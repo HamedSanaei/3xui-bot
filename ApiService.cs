@@ -208,7 +208,7 @@ public class ApiService
             Console.WriteLine("=================================");
 
 
-            string dateString = "Thu, 28 Dec 2023 15:03:23 GMT; Max-Age=2592000";
+            string dateString = expirationDateString2;
 
             string[] dateParts = dateString.Split(';');
 

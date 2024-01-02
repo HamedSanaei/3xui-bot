@@ -35,6 +35,7 @@ public class UserDbContext : DbContext
             if (user.TotoalGB != null) existingUser.TotoalGB = user.TotoalGB;
             if (user.ConfigLink != null) existingUser.ConfigLink = user.ConfigLink;
             if (user.Email != null) existingUser.Email = user.Email;
+            if (user.Flow != null) existingUser.Flow = user.Flow;
 
         }
         await context.SaveChangesAsync();
@@ -64,6 +65,7 @@ public class UserDbContext : DbContext
             existingUser.TotoalGB = "";
             existingUser.ConfigLink = "";
             existingUser.Email = "";
+            existingUser.Type = "";
         }
         await context.SaveChangesAsync();
 

@@ -11,7 +11,12 @@ public class User
     public string SelectedCountry { get; set; }
     public string SelectedPeriod { get; set; }
     public string Type { get; set; }
+    /// <summary>
+    /// check if is it a create or read or update config flow
+    /// </summary>
+    public string Flow { get; set; }
     public string LastStep { get; set; }
+
     public string TotoalGB { get; set; }
     public string ConfigLink { get; set; }
     public string Email { get; set; }
