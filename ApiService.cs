@@ -102,11 +102,9 @@ public class ApiService
     //it called by methodes in program.cs
     public static async Task<bool> CreateUserAccount(AccountDto accountDto)
     {
-
         string sessionCookie = accountDto.SessionCookie;
         string selectedCountry = accountDto.SelectedCountry;
         string selectedPeriod = accountDto.SelectedPeriod;
-
 
         // Create an HttpClientHandler
         var handler = new HttpClientHandler();
@@ -134,6 +132,99 @@ public class ApiService
         };
 
         var apiUrl = accountDto.ServerInfo.Url + "/" + accountDto.ServerInfo.RootPath + "/" + "panel/api/inbounds/addClient";
+
+        try
+        {
+            // Send the POST request with the JSON body
+            HttpResponseMessage response = await httpClient.PostAsJsonAsync(apiUrl, requestBody);
+            string responseBody = await response.Content.ReadAsStringAsync();
+            AddClientResult result = JsonConvert.DeserializeObject<AddClientResult>(responseBody);
+
+
+            // Check if the request was successful
+            if (response.IsSuccessStatusCode && result.Success)
+            {
+                // Account created successfully
+                // Read and print the response content
+                if (accountDto.AccType == "tunnel")
+                {
+
+                    var configLink = accountDto.ServerInfo.VmessTemplate;
+                    configLink.Ps += client.Email;
+                    configLink.Id = client.Id;
+
+                    //Console.WriteLine(responseBody);
+                    UserDbContext _userDbContext = new UserDbContext();
+
+                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
+                    await _userDbContext.SaveChangesAsync();
+                    return true;
+                }
+                else if (accountDto.AccType == "realityv6")
+                {
+                    var vlessLink = $"vless://{client.Id}@{accountDto.ServerInfo.Vless.Domain}:443?type=tcp&security=reality&fp=firefox&pbk=kGzzo-8w_p6XHOyF1Pr1jiGjgqjICkWJyNw7ksML3yY&sni=www.google-analytics.com&sid=6c0eefcb#RealityMTN-{client.Email}";
+                    UserDbContext _userDbContext = new UserDbContext();
+
+                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = vlessLink, Email = client.Email });
+                    await _userDbContext.SaveChangesAsync();
+                    return true;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                Console.WriteLine($"Error: {response.StatusCode} - {response.ReasonPhrase}");
+                Console.WriteLine($"Server Message:  isSuccessful:{result.Success} - {result.Msg}");
+                return false;
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"HttpRequestException: {ex.Message}");
+
+        }
+        return false;
+    }
+
+
+    public static async Task<bool> UpdateUserAccount(AccountDtoUpdate accountDto)
+    {
+        string sessionCookie = accountDto.SessionCookie;
+        string selectedCountry = accountDto.SelectedCountry;
+        string selectedPeriod = accountDto.SelectedPeriod;
+
+        // Create an HttpClientHandler
+        var handler = new HttpClientHandler();
+
+        // Create a CookieContainer and add your cookie
+        var cookieContainer = new CookieContainer();
+        cookieContainer.Add(new Uri(accountDto.ServerInfo.Url), new Cookie("session", accountDto.SessionCookie));
+
+        // Assign the CookieContainer to the handler
+        handler.CookieContainer = cookieContainer;
+
+        // Create the HttpClient with the custom handler
+        var httpClient = new HttpClient(handler);
+
+        // Now you can use the httpClient to make requests with the specified cookie
+
+        // Create the request body
+        var inboundId = accountDto.ServerInfo.Inbounds.FirstOrDefault(i => i.Type == accountDto.AccType);
+        if (inboundId == null) return false;
+        if (accountDto.Client.ExpiryTime <= DateTime.UtcNow)
+            accountDto.Client.ExpiryTime = DateTime.UtcNow;
+        Client client = new Client { Id = accountDto.Client.Id, TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)) + accountDto.Client.TotalGB, ExpiryTime = accountDto.Client.ExpiryTime.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)), Email = accountDto.Client.Email, Enable = true };
+        var requestBody = new
+        {
+            id = inboundId.Id,
+            settings = Client.MakeSettingString(client)
+        };
+
+        //var apiUrl = accountDto.ServerInfo.Url + "/" + accountDto.ServerInfo.RootPath + "/" + "panel/api/inbounds/addClient";
+        var apiUrl = $"{accountDto.ServerInfo.Url}/{accountDto.ServerInfo.RootPath}/panel/api/inbounds/updateClient/{client.Id}";
 
         try
         {

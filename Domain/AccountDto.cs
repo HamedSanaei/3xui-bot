@@ -17,4 +17,8 @@ namespace Adminbot.Domain
         //reality or tunnel
         public string AccType { get; set; }
     }
+    public class AccountDtoUpdate : AccountDto
+    {
+        public ClientExtend Client { get; set; }
+    }
 }

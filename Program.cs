@@ -148,15 +148,25 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
         // Create a keyboard based on the selected period
         var keyboard = GetAccountTypeKeyboard();
 
-        // Send the keyboard to the user
-        await botClient.SendTextMessageAsync(
-            chatId: message.Chat.Id,
-            text: "Select the account type:",
-            replyMarkup: keyboard
-        );
+        // Send the keyboard to the user for renew
+        if ((await _userDbContext.GetUserStatus(message.From.Id)).Flow == "update")
+            await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "Type Traffic in GB and send! \n" + "For example if you send 20, the account will have 20GB traffic",
+                    replyMarkup: new ReplyKeyboardRemove());
+
+
+        // Send the keyboard to the user for creation
+        if ((await _userDbContext.GetUserStatus(message.From.Id)).Flow == "create")
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "Select the account type:",
+                replyMarkup: keyboard
+            );
 
 
     }
+
     else if (message.Text == "Reality Ipv6")
     {
         await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, Type = "realityv6", TotoalGB = "500" });
@@ -209,14 +219,10 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
         }
 
 
-
         await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "Type Traffic in GB and send! \n" + "For example if you send 20, the account will have 20GB traffic",
                     replyMarkup: new ReplyKeyboardRemove());
-
-
-
     }
 
     else if (message.Text == "Yes Create!")
@@ -354,8 +360,33 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
         user.ConfigLink = message.Text;
         await _userDbContext.SaveUserStatus(user);
 
-    }
 
+        var periodKeyboard = new ReplyKeyboardMarkup(new[]
+        {
+                new []
+                {
+                    new KeyboardButton("1 Month"),
+                },
+                new []
+                {
+                    new KeyboardButton("2 Months"),
+                },
+                new []
+                {
+                    new KeyboardButton("3 Months"),
+                },
+                new []
+                {
+                    new KeyboardButton("6 Months"),
+                },
+            });
+
+        await botClient.SendTextMessageAsync(
+            chatId: message.Chat.Id,
+            text: "Select the account period:",
+            replyMarkup: periodKeyboard);
+
+    }
 
     else if (message.Text == "🔄 Renew Existing Account")
     {
@@ -367,8 +398,6 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
     }
     else if ((await _userDbContext.GetUserStatus(message.From.Id)).Flow == "update")
     {
-
-
     }
     else if (message.Text == "📑 Menu")
     {
@@ -382,10 +411,29 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
     {
 
 
-        if ((await _userDbContext.GetUserStatus(message.From.Id)).LastStep == "Renew Existing Account")
+        if ((await _userDbContext.GetUserStatus(message.From.Id)).LastStep == "Renew Existing Account" && (await _userDbContext.GetUserStatus(message.From.Id)).Flow == "update")
         {
-            // bayad tamdid konim va tamam az ro config link.
-            // aval fetch mikonim 
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = res.ToString() });
+
+            // The user entered a valid number
+            var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                       {
+            new []
+            {
+                new KeyboardButton("Yes Renew!"),
+            },
+            new []
+            {
+                new KeyboardButton("No Don't Create!"),
+            },
+        });
+
+            var user = await _userDbContext.GetUserStatus(message.From.Id);
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: $"You selected {user.SelectedPeriod}(s) with account type and Traffic {res}GB. Confirm?",
+                replyMarkup: confirmationKeyboard);
             return;
         }
         if ((await _userDbContext.GetUserStatus(message.From.Id)).LastStep == "Create New Account" && (await _userDbContext.GetUserStatus(message.From.Id)).Flow == "create")
@@ -411,15 +459,12 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
 
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
-                    text: $"You selected {user.SelectedCountry} for {user.SelectedPeriod}Month(s) with account type {user.Type} and Traffic {userTraffic}GB. Confirm?",
+                    text: $"You selected {user.SelectedCountry} for {user.SelectedPeriod}(s) with account type {user.Type} and Traffic {userTraffic}GB. Confirm?",
                     replyMarkup: confirmationKeyboard);
 
 
                 return;
             }
-
-
-
             // You can now use the 'userTraffic' value in your logic
             // For example, store it in a database, perform further actions, etc.
         }
@@ -431,9 +476,110 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
                 text: "Please enter a valid number."
             );
         }
+    }
+    else if (message.Text == "Yes Renew!")
+    {
+        var user = await _userDbContext.GetUserStatus(message.From.Id);
+        ClientExtend client = await TryGetClient(user.ConfigLink);
+        if (client == null)
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+            await botClient.SendTextMessageAsync(
+                          chatId: message.Chat.Id,
+                          text: "There is a Error with decoding Your config link!",
+                           replyMarkup: new ReplyKeyboardRemove());
+            return;
+        }
+
+        if (client != null)
+        {
+            ServerInfo findedServer = null;
+            string findedcountry = null;
+            AccountDtoUpdate accountDto = null;
+            var serversJson = System.IO.File.ReadAllText("servers.json");
+            var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+            //trafic va modat faghat darim
+            if (user.ConfigLink.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
+            {
+                // location nadarim Get location
+                var vless = Vless.DecodeVlessLink(message.Text);
+
+                // Iterate over the dictionary
+                foreach (var kvp in servers)
+                {
+                    var country = kvp.Key;
+                    ServerInfo serverInfo = kvp.Value;
+                    if (serverInfo.Vless.Domain == vless.Domain)
+                    {
+                        findedServer = serverInfo;
+                        findedcountry = country;
+                    }
+                }
+
+                accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "realityv6", TotoalGB = "500" };
+            }
+
+            if (user.ConfigLink.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase))
+            {
+
+                var vmess = VMessConfiguration.DecodeVMessLink(message.Text);
+
+                // Iterate over the dictionary
+                foreach (var kvp in servers)
+                {
+                    string country = kvp.Key;
+                    ServerInfo serverInfo = kvp.Value;
+                    if (serverInfo.VmessTemplate.Add == vmess.Add)
+                    {
+                        serverInfo.Inbounds = new List<Inbound> { serverInfo.Inbounds.FirstOrDefault(i => i.Port.ToString() == vmess.Port) };
+                        serverInfo.VmessTemplate.Port = vmess.Port;
+                        findedServer = serverInfo;
+                        findedcountry = country;
+                    }
+                }
+
+                accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB };
+            }
+            var result = await UpdateAccount(accountDto);
 
 
+            if (result)
+            {
+                user = await _userDbContext.GetUserStatus(message.From.Id);
 
+                var msg = $"✅ Account details: \n";
+                msg += $"Account Name: `{user.Email}`";
+                msg += $"\nLocation: {user.SelectedCountry} \nDuration: {user.SelectedPeriod}";
+                if (Convert.ToInt32(user.TotoalGB) < 100) msg += $"\nTraffic: {user.TotoalGB}GB.\n";
+                string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
+                msg += $"\nExpiration Date: {hijriShamsiDate}\n";
+                msg += $"Your Connection link is: \n";
+                msg += "============= Tap to Copy =============\n";
+                msg += $"`{user.ConfigLink}`" + "\n ";
+
+                // Send the photo with caption
+
+                await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                // .GetAwaiter()
+                // .GetResult();
+
+
+                await botClient.SendTextMessageAsync(
+                   chatId: message.Chat.Id,
+                   text: "Main menu",
+                    replyMarkup: GetMainMenuKeyboard());
+
+                await _userDbContext.ClearUserStatus(new User { Id = user.Id });
+            }
+
+            await botClient.SendTextMessageAsync(
+       chatId: message.Chat.Id, parseMode: ParseMode.Markdown,
+       text: "Main menu",
+        replyMarkup: GetMainMenuKeyboard());
+
+
+        }
     }
     else
     {
@@ -516,6 +662,24 @@ async Task<bool> CreateAccount(AccountDto accountDto)
         // var selectedPeriod = "2 Months";
 
         result = await ApiService.CreateUserAccount(accountDto);
+    }
+    else
+    {
+        // Handle the case where login fails
+        result = false;
+    }
+    return result;
+}
+
+async Task<bool> UpdateAccount(AccountDtoUpdate accountDto)
+{
+    bool result;
+    var sessionCookie = await ApiService.LoginAndGetSessionCookie(accountDto.ServerInfo);
+    if (sessionCookie != null)
+    {
+        accountDto.SessionCookie = sessionCookie;
+
+        result = await ApiService.UpdateUserAccount(accountDto);
     }
     else
     {
@@ -632,6 +796,7 @@ async Task<ClientExtend> TryGetClient(string messageText)
         var inbound = serverInfo.Inbounds.FirstOrDefault(i => i.Type == "realityv6");
         if (inbound == null) return null;
         client = await ApiService.FetchClientFromServer(vless.Id, serverInfo, inbound.Id);
+
     }
     return client;
 
