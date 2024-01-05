@@ -101,6 +101,40 @@ public class UserDbContext : DbContext
 
 
     }
+
+
+    public async Task<bool> IsUserReadyToUpdate(long teluserid)
+    {
+
+        UserDbContext context = new UserDbContext();
+        context.Database.EnsureCreated(); // Create the database if it doesn't exist
+
+        var existingUser = await context.Users.FirstOrDefaultAsync(u => u.Id == teluserid);
+
+        if (existingUser == null)
+        {
+            // User does not exist, create a new user
+            context.Users.Add(new User { Id = teluserid });
+            return false;
+        }
+
+        if (existingUser.Type == "realityv6")
+        {
+            existingUser.TotoalGB = "500";
+        }
+
+        if (!string.IsNullOrEmpty(existingUser.LastStep) && !string.IsNullOrEmpty(existingUser.SelectedPeriod) && !string.IsNullOrEmpty(existingUser.TotoalGB))
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+
+
+    }
+
     public async Task<User> GetUserStatus(long userId)
     {
         var context = new UserDbContext();

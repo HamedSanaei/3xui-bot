@@ -456,6 +456,8 @@ public class ApiService
     {
         switch (period)
         {
+            case "0 Month":
+                return 0;
             case "1 Month":
                 return 30; // Assuming one month is approximately 30 days
             case "2 Months":

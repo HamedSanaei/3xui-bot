@@ -59,6 +59,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
     {
         return;
     }
+    var currentUser = await _userDbContext.GetUserStatus(message.From.Id);
 
     if (message.Text == "/start")
     {
@@ -68,6 +69,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
             replyMarkup: GetMainMenuKeyboard());
         await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
     }
+
     else if (message.Text == "➕ Create New Account")
     {
         var createAccountKeyboard = new ReplyKeyboardMarkup(new[]
@@ -128,14 +130,14 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
             replyMarkup: periodKeyboard);
     }
 
-    else if (message.Text == "1 Month" || message.Text == "2 Months" || message.Text == "3 Months" || message.Text == "6 Months")
+    else if (message.Text == "0 Month" || message.Text == "1 Month" || message.Text == "2 Months" || message.Text == "3 Months" || message.Text == "6 Months")
     {
         // Handle the selected period
         await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, SelectedPeriod = message.Text });
 
         // user does not go throw the actual flow
-        var user = await _userDbContext.GetUserStatus(message.From.Id);
-        if (string.IsNullOrEmpty(user.SelectedCountry))
+        var user = currentUser;
+        if (string.IsNullOrEmpty(user.SelectedCountry) && (user.Flow == "create"))
         {
             await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
@@ -148,16 +150,19 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
         // Create a keyboard based on the selected period
         var keyboard = GetAccountTypeKeyboard();
 
-        // Send the keyboard to the user for renew
-        if ((await _userDbContext.GetUserStatus(message.From.Id)).Flow == "update")
+        // get trafic for renew
+        if (currentUser.Flow == "update")
+        {
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "get_traffic" });
             await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "Type Traffic in GB and send! \n" + "For example if you send 20, the account will have 20GB traffic",
                     replyMarkup: new ReplyKeyboardRemove());
+        }
 
 
         // Send the keyboard to the user for creation
-        if ((await _userDbContext.GetUserStatus(message.From.Id)).Flow == "create")
+        if (currentUser.Flow == "create")
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Select the account type:",
@@ -171,7 +176,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
     {
         await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, Type = "realityv6", TotoalGB = "500" });
 
-        var user = await _userDbContext.GetUserStatus(message.From.Id);
+        var user = currentUser;
         if (string.IsNullOrEmpty(user.SelectedCountry) || string.IsNullOrEmpty(user.SelectedPeriod))
         {
             await botClient.SendTextMessageAsync(
@@ -196,7 +201,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
             },
         });
 
-        user = await _userDbContext.GetUserStatus(message.From.Id);
+        user = currentUser;
 
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
@@ -204,11 +209,12 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
             replyMarkup: confirmationKeyboard);
 
     }
+
     else if (message.Text == "All operators")
     {
-        await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, Type = "tunnel" });
+        await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, Type = "tunnel", LastStep = "get_traffic" });
 
-        var user = await _userDbContext.GetUserStatus(message.From.Id);
+        var user = currentUser;
         if (string.IsNullOrEmpty(user.SelectedCountry) || string.IsNullOrEmpty(user.SelectedPeriod))
         {
             await botClient.SendTextMessageAsync(
@@ -241,7 +247,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
         if (!ready) return;
 
         // Handle confirmation (create the account or perform other actions)
-        var user = await _userDbContext.GetUserStatus(message.From.Id);
+        var user = currentUser;
 
         // Access the server information from the servers.json file
         var serversJson = System.IO.File.ReadAllText("servers.json");
@@ -258,7 +264,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
             // For example, create the account, send a request to the server, etc.
             if (result)
             {
-                user = await _userDbContext.GetUserStatus(message.From.Id);
+                user = await _userDbContext.GetUserStatus(currentUser.Id);
 
                 var msg = $"✅ Account details: \n";
                 msg += $"Account Name: `{user.Email}`";
@@ -295,6 +301,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
                 replyMarkup: GetMainMenuKeyboard());
         }
     }
+
     else if (message.Text == "No Don't Create!")
     {
         await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
@@ -319,22 +326,21 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
 
     }
 
-    else if ((await _userDbContext.GetUserStatus(message.From.Id)).Flow == "read" && StartsWithVMessOrVLess(message.Text))
+    else if (currentUser.Flow == "read" && StartsWithVMessOrVLess(message.Text))
     {
-        var user = await _userDbContext.GetUserStatus(message.From.Id);
+
         ClientExtend client = await TryGetClient(message.Text);
+        await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
         // Handle "Get Account Info" button click
         // You can implement the logic for this button here
         // For example, retrieve and display account information
-
-
         if (client == null)
         {
             await botClient.SendTextMessageAsync(
                           chatId: message.Chat.Id,
                           text: "There is a Error with decoding Your config link!",
-                           replyMarkup: new ReplyKeyboardRemove());
+                           replyMarkup: GetMainMenuKeyboard());
             return;
         }
 
@@ -354,9 +360,10 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
 
 
     }
-    else if ((await _userDbContext.GetUserStatus(message.From.Id)).Flow == "update" && StartsWithVMessOrVLess(message.Text))
+
+    else if (currentUser.Flow == "update" && StartsWithVMessOrVLess(message.Text))
     {
-        var user = await _userDbContext.GetUserStatus(message.From.Id);
+        var user = currentUser;
         user.ConfigLink = message.Text;
         await _userDbContext.SaveUserStatus(user);
 
@@ -364,6 +371,9 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
         var periodKeyboard = new ReplyKeyboardMarkup(new[]
         {
                 new []
+                {
+                    new KeyboardButton("0 Month"),
+                },new []
                 {
                     new KeyboardButton("1 Month"),
                 },
@@ -396,9 +406,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
                            text: "Send your Vmess or Vless link:",
                             replyMarkup: new ReplyKeyboardRemove());
     }
-    else if ((await _userDbContext.GetUserStatus(message.From.Id)).Flow == "update")
-    {
-    }
+
     else if (message.Text == "📑 Menu")
     {
         await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
@@ -407,79 +415,24 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
         // You can implement the logic for this button here
         // For example, show a different menu or perform another action
     }
-    else if (int.TryParse(message.Text, out int res))
-    {
 
-
-        if ((await _userDbContext.GetUserStatus(message.From.Id)).LastStep == "Renew Existing Account" && (await _userDbContext.GetUserStatus(message.From.Id)).Flow == "update")
-        {
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = res.ToString() });
-
-            // The user entered a valid number
-            var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
-                       {
-            new []
-            {
-                new KeyboardButton("Yes Renew!"),
-            },
-            new []
-            {
-                new KeyboardButton("No Don't Create!"),
-            },
-        });
-
-            var user = await _userDbContext.GetUserStatus(message.From.Id);
-
-            await botClient.SendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: $"You selected {user.SelectedPeriod}(s) with account type and Traffic {res}GB. Confirm?",
-                replyMarkup: confirmationKeyboard);
-            return;
-        }
-        if ((await _userDbContext.GetUserStatus(message.From.Id)).LastStep == "Create New Account" && (await _userDbContext.GetUserStatus(message.From.Id)).Flow == "create")
-        {
-            if (int.TryParse(message.Text, out int userTraffic))
-            {
-                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = userTraffic.ToString() });
-
-                // The user entered a valid number
-                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
-                           {
-            new []
-            {
-                new KeyboardButton("Yes Create!"),
-            },
-            new []
-            {
-                new KeyboardButton("No Don't Create!"),
-            },
-        });
-
-                var user = await _userDbContext.GetUserStatus(message.From.Id);
-
-                await botClient.SendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: $"You selected {user.SelectedCountry} for {user.SelectedPeriod}(s) with account type {user.Type} and Traffic {userTraffic}GB. Confirm?",
-                    replyMarkup: confirmationKeyboard);
-
-
-                return;
-            }
-            // You can now use the 'userTraffic' value in your logic
-            // For example, store it in a database, perform further actions, etc.
-        }
-        else
-        {
-            // The user did not enter a valid number
-            await botClient.SendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: "Please enter a valid number."
-            );
-        }
-    }
     else if (message.Text == "Yes Renew!")
     {
-        var user = await _userDbContext.GetUserStatus(message.From.Id);
+        await botClient.SendTextMessageAsync(
+                   chatId: message.Chat.Id,
+                   text: "Please wait ...",
+                    replyMarkup: new ReplyKeyboardRemove());
+
+
+        var ready = await _userDbContext.IsUserReadyToUpdate(message.From.Id);
+        if (!ready) await botClient.SendTextMessageAsync(
+                   chatId: message.Chat.Id,
+                   text: "Your information is not complete. please go throw steps correctly.",
+                    replyMarkup: GetMainMenuKeyboard()); ;
+        if (!ready) return;
+
+
+        var user = currentUser;
         ClientExtend client = await TryGetClient(user.ConfigLink);
         if (client == null)
         {
@@ -503,7 +456,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
             if (user.ConfigLink.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
             {
                 // location nadarim Get location
-                var vless = Vless.DecodeVlessLink(message.Text);
+                var vless = Vless.DecodeVlessLink(user.ConfigLink);
 
                 // Iterate over the dictionary
                 foreach (var kvp in servers)
@@ -516,14 +469,12 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
                         findedcountry = country;
                     }
                 }
-
                 accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "realityv6", TotoalGB = "500" };
             }
 
             if (user.ConfigLink.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase))
             {
-
-                var vmess = VMessConfiguration.DecodeVMessLink(message.Text);
+                var vmess = VMessConfiguration.DecodeVMessLink(user.ConfigLink);
 
                 // Iterate over the dictionary
                 foreach (var kvp in servers)
@@ -541,18 +492,20 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
 
                 accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB };
             }
+            await _userDbContext.SaveUserStatus(new User { Id = currentUser.Id, SelectedCountry = findedcountry });
             var result = await UpdateAccount(accountDto);
 
 
             if (result)
             {
-                user = await _userDbContext.GetUserStatus(message.From.Id);
+                user = await _userDbContext.GetUserStatus(user.Id);
 
+                user.TotoalGB = (Convert.ToInt64(user.TotoalGB) + (client.TotalGB / 1073741824L)).ToString();
                 var msg = $"✅ Account details: \n";
                 msg += $"Account Name: `{user.Email}`";
                 msg += $"\nLocation: {user.SelectedCountry} \nDuration: {user.SelectedPeriod}";
                 if (Convert.ToInt32(user.TotoalGB) < 100) msg += $"\nTraffic: {user.TotoalGB}GB.\n";
-                string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
+                string hijriShamsiDate = client.ExpiryTime.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).ConvertToHijriShamsi();
                 msg += $"\nExpiration Date: {hijriShamsiDate}\n";
                 msg += $"Your Connection link is: \n";
                 msg += "============= Tap to Copy =============\n";
@@ -563,13 +516,6 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
                 await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
                 // .GetAwaiter()
                 // .GetResult();
-
-
-                await botClient.SendTextMessageAsync(
-                   chatId: message.Chat.Id,
-                   text: "Main menu",
-                    replyMarkup: GetMainMenuKeyboard());
-
                 await _userDbContext.ClearUserStatus(new User { Id = user.Id });
             }
 
@@ -581,6 +527,85 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
 
         }
     }
+
+    else if (currentUser.LastStep == "get_traffic")
+    {
+        var isSuccessful = int.TryParse(message.Text, out int res);
+        if (!isSuccessful)
+        {
+            await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "Error! \n Type Traffic in GB and send! \n" + "For example if you send 20, the account will have 20GB traffic.\n Tap /start to cancell the proccess.",
+                    replyMarkup: new ReplyKeyboardRemove());
+            return;
+        }
+
+        if (currentUser.Flow == "update")
+        {
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = res.ToString() });
+
+            // The user entered a valid number
+            var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                       {
+            new []
+            {
+                new KeyboardButton("Yes Renew!"),
+            },
+            new []
+            {
+                new KeyboardButton("No Don't Create!"),
+            },
+        });
+
+            var user = currentUser;
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: $"You selected {user.SelectedPeriod}(s) with account type and Traffic {res}GB. Confirm?",
+                replyMarkup: confirmationKeyboard);
+            return;
+        }
+        if (currentUser.Flow == "create")
+        {
+            if (int.TryParse(message.Text, out int userTraffic))
+            {
+                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = userTraffic.ToString() });
+
+                // The user entered a valid number
+                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                           {
+            new []
+            {
+                new KeyboardButton("Yes Create!"),
+            },
+            new []
+            {
+                new KeyboardButton("No Don't Create!"),
+            },
+        });
+
+                var user = currentUser;
+
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"You selected {user.SelectedCountry} for {user.SelectedPeriod}(s) with account type {user.Type} and Traffic {userTraffic}GB. Confirm?",
+                    replyMarkup: confirmationKeyboard);
+
+
+                return;
+            }
+            // You can now use the 'userTraffic' value in your logic
+            // For example, store it in a database, perform further actions, etc.
+        }
+        else
+        {
+            // The user did not enter a valid number
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "Please enter a valid number."
+            );
+        }
+    }
+
     else
     {
         await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
