@@ -8,7 +8,7 @@ using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using Adminbot.Utils;
 
-//var bot1 = "6019665082:AAGBDkTknaoRvTV8wmpS3xOits3XCcwufqU";
+// var bot1 = "6019665082:AAGBDkTknaoRvTV8wmpS3xOits3XCcwufqU";
 var bot2 = "6034372537:AAH_iAh1rLrosds9wGqtq-cdUG7yp4um60c";
 var botClient = new TelegramBotClient(bot2);
 UserDbContext _userDbContext = new UserDbContext();
@@ -503,7 +503,7 @@ async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, Cancel
                 user.TotoalGB = (Convert.ToInt64(user.TotoalGB) + (client.TotalGB / 1073741824L)).ToString();
                 var msg = $"✅ Account details: \n";
                 msg += $"Account Name: `{user.Email}`";
-                msg += $"\nLocation: {user.SelectedCountry} \nDuration: {user.SelectedPeriod}";
+                msg += $"\nLocation: {user.SelectedCountry} \nAdded duration: {user.SelectedPeriod}";
                 if (Convert.ToInt32(user.TotoalGB) < 100) msg += $"\nTraffic: {user.TotoalGB}GB.\n";
                 string hijriShamsiDate = client.ExpiryTime.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).ConvertToHijriShamsi();
                 msg += $"\nExpiration Date: {hijriShamsiDate}\n";
@@ -779,7 +779,6 @@ static ServerInfo GetConfigServerFromVless(Vless vless)
     }
     else
     {
-
         throw new Exception("Your Vmess Link is not completed!");
     }
 }
@@ -798,7 +797,7 @@ async Task<ClientExtend> TryGetClient(string messageText)
         try
         {
             var vmess = VMessConfiguration.DecodeVMessLink(messageText);
-            var serverInfo = GetConfigServer(vmess);
+            ServerInfo serverInfo = GetConfigServer(vmess);
             var inbound = serverInfo.Inbounds.FirstOrDefault(i => i.Type == "tunnel");
             if (inbound == null) return null;
             client = await ApiService.FetchClientFromServer(vmess.Id, serverInfo, inbound.Id);
@@ -816,11 +815,20 @@ async Task<ClientExtend> TryGetClient(string messageText)
     //vless
     else
     {
-        var vless = Vless.DecodeVlessLink(messageText);
-        var serverInfo = GetConfigServerFromVless(vless);
-        var inbound = serverInfo.Inbounds.FirstOrDefault(i => i.Type == "realityv6");
-        if (inbound == null) return null;
-        client = await ApiService.FetchClientFromServer(vless.Id, serverInfo, inbound.Id);
+        try
+        {
+            var vless = Vless.DecodeVlessLink(messageText);
+            var serverInfo = GetConfigServerFromVless(vless);
+            var inbound = serverInfo.Inbounds.FirstOrDefault(i => i.Type == "realityv6");
+            if (inbound == null) return null;
+            client = await ApiService.FetchClientFromServer(vless.Id, serverInfo, inbound.Id);
+        }
+        catch (System.Exception ex)
+        {
+
+            Console.WriteLine(ex.Message);
+        }
+
 
     }
     return client;

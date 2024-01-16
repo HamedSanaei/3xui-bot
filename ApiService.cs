@@ -38,7 +38,7 @@ public class ApiService
             DateTimeOffset currentUtcTime = DateTimeOffset.UtcNow;
 
 
-            if (dbCookie.ExpirationDate > currentUtcTime)
+            if (dbCookie.ExpirationDate > currentUtcTime && await IsCookieValid(serverInfo, cookie))
                 return dbCookie.SessionCookie;
         }
         else if (dbCookie?.ExpirationDate < DateTimeOffset.UtcNow || dbCookie == null)
@@ -82,6 +82,51 @@ public class ApiService
             }
         }
         return GetSessionCookie(completeSessionCookie);
+    }
+
+    private static async Task<bool> IsCookieValid(ServerInfo serverInfo, string cookie)
+    {
+        var loginData = new
+        {
+            Username = serverInfo.Username,
+            Password = serverInfo.Password
+        };
+
+        // Create an HttpClientHandler
+        var handler = new HttpClientHandler();
+
+        // Create a CookieContainer and add your cookie
+        var cookieContainer = new CookieContainer();
+        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", cookie));
+
+        // Assign the CookieContainer to the handler
+        handler.CookieContainer = cookieContainer;
+
+
+        // Create the HttpClient with the custom handler
+        var httpClient = new HttpClient(handler);
+
+        try
+        {
+            var route = serverInfo.Url + "/" + serverInfo.RootPath + "/panel/api/inbounds/list";
+            HttpResponseMessage response = await httpClient.GetAsync(route);
+            if (response.IsSuccessStatusCode)
+            {
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        catch (System.Exception ex)
+        {
+
+            Console.WriteLine(ex.Message);
+            return false;
+        }
+
+
     }
 
     private static string GetSessionCookie(string cookie)

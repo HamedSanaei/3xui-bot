@@ -61,6 +61,7 @@ public class Client
 
     public static string MakeSettingString(Client client)
     {
+
         StringBuilder sb = new StringBuilder("{\"clients\":[{\"id\":\"");
         sb.Append(client.Id.ToString());
         sb.Append("\",\"alterId\":");
