@@ -20,5 +20,7 @@ namespace Adminbot.Domain
     public class AccountDtoUpdate : AccountDto
     {
         public ClientExtend Client { get; set; }
+        public string ConfigLink { get; set; }
+
     }
 }

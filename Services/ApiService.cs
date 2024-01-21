@@ -170,11 +170,20 @@ public class ApiService
         var inboundId = accountDto.ServerInfo.Inbounds.FirstOrDefault(i => i.Type == accountDto.AccType);
         if (inboundId == null) return false;
         Client client = new Client { TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)), ExpiryTime = DateTime.Now.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)) };
+
+        var setting = Client.MakeSettingString(client);
+        if (accountDto.AccType == "realityv6")
+        {
+            int commaIndex = setting.IndexOf(',');
+            setting = setting.Insert(commaIndex, ",\"flow\":\"xtls-rprx-vision\"");
+        }
+
         var requestBody = new
         {
             id = inboundId.Id,
-            settings = Client.MakeSettingString(client)
+            settings = setting
         };
+
 
         var apiUrl = accountDto.ServerInfo.Url + "/" + accountDto.ServerInfo.RootPath + "/" + "panel/api/inbounds/addClient";
 
@@ -207,7 +216,7 @@ public class ApiService
                 }
                 else if (accountDto.AccType == "realityv6")
                 {
-                    var vlessLink = $"vless://{client.Id}@{accountDto.ServerInfo.Vless.Domain}:443?type=tcp&security=reality&fp=firefox&pbk=kGzzo-8w_p6XHOyF1Pr1jiGjgqjICkWJyNw7ksML3yY&sni=www.google-analytics.com&sid=6c0eefcb#RealityMTN-{client.Email}";
+                    var vlessLink = $"vless://{client.Id}@{accountDto.ServerInfo.Vless.Domain}:443?type=tcp&security=reality&flow=xtls-rprx-vision&fp=firefox&pbk=kGzzo-8w_p6XHOyF1Pr1jiGjgqjICkWJyNw7ksML3yY&sni=www.google-analytics.com&sid=6c0eefcb#RealityMTN-{client.Email}";
                     UserDbContext _userDbContext = new UserDbContext();
 
                     await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = vlessLink, Email = client.Email });
@@ -233,7 +242,6 @@ public class ApiService
         }
         return false;
     }
-
 
     public static async Task<bool> UpdateUserAccount(AccountDtoUpdate accountDto)
     {
@@ -265,7 +273,7 @@ public class ApiService
         var requestBody = new
         {
             id = inboundId.Id,
-            settings = Client.MakeSettingString(client)
+            settings = Client.MakeSettingString(client, accountDto)
         };
 
         //var apiUrl = accountDto.ServerInfo.Url + "/" + accountDto.ServerInfo.RootPath + "/" + "panel/api/inbounds/addClient";
@@ -300,7 +308,13 @@ public class ApiService
                 }
                 else if (accountDto.AccType == "realityv6")
                 {
+
                     var vlessLink = $"vless://{client.Id}@{accountDto.ServerInfo.Vless.Domain}:443?type=tcp&security=reality&fp=firefox&pbk=kGzzo-8w_p6XHOyF1Pr1jiGjgqjICkWJyNw7ksML3yY&sni=www.google-analytics.com&sid=6c0eefcb#RealityMTN-{client.Email}";
+                    if (accountDto.ConfigLink.Contains("flow=xtls-rprx-vision"))
+                    {
+                        int commaIndex = vlessLink.IndexOf('&');
+                        vlessLink = vlessLink.Insert(commaIndex, "&flow=xtls-rprx-vision");
+                    }
                     UserDbContext _userDbContext = new UserDbContext();
 
                     await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = vlessLink, Email = client.Email });

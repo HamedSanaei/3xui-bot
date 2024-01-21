@@ -13,6 +13,8 @@ public class TelegramBotService : IHostedService
 {
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
+    private readonly CredentialsDbContext _credentialsDbContext;
+
 
 
     public TelegramBotService(ITelegramBotClient botClient, UserDbContext dbContext)
@@ -73,6 +75,7 @@ public class TelegramBotService : IHostedService
         long[] allowedValues = { 6257546736, 85758085, 888197418 };
         if (!allowedValues.Contains(message.From.Id))
         {
+            await HandleUpdateRegularUsers(botClient, update, cancellationToken);
             return;
         }
         var currentUser = await _userDbContext.GetUserStatus(message.From.Id);
@@ -485,7 +488,7 @@ public class TelegramBotService : IHostedService
                             findedcountry = country;
                         }
                     }
-                    accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "realityv6", TotoalGB = "500" };
+                    accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "realityv6", TotoalGB = "500", ConfigLink = user.ConfigLink };
                 }
 
                 if (user.ConfigLink.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase))
@@ -506,7 +509,7 @@ public class TelegramBotService : IHostedService
                         }
                     }
 
-                    accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB };
+                    accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB, ConfigLink = user.ConfigLink };
                 }
                 await _userDbContext.SaveUserStatus(new User { Id = currentUser.Id, SelectedCountry = findedcountry });
                 var result = await UpdateAccount(accountDto);
@@ -633,6 +636,76 @@ public class TelegramBotService : IHostedService
         }
     }
 
+    private async Task HandleUpdateRegularUsers(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
+    {
+
+        if (update.Message is not { } message)
+            return;
+        // Only process text messages
+        if (message.Text is not { } messageText)
+            return;
+
+
+        if (message.Text == "/start")
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "Main Menu:",
+                replyMarkup: GetMainMenuKeyboard());
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+            var creds = new CredUser { TelegramUserId = message.From.Id, ChatID = message.Chat.Id, Username = message.From.Username ?? "", FirstName = message.From.FirstName, LastName = message.From.LastName ?? "", LanguageCode = message.From.LanguageCode ?? "fa" };
+            await _credentialsDbContext.GetUserStatus(message.From.Id, creds);
+        }
+
+        else if (message.Text == "💬ارتباط با پشتیبانی")
+        {
+            var createAccountKeyboard = new ReplyKeyboardMarkup(new[]
+            {
+            new []
+            {
+                new KeyboardButton("🇩🇪 Germany"),
+            },
+            new []
+            {
+                new KeyboardButton("🇸🇪 Sweden"),
+            },
+            new []
+            {
+                new KeyboardButton("🇧🇬 Bulgaria"),
+            },
+        });
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "Select your country:",
+                replyMarkup: createAccountKeyboard);
+
+            // Save the user's context (selected country)
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
+
+        }
+
+
+        else if (message.Text == "🌟اکانت رایگان")
+        {
+
+        }
+
+        else if (message.Text == "💰شارژ حساب کاربری")
+        {
+            var text = "درحال حاضر شارژ حساب فقط از طریق ادمین امکان پذیر می‌باشد.برای شارژ حساب خود به ادمین پیام دهید و این پیام را برای ایشان فوروارد کنید: /n @vpsnetiran_vpn /n به زودی پرداخت ریالی و ترونی به ربات اضافه خواهد شد.";
+            text += $"/n  آیدی عددی شما: `{message.From.Id}`";
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: text,
+                replyMarkup: GetMainMenuKeyboard());
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+        }
+
+    }
+
     Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
     {
         var ErrorMessage = exception switch
@@ -671,6 +744,7 @@ public class TelegramBotService : IHostedService
 
         return keyboard;
     }
+
     static ReplyKeyboardMarkup GetAccountTypeKeyboard()
     {
         // Create an inline keyboard with the available account types

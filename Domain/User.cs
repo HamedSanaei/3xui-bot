@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json.Serialization;
+using Adminbot.Domain;
 using Adminbot.Utils;
 using Newtonsoft.Json;
 
@@ -79,6 +80,31 @@ public class Client
         sb.Append("\"}]}");
         return sb.ToString();
     }
+
+    public static string MakeSettingString(Client client, AccountDtoUpdate accountDto)
+    {
+
+        StringBuilder sb = new StringBuilder("{\"clients\":[{\"id\":\"");
+        sb.Append(client.Id.ToString());
+        sb.Append("\",\"alterId\":");
+        sb.Append(client.AlterId.ToString());
+        sb.Append(",\"email\":\"");
+        sb.Append(client.Email);
+        sb.Append("\",\"limitIp\":0,\"totalGB\":");
+        sb.Append(client.TotalGB.ToString());
+        if (accountDto.ConfigLink.Contains("flow=xtls-rprx-vision"))
+            sb.Append(",\"flow\":\"xtls-rprx-vision\"");
+
+        sb.Append(",\"expiryTime\":");
+        sb.Append(ConvertDateTimeToTimestamp(client.ExpiryTime));
+        sb.Append(" ,\"enable\":true,\"tgId\":\"");
+        sb.Append(client.TgId);
+        sb.Append(" \",\"subId\":\"");
+        sb.Append(client.SubId);
+        sb.Append("\"}]}");
+        return sb.ToString();
+    }
+
 
     static long ConvertDateTimeToTimestamp(DateTime dateTime)
     {
