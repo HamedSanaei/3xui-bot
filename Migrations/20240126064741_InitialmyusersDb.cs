@@ -6,7 +6,7 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace Adminbot.Migrations
 {
     /// <inheritdoc />
-    public partial class InitialCreate : Migration
+    public partial class InitialmyusersDb : Migration
     {
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
@@ -39,7 +39,9 @@ namespace Adminbot.Migrations
                     LastStep = table.Column<string>(type: "TEXT", nullable: true),
                     TotoalGB = table.Column<string>(type: "TEXT", nullable: true),
                     ConfigLink = table.Column<string>(type: "TEXT", nullable: true),
-                    Email = table.Column<string>(type: "TEXT", nullable: true)
+                    Email = table.Column<string>(type: "TEXT", nullable: true),
+                    ConfigPrice = table.Column<string>(name: "_ConfigPrice", type: "TEXT", nullable: true),
+                    ConfigPrice0 = table.Column<long>(name: "ConfigPrice", type: "INTEGER", nullable: false)
                 },
                 constraints: table =>
                 {

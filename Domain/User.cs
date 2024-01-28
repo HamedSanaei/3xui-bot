@@ -21,6 +21,22 @@ public class User
     public string TotoalGB { get; set; }
     public string ConfigLink { get; set; }
     public string Email { get; set; }
+    public string _ConfigPrice { get; set; }
+
+
+    public long ConfigPrice
+    {
+        get
+        {
+            // You can add custom logic here
+            return Convert.ToInt64(_ConfigPrice);
+        }
+        set
+        {
+            // You can add custom logic here
+            _ConfigPrice = value.ToString();
+        }
+    }
 }
 public class CookieData
 {

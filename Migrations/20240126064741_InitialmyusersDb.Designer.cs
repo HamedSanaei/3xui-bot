@@ -10,8 +10,8 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    [Migration("20240101181019_InitialCreate")]
-    partial class InitialCreate
+    [Migration("20240126064741_InitialmyusersDb")]
+    partial class InitialmyusersDb
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
@@ -48,6 +48,9 @@ namespace Adminbot.Migrations
                     b.Property<string>("ConfigLink")
                         .HasColumnType("TEXT");
 
+                    b.Property<long>("ConfigPrice")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("Email")
                         .HasColumnType("TEXT");
 
@@ -70,6 +73,9 @@ namespace Adminbot.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<string>("Username")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("_ConfigPrice")
                         .HasColumnType("TEXT");
 
                     b.HasKey("Id");

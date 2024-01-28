@@ -1,5 +1,7 @@
+using System.Text.RegularExpressions;
 using Adminbot.Domain;
 using Adminbot.Utils;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Newtonsoft.Json;
 using Telegram.Bot;
@@ -14,15 +16,16 @@ public class TelegramBotService : IHostedService
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly IConfiguration _configuration;
 
 
 
-    public TelegramBotService(ITelegramBotClient botClient, UserDbContext dbContext)
+    public TelegramBotService(ITelegramBotClient botClient, UserDbContext dbContext, CredentialsDbContext credentialsDb, IConfiguration configuration)
     {
         _botClient = botClient;
         _userDbContext = dbContext;
-
-
+        _credentialsDbContext = credentialsDb;
+        _configuration = configuration;
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -285,15 +288,7 @@ public class TelegramBotService : IHostedService
                 {
                     user = await _userDbContext.GetUserStatus(currentUser.Id);
 
-                    var msg = $"✅ Account details: \n";
-                    msg += $"Account Name: `{user.Email}`";
-                    msg += $"\nLocation: {user.SelectedCountry} \nDuration: {user.SelectedPeriod}";
-                    if (Convert.ToInt32(user.TotoalGB) < 100) msg += $"\nTraffic: {user.TotoalGB}GB.\n";
-                    string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
-                    msg += $"\nExpiration Date: {hijriShamsiDate}\n";
-                    msg += $"Your Connection link is: \n";
-                    msg += "============= Tap to Copy =============\n";
-                    msg += $"`{user.ConfigLink}`" + "\n ";
+                    var msg = CaptionForAccountCreation(user, language: "en", showTraffic: false);
 
                     // Send the photo with caption
 
@@ -636,6 +631,38 @@ public class TelegramBotService : IHostedService
         }
     }
 
+    private string CaptionForAccountCreation(User user, string language, bool showTraffic)
+    {
+        string msg;
+        if (language == "en")
+        {
+            msg = $"✅ Account details: \n";
+            msg += $"Account Name: `{user.Email}`";
+            msg += $"\nLocation: {user.SelectedCountry} \nDuration: {user.SelectedPeriod}";
+            if (Convert.ToInt32(user.TotoalGB) < 100) msg += $"\nTraffic: {user.TotoalGB}GB.\n";
+            string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
+            msg += $"\nExpiration Date: {hijriShamsiDate}\n";
+            msg += $"Your Connection link is: \n";
+            msg += "============= Tap to Copy =============\n";
+            msg += $"`{user.ConfigLink}`" + "\n ";
+        }
+        else
+        {
+            msg = $"✅ مشخصات اکانت شما:  \n";
+            msg += $"👤نام: `{user.Email}` \n";
+            msg += $"⌛️دوره : {ApiService.ConvertPeriodToDays(user.SelectedPeriod)} روزه \n";
+            // msg += $"Location: {user.SelectedCountry} \n";
+            if (showTraffic) msg += $"🧮 حجم ترافیک: {user.TotoalGB} گیگابایت\n";
+            string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
+            msg += $"\n📅تاریخ انقضاء:  {hijriShamsiDate}\n";
+            msg += $"🔗 لینک اتصال: \n";
+            msg += "=== برای کپی شدن لمس کنید === \n";
+            msg += $"`{user.ConfigLink}`" + "\n ";
+
+        }
+        return msg;
+    }
+
     private async Task HandleUpdateRegularUsers(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
 
@@ -645,65 +672,288 @@ public class TelegramBotService : IHostedService
         if (message.Text is not { } messageText)
             return;
 
-
+        var credUser = await _credentialsDbContext.GetUserStatus(message.From.Id);
+        var user = await _userDbContext.GetUserStatus(message.From.Id);
         if (message.Text == "/start")
         {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "Main Menu:",
-                replyMarkup: GetMainMenuKeyboard());
+                text: "به ربات خوش آمدید!",
+                replyMarkup: MainReplyMarkupKeyboardFa());
+
+            await _credentialsDbContext.GetUserStatus(message.From.Id, credUser);
+
+        }
+
+        else if (message.Text == "💻 ارتباط با ادمین")
+        {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
-            var creds = new CredUser { TelegramUserId = message.From.Id, ChatID = message.Chat.Id, Username = message.From.Username ?? "", FirstName = message.From.FirstName, LastName = message.From.LastName ?? "", LanguageCode = message.From.LanguageCode ?? "fa" };
-            await _credentialsDbContext.GetUserStatus(message.From.Id, creds);
-        }
-
-        else if (message.Text == "💬ارتباط با پشتیبانی")
-        {
-            var createAccountKeyboard = new ReplyKeyboardMarkup(new[]
-            {
-            new []
-            {
-                new KeyboardButton("🇩🇪 Germany"),
-            },
-            new []
-            {
-                new KeyboardButton("🇸🇪 Sweden"),
-            },
-            new []
-            {
-                new KeyboardButton("🇧🇬 Bulgaria"),
-            },
-        });
+            var text = "✅ برای ارتباط با پشتیبانی از لینک زیر اقدام کنید." + "\n" + "🆔 @vpnetiran_admin";
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "Select your country:",
-                replyMarkup: createAccountKeyboard);
+                text: text,
+                replyMarkup: MainReplyMarkupKeyboardFa());
 
-            // Save the user's context (selected country)
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
+            // Save the user's context
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
         }
 
+        else if (message.Text == "🏠منو")
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "منوی اصلی",
+                replyMarkup: MainReplyMarkupKeyboardFa());
+        }
 
         else if (message.Text == "🌟اکانت رایگان")
         {
-
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            return;
         }
 
         else if (message.Text == "💰شارژ حساب کاربری")
         {
-            var text = "درحال حاضر شارژ حساب فقط از طریق ادمین امکان پذیر می‌باشد.برای شارژ حساب خود به ادمین پیام دهید و این پیام را برای ایشان فوروارد کنید: /n @vpsnetiran_vpn /n به زودی پرداخت ریالی و ترونی به ربات اضافه خواهد شد.";
-            text += $"/n  آیدی عددی شما: `{message.From.Id}`";
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+            var text = "درحال حاضر شارژ حساب فقط از طریق ادمین امکان پذیر می‌باشد.برای شارژ حساب خود به ادمین پیام دهید و پیام زیر را برای ایشان فوروارد کنید: /n @vpsnetiran_vpn /n به زودی پرداخت ریالی و ترونی به ربات اضافه خواهد شد.";
+            await botClient.SendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: text,
+                            replyMarkup: new ReplyKeyboardRemove());
+
+            text = await GetUserProfileMessage(message.From.Id);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: text,
-                replyMarkup: GetMainMenuKeyboard());
+                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
         }
 
+        else if (message.Text == "💳خرید اکانت جدید")
+        {
+            var replyKeboard = PriceReplyMarkupKeyboardFa(credUser.IsColleague);
+
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
+
+            await botClient.SendTextMessageAsync(
+               chatId: message.Chat.Id,
+               text: "شرایط اکانت ها به شرح زیر میباشد:",
+               replyMarkup: replyKeboard);
+
+        }
+
+        else if (message.Text == "⚙️مدیریت اکانت")
+        {
+            var text = await GetUserProfileMessage(message.From.Id);
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: text,
+                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+        }
+
+        else if (user.Flow == "create" && user.LastStep == "Create New Account" && message.Text.Contains("خرید"))
+        {
+            long price = TryParsPrice(message.Text);
+            if (price == 0)
+            {
+                await botClient.SendTextMessageAsync(
+                                    chatId: message.Chat.Id,
+                                    text: "خطا",
+                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            if (CheckButtonCorrectness(credUser.IsColleague, message.Text) == false)
+            {
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "خطا",
+                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            if (credUser.AccountBalance >= price)
+            {
+
+                await PrepareAccount(message.Text, credUser, user);
+                user.Flow = "create";
+                user.LastStep = "ask_confirmation";
+                user._ConfigPrice = price.ToString();
+                await _userDbContext.SaveUserStatus(user);
+
+
+                // The user entered a valid number
+                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                           {
+            new []
+            {
+                new KeyboardButton("تایید نهایی"),
+            },
+            new []
+            {
+                new KeyboardButton("انصراف"),
+            },
+        });
+
+
+
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"✅ شما اعتبار لازم برای ساخت اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
+                    replyMarkup: confirmationKeyboard);
+
+
+                return;
+
+            }
+        }
+
+        else if (user.LastStep == "create" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
+        {
+            if (message.Text == "انصراف")
+            {
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            await botClient.SendTextMessageAsync(
+                               chatId: message.Chat.Id,
+                               text: "لطفاً تا ساخته شدن اکانت چند لحظه صبر کنید ...",
+                                replyMarkup: new ReplyKeyboardRemove());
+
+
+            var ready = await _userDbContext.IsUserReadyToCreate(message.From.Id);
+            if (!ready) await botClient.SendTextMessageAsync(
+                       chatId: message.Chat.Id,
+                       text: "مشخصات اکانت کامل نیست. لطفاً مراحل دریافت اکانت را به طور کامل طی کنید..",
+                        replyMarkup: MainReplyMarkupKeyboardFa()); ;
+
+            if (!ready)
+            {
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            // Access the server information from the servers.json file
+            var serversJson = ReadJsonFile.ReadJsonAsString();
+            var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+
+            if (servers.ContainsKey(user.SelectedCountry))
+            {
+                var serverInfo = servers[user.SelectedCountry];
+
+                AccountDto accountDto = new AccountDto { TelegramUserId = message.From.Id, ServerInfo = serverInfo, SelectedCountry = user.SelectedCountry, SelectedPeriod = user.SelectedPeriod, AccType = user.Type, TotoalGB = user.TotoalGB };
+
+                var result = await CreateAccount(accountDto);
+
+                if (result)
+                {
+                    user = await _userDbContext.GetUserStatus(user.Id);
+
+                    ClientExtend client = await TryGetClient(user.ConfigLink);
+
+                    if (client == null || client?.Enable == false)
+                    {
+                        await botClient.SendTextMessageAsync(
+                                      chatId: message.Chat.Id,
+                                      text: "متاسفانه مشکلی در ساخت اکانت شما به وجود آمد. مجدداً دقایقی دیگر تلاش کنید",
+                                       replyMarkup: MainReplyMarkupKeyboardFa());
+                        await _userDbContext.ClearUserStatus(user);
+                        return;
+                    }
+
+
+                    var msg = CaptionForAccountCreation(user, language: "fa", showTraffic: false);
+
+                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                    // .GetAwaiter()
+                    // .GetResult();
+
+                    await botClient.SendTextMessageAsync(
+                       chatId: message.Chat.Id,
+                       text: "بازگشت به منوی اصلی",
+                        replyMarkup: MainReplyMarkupKeyboardFa());
+                    await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice));
+                    await _userDbContext.ClearUserStatus(new User { Id = user.Id });
+
+                }
+            }
+            else
+            {
+                // Handle the case where the selected country is not found in the servers.json file
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"اطلاعات سرور مورد نظر پیدا نشد.",
+                    replyMarkup: MainReplyMarkupKeyboardFa());
+                await _userDbContext.ClearUserStatus(user);
+
+            }
+            await _userDbContext.ClearUserStatus(user);
+
+        }
+
+        else
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await botClient.SendTextMessageAsync(
+                                       chatId: message.Chat.Id,
+                                       text: "مشکلی به وجود امد. لطفاً از اول تلاش کنید.",
+                                        replyMarkup: MainReplyMarkupKeyboardFa());
+
+        }
+        return;
+    }
+
+    private async Task PrepareAccount(string messageText, CredUser credUser, User user)
+    {
+
+        var priceConfig = GetPriceConfig(messageText, credUser);
+        ServerInfo randomServerInfo = GetRandomServer();
+        var serverInfo = randomServerInfo;
+
+        var serversJson = ReadJsonFile.ReadJsonAsString();
+        var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+
+        var pair = servers.FirstOrDefault(kv => kv.Value != null &&
+                                                   typeof(ServerInfo).GetProperty("Url")?.GetValue(kv.Value)?.ToString() == serverInfo.Url);
+
+
+        user.Type = "tunnel";
+        user.TotoalGB = priceConfig.Traffic.ToString();
+        user.SelectedCountry = pair.Key;
+        await _userDbContext.SaveUserStatus(user);
+
+        // AccountDto accountDto = new AccountDto { TelegramUserId = user.Id, ServerInfo = serverInfo, SelectedCountry = pair.Key, SelectedPeriod = priceConfig.Duration, AccType = user.Type, TotoalGB = priceConfig.Traffic.ToString() };
+
+        return;
+    }
+
+    private ServerInfo GetRandomServer()
+    {
+        List<ServerInfo> serverInfos = new List<ServerInfo>();
+        var weightedItems = serverInfos.Select(i => new WeightedItem<ServerInfo>(i, i.Chance));
+
+
+        ServerInfo selected = RouletteWheel.Spin(weightedItems.ToList<WeightedItem<ServerInfo>>());
+        return selected;
+        // Console.WriteLine($"Selected item: {selected}");
+    }
+
+    private bool CheckButtonCorrectness(bool isColleague, string text)
+    {
+        return GetPrices(isColleague).Contains(text);
     }
 
     Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
@@ -719,6 +969,151 @@ public class TelegramBotService : IHostedService
         return Task.CompletedTask;
     }
 
+    async Task<string> GetUserProfileMessage(long tgUserId)
+    {
+        var credUser = await _credentialsDbContext.GetUserStatus(tgUserId);
+
+        var text = "✅ مشخصات اکانت شما به شرح زیر میباشد:  \n";
+        text += $"👤نام حساب: {credUser.FirstName} {credUser.LastName} \n";
+        if (!string.IsNullOrEmpty(credUser.Username))
+            text += $"\u200F🆔 آیدی: @{credUser.Username} \n";
+        text += $"\u200Fℹ️ آیدی عددی: `{credUser.TelegramUserId}` \n";
+        text += $"‌💰اعتبار حساب: {credUser.AccountBalance} تومان \n";
+        if (credUser.IsColleague)
+        {
+            text += $"‌🧰 نوع: اکانت شما از نوع همکار 💎می‌باشد. \n";
+        }
+        else
+        {
+            text += "‌🧰 نوع: اکانت شما از نوع کاربر عادی می‌باشد. \n";
+        }
+        return text;
+    }
+    string[] GetPrices(bool isColleague)
+    {
+        var appConfig = _configuration.Get<AppConfig>();
+        List<string> buttonsName = new List<string>();
+
+        if (isColleague)
+        {
+            appConfig.PriceColleagues.ForEach(i => buttonsName.Add($"خرید اکانت {i.Duration} قیمت {i.Price}"));
+
+
+            //     return new string[]{ "خرید اکانت یک ماهه قیمت 60000",
+            // "خرید اکانت  دو ماهه قیمت 120000",
+            // "خرید اکانت سه ماهه قیمت 180000",
+            // "خرید اکانت شش ماهه قیمت 360000" };
+        }
+        else
+        {
+            appConfig.Price.ForEach(i => buttonsName.Add($"خرید اکانت {i.Duration} قیمت {i.Price}"));
+
+            //     return new string[]{ "خرید اکانت یک ماهه قیمت 149000",
+            // "خرید اکانت  دو ماهه قیمت 259000",
+            // "خرید اکانت سه ماهه قیمت 345000",
+            // "خرید اکانت شش ماهه قیمت 649000" };
+        }
+        return buttonsName.ToArray();
+    }
+
+    PriceConfig GetPriceConfig(string messageText, CredUser credUser)
+    {
+        var appConfig = _configuration.Get<AppConfig>();
+
+        PriceConfig priceConfig;
+        var prices = GetPrices(credUser.IsColleague);
+        int index = -1;
+        try
+        {
+            index = Array.IndexOf(prices, messageText);
+        }
+        catch (System.Exception ex)
+        {
+            Console.WriteLine(ex.Message);
+        }
+        if (index == -1) return null;
+
+        if (credUser.IsColleague)
+        {
+            priceConfig = appConfig.PriceColleagues.ToArray().ElementAtOrDefault(index) ?? null;
+        }
+        else
+        {
+            priceConfig = appConfig.Price.ToArray().ElementAtOrDefault(index) ?? null;
+        }
+        return priceConfig;
+
+    }
+    long TryParsPrice(string input)
+    {
+
+        //input = "خرید اکانت شش ماهه قیمت 360000";
+
+        // Define a regular expression pattern to match a numeric value.
+        //string pattern = @"([\d٠-٩]+)";
+        string pattern = @"(\d+)";
+
+        // Use Regex.Match to find the first match in the input string.
+        Match match = Regex.Match(input, pattern);
+        long value = 0;
+        // Check if the match was successful.
+        if (match.Success)
+        {
+            // Try to parse the matched value as a long.
+            if (long.TryParse(match.Groups[1].Value, out long extractedValue))
+            {
+                value = extractedValue;
+            }
+            else
+            {
+                value = 0;
+            }
+        }
+        else
+        {
+            value = 0;
+        }
+        return value;
+    }
+    ReplyKeyboardMarkup MainReplyMarkupKeyboardFa()
+    {
+
+        ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
+               {
+                    new KeyboardButton[] { "💳خرید اکانت جدید", "🏠منو","💻 ارتباط با ادمین" },
+                    new KeyboardButton[] { "💡راهنما نصب", "🌟اکانت رایگان","⚙️مدیریت اکانت" }})
+        {
+            ResizeKeyboard = false
+        };
+        return replyKeyboardMarkup;
+
+        // var buttons = new[]
+        // {
+        // new[] { "💳خرید اکانت جدید", "🏠منو","💻 ارتباط با ادمین" },
+        // new[] { "💡راهنما نصب", "🌟اکانت رایگان", "⚙️مدیریت اکانت ها" }
+        // };
+
+        // var keyboardButtons = buttons
+        //     .Select(row => row.Select(buttonText => new KeyboardButton(buttonText)))
+        //     .ToArray();
+        // return new ReplyKeyboardMarkup(keyboardButtons, ResizeKeyboard = false);
+    }
+
+
+    ReplyKeyboardMarkup PriceReplyMarkupKeyboardFa(bool isColleague)
+    {
+
+        var prices = GetPrices(isColleague);
+        ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
+               {
+                    new KeyboardButton[] { prices[0], prices[1] },
+                    new KeyboardButton[] { prices[2],prices[3] },
+                    new KeyboardButton[] { "🏠منو" }})
+        {
+            ResizeKeyboard = false
+        };
+        return replyKeyboardMarkup;
+    }
 
     static ReplyKeyboardMarkup GetMainMenuKeyboard()
     {

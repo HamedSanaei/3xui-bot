@@ -36,6 +36,7 @@ public class UserDbContext : DbContext
             if (user.ConfigLink != null) existingUser.ConfigLink = user.ConfigLink;
             if (user.Email != null) existingUser.Email = user.Email;
             if (user.Flow != null) existingUser.Flow = user.Flow;
+            if (user._ConfigPrice != null) existingUser._ConfigPrice = user._ConfigPrice;
 
         }
         await context.SaveChangesAsync();

@@ -45,6 +45,9 @@ namespace Adminbot.Migrations
                     b.Property<string>("ConfigLink")
                         .HasColumnType("TEXT");
 
+                    b.Property<long>("ConfigPrice")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("Email")
                         .HasColumnType("TEXT");
 
@@ -67,6 +70,9 @@ namespace Adminbot.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<string>("Username")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("_ConfigPrice")
                         .HasColumnType("TEXT");
 
                     b.HasKey("Id");
