@@ -67,6 +67,7 @@ public class UserDbContext : DbContext
             existingUser.ConfigLink = "";
             existingUser.Email = "";
             existingUser.Type = "";
+
         }
         await context.SaveChangesAsync();
 

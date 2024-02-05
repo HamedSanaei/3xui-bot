@@ -10,6 +10,8 @@ using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
+using Microsoft.Extensions.Configuration.Json;
+using Microsoft.Extensions.Logging;
 
 public class TelegramBotService : IHostedService
 {
@@ -17,15 +19,19 @@ public class TelegramBotService : IHostedService
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
     private readonly IConfiguration _configuration;
+    private readonly AppConfig _appConfig;
+    private readonly ILogger<TelegramBotService> _logger;
 
 
 
-    public TelegramBotService(ITelegramBotClient botClient, UserDbContext dbContext, CredentialsDbContext credentialsDb, IConfiguration configuration)
+    public TelegramBotService(ITelegramBotClient botClient, UserDbContext dbContext, CredentialsDbContext credentialsDb, IConfiguration configuration, ILogger<TelegramBotService> logger)
     {
         _botClient = botClient;
         _userDbContext = dbContext;
         _credentialsDbContext = credentialsDb;
         _configuration = configuration;
+        _appConfig = _configuration.Get<AppConfig>();
+        _logger = logger;
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -75,9 +81,13 @@ public class TelegramBotService : IHostedService
         //85758085 hamed
         // 888197418 admin hamed
 
-        long[] allowedValues = { 6257546736, 85758085, 888197418 };
+
+
+        //        List<long> allowedValues = _configuration.GetSection("adminsUserIds").Get<List<long>>();
+        List<long> allowedValues = _appConfig.AdminsUserIds;
         if (!allowedValues.Contains(message.From.Id))
         {
+            // _logger.LogInformation("این یک یوزر عادی است.");
             await HandleUpdateRegularUsers(botClient, update, cancellationToken);
             return;
         }
@@ -85,7 +95,7 @@ public class TelegramBotService : IHostedService
 
         if (message.Text == "/start")
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Main Menu:",
                 replyMarkup: GetMainMenuKeyboard());
@@ -94,23 +104,9 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "➕ Create New Account")
         {
-            var createAccountKeyboard = new ReplyKeyboardMarkup(new[]
-            {
-            new []
-            {
-                new KeyboardButton("🇩🇪 Germany"),
-            },
-            new []
-            {
-                new KeyboardButton("🇸🇪 Sweden"),
-            },
-            new []
-            {
-                new KeyboardButton("🇧🇬 Bulgaria"),
-            },
-        });
+            var createAccountKeyboard = GetLocationKeyboard();
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Select your country:",
                 replyMarkup: createAccountKeyboard);
@@ -120,7 +116,7 @@ public class TelegramBotService : IHostedService
 
         }
 
-        else if (message.Text == "🇩🇪 Germany" || message.Text == "🇸🇪 Sweden" || message.Text == "🇧🇬 Bulgaria")
+        else if (GetLocations().Contains(message.Text))
         {
             // Update the user's context with the selected country
             await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, SelectedCountry = message.Text });
@@ -146,7 +142,7 @@ public class TelegramBotService : IHostedService
                 },
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Select the account period:",
                 replyMarkup: periodKeyboard);
@@ -161,7 +157,7 @@ public class TelegramBotService : IHostedService
             var user = currentUser;
             if (string.IsNullOrEmpty(user.SelectedCountry) && (user.Flow == "create"))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Main Menu:",
                 replyMarkup: GetMainMenuKeyboard());
@@ -176,7 +172,7 @@ public class TelegramBotService : IHostedService
             if (currentUser.Flow == "update")
             {
                 await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "get_traffic" });
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "Type Traffic in GB and send! \n" + "For example if you send 20, the account will have 20GB traffic",
                         replyMarkup: new ReplyKeyboardRemove());
@@ -185,7 +181,7 @@ public class TelegramBotService : IHostedService
 
             // Send the keyboard to the user for creation
             if (currentUser.Flow == "create")
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "Select the account type:",
                     replyMarkup: keyboard
@@ -201,7 +197,7 @@ public class TelegramBotService : IHostedService
             var user = currentUser;
             if (string.IsNullOrEmpty(user.SelectedCountry) || string.IsNullOrEmpty(user.SelectedPeriod))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Main Menu:",
                 replyMarkup: GetMainMenuKeyboard());
@@ -225,7 +221,7 @@ public class TelegramBotService : IHostedService
 
             user = currentUser;
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: $"You selected {user.SelectedCountry} for {user.SelectedPeriod} with account type {user.Type}. Confirm?",
                 replyMarkup: confirmationKeyboard);
@@ -239,7 +235,7 @@ public class TelegramBotService : IHostedService
             var user = currentUser;
             if (string.IsNullOrEmpty(user.SelectedCountry) || string.IsNullOrEmpty(user.SelectedPeriod))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Main Menu:",
                 replyMarkup: GetMainMenuKeyboard());
@@ -247,7 +243,7 @@ public class TelegramBotService : IHostedService
             }
 
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "Type Traffic in GB and send! \n" + "For example if you send 20, the account will have 20GB traffic",
                         replyMarkup: new ReplyKeyboardRemove());
@@ -255,14 +251,14 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "Yes Create!")
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "Please wait ...",
                         replyMarkup: new ReplyKeyboardRemove());
 
 
             var ready = await _userDbContext.IsUserReadyToCreate(message.From.Id);
-            if (!ready) await botClient.SendTextMessageAsync(
+            if (!ready) await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "Your information is not complete. please go throw steps correctly.",
                         replyMarkup: GetMainMenuKeyboard()); ;
@@ -292,12 +288,14 @@ public class TelegramBotService : IHostedService
 
                     // Send the photo with caption
 
-                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+
+                    //await botClient.SendImagesWithCaptionAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg)
+                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.MarkdownV2);
                     // .GetAwaiter()
                     // .GetResult();
 
 
-                    await botClient.SendTextMessageAsync(
+                    await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "Main menu",
                         replyMarkup: GetMainMenuKeyboard());
@@ -309,7 +307,7 @@ public class TelegramBotService : IHostedService
             else
             {
                 // Handle the case where the selected country is not found in the servers.json file
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: $"Server information not found for {user.SelectedCountry}.",
                     replyMarkup: GetMainMenuKeyboard());
@@ -320,7 +318,7 @@ public class TelegramBotService : IHostedService
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
             // Handle rejection or provide other options
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Account creation canceled.",
                 replyMarkup: GetMainMenuKeyboard());
@@ -333,7 +331,7 @@ public class TelegramBotService : IHostedService
             // Handle "Get Account Info" button click
             // You can implement the logic for this button here
             // For example, retrieve and display account information
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                                chatId: message.Chat.Id,
                                text: "Send your Vmess or Vless link:",
                                 replyMarkup: new ReplyKeyboardRemove());
@@ -351,7 +349,7 @@ public class TelegramBotService : IHostedService
             // For example, retrieve and display account information
             if (client == null)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                               chatId: message.Chat.Id,
                               text: "There is a Error with decoding Your config link!",
                                replyMarkup: GetMainMenuKeyboard());
@@ -367,8 +365,8 @@ public class TelegramBotService : IHostedService
             msg += $"\nExpiration Date: {hijriShamsiDate}\n";
 
 
-            await botClient.SendTextMessageAsync(
-               chatId: message.Chat.Id, parseMode: ParseMode.Markdown,
+            await botClient.CustomSendTextMessageAsync(
+               chatId: message.Chat.Id, parseMode: ParseMode.MarkdownV2,
                text: msg,
                 replyMarkup: GetMainMenuKeyboard());
 
@@ -405,7 +403,7 @@ public class TelegramBotService : IHostedService
                 },
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Select the account period:",
                 replyMarkup: periodKeyboard);
@@ -415,7 +413,7 @@ public class TelegramBotService : IHostedService
         else if (message.Text == "🔄 Renew Existing Account")
         {
             await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                                chatId: message.Chat.Id,
                                text: "Send your Vmess or Vless link:",
                                 replyMarkup: new ReplyKeyboardRemove());
@@ -432,14 +430,14 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "Yes Renew!")
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "Please wait ...",
                         replyMarkup: new ReplyKeyboardRemove());
 
 
             var ready = await _userDbContext.IsUserReadyToUpdate(message.From.Id);
-            if (!ready) await botClient.SendTextMessageAsync(
+            if (!ready) await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "Your information is not complete. please go throw steps correctly.",
                         replyMarkup: GetMainMenuKeyboard()); ;
@@ -452,7 +450,7 @@ public class TelegramBotService : IHostedService
             {
                 await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                               chatId: message.Chat.Id,
                               text: "There is a Error with decoding Your config link!",
                                replyMarkup: new ReplyKeyboardRemove());
@@ -527,14 +525,14 @@ public class TelegramBotService : IHostedService
 
                     // Send the photo with caption
 
-                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.MarkdownV2);
                     // .GetAwaiter()
                     // .GetResult();
                     await _userDbContext.ClearUserStatus(new User { Id = user.Id });
                 }
 
-                await botClient.SendTextMessageAsync(
-           chatId: message.Chat.Id, parseMode: ParseMode.Markdown,
+                await botClient.CustomSendTextMessageAsync(
+           chatId: message.Chat.Id, parseMode: ParseMode.MarkdownV2,
            text: "Main menu",
             replyMarkup: GetMainMenuKeyboard());
 
@@ -547,7 +545,7 @@ public class TelegramBotService : IHostedService
             var isSuccessful = int.TryParse(message.Text, out int res);
             if (!isSuccessful)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "Error! \n Type Traffic in GB and send! \n" + "For example if you send 20, the account will have 20GB traffic.\n Tap /start to cancell the proccess.",
                         replyMarkup: new ReplyKeyboardRemove());
@@ -572,7 +570,7 @@ public class TelegramBotService : IHostedService
         });
 
                 var user = currentUser;
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: $"You selected {user.SelectedPeriod}(s) with account type and Traffic {res}GB. Confirm?",
                     replyMarkup: confirmationKeyboard);
@@ -599,7 +597,7 @@ public class TelegramBotService : IHostedService
 
                     var user = currentUser;
 
-                    await botClient.SendTextMessageAsync(
+                    await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: $"You selected {user.SelectedCountry} for {user.SelectedPeriod}(s) with account type {user.Type} and Traffic {userTraffic}GB. Confirm?",
                         replyMarkup: confirmationKeyboard);
@@ -613,22 +611,189 @@ public class TelegramBotService : IHostedService
             else
             {
                 // The user did not enter a valid number
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "Please enter a valid number."
                 );
             }
         }
 
+        else if (message.Text == "🗽 Admin")
+        {
+            GetAdminKeyboard();
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "Admin:",
+                replyMarkup: GetAdminKeyboard());
+
+
+        }
+        else if (currentUser.Flow == "admin" && currentUser.LastStep == "Get-public-message")
+        {
+            currentUser.ConfigLink = message.Text;
+            currentUser.LastStep = "confirm-public-message";
+
+
+
+            var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                           {
+            new []
+            {
+                new KeyboardButton("Yes Send!"),
+            },
+            new []
+            {
+                new KeyboardButton("No Don't Send!"),
+            },
+        });
+
+            await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: "This is Your message. Are  you Sure to send it to all of your users?",
+                            replyMarkup: confirmationKeyboard);
+
+
+
+            return;
+        }
+        else if (currentUser.Flow == "admin" && currentUser.LastStep == "confirm-public-message")
+        {
+            if (message.Text == "Yes Send!")
+            {
+
+                InlineKeyboardMarkup inlineKeyboard = new(new[]
+                 {
+                 // first row
+                        new []
+                {
+                    InlineKeyboardButton.WithUrl(text:"ارتباط با پشتیبانی",url:_appConfig.SupportAccount),
+                    InlineKeyboardButton.WithUrl(text:"کانال ما",url:_appConfig.MainChannel),
+                },});
+
+                foreach (var item in _credentialsDbContext.Users)
+                {
+                    await botClient.CustomSendTextMessageAsync(
+                                                chatId: item.ChatID,
+                                                text: currentUser.ConfigLink,
+                                                parseMode: ParseMode.MarkdownV2,
+                                                replyMarkup: inlineKeyboard
+                                                );
+
+                }
+            }
+            else if (message.Text == "No Don't Send!")
+            {
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await botClient.CustomSendTextMessageAsync(
+                                           chatId: message.Chat.Id,
+                                           text: "The Operation(send message) has been cancelled.",
+                                            replyMarkup: GetMainMenuKeyboard());
+
+            }
+            else
+            {
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await botClient.CustomSendTextMessageAsync(
+                                           chatId: message.Chat.Id,
+                                           text: "Oops! Start Again",
+                                            replyMarkup: GetMainMenuKeyboard());
+            }
+        }
+        else if (GetAdminActions().Contains(message.Text))
+        {
+            currentUser.Flow = "admin";
+            currentUser.LastStep = message.Text;
+            await _userDbContext.SaveUserStatus(currentUser);
+
+            if (message.Text == "⬅️ Return to main menu")
+            {
+                await _userDbContext.ClearUserStatus(currentUser);
+                return;
+            }
+            else if (message.Text == "📨 Send message to all")
+            {
+                currentUser.Flow = "admin";
+                currentUser.LastStep = "Get-public-message";
+                await botClient.CustomSendTextMessageAsync(
+                                chatId: message.Chat.Id,
+                                text: "Type your message and Send it:",
+                                replyMarkup: new ReplyKeyboardRemove());
+                return;
+            }
+            else
+            {
+                await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "Send User (user must get it from @userinfobot or our bot)",
+                replyMarkup: GetAdminKeyboard());
+
+                return;
+            }
+        }
+
         else
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                                        chatId: message.Chat.Id,
                                        text: "Oops! Start Again",
                                         replyMarkup: GetMainMenuKeyboard());
 
         }
+    }
+    private List<string> GetLocations()
+    {
+
+        var serversJson = ReadJsonFile.ReadJsonAsString();
+        var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+        return servers.Keys.ToList();
+
+
+    }
+    private string[] GetAdminActions()
+    {
+        string[] actions = new string[] { "➕ Add credit", "➖ Reduce credit", "🚀 Promote as admin", "❌ Demote as admin", "ℹ️ See User Account", "📨 Send message to all", "⬅️ Return to main menu" };
+        return actions;
+    }
+
+    private ReplyKeyboardMarkup GetAdminKeyboard()
+    {
+        var actions = GetAdminActions();
+
+        // Creating keyboard buttons dynamically in two-column layout
+        List<KeyboardButton[]> keyboardRows = new List<KeyboardButton[]>();
+        for (int i = 0; i < actions.Length; i += 2)
+        {
+            KeyboardButton[] row;
+            if (i + 1 < actions.Length)
+            {
+                // Pair two locations in one row
+                row = new KeyboardButton[] { new KeyboardButton(actions[i]), new KeyboardButton(actions[i + 1]) };
+            }
+            else
+            {
+                // For odd number of locations, last row will have a single column
+                row = new KeyboardButton[] { new KeyboardButton(actions[i]) };
+            }
+            keyboardRows.Add(row);
+        }
+
+        // Creating the keyboard markup
+        var createAccountKeyboard = new ReplyKeyboardMarkup(keyboardRows.ToArray());
+        return createAccountKeyboard;
+    }
+
+    private ReplyKeyboardMarkup GetLocationKeyboard()
+    {
+        // Example list of locations
+        List<string> locations = GetLocations();
+
+        // Creating keyboard buttons dynamically
+        var keyboardButtons = locations.Select(location => new KeyboardButton[] { new KeyboardButton(location) }).ToArray();
+
+        // Creating the keyboard markup
+        var createAccountKeyboard = new ReplyKeyboardMarkup(keyboardButtons);
+        return createAccountKeyboard;
     }
 
     private string CaptionForAccountCreation(User user, string language, bool showTraffic)
@@ -642,6 +807,7 @@ public class TelegramBotService : IHostedService
             if (Convert.ToInt32(user.TotoalGB) < 100) msg += $"\nTraffic: {user.TotoalGB}GB.\n";
             string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
             msg += $"\nExpiration Date: {hijriShamsiDate}\n";
+            msg += $"Your Sublink is: `{user.SubLink}` \n";
             msg += $"Your Connection link is: \n";
             msg += "============= Tap to Copy =============\n";
             msg += $"`{user.ConfigLink}`" + "\n ";
@@ -655,6 +821,12 @@ public class TelegramBotService : IHostedService
             if (showTraffic) msg += $"🧮 حجم ترافیک: {user.TotoalGB} گیگابایت\n";
             string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
             msg += $"\n📅تاریخ انقضاء:  {hijriShamsiDate}\n";
+
+            msg += "✳️ آموزش کانفیگ لینک" + $"**آی‌اواس** [link text]({_appConfig.ConfiglinkTutorial[0]})" + " | " + $"**اندروید** [link text]({_appConfig.ConfiglinkTutorial[1]}) \n";
+            msg += "✴️ آموزش سابلینک (برای تعویض اتوماتیک و فیلترینگ شدید)" + $"**آی‌اواس** [link text]({_appConfig.SubLinkTotorial[0]})" + " | " + $"**اندروید** [link text]({_appConfig.SubLinkTotorial[1]}) \n";
+            msg += $"🔗 ساب لینک: `{user.SubLink}`\n";
+
+
             msg += $"🔗 لینک اتصال: \n";
             msg += "=== برای کپی شدن لمس کنید === \n";
             msg += $"`{user.ConfigLink}`" + "\n ";
@@ -674,10 +846,23 @@ public class TelegramBotService : IHostedService
 
         var credUser = await _credentialsDbContext.GetUserStatus(message.From.Id);
         var user = await _userDbContext.GetUserStatus(message.From.Id);
+
+        // try
+        // {
+        //     await botClient.SendTextMessageAsync(
+        //         chatId: new ChatId(_appConfig.LoggerChannel.ToString()), // Use the channel's ID for private channels
+        //         text: "این یک تست ارسال پیامتوسط ربات است."
+        //     );
+        // }
+        // catch (Exception ex)
+        // {
+        //     // Handle any exceptions thrown
+        //     Console.WriteLine($"An error occurred: {ex.Message}");
+        // }
         if (message.Text == "/start")
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "به ربات خوش آمدید!",
                 replyMarkup: MainReplyMarkupKeyboardFa());
@@ -692,7 +877,7 @@ public class TelegramBotService : IHostedService
 
             var text = "✅ برای ارتباط با پشتیبانی از لینک زیر اقدام کنید." + "\n" + "🆔 @vpnetiran_admin";
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: text,
                 replyMarkup: MainReplyMarkupKeyboardFa());
@@ -706,7 +891,7 @@ public class TelegramBotService : IHostedService
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "منوی اصلی",
                 replyMarkup: MainReplyMarkupKeyboardFa());
@@ -723,16 +908,16 @@ public class TelegramBotService : IHostedService
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
             var text = "درحال حاضر شارژ حساب فقط از طریق ادمین امکان پذیر می‌باشد.برای شارژ حساب خود به ادمین پیام دهید و پیام زیر را برای ایشان فوروارد کنید: /n @vpsnetiran_vpn /n به زودی پرداخت ریالی و ترونی به ربات اضافه خواهد شد.";
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                             chatId: message.Chat.Id,
                             text: text,
                             replyMarkup: new ReplyKeyboardRemove());
 
             text = await GetUserProfileMessage(message.From.Id);
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: text,
-                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.MarkdownV2);
 
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
@@ -744,7 +929,7 @@ public class TelegramBotService : IHostedService
 
             await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                chatId: message.Chat.Id,
                text: "شرایط اکانت ها به شرح زیر میباشد:",
                replyMarkup: replyKeboard);
@@ -754,10 +939,10 @@ public class TelegramBotService : IHostedService
         else if (message.Text == "⚙️مدیریت اکانت")
         {
             var text = await GetUserProfileMessage(message.From.Id);
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: text,
-                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.MarkdownV2);
 
         }
 
@@ -766,20 +951,20 @@ public class TelegramBotService : IHostedService
             long price = TryParsPrice(message.Text);
             if (price == 0)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                                     chatId: message.Chat.Id,
                                     text: "خطا",
-                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.MarkdownV2);
                 await _userDbContext.ClearUserStatus(user);
                 return;
             }
 
             if (CheckButtonCorrectness(credUser.IsColleague, message.Text) == false)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "خطا",
-                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.MarkdownV2);
                 await _userDbContext.ClearUserStatus(user);
                 return;
             }
@@ -809,7 +994,7 @@ public class TelegramBotService : IHostedService
 
 
 
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: $"✅ شما اعتبار لازم برای ساخت اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
                     replyMarkup: confirmationKeyboard);
@@ -828,14 +1013,14 @@ public class TelegramBotService : IHostedService
                 return;
             }
 
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                                chatId: message.Chat.Id,
                                text: "لطفاً تا ساخته شدن اکانت چند لحظه صبر کنید ...",
                                 replyMarkup: new ReplyKeyboardRemove());
 
 
             var ready = await _userDbContext.IsUserReadyToCreate(message.From.Id);
-            if (!ready) await botClient.SendTextMessageAsync(
+            if (!ready) await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "مشخصات اکانت کامل نیست. لطفاً مراحل دریافت اکانت را به طور کامل طی کنید..",
                         replyMarkup: MainReplyMarkupKeyboardFa()); ;
@@ -866,7 +1051,7 @@ public class TelegramBotService : IHostedService
 
                     if (client == null || client?.Enable == false)
                     {
-                        await botClient.SendTextMessageAsync(
+                        await botClient.CustomSendTextMessageAsync(
                                       chatId: message.Chat.Id,
                                       text: "متاسفانه مشکلی در ساخت اکانت شما به وجود آمد. مجدداً دقایقی دیگر تلاش کنید",
                                        replyMarkup: MainReplyMarkupKeyboardFa());
@@ -877,11 +1062,11 @@ public class TelegramBotService : IHostedService
 
                     var msg = CaptionForAccountCreation(user, language: "fa", showTraffic: false);
 
-                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.MarkdownV2);
                     // .GetAwaiter()
                     // .GetResult();
 
-                    await botClient.SendTextMessageAsync(
+                    await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "بازگشت به منوی اصلی",
                         replyMarkup: MainReplyMarkupKeyboardFa());
@@ -893,7 +1078,7 @@ public class TelegramBotService : IHostedService
             else
             {
                 // Handle the case where the selected country is not found in the servers.json file
-                await botClient.SendTextMessageAsync(
+                await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: $"اطلاعات سرور مورد نظر پیدا نشد.",
                     replyMarkup: MainReplyMarkupKeyboardFa());
@@ -907,7 +1092,7 @@ public class TelegramBotService : IHostedService
         else
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await botClient.SendTextMessageAsync(
+            await botClient.CustomSendTextMessageAsync(
                                        chatId: message.Chat.Id,
                                        text: "مشکلی به وجود امد. لطفاً از اول تلاش کنید.",
                                         replyMarkup: MainReplyMarkupKeyboardFa());
@@ -991,12 +1176,12 @@ public class TelegramBotService : IHostedService
     }
     string[] GetPrices(bool isColleague)
     {
-        var appConfig = _configuration.Get<AppConfig>();
+
         List<string> buttonsName = new List<string>();
 
         if (isColleague)
         {
-            appConfig.PriceColleagues.ForEach(i => buttonsName.Add($"خرید اکانت {i.Duration} قیمت {i.Price}"));
+            _appConfig.PriceColleagues.ForEach(i => buttonsName.Add($"خرید اکانت {i.Duration} قیمت {i.Price}"));
 
 
             //     return new string[]{ "خرید اکانت یک ماهه قیمت 60000",
@@ -1006,7 +1191,7 @@ public class TelegramBotService : IHostedService
         }
         else
         {
-            appConfig.Price.ForEach(i => buttonsName.Add($"خرید اکانت {i.Duration} قیمت {i.Price}"));
+            _appConfig.Price.ForEach(i => buttonsName.Add($"خرید اکانت {i.Duration} قیمت {i.Price}"));
 
             //     return new string[]{ "خرید اکانت یک ماهه قیمت 149000",
             // "خرید اکانت  دو ماهه قیمت 259000",
@@ -1133,7 +1318,7 @@ public class TelegramBotService : IHostedService
         },
         new[]
         {
-            new KeyboardButton("📑 Menu"),
+            new KeyboardButton("📑 Menu"), new KeyboardButton("🗽 Admin"),
         }
         });
 
@@ -1318,5 +1503,7 @@ public class TelegramBotService : IHostedService
         return client;
 
     }
+
+
 }
 

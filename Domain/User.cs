@@ -19,7 +19,9 @@ public class User
     public string LastStep { get; set; }
 
     public string TotoalGB { get; set; }
-    public string ConfigLink { get; set; }
+    public string ConfigLink { get; set; }// or message for user
+    public string SubLink { get; set; }// or message for user
+
     public string Email { get; set; }
     public string _ConfigPrice { get; set; }
 
@@ -78,6 +80,7 @@ public class Client
 
     public static string MakeSettingString(Client client)
     {
+        client.SubId = client.Email;
 
         StringBuilder sb = new StringBuilder("{\"clients\":[{\"id\":\"");
         sb.Append(client.Id.ToString());

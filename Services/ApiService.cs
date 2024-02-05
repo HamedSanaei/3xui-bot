@@ -269,7 +269,7 @@ public class ApiService
         if (inboundId == null) return false;
         if (accountDto.Client.ExpiryTime <= DateTime.UtcNow)
             accountDto.Client.ExpiryTime = DateTime.UtcNow;
-        Client client = new Client { Id = accountDto.Client.Id, TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)) + accountDto.Client.TotalGB, ExpiryTime = accountDto.Client.ExpiryTime.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)), Email = accountDto.Client.Email, Enable = true };
+        Client client = new Client { Id = accountDto.Client.Id, TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)) + accountDto.Client.TotalGB, ExpiryTime = accountDto.Client.ExpiryTime.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)), Email = accountDto.Client.Email, SubId = accountDto.Client.Email, Enable = true };
         var requestBody = new
         {
             id = inboundId.Id,
@@ -302,7 +302,7 @@ public class ApiService
                     //Console.WriteLine(responseBody);
                     UserDbContext _userDbContext = new UserDbContext();
 
-                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
+                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
                     await _userDbContext.SaveChangesAsync();
                     return true;
                 }

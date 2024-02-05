@@ -1,8 +1,16 @@
 {
-  "admins_userids": [6257546736, 85758085, 888197418],
-  "bot_token": "6034372537:AAH_iAh1rLrosds9wGqtq-cdUG7yp4um60c",
-  "channel_ids": ["https://t.me/vpnetiran", "https://t.me/kingofilter"],
-  "price_colleagues": [
+  "adminsUserIds": [6257546736, 85758085, 888197418],
+  "botToken": "6034372537:AAH_iAh1rLrosds9wGqtq-cdUG7yp4um60c",
+  "supportAccount": "https://t.me/vpnetiran_admin",
+  "mainChannel": "https://t.me/vpnetiran",
+  "loggerChannel": -1002142796109,
+  "subLinkTotorial": ["", ""],
+  "configlinkTutorial": [
+    "https://t.me/vpnetiran/194",
+    "https://t.me/vpnetiran/186"
+  ],
+  "channelIds": ["https://t.me/vpnetiran", "https://t.me/kingofilter"],
+  "priceColleagues": [
     {
       "durationName": "یک ماه",
       "traffic": 60,

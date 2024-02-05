@@ -1,8 +1,9 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Telegram.Bot;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Adminbot.Domain.Logging;
 
 class Program
 {
@@ -15,6 +16,8 @@ class Program
                 var configuration = new ConfigurationBuilder()
                     .AddJsonFile("./Data/configuration.json", optional: false, reloadOnChange: true)
                     .Build();
+
+
 
                 services.AddSingleton<IConfiguration>(configuration);
 
@@ -35,10 +38,21 @@ class Program
                 services.AddSingleton<ITelegramBotClient>(sp =>
                 {
                     // Initialize and configure your TelegramBotClient here
-                    // var bot1 = "6019665082:AAGBDkTknaoRvTV8wmpS3xOits3XCcwufqU";
+                    //var bot1 = "6019665082:AAGBDkTknaoRvTV8wmpS3xOits3XCcwufqU";
                     // var bot2 = "6034372537:AAH_iAh1rLrosds9wGqtq-cdUG7yp4um60c";
-                    return new TelegramBotClient(configuration["bot_token"]);
+                    //var vpnetiranbot = "6651502559:AAGmpsPINM5OB43vANs28ezkhfVLdJZAMcc";
+
+                    return new TelegramBotClient(configuration["botToken"]);
+                    // return new TelegramBotClient(bot1);
                 });
+
+                services.AddLogging(builder =>
+               {
+                   // Use a factory to resolve dependencies more cleanly
+                   builder.Services.AddSingleton<ILoggerProvider>(sp => new TelegramLoggerProvider((_, logLevel) => logLevel >= LogLevel.Information,
+                       sp.GetRequiredService<ITelegramBotClient>(),
+                       configuration["loggerChannel"]));
+               });
             })
             .RunConsoleAsync();
     }

@@ -4,8 +4,8 @@ public class ServerInfo
 {
     public string Username { get; set; }
     public string Name { get; set; }
-
     public string Password { get; set; }
+    public string SubLinkUrl { get; set; }
     public string Url { get; set; }
     public string RootPath { get; set; }
     public long Chance { get; set; }
