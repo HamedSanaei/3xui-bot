@@ -210,7 +210,7 @@ public class ApiService
                     //Console.WriteLine(responseBody);
                     UserDbContext _userDbContext = new UserDbContext();
 
-                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
+                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = configLink.ToVMessLink(), Email = client.Email, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email });
                     await _userDbContext.SaveChangesAsync();
                     return true;
                 }

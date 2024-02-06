@@ -34,6 +34,7 @@ public class UserDbContext : DbContext
             if (user.LastStep != null) existingUser.LastStep = user.LastStep;
             if (user.TotoalGB != null) existingUser.TotoalGB = user.TotoalGB;
             if (user.ConfigLink != null) existingUser.ConfigLink = user.ConfigLink;
+            if (user.SubLink != null) existingUser.SubLink = user.SubLink;
             if (user.Email != null) existingUser.Email = user.Email;
             if (user.Flow != null) existingUser.Flow = user.Flow;
             if (user._ConfigPrice != null) existingUser._ConfigPrice = user._ConfigPrice;

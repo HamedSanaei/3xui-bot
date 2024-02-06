@@ -17,28 +17,52 @@ public class CredentialsDbContext : DbContext
             .HasKey(u => u.Id); // Set the Id property as the primary key
     }
 
-    public async Task<CredUser> GetUserStatus(long userId, CredUser credUser)
+    public async Task<CredUser> GetUserStatus(CredUser credUser)
     {
         var context = new CredentialsDbContext();
         context.Database.Migrate(); // Create the database if it doesn't exist
 
-        var existingUser = await context.Users.FirstOrDefaultAsync(u => u.TelegramUserId == userId);
+        var existingUser = await context.Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser.TelegramUserId);
 
         if (existingUser != null)
         {
+            // update public infos
+            await context.SaveUserStatus(credUser);
             return existingUser;
         }
         else
         {
+            // Add
             await context.Users.AddAsync(credUser);
             await context.SaveChangesAsync();
             return credUser;
         }
     }
 
+    // public async Task<CredUser> GetUserStatusWithId(long credUser)
+    // {
+    //     var context = new CredentialsDbContext();
+    //     context.Database.Migrate(); // Create the database if it doesn't exist
+
+    //     var existingUser = await context.Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser);
+
+    //     if (existingUser != null)
+    //     {
+    //         // update public infos
+    //         await context.SaveUserStatus(credUser);
+    //         return existingUser;
+    //     }
+    //     else
+    //     {
+    //         // Add
+    //         await context.Users.AddAsync(credUser);
+    //         await context.SaveChangesAsync();
+    //         return credUser;
+    //     }
+    // }
+
 
     public async Task SaveUserStatus(CredUser credUser)
-
     {
         var context = new CredentialsDbContext();
         context.Database.Migrate(); // Create the database if it doesn't exist
@@ -53,20 +77,20 @@ public class CredentialsDbContext : DbContext
         else
         {
             // // User already exists, update the user's information if needed
-            // if (credUser.SelectedCountry != null) existingUser.SelectedCountry = user.SelectedCountry;
-            // if (user.SelectedPeriod != null) existingUser.SelectedPeriod = user.SelectedPeriod;
-            // if (user.Type != null) existingUser.Type = user.Type;
-            // if (user.LastStep != null) existingUser.LastStep = user.LastStep;
-            // if (user.TotoalGB != null) existingUser.TotoalGB = user.TotoalGB;
-            // if (user.ConfigLink != null) existingUser.ConfigLink = user.ConfigLink;
-            // if (user.Email != null) existingUser.Email = user.Email;
-            // if (user.Flow != null) existingUser.Flow = user.Flow;
-            // if (user._ConfigPrice != null) existingUser._ConfigPrice = user._ConfigPrice;
-
+            if (!string.IsNullOrEmpty(credUser.Username)) existingUser.Username = credUser.Username;
+            if (!string.IsNullOrEmpty(credUser.LastName)) existingUser.LastName = credUser.LastName;
+            if (credUser.Email != null) existingUser.Email = credUser.Email;
+            if (credUser.ChatID != existingUser.ChatID) existingUser.ChatID = credUser.ChatID;
+            if (credUser.LanguageCode != existingUser.LanguageCode) existingUser.LanguageCode = credUser.LanguageCode;
+            if (credUser.FirstName != existingUser.FirstName) existingUser.FirstName = credUser.FirstName;
+            if (credUser.IsColleague != existingUser.IsColleague) existingUser.IsColleague = credUser.IsColleague;
+            if (credUser.TelegramUserId != existingUser.TelegramUserId) existingUser.TelegramUserId = credUser.TelegramUserId;
+            // phone number does not exist
         }
         await context.SaveChangesAsync();
 
     }
+
 
     public async Task<bool> Pay(CredUser credUser, long amount)
     {
@@ -79,9 +103,15 @@ public class CredentialsDbContext : DbContext
         await credentialsDbContext.SaveChangesAsync();
         return true;
     }
-    public async Task<CredUser> GetUserStatus(long userId)
+
+    public async Task<bool> AddFund(CredUser credUser, long amount)
     {
-        return await GetUserStatus(userId, new CredUser { TelegramUserId = userId });
+        //CredentialsDbContext credentialsDbContext = new CredentialsDbContext();
+        Attach<CredUser>(credUser);
+        credUser.AccountBalance += amount;
+        await SaveChangesAsync();
+        return true;
     }
+
 
 }

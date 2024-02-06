@@ -10,8 +10,8 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    [Migration("20240205094819_Initial3myusersDb")]
-    partial class Initial3myusersDb
+    [Migration("20240205181159_InitialmyusersDb")]
+    partial class InitialmyusersDb
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
