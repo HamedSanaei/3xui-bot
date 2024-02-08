@@ -23,8 +23,6 @@ public class TelegramBotService : IHostedService
     private readonly AppConfig _appConfig;
     private readonly ILogger<TelegramBotService> _logger;
 
-
-
     public TelegramBotService(ITelegramBotClient botClient, UserDbContext dbContext, CredentialsDbContext credentialsDb, IConfiguration configuration, ILogger<TelegramBotService> logger)
     {
         _botClient = botClient;
@@ -82,8 +80,6 @@ public class TelegramBotService : IHostedService
         //85758085 hamed
         // 888197418 admin hamed
 
-
-
         //        List<long> allowedValues = _configuration.GetSection("adminsUserIds").Get<List<long>>();
         List<long> allowedValues = _appConfig.AdminsUserIds;
         if (!allowedValues.Contains(message.From.Id))
@@ -97,10 +93,13 @@ public class TelegramBotService : IHostedService
 
         if (message.Text == "/start")
         {
+
+            //string hamed = "✅ Account details: \n Active: *Depleted* ❗️MultiIP \n Account Name: `vniaccgF8uNAN2` \n Expiration Date: 1402 / 12 / 1 - 8:13";
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "Main Menu:",
-                replyMarkup: GetMainMenuKeyboard());
+                text: "Main Menu",
+                replyMarkup: GetMainMenuKeyboard()
+                );
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
         }
 
@@ -525,6 +524,8 @@ public class TelegramBotService : IHostedService
                     if (Convert.ToInt32(user.TotoalGB) < 100) msg += $"\nTraffic: {user.TotoalGB}GB.\n";
                     string hijriShamsiDate = client.ExpiryTime.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).ConvertToHijriShamsi();
                     msg += $"\nExpiration Date: {hijriShamsiDate}\n";
+                    msg += $"Your Sublink is: \n";
+                    msg += $"`{user.SubLink}` \n";
                     msg += $"Your Connection link is: \n";
                     msg += "============= Tap to Copy =============\n";
                     msg += $"`{user.ConfigLink}`" + "\n ";
@@ -655,9 +656,39 @@ public class TelegramBotService : IHostedService
         //get user id for admin operations:
         else if (currentUser.Flow == "admin" && currentUser.LastStep.Contains("get-tel-user-id"))
         {
+            var action = message.Text.Split('|')[1];
+            if (action == "ℹ️ See User Account")
+            {
+                // تمام ! ارسال کن 
+                // _credentialsDbContext.Users.Any(c => c.TelegramUserId == )
+                // if ()
 
-            var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
-                                   {
+                //     await _userDbContext.ClearUserStatus(currentUser);
+                // return;
+            }
+            //promote demote
+            else if (action == "🚀 Promote as admin" || action == "❌ Demote as admin")
+            {
+                // get confirmation
+                currentUser.LastStep.Replace("get-tel-user-id", "confirm-admin-action");
+                currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
+
+
+                await _userDbContext.SaveUserStatus(currentUser);
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "You have entered:\n" + message.Text + $"\n for action {currentUser.LastStep.Split('|')[1]}" + " Are you sure?",
+                    replyMarkup: GetAdminConfirmationKeyboard());
+            }
+
+            else if (action == "➕ Add credit" || action == "➖ Reduce credit")
+            {
+                // get confirmation
+                currentUser.LastStep.Replace("get-tel-user-id", "get-money-amount");
+                currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
+                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                                       {
             new []
             {
                 new KeyboardButton("Yes Confirm!"),
@@ -669,29 +700,30 @@ public class TelegramBotService : IHostedService
 
         });
 
-            currentUser.LastStep.Replace("get-tel-user-id", "confirm-admin-action");
-            currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
+                await _userDbContext.SaveUserStatus(currentUser);
 
-            await _userDbContext.SaveUserStatus(currentUser);
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "You have entered:\n" + message.Text + $"\n for action {currentUser.LastStep.Split('|')[1]}" + " Are you sure?",
+                    replyMarkup: confirmationKeyboard);
+            }
 
-            await botClient.CustomSendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: "You have entered:\n" + message.Text + $"\n for action {currentUser.LastStep.Split('|')[1]}" + " Are you sure?",
-                replyMarkup: confirmationKeyboard);
         }
 
         //get confirmation and do admin action:
         else if ((message.Text == "Yes Confirm!" || message.Text == "No Don't Confirm!") && currentUser.Flow == "admin" && currentUser.LastStep.Contains("confirm-admin-action"))
         {
 
-            long userinput;
+            // "admin-confirmed" "get-money-amount"
+            long cUserId;
+            var status = message.Text.Split('|')[0];
             var action = message.Text.Split('|')[1];
-            var amountORuserid = message.Text.Split('|')[2];
+            var userid = message.Text.Split('|')[2];
 
-            bool isValid = amountORuserid == "0" || long.TryParse(amountORuserid, out userinput);
+            bool isuseridValid = long.TryParse(userid, out cUserId);
 
 
-            if (message.Text == "No Don't Confirm!" || !isValid)
+            if (message.Text == "No Don't Confirm!" || !isuseridValid)
             {
                 await _userDbContext.ClearUserStatus(currentUser);
                 await botClient.CustomSendTextMessageAsync(
@@ -701,7 +733,6 @@ public class TelegramBotService : IHostedService
             }
             else
             {
-
                 switch (action)
                 {
                     case "➕ Add credit":
@@ -714,7 +745,8 @@ public class TelegramBotService : IHostedService
                         //     _credentialsDbContext.AddFund(GetUserStatusWithId, )
                         break;
                     case "🚀 Promote as admin":
-                        // Promote as admin logic here
+                        if (isuseridValid)
+                            await _credentialsDbContext.GetUserStatusWithId(cUserId);
                         break;
                     case "❌ Demote as admin":
                         // Demote as admin logic here
@@ -736,7 +768,6 @@ public class TelegramBotService : IHostedService
             }
 
         }
-
 
         //send public message:
         else if (message.Text == "Yes Send!" && currentUser.Flow == "admin" && currentUser.LastStep == "confirm-public-message")
@@ -797,6 +828,7 @@ public class TelegramBotService : IHostedService
                                             replyMarkup: GetMainMenuKeyboard());
             }
         }
+
         else if (GetAdminActions().Contains(message.Text))
         {
             currentUser.Flow = "admin";
@@ -845,6 +877,23 @@ public class TelegramBotService : IHostedService
                                         replyMarkup: GetMainMenuKeyboard());
 
         }
+    }
+    private ReplyKeyboardMarkup GetAdminConfirmationKeyboard()
+    {
+
+        var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                               {
+            new []
+            {
+                new KeyboardButton("Yes Confirm!"),
+            },
+            new []
+            {
+                new KeyboardButton("No Don't Confirm!"),
+            },
+
+        });
+        return confirmationKeyboard;
     }
     private CredUser GetCreduserFromMessage(Message message)
     {
@@ -976,23 +1025,9 @@ public class TelegramBotService : IHostedService
         if (message.Text is not { } messageText)
             return;
 
-
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
-
         var user = await _userDbContext.GetUserStatus(message.From.Id);
 
-        // try
-        // {
-        //     await botClient.SendTextMessageAsync(
-        //         chatId: new ChatId(_appConfig.LoggerChannel.ToString()), // Use the channel's ID for private channels
-        //         text: "این یک تست ارسال پیامتوسط ربات است."
-        //     );
-        // }
-        // catch (Exception ex)
-        // {
-        //     // Handle any exceptions thrown
-        //     Console.WriteLine($"An error occurred: {ex.Message}");
-        // }
         if (message.Text == "/start")
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
@@ -1000,9 +1035,6 @@ public class TelegramBotService : IHostedService
                 chatId: message.Chat.Id,
                 text: "به ربات خوش آمدید!",
                 replyMarkup: MainReplyMarkupKeyboardFa());
-
-
-
         }
 
         else if (message.Text == "💻 ارتباط با ادمین")

@@ -39,27 +39,15 @@ public class CredentialsDbContext : DbContext
         }
     }
 
-    // public async Task<CredUser> GetUserStatusWithId(long credUser)
-    // {
-    //     var context = new CredentialsDbContext();
-    //     context.Database.Migrate(); // Create the database if it doesn't exist
+    public async Task<CredUser> GetUserStatusWithId(long credUser)
+    {
 
-    //     var existingUser = await context.Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser);
+        var context = new CredentialsDbContext();
+        context.Database.Migrate(); // Create the database if it doesn't exist
 
-    //     if (existingUser != null)
-    //     {
-    //         // update public infos
-    //         await context.SaveUserStatus(credUser);
-    //         return existingUser;
-    //     }
-    //     else
-    //     {
-    //         // Add
-    //         await context.Users.AddAsync(credUser);
-    //         await context.SaveChangesAsync();
-    //         return credUser;
-    //     }
-    // }
+        var existingUser = await context.Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser);
+        return existingUser;
+    }
 
 
     public async Task SaveUserStatus(CredUser credUser)
