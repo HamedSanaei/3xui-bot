@@ -659,12 +659,47 @@ public class TelegramBotService : IHostedService
             var action = message.Text.Split('|')[1];
             if (action == "ℹ️ See User Account")
             {
-                // تمام ! ارسال کن 
-                // _credentialsDbContext.Users.Any(c => c.TelegramUserId == )
-                // if ()
+                try
+                {
+                    var userid = Convert.ToInt64(message.Text.Split('|').ElementAt(2));
+                    if (userid == 0) throw new Exception("user id is null");
+                    var findedClient = _credentialsDbContext.Users.Any(c => c.TelegramUserId == userid);
+                    if (!findedClient) await _credentialsDbContext.AddEmptyUser(userid);
+                    else { }
+                    var text = await GetUserProfileMessage(new CredUser { TelegramUserId = userid });
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: text,
+                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-                //     await _userDbContext.ClearUserStatus(currentUser);
-                // return;
+
+                }
+
+                catch (System.Exception ex)
+                {
+                    string errorMessage;
+                    switch (ex)
+                    {
+                        case ArgumentOutOfRangeException argumentOutOfRangeException:
+                            errorMessage = "There is no userid in Database";
+                            break;
+                        case FormatException formatException:
+                            errorMessage = "There is no userid in Database";
+                            break;
+                        case OverflowException overflowException:
+                            errorMessage = "There is no userid in Database";
+                            break;
+                        default:
+                            errorMessage = ex.Message;
+                            break;
+                    }
+                    await botClient.CustomSendTextMessageAsync(
+                                       chatId: message.Chat.Id,
+                                       text: errorMessage,
+                                       replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+                }
+
             }
             //promote demote
             else if (action == "🚀 Promote as admin" || action == "❌ Demote as admin")

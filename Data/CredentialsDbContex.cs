@@ -101,5 +101,10 @@ public class CredentialsDbContext : DbContext
         return true;
     }
 
+    internal async Task AddEmptyUser(long userid)
+    {
 
+        var user = new CredUser { TelegramUserId = userid, ChatID = 0, Username = "", FirstName = "", LastName = "", LanguageCode = "", AccountBalance = 0 };
+        await Users.AddAsync(user);
+    }
 }
