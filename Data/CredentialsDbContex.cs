@@ -5,10 +5,15 @@ public class CredentialsDbContext : DbContext
 {
     public DbSet<CredUser> Users { get; set; }
 
+    public CredentialsDbContext(DbContextOptions<CredentialsDbContext> options)
+       : base(options)
+    {
+    }
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
         // Replace "YourUserDbConnectionString" with your actual connection string
-        optionsBuilder.UseSqlite("Data Source=./Data/credentials.db");
+        // optionsBuilder.UseSqlite("Data Source=./Data/credentials.db");
+
     }
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -19,22 +24,21 @@ public class CredentialsDbContext : DbContext
 
     public async Task<CredUser> GetUserStatus(CredUser credUser)
     {
-        var context = new CredentialsDbContext();
-        context.Database.Migrate(); // Create the database if it doesn't exist
+        // Create the database if it doesn't exist
 
-        var existingUser = await context.Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser.TelegramUserId);
+        var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser.TelegramUserId);
 
         if (existingUser != null)
         {
             // update public infos
-            await context.SaveUserStatus(credUser);
+            await SaveUserStatus(credUser);
             return existingUser;
         }
         else
         {
             // Add
-            await context.Users.AddAsync(credUser);
-            await context.SaveChangesAsync();
+            await Users.AddAsync(credUser);
+            await SaveChangesAsync();
             return credUser;
         }
     }
@@ -42,25 +46,21 @@ public class CredentialsDbContext : DbContext
     public async Task<CredUser> GetUserStatusWithId(long credUser)
     {
 
-        var context = new CredentialsDbContext();
-        context.Database.Migrate(); // Create the database if it doesn't exist
 
-        var existingUser = await context.Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser);
+        var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser);
         return existingUser;
     }
 
 
     public async Task SaveUserStatus(CredUser credUser)
     {
-        var context = new CredentialsDbContext();
-        context.Database.Migrate(); // Create the database if it doesn't exist
 
-        var existingUser = await context.Users.FirstOrDefaultAsync(u => u.Id == credUser.Id);
+        var existingUser = await Users.FirstOrDefaultAsync(u => u.Id == credUser.Id);
 
         if (existingUser == null)
         {
             // User does not exist, create a new user
-            context.Users.Add(credUser);
+            Users.Add(credUser);
         }
         else
         {
@@ -75,28 +75,48 @@ public class CredentialsDbContext : DbContext
             if (credUser.TelegramUserId != existingUser.TelegramUserId) existingUser.TelegramUserId = credUser.TelegramUserId;
             // phone number does not exist
         }
-        await context.SaveChangesAsync();
+        await SaveChangesAsync();
 
     }
 
 
     public async Task<bool> Pay(CredUser credUser, long amount)
     {
-        CredentialsDbContext credentialsDbContext = new CredentialsDbContext();
-        credentialsDbContext.Attach<CredUser>(credUser);
+        Attach<CredUser>(credUser);
 
         if (credUser.AccountBalance < amount)
             return false;
         credUser.AccountBalance -= amount;
-        await credentialsDbContext.SaveChangesAsync();
+        await SaveChangesAsync();
         return true;
     }
 
-    public async Task<bool> AddFund(CredUser credUser, long amount)
+    public async Task<bool> AddFund(long credUserId, long amount)
     {
         //CredentialsDbContext credentialsDbContext = new CredentialsDbContext();
-        Attach<CredUser>(credUser);
-        credUser.AccountBalance += amount;
+        // var user = await Users.FirstOrDefaultAsync(c => c.TelegramUserId == credUser.TelegramUserId);
+        // if (user == null) return false;
+
+        // var existingUser = Users.Find(credUser.Id);
+        // if (existingUser != null)
+        // {
+        //     credUser.AccountBalance += amount;
+        // }
+        // else
+        // {
+        //     Users.Add(credUser);
+        // }
+        var existingUser = await Users.FirstOrDefaultAsync(c => c.TelegramUserId == credUserId);
+
+        if (existingUser != null)
+        {
+            existingUser.AccountBalance += amount;
+        }
+        else
+        {
+            return false;
+        }
+
         await SaveChangesAsync();
         return true;
     }

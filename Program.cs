@@ -4,6 +4,7 @@ using Telegram.Bot;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Adminbot.Domain.Logging;
+using Microsoft.EntityFrameworkCore;
 
 class Program
 {
@@ -29,10 +30,16 @@ class Program
                     return new UserDbContext();
                 });
 
+
+                var optionsBuilder = new DbContextOptionsBuilder<CredentialsDbContext>();
+                optionsBuilder.UseSqlite("Data Source=./Data/credentials.db");
+                var context = new CredentialsDbContext(optionsBuilder.Options);
+                context.Database.Migrate();
+
                 services.AddSingleton<CredentialsDbContext>(sp =>
                 {
                     // Initialize and configure your Dbcontext here
-                    return new CredentialsDbContext();
+                    return new CredentialsDbContext(optionsBuilder.Options);
                 });
 
                 services.AddSingleton<ITelegramBotClient>(sp =>

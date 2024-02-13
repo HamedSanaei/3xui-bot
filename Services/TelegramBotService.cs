@@ -13,6 +13,7 @@ using Telegram.Bot.Types.ReplyMarkups;
 using Microsoft.Extensions.Configuration.Json;
 using Microsoft.Extensions.Logging;
 using System.Linq;
+using Microsoft.EntityFrameworkCore;
 
 public class TelegramBotService : IHostedService
 {
@@ -627,6 +628,8 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "🗽 Admin")
         {
+            await _userDbContext.ClearUserStatus(currentUser);
+
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Admin:",
@@ -653,25 +656,64 @@ public class TelegramBotService : IHostedService
             return;
         }
 
+        else if (currentUser.Flow == "admin" && currentUser.LastStep.Contains("get-money-amount"))
+        {
+            currentUser.LastStep = currentUser.LastStep.Replace("get-money-amount", "confirm-admin-action");
+            currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
+            await _userDbContext.SaveUserStatus(currentUser);
+
+            var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                               {
+                        new []
+                        {
+                            new KeyboardButton("Yes Confirm!"),
+                        },
+                        new []
+                        {
+                            new KeyboardButton("No Don't Confirm!"),
+                        },});
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "You have entered:\n" + message.Text + $"\n for action {currentUser.LastStep.Split('|')[1]}" + " Are you sure?",
+                replyMarkup: confirmationKeyboard);
+
+        }
+
         //get user id for admin operations:
         else if (currentUser.Flow == "admin" && currentUser.LastStep.Contains("get-tel-user-id"))
         {
-            var action = message.Text.Split('|')[1];
+            // var action = "🚀 Promote as admin";
+            var action = currentUser.LastStep.Split('|')[1];
             if (action == "ℹ️ See User Account")
             {
                 try
                 {
-                    var userid = Convert.ToInt64(message.Text.Split('|').ElementAt(2));
+                    // var userid = Convert.ToInt64(message.Text.Split('|').ElementAt(2));
+                    var userid = Convert.ToInt64(message.Text);
                     if (userid == 0) throw new Exception("user id is null");
                     var findedClient = _credentialsDbContext.Users.Any(c => c.TelegramUserId == userid);
-                    if (!findedClient) await _credentialsDbContext.AddEmptyUser(userid);
-                    else { }
-                    var text = await GetUserProfileMessage(new CredUser { TelegramUserId = userid });
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: text,
-                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                    // if (!findedClient) await _credentialsDbContext.AddEmptyUser(userid);
+                    // else { }
+                    if (findedClient)
+                    {
+                        CredUser existedUser = await _credentialsDbContext.GetUserStatusWithId(userid);
+                        var text = await GetUserProfileMessage(existedUser);
+                        await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: text,
+                            replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
 
+                    }
+                    else
+                    {
+                        await botClient.CustomSendTextMessageAsync(
+                                                    chatId: message.Chat.Id,
+                                                    text: "User doesn't run the bot yet!. Ask him to first run the bot.",
+                                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+
+                    }
+                    await _userDbContext.ClearUserStatus(currentUser);
 
                 }
 
@@ -705,11 +747,10 @@ public class TelegramBotService : IHostedService
             else if (action == "🚀 Promote as admin" || action == "❌ Demote as admin")
             {
                 // get confirmation
-                currentUser.LastStep.Replace("get-tel-user-id", "confirm-admin-action");
+                currentUser.LastStep = currentUser.LastStep.Replace("get-tel-user-id", "confirm-admin-action");
                 currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
-
-
                 await _userDbContext.SaveUserStatus(currentUser);
+
 
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -720,27 +761,14 @@ public class TelegramBotService : IHostedService
             else if (action == "➕ Add credit" || action == "➖ Reduce credit")
             {
                 // get confirmation
-                currentUser.LastStep.Replace("get-tel-user-id", "get-money-amount");
+                currentUser.LastStep = currentUser.LastStep.Replace("get-tel-user-id", "get-money-amount");
                 currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
-                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
-                                       {
-            new []
-            {
-                new KeyboardButton("Yes Confirm!"),
-            },
-            new []
-            {
-                new KeyboardButton("No Don't Confirm!"),
-            },
-
-        });
-
                 await _userDbContext.SaveUserStatus(currentUser);
 
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
-                    text: "You have entered:\n" + message.Text + $"\n for action {currentUser.LastStep.Split('|')[1]}" + " Are you sure?",
-                    replyMarkup: confirmationKeyboard);
+                    text: "Enter Credit and send it:",
+                    replyMarkup: new ReplyKeyboardRemove());
             }
 
         }
@@ -748,54 +776,287 @@ public class TelegramBotService : IHostedService
         //get confirmation and do admin action:
         else if ((message.Text == "Yes Confirm!" || message.Text == "No Don't Confirm!") && currentUser.Flow == "admin" && currentUser.LastStep.Contains("confirm-admin-action"))
         {
+            string status = "", action = "", userid = "";
+            bool canContinue = false;
+            try
+            {
+                status = currentUser.LastStep.Split('|')[0];
+                action = currentUser.LastStep.Split('|')[1];
+                userid = currentUser.LastStep.Split('|')[2];
+                canContinue = true;
+                if (string.IsNullOrEmpty(status) || string.IsNullOrEmpty(action) || string.IsNullOrEmpty(userid))
+                    canContinue = false;
+
+            }
+            catch (System.Exception)
+            {
+                canContinue = false;
+            }
+            if (!canContinue)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                     chatId: message.Chat.Id,
+                                     text: "There is a error with interpreting the user inputs",
+                                     replyMarkup: GetMainMenuKeyboard());
+                return;
+            }
 
             // "admin-confirmed" "get-money-amount"
             long cUserId;
-            var status = message.Text.Split('|')[0];
-            var action = message.Text.Split('|')[1];
-            var userid = message.Text.Split('|')[2];
-
             bool isuseridValid = long.TryParse(userid, out cUserId);
-
+            long amount = 0;
+            bool isCreditAmountValid = false;
+            if (action == "➕ Add credit" || action == "➖ Reduce credit")
+            {
+                if (currentUser.LastStep.Split('|').Length >= 4)
+                    isCreditAmountValid = long.TryParse(currentUser.LastStep.Split('|')[3], out amount);
+            }
+            // currentUser.LastStep.Replace("get-tel-user-id", "get-money-amount");
 
             if (message.Text == "No Don't Confirm!" || !isuseridValid)
             {
                 await _userDbContext.ClearUserStatus(currentUser);
-                await botClient.CustomSendTextMessageAsync(
-                     chatId: message.Chat.Id,
-                     text: "Cancelled",
-                     replyMarkup: GetMainMenuKeyboard());
+                if (message.Text == "No Don't Confirm!")
+                    await botClient.CustomSendTextMessageAsync(
+                         chatId: message.Chat.Id,
+                         text: "Cancelled",
+                         replyMarkup: GetMainMenuKeyboard());
+                else
+                {
+                    await botClient.CustomSendTextMessageAsync(
+                         chatId: message.Chat.Id,
+                         text: "User Input is not correct",
+                         replyMarkup: GetMainMenuKeyboard());
+                }
             }
             else
             {
-                switch (action)
+                var findedUser = await _credentialsDbContext.GetUserStatusWithId(cUserId);
+                if (findedUser == null)
                 {
-                    case "➕ Add credit":
-                        // Add credit logic here
-                        //add to user
-                        // send confirmation to both user
-                        break;
-                    case "➖ Reduce credit":
-                        // await _credentialsDbContext(userinput)
-                        //     _credentialsDbContext.AddFund(GetUserStatusWithId, )
-                        break;
-                    case "🚀 Promote as admin":
-                        if (isuseridValid)
-                            await _credentialsDbContext.GetUserStatusWithId(cUserId);
-                        break;
-                    case "❌ Demote as admin":
-                        // Demote as admin logic here
-                        break;
-                    case "ℹ️ See User Account":
-                        // See user account logic here
-                        break;
+                    await botClient.CustomSendTextMessageAsync(
+                                                    chatId: message.Chat.Id,
+                                                    text: "User with specified id doesn't existed!",
+                                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-                    default:
-                        // This is the else-like case when none of the above matches
-                        // Default logic here
-                        break;
+                    return;
                 }
-                // await botClient.CustomSendTextMessageAsync(
+
+                if (action == "➕ Add credit")
+                {
+
+                    if (isCreditAmountValid)
+                    {
+                        findedUser.AccountBalance += amount;
+                        _credentialsDbContext.Users.Update(findedUser);
+                        await _credentialsDbContext.SaveChangesAsync();
+
+
+
+                        await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: await GetUserProfileMessage(findedUser),
+                        replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+
+                        await botClient.CustomSendTextMessageAsync(
+                                                    chatId: (findedUser).ChatID,
+                                                    text: $"حساب شما به میزان {amount} تومان از طرف مدیریت شارژ شد.",
+                                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+                        await botClient.CustomSendTextMessageAsync(
+                        chatId: findedUser.ChatID,
+                        text: await GetUserProfileMessage(findedUser),
+                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                    }
+
+                    else
+                    {
+                        await _userDbContext.ClearUserStatus(currentUser);
+                        await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "The credit amount you have just entered is not correct! go through steps again! ",
+                        replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+                    }
+                    await _userDbContext.ClearUserStatus(currentUser);
+                }
+                else if (action == "➖ Reduce credit")
+                {
+                    if (isCreditAmountValid)
+                    {
+                        findedUser.AccountBalance -= amount;
+                        _credentialsDbContext.Users.Update(findedUser);
+                        await _credentialsDbContext.SaveChangesAsync();
+
+
+                        await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: await GetUserProfileMessage(findedUser),
+                        replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+                        await botClient.CustomSendTextMessageAsync(
+                                                    chatId: findedUser.ChatID,
+                                                    text: $"از حساب شما به میزان {amount} تومان از طرف مدیریت کسر شد.",
+                                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+                        await botClient.CustomSendTextMessageAsync(
+                        chatId: findedUser.ChatID,
+                        text: await GetUserProfileMessage(findedUser),
+                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                    }
+
+
+                    else
+                    {
+                        await _userDbContext.ClearUserStatus(currentUser);
+                        await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "The credit amount you have just entered is not correct! go through steps again! ",
+                        replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+                    }
+
+                    await _userDbContext.ClearUserStatus(currentUser);
+
+                }
+                else if (action == "🚀 Promote as admin")
+                {
+                    findedUser.IsColleague = true;
+                    await _credentialsDbContext.SaveUserStatus(findedUser);
+
+
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: await GetUserProfileMessage(findedUser),
+                        replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: findedUser.ChatID,
+                        text: "تبریک! \n شما اکنون همکار مجموعه ما هستید. \n" + await GetUserProfileMessage(findedUser),
+                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+                    await _userDbContext.ClearUserStatus(currentUser);
+
+                }
+                else if (action == "❌ Demote as admin")
+                {
+                    // Demote as admin logic here
+                    findedUser.IsColleague = false;
+                    await _credentialsDbContext.SaveUserStatus(findedUser);
+
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: await GetUserProfileMessage(findedUser),
+                        replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+                    await botClient.CustomSendTextMessageAsync(
+                   chatId: findedUser.ChatID,
+                   text: "شما اکنون کاربر عادی مجموعه ما هستید.\n" + await GetUserProfileMessage(findedUser),
+                   replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+                    await _userDbContext.ClearUserStatus(currentUser);
+
+                }
+                else
+                {
+                    await _userDbContext.ClearUserStatus(currentUser);
+                    await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "Something went wrong! Go through the steps correctly",
+                    replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+
+                }
+
+
+                // switch (action)
+                // {
+                //     case "➕ Add credit":
+
+                //         if (isCreditAmountValid)
+                //         {
+                //             await _credentialsDbContext.AddFund(findedUser, amount);
+                //             findedUser.AccountBalance += amount;
+
+                //             await botClient.CustomSendTextMessageAsync(
+                //             chatId: message.Chat.Id,
+                //             text: await GetUserProfileMessage(findedUser),
+                //             replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+
+                //             await botClient.CustomSendTextMessageAsync(
+                //                                         chatId: findedUser.ChatID,
+                //                                         text: $"حساب شما به میزان {amount} تومان از طرف مدیریت شارژ شد.",
+                //                                         replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+                //             await botClient.CustomSendTextMessageAsync(
+                //             chatId: findedUser.ChatID,
+                //             text: await GetUserProfileMessage(findedUser),
+                //             replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                //         }
+
+                //         else
+                //         {
+                //             await _userDbContext.ClearUserStatus(currentUser);
+                //             await botClient.CustomSendTextMessageAsync(
+                //             chatId: message.Chat.Id,
+                //             text: "The credit amount you have just entered is not correct! go through steps again! ",
+                //             replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+                //         }
+                //         await _userDbContext.ClearUserStatus(currentUser);
+                //         break;
+                //     case "➖ Reduce credit":
+
+                //         break;
+                //     case "🚀 Promote as admin":
+
+                //         findedUser.IsColleague = true;
+                //         await _credentialsDbContext.SaveUserStatus(findedUser);
+
+                //         await botClient.CustomSendTextMessageAsync(
+                //             chatId: message.Chat.Id,
+                //             text: await GetUserProfileMessage(findedUser),
+                //             replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+                //         await botClient.CustomSendTextMessageAsync(
+                //             chatId: findedUser.ChatID,
+                //             text: "تبریک! \n شما اکنون همکار مجموعه ما هستید. \n" + await GetUserProfileMessage(findedUser),
+                //             replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+                //         await _userDbContext.ClearUserStatus(currentUser);
+
+                //         break;
+                //     case "❌ Demote as admin":
+                //         // Demote as admin logic here
+                //         findedUser.IsColleague = false;
+                //         await _credentialsDbContext.SaveUserStatus(findedUser);
+
+                //         await botClient.CustomSendTextMessageAsync(
+                //             chatId: message.Chat.Id,
+                //             text: await GetUserProfileMessage(findedUser),
+                //             replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+                //         await botClient.CustomSendTextMessageAsync(
+                //        chatId: findedUser.ChatID,
+                //        text: "شما اکنون کاربر عادی مجموعه ما هستید.\n" + await GetUserProfileMessage(findedUser),
+                //        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+                //         await _userDbContext.ClearUserStatus(currentUser);
+
+                //         break;
+                //     case "ℹ️ See User Account":
+                //         // See user account logic here
+                //         // it has been implemented before!
+                //         break;
+
+                //     default:
+                //         await _userDbContext.ClearUserStatus(currentUser);
+                //         await botClient.CustomSendTextMessageAsync(
+                //         chatId: message.Chat.Id,
+                //         text: "Something went wrong! Go through the steps correctly",
+                //         replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+                //         break;
+                // }
+                // // await botClient.CustomSendTextMessageAsync(
                 // chatId: message.Chat.Id,
                 // text: "You have entered:\n" + message.Text + "\n Are you sure?",
                 // replyMarkup: GetMainMenuKeyboard());
@@ -829,6 +1090,7 @@ public class TelegramBotService : IHostedService
                                                 );
 
                 }
+
                 await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
                 await botClient.CustomSendTextMessageAsync(
                                            chatId: message.Chat.Id,
@@ -867,7 +1129,7 @@ public class TelegramBotService : IHostedService
         else if (GetAdminActions().Contains(message.Text))
         {
             currentUser.Flow = "admin";
-            currentUser.LastStep = message.Text;
+            currentUser.LastStep += "|" + message.Text;
             await _userDbContext.SaveUserStatus(currentUser);
 
             if (message.Text == "📑 Menu")
@@ -912,6 +1174,7 @@ public class TelegramBotService : IHostedService
                                         replyMarkup: GetMainMenuKeyboard());
 
         }
+
     }
     private ReplyKeyboardMarkup GetAdminConfirmationKeyboard()
     {
