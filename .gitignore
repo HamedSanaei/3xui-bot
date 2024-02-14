@@ -136,3 +136,6 @@ servers.json
 users.db
 
 bin
+
+Data/servers.json
+Data/configuration.json

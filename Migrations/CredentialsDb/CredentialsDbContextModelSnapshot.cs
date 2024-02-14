@@ -17,8 +17,7 @@ namespace Adminbot.Migrations.CredentialsDb
 
             modelBuilder.Entity("Adminbot.Domain.CredUser", b =>
                 {
-                    b.Property<int>("Id")
-                        .ValueGeneratedOnAdd()
+                    b.Property<long>("TelegramUserId")
                         .HasColumnType("INTEGER");
 
                     b.Property<long>("AccountBalance")
@@ -45,13 +44,10 @@ namespace Adminbot.Migrations.CredentialsDb
                     b.Property<string>("PhoneNumber")
                         .HasColumnType("TEXT");
 
-                    b.Property<long>("TelegramUserId")
-                        .HasColumnType("INTEGER");
-
                     b.Property<string>("Username")
                         .HasColumnType("TEXT");
 
-                    b.HasKey("Id");
+                    b.HasKey("TelegramUserId");
 
                     b.ToTable("Users");
                 });

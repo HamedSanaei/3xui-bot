@@ -9,8 +9,8 @@ namespace Adminbot.Domain
 
     public class CredUser
     {
+        //public int Id { get; set; }
         [Key]
-        public int Id { get; set; }
         public long TelegramUserId { get; set; } // Telegram user ID
         public long ChatID { get; set; }
         public string Username { get; set; }

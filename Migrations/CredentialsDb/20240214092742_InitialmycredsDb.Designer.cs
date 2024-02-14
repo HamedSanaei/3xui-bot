@@ -9,7 +9,7 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations.CredentialsDb
 {
     [DbContext(typeof(CredentialsDbContext))]
-    [Migration("20240126064750_InitialmycredsDb")]
+    [Migration("20240214092742_InitialmycredsDb")]
     partial class InitialmycredsDb
     {
         /// <inheritdoc />
@@ -20,8 +20,7 @@ namespace Adminbot.Migrations.CredentialsDb
 
             modelBuilder.Entity("Adminbot.Domain.CredUser", b =>
                 {
-                    b.Property<int>("Id")
-                        .ValueGeneratedOnAdd()
+                    b.Property<long>("TelegramUserId")
                         .HasColumnType("INTEGER");
 
                     b.Property<long>("AccountBalance")
@@ -48,13 +47,10 @@ namespace Adminbot.Migrations.CredentialsDb
                     b.Property<string>("PhoneNumber")
                         .HasColumnType("TEXT");
 
-                    b.Property<long>("TelegramUserId")
-                        .HasColumnType("INTEGER");
-
                     b.Property<string>("Username")
                         .HasColumnType("TEXT");
 
-                    b.HasKey("Id");
+                    b.HasKey("TelegramUserId");
 
                     b.ToTable("Users");
                 });

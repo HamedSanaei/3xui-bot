@@ -14,8 +14,6 @@ namespace Adminbot.Migrations.CredentialsDb
                 name: "Users",
                 columns: table => new
                 {
-                    Id = table.Column<int>(type: "INTEGER", nullable: false)
-                        .Annotation("Sqlite:Autoincrement", true),
                     TelegramUserId = table.Column<long>(type: "INTEGER", nullable: false),
                     ChatID = table.Column<long>(type: "INTEGER", nullable: false),
                     Username = table.Column<string>(type: "TEXT", nullable: true),
@@ -29,7 +27,7 @@ namespace Adminbot.Migrations.CredentialsDb
                 },
                 constraints: table =>
                 {
-                    table.PrimaryKey("PK_Users", x => x.Id);
+                    table.PrimaryKey("PK_Users", x => x.TelegramUserId);
                 });
         }
 

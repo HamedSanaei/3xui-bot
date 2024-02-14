@@ -1591,8 +1591,12 @@ public class TelegramBotService : IHostedService
 
     private ServerInfo GetRandomServer()
     {
+        var serversJson = ReadJsonFile.ReadJsonAsString();
+        var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+
         List<ServerInfo> serverInfos = new List<ServerInfo>();
         var weightedItems = serverInfos.Select(i => new WeightedItem<ServerInfo>(i, i.Chance));
+
 
 
         ServerInfo selected = RouletteWheel.Spin(weightedItems.ToList<WeightedItem<ServerInfo>>());
@@ -1645,7 +1649,7 @@ public class TelegramBotService : IHostedService
 
         if (isColleague)
         {
-            _appConfig.PriceColleagues.ForEach(i => buttonsName.Add($"خرید اکانت {i.Duration} قیمت {i.Price}"));
+            _appConfig.PriceColleagues.ForEach(i => buttonsName.Add($"خرید اکانت {i.DurationName} قیمت {i.Price}"));
 
 
             //     return new string[]{ "خرید اکانت یک ماهه قیمت 60000",
@@ -1655,7 +1659,7 @@ public class TelegramBotService : IHostedService
         }
         else
         {
-            _appConfig.Price.ForEach(i => buttonsName.Add($"خرید اکانت {i.Duration} قیمت {i.Price}"));
+            _appConfig.Price.ForEach(i => buttonsName.Add($"خرید اکانت {i.DurationName} قیمت {i.Price}"));
 
             //     return new string[]{ "خرید اکانت یک ماهه قیمت 149000",
             // "خرید اکانت  دو ماهه قیمت 259000",

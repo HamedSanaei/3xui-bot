@@ -17,9 +17,13 @@ public class CredentialsDbContext : DbContext
     }
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        // Configure the UserData entity
         modelBuilder.Entity<CredUser>()
-            .HasKey(u => u.Id); // Set the Id property as the primary key
+            .HasKey(c => c.TelegramUserId);
+
+        modelBuilder.Entity<CredUser>()
+            .Property(c => c.TelegramUserId)
+            .ValueGeneratedNever(); // This tells EF Core not to expect a database-generated value
+
     }
 
     public async Task<CredUser> GetUserStatus(CredUser credUser)
@@ -45,8 +49,6 @@ public class CredentialsDbContext : DbContext
 
     public async Task<CredUser> GetUserStatusWithId(long credUser)
     {
-
-
         var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser);
         return existingUser;
     }
@@ -55,7 +57,7 @@ public class CredentialsDbContext : DbContext
     public async Task SaveUserStatus(CredUser credUser)
     {
 
-        var existingUser = await Users.FirstOrDefaultAsync(u => u.Id == credUser.Id);
+        var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser.TelegramUserId);
 
         if (existingUser == null)
         {
