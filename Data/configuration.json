@@ -21,19 +21,19 @@
       "durationName": "دو ماه",
       "traffic": 120,
       "price": 120000,
-      "duration": "2 Month"
+      "duration": "2 Months"
     },
     {
       "durationName": "سه ماه",
       "traffic": 180,
       "price": 180000,
-      "duration": "3 Month"
+      "duration": "3 Months"
     },
     {
       "durationName": "شش ماه",
       "traffic": 360,
       "price": 360000,
-      "duration": "6 Month"
+      "duration": "6 Months"
     }
   ],
   "price": [
@@ -47,19 +47,19 @@
       "durationName": "دو ماه",
       "traffic": 170,
       "price": 259000,
-      "duration": "2 Month"
+      "duration": "2 Months"
     },
     {
       "durationName": "سه ماه",
       "traffic": 230,
       "price": 345000,
-      "duration": "3 Month"
+      "duration": "3 Months"
     },
     {
       "durationName": "شش ماه",
       "traffic": 430,
       "price": 649000,
-      "duration": "6 Month"
+      "duration": "3 Months"
     }
   ]
 }

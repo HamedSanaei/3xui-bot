@@ -14,6 +14,7 @@ using Microsoft.Extensions.Configuration.Json;
 using Microsoft.Extensions.Logging;
 using System.Linq;
 using Microsoft.EntityFrameworkCore;
+using System.Security.Cryptography.X509Certificates;
 
 public class TelegramBotService : IHostedService
 {
@@ -1326,6 +1327,39 @@ public class TelegramBotService : IHostedService
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
         var user = await _userDbContext.GetUserStatus(message.From.Id);
 
+        var isJoined = await isJoinedToChannel(_appConfig.ChannelIds.Select(c => c.Replace("https://t.me/", "@")), message.From.Id);
+        // var isJoined = false;
+        if (!isJoined)
+        {
+            ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
+               {
+                    new KeyboardButton[] { "عضو شدم!" }
+                })
+            {
+                ResizeKeyboard = false
+            };
+            string toRemove = "https://t.me/";
+            List<InlineKeyboardButton[]> rows = new List<InlineKeyboardButton[]>();
+            foreach (var url in _appConfig.ChannelIds)
+            {
+                rows.Add(new[] { InlineKeyboardButton.WithUrl(url.Replace(toRemove, ""), url) });
+            }
+
+            InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows.ToArray());
+
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "به کانال(های) زیر بپیوندید و روی استارت کلیک کنید. \n" + "/start",
+                replyMarkup: inlineKeyboard);
+
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "پس از عضویت روی دکمه زیر کلیک کنید.",
+                replyMarkup: replyKeyboardMarkup);
+            return;
+        }
+
         if (message.Text == "/start")
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
@@ -1334,7 +1368,15 @@ public class TelegramBotService : IHostedService
                 text: "به ربات خوش آمدید!",
                 replyMarkup: MainReplyMarkupKeyboardFa());
         }
+        if (message.Text == "عضو شدم!")
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "به ربات خوش آمدید!",
+                replyMarkup: MainReplyMarkupKeyboardFa());
 
+        }
         else if (message.Text == "💻 ارتباط با ادمین")
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
@@ -1469,7 +1511,7 @@ public class TelegramBotService : IHostedService
             }
         }
 
-        else if (user.LastStep == "create" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
+        else if (user.Flow == "create" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
         {
             if (message.Text == "انصراف")
             {
@@ -1565,6 +1607,29 @@ public class TelegramBotService : IHostedService
         return;
     }
 
+    private async Task<bool> isJoinedToChannel(IEnumerable<string> channelIDs, long userId)
+    {
+        bool isJoined = true;
+
+        foreach (var c in channelIDs)
+        {
+
+            var chatMember = await _botClient.GetChatMemberAsync(c, userId);
+            //var st = chatMember.Status.ToString();
+            // if (st == "null" || st == "" || st == "Left")
+            if (chatMember != null && chatMember.Status != ChatMemberStatus.Left && chatMember.Status != ChatMemberStatus.Kicked)
+            {
+                isJoined = isJoined && true;
+            }
+            else
+            {
+                isJoined = isJoined && false;
+            }
+        }
+
+        return isJoined;
+
+    }
     private async Task PrepareAccount(string messageText, CredUser credUser, User user)
     {
 
@@ -1581,6 +1646,7 @@ public class TelegramBotService : IHostedService
 
         user.Type = "tunnel";
         user.TotoalGB = priceConfig.Traffic.ToString();
+        user.SelectedPeriod = priceConfig.Duration;
         user.SelectedCountry = pair.Key;
         await _userDbContext.SaveUserStatus(user);
 
@@ -1594,7 +1660,9 @@ public class TelegramBotService : IHostedService
         var serversJson = ReadJsonFile.ReadJsonAsString();
         var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
 
-        List<ServerInfo> serverInfos = new List<ServerInfo>();
+
+        List<ServerInfo> serverInfos = servers.Values.ToList();
+        // List<ServerInfo> serverInfos = new List<ServerInfo>();
         var weightedItems = serverInfos.Select(i => new WeightedItem<ServerInfo>(i, i.Chance));
 
 
