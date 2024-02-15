@@ -13,13 +13,13 @@ namespace Adminbot.Domain
 
         }
         public List<long> AdminsUserIds { get; set; }
-
         public string BotToken { get; set; }
         public string SupportAccount { get; set; }
         public string MainChannel { get; set; }
         public string LoggerChannel { get; set; }
-        public string[] SubLinkTotorial { get; set; }
-        public string[] ConfiglinkTutorial { get; set; }
+        public string[] IosTutorial { get; set; }
+        public string[] AndroidTutorial { get; set; }
+        public string[] WindowsTutorial { get; set; }
 
         public List<string> ChannelIds { get; set; }
 

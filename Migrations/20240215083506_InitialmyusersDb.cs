@@ -31,7 +31,6 @@ namespace Adminbot.Migrations
                 {
                     Id = table.Column<long>(type: "INTEGER", nullable: false)
                         .Annotation("Sqlite:Autoincrement", true),
-                    Username = table.Column<string>(type: "TEXT", nullable: true),
                     SelectedCountry = table.Column<string>(type: "TEXT", nullable: true),
                     SelectedPeriod = table.Column<string>(type: "TEXT", nullable: true),
                     Type = table.Column<string>(type: "TEXT", nullable: true),
@@ -42,7 +41,9 @@ namespace Adminbot.Migrations
                     SubLink = table.Column<string>(type: "TEXT", nullable: true),
                     Email = table.Column<string>(type: "TEXT", nullable: true),
                     ConfigPrice = table.Column<string>(name: "_ConfigPrice", type: "TEXT", nullable: true),
-                    ConfigPrice0 = table.Column<long>(name: "ConfigPrice", type: "INTEGER", nullable: false)
+                    ConfigPrice0 = table.Column<long>(name: "ConfigPrice", type: "INTEGER", nullable: false),
+                    LastFreeAcc = table.Column<DateTime>(type: "TEXT", nullable: false),
+                    PaymentMethod = table.Column<string>(type: "TEXT", nullable: true)
                 },
                 constraints: table =>
                 {

@@ -54,7 +54,13 @@ namespace Adminbot.Migrations
                     b.Property<string>("Flow")
                         .HasColumnType("TEXT");
 
+                    b.Property<DateTime>("LastFreeAcc")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("LastStep")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PaymentMethod")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("SelectedCountry")
@@ -70,9 +76,6 @@ namespace Adminbot.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<string>("Type")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Username")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("_ConfigPrice")

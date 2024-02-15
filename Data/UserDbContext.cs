@@ -68,6 +68,10 @@ public class UserDbContext : DbContext
             existingUser.ConfigLink = "";
             existingUser.Email = "";
             existingUser.Type = "";
+            existingUser.SubLink = "";
+            existingUser.ConfigPrice = 0;
+
+
 
         }
         await context.SaveChangesAsync();

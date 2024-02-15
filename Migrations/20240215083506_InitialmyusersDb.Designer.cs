@@ -10,7 +10,7 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    [Migration("20240205181159_InitialmyusersDb")]
+    [Migration("20240215083506_InitialmyusersDb")]
     partial class InitialmyusersDb
     {
         /// <inheritdoc />
@@ -57,7 +57,13 @@ namespace Adminbot.Migrations
                     b.Property<string>("Flow")
                         .HasColumnType("TEXT");
 
+                    b.Property<DateTime>("LastFreeAcc")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("LastStep")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PaymentMethod")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("SelectedCountry")
@@ -73,9 +79,6 @@ namespace Adminbot.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<string>("Type")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Username")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("_ConfigPrice")

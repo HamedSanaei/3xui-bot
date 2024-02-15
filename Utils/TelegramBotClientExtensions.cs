@@ -53,6 +53,32 @@ public static class TelegramBotClientExtensions
         }
     }
 
+
+
+
+    public static async Task CustomForwardMessage(
+            this ITelegramBotClient botClient,
+            long chatId,
+            string fromChatId,
+            int messageId)
+    {
+
+        try
+        {
+            await botClient.ForwardMessageAsync(
+                chatId: chatId,
+                fromChatId: $"@{fromChatId}",
+                messageId: messageId
+            );
+            // Console.WriteLine("Message forwarded successfully.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"An error occurred while forwarding the message: {ex.Message}");
+        }
+    }
+
+
     public static async Task SendImagesWithCaptionAsync(this ITelegramBotClient botClient, ChatId chatId, List<Stream> imageStreams, string caption)
     {
         // Prepare a list of InputMediaPhoto

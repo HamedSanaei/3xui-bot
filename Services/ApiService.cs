@@ -169,7 +169,7 @@ public class ApiService
         // Create the request body
         var inboundId = accountDto.ServerInfo.Inbounds.FirstOrDefault(i => i.Type == accountDto.AccType);
         if (inboundId == null) return false;
-        Client client = new Client { TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)), ExpiryTime = DateTime.Now.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)) };
+        Client client = new Client { TgId = accountDto.TelegramUserId.ToString(), TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)), ExpiryTime = DateTime.Now.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)) };
 
         var setting = Client.MakeSettingString(client);
         if (accountDto.AccType == "realityv6")
@@ -269,7 +269,7 @@ public class ApiService
         if (inboundId == null) return false;
         if (accountDto.Client.ExpiryTime <= DateTime.UtcNow)
             accountDto.Client.ExpiryTime = DateTime.UtcNow;
-        Client client = new Client { Id = accountDto.Client.Id, TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)) + accountDto.Client.TotalGB, ExpiryTime = accountDto.Client.ExpiryTime.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)), Email = accountDto.Client.Email, SubId = accountDto.Client.Email, Enable = true };
+        Client client = new Client { TgId = accountDto.TelegramUserId.ToString(), Id = accountDto.Client.Id, TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)) + accountDto.Client.TotalGB, ExpiryTime = accountDto.Client.ExpiryTime.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)), Email = accountDto.Client.Email, SubId = accountDto.Client.Email, Enable = true };
         var requestBody = new
         {
             id = inboundId.Id,
@@ -515,6 +515,8 @@ public class ApiService
     {
         switch (period)
         {
+            case "1 Day":
+                return 1;
             case "0 Month":
                 return 0;
             case "1 Month":

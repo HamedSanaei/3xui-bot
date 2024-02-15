@@ -8,7 +8,6 @@ using Newtonsoft.Json;
 public class User
 {
     public long Id { get; set; }
-    public string Username { get; set; }
     public string SelectedCountry { get; set; }
     public string SelectedPeriod { get; set; }
     public string Type { get; set; }
@@ -24,8 +23,6 @@ public class User
 
     public string Email { get; set; }
     public string _ConfigPrice { get; set; }
-
-
     public long ConfigPrice
     {
         get
@@ -39,6 +36,9 @@ public class User
             _ConfigPrice = value.ToString();
         }
     }
+    public DateTime LastFreeAcc { get; set; } = DateTime.MinValue;
+    public string PaymentMethod { get; set; } = "credit";
+
 }
 public class CookieData
 {

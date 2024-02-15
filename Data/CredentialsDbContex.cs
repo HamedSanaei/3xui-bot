@@ -35,7 +35,7 @@ public class CredentialsDbContext : DbContext
         if (existingUser != null)
         {
             // update public infos
-            await SaveUserStatus(credUser);
+            //await SaveUserStatus(credUser);
             return existingUser;
         }
         else
@@ -56,7 +56,6 @@ public class CredentialsDbContext : DbContext
 
     public async Task SaveUserStatus(CredUser credUser)
     {
-
         var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser.TelegramUserId);
 
         if (existingUser == null)
@@ -69,15 +68,54 @@ public class CredentialsDbContext : DbContext
             // // User already exists, update the user's information if needed
             if (!string.IsNullOrEmpty(credUser.Username)) existingUser.Username = credUser.Username;
             if (!string.IsNullOrEmpty(credUser.LastName)) existingUser.LastName = credUser.LastName;
-            if (credUser.Email != null) existingUser.Email = credUser.Email;
+            // if (credUser.Email != null) existingUser.Email = credUser.Email;
             if (credUser.ChatID != existingUser.ChatID) existingUser.ChatID = credUser.ChatID;
             if (credUser.LanguageCode != existingUser.LanguageCode) existingUser.LanguageCode = credUser.LanguageCode;
             if (credUser.FirstName != existingUser.FirstName) existingUser.FirstName = credUser.FirstName;
-            if (credUser.IsColleague != existingUser.IsColleague) existingUser.IsColleague = credUser.IsColleague;
+            // if (credUser.IsColleague != existingUser.IsColleague) existingUser.IsColleague = credUser.IsColleague;
             if (credUser.TelegramUserId != existingUser.TelegramUserId) existingUser.TelegramUserId = credUser.TelegramUserId;
             // phone number does not exist
         }
         await SaveChangesAsync();
+
+    }
+
+
+
+    public async Task SavePhoneNumber(long credUserId, string phoneNumber)
+    {
+
+        var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUserId);
+
+        if (existingUser == null)
+        {
+            // User does not exist, create a new user
+            Users.Add(new CredUser { TelegramUserId = credUserId, PhoneNumber = phoneNumber });
+        }
+        else
+        {
+            if (existingUser.PhoneNumber != phoneNumber) existingUser.PhoneNumber = phoneNumber;
+        }
+        await SaveChangesAsync();
+
+    }
+
+    public async Task<bool> PromotOrDemote(long credUserId, bool isColleague)
+    {
+
+        var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUserId);
+
+        if (existingUser == null)
+        {
+            // User does not exist, create a new user
+            return false;
+        }
+        else
+        {
+            existingUser.IsColleague = isColleague;
+        }
+        await SaveChangesAsync();
+        return true;
 
     }
 
