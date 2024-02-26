@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using Telegram.Bot;
 
+
 namespace Adminbot.Domain.Logging
 {
 
@@ -43,7 +44,7 @@ namespace Adminbot.Domain.Logging
         {
             try
             {
-                await _botClient.SendTextMessageAsync(_channelId, message);
+                await _botClient.SendTextMessageAsync(_channelId, message, parseMode: Telegram.Bot.Types.Enums.ParseMode.Markdown);
             }
             catch (Exception ex)
             {

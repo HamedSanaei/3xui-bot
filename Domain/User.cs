@@ -94,7 +94,7 @@ public class Client
         sb.Append(ConvertDateTimeToTimestamp(client.ExpiryTime));
         sb.Append(" ,\"enable\":true,\"tgId\":\"");
         sb.Append(client.TgId);
-        sb.Append(" \",\"subId\":\"");
+        sb.Append("\",\"subId\":\"");
         sb.Append(client.SubId);
         sb.Append("\"}]}");
         return sb.ToString();

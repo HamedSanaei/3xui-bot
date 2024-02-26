@@ -18,8 +18,6 @@ class Program
                     .AddJsonFile("./Data/configuration.json", optional: false, reloadOnChange: true)
                     .Build();
 
-
-
                 services.AddSingleton<IConfiguration>(configuration);
 
                 services.AddHostedService<TelegramBotService>();
@@ -60,7 +58,7 @@ class Program
                 services.AddLogging(builder =>
                {
                    // Use a factory to resolve dependencies more cleanly
-                   builder.Services.AddSingleton<ILoggerProvider>(sp => new TelegramLoggerProvider((_, logLevel) => logLevel >= LogLevel.None,
+                   builder.Services.AddSingleton<ILoggerProvider>(sp => new TelegramLoggerProvider((_, logLevel) => logLevel >= LogLevel.Information,
                        sp.GetRequiredService<ITelegramBotClient>(),
                        configuration["loggerChannel"]));
                });

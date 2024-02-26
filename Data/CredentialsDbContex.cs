@@ -53,6 +53,17 @@ public class CredentialsDbContext : DbContext
         return existingUser;
     }
 
+    public async Task<long> GetAccountBalance(long credUser)
+    {
+        long balance = -1;
+        var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == credUser);
+        if (existingUser != null)
+        {
+            balance = existingUser.AccountBalance;
+        }
+        return balance;
+    }
+
 
     public async Task SaveUserStatus(CredUser credUser)
     {
@@ -125,7 +136,11 @@ public class CredentialsDbContext : DbContext
         Attach<CredUser>(credUser);
 
         if (credUser.AccountBalance < amount)
+        {
+            credUser.AccountBalance -= amount;
+            await SaveChangesAsync();
             return false;
+        }
         credUser.AccountBalance -= amount;
         await SaveChangesAsync();
         return true;

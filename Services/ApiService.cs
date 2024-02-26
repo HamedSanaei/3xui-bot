@@ -409,6 +409,7 @@ public class ApiService
 
         return requestBody;
     }
+
     public static async Task<ClientExtend> FetchClientFromServer(Guid id, ServerInfo serverInfo, int inboundId)
     {
         Client findedClient = null;
@@ -496,6 +497,108 @@ public class ApiService
         return client;
 
     }
+
+
+    public static async Task<List<ClientExtend>> FetchAllClientFromServer(long telegramUserId, ServerInfo serverInfo, int inboundId)
+    {
+
+        List<Client> findedClients = null;
+        List<ClientExtend> findedClientsWithTraffic = new List<ClientExtend>();
+
+        // login
+        var sessionCookie = await LoginAndGetSessionCookie(serverInfo);
+        if (sessionCookie == null) throw new Exception("Error in login and get session cookie");
+
+        //1.fetch inbound data
+        var inboundstateUrl = serverInfo.Url + "/" + serverInfo.RootPath + "/panel/api/inbounds/get/" + inboundId.ToString();
+        //InboundState apiResponse = JsonConvert.DeserializeObject<InboundState>(jsonResponse);
+
+
+        // Create an HttpClientHandler
+        var handler = new HttpClientHandler();
+
+        // Create a CookieContainer and add your cookie
+        var cookieContainer = new CookieContainer();
+        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", sessionCookie));
+
+        // Assign the CookieContainer to the handler
+        handler.CookieContainer = cookieContainer;
+
+        // Create the HttpClient with the custom handler
+        var httpClient = new HttpClient(handler);
+
+        // Now you can use the httpClient to make requests with the specified cookie
+        InboundState result = null;
+        try
+        {
+            // Send the Get request 
+            HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
+            string responseBody = await response.Content.ReadAsStringAsync();
+            result = JsonConvert.DeserializeObject<InboundState>(responseBody);
+            //result.ServerInfoObject.Settings;
+        }
+        catch
+        {
+        }
+        if (result == null) return null;
+
+        // Deserialize the JSON string to a JObject
+        JObject jsonObject = JsonConvert.DeserializeObject<JObject>(result.ServerInfoObject.Settings);
+        // Access the "clients" array
+        JArray clientsArray = jsonObject["clients"] as JArray;
+        if (clientsArray != null)
+        {
+            // Convert the JArray to a list of objects
+            List<Client> clients = clientsArray.ToObject<List<Client>>();
+            findedClients = clients.FindAll(c => c.TgId.Trim() == telegramUserId.ToString());
+            //!string.IsNullOrEmpty(c.TgId) &&
+        }
+        if (findedClients == null) return null;
+
+
+        foreach (var findedClient in findedClients)
+        {
+            inboundstateUrl = serverInfo.Url + "/" + serverInfo.RootPath + "/panel/api/inbounds/getClientTraffics/" + findedClient.Email;
+            ClientState clientState = null;
+
+            //2.fetch client stat
+            try
+            {
+                // Send the Get request 
+                HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
+                string responseBody = await response.Content.ReadAsStringAsync();
+                clientState = JsonConvert.DeserializeObject<ClientState>(responseBody);
+                //result.ServerInfoObject.Settings;
+
+            }
+            catch
+            {
+            }
+            if (clientState == null) return null;
+
+            ClientExtend client = new ClientExtend
+            {
+                Id = findedClient.Id,
+                Email = findedClient.Email,
+                TotalGB = clientState.ClientStateObject.Total,
+                ExpiryTime = findedClient.ExpiryTime,
+                SubId = findedClient.SubId,
+                Enable = findedClient.Enable,
+                Down = clientState.ClientStateObject.Down,
+                Up = clientState.ClientStateObject.Up,
+                InboundId = clientState.ClientStateObject.InboundId
+            };
+            findedClientsWithTraffic.Add(client);
+
+        }
+
+
+
+        return findedClientsWithTraffic;
+
+    }
+
+
     public static long ConvertGBToBytes(int gigabytes)
     {
         const long bytesPerGB = 1024L * 1024L * 1024L;

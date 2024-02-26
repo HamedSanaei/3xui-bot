@@ -50,6 +50,9 @@ public class TelegramBotService : IHostedService
             AllowedUpdates = Array.Empty<UpdateType>() // receive all update types except ChatMember related updates
         };
 
+
+        PeriodicTaskRunner.Start();
+
         _botClient.StartReceiving(
             updateHandler: HandleUpdateAsync,
             pollingErrorHandler: HandlePollingErrorAsync,
@@ -76,7 +79,6 @@ public class TelegramBotService : IHostedService
         List<long> allowedValues = _appConfig.AdminsUserIds;
         if (!allowedValues.Contains(message.From.Id))
         {
-            // _logger.LogInformation("این یک یوزر عادی است.");
             await HandleUpdateRegularUsers(botClient, update, cancellationToken);
             return;
         }
@@ -734,7 +736,7 @@ public class TelegramBotService : IHostedService
                         await botClient.CustomSendTextMessageAsync(
                                                     chatId: message.Chat.Id,
                                                     text: "User doesn't run the bot yet!. Ask him to first run the bot.",
-                                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                                                    replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
 
 
                     }
@@ -873,7 +875,6 @@ public class TelegramBotService : IHostedService
                     if (isCreditAmountValid)
                     {
                         findedUser.AccountBalance += amount;
-                        _credentialsDbContext.Users.Update(findedUser);
                         await _credentialsDbContext.SaveChangesAsync();
 
 
@@ -910,7 +911,6 @@ public class TelegramBotService : IHostedService
                     if (isCreditAmountValid)
                     {
                         findedUser.AccountBalance -= amount;
-                        _credentialsDbContext.Users.Update(findedUser);
                         await _credentialsDbContext.SaveChangesAsync();
 
 
@@ -1304,6 +1304,9 @@ public class TelegramBotService : IHostedService
         return createAccountKeyboard;
     }
 
+
+
+
     private ReplyKeyboardMarkup GetLocationKeyboard()
     {
         // Example list of locations
@@ -1439,13 +1442,12 @@ public class TelegramBotService : IHostedService
         }
         else if (message.Text == "💻 ارتباط با ادمین")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
-            var text = "✅ برای ارتباط با پشتیبانی از لینک زیر اقدام کنید." + "\n" + "🆔 @vpnetiran_admin";
+            var text = "✅ برای ارتباط با پشتیبانی از لینک زیر اقدام کنید." + "\n" + @"🆔 @vpnetiran\_admin";
 
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: text,
+                text: text, parseMode: ParseMode.Markdown,
                 replyMarkup: MainReplyMarkupKeyboardFa());
 
             // Save the user's context
@@ -1584,6 +1586,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text.Contains("راهنما"))
         {
+
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
             var rkm = new ReplyKeyboardMarkup(new[]
                 {
@@ -1606,51 +1609,134 @@ public class TelegramBotService : IHostedService
             }
             else if (message.Text == "راهنمای اپل 📱")
             {
-                foreach (var item in _appConfig.IosTutorial)
-                {
-                    var forwardMessage = GetChannelAndPost(item);
-                    await _botClient.CustomForwardMessage(chatId: message.Chat.Id,
-                    fromChatId: forwardMessage.ChannelName,
-                    messageId: forwardMessage.PostNumber);
-                }
+                List<InlineKeyboardButton[]> rows = _appConfig.IosTutorial.Select(url => new InlineKeyboardButton[]
+                    {
+                        InlineKeyboardButton.WithUrl("آموزش", url)
+                    }).ToList();
+
+                // Create the InlineKeyboardMarkup
+                InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows);
+
+                await _botClient.CustomSendTextMessageAsync(chatId: message.Chat.Id,
+                     text: "برای دریافت آموزش روی دکمه زیر کلیک کنید.",
+                     replyMarkup: inlineKeyboard);
+
+
+                // foreach (var item in _appConfig.IosTutorial)
+                // {
+                // var forwardMessage = GetChannelAndPost(item);
+                // await _botClient.CustomForwardMessage(chatId: message.Chat.Id,
+                // fromChatId: forwardMessage.ChannelName,
+                // messageId: forwardMessage.PostNumber);
+
+
+                // }
             }
             else if (message.Text == "راهنمای اندروید 📱")
             {
-                foreach (var item in _appConfig.AndroidTutorial)
-                {
-                    var forwardMessage = GetChannelAndPost(item);
-                    await _botClient.CustomForwardMessage(chatId: message.Chat.Id,
-                    fromChatId: forwardMessage.ChannelName,
-                    messageId: forwardMessage.PostNumber);
-                }
+                List<InlineKeyboardButton[]> rows = _appConfig.AndroidTutorial.Select(url => new InlineKeyboardButton[]
+                    {
+                        InlineKeyboardButton.WithUrl("آموزش", url)
+                    }).ToList();
+
+                // Create the InlineKeyboardMarkup
+                InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows);
+
+                await _botClient.CustomSendTextMessageAsync(chatId: message.Chat.Id,
+                     text: "برای دریافت آموزش روی دکمه زیر کلیک کنید.",
+                     replyMarkup: inlineKeyboard);
+
+                // foreach (var item in _appConfig.AndroidTutorial)
+                // {
+                //     var forwardMessage = GetChannelAndPost(item);
+                //     await _botClient.CustomForwardMessage(chatId: message.Chat.Id,
+                //     fromChatId: forwardMessage.ChannelName,
+                //     messageId: forwardMessage.PostNumber);
+                // }
             }
             else if (message.Text == "راهنمای ویندوز 💻")
             {
-                foreach (var item in _appConfig.WindowsTutorial)
-                {
-                    var forwardMessage = GetChannelAndPost(item);
-                    await _botClient.CustomForwardMessage(chatId: message.Chat.Id,
-                    fromChatId: forwardMessage.ChannelName,
-                    messageId: forwardMessage.PostNumber);
-                }
+
+                List<InlineKeyboardButton[]> rows = _appConfig.WindowsTutorial.Select(url => new InlineKeyboardButton[]
+                    {
+                        InlineKeyboardButton.WithUrl("آموزش", url)
+                    }).ToList();
+
+                // Create the InlineKeyboardMarkup
+                InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows);
+
+                await _botClient.CustomSendTextMessageAsync(chatId: message.Chat.Id,
+                     text: "برای دریافت آموزش روی دکمه زیر کلیک کنید.",
+                     replyMarkup: inlineKeyboard);
+
+                // foreach (var item in _appConfig.WindowsTutorial)
+                // {
+                //     var forwardMessage = GetChannelAndPost(item);
+                //     await _botClient.CustomForwardMessage(chatId: message.Chat.Id,
+                //     fromChatId: forwardMessage.ChannelName,
+                //     messageId: forwardMessage.PostNumber);
+                // }
             }
             else
             {
                 await botClient.CustomSendTextMessageAsync(
                               chatId: message.Chat.Id,
-                              text: "منوی اصلی",
+                              text: "آموزش مورد نظر وجود ندارد",
                               replyMarkup: MainReplyMarkupKeyboardFa());
             }
+            await botClient.CustomSendTextMessageAsync(
+                              chatId: message.Chat.Id,
+                              text: "منوی اصلی",
+                              replyMarkup: MainReplyMarkupKeyboardFa());
         }
 
 
-        else if (message.Text == "⚙️مدیریت اکانت")
+        else if (message.Text == "⚙️ مدیریت اکانت")
+        {
+
+            ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
+            {
+                new KeyboardButton[] { "مشاهده وضعیت حساب","تمدید اکانت"},
+                new KeyboardButton[] { "وضعیت اکانت های من","منوی اصلی" },
+            })
+            {
+                ResizeKeyboard = true, // This will make the keyboard buttons resize to fit their container
+                OneTimeKeyboard = true // This will hide the keyboard after a button is pressed (optional)
+            };
+
+
+            // var text = await GetUserProfileMessage(credUser);
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "یک گزینه را انتخاب نمائید.",
+                replyMarkup: replyKeyboardMarkup, parseMode: ParseMode.Markdown);
+
+        }
+        else if (message.Text == "مشاهده وضعیت حساب")
         {
             var text = await GetUserProfileMessage(credUser);
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: text,
                 replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+        }
+        else if (message.Text == "وضعیت اکانت های من")
+        {
+            var accounts = await TryGetَAllClient(5951689820);
+            string text = "start";
+            foreach (var item in accounts)
+            {
+                text += item.Email + "\n";
+            }
+
+            await botClient.CustomSendTextMessageAsync(
+               chatId: message.Chat.Id,
+               text: text,
+               replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+        }
+        else if (message.Text == "تمدید اکانت")
+        {
 
         }
 
@@ -1882,7 +1968,13 @@ public class TelegramBotService : IHostedService
                    text: "بازگشت به منوی اصلی",
                     replyMarkup: MainReplyMarkupKeyboardFa());
 
+                long beforeBalance = credUser.AccountBalance;
                 await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice));
+                long afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
+                var logMesseage = $"یوزر `{credUser.TelegramUserId}` با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
+
+                if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage);
+
                 if (user.SelectedPeriod == "1 Day")
                 {
                     user.LastFreeAcc = DateTime.Now;
@@ -1999,7 +2091,7 @@ public class TelegramBotService : IHostedService
         if (!string.IsNullOrEmpty(_credUser.Username))
             text += $"\u200F🆔 آیدی: @{_credUser.Username} \n";
         text += $"\u200Fℹ️ آیدی عددی: `{_credUser.TelegramUserId}` \n";
-        text += $"‌💰اعتبار حساب: {_credUser.AccountBalance} تومان \n";
+        text += $"‌💰اعتبار حساب: {_credUser.AccountBalance.FormatCurrency()}\n";
         if (_credUser.IsColleague)
         {
             text += $"‌🧰 نوع: اکانت شما از نوع همکار 💎می‌باشد. \n";
@@ -2008,7 +2100,7 @@ public class TelegramBotService : IHostedService
         {
             text += "‌🧰 نوع: اکانت شما از نوع کاربر عادی می‌باشد. \n";
         }
-        return text;
+        return text.EscapeMarkdown();
     }
     string[] GetPrices(bool isColleague)
     {
@@ -2102,7 +2194,7 @@ public class TelegramBotService : IHostedService
         ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
                {
                     new KeyboardButton[] { "💳خرید اکانت جدید", "🏠منو","💻 ارتباط با ادمین" },
-                    new KeyboardButton[] { "💡راهنما نصب", "🌟اکانت رایگان","⚙️مدیریت اکانت" }})
+                    new KeyboardButton[] { "💡راهنما نصب", "🌟اکانت رایگان","⚙️ مدیریت اکانت" }})
         {
             ResizeKeyboard = false
         };
@@ -2336,6 +2428,44 @@ public class TelegramBotService : IHostedService
 
         }
         return client;
+
+    }
+
+
+
+    async Task<List<ClientExtend>> TryGetَAllClient(long telegramUserId)
+    {
+        List<ClientExtend> clients = new List<ClientExtend>();
+
+        var serversJson = ReadJsonFile.ReadJsonAsString();
+        var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+
+        foreach (var s in servers)
+        {
+            ServerInfo serverInfo = s.Value;
+            foreach (var inbound in serverInfo.Inbounds)
+            {
+                if (inbound.Type == "tunnel")
+                {
+                    try
+                    {
+                        var temp = await ApiService.FetchAllClientFromServer(telegramUserId, serverInfo, inbound.Id);
+
+                        if (temp.Count > 0)
+                            clients.AddRange(temp);
+
+                    }
+                    catch (System.Exception ex)
+                    {
+
+                        Console.WriteLine(ex.Message);
+                    }
+
+                }
+            }
+
+        }
+        return clients;
 
     }
 
