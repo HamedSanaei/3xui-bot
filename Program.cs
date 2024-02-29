@@ -10,6 +10,8 @@ class Program
 {
     static async Task Main(string[] args)
     {
+
+
         await new HostBuilder()
             .ConfigureServices((hostContext, services) =>
             {
@@ -30,7 +32,7 @@ class Program
 
 
                 var optionsBuilder = new DbContextOptionsBuilder<CredentialsDbContext>();
-                optionsBuilder.UseSqlite("Data Source=./Data/credentials.db");
+                optionsBuilder.UseSqlite("Data Source=./Data/credentials.db;Mode=ReadWrite;Cache=Shared");
                 var context = new CredentialsDbContext(optionsBuilder.Options);
                 context.Database.Migrate();
 
@@ -55,12 +57,15 @@ class Program
                     return new TelegramBotClient(configuration["botToken"]);
                     // return new TelegramBotClient(bot1);
                 });
+
                 services.AddLogging(builder =>
                {
                    // Use a factory to resolve dependencies more cleanly
                    builder.Services.AddSingleton<ILoggerProvider>(sp => new TelegramLoggerProvider((_, logLevel) => logLevel >= LogLevel.Information,
                        sp.GetRequiredService<ITelegramBotClient>(),
-                       configuration["loggerChannel"]));
+                       configuration["loggerChannel"],
+                       configuration["backupChannel"]
+                       ));
                });
             })
             .RunConsoleAsync();

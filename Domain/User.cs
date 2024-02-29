@@ -157,7 +157,7 @@ public class ClientExtend : Client
             long totalBytes = Up + Down;
             double totalUsed = ConvertBytesToGB(totalBytes);
             string allowed = ConvertBytesToGB(TotalGB).ToString();
-            return $"used {totalUsed:F3} GB / {allowed} GB";
+            return $" used {totalUsed:F3} GB / {allowed} GB";
         }
     }
     private double ConvertBytesToGB(long bytes)
@@ -165,7 +165,6 @@ public class ClientExtend : Client
         const double bytesInGB = 1024 * 1024 * 1024;
         return bytes / bytesInGB;
     }
-
 }
 
 public class AccountGenerator

@@ -17,6 +17,8 @@ namespace Adminbot.Domain
         public string SupportAccount { get; set; }
         public string MainChannel { get; set; }
         public string LoggerChannel { get; set; }
+        public long BackupChannel { get; set; }
+
         public string[] IosTutorial { get; set; }
         public string[] AndroidTutorial { get; set; }
         public string[] WindowsTutorial { get; set; }

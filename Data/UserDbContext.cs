@@ -64,6 +64,7 @@ public class UserDbContext : DbContext
             existingUser.SelectedPeriod = "";
             existingUser.Type = "";
             existingUser.LastStep = "";
+            existingUser.Flow = "";
             existingUser.TotoalGB = "";
             existingUser.ConfigLink = "";
             existingUser.Email = "";

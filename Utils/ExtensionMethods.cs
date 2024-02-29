@@ -19,6 +19,11 @@ namespace Adminbot.Utils
             }
             return text;
         }
+        public static double ConvertBytesToGB(this long bytes)
+        {
+            const double bytesInGB = 1024 * 1024 * 1024;
+            return bytes / bytesInGB;
+        }
 
     }
 }

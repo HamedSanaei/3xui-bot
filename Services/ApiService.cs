@@ -582,7 +582,7 @@ public class ApiService
                 Email = findedClient.Email,
                 TotalGB = clientState.ClientStateObject.Total,
                 ExpiryTime = findedClient.ExpiryTime,
-                SubId = findedClient.SubId,
+                SubId = serverInfo.SubLinkUrl + findedClient.SubId,
                 Enable = findedClient.Enable,
                 Down = clientState.ClientStateObject.Down,
                 Up = clientState.ClientStateObject.Up,

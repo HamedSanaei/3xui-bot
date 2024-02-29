@@ -13,17 +13,20 @@ namespace Adminbot.Domain.Logging
         private readonly Func<string, LogLevel, bool> _filter;
         private readonly ITelegramBotClient _botClient;
         private readonly string _channelId;
+        private readonly string _backupChannelId;
 
-        public TelegramLoggerProvider(Func<string, LogLevel, bool> filter, ITelegramBotClient botClient, string channelId)
+        public TelegramLoggerProvider(Func<string, LogLevel, bool> filter, ITelegramBotClient botClient, string channelId, string backupChannelId)
         {
             _filter = filter;
             _botClient = botClient;
             _channelId = channelId;
+            _backupChannelId = backupChannelId;
+
         }
 
         public ILogger CreateLogger(string categoryName)
         {
-            return new TelegramLogger(categoryName, _filter, _botClient, _channelId);
+            return new TelegramLogger(categoryName, _filter, _botClient, _channelId, _backupChannelId);
         }
 
         public void Dispose()

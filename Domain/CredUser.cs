@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Drawing.Printing;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -21,6 +22,23 @@ namespace Adminbot.Domain
         public string PhoneNumber { get; set; }
         public string Email { get; set; }
         public bool IsColleague { get; set; } = false;
+
+        public override string ToString()
+        {
+            string val = "\u200F";
+            if (!string.IsNullOrEmpty(FirstName))
+                val += FirstName;
+            if (!string.IsNullOrEmpty(LastName))
+                val += " " + LastName;
+            if (!string.IsNullOrEmpty(Username))
+                val += " - @" + Username;
+            if (IsColleague)
+                val += " - " + "همکار ";
+            else
+                val += " - " + "عادی ";
+
+            return val;
+        }
     }
 
 }

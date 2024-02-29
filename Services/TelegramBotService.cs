@@ -17,7 +17,7 @@ using Microsoft.EntityFrameworkCore;
 using System.Security.Cryptography.X509Certificates;
 using System.Globalization;
 using System;
-using Microsoft.VisualBasic;
+using System.Text;
 
 public class TelegramBotService : IHostedService
 {
@@ -50,8 +50,8 @@ public class TelegramBotService : IHostedService
             AllowedUpdates = Array.Empty<UpdateType>() // receive all update types except ChatMember related updates
         };
 
-
-        PeriodicTaskRunner.Start();
+        // PeriodicTaskRunner._credentialsDbContext = _credentialsDbContext;
+        // PeriodicTaskRunner.Start();
 
         _botClient.StartReceiving(
             updateHandler: HandleUpdateAsync,
@@ -357,7 +357,7 @@ public class TelegramBotService : IHostedService
         {
 
             ClientExtend client = await TryGetClient(message.Text);
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _userDbContext.Clear UserStatus(new User { Id = message.From.Id });
 
             // Handle "Get Account Info" button click
             // You can implement the logic for this button here
@@ -536,7 +536,8 @@ public class TelegramBotService : IHostedService
                     msg += $"Account Name: `{user.Email}`";
                     msg += $"\nLocation: {user.SelectedCountry} \nAdded duration: {user.SelectedPeriod}";
                     if (Convert.ToInt32(user.TotoalGB) < 100) msg += $"\nTraffic: {user.TotoalGB}GB.\n";
-                    string hijriShamsiDate = client.ExpiryTime.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).ConvertToHijriShamsi();
+                    string hijriShamsiDate = client.ExpiryTime.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
+
                     msg += $"\nExpiration Date: {hijriShamsiDate}\n";
                     msg += $"Your Sublink is: \n";
                     msg += $"`{user.SubLink}` \n";
@@ -1361,6 +1362,7 @@ public class TelegramBotService : IHostedService
     private async Task HandleUpdateRegularUsers(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
 
+
         if (update.Message is not { } message)
             return;
         if (message is not null && message.Type == MessageType.Contact && message.Contact != null)
@@ -1722,18 +1724,35 @@ public class TelegramBotService : IHostedService
         }
         else if (message.Text == "وضعیت اکانت های من")
         {
-            var accounts = await TryGetَAllClient(5951689820);
-            string text = "start";
-            foreach (var item in accounts)
+
+
+
+
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "لطفاً چند ثانیه صبر کنید. دریافت اطلاعات از سرورها ممکن است لحظاتی طول بکشد ...",
+                replyMarkup: new ReplyKeyboardRemove());
+
+            var accounts = await TryGetَAllClient(credUser.TelegramUserId);
+            if (accounts.Count < 1)
             {
-                text += item.Email + "\n";
+
+                await botClient.CustomSendTextMessageAsync(
+               chatId: message.Chat.Id,
+               text: "شما هنوز هیچ اکانتی از مجموعه ما ندارید.",
+               replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                return;
             }
+            await SendMessageWithClientInfo(credUser.ChatID, credUser.IsColleague, accounts);
+
 
             await botClient.CustomSendTextMessageAsync(
                chatId: message.Chat.Id,
-               text: text,
+               text: "منوی اصلی",
                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            return;
         }
         else if (message.Text == "تمدید اکانت")
         {
@@ -1971,7 +1990,8 @@ public class TelegramBotService : IHostedService
                 long beforeBalance = credUser.AccountBalance;
                 await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice));
                 long afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
-                var logMesseage = $"یوزر `{credUser.TelegramUserId}` با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
+
+                var logMesseage = $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
 
                 if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage);
 
@@ -2067,6 +2087,72 @@ public class TelegramBotService : IHostedService
     private bool CheckButtonCorrectness(bool isColleague, string text)
     {
         return GetPrices(isColleague).Contains(text);
+    }
+
+    public async Task SendMessageWithClientInfo(ChatId chatId, bool isColleague, List<ClientExtend> clients)
+    {
+        const int MaxMessageLength = 4096; // Telegram max message length
+        StringBuilder messageBuilder = new StringBuilder();
+        string clientInfo = "وضعیت اکانت های شما به شرح زیر است: \n";
+        foreach (var client in clients)
+        {
+            clientInfo = $"👤 نام: `{client.Email}`\n" +
+                               // $"- Name: {client.Name}\n" +
+                               // $"- Subscription: {client.}\n" +
+                               $"📅 انقضاء: {client.ExpiryTime.ConvertToHijriShamsi()}\n";
+
+            if (client.ExpiryTime < DateTime.UtcNow)
+                clientInfo += $"\u200F🚫 منقضی شده است. \n";
+            else if ((client.ExpiryTime - DateTime.UtcNow) <= TimeSpan.FromDays(5))
+                clientInfo += $"\u200F❕⌛️ روزهای باقی‌مانده: " + (client.ExpiryTime - DateTime.UtcNow).Days + " روز \n";
+
+            else
+                clientInfo += $"\u200F⏳ روزهای باقی‌مانده: " + (client.ExpiryTime - DateTime.UtcNow).Days + " روز \n";
+
+
+
+            if (isColleague)
+            {
+
+                double totalUsed = (client.Up + client.Down).ConvertBytesToGB();
+                if (((client.Up + client.Down) / client.TotalGB) < 0.9)
+                    clientInfo += "\u200F" + "🔋 میزان مصرف : " + $"{totalUsed:F2}" + $" از {client.TotalGB.ConvertBytesToGB()} گیگابایت" + "\n";
+                else
+                    clientInfo += "\u200F" + "🪫 میزان مصرف: " + $"{totalUsed:F2}" + $" از {client.TotalGB.ConvertBytesToGB()} گیگابایت" + "\n";
+
+            }
+            else
+            {
+                if ((client.Up + client.Down) >= client.TotalGB && (client.ExpiryTime > DateTime.UtcNow))
+                    clientInfo += "\u200F" + $"❗️مولتی آیپی \n";
+            }
+
+
+            // tamdid 
+            clientInfo += "\u200F" + "🔄 تمدید ⬅️  " + $"/renew_{client.Email} \n";
+            // /renew_{client.Email}
+            clientInfo += "\u200F" + "🔗 ساب لینک: \n" + $"`{client.SubId}` \n";
+            //clientInfo += ":میزان مصرف" + client.TotalUsedTrafficInGB + "\n";
+
+            clientInfo += "___________________________\n";
+
+            // Check if adding this client's info will exceed the Telegram message length limit
+            if (messageBuilder.Length + clientInfo.Length > MaxMessageLength)
+            {
+                // Send the current message
+                await _botClient.CustomSendTextMessageAsync(chatId, messageBuilder.ToString().EscapeMarkdown(), parseMode: ParseMode.Markdown);
+                messageBuilder.Clear(); // Clear the builder for the next message
+            }
+
+            // Add the current client's info to the message builder
+            messageBuilder.Append(clientInfo);
+        }
+
+        // Send any remaining info
+        if (messageBuilder.Length > 0)
+        {
+            await _botClient.SendTextMessageAsync(chatId, messageBuilder.ToString().EscapeMarkdown(), parseMode: ParseMode.Markdown);
+        }
     }
 
     Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
