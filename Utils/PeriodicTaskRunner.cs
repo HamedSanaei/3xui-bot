@@ -4,7 +4,8 @@ namespace Adminbot.Utils
     public class PeriodicTaskRunner
     {
         private static System.Timers.Timer _timer;
-        private static Dictionary<long, string> _allAccounts;
+
+        // private static Dictionary<long, string> _allAccounts;
         public static CredentialsDbContext _credentialsDbContext;
 
 

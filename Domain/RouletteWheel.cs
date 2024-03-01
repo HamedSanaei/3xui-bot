@@ -12,7 +12,7 @@ namespace Adminbot.Domain
         public static T Spin<T>(List<WeightedItem<T>> weightedItems)
         {
             long totalWeight = weightedItems.Sum(item => item.Weight);
-            long randomValue = (long)(random.NextDouble() * totalWeight);
+            double randomValue = random.NextDouble() * totalWeight;
 
             long currentWeight = 0;
             foreach (var weightedItem in weightedItems)

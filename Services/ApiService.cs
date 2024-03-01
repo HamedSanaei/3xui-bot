@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Threading.Tasks;
 using Adminbot.Domain;
+using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Query;
 using Newtonsoft.Json;
@@ -408,6 +409,126 @@ public class ApiService
         string requestBody = JsonConvert.SerializeObject(addAccountRequest);
 
         return requestBody;
+    }
+
+    public static async Task<ClientExtend> FetchClientByEmail(string email, long tgUserId)
+    {
+
+        Client findedClient = null;
+        ClientExtend emailClient = null;
+
+        var serversJson = ReadJsonFile.ReadJsonAsString();
+        var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+
+        foreach (KeyValuePair<string, ServerInfo> kvp in servers)
+        {
+            ServerInfo serverInfo = kvp.Value;
+
+            foreach (var si in serverInfo.Inbounds)
+            {
+                if (si.Type == "tunnel")
+                {
+                    // login
+                    var sessionCookie = await LoginAndGetSessionCookie(serverInfo);
+                    // if (sessionCookie == null) throw new Exception("Error in login and get session cookie");
+                    if (sessionCookie == null) continue;
+
+                    //1.fetch inbound data
+                    var inboundstateUrl = serverInfo.Url + "/" + serverInfo.RootPath + "/panel/api/inbounds/get/" + si.Id.ToString();
+                    //InboundState apiResponse = JsonConvert.DeserializeObject<InboundState>(jsonResponse);
+
+                    // Create an HttpClientHandler
+                    var handler = new HttpClientHandler();
+
+                    // Create a CookieContainer and add your cookie
+                    var cookieContainer = new CookieContainer();
+                    cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", sessionCookie));
+
+                    // Assign the CookieContainer to the handler
+                    handler.CookieContainer = cookieContainer;
+
+                    // Create the HttpClient with the custom handler
+                    var httpClient = new HttpClient(handler);
+
+                    // Now you can use the httpClient to make requests with the specified cookie
+                    InboundState result = null;
+                    try
+                    {
+                        // Send the Get request 
+                        HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
+                        string responseBody = await response.Content.ReadAsStringAsync();
+                        result = JsonConvert.DeserializeObject<InboundState>(responseBody);
+                        //result.ServerInfoObject.Settings;
+
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                    if (result == null) continue;
+
+
+                    // Deserialize the JSON string to a JObject
+                    JObject jsonObject = JsonConvert.DeserializeObject<JObject>(result.ServerInfoObject.Settings);
+                    // Access the "clients" array
+                    JArray clientsArray = jsonObject["clients"] as JArray;
+                    if (clientsArray != null)
+                    {
+                        // Convert the JArray to a list of objects
+                        List<Client> clients = clientsArray.ToObject<List<Client>>();
+                        findedClient = clients.FirstOrDefault(c => c.Email == email);
+                    }
+                    if (findedClient == null) continue;
+
+                    inboundstateUrl = serverInfo.Url + "/" + serverInfo.RootPath + "/panel/api/inbounds/getClientTraffics/" + findedClient.Email;
+                    ClientState clientState = null;
+                    //2.fetch client stat
+                    try
+                    {
+                        // Send the Get request 
+                        HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
+                        string responseBody = await response.Content.ReadAsStringAsync();
+                        clientState = JsonConvert.DeserializeObject<ClientState>(responseBody);
+                        //result.ServerInfoObject.Settings;
+
+                    }
+                    catch
+                    {
+                    }
+                    if (clientState == null) continue;
+                    ClientExtend client = new ClientExtend
+                    {
+                        Id = findedClient.Id,
+                        Email = findedClient.Email,
+                        TotalGB = clientState.ClientStateObject.Total,
+                        ExpiryTime = findedClient.ExpiryTime,
+                        SubId = findedClient.SubId,
+                        Enable = findedClient.Enable,
+                        Down = clientState.ClientStateObject.Down,
+                        Up = clientState.ClientStateObject.Up,
+                        InboundId = clientState.ClientStateObject.InboundId
+                    };
+                    emailClient = client;
+
+                    var configLink = kvp.Value.VmessTemplate;
+                    configLink.Ps += client.Email;
+                    configLink.Id = client.Id;
+
+                    //Console.WriteLine(responseBody);
+                    UserDbContext _userDbContext = new UserDbContext();
+
+                    await _userDbContext.SaveUserStatus(new User { Id = tgUserId, ConfigLink = configLink.ToVMessLink(), Email = email, SubLink = kvp.Value.SubLinkUrl + client.Email, SelectedCountry = kvp.Key });
+                    await _userDbContext.SaveChangesAsync();
+
+
+                }
+                return emailClient;
+            }
+
+        }
+
+        if (emailClient != null) return emailClient;
+        return null;
     }
 
     public static async Task<ClientExtend> FetchClientFromServer(Guid id, ServerInfo serverInfo, int inboundId)

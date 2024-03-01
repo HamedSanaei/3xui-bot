@@ -40,6 +40,7 @@ public class TelegramBotService : IHostedService
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+
         var me = await _botClient.GetMeAsync();
         Console.WriteLine($"Start listening for @{me.Username}");
 
@@ -357,7 +358,7 @@ public class TelegramBotService : IHostedService
         {
 
             ClientExtend client = await TryGetClient(message.Text);
-            await _userDbContext.Clear UserStatus(new User { Id = message.From.Id });
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
             // Handle "Get Account Info" button click
             // You can implement the logic for this button here
@@ -449,6 +450,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "Yes Renew!")
         {
+
             await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "Please wait ...",
@@ -1575,7 +1577,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "💳خرید اکانت جدید")
         {
-            var replyKeboard = PriceReplyMarkupKeyboardFa(credUser.IsColleague);
+            var replyKeboard = PriceReplyMarkupKeyboardFa(credUser.IsColleague, false);
 
             await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
 
@@ -1692,10 +1694,8 @@ public class TelegramBotService : IHostedService
                               replyMarkup: MainReplyMarkupKeyboardFa());
         }
 
-
         else if (message.Text == "⚙️ مدیریت اکانت")
         {
-
             ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
             {
                 new KeyboardButton[] { "مشاهده وضعیت حساب","تمدید اکانت"},
@@ -1756,8 +1756,196 @@ public class TelegramBotService : IHostedService
         }
         else if (message.Text == "تمدید اکانت")
         {
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "لطفاً لینک Vmess یا نام اکانت خود را برای ربات ارسال کنید:",
+                replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
 
         }
+        else if (message.Text == "تمدید حجمی" && user.Flow == "update" && user.LastStep == "get-traffic")
+        {
+            var isSuccessful = int.TryParse(message.Text, out int res);
+            if (!isSuccessful)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "خطا! \n ترافیک را به گیگابایت و با اعداد انگلیسی تایپ کنید \n" + "به عنوان مثال 20 معادل بیست گیگابایت خواهد بود \n روی /start برای شروع مجدد کلیک کنید.",
+                        replyMarkup: new ReplyKeyboardRemove());
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                return;
+            }
+
+            long price = res * 1000;
+            if (credUser.AccountBalance >= price)
+            {
+
+                user.Flow = "update";
+                user.LastStep = "ask_confirmation";
+                user._ConfigPrice = price.ToString();
+                user.Type = "tunnel";
+                user.TotoalGB = res.ToString();
+                user.SelectedPeriod = "0 Month";
+
+                await _userDbContext.SaveUserStatus(user);
+
+
+                // The user entered a valid number
+                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                           {
+            new []
+            {
+                new KeyboardButton("تایید نهایی"),
+            },
+            new []
+            {
+                new KeyboardButton("انصراف"),
+            },
+        });
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"✅ شما اعتبار لازم برای تمدید اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
+                    replyMarkup: confirmationKeyboard);
+                return;
+
+            }
+
+            else
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                   chatId: message.Chat.Id,
+                                   text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
+                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+                return;
+            }
+
+        }
+
+
+        else if (message.Text == "تمدید حجمی" && user.Flow == "update")
+        {
+            user.LastStep = "get-traffic";
+            await _userDbContext.SaveUserStatus(user);
+
+            await botClient.CustomSendTextMessageAsync(
+                                chatId: message.Chat.Id,
+                                text: "ترافیک مورد نظر را به عدد ارسال کنید. هر گیگابایت معادل 1000 تومان از حساب شما کسر خواهد شد.",
+                                replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
+
+        }
+        else if (user.Flow == "update" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
+        {
+            await FinalizeRenewCustomerAccount(_botClient, user, credUser, message);
+
+        }
+        else if (user.Flow == "update" && user.LastStep == "set-renew-type" && message.Text.Contains("خرید"))
+        {
+            long price = TryParsPrice(message.Text);
+            if (price == 0)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                    chatId: message.Chat.Id,
+                                    text: "خطا",
+                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            if (CheckButtonCorrectness(credUser.IsColleague, message.Text) == false)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "خطا",
+                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            if (credUser.AccountBalance >= price)
+            {
+                await PrepareAccount(message.Text, credUser, user);
+                user.Flow = "update";
+                user.LastStep = "ask_confirmation";
+                user._ConfigPrice = price.ToString();
+                await _userDbContext.SaveUserStatus(user);
+
+
+                // The user entered a valid number
+                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                           {
+            new []
+            {
+                new KeyboardButton("تایید نهایی"),
+            },
+            new []
+            {
+                new KeyboardButton("انصراف"),
+            },
+        });
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"✅ شما اعتبار لازم برای تمدید اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
+                    replyMarkup: confirmationKeyboard);
+                return;
+
+            }
+
+            else
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                   chatId: message.Chat.Id,
+                                   text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
+                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+                return;
+            }
+        }
+
+        else if ((user.Flow == "update" && user.LastStep == "Renew Existing Account") || message.Text.Contains("/renew_"))
+        {
+
+            var replyKeboard = PriceReplyMarkupKeyboardFa(credUser.IsColleague, true);
+
+            var input = message.Text;
+
+            if (message.Text.Contains("/renew_"))
+                input = message.Text.Replace("/renew_", "");
+
+            if (StartsWithVMessOrVLess(message.Text))
+            {
+                user.ConfigLink = message.Text;
+                await _userDbContext.SaveUserStatus(user);
+            }
+            else if (input.StartsWith("vniacc", StringComparison.OrdinalIgnoreCase))
+            {
+                // ممکن است که مشکلی در رابطه با ذخیره وی مس  در  دیتا بیس وجود داشته باشد.
+                var client = await ApiService.FetchClientByEmail(input, credUser.TelegramUserId);
+                if (client == null)
+                {
+                    await botClient.CustomSendTextMessageAsync(
+                                    chatId: message.Chat.Id,
+                                    text: "اکانت مورد نظر پیدا نشد.",
+                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                    await _userDbContext.ClearUserStatus(user);
+                    return;
+
+                }
+            }
+
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "set-renew-type", Flow = "update" });
+
+            await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "یک گزینه را انتخاب نمائید:",
+                    replyMarkup: replyKeboard, parseMode: ParseMode.Markdown);
+
+        }
+
 
         else if (user.Flow == "create" && user.LastStep == "Create New Account" && message.Text.Contains("خرید"))
         {
@@ -1821,92 +2009,9 @@ public class TelegramBotService : IHostedService
             }
 
         }
-
         else if (user.Flow == "create" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
         {
-
             await FinalizeCustomerAccount(_botClient, user, credUser, message);
-
-            // if (message.Text == "انصراف")
-            // {
-            //     await _userDbContext.ClearUserStatus(user);
-            //     return;
-            // }
-
-            // await botClient.CustomSendTextMessageAsync(
-            //                    chatId: message.Chat.Id,
-            //                    text: "لطفاً تا ساخته شدن اکانت چند لحظه صبر کنید ...",
-            //                     replyMarkup: new ReplyKeyboardRemove());
-
-
-            // var ready = await _userDbContext.IsUserReadyToCreate(message.From.Id);
-            // if (!ready) await botClient.CustomSendTextMessageAsync(
-            //            chatId: message.Chat.Id,
-            //            text: "مشخصات اکانت کامل نیست. لطفاً مراحل دریافت اکانت را به طور کامل طی کنید..",
-            //             replyMarkup: MainReplyMarkupKeyboardFa()); ;
-
-            // if (!ready)
-            // {
-            //     await _userDbContext.ClearUserStatus(user);
-            //     return;
-            // }
-
-            // // Access the server information from the servers.json file
-            // var serversJson = ReadJsonFile.ReadJsonAsString();
-            // var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
-
-            // if (servers.ContainsKey(user.SelectedCountry))
-            // {
-            //     var serverInfo = servers[user.SelectedCountry];
-
-            //     AccountDto accountDto = new AccountDto { TelegramUserId = message.From.Id, ServerInfo = serverInfo, SelectedCountry = user.SelectedCountry, SelectedPeriod = user.SelectedPeriod, AccType = user.Type, TotoalGB = user.TotoalGB };
-
-            //     var result = await CreateAccount(accountDto);
-
-            //     if (result)
-            //     {
-            //         user = await _userDbContext.GetUserStatus(user.Id);
-
-            //         ClientExtend client = await TryGetClient(user.ConfigLink);
-
-            //         if (client == null || client?.Enable == false)
-            //         {
-            //             await botClient.CustomSendTextMessageAsync(
-            //                           chatId: message.Chat.Id,
-            //                           text: "متاسفانه مشکلی در ساخت اکانت شما به وجود آمد. مجدداً دقایقی دیگر تلاش کنید",
-            //                            replyMarkup: MainReplyMarkupKeyboardFa());
-            //             await _userDbContext.ClearUserStatus(user);
-            //             return;
-            //         }
-
-
-            //         var msg = CaptionForAccountCreation(user, language: "fa", showTraffic: false);
-
-            //         await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
-            //         // .GetAwaiter()
-            //         // .GetResult();
-
-            //         await botClient.CustomSendTextMessageAsync(
-            //            chatId: message.Chat.Id,
-            //            text: "بازگشت به منوی اصلی",
-            //             replyMarkup: MainReplyMarkupKeyboardFa());
-            //         await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice));
-            //         await _userDbContext.ClearUserStatus(new User { Id = user.Id });
-
-            //     }
-            // }
-            // else
-            // {
-            //     // Handle the case where the selected country is not found in the servers.json file
-            //     await botClient.CustomSendTextMessageAsync(
-            //         chatId: message.Chat.Id,
-            //         text: $"اطلاعات سرور مورد نظر پیدا نشد.",
-            //         replyMarkup: MainReplyMarkupKeyboardFa());
-            //     await _userDbContext.ClearUserStatus(user);
-
-            // }
-            // await _userDbContext.ClearUserStatus(user);
-
         }
 
         else
@@ -1918,9 +2023,135 @@ public class TelegramBotService : IHostedService
                                         replyMarkup: MainReplyMarkupKeyboardFa());
 
         }
+
         return;
     }
 
+
+    private async Task FinalizeRenewCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
+    {
+        if (message.Text == "انصراف")
+        {
+            await _userDbContext.ClearUserStatus(user);
+            return;
+        }
+        await botClient.CustomSendTextMessageAsync(
+                           chatId: message.Chat.Id,
+                           text: "لطفاً تا ساخته شدن اکانت چند لحظه صبر کنید ...",
+                            replyMarkup: new ReplyKeyboardRemove());
+
+
+        var ready = await _userDbContext.IsUserReadyToCreate(message.From.Id);
+
+        if (!ready)
+        {
+            await botClient.CustomSendTextMessageAsync(
+                   chatId: message.Chat.Id,
+                   text: "مشخصات اکانت کامل نیست. لطفاً مراحل دریافت اکانت را به طور کامل طی کنید..",
+                    replyMarkup: MainReplyMarkupKeyboardFa());
+            await _userDbContext.ClearUserStatus(user);
+            return;
+        }
+
+        ClientExtend client = await TryGetClient(user.ConfigLink);
+        if (client == null)
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+            await botClient.CustomSendTextMessageAsync(
+                          chatId: message.Chat.Id,
+                          text: "مشکلی با لینک vmess ارسالی شما وجود دارد. سعی کنید ابتدا لینک سالم را برای ربات بفرستید و درصورت عدم رفع مشکل به پشتیبانی پیام دهید.",
+                           replyMarkup: new ReplyKeyboardRemove());
+            return;
+        }
+
+        if (client != null)
+        {
+            ServerInfo findedServer = null;
+            string findedcountry = null;
+            AccountDtoUpdate accountDto = null;
+            var serversJson = ReadJsonFile.ReadJsonAsString();
+            var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+
+            if (user.ConfigLink.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase))
+            {
+                var vmess = VMessConfiguration.DecodeVMessLink(user.ConfigLink);
+
+                // Iterate over the dictionary
+                foreach (var kvp in servers)
+                {
+                    string country = kvp.Key;
+                    ServerInfo serverInfo = kvp.Value;
+                    if (serverInfo.VmessTemplate.Add == vmess.Add)
+                    {
+                        serverInfo.Inbounds = new List<Inbound> { serverInfo.Inbounds.FirstOrDefault(i => i.Port.ToString() == vmess.Port) };
+                        serverInfo.VmessTemplate.Port = vmess.Port;
+                        findedServer = serverInfo;
+                        findedcountry = country;
+                    }
+                }
+
+                accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB, ConfigLink = user.ConfigLink };
+            }
+            await _userDbContext.SaveUserStatus(new User { Id = user.Id, SelectedCountry = findedcountry });
+            var result = await UpdateAccount(accountDto);
+
+            if (result)
+            {
+                user = await _userDbContext.GetUserStatus(user.Id);
+
+                if (client == null)
+                {
+                    await botClient.CustomSendTextMessageAsync(
+                                  chatId: message.Chat.Id,
+                                  text: "متاسفانه مشکلی در ساخت اکانت شما به وجود آمد. مجدداً دقایقی دیگر تلاش کنید",
+                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                    await _userDbContext.ClearUserStatus(user);
+                    return;
+                }
+
+                var msg = CaptionForAccountCreation(user, language: "fa", showTraffic: false);
+
+                await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                // .GetAwaiter()
+                // .GetResult();
+
+                await botClient.CustomSendTextMessageAsync(
+                   chatId: message.Chat.Id,
+                   text: "بازگشت به منوی اصلی",
+                    replyMarkup: MainReplyMarkupKeyboardFa());
+
+                long beforeBalance = credUser.AccountBalance;
+                await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice));
+                long afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
+
+                var logMesseage = $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
+
+                if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage.EscapeMarkdown());
+
+                if (user.SelectedPeriod == "1 Day")
+                {
+                    user.LastFreeAcc = DateTime.Now;
+                    _userDbContext.Users.Update(user);
+                    await _userDbContext.SaveChangesAsync();
+                }
+
+            }
+        }
+        else
+        {
+            // Handle the case where the selected country is not found in the servers.json file
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "مشکلی در بازیابی اطاعات اکانت ارسالی شما برای عملیات تمدید وجود دارد.",
+                replyMarkup: MainReplyMarkupKeyboardFa());
+            await _userDbContext.ClearUserStatus(user);
+
+        }
+
+        await _userDbContext.ClearUserStatus(user);
+
+    }
     private async Task FinalizeCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
     {
         if (message.Text == "انصراف")
@@ -1993,7 +2224,7 @@ public class TelegramBotService : IHostedService
 
                 var logMesseage = $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
 
-                if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage);
+                if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage.EscapeMarkdown());
 
                 if (user.SelectedPeriod == "1 Day")
                 {
@@ -2083,7 +2314,32 @@ public class TelegramBotService : IHostedService
         return selected;
         // Console.WriteLine($"Selected item: {selected}");
     }
+    public void TestGetRandomServerHits()
+    {
+        var hitDictionary = new Dictionary<string, int>();
+        int numberOfTests = 100;
 
+        for (int i = 0; i < numberOfTests; i++)
+        {
+            ServerInfo server = GetRandomServer();
+
+            if (hitDictionary.ContainsKey(server.Name))
+            {
+                hitDictionary[server.Name]++;
+            }
+            else
+            {
+                hitDictionary.Add(server.Name, 1);
+            }
+        }
+
+        // Calculate and print the percentage of hits for each server
+        foreach (var entry in hitDictionary)
+        {
+            double percentage = (double)entry.Value / numberOfTests * 100;
+            Console.WriteLine($"Server: {entry.Key}, Hits: {entry.Value}, Percentage: {percentage}%");
+        }
+    }
     private bool CheckButtonCorrectness(bool isColleague, string text)
     {
         return GetPrices(isColleague).Contains(text);
@@ -2119,6 +2375,12 @@ public class TelegramBotService : IHostedService
                     clientInfo += "\u200F" + "🔋 میزان مصرف : " + $"{totalUsed:F2}" + $" از {client.TotalGB.ConvertBytesToGB()} گیگابایت" + "\n";
                 else
                     clientInfo += "\u200F" + "🪫 میزان مصرف: " + $"{totalUsed:F2}" + $" از {client.TotalGB.ConvertBytesToGB()} گیگابایت" + "\n";
+
+                if (client.Enable)
+                    clientInfo += $"\u200F✔️ فعال  \n" + "\u200F غیر فعال سازی ⬅️" + $"/disable_{client.Email} \n";
+
+                else
+                    clientInfo += $"\u200F🚫 غیرفعال  \n" + "\u200F فعالسازی ⬅️" + $"/enable_{client.Email} \n";
 
             }
             else
@@ -2299,19 +2561,39 @@ public class TelegramBotService : IHostedService
     }
 
 
-    ReplyKeyboardMarkup PriceReplyMarkupKeyboardFa(bool isColleague)
+    ReplyKeyboardMarkup PriceReplyMarkupKeyboardFa(bool isColleague, bool isForRenew)
     {
-
         var prices = GetPrices(isColleague);
-        ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
-               {
+        if (isForRenew)
+        {
+            ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
+                          {
+                    new KeyboardButton[] { prices[0], prices[1] },
+                    new KeyboardButton[] { prices[2],prices[3] },
+                    new KeyboardButton[] { "🏠منو" ,"تمدید حجمی" }})
+            {
+                ResizeKeyboard = true,
+                OneTimeKeyboard = true
+            };
+
+            return replyKeyboardMarkup;
+        }
+        else
+        {
+            ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
+              {
                     new KeyboardButton[] { prices[0], prices[1] },
                     new KeyboardButton[] { prices[2],prices[3] },
                     new KeyboardButton[] { "🏠منو" }})
-        {
-            ResizeKeyboard = false
-        };
-        return replyKeyboardMarkup;
+            {
+                ResizeKeyboard = true,
+                OneTimeKeyboard = true
+            };
+
+            return replyKeyboardMarkup;
+
+        }
+
     }
 
     static ReplyKeyboardMarkup GetMainMenuKeyboard()
