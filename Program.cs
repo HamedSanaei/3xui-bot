@@ -13,7 +13,7 @@ class Program
 
 
         await new HostBuilder()
-            .ConfigureServices((hostContext, services) =>
+            .ConfigureServices(async (hostContext, services) =>
             {
                 // Build configuration manually
                 var configuration = new ConfigurationBuilder()

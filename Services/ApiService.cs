@@ -756,5 +756,15 @@ public class ApiService
                 throw new ArgumentException($"Invalid period: {period}");
         }
     }
+
+    internal static async Task<bool> AccountActivating(string email, long telegramUserId, bool enable)
+    {
+        var client = await FetchClientByEmail(email, telegramUserId);
+        if (client == null) return false;
+        if (client.TgId.Trim() != telegramUserId.ToString()) return false;
+        client.Enable = enable;
+
+
+    }
 }
 

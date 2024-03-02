@@ -1469,6 +1469,36 @@ public class TelegramBotService : IHostedService
                 replyMarkup: MainReplyMarkupKeyboardFa());
         }
 
+        else if (StartsWithEnableOrDisable(message.Text))
+        {
+            bool enable;
+            var input = message.Text;
+            if (message.Text.Contains("/enable_"))
+            {
+                input = message.Text.Replace("/enable_", "");
+                enable = true;
+            }
+            else
+            {
+                input = message.Text.Replace("/disable_", "");
+                enable = false;
+            }
+            // ممکن است که مشکلی در رابطه با ذخیره وی مس  در  دیتا بیس وجود داشته باشد.
+            await ApiService.AccountActivating(input, credUser.TelegramUserId, enable),
+            if (client == null)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                chatId: message.Chat.Id,
+                                text: "اکانت مورد نظر پیدا نشد.",
+                                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            //client.Enable
+
+        }
+
         else if (message.Text == "🌟اکانت رایگان")
         {
             var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
@@ -2682,6 +2712,11 @@ public class TelegramBotService : IHostedService
     {
         return value.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase)
             || value.StartsWith("vless://", StringComparison.OrdinalIgnoreCase);
+    }
+    static bool StartsWithEnableOrDisable(string value)
+    {
+        return value.StartsWith("/disable_", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("/enable_", StringComparison.OrdinalIgnoreCase);
     }
 
     static ServerInfo GetConfigServer(VMessConfiguration vmess)
