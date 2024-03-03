@@ -1491,7 +1491,7 @@ public class TelegramBotService : IHostedService
                 await _credentialsDbContext.SavePhoneNumber(message.From.Id, message.Contact.PhoneNumber);
                 await botClient.CustomSendTextMessageAsync(
                              chatId: message.Chat.Id,
-                             text: "شماره شما با موفقیت دریافت شد.",
+                             text: "شماره شما با موفقیت دریافت شد. برای درییافت اکانت رایگان روی گزینه دریافت اکانت رایگان مجدد کلیک کنید. ",
                              replyMarkup: MainReplyMarkupKeyboardFa());
                 return;
             }
@@ -1911,7 +1911,7 @@ public class TelegramBotService : IHostedService
                 replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
 
         }
-        else if (message.Text == "تمدید حجمی" && user.Flow == "update" && user.LastStep == "get-traffic")
+        else if (user.Flow == "update" && user.LastStep == "get-traffic")
         {
             var isSuccessful = int.TryParse(message.Text, out int res);
             if (!isSuccessful)
@@ -1934,6 +1934,7 @@ public class TelegramBotService : IHostedService
                 user.Type = "tunnel";
                 user.TotoalGB = res.ToString();
                 user.SelectedPeriod = "0 Month";
+
 
                 await _userDbContext.SaveUserStatus(user);
 
@@ -3011,10 +3012,10 @@ public class TelegramBotService : IHostedService
             string phoneNumber = message.Contact.PhoneNumber;
 
             // Check if the phone number starts with the Iranian country code
-            bool isIranianPhoneNumber = phoneNumber.StartsWith("+98") || phoneNumber.StartsWith("0098");
+            bool isIranianPhoneNumber = phoneNumber.StartsWith("98") || phoneNumber.StartsWith("+98") || phoneNumber.StartsWith("0098");
 
             // Check the length to be sure (country code + 10 digits)
-            if (isIranianPhoneNumber && (phoneNumber.Length == 13 || phoneNumber.Length == 14))
+            if (isIranianPhoneNumber && (phoneNumber.Length == 12 || phoneNumber.Length == 13 || phoneNumber.Length == 14))
             {
                 return true;
 
