@@ -411,8 +411,9 @@ public class ApiService
         return requestBody;
     }
 
-    public static async Task<ClientExtend> FetchClientByEmail(string email, long tgUserId)
+    public static async Task<(ClientExtend ClientExtend, string SelectedCountry)> FetchClientByEmail(string email, long tgUserId)
     {
+
 
         Client findedClient = null;
         ClientExtend emailClient = null;
@@ -496,18 +497,22 @@ public class ApiService
                     {
                     }
                     if (clientState == null) continue;
+
                     ClientExtend client = new ClientExtend
                     {
                         Id = findedClient.Id,
                         Email = findedClient.Email,
                         TotalGB = clientState.ClientStateObject.Total,
                         ExpiryTime = findedClient.ExpiryTime,
+                        ExpiryTimeRaw = findedClient.ExpiryTimeRaw,
                         SubId = findedClient.SubId,
+                        TgId = findedClient.TgId,
                         Enable = findedClient.Enable,
                         Down = clientState.ClientStateObject.Down,
                         Up = clientState.ClientStateObject.Up,
-                        InboundId = clientState.ClientStateObject.InboundId
+                        InboundId = clientState.ClientStateObject.InboundId,
                     };
+
                     emailClient = client;
 
                     var configLink = kvp.Value.VmessTemplate;
@@ -517,18 +522,21 @@ public class ApiService
                     //Console.WriteLine(responseBody);
                     UserDbContext _userDbContext = new UserDbContext();
 
+                    // this Is VERY IMPPRTANT  the renew method use this!
                     await _userDbContext.SaveUserStatus(new User { Id = tgUserId, ConfigLink = configLink.ToVMessLink(), Email = email, SubLink = kvp.Value.SubLinkUrl + client.Email, SelectedCountry = kvp.Key });
                     await _userDbContext.SaveChangesAsync();
 
-
+                    return (ClientExtend: emailClient, SelectedCountry: kvp.Key);
                 }
-                return emailClient;
+                // return emailClient;
+
             }
+
 
         }
 
-        if (emailClient != null) return emailClient;
-        return null;
+
+        return (ClientExtend: null, SelectedCountry: null);
     }
 
     public static async Task<ClientExtend> FetchClientFromServer(Guid id, ServerInfo serverInfo, int inboundId)
@@ -606,7 +614,10 @@ public class ApiService
             Id = findedClient.Id,
             Email = findedClient.Email,
             TotalGB = clientState.ClientStateObject.Total,
+            TgId = findedClient.TgId,
             ExpiryTime = findedClient.ExpiryTime,
+            ExpiryTimeRaw = findedClient.ExpiryTimeRaw,
+
             SubId = findedClient.SubId,
             Enable = findedClient.Enable,
             Down = clientState.ClientStateObject.Down,
@@ -703,8 +714,10 @@ public class ApiService
                 Email = findedClient.Email,
                 TotalGB = clientState.ClientStateObject.Total,
                 ExpiryTime = findedClient.ExpiryTime,
+                ExpiryTimeRaw = findedClient.ExpiryTimeRaw,
                 SubId = serverInfo.SubLinkUrl + findedClient.SubId,
                 Enable = findedClient.Enable,
+                TgId = findedClient.TgId,
                 Down = clientState.ClientStateObject.Down,
                 Up = clientState.ClientStateObject.Up,
                 InboundId = clientState.ClientStateObject.InboundId
@@ -759,12 +772,97 @@ public class ApiService
 
     internal static async Task<bool> AccountActivating(string email, long telegramUserId, bool enable)
     {
-        var client = await FetchClientByEmail(email, telegramUserId);
+        var res = await FetchClientByEmail(email, telegramUserId);
+        var client = res.ClientExtend;
         if (client == null) return false;
         if (client.TgId.Trim() != telegramUserId.ToString()) return false;
         client.Enable = enable;
 
+        string selectedCountry = res.SelectedCountry;
 
+
+
+
+        var serversJson = ReadJsonFile.ReadJsonAsString();
+        var servers = JsonConvert.DeserializeObject<Dictionary<string, ServerInfo>>(serversJson);
+
+        if (!servers.TryGetValue(selectedCountry, out ServerInfo serverInfo)) return false;
+
+
+        // login
+        var sessionCookie = await LoginAndGetSessionCookie(serverInfo);
+        // if (sessionCookie == null) throw new Exception("Error in login and get session cookie");
+        if (sessionCookie == null) return false;
+
+
+        // Create an HttpClientHandler
+        var handler = new HttpClientHandler();
+
+        // Create a CookieContainer and add your cookie
+        var cookieContainer = new CookieContainer();
+        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", sessionCookie));
+
+        // Assign the CookieContainer to the handler
+        handler.CookieContainer = cookieContainer;
+
+        // Create the HttpClient with the custom handler
+        var httpClient = new HttpClient(handler);
+
+        // Now you can use the httpClient to make requests with the specified cookie
+
+        // Create the request body
+        var inboundId = serverInfo.Inbounds.FirstOrDefault(i => i.Type == "tunnel");
+        if (inboundId == null) return false;
+        Client editedClient = client;
+
+        var requestBody = new
+        {
+            id = inboundId.Id,
+            settings = Client.MakeSettingString(editedClient)
+        };
+
+        //var apiUrl = accountDto.ServerInfo.Url + "/" + accountDto.ServerInfo.RootPath + "/" + "panel/api/inbounds/addClient";
+        var apiUrl = $"{serverInfo.Url}/{serverInfo.RootPath}/panel/api/inbounds/updateClient/{client.Id}";
+
+        try
+        {
+            // Send the POST request with the JSON body
+            HttpResponseMessage response = await httpClient.PostAsJsonAsync(apiUrl, requestBody);
+            string responseBody = await response.Content.ReadAsStringAsync();
+            AddClientResult result = JsonConvert.DeserializeObject<AddClientResult>(responseBody);
+
+
+            // Check if the request was successful
+            if (response.IsSuccessStatusCode && result.Success)
+            {
+                // Account created successfully
+                // Read and print the response content
+
+                // var configLink = serverInfo.VmessTemplate;
+                // configLink.Ps += client.Email;
+                // configLink.Id = client.Id;
+
+                // //Console.WriteLine(responseBody);
+                // UserDbContext _userDbContext = new UserDbContext();
+
+                // await _userDbContext.SaveUserStatus(new User { Id = telegramUserId, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
+                // await _userDbContext.SaveChangesAsync();
+                return true;
+
+            }
+            else
+            {
+                Console.WriteLine($"Error: {response.StatusCode} - {response.ReasonPhrase}");
+                Console.WriteLine($"Server Message:  isSuccessful:{result.Success} - {result.Msg}");
+                return false;
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"HttpRequestException: {ex.Message}");
+
+        }
+        return false;
     }
 }
 

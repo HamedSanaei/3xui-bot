@@ -70,9 +70,25 @@ public class Client
     public string Email { get; set; } = AccountGenerator.GenerateRandomAccountName();
     public int LimitIp { get; set; } = 0;
     public long TotalGB { get; set; }
+    // [JsonProperty("expiryTime")]
+    // [Newtonsoft.Json.JsonConverter(typeof(UnixTimestampConverter))]
+    // public DateTime ExpiryTime { get; set; }
+
+
     [JsonProperty("expiryTime")]
-    [Newtonsoft.Json.JsonConverter(typeof(UnixTimestampConverter))]
-    public DateTime ExpiryTime { get; set; }
+    public long ExpiryTimeRaw { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore]
+    public DateTime ExpiryTime
+    {
+        get
+        {
+            if (ExpiryTimeRaw < 0) return DateTime.UtcNow.AddMilliseconds(ExpiryTimeRaw * -1).ToLocalTime();
+
+            return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(ExpiryTimeRaw).ToLocalTime();
+        }
+        set => ExpiryTimeRaw = new DateTimeOffset(value).ToUnixTimeMilliseconds();
+    }
+
     public string TgId { get; set; } = "";
     public string SubId { get; set; } = AccountGenerator.GenerateRandomSubId();
     public bool Enable { get; set; } = true;
@@ -92,7 +108,9 @@ public class Client
         sb.Append(client.TotalGB.ToString());
         sb.Append(",\"expiryTime\":");
         sb.Append(ConvertDateTimeToTimestamp(client.ExpiryTime));
-        sb.Append(" ,\"enable\":true,\"tgId\":\"");
+        sb.Append(" ,\"enable\":");
+        sb.Append(client.Enable.ToString().ToLower());
+        sb.Append(",\"tgId\":\"");
         sb.Append(client.TgId);
         sb.Append("\",\"subId\":\"");
         sb.Append(client.SubId);

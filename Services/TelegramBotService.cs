@@ -18,6 +18,8 @@ using System.Security.Cryptography.X509Certificates;
 using System.Globalization;
 using System;
 using System.Text;
+using System.Linq.Expressions;
+using Microsoft.EntityFrameworkCore.Storage;
 
 public class TelegramBotService : IHostedService
 {
@@ -769,9 +771,89 @@ public class TelegramBotService : IHostedService
                                        chatId: message.Chat.Id,
                                        text: errorMessage,
                                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                    await _userDbContext.ClearUserStatus(currentUser);
+
+                }
+            }
+            else if (action == "ℹ️ See All account of user")
+            {
+                try
+                {
+                    // var userid = Convert.ToInt64(message.Text.Split('|').ElementAt(2));
+                    var userid = Convert.ToInt64(message.Text);
+                    if (userid == 0) throw new Exception("user id is null");
+                    var findedClient = _credentialsDbContext.Users.Any(c => c.TelegramUserId == userid);
+                    // if (!findedClient) await _credentialsDbContext.AddEmptyUser(userid);
+                    // else { }
+                    if (findedClient)
+                    {
+                        CredUser existedUser = await _credentialsDbContext.GetUserStatusWithId(userid);
+                        // var text = await GetUserProfileMessage(existedUser);
+
+                        await botClient.CustomSendTextMessageAsync(
+                      chatId: message.Chat.Id,
+                      text: "Please wait for tens seconds ...",
+                      replyMarkup: new ReplyKeyboardRemove());
+
+                        var accounts = await TryGetَAllClient(existedUser.TelegramUserId);
+                        if (accounts.Count < 1)
+                        {
+
+                            await botClient.CustomSendTextMessageAsync(
+                           chatId: message.Chat.Id,
+                           text: "There is no account for specified user!",
+                           replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+                            return;
+                        }
+
+                        await SendMessageWithClientInfo(message.Chat.Id, true, accounts);
+
+
+                        await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: "Main Menu",
+                            replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+
+                        await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                        return;
+
+                    }
+                    else
+                    {
+                        await botClient.CustomSendTextMessageAsync(
+                                                    chatId: message.Chat.Id,
+                                                    text: "User doesn't run the bot yet!. Ask him to first run the bot.",
+                                                    replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+                    }
+                    await _userDbContext.ClearUserStatus(currentUser);
 
                 }
 
+                catch (System.Exception ex)
+                {
+                    string errorMessage;
+                    switch (ex)
+                    {
+                        case ArgumentOutOfRangeException argumentOutOfRangeException:
+                            errorMessage = "There is no userid in Database";
+                            break;
+                        case FormatException formatException:
+                            errorMessage = "There is no userid in Database";
+                            break;
+                        case OverflowException overflowException:
+                            errorMessage = "There is no userid in Database";
+                            break;
+                        default:
+                            errorMessage = ex.Message;
+                            break;
+                    }
+                    await botClient.CustomSendTextMessageAsync(
+                                       chatId: message.Chat.Id,
+                                       text: errorMessage,
+                                       replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
+                    await _userDbContext.ClearUserStatus(currentUser);
+
+                }
             }
             //promote demote
             else if (action == "🚀 Promote as admin" || action == "❌ Demote as admin")
@@ -1276,7 +1358,7 @@ public class TelegramBotService : IHostedService
     }
     private string[] GetAdminActions()
     {
-        string[] actions = new string[] { "➕ Add credit", "➖ Reduce credit", "🚀 Promote as admin", "❌ Demote as admin", "ℹ️ See User Account", "📨 Send message to all", "📑 Menu" };
+        string[] actions = new string[] { "➕ Add credit", "➖ Reduce credit", "🚀 Promote as admin", "❌ Demote as admin", "ℹ️ See User Account", "📨 Send message to all", "ℹ️ See All account of user", "📑 Menu" };
         return actions;
     }
 
@@ -1323,6 +1405,37 @@ public class TelegramBotService : IHostedService
         return createAccountKeyboard;
     }
 
+    private string CaptionForRenewAccount(User user, DateTime expirationDateUTC, bool showTraffic)
+    {
+        string msg = "";
+        msg = $"✅ مشخصات اکانت شما:  \n";
+        msg += $"👤نام: `{user.Email}` \n";
+        msg += $"⌛️دوره : {ApiService.ConvertPeriodToDays(user.SelectedPeriod)} روزه \n";
+        // msg += $"Location: {user.SelectedCountry} \n";
+        if (showTraffic) msg += $"🧮 حجم ترافیک: {user.TotoalGB} گیگابایت\n";
+
+        string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
+
+        //expired
+        if (expirationDateUTC <= DateTime.UtcNow)
+            msg += $"📅تاریخ انقضاء:  {hijriShamsiDate}\n";
+        else
+        {
+            hijriShamsiDate = expirationDateUTC.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
+            msg += $"📅تاریخ انقضاء:  {hijriShamsiDate}\n";
+        }
+
+
+        // msg += "✳️ آموزش کانفیگ لینک" + $"**آی‌اواس** [link text]({_appConfig.ConfiglinkTutorial[0]})" + " | " + $"**اندروید** [link text]({_appConfig.ConfiglinkTutorial[1]}) \n";
+        // msg += "✴️ آموزش سابلینک (برای تعویض اتوماتیک و فیلترینگ شدید)" + $"**آی‌اواس** [link text]({_appConfig.SubLinkTotorial[0]})" + " | " + $"**اندروید** [link text]({_appConfig.SubLinkTotorial[1]}) \n";
+        msg += $"🔗 ساب لینک: \n `{user.SubLink}`\n \n ";
+
+        msg += $"🔗 لینک اتصال: \n";
+        msg += "=== برای کپی شدن لمس کنید === \n";
+        msg += $"`{user.ConfigLink}`" + "\n ";
+        return msg;
+    }
+
     private string CaptionForAccountCreation(User user, string language, bool showTraffic)
     {
         string msg;
@@ -1346,6 +1459,7 @@ public class TelegramBotService : IHostedService
             msg += $"⌛️دوره : {ApiService.ConvertPeriodToDays(user.SelectedPeriod)} روزه \n";
             // msg += $"Location: {user.SelectedCountry} \n";
             if (showTraffic) msg += $"🧮 حجم ترافیک: {user.TotoalGB} گیگابایت\n";
+
             string hijriShamsiDate = DateTime.UtcNow.AddDays(ApiService.ConvertPeriodToDays(user.SelectedPeriod)).AddMinutes(210).ConvertToHijriShamsi();
             msg += $"📅تاریخ انقضاء:  {hijriShamsiDate}\n";
 
@@ -1483,20 +1597,27 @@ public class TelegramBotService : IHostedService
                 input = message.Text.Replace("/disable_", "");
                 enable = false;
             }
-            // ممکن است که مشکلی در رابطه با ذخیره وی مس  در  دیتا بیس وجود داشته باشد.
-            await ApiService.AccountActivating(input, credUser.TelegramUserId, enable),
-            if (client == null)
+
+            bool result = await ApiService.AccountActivating(input, credUser.TelegramUserId, enable);
+
+
+            if (!result)
             {
                 await botClient.CustomSendTextMessageAsync(
                                 chatId: message.Chat.Id,
-                                text: "اکانت مورد نظر پیدا نشد.",
+                                text: "متاسفانه عملیات مورد نظر انجام نشد!",
                                 replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                await _userDbContext.ClearUserStatus(user);
-                return;
+            }
+            else
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                chatId: message.Chat.Id,
+                                text: "عملیات مورد نظر با موفقیت انجام شد!",
+                                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
             }
 
-            //client.Enable
-
+            await _userDbContext.ClearUserStatus(user);
+            return;
         }
 
         else if (message.Text == "🌟اکانت رایگان")
@@ -1755,9 +1876,6 @@ public class TelegramBotService : IHostedService
         else if (message.Text == "وضعیت اکانت های من")
         {
 
-
-
-
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "لطفاً چند ثانیه صبر کنید. دریافت اطلاعات از سرورها ممکن است لحظاتی طول بکشد ...",
@@ -1854,7 +1972,6 @@ public class TelegramBotService : IHostedService
 
         }
 
-
         else if (message.Text == "تمدید حجمی" && user.Flow == "update")
         {
             user.LastStep = "get-traffic";
@@ -1871,7 +1988,7 @@ public class TelegramBotService : IHostedService
             await FinalizeRenewCustomerAccount(_botClient, user, credUser, message);
 
         }
-        else if (user.Flow == "update" && user.LastStep == "set-renew-type" && message.Text.Contains("خرید"))
+        else if (user.Flow == "update" && user.LastStep == "set-renew-type" && message.Text.Contains("تمدید"))
         {
             long price = TryParsPrice(message.Text);
             if (price == 0)
@@ -1884,7 +2001,7 @@ public class TelegramBotService : IHostedService
                 return;
             }
 
-            if (CheckButtonCorrectness(credUser.IsColleague, message.Text) == false)
+            if (CheckButtonCorrectness(credUser.IsColleague, message.Text, true) == false)
             {
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -1896,7 +2013,8 @@ public class TelegramBotService : IHostedService
 
             if (credUser.AccountBalance >= price)
             {
-                await PrepareAccount(message.Text, credUser, user);
+
+                await PrepareAccount(message.Text, credUser, user, true);
                 user.Flow = "update";
                 user.LastStep = "ask_confirmation";
                 user._ConfigPrice = price.ToString();
@@ -1951,11 +2069,15 @@ public class TelegramBotService : IHostedService
                 user.ConfigLink = message.Text;
                 await _userDbContext.SaveUserStatus(user);
             }
-            else if (input.StartsWith("vniacc", StringComparison.OrdinalIgnoreCase))
+            else // if (message.Text.StartsWith("/renew_", StringComparison.OrdinalIgnoreCase))
             {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "لطفاً چند لحظه صبر کنید تا اکانت شما را پیدا کنیم. این عملیات ممکن است چند ثانیه طول بکشد...",
+                    replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
                 // ممکن است که مشکلی در رابطه با ذخیره وی مس  در  دیتا بیس وجود داشته باشد.
                 var client = await ApiService.FetchClientByEmail(input, credUser.TelegramUserId);
-                if (client == null)
+                if (client.ClientExtend == null)
                 {
                     await botClient.CustomSendTextMessageAsync(
                                     chatId: message.Chat.Id,
@@ -1976,7 +2098,6 @@ public class TelegramBotService : IHostedService
 
         }
 
-
         else if (user.Flow == "create" && user.LastStep == "Create New Account" && message.Text.Contains("خرید"))
         {
             long price = TryParsPrice(message.Text);
@@ -1990,7 +2111,7 @@ public class TelegramBotService : IHostedService
                 return;
             }
 
-            if (CheckButtonCorrectness(credUser.IsColleague, message.Text) == false)
+            if (CheckButtonCorrectness(credUser.IsColleague, message.Text, false) == false)
             {
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -2002,7 +2123,7 @@ public class TelegramBotService : IHostedService
 
             if (credUser.AccountBalance >= price)
             {
-                await PrepareAccount(message.Text, credUser, user);
+                await PrepareAccount(message.Text, credUser, user, false);
                 user.Flow = "create";
                 user.LastStep = "ask_confirmation";
                 user._ConfigPrice = price.ToString();
@@ -2067,7 +2188,7 @@ public class TelegramBotService : IHostedService
         }
         await botClient.CustomSendTextMessageAsync(
                            chatId: message.Chat.Id,
-                           text: "لطفاً تا ساخته شدن اکانت چند لحظه صبر کنید ...",
+                           text: "لطفاً تا تمدید شدن اکانت چند لحظه صبر کنید ...",
                             replyMarkup: new ReplyKeyboardRemove());
 
 
@@ -2140,7 +2261,7 @@ public class TelegramBotService : IHostedService
                     return;
                 }
 
-                var msg = CaptionForAccountCreation(user, language: "fa", showTraffic: false);
+                var msg = CaptionForRenewAccount(user, expirationDateUTC: client.ExpiryTime, showTraffic: false);
 
                 await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
                 // .GetAwaiter()
@@ -2155,7 +2276,7 @@ public class TelegramBotService : IHostedService
                 await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice));
                 long afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
 
-                var logMesseage = $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
+                var logMesseage = "تمدید \n" + $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
 
                 if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage.EscapeMarkdown());
 
@@ -2303,10 +2424,10 @@ public class TelegramBotService : IHostedService
         return isJoined;
 
     }
-    private async Task PrepareAccount(string messageText, CredUser credUser, User user)
+    private async Task PrepareAccount(string messageText, CredUser credUser, User user, bool isForRenew)
     {
 
-        var priceConfig = GetPriceConfig(messageText, credUser);
+        var priceConfig = GetPriceConfig(messageText, credUser, isForRenew);
         ServerInfo randomServerInfo = GetRandomServer();
         var serverInfo = randomServerInfo;
 
@@ -2370,9 +2491,9 @@ public class TelegramBotService : IHostedService
             Console.WriteLine($"Server: {entry.Key}, Hits: {entry.Value}, Percentage: {percentage}%");
         }
     }
-    private bool CheckButtonCorrectness(bool isColleague, string text)
+    private bool CheckButtonCorrectness(bool isColleague, string text, bool isForRenew)
     {
-        return GetPrices(isColleague).Contains(text);
+        return GetPrices(isColleague, isForRenew).Contains(text);
     }
 
     public async Task SendMessageWithClientInfo(ChatId chatId, bool isColleague, List<ClientExtend> clients)
@@ -2382,18 +2503,24 @@ public class TelegramBotService : IHostedService
         string clientInfo = "وضعیت اکانت های شما به شرح زیر است: \n";
         foreach (var client in clients)
         {
-            clientInfo = $"👤 نام: `{client.Email}`\n" +
-                               // $"- Name: {client.Name}\n" +
-                               // $"- Subscription: {client.}\n" +
-                               $"📅 انقضاء: {client.ExpiryTime.ConvertToHijriShamsi()}\n";
+            clientInfo = $"👤 نام: `{client.Email}`\n";
+            // $"- Name: {client.Name}\n" +
+            // $"- Subscription: {client.}\n" +
 
-            if (client.ExpiryTime < DateTime.UtcNow)
-                clientInfo += $"\u200F🚫 منقضی شده است. \n";
-            else if ((client.ExpiryTime - DateTime.UtcNow) <= TimeSpan.FromDays(5))
-                clientInfo += $"\u200F❕⌛️ روزهای باقی‌مانده: " + (client.ExpiryTime - DateTime.UtcNow).Days + " روز \n";
 
+            if (client.ExpiryTimeRaw > 0)
+            {
+                clientInfo += $"📅 انقضاء: {client.ExpiryTime.ConvertToHijriShamsi()}\n";
+                if (client.ExpiryTime < DateTime.UtcNow)
+                    clientInfo += $"\u200F🚫 منقضی شده است. \n";
+                else if ((client.ExpiryTime - DateTime.UtcNow) <= TimeSpan.FromDays(5))
+                    clientInfo += $"\u200F❕⌛️ روزهای باقی‌مانده: " + (client.ExpiryTime - DateTime.UtcNow).Days + " روز \n";
+
+                else
+                    clientInfo += $"\u200F⏳ روزهای باقی‌مانده: " + (client.ExpiryTime - DateTime.UtcNow).Days + " روز \n";
+            }
             else
-                clientInfo += $"\u200F⏳ روزهای باقی‌مانده: " + (client.ExpiryTime - DateTime.UtcNow).Days + " روز \n";
+                clientInfo += $"\u200F⌛️ روزهای باقی‌مانده: " + (client.ExpiryTime - DateTime.UtcNow).Days + " روز پس از برقراری اولین اتصال \n";
 
 
 
@@ -2480,39 +2607,41 @@ public class TelegramBotService : IHostedService
         }
         return text.EscapeMarkdown();
     }
-    string[] GetPrices(bool isColleague)
+    string[] GetPrices(bool isColleague, bool isForRenew)
     {
 
         List<string> buttonsName = new List<string>();
-
-        if (isColleague)
+        if (isForRenew)
         {
-            _appConfig.PriceColleagues.ForEach(i => buttonsName.Add($"خرید اکانت {i.DurationName} قیمت {i.Price}"));
-
-
-            //     return new string[]{ "خرید اکانت یک ماهه قیمت 60000",
-            // "خرید اکانت  دو ماهه قیمت 120000",
-            // "خرید اکانت سه ماهه قیمت 180000",
-            // "خرید اکانت شش ماهه قیمت 360000" };
+            if (isColleague)
+            {
+                _appConfig.PriceColleagues.ForEach(i => buttonsName.Add($"تمدید اکانت {i.DurationName} قیمت {i.Price}"));
+            }
+            else
+            {
+                _appConfig.Price.ForEach(i => buttonsName.Add($"تمدید اکانت {i.DurationName} قیمت {i.Price}"));
+            }
         }
         else
         {
-            _appConfig.Price.ForEach(i => buttonsName.Add($"خرید اکانت {i.DurationName} قیمت {i.Price}"));
-
-            //     return new string[]{ "خرید اکانت یک ماهه قیمت 149000",
-            // "خرید اکانت  دو ماهه قیمت 259000",
-            // "خرید اکانت سه ماهه قیمت 345000",
-            // "خرید اکانت شش ماهه قیمت 649000" };
+            if (isColleague)
+            {
+                _appConfig.PriceColleagues.ForEach(i => buttonsName.Add($"خرید اکانت {i.DurationName} قیمت {i.Price}"));
+            }
+            else
+            {
+                _appConfig.Price.ForEach(i => buttonsName.Add($"خرید اکانت {i.DurationName} قیمت {i.Price}"));
+            }
         }
         return buttonsName.ToArray();
     }
 
-    PriceConfig GetPriceConfig(string messageText, CredUser credUser)
+    PriceConfig GetPriceConfig(string messageText, CredUser credUser, bool isForRenew)
     {
         var appConfig = _configuration.Get<AppConfig>();
 
         PriceConfig priceConfig;
-        var prices = GetPrices(credUser.IsColleague);
+        var prices = GetPrices(credUser.IsColleague, isForRenew);
         int index = -1;
         try
         {
@@ -2593,8 +2722,8 @@ public class TelegramBotService : IHostedService
 
     ReplyKeyboardMarkup PriceReplyMarkupKeyboardFa(bool isColleague, bool isForRenew)
     {
-        var prices = GetPrices(isColleague);
-        if (isForRenew)
+        var prices = GetPrices(isColleague, isForRenew);
+        if (isForRenew && isColleague)
         {
             ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
                           {
