@@ -139,3 +139,6 @@ bin
 
 Data/servers.json
 Data/configuration.json
+
+Data/credentials_backup.db
+Data/credentials.db

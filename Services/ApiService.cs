@@ -42,7 +42,7 @@ public class ApiService
             if (dbCookie.ExpirationDate > currentUtcTime && await IsCookieValid(serverInfo, cookie))
                 return dbCookie.SessionCookie;
         }
-        else if (dbCookie?.ExpirationDate < DateTimeOffset.UtcNow || dbCookie == null)
+        if (dbCookie?.ExpirationDate < DateTimeOffset.UtcNow || dbCookie == null)
         {
             // valid nist 
             // Set the base address of your API
@@ -71,9 +71,21 @@ public class ApiService
                 //Console.WriteLine($"Complete Session Cookie: {completeSessionCookie}");
                 TryExtractExpirationDate(completeSessionCookie, out var expirationDate);
                 var purecookie = GetSessionCookie(completeSessionCookie);
-                CookieData cookieData = new CookieData { Id = new Guid(), Url = apiUrl, ExpirationDate = expirationDate, SessionCookie = purecookie };
-                await context.Cookies.AddAsync(cookieData);
-                context.SaveChanges();
+
+                if (dbCookie != null)
+                {
+                    dbCookie.ExpirationDate = expirationDate;
+                    dbCookie.SessionCookie = purecookie;
+                    context.Cookies.Update(dbCookie);
+                    context.SaveChanges();
+                }
+                else
+                {
+                    CookieData cookieData = new CookieData { Id = new Guid(), Url = apiUrl, ExpirationDate = expirationDate, SessionCookie = purecookie };
+                    await context.Cookies.AddAsync(cookieData);
+                    context.SaveChanges();
+                }
+
             }
             else
             {
@@ -171,6 +183,11 @@ public class ApiService
         var inboundId = accountDto.ServerInfo.Inbounds.FirstOrDefault(i => i.Type == accountDto.AccType);
         if (inboundId == null) return false;
         Client client = new Client { TgId = accountDto.TelegramUserId.ToString(), TotalGB = ConvertGBToBytes(Convert.ToInt32(accountDto.TotoalGB)), ExpiryTime = DateTime.Now.AddDays(ConvertPeriodToDays(accountDto.SelectedPeriod)) };
+
+        if (accountDto.IsColleague)
+        {
+            client.Email = client.Email + "_" + accountDto.AccountCounter.ToString();
+        }
 
         var setting = Client.MakeSettingString(client);
         if (accountDto.AccType == "realityv6")

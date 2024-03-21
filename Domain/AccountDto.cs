@@ -16,6 +16,9 @@ namespace Adminbot.Domain
         public ServerInfo ServerInfo { get; set; }
         //reality or tunnel
         public string AccType { get; set; }
+        public int AccountCounter { get; set; }
+        public bool IsColleague { get; set; }
+
     }
     public class AccountDtoUpdate : AccountDto
     {

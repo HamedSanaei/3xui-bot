@@ -1479,6 +1479,7 @@ public class TelegramBotService : IHostedService
     {
 
 
+
         if (update.Message is not { } message)
             return;
         if (message is not null && message.Type == MessageType.Contact && message.Contact != null)
@@ -1541,15 +1542,18 @@ public class TelegramBotService : IHostedService
             return;
         }
 
+
+
         if (message.Text == "/start")
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
             await botClient.CustomSendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: "به ربات خوش آمدید!",
-                replyMarkup: MainReplyMarkupKeyboardFa());
+               chatId: message.Chat.Id,
+               text: "به ربات خوش آمدید!",
+               replyMarkup: MainReplyMarkupKeyboardFa());
+            return;
         }
-        if (message.Text == "عضو شدم!")
+        else if (message.Text == "عضو شدم!")
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
             await botClient.CustomSendTextMessageAsync(
@@ -2338,7 +2342,7 @@ public class TelegramBotService : IHostedService
         {
             var serverInfo = servers[user.SelectedCountry];
 
-            AccountDto accountDto = new AccountDto { TelegramUserId = message.From.Id, ServerInfo = serverInfo, SelectedCountry = user.SelectedCountry, SelectedPeriod = user.SelectedPeriod, AccType = user.Type, TotoalGB = user.TotoalGB };
+            AccountDto accountDto = new AccountDto { TelegramUserId = message.From.Id, IsColleague = credUser.IsColleague, AccountCounter = user.AccountCounter + 1, ServerInfo = serverInfo, SelectedCountry = user.SelectedCountry, SelectedPeriod = user.SelectedPeriod, AccType = user.Type, TotoalGB = user.TotoalGB };
 
             var result = await CreateAccount(accountDto);
 
@@ -2384,7 +2388,8 @@ public class TelegramBotService : IHostedService
                     _userDbContext.Users.Update(user);
                     await _userDbContext.SaveChangesAsync();
                 }
-
+                user.AccountCounter = user.AccountCounter + 1;
+                await _userDbContext.SaveUserStatus(user);
                 await _userDbContext.ClearUserStatus(new User { Id = user.Id });
 
             }
@@ -2511,7 +2516,7 @@ public class TelegramBotService : IHostedService
 
             if (client.ExpiryTimeRaw > 0)
             {
-                clientInfo += $"📅 انقضاء: {client.ExpiryTime.ConvertToHijriShamsi()}\n";
+                clientInfo += $"📅 انقضاء: {client.ExpiryTime.AddMinutes(210).ConvertToHijriShamsi()}\n";
                 if (client.ExpiryTime < DateTime.UtcNow)
                     clientInfo += $"\u200F🚫 منقضی شده است. \n";
                 else if ((client.ExpiryTime - DateTime.UtcNow) <= TimeSpan.FromDays(5))

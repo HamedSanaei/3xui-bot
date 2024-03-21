@@ -38,6 +38,7 @@ public class User
     }
     public DateTime LastFreeAcc { get; set; } = DateTime.MinValue;
     public string PaymentMethod { get; set; } = "credit";
+    public int AccountCounter { get; set; }
 
 }
 public class CookieData

@@ -11,6 +11,8 @@ class Program
     static async Task Main(string[] args)
     {
 
+        // var ucontext = new UserDbContext();
+        // ucontext.Database.Migrate();
 
         await new HostBuilder()
             .ConfigureServices(async (hostContext, services) =>
@@ -55,6 +57,7 @@ class Program
                     //var vpnetiranbot = "6651502559:AAGmpsPINM5OB43vANs28ezkhfVLdJZAMcc";
 
                     return new TelegramBotClient(configuration["botToken"]);
+
                     // return new TelegramBotClient(bot1);
                 });
 

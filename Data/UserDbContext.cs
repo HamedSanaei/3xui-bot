@@ -38,14 +38,15 @@ public class UserDbContext : DbContext
             if (user.Email != null) existingUser.Email = user.Email;
             if (user.Flow != null) existingUser.Flow = user.Flow;
             if (user._ConfigPrice != null) existingUser._ConfigPrice = user._ConfigPrice;
+            if (user.AccountCounter > existingUser.AccountCounter) existingUser.AccountCounter = user.AccountCounter;
 
         }
         await context.SaveChangesAsync();
 
     }
 
-    public async Task ClearUserStatus(User user)
 
+    public async Task ClearUserStatus(User user)
     {
         var context = new UserDbContext();
         context.Database.EnsureCreated(); // Create the database if it doesn't exist
@@ -71,8 +72,6 @@ public class UserDbContext : DbContext
             existingUser.Type = "";
             existingUser.SubLink = "";
             existingUser.ConfigPrice = 0;
-
-
 
         }
         await context.SaveChangesAsync();
