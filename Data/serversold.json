@@ -1,0 +1,208 @@
+{
+  "🇩🇪 Germany": {
+    "username": "amirsan",
+    "password": "hamedsan",
+    "url": "https://mizban.hamedgeek.top:2053",
+    "subLinkUrl": "https://shiraz.feelpower.ir:5001/sub/",
+    "rootPath": "bc0e51",
+    "name": "Germany",
+    "chance": 2,
+    "inbounds": [
+      {
+        "id": 24,
+        "type": "tunnel",
+        "port": 2083
+      },
+      {
+        "id": 15,
+        "type": "realityv6",
+        "port": 443
+      },
+      {
+        "id": 14,
+        "type": "tunnel",
+        "port": 8080
+      }
+    ],
+    "vmessTemplate": {
+      "v": "2",
+      "ps": "Dorm-",
+      "add": "shiraz.hamedmorgen.ir",
+      "port": "2083",
+      "id": "0228fcee-8ec4-4083-b78d-5c30d09cdecb",
+      "aid": "0",
+      "scy": "auto",
+      "net": "ws",
+      "type": "none",
+      "host": "shiraz.hamedmorgen.ir",
+      "path": "/dorm",
+      "tls": "tls",
+      "sni": "shiraz.hamedmorgen.ir",
+      "alpn": "h2,http/1.1",
+      "fp": "chrome"
+    },
+    "vless": {
+      "domain": "rde.tofanservice.ir"
+    }
+  },
+  "🇫🇮 Finland": {
+    "username": "amirsan",
+    "password": "hamedsan",
+    "url": "https://qom.hamedgeek.top:2053",
+    "subLinkUrl": "https://tehran.feelpower.ir:5002/sub/",
+    "rootPath": "bc0e51",
+    "name": "Sweden",
+    "chance": 2,
+    "inbounds": [
+      {
+        "id": 20,
+        "type": "tunnel",
+        "port": 2082
+      },
+      {
+        "id": 15,
+        "type": "realityv6",
+        "port": 443
+      }
+    ],
+    "vmessTemplate": {
+      "v": "2",
+      "ps": "VpnOnyx-FI-",
+      "add": "tehran.hamedmorgen.ir",
+      "port": 2082,
+      "id": "9c81d12b-811f-4b06-9057-c311763614b5",
+      "aid": "0",
+      "scy": "auto",
+      "net": "ws",
+      "type": "none",
+      "tls": "tls",
+      "path": "/VpnOnyxSE",
+      "host": "tehran.hamedmorgen.ir",
+      "sni": "tehran.hamedmorgen.ir",
+      "fp": "chrome",
+      "alpn": "http/1.1,h2"
+    },
+    "vless": {
+      "domain": "rswe.tofanservice.ir"
+    }
+  },
+  "🇪🇪 Estonia": {
+    "username": "hamed",
+    "password": "behzad",
+    "url": "https://bg.hamedgeek.top:2053",
+    "subLinkUrl": "https://mashhad.feelpower.ir:5003/sub/",
+    "rootPath": "bc0e51",
+    "name": "Blgaria",
+    "chance": 1,
+    "inbounds": [
+      {
+        "id": 23,
+        "type": "tunnel",
+        "port": 2052
+      },
+      {
+        "id": 7,
+        "type": "realityv6",
+        "port": 443
+      }
+    ],
+    "vmessTemplate": {
+      "v": "2",
+      "ps": "VpnOnyx-EE-",
+      "add": "mashhad.hamedmorgen.ir",
+      "port": "2052",
+      "id": "c78a7998-8878-44bf-9eaa-c2016e93f746",
+      "aid": "0",
+      "scy": "auto",
+      "net": "ws",
+      "type": "none",
+      "host": "mashhad.hamedmorgen.ir",
+      "path": "/VpnOnyxBG",
+      "tls": "tls",
+      "sni": "mashhad.hamedmorgen.ir",
+      "alpn": "http/1.1,h2",
+      "fp": "chrome"
+    },
+    "vless": {
+      "domain": "rbg.tofanservice.ir"
+    }
+  },
+
+  "🇺🇸 UnitedStates": {
+    "username": "amirsan",
+    "password": "hamedsan",
+    "url": "https://mizban.hamedgeek.top:2053",
+    "rootPath": "bc0e51",
+    "subLinkUrl": "https://yazd.feelpower.ir:5004/sub/",
+    "name": "UnitedStates",
+    "chance": 0,
+    "inbounds": [
+      {
+        "id": 26,
+        "type": "tunnel",
+        "port": 8086
+      },
+      {
+        "id": 5,
+        "type": "realityv6",
+        "port": 443
+      }
+    ],
+    "vmessTemplate": {
+      "v": "2",
+      "ps": "VpnOnyx-US-",
+      "add": "yazd.hamedmorgen.ir",
+1     "port": 8086,
+      "id": "9c81d12b-811f-4b06-9057-c311763614b5",
+      "aid": "0",
+      "scy": "auto",
+      "net": "ws",
+      "type": "none",
+      "tls": "tls",
+      "path": "/",
+      "host": "yazd.hamedmorgen.ir",
+      "sni": "yazd.hamedmorgen.ir",
+      "fp": "chrome",
+      "alpn": "http/1.1,h2"
+    },
+    "vless": {
+      "domain": "rus.tofanservice.ir"
+    }
+  },
+  "Test": {
+    "username": "amirsan",
+    "password": "zedbazi88",
+    "url": "https://de.hamedgeek.top:2053",
+    "subLinkUrl": "https://sub.lightningservice.ir:6002/sub/",
+    "rootPath": "bc0e51",
+    "name": "Germany-Test",
+    "chance": 0,
+    "inbounds": [
+      {
+        "id": 17,
+        "type": "tunnel",
+        "port": 1080
+      }
+    ],
+    "vmessTemplate": {
+      "v": "2",
+      "ps": "Test-",
+      "add": "test.lightningservice.ir",
+      "port": "1080",
+      "id": "0228fcee-8ec4-4083-b78d-5c30d09cdecb",
+      "aid": "0",
+      "scy": "auto",
+      "net": "ws",
+      "type": "none",
+      "host": "test.lightningservice.ir",
+      "path": "/",
+      "tls": "tls",
+      "sni": "test.lightningservice.ir",
+      "alpn": "h2,http/1.1,h3",
+      "fp": "chrome"
+    },
+    "vless": {
+      "domain": "rde.tofanservice.ir"
+    }
+  }
+}

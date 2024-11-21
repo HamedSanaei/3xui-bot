@@ -10,7 +10,7 @@ using Telegram.Bot.Types.ReplyMarkups;
 
 public static class TelegramBotClientExtensions
 {
-    public static async Task CustomSendTextMessageAsync(
+    public static async Task<Message> CustomSendTextMessageAsync(
         this ITelegramBotClient botClient,
         ChatId chatId,
         string text,
@@ -25,9 +25,10 @@ public static class TelegramBotClientExtensions
         IReplyMarkup replyMarkup = null,
         CancellationToken cancellationToken = default)
     {
+        Message result = null;
         try
         {
-            await botClient.SendTextMessageAsync(
+            result = await botClient.SendTextMessageAsync(
                 chatId,
                 text,
                 messageThreadId,
@@ -51,6 +52,8 @@ public static class TelegramBotClientExtensions
             // Log other exceptions
             Console.WriteLine($"An error occurred: {ex.Message}");
         }
+
+        return result;
     }
 
 

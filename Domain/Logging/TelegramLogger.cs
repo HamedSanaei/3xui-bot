@@ -44,9 +44,17 @@ namespace Adminbot.Domain.Logging
             }
 
             var message = formatter(state, exception);
-            SendMessageToChannelAsync(message).Wait();
-            BackupDatabas().Wait();
+            if (eventId.Id == 1000 && eventId.Name == "Payment")
+            {
+                LogPayment(message).Wait();
+                // BackupDatabas().Wait();
+            }
+            else
+            {
+                SendMessageToChannelAsync(message).Wait();
+                //BackupDatabas().Wait();
 
+            }
 
         }
 
@@ -78,6 +86,28 @@ namespace Adminbot.Domain.Logging
                 chatId: _backupChannelId,
                 document: InputFile.FromStream(stream: stream, fileName: "credentials.db"),
                 caption: DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi());
+        }
+
+        public async Task LogPayment(string message)
+        {
+            try
+            {
+                // Escape HTML-sensitive characters for proper rendering in HTML mode
+                ;
+
+                // Send message using ParseMode.Html
+                await _botClient.SendTextMessageAsync(
+                    _channelId,
+                    message,
+                    parseMode: Telegram.Bot.Types.Enums.ParseMode.Html
+                );
+
+                BackupDatabas().Wait();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Exception in LogPayment: {ex.Message}");
+            }
         }
 
         private async Task SendMessageToChannelAsync(string message)

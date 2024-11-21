@@ -77,13 +77,13 @@ public class ApiService
                     dbCookie.ExpirationDate = expirationDate;
                     dbCookie.SessionCookie = purecookie;
                     context.Cookies.Update(dbCookie);
-                    context.SaveChanges();
+                    await context.SaveChangesAsync();
                 }
                 else
                 {
                     CookieData cookieData = new CookieData { Id = new Guid(), Url = apiUrl, ExpirationDate = expirationDate, SessionCookie = purecookie };
                     await context.Cookies.AddAsync(cookieData);
-                    context.SaveChanges();
+                    await context.SaveChangesAsync();
                 }
 
             }
@@ -169,6 +169,9 @@ public class ApiService
 
         // Create a CookieContainer and add your cookie
         var cookieContainer = new CookieContainer();
+
+        // var xff = "MTcxODIxMTY2OXxEWDhFQVFMX2dBQUJFQUVRQUFCMV80QUFBUVp6ZEhKcGJtY01EQUFLVEU5SFNVNWZWVk5GVWhoNExYVnBMMlJoZEdGaVlYTmxMMjF2WkdWc0xsVnpaWExfZ1FNQkFRUlZjMlZ5QWYtQ0FBRUVBUUpKWkFFRUFBRUlWWE5sY201aGJXVUJEQUFCQ0ZCaGMzTjNiM0prQVF3QUFRdE1iMmRwYmxObFkzSmxkQUVNQUFBQUd2LUNGd0VDQVFkaGJXbHljMkZ1QVFsNlpXUmlZWHBwT0RnQXzzRIGYIgPo8voWj8dpPkOlMdk5tAmN8SxAzg0YmKHqWg==";
+        // cookieContainer.Add(new Uri(accountDto.ServerInfo.Url), new Cookie("session", xff));
         cookieContainer.Add(new Uri(accountDto.ServerInfo.Url), new Cookie("session", accountDto.SessionCookie));
 
         // Assign the CookieContainer to the handler
@@ -646,7 +649,6 @@ public class ApiService
         return client;
 
     }
-
 
     public static async Task<List<ClientExtend>> FetchAllClientFromServer(long telegramUserId, ServerInfo serverInfo, int inboundId)
     {

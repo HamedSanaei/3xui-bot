@@ -17,8 +17,9 @@ namespace Adminbot.Domain
         public string SupportAccount { get; set; }
         public string MainChannel { get; set; }
         public string LoggerChannel { get; set; }
+        public string NowPaymentApiKey { get; set; }
+        public string ZibalMerchantCode { get; set; }
         public long BackupChannel { get; set; }
-
         public string[] IosTutorial { get; set; }
         public string[] AndroidTutorial { get; set; }
         public string[] WindowsTutorial { get; set; }
@@ -26,6 +27,7 @@ namespace Adminbot.Domain
         public List<string> ChannelIds { get; set; }
 
         public List<PriceConfig> PriceColleagues { get; set; }
+        public List<PriceConfig> PriceCommon { get; set; }
 
         public List<PriceConfig> Price { get; set; }
     }
@@ -36,6 +38,7 @@ namespace Adminbot.Domain
         public int Traffic { get; set; }
         public int Price { get; set; }
         public string Duration { get; set; }
+        public string FakeDescription { get; set; }
 
     }
 

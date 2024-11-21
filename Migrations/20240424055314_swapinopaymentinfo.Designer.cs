@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -9,12 +10,14 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    partial class UserDbContextModelSnapshot : ModelSnapshot
+    [Migration("20240424055314_swapinopaymentinfo")]
+    partial class swapinopaymentinfo
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder.HasAnnotation("ProductVersion", "8.0.0");
+            modelBuilder.HasAnnotation("ProductVersion", "7.0.0");
 
             modelBuilder.Entity("Adminbot.Domain.SwapinoPaymentInfo", b =>
                 {
@@ -47,41 +50,22 @@ namespace Adminbot.Migrations
 
                     b.HasKey("Payment_Id");
 
-                    b.ToTable("SwapinoPaymentInfos");
+                    b.ToTable("SwapinoPaymentInfo");
                 });
 
             modelBuilder.Entity("Adminbot.Domain.ZibalPaymentInfo", b =>
                 {
-                    b.Property<int>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
+                    b.Property<string>("TrackId")
+                        .HasColumnType("TEXT");
 
                     b.Property<long>("Amount")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("AttemptsRemaining")
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("CallbackUrl")
                         .HasColumnType("TEXT");
 
-                    b.Property<long>("ChatId")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("TEXT");
-
                     b.Property<bool>("IsAddedToBallance")
                         .HasColumnType("INTEGER");
-
-                    b.Property<bool>("IsExpired")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<bool>("IsPaid")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("PaidAt")
-                        .HasColumnType("TEXT");
 
                     b.Property<string>("Result")
                         .HasColumnType("TEXT");
@@ -92,10 +76,7 @@ namespace Adminbot.Migrations
                     b.Property<long>("TelegramUserId")
                         .HasColumnType("INTEGER");
 
-                    b.Property<long>("TrackId")
-                        .HasColumnType("INTEGER");
-
-                    b.HasKey("Id");
+                    b.HasKey("TrackId");
 
                     b.ToTable("ZibalPaymentInfos");
                 });

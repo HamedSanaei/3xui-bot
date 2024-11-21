@@ -14,6 +14,8 @@ class Program
         // var ucontext = new UserDbContext();
         // ucontext.Database.Migrate();
 
+
+
         await new HostBuilder()
             .ConfigureServices(async (hostContext, services) =>
             {
@@ -26,6 +28,8 @@ class Program
 
                 services.AddHostedService<TelegramBotService>();
 
+                //services.AddHostedService<ZibalPaymentCheckerService>();
+
                 services.AddSingleton<UserDbContext>(sp =>
                 {
                     // Initialize and configure your Dbcontext here
@@ -36,7 +40,7 @@ class Program
                 var optionsBuilder = new DbContextOptionsBuilder<CredentialsDbContext>();
                 optionsBuilder.UseSqlite("Data Source=./Data/credentials.db;Mode=ReadWrite;Cache=Shared");
                 var context = new CredentialsDbContext(optionsBuilder.Options);
-                context.Database.Migrate();
+                //context.Database.Migrate();
 
                 services.AddSingleton<CredentialsDbContext>(sp =>
                 {
@@ -49,12 +53,10 @@ class Program
                     // Initialize and configure your TelegramBotClient here
 
                     //weswap
-                    //var bot1 = "6019665082:AAGBDkTknaoRvTV8wmpS3xOits3XCcwufqU";
-
                     //hamed test
-                    // var bot2 = "6034372537:AAH_iAh1rLrosds9wGqtq-cdUG7yp4um60c";
 
-                    //var vpnetiranbot = "6651502559:AAGmpsPINM5OB43vANs28ezkhfVLdJZAMcc";
+
+
 
                     return new TelegramBotClient(configuration["botToken"]);
 

@@ -1,14 +1,18 @@
+using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
 
 public class UserDbContext : DbContext
 {
     public DbSet<User> Users { get; set; }
     public DbSet<CookieData> Cookies { get; set; }
+    public DbSet<SwapinoPaymentInfo> SwapinoPaymentInfos { get; set; }
 
+    public DbSet<ZibalPaymentInfo> ZibalPaymentInfos { get; set; }
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
         optionsBuilder.UseSqlite("Data Source=./Data/users.db");
+
     }
 
 
@@ -16,6 +20,7 @@ public class UserDbContext : DbContext
 
     {
         var context = new UserDbContext();
+        // context.Database.Migrate();
         context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
         var existingUser = await context.Users.FirstOrDefaultAsync(u => u.Id == user.Id);
@@ -39,6 +44,8 @@ public class UserDbContext : DbContext
             if (user.Flow != null) existingUser.Flow = user.Flow;
             if (user._ConfigPrice != null) existingUser._ConfigPrice = user._ConfigPrice;
             if (user.AccountCounter > existingUser.AccountCounter) existingUser.AccountCounter = user.AccountCounter;
+            if (user.PaymentMethod != existingUser.PaymentMethod) existingUser.PaymentMethod = user.PaymentMethod;
+
 
         }
         await context.SaveChangesAsync();
@@ -72,6 +79,7 @@ public class UserDbContext : DbContext
             existingUser.Type = "";
             existingUser.SubLink = "";
             existingUser.ConfigPrice = 0;
+            existingUser.PaymentMethod = "credit";
 
         }
         await context.SaveChangesAsync();
@@ -144,6 +152,8 @@ public class UserDbContext : DbContext
 
     public async Task<User> GetUserStatus(long userId)
     {
+
+
         var context = new UserDbContext();
         context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
