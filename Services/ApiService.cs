@@ -17,6 +17,10 @@ public class ApiService
     public static async Task<string> LoginAndGetSessionCookie(ServerInfo serverInfo)
 
     {
+
+        System.Net.ServicePointManager.SecurityProtocol =
+    SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+
         HttpClient httpClient = new HttpClient();
         string username = serverInfo.Username;
         string password = serverInfo.Password;
@@ -59,7 +63,22 @@ public class ApiService
                 if (response.Headers.TryGetValues("Set-Cookie", out setCookieHeaders))
                 {
                     // Extract the session cookie from the Set-Cookie header
-                    completeSessionCookie = setCookieHeaders.FirstOrDefault(cookie => cookie.StartsWith("session"));
+                    completeSessionCookie = setCookieHeaders.FirstOrDefault(cookie => cookie.StartsWith("session") || cookie.StartsWith("3x-ui="));
+                    //     var allSetCookies = setCookieHeaders.Where(cookie => cookie.StartsWith("session") || cookie.StartsWith("3x-ui")).ToList();
+
+                    //     // for newer version of 3xui
+                    //     if (allSetCookies[0].Contains("3x-ui"))
+                    //     {
+
+                    //         completeSessionCookie = allSetCookies.Last();
+                    //     }
+                    //     // for older panels
+                    //     else
+                    //     {
+                    //         completeSessionCookie = setCookieHeaders.FirstOrDefault(cookie => cookie.StartsWith("session"));
+
+                    //     }
+                    // 
                 }
                 else
                 {
@@ -111,6 +130,7 @@ public class ApiService
         // Create a CookieContainer and add your cookie
         var cookieContainer = new CookieContainer();
         cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", cookie));
+        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("3x-ui", cookie));
 
         // Assign the CookieContainer to the handler
         handler.CookieContainer = cookieContainer;
@@ -152,6 +172,10 @@ public class ApiService
             // Extract the main part of the session cookie
             return cookieParts[0].Trim().Substring("session=".Length);
         }
+        else if (cookieParts[0].Trim().StartsWith("3x-ui="))
+        {
+            return cookieParts[0].Trim().Substring("3x-ui=".Length);
+        }
 
         // Return null or an empty string if the session cookie is not found
         return null;
@@ -173,6 +197,7 @@ public class ApiService
         // var xff = "MTcxODIxMTY2OXxEWDhFQVFMX2dBQUJFQUVRQUFCMV80QUFBUVp6ZEhKcGJtY01EQUFLVEU5SFNVNWZWVk5GVWhoNExYVnBMMlJoZEdGaVlYTmxMMjF2WkdWc0xsVnpaWExfZ1FNQkFRUlZjMlZ5QWYtQ0FBRUVBUUpKWkFFRUFBRUlWWE5sY201aGJXVUJEQUFCQ0ZCaGMzTjNiM0prQVF3QUFRdE1iMmRwYmxObFkzSmxkQUVNQUFBQUd2LUNGd0VDQVFkaGJXbHljMkZ1QVFsNlpXUmlZWHBwT0RnQXzzRIGYIgPo8voWj8dpPkOlMdk5tAmN8SxAzg0YmKHqWg==";
         // cookieContainer.Add(new Uri(accountDto.ServerInfo.Url), new Cookie("session", xff));
         cookieContainer.Add(new Uri(accountDto.ServerInfo.Url), new Cookie("session", accountDto.SessionCookie));
+        cookieContainer.Add(new Uri(accountDto.ServerInfo.Url), new Cookie("3x-ui", accountDto.SessionCookie));
 
         // Assign the CookieContainer to the handler
         handler.CookieContainer = cookieContainer;
@@ -276,6 +301,7 @@ public class ApiService
         // Create a CookieContainer and add your cookie
         var cookieContainer = new CookieContainer();
         cookieContainer.Add(new Uri(accountDto.ServerInfo.Url), new Cookie("session", accountDto.SessionCookie));
+        cookieContainer.Add(new Uri(accountDto.ServerInfo.Url), new Cookie("3x-ui", accountDto.SessionCookie));
 
         // Assign the CookieContainer to the handler
         handler.CookieContainer = cookieContainer;
@@ -366,11 +392,17 @@ public class ApiService
     {
         expirationDate = DateTimeOffset.MinValue; // Default value if extraction fails
 
+        if (cookie.Contains("3x-ui"))
+        {
+            expirationDate = DateTimeOffset.Now.AddHours(6);
+            return true;
+        }
 
         var expirationDateIndex = cookie.IndexOf("Expires=");
 
         if (expirationDateIndex != -1)
         {
+
             var expirationDateString2 = cookie.Substring(expirationDateIndex + "Expires=".Length).Trim();
 
             Console.WriteLine("=================================");
@@ -464,6 +496,7 @@ public class ApiService
                     // Create a CookieContainer and add your cookie
                     var cookieContainer = new CookieContainer();
                     cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", sessionCookie));
+                    cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("3x-ui", sessionCookie));
 
                     // Assign the CookieContainer to the handler
                     handler.CookieContainer = cookieContainer;
@@ -577,6 +610,7 @@ public class ApiService
         // Create a CookieContainer and add your cookie
         var cookieContainer = new CookieContainer();
         cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", sessionCookie));
+        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("3x-ui", sessionCookie));
 
         // Assign the CookieContainer to the handler
         handler.CookieContainer = cookieContainer;
@@ -671,6 +705,7 @@ public class ApiService
         // Create a CookieContainer and add your cookie
         var cookieContainer = new CookieContainer();
         cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", sessionCookie));
+        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("3x-ui", sessionCookie));
 
         // Assign the CookieContainer to the handler
         handler.CookieContainer = cookieContainer;
@@ -692,7 +727,10 @@ public class ApiService
         {
         }
         if (result == null) return null;
-
+        var settings = new JsonSerializerSettings
+        {
+            NullValueHandling = NullValueHandling.Ignore
+        };
         // Deserialize the JSON string to a JObject
         JObject jsonObject = JsonConvert.DeserializeObject<JObject>(result.ServerInfoObject.Settings);
         // Access the "clients" array
@@ -700,7 +738,8 @@ public class ApiService
         if (clientsArray != null)
         {
             // Convert the JArray to a list of objects
-            List<Client> clients = clientsArray.ToObject<List<Client>>();
+            List<Client> clients = clientsArray.ToObject<List<Client>>(JsonSerializer.Create(settings));
+
             findedClients = clients.FindAll(c => c.TgId.Trim() == telegramUserId.ToString());
             //!string.IsNullOrEmpty(c.TgId) &&
         }
@@ -820,6 +859,7 @@ public class ApiService
         // Create a CookieContainer and add your cookie
         var cookieContainer = new CookieContainer();
         cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", sessionCookie));
+        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("3x-ui", sessionCookie));
 
         // Assign the CookieContainer to the handler
         handler.CookieContainer = cookieContainer;

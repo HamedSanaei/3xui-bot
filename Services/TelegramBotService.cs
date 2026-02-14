@@ -81,7 +81,7 @@ public class TelegramBotService : IHostedService
 
         if (update.CallbackQuery is { } callbackQuery)
             ProccessCallbacks(callbackQuery, cancellationToken);
-        // if (true) return;
+        //if (true) return;
         // Only process Message updates: https://core.telegram.org/bots/api#message
 
         if (update.Message is not { } message)
@@ -384,12 +384,26 @@ public class TelegramBotService : IHostedService
                 return;
             }
 
-            var msg = $"✅ Account details: \n";
+            var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
+            string msg = string.Empty;
+
+            // msg = $"✅ مشخصات اکانت شما:  \n";
+            // msg += $"👤نام: `{client.Email}` \n";
+            // //// msg += $"⌛️دوره : {ApiService.ConvertPeriodToDays(user.SelectedPeriod)} روزه \n";
+            // //// msg += $"Location: {user.SelectedCountry} \n";
+            // if (credUser.IsColleague) msg += $"🧮 حجم ترافیک: {client.TotalUsedTrafficInGB} گیگابایت\n";
+
+            // string hijriShamsiDate = client.ExpiryTime.AddMinutes(210).ConvertToHijriShamsi();
+            // msg += $"📅تاریخ انقضاء:  {hijriShamsiDate}\n";
+            // msg += "\u200F" + "🔄 تمدید ⬅️  " + $"/renew_{client.Email} \n";
+
+
+            msg = $"✅ Account details: \n";
             msg += $"Active: {client.Enable}";
             msg += $"\n Account Name: \n `{client.Email}` \n";
 
             msg += client.TotalUsedTrafficInGB;
-            string hijriShamsiDate = client.ExpiryTime.ConvertToHijriShamsi();
+            string hijriShamsiDate = client.ExpiryTime.AddMinutes(210).ConvertToHijriShamsi();
             msg += $"\nExpiration Date: {hijriShamsiDate}\n";
 
 
@@ -1451,7 +1465,8 @@ public class TelegramBotService : IHostedService
                     await EditMessageWithCallback(_botClient, zpi.ChatId, Convert.ToInt32(zpi.TelMsgId));
                     return;
 
-                };
+                }
+                ;
 
                 var inq_respnse = await ZibalAPI.Inquiry(zpi.TrackId, _appConfig.ZibalMerchantCode);
                 // paid but not verified
@@ -2163,6 +2178,12 @@ public class TelegramBotService : IHostedService
                         }
                     }
 
+
+
+
+                    long dollarPrice = await new DollarPriceHelper().NobitexUSDTIRTPrice();
+                    if (dollarPrice == 0) dollarPrice = 780000;
+                    description = $"گیفت کارت {Math.Ceiling((double)(amount / dollarPrice))} دلاری استیم";
                     PaymentRequestResponse x = await ZibalAPI.SendPaymentRequest(amount, zpi.CallbackUrl, _appConfig.ZibalMerchantCode, description);
                     x.PayLink = ZibalAPI.GetPaymentLink(x);
                     zpi.TrackId = x.TrackId;
@@ -2303,10 +2324,20 @@ public class TelegramBotService : IHostedService
             await _userDbContext.SaveUserStatus(user);
 
 
+            // fuck
+            // await botClient.CustomSendTextMessageAsync(
+            //     chatId: message.Chat.Id,
+            //     text: $"✅ شما مقدار {Convert.ToInt64(user.ConfigLink).FormatCurrency()}  را برای شارژ حساب خود وارد کرده اید. \n" + $"درگاه انتخابی:{message.Text} \n " + " ❕ برای شارژ حساب، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
+            //     replyMarkup: confirmationKeyboard);
+            // return;
+
+            var text = "✅ برای شارژ حساب کاربری به پشتیبانی پیام دهید ." + "\n" + @"🆔 @vpnetiran\_admin";
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: $"✅ شما مقدار {Convert.ToInt64(user.ConfigLink).FormatCurrency()}  را برای شارژ حساب خود وارد کرده اید. \n" + $"درگاه انتخابی:{message.Text} \n " + " ❕ برای شارژ حساب، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
-                replyMarkup: confirmationKeyboard);
+                text: text, parseMode: ParseMode.Markdown,
+                replyMarkup: MainReplyMarkupKeyboardFa());
+
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
             return;
 
 

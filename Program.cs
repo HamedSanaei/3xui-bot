@@ -58,9 +58,12 @@ class Program
 
 
 
-                    return new TelegramBotClient(configuration["botToken"]);
+                    // return new TelegramBotClient(configuration["botToken"]);
+                    // // 6034372537:AAGU3YjVo7a5NBoGwyVBy_eiVuQbE0kPFg8    v2raynapster
+                    return new TelegramBotClient("6651502559:AAHWgMkvN8_nscnHWFxdPoRs-pXHKL7hw34");
+                    // //return new TelegramBotClient("6034372537:AAGU3YjVo7a5NBoGwyVBy_eiVuQbE0kPFg8");
+                    // return new TelegramBotClient("6034372537:AAGU3YjVo7a5NBoGwyVBy_eiVuQbE0kPFg8");
 
-                    // return new TelegramBotClient(bot1);
                 });
 
                 services.AddLogging(builder =>

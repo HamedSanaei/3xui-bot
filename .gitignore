@@ -142,3 +142,7 @@ Data/configuration.json
 
 Data/credentials_backup.db
 Data/credentials.db
+
+credentials.db
+credentials*.db
+users*.db
