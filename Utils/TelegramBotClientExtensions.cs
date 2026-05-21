@@ -44,6 +44,7 @@ public static class TelegramBotClientExtensions
         }
         catch (ApiRequestException ex) when (ex.ErrorCode == 403)
         {
+
             // Handle the case when the bot is blocked by the user
             Console.WriteLine("The bot has been blocked by the user.");
         }
