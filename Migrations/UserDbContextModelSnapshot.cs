@@ -18,34 +18,147 @@ namespace Adminbot.Migrations
 
             modelBuilder.Entity("Adminbot.Domain.SwapinoPaymentInfo", b =>
                 {
-                    b.Property<string>("Payment_Id")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CallbackUrl")
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("IsAddedToBallance")
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
+
+                    b.Property<long>("AmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<decimal>("ActuallyPaid")
+                        .HasColumnType("TEXT");
+
+                    b.Property<decimal>("ActuallyPaidAtFiat")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("AttemptNo")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("BalanceAfter")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("BalanceBefore")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<decimal>("BaseAmount")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BaseCurrency")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CancelUrl")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("ChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ErrorCode")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ErrorMessage")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("InvoiceId")
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("InvoiceUrl")
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("IsAddedToBalance")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("IpnCallbackUrl")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OutcomeCurrency")
+                        .HasColumnType("TEXT");
+
+                    b.Property<decimal>("OutcomeAmount")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OrderId")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ParentOrderId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ParentPaymentId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PayAddress")
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("PaidAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PayCurrency")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PayinHash")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PaymentId")
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PaymentStatus")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PayoutHash")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RawIpnJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RawRequestJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RawResponseJson")
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Result")
                         .HasColumnType("TEXT");
 
-                    b.Property<long>("RialAmount")
-                        .HasColumnType("INTEGER");
+                    b.Property<string>("RootOrderId")
+                        .HasColumnType("TEXT");
 
-                    b.Property<long>("TelMsgId")
+                    b.Property<string>("SuccessUrl")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("SettledAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("TelMsgId")
                         .HasColumnType("INTEGER");
 
                     b.Property<long>("TelegramUserId")
                         .HasColumnType("INTEGER");
 
-                    b.Property<double>("TronAmount")
-                        .HasColumnType("REAL");
+                    b.Property<DateTime?>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
 
-                    b.Property<double>("UsdtAmount")
-                        .HasColumnType("REAL");
+                    b.HasKey("Id");
 
-                    b.HasKey("Payment_Id");
+                    b.HasIndex("ChatId");
+
+                    b.HasIndex("OrderId")
+                        .IsUnique();
+
+                    b.HasIndex("ParentOrderId");
+
+                    b.HasIndex("PaymentId");
+
+                    b.HasIndex("TelegramUserId");
 
                     b.ToTable("SwapinoPaymentInfos");
                 });
@@ -144,10 +257,22 @@ namespace Adminbot.Migrations
                     b.Property<DateTime>("LastFreeAcc")
                         .HasColumnType("TEXT");
 
+                    b.Property<DateTime>("LastFreeNationalAcc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("LastFreeNormalAcc")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("LastStep")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("PaymentMethod")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("PendingAccountCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("PendingUserComment")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("SelectedCountry")

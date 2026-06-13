@@ -25,7 +25,13 @@ class Program
             .Build();
 
         builder.Services.AddSingleton<IConfiguration>(configuration);
-        builder.Services.AddTransient<PaymentFactory>();
+        builder.Services.AddSingleton<NowPayments>();
+        builder.Services.AddSingleton<NowPaymentsSettlementService>();
+        builder.Services.AddSingleton<XuiV3PurchaseService>();
+        builder.Services.AddSingleton<XuiV3PurchaseSessionStore>();
+        builder.Services.AddSingleton<UserActivityLogService>();
+        builder.Services.AddSingleton<XuiV3BotFlowService>();
+        builder.Services.AddSingleton<XuiV3AdminFlowService>();
 
         builder.Services.AddHostedService<TelegramBotService>();
 
@@ -49,6 +55,7 @@ class Program
             return new CredentialsDbContext(optionsBuilder.Options);
         });
         builder.Services.AddSingleton<BroadcastManager>();
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<BroadcastManager>());
 
         if (builder.Environment.IsProduction())
         {
@@ -76,8 +83,7 @@ class Program
         builder.Services.AddSingleton<ITelegramBotClient>(sp =>
         {
 
-            return new TelegramBotClient("6034372537:AAGU3YjVo7a5NBoGwyVBy_eiVuQbE0kPFg8");
-            // return new TelegramBotClient(configuration["botToken"]);
+            return new TelegramBotClient(configuration["botToken"]);
 
         });
 
@@ -92,6 +98,13 @@ class Program
        });
 
         var app = builder.Build();
+        using (var scope = app.Services.CreateScope())
+        {
+            var userDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+            userDb.Database.Migrate();
+            var credentialsDb = scope.ServiceProvider.GetRequiredService<CredentialsDbContext>();
+            credentialsDb.Database.Migrate();
+        }
         app.MapControllers();
         app.Run();
 

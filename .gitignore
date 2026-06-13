@@ -146,3 +146,43 @@ Data/credentials.db
 credentials.db
 credentials*.db
 users*.db
+
+# =========================
+# Local secrets and runtime data
+# =========================
+
+# App configuration and panel/server credentials
+configuration.json
+Data/configuration.json
+servers.json
+servers*.json
+Data/servers.json
+Data/servers*.json
+*.save
+
+# SQLite databases and sidecar files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+
+# Certificates, private keys, and local environment files
+*.pfx
+*.pem
+*.key
+*.crt
+*.env
+.env
+.env.*
+
+# Bot/user activity logs and generated build artifacts
+Logs/
+Data/Logs/
+artifacts/
+published/
+
+# Local IDE/debug settings may contain tokens or private paths
+.vscode/launch.json

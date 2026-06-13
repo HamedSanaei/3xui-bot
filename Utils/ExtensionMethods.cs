@@ -86,6 +86,18 @@ namespace Adminbot.Utils
                 return input;
             }
 
+            var normalized = new StringBuilder(input.Length);
+            foreach (char c in input)
+            {
+                var numericValue = char.GetNumericValue(c);
+                if (numericValue >= 0 && numericValue <= 9 && Math.Floor(numericValue) == numericValue)
+                    normalized.Append((char)('0' + (int)numericValue));
+                else
+                    normalized.Append(c);
+            }
+
+            return normalized.ToString();
+
             var builder = new StringBuilder(input.Length);
             foreach (char c in input)
             {

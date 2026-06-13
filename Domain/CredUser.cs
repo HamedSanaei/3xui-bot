@@ -22,6 +22,9 @@ namespace Adminbot.Domain
         public string PhoneNumber { get; set; }
         public string Email { get; set; }
         public bool IsColleague { get; set; } = false;
+        public bool IsBlocked { get; set; } = false;
+        public DateTime? BlockedAtUtc { get; set; }
+        public long? BlockedByTelegramUserId { get; set; }
 
         public override string ToString()
         {

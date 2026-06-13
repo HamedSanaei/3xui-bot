@@ -15,13 +15,36 @@ public class UserDbContext : DbContext
 
     }
 
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+
+        modelBuilder.Entity<SwapinoPaymentInfo>(entity =>
+        {
+            entity.ToTable("SwapinoPaymentInfos");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.OrderId).IsRequired().HasMaxLength(120);
+            entity.HasIndex(x => x.OrderId).IsUnique();
+            entity.HasIndex(x => x.ParentOrderId);
+            entity.HasIndex(x => x.PaymentId);
+            entity.HasIndex(x => x.TelegramUserId);
+            entity.HasIndex(x => x.ChatId);
+            entity.Property(x => x.BaseCurrency).HasMaxLength(32);
+            entity.Property(x => x.PayCurrency).HasMaxLength(32);
+            entity.Property(x => x.InvoiceId).HasMaxLength(120);
+            entity.Property(x => x.PaymentId).HasMaxLength(120);
+            entity.Property(x => x.PaymentStatus).HasMaxLength(64);
+            entity.Property(x => x.PayAddress).HasMaxLength(256);
+        });
+    }
+
 
     public async Task SaveUserStatus(User user)
 
     {
         var context = new UserDbContext();
-        // context.Database.Migrate();
-        context.Database.EnsureCreated(); // Create the database if it doesn't exist
+        // Schema creation and updates are handled by migrations at application startup.
 
         var existingUser = await context.Users.FirstOrDefaultAsync(u => u.Id == user.Id);
 
@@ -45,6 +68,11 @@ public class UserDbContext : DbContext
             if (user._ConfigPrice != null) existingUser._ConfigPrice = user._ConfigPrice;
             if (user.AccountCounter > existingUser.AccountCounter) existingUser.AccountCounter = user.AccountCounter;
             if (user.PaymentMethod != existingUser.PaymentMethod) existingUser.PaymentMethod = user.PaymentMethod;
+            if (user.PendingAccountCount > 0) existingUser.PendingAccountCount = user.PendingAccountCount;
+            if (user.PendingUserComment != null) existingUser.PendingUserComment = user.PendingUserComment;
+            if (user.LastFreeAcc > DateTime.MinValue) existingUser.LastFreeAcc = user.LastFreeAcc;
+            if (user.LastFreeNationalAcc > DateTime.MinValue) existingUser.LastFreeNationalAcc = user.LastFreeNationalAcc;
+            if (user.LastFreeNormalAcc > DateTime.MinValue) existingUser.LastFreeNormalAcc = user.LastFreeNormalAcc;
 
 
         }
@@ -56,7 +84,7 @@ public class UserDbContext : DbContext
     public async Task ClearUserStatus(User user)
     {
         var context = new UserDbContext();
-        context.Database.EnsureCreated(); // Create the database if it doesn't exist
+        // context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
         var existingUser = await context.Users.FirstOrDefaultAsync(u => u.Id == user.Id);
 
@@ -80,6 +108,8 @@ public class UserDbContext : DbContext
             existingUser.SubLink = "";
             existingUser.ConfigPrice = 0;
             existingUser.PaymentMethod = "credit";
+            existingUser.PendingAccountCount = 0;
+            existingUser.PendingUserComment = "";
 
         }
         await context.SaveChangesAsync();
@@ -89,7 +119,7 @@ public class UserDbContext : DbContext
     {
 
         UserDbContext context = new UserDbContext();
-        context.Database.EnsureCreated(); // Create the database if it doesn't exist
+        // context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
         var existingUser = await context.Users.FirstOrDefaultAsync(u => u.Id == teluserid);
 
@@ -122,7 +152,7 @@ public class UserDbContext : DbContext
     {
 
         UserDbContext context = new UserDbContext();
-        context.Database.EnsureCreated(); // Create the database if it doesn't exist
+        // context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
         var existingUser = await context.Users.FirstOrDefaultAsync(u => u.Id == teluserid);
 
@@ -155,7 +185,7 @@ public class UserDbContext : DbContext
 
 
         var context = new UserDbContext();
-        context.Database.EnsureCreated(); // Create the database if it doesn't exist
+        // context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
         var existingUser = await context.Users.FirstOrDefaultAsync(u => u.Id == userId);
 

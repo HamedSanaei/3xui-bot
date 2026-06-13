@@ -23,6 +23,12 @@ namespace Adminbot.Migrations.CredentialsDb
                     b.Property<long>("AccountBalance")
                         .HasColumnType("INTEGER");
 
+                    b.Property<DateTime?>("BlockedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("BlockedByTelegramUserId")
+                        .HasColumnType("INTEGER");
+
                     b.Property<long>("ChatID")
                         .HasColumnType("INTEGER");
 
@@ -33,6 +39,9 @@ namespace Adminbot.Migrations.CredentialsDb
                         .HasColumnType("TEXT");
 
                     b.Property<bool>("IsColleague")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsBlocked")
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("LanguageCode")

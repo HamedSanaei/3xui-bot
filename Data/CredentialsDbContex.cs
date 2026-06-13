@@ -34,8 +34,8 @@ public class CredentialsDbContext : DbContext
 
         if (existingUser != null)
         {
-            // update public infos
-            //await SaveUserStatus(credUser);
+            ApplyTelegramProfile(existingUser, credUser);
+            await SaveChangesAsync();
             return existingUser;
         }
         else
@@ -76,19 +76,34 @@ public class CredentialsDbContext : DbContext
         }
         else
         {
-            // // User already exists, update the user's information if needed
-            if (!string.IsNullOrEmpty(credUser.Username)) existingUser.Username = credUser.Username;
-            if (!string.IsNullOrEmpty(credUser.LastName)) existingUser.LastName = credUser.LastName;
-            // if (credUser.Email != null) existingUser.Email = credUser.Email;
-            if (credUser.ChatID != existingUser.ChatID) existingUser.ChatID = credUser.ChatID;
-            if (credUser.LanguageCode != existingUser.LanguageCode) existingUser.LanguageCode = credUser.LanguageCode;
-            if (credUser.FirstName != existingUser.FirstName) existingUser.FirstName = credUser.FirstName;
-            // if (credUser.IsColleague != existingUser.IsColleague) existingUser.IsColleague = credUser.IsColleague;
-            if (credUser.TelegramUserId != existingUser.TelegramUserId) existingUser.TelegramUserId = credUser.TelegramUserId;
-            // phone number does not exist
+            ApplyTelegramProfile(existingUser, credUser);
         }
         await SaveChangesAsync();
 
+    }
+
+    private static void ApplyTelegramProfile(CredUser existingUser, CredUser incomingUser)
+    {
+        if (existingUser == null || incomingUser == null)
+            return;
+
+        var hasProfileSnapshot =
+            incomingUser.ChatID != 0 ||
+            incomingUser.Username != null ||
+            incomingUser.FirstName != null ||
+            incomingUser.LastName != null ||
+            incomingUser.LanguageCode != null;
+
+        if (!hasProfileSnapshot)
+            return;
+
+        if (incomingUser.ChatID != 0 && incomingUser.ChatID != existingUser.ChatID)
+            existingUser.ChatID = incomingUser.ChatID;
+
+        existingUser.Username = incomingUser.Username ?? string.Empty;
+        existingUser.FirstName = incomingUser.FirstName ?? string.Empty;
+        existingUser.LastName = incomingUser.LastName ?? string.Empty;
+        existingUser.LanguageCode = incomingUser.LanguageCode ?? string.Empty;
     }
 
 
@@ -128,6 +143,42 @@ public class CredentialsDbContext : DbContext
         await SaveChangesAsync();
         return true;
 
+    }
+
+    public async Task<int> SetBlockedStatus(IEnumerable<long> credUserIds, bool isBlocked, long actorTelegramUserId)
+    {
+        var ids = credUserIds?
+            .Where(id => id > 0)
+            .Distinct()
+            .ToList() ?? new List<long>();
+
+        var changed = 0;
+        foreach (var id in ids)
+        {
+            var existingUser = await Users.FirstOrDefaultAsync(u => u.TelegramUserId == id);
+            if (existingUser == null)
+            {
+                existingUser = new CredUser
+                {
+                    TelegramUserId = id,
+                    ChatID = id,
+                    Username = "",
+                    FirstName = "",
+                    LastName = "",
+                    LanguageCode = "",
+                    AccountBalance = 0
+                };
+                await Users.AddAsync(existingUser);
+            }
+
+            existingUser.IsBlocked = isBlocked;
+            existingUser.BlockedAtUtc = isBlocked ? DateTime.UtcNow : null;
+            existingUser.BlockedByTelegramUserId = isBlocked ? actorTelegramUserId : null;
+            changed++;
+        }
+
+        await SaveChangesAsync();
+        return changed;
     }
 
 

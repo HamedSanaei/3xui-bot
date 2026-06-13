@@ -1,0 +1,152 @@
+{
+  "version": 1,
+  "currency": "toman",
+  "services": [
+    {
+      "key": "national",
+      "displayName": "نت ملی",
+      "description": "سرویس مخصوص ترافیک داخلی با چند اینباند",
+      "kind": "metered",
+      "isEnabled": true,
+      "inboundIds": [
+        3,
+        4
+      ],
+      "multiInbound": true,
+      "inboundProfileKeys": [
+        "national"
+      ],
+      "fallbackInboundTypes": [
+        "tunnel"
+      ],
+      "pricePerGb": {
+        "user": 145000,
+        "colleague": 96000
+      },
+      "trafficOptionsGb": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        10
+      ],
+      "durationOptions": [
+        {
+          "key": "life",
+          "displayName": "نامحدود",
+          "days": 0
+        },
+        {
+          "key": "m1",
+          "displayName": "یک ماه",
+          "days": 30
+        },
+        {
+          "key": "m2",
+          "displayName": "دو ماه",
+          "days": 60
+        },
+        {
+          "key": "m3",
+          "displayName": "سه ماه",
+          "days": 90
+        }
+      ]
+    },
+    {
+      "key": "normal",
+      "displayName": "نت عادی",
+      "description": "سرویس اینترنت عادی با چند اینباند",
+      "kind": "metered",
+      "isEnabled": true,
+      "inboundIds": [
+        3,
+        4
+      ],
+      "multiInbound": true,
+      "inboundProfileKeys": [
+        "normal"
+      ],
+      "fallbackInboundTypes": [
+        "tunnel"
+      ],
+      "pricePerGb": {
+        "user": 15000,
+        "colleague": 9000
+      },
+      "trafficOptionsGb": [
+        50,
+        100,
+        200,
+        500
+      ],
+      "durationOptions": [
+        {
+          "key": "life",
+          "displayName": "نامحدود",
+          "days": 0
+        },
+        {
+          "key": "m1",
+          "displayName": "یک ماه",
+          "days": 30
+        },
+        {
+          "key": "m2",
+          "displayName": "دو ماه",
+          "days": 60
+        },
+        {
+          "key": "m3",
+          "displayName": "سه ماه",
+          "days": 90
+        }
+      ]
+    },
+    {
+      "key": "unlimited",
+      "displayName": "نامحدود",
+      "description": "نامحدود با مصرف منصفانه، محدودیت زمان و تعداد کاربر",
+      "kind": "unlimited",
+      "isEnabled": false,
+      "inboundIds": [
+        26,
+        19
+      ],
+      "multiInbound": true,
+      "inboundProfileKeys": [
+        "unlimited"
+      ],
+      "fallbackInboundTypes": [
+        "tunnel"
+      ],
+      "unlimitedPlans": [
+        {
+          "key": "u1-m1",
+          "displayName": "یک کاربره - یک ماه",
+          "days": 30,
+          "fairUsageGb": 500,
+          "maxUsers": 1,
+          "price": {
+            "user": 0,
+            "colleague": 0
+          },
+          "isEnabled": false
+        },
+        {
+          "key": "u2-m1",
+          "displayName": "دو کاربره - یک ماه",
+          "days": 30,
+          "fairUsageGb": 800,
+          "maxUsers": 2,
+          "price": {
+            "user": 0,
+            "colleague": 0
+          },
+          "isEnabled": false
+        }
+      ]
+    }
+  ]
+}

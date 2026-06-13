@@ -3,6 +3,7 @@ using Adminbot.Domain;
 using Adminbot.Utils;
 
 using Newtonsoft.Json;
+using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
@@ -18,6 +19,8 @@ using Adminbot.Domain.Logging;
 
 public class TelegramBotService : IHostedService
 {
+    private const long MinimumChargeAmountToman = 100_000L;
+
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
@@ -25,8 +28,24 @@ public class TelegramBotService : IHostedService
     private readonly AppConfig _appConfig;
     private readonly ILogger<TelegramBotService> _logger;
     private BroadcastManager _broadcastManager;
+    private readonly NowPayments _nowPayments;
+    private readonly NowPaymentsSettlementService _nowPaymentsSettlementService;
+    private readonly XuiV3BotFlowService _xuiV3BotFlowService;
+    private readonly XuiV3AdminFlowService _xuiV3AdminFlowService;
+    private readonly UserActivityLogService _userActivityLog;
 
-    public TelegramBotService(ITelegramBotClient botClient, UserDbContext dbContext, CredentialsDbContext credentialsDb, IConfiguration configuration, ILogger<TelegramBotService> logger, BroadcastManager broadcastManager)
+    public TelegramBotService(
+        ITelegramBotClient botClient,
+        UserDbContext dbContext,
+        CredentialsDbContext credentialsDb,
+        IConfiguration configuration,
+        ILogger<TelegramBotService> logger,
+        BroadcastManager broadcastManager,
+        NowPayments nowPayments,
+        NowPaymentsSettlementService nowPaymentsSettlementService,
+        XuiV3BotFlowService xuiV3BotFlowService,
+        XuiV3AdminFlowService xuiV3AdminFlowService,
+        UserActivityLogService userActivityLog)
     {
         _botClient = botClient;
         _userDbContext = dbContext;
@@ -35,6 +54,11 @@ public class TelegramBotService : IHostedService
         _appConfig = _configuration.Get<AppConfig>();
         _logger = logger;
         _broadcastManager = broadcastManager;
+        _nowPayments = nowPayments;
+        _nowPaymentsSettlementService = nowPaymentsSettlementService;
+        _xuiV3BotFlowService = xuiV3BotFlowService;
+        _xuiV3AdminFlowService = xuiV3AdminFlowService;
+        _userActivityLog = userActivityLog;
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -72,21 +96,101 @@ public class TelegramBotService : IHostedService
 
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
+        try
+        {
+            await HandleUpdateCoreAsync(botClient, update, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            var credUser = GetCreduserFromUpdate(update);
+            await _userActivityLog.LogErrorAsync(
+                "handle_update_failed",
+                ex,
+                credUser,
+                IsSuperAdminUser(credUser?.TelegramUserId ?? 0),
+                new Dictionary<string, object>
+                {
+                    ["updateType"] = update?.Type.ToString() ?? "unknown"
+                },
+                cancellationToken);
+            throw;
+        }
+    }
+
+    private async Task HandleUpdateCoreAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
+    {
 
 
         if (update.CallbackQuery is { } callbackQuery)
-            ProccessCallbacks(callbackQuery, cancellationToken);
+        {
+            var callbackCredUser = await _credentialsDbContext.GetUserStatus(
+                GetCreduserFromTelegramUser(callbackQuery.From, callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id));
+            var callbackIsSuperAdmin = IsSuperAdminUser(callbackQuery.From.Id);
+
+            await _userActivityLog.LogCallbackAsync(callbackQuery, callbackCredUser, callbackIsSuperAdmin, cancellationToken);
+
+            if (!callbackIsSuperAdmin && callbackCredUser?.IsBlocked == true)
+            {
+                await botClient.AnswerCallbackQueryAsync(
+                    callbackQueryId: callbackQuery.Id,
+                    text: "به علت تخلف مسدود شدید. لطفاً با پشتیبانی تلگرام پیام بدهید.",
+                    showAlert: true,
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (callbackQuery.Data != null && callbackQuery.Data.StartsWith("x3:"))
+            {
+                var user = await _userDbContext.GetUserStatus(callbackQuery.From.Id);
+                var callbackMainKeyboard = callbackIsSuperAdmin
+                    ? GetMainMenuKeyboard()
+                    : MainReplyMarkupKeyboardFa();
+                if (await _xuiV3BotFlowService.TryHandleCallbackAsync(_botClient, callbackQuery, callbackCredUser, user, callbackMainKeyboard, cancellationToken))
+                    return;
+            }
+
+            await ProccessCallbacks(callbackQuery, cancellationToken);
+            return;
+        }
         //if (true) return;
         // Only process Message updates: https://core.telegram.org/bots/api#message
 
         if (update.Message is not { } message)
             return;
+        if (message.From == null)
+            return;
 
         List<long> allowedValues = _appConfig.AdminsUserIds;
+        var isSuperAdmin = message.From != null && allowedValues != null && allowedValues.Contains(message.From.Id);
+        var messageCredUser = message.From == null
+            ? null
+            : await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
 
+        await _userActivityLog.LogMessageAsync(message, messageCredUser, isSuperAdmin, cancellationToken);
 
-        if (!allowedValues.Contains(message.From.Id))
+        if (!isSuperAdmin && messageCredUser?.IsBlocked == true)
         {
+            await SendBlockedUserMessageAsync(botClient, message.Chat.Id, cancellationToken);
+            return;
+        }
+
+        if (isSuperAdmin && await TryHandleUserActivityLogCommandAsync(botClient, message, messageCredUser, cancellationToken))
+            return;
+
+        if (await TryHandleNowPaymentsSuccessStartAsync(
+            botClient,
+            message,
+            messageCredUser,
+            isSuperAdmin ? GetMainMenuKeyboard() : MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
+
+        if (!isSuperAdmin)
+        {
+
+
             await HandleUpdateRegularUsers(botClient, update, cancellationToken);
             return;
         }
@@ -106,6 +210,16 @@ public class TelegramBotService : IHostedService
         //        List<long> allowedValues = _configuration.GetSection("adminsUserIds").Get<List<long>>();
         var currentUser = await _userDbContext.GetUserStatus(message.From.Id);
         //_userDbContext.Users.Attach(currentUser);
+
+        if (await _xuiV3AdminFlowService.TryHandleMessageAsync(
+            botClient,
+            message,
+            currentUser,
+            GetMainMenuKeyboard(),
+            cancellationToken))
+        {
+            return;
+        }
 
         // await _botClient.ForwardMessageAsync(
         //             chatId: 85758085,
@@ -1304,7 +1418,9 @@ public class TelegramBotService : IHostedService
             {
                 var allUsers = _credentialsDbContext.Users
                     .Select(x => x.ChatID)
-                     .ToList();
+                    .Where(chatId => chatId > 0)
+                    .Distinct()
+                    .ToList();
 
                 if (allUsers.Count == 0)
                     return;
@@ -1318,8 +1434,17 @@ public class TelegramBotService : IHostedService
                         IsForward = true
                     };
 
-                    _ = Task.Run(() =>
-                        _broadcastManager.EnqueueAsync(allUsers, template));
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _broadcastManager.EnqueueAsync(allUsers, template, CancellationToken.None);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Broadcast enqueue failed.");
+                        }
+                    });
                 }
                 else
                 {
@@ -1329,13 +1454,22 @@ public class TelegramBotService : IHostedService
                         IsForward = false
                     };
 
-                    _ = Task.Run(() =>
-                        _broadcastManager.EnqueueAsync(allUsers, template));
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _broadcastManager.EnqueueAsync(allUsers, template, CancellationToken.None);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Broadcast enqueue failed.");
+                        }
+                    });
                 }
 
                 await botClient.SendTextMessageAsync(
                     message.Chat.Id,
-                    $"ارسال برای {allUsers.Count} کاربر در پس‌زمینه شروع شد.",
+                    $"ارسال برای {allUsers.Count} کاربر در صف پس‌زمینه قرار گرفت.",
                     replyMarkup: GetMainMenuKeyboard());
 
                 await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
@@ -1470,85 +1604,917 @@ public class TelegramBotService : IHostedService
 
     }
 
-    private async void ProccessCallbacks(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    private async Task ProccessCallbacks(CallbackQuery callbackQuery, CancellationToken cancellationToken)
     {
         //Process call back query
-        if (callbackQuery != null)
+        if (callbackQuery == null || string.IsNullOrWhiteSpace(callbackQuery.Data))
+            return;
+
+        try
         {
-            if (callbackQuery!.Data!.Contains("Paid!"))
+            if (callbackQuery.Data.Contains("Paid!"))
                 return;
 
-            if (callbackQuery!.Data!.Contains("check_payment_"))
+            if (callbackQuery.Data.StartsWith("check_crypto_payment_"))
             {
-                var zpi_id = Int32.Parse(callbackQuery!.Data!.ToString().Replace("check_payment_", ""));
-                //long zpi_id = Convert.ToInt64(paymentID);
-                var tgID = callbackQuery.From.Username ?? string.Empty;
-                var userID = callbackQuery.From.Id;
+                await ProcessCryptoPaymentCallback(callbackQuery, cancellationToken);
+                return;
+            }
 
-                var chatid = callbackQuery.Message!.Chat.Id;
-                var messageId = callbackQuery.Message.MessageId;
-                var zpi = _userDbContext.ZibalPaymentInfos.Find(zpi_id);
-                if (zpi == null) return;
-                if (zpi.IsAddedToBallance)
-                {
-                    //notify user 
+            if (callbackQuery.Data.StartsWith("settle_crypto_partial_"))
+            {
+                await ProcessCryptoPartialSettlementCallback(callbackQuery, cancellationToken);
+                return;
+            }
 
-                    await _botClient.CustomSendTextMessageAsync(
-                        chatId: chatid,
-                        text: $"اعتبار مربوط به این نشست قبلاً به حساب کاربری شما افزدوه شده است.",
-                        replyMarkup: MainReplyMarkupKeyboardFa());
-                    await EditMessageWithCallback(_botClient, zpi.ChatId, Convert.ToInt32(zpi.TelMsgId));
-                    return;
-
-                }
-                ;
-
-                var inq_respnse = await ZibalAPI.Inquiry(zpi.TrackId, _appConfig.ZibalMerchantCode);
-                // paid but not verified
-                if (inq_respnse.Status == 2)
-                {
-
-                    var verify_res = await ZibalAPI.Verify(zpi.TrackId, merchantId: _appConfig.ZibalMerchantCode);
-                    zpi.Result = verify_res.Message;
-                    if (verify_res.Result == 100)
-                    {
-                        var credUser = await _credentialsDbContext.GetUserStatus(new CredUser { TelegramUserId = zpi.TelegramUserId });
-                        zpi = ZibalAPI.MarkAsPaid(zpi, inq_respnse);
-                        await ZibalAddtoBalance(zpi, _appConfig, credUser, chatid, false);
-
-                        return;
-                    }
-                }
-
-
-                else if (inq_respnse.Status == 1)
-                {
-                    // paid and verified
-                    await EditMessageWithCallback(_botClient, zpi.ChatId, Convert.ToInt32(zpi.TelMsgId));
-                }
-
-
-                else if (inq_respnse.Status == -1)
-                    // wait for payment
-                    await _botClient.CustomSendTextMessageAsync(
-                        chatId: chatid,
-                        text: $"نشست شماره `{zpi.TrackId}` در انتظار پرداخت است.",
-                        replyMarkup: MainReplyMarkupKeyboardFa());
-                else
-                    // other errors
-                    throw new NotImplementedException();
-
-                // Close the query to end the client-side loading animation
-                try
-                {
-                    await _botClient.AnswerCallbackQueryAsync(callbackQuery.Id);
-                }
-                catch (System.Exception)
-                {
-                    Console.WriteLine("Bad Request: query is too old and response timeout expired or query ID is invalid");
-                }
+            if (callbackQuery.Data.Contains("check_payment_"))
+            {
+                await ProcessZibalPaymentCallback(callbackQuery, cancellationToken);
+                return;
             }
         }
+        catch (Exception ex)
+        {
+            var credUser = await _credentialsDbContext.GetUserStatus(
+                GetCreduserFromTelegramUser(callbackQuery.From, callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id));
+
+            await _userActivityLog.LogErrorAsync(
+                "payment_callback_failed",
+                ex,
+                credUser,
+                IsSuperAdminUser(callbackQuery.From.Id),
+                new Dictionary<string, object>
+                {
+                    ["callbackData"] = callbackQuery.Data ?? string.Empty
+                },
+                cancellationToken);
+
+            Console.WriteLine($"[PaymentCallback] exception data={callbackQuery.Data}: {ex}");
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                text: "بررسی پرداخت با خطا روبه‌رو شد. جزئیات خطا در لاگ ثبت شد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+        }
+    }
+
+    private async Task ProcessZibalPaymentCallback(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+
+        if (!int.TryParse(callbackQuery.Data.Replace("check_payment_", ""), out var zpiId))
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "شناسه پرداخت زیبال معتبر نیست.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        var zpi = await _userDbContext.ZibalPaymentInfos.FindAsync(new object[] { zpiId }, cancellationToken);
+        if (zpi == null)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "پرداخت زیبال مورد نظر در دیتابیس پیدا نشد.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (zpi.IsAddedToBallance)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "اعتبار مربوط به این پرداخت قبلاً به حساب کاربری شما افزوده شده است.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+
+            await EditMessageWithCallback(_botClient, zpi.ChatId, Convert.ToInt32(zpi.TelMsgId));
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        var inquiry = await ZibalAPI.Inquiry(zpi.TrackId, _appConfig.ZibalMerchantCode);
+        if (inquiry == null)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "پاسخ معتبری از زیبال دریافت نشد. لطفاً کمی بعد دوباره بررسی کنید.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        zpi.Result = BuildZibalStatusText(inquiry);
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+
+        Console.WriteLine(
+            $"[Zibal] inquiry paymentId={zpi.Id}, trackId={zpi.TrackId}, user={zpi.TelegramUserId}, status={inquiry.Status}, result={inquiry.Result}, message={inquiry.Message}");
+
+        if (inquiry.Status == 2)
+        {
+            var verify = await ZibalAPI.Verify(zpi.TrackId, _appConfig.ZibalMerchantCode);
+            zpi.Result = BuildZibalStatusText(inquiry, verify);
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            Console.WriteLine(
+                $"[Zibal] verify paymentId={zpi.Id}, trackId={zpi.TrackId}, result={verify?.Result}, status={verify?.Status}, message={verify?.Message}");
+
+            if (verify != null && (verify.Result == 100 || verify.Result == 201))
+            {
+                var credUser = await _credentialsDbContext.GetUserStatus(new CredUser { TelegramUserId = zpi.TelegramUserId });
+                zpi = ZibalAPI.MarkAsPaid(zpi, inquiry);
+                await ZibalAddtoBalance(zpi, _appConfig, credUser, chatId, false);
+                await AnswerCallbackSafely(callbackQuery, cancellationToken);
+                return;
+            }
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: BuildZibalUserMessage(zpi.TrackId, inquiry, verify),
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (inquiry.Status == 1)
+        {
+            var credUser = await _credentialsDbContext.GetUserStatus(new CredUser { TelegramUserId = zpi.TelegramUserId });
+            zpi = ZibalAPI.MarkAsPaid(zpi, inquiry);
+            await ZibalAddtoBalance(zpi, _appConfig, credUser, chatId, false);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (inquiry.Status == -1)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: $"نشست شماره `{zpi.TrackId}` هنوز در انتظار پرداخت است.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        zpi.IsExpired = IsFinalUnsuccessfulZibalStatus(inquiry.Status);
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+
+        await _userActivityLog.LogWarningAsync(
+            "zibal_payment_not_successful",
+            await _credentialsDbContext.GetUserStatus(new CredUser { TelegramUserId = zpi.TelegramUserId }),
+            false,
+            new Dictionary<string, object>
+            {
+                ["paymentId"] = zpi.Id,
+                ["trackId"] = zpi.TrackId,
+                ["status"] = inquiry.Status,
+                ["result"] = inquiry.Result,
+                ["message"] = inquiry.Message ?? string.Empty
+            },
+            cancellationToken);
+
+        await _botClient.CustomSendTextMessageAsync(
+            chatId: chatId,
+            text: BuildZibalUserMessage(zpi.TrackId, inquiry, null),
+            replyMarkup: MainReplyMarkupKeyboardFa(),
+            cancellationToken: cancellationToken);
+
+        await AnswerCallbackSafely(callbackQuery, cancellationToken);
+    }
+
+    private async Task ProcessCryptoPaymentCallback(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var messageId = callbackQuery.Message?.MessageId ?? 0;
+        var orderId = callbackQuery.Data.Replace("check_crypto_payment_", "");
+        Console.WriteLine($"[NOWPayments ManualCheck] start user={callbackQuery.From.Id}, chat={chatId}, orderId={orderId}");
+
+        var payment = await _userDbContext.SwapinoPaymentInfos.FirstOrDefaultAsync(
+            p => p.OrderId == orderId,
+            cancellationToken);
+        if (payment == null)
+        {
+            Console.WriteLine($"[NOWPayments ManualCheck] payment not found. orderId={orderId}");
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "پرداخت مورد نظر پیدا نشد.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (payment.IsAddedToBallance)
+        {
+            Console.WriteLine($"[NOWPayments ManualCheck] already added. orderId={payment.OrderId}, paymentId={payment.PaymentId}, user={payment.TelegramUserId}");
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "اعتبار این پرداخت قبلاً به کیف پول شما اضافه شده است و دوباره شارژ نمی‌شود.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        var data = payment.GetNowPaymentsData();
+        NowPaymentsPaymentStatusResult status;
+        try
+        {
+            var paymentId = payment.PaymentId ?? data.PaymentId;
+            if (!string.IsNullOrWhiteSpace(paymentId))
+            {
+                status = await _nowPayments.GetPaymentStatusAsync(paymentId, cancellationToken);
+                Console.WriteLine(
+                    $"[NOWPayments ManualCheck] remote status received by payment_id. orderId={payment.OrderId}, paymentId={paymentId}, status={status?.payment_status}, actuallyPaid={status?.actually_paid}, payAmount={status?.pay_amount}, payCurrency={status?.pay_currency}");
+            }
+            else
+            {
+                var invoiceId = payment.InvoiceId ?? data.InvoiceId;
+                Console.WriteLine(
+                    $"[NOWPayments ManualCheck] payment_id missing; searching NOWPayments by invoice/order. orderId={payment.OrderId}, invoiceId={invoiceId}, invoiceUrl={payment.InvoiceUrl ?? data.InvoiceUrl}");
+
+                status = await _nowPayments.FindPaymentStatusByInvoiceOrOrderAsync(
+                    invoiceId,
+                    payment.OrderId ?? data.OrderId,
+                    cancellationToken);
+
+                if (status == null)
+                {
+                    Console.WriteLine($"[NOWPayments ManualCheck] no remote payment found for invoice/order. orderId={payment.OrderId}, invoiceId={invoiceId}");
+                    await _botClient.CustomSendTextMessageAsync(
+                        chatId: chatId,
+                        text: "هنوز پرداختی برای این فاکتور در لیست پرداخت‌های NOWPayments پیدا نشد.\n" +
+                              "اگر پرداخت را تازه انجام داده‌اید چند دقیقه بعد دوباره بررسی کنید.\n\n" +
+                              $"<a href=\"{System.Net.WebUtility.HtmlEncode(payment.InvoiceUrl ?? data.InvoiceUrl ?? "")}\">باز کردن فاکتور</a>",
+                        parseMode: ParseMode.Html,
+                        cancellationToken: cancellationToken);
+                    await AnswerCallbackSafely(callbackQuery, cancellationToken);
+                    return;
+                }
+
+                Console.WriteLine(
+                    $"[NOWPayments ManualCheck] remote status received by invoice/order. orderId={payment.OrderId}, paymentId={status.payment_id}, invoiceId={status.invoice_id}, status={status.payment_status}, actuallyPaid={status.actually_paid}, payAmount={status.pay_amount}, payCurrency={status.pay_currency}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[NOWPayments ManualCheck] remote status failed. orderId={payment.OrderId}, paymentId={payment.PaymentId ?? data.PaymentId}, invoiceId={payment.InvoiceId ?? data.InvoiceId}, error={ex.Message}");
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: $"خطا در بررسی وضعیت پرداخت: <code>{System.Net.WebUtility.HtmlEncode(ex.Message)}</code>",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        data.Apply(status);
+        payment.SetNowPaymentsData(data);
+        payment.OutcomeAmount = data.PayAmount == 0 ? payment.OutcomeAmount : data.PayAmount;
+        payment.BaseAmount = data.PriceAmount == 0 ? payment.BaseAmount : data.PriceAmount;
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+        Console.WriteLine($"[NOWPayments ManualCheck] local payment updated. orderId={payment.OrderId}, paymentId={payment.PaymentId}, status={payment.PaymentStatus}, added={payment.IsAddedToBalance}");
+
+        if (NowPaymentsStatuses.IsPaid(data.PaymentStatus))
+        {
+            var settlement = await _nowPaymentsSettlementService.ApplyFinishedPaymentAsync(
+                payment,
+                "manual-check",
+                chatId,
+                cancellationToken);
+            Console.WriteLine($"[NOWPayments ManualCheck] settlement result. orderId={payment.OrderId}, paymentId={payment.PaymentId}, settlement={settlement.Status}, before={settlement.BeforeBalance}, after={settlement.AfterBalance}");
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: BuildCryptoManualCheckSettlementText(payment, data, settlement),
+                parseMode: ParseMode.Html,
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+        }
+        else if (NowPaymentsStatuses.IsPartiallyPaid(data.PaymentStatus))
+        {
+            var partialAmountToman = CalculatePartialCryptoChargeToman(payment, data);
+            var text = BuildPartialCryptoPaymentText(payment, data, partialAmountToman);
+            var replyMarkup = BuildPartialCryptoPaymentKeyboard(payment);
+            Console.WriteLine($"[NOWPayments ManualCheck] partial payment. orderId={payment.OrderId}, paymentId={payment.PaymentId}, partialAmountToman={partialAmountToman}");
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: text,
+                parseMode: ParseMode.Html,
+                replyMarkup: replyMarkup,
+                cancellationToken: cancellationToken);
+        }
+        else
+        {
+            var text = $"وضعیت فعلی پرداخت: <code>{System.Net.WebUtility.HtmlEncode(data.PaymentStatus ?? "unknown")}</code>\n" +
+                       "بعد از تایید شبکه، موجودی شما به صورت خودکار شارژ می‌شود.";
+
+            if (NowPaymentsStatuses.IsFinalFailure(data.PaymentStatus))
+                text = $"این پرداخت با وضعیت <code>{System.Net.WebUtility.HtmlEncode(data.PaymentStatus)}</code> بسته شده و قابل شارژ نیست.";
+
+            Console.WriteLine($"[NOWPayments ManualCheck] not settled. orderId={payment.OrderId}, paymentId={payment.PaymentId}, status={data.PaymentStatus}");
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: text,
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+        }
+
+        await AnswerCallbackSafely(callbackQuery, cancellationToken);
+    }
+
+    private static string BuildCryptoManualCheckSettlementText(
+        SwapinoPaymentInfo payment,
+        NowPaymentsPaymentRecordData data,
+        NowPaymentsSettlementResult settlement)
+    {
+        var status = Html(data?.PaymentStatus ?? payment?.PaymentStatus ?? "unknown");
+        var orderId = Html(payment?.OrderId ?? "");
+        var paymentId = Html(payment?.PaymentId ?? data?.PaymentId ?? "");
+        var amount = Html((payment?.AmountToman ?? 0).FormatCurrency());
+
+        if (settlement?.Status == NowPaymentsSettlementStatus.Applied)
+        {
+            return "✅ پرداخت شما با موفقیت تایید شد و کیف پول شارژ شد.\n\n" +
+                   $"📌 وضعیت: <code>{status}</code>\n" +
+                   $"🧾 Order ID: <code>{orderId}</code>\n" +
+                   $"🧾 Payment ID: <code>{paymentId}</code>\n" +
+                   $"💰 مبلغ شارژ: <code>{amount}</code>\n" +
+                   $"💳 موجودی قبل: <code>{Html(settlement.BeforeBalance.FormatCurrency())}</code>\n" +
+                   $"💳 موجودی بعد: <code>{Html(settlement.AfterBalance.FormatCurrency())}</code>";
+        }
+
+        if (settlement?.Status == NowPaymentsSettlementStatus.AlreadyAdded)
+        {
+            return "ℹ️ اعتبار این پرداخت قبلاً به کیف پول شما اضافه شده است.\n\n" +
+                   $"📌 وضعیت: <code>{status}</code>\n" +
+                   $"🧾 Order ID: <code>{orderId}</code>\n" +
+                   $"🧾 Payment ID: <code>{paymentId}</code>\n" +
+                   $"💳 موجودی فعلی: <code>{Html(settlement.AfterBalance.FormatCurrency())}</code>";
+        }
+
+        if (settlement?.Status == NowPaymentsSettlementStatus.UserNotFound)
+        {
+            return "پرداخت در سمت NOWPayments تایید شده، اما کاربر مربوط به این پرداخت در دیتابیس پیدا نشد.\n" +
+                   $"🧾 Order ID: <code>{orderId}</code>";
+        }
+
+        return "پرداخت در سمت NOWPayments تایید شده، اما شارژ کیف پول کامل نشد.\n\n" +
+               $"📌 وضعیت پرداخت: <code>{status}</code>\n" +
+               $"📌 نتیجه شارژ: <code>{Html(settlement?.Status.ToString() ?? "unknown")}</code>\n" +
+               $"🧾 Order ID: <code>{orderId}</code>";
+    }
+
+    private async Task<bool> TryHandleNowPaymentsSuccessStartAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CredUser credUser,
+        IReplyMarkup mainReplyMarkup,
+        CancellationToken cancellationToken)
+    {
+        if (message?.Text == null || !IsNowPaymentsSuccessStart(message.Text))
+            return false;
+
+        var telegramUserId = message.From?.Id ?? credUser?.TelegramUserId ?? 0;
+        Console.WriteLine($"[NOWPayments SuccessUrl] received success start. user={telegramUserId}, chat={message.Chat.Id}, text={message.Text}");
+
+        var payment = await _userDbContext.SwapinoPaymentInfos
+            .Where(p => p.TelegramUserId == telegramUserId && !p.IsAddedToBalance)
+            .OrderByDescending(p => p.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (payment == null)
+        {
+            Console.WriteLine($"[NOWPayments SuccessUrl] no pending crypto payment found. user={telegramUserId}");
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "پرداخت در حال انتظاری برای حساب شما پیدا نشد. اگر کیف پول قبلاً شارژ شده، نیازی به اقدام دوباره نیست.",
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        await botClient.SendTextMessageAsync(
+            chatId: message.Chat.Id,
+            text: "بازگشت از درگاه پرداخت دریافت شد. در حال بررسی وضعیت پرداخت از NOWPayments هستم...",
+            cancellationToken: cancellationToken);
+
+        await CheckAndSettleCryptoPaymentCoreAsync(
+            payment,
+            message.Chat.Id,
+            0,
+            telegramUserId,
+            "success-url",
+            mainReplyMarkup,
+            cancellationToken);
+
+        return true;
+    }
+
+    private static bool IsNowPaymentsSuccessStart(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        var normalized = text.Trim();
+        return normalized.Equals("/start payment_success", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("/start=payment_success", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("payment_success", StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith("/start payment_success", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task CheckAndSettleCryptoPaymentCoreAsync(
+        SwapinoPaymentInfo payment,
+        long chatId,
+        int messageId,
+        long actorUserId,
+        string source,
+        IReplyMarkup mainReplyMarkup,
+        CancellationToken cancellationToken)
+    {
+        if (payment.IsAddedToBalance)
+        {
+            Console.WriteLine($"[NOWPayments ManualCheck] already added. source={source}, actor={actorUserId}, orderId={payment.OrderId}, paymentId={payment.PaymentId}, user={payment.TelegramUserId}");
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "اعتبار این پرداخت قبلاً به کیف پول شما اضافه شده است و دوباره شارژ نمی‌شود.",
+                parseMode: ParseMode.Html,
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+
+            return;
+        }
+
+        var data = payment.GetNowPaymentsData();
+        NowPaymentsPaymentStatusResult status;
+        try
+        {
+            var paymentId = payment.PaymentId ?? data.PaymentId;
+            if (!string.IsNullOrWhiteSpace(paymentId))
+            {
+                status = await _nowPayments.GetPaymentStatusAsync(paymentId, cancellationToken);
+                Console.WriteLine(
+                    $"[NOWPayments ManualCheck] remote status received by payment_id. source={source}, orderId={payment.OrderId}, paymentId={paymentId}, status={status?.payment_status}, actuallyPaid={status?.actually_paid}, payAmount={status?.pay_amount}, payCurrency={status?.pay_currency}");
+            }
+            else
+            {
+                var invoiceId = payment.InvoiceId ?? data.InvoiceId;
+                Console.WriteLine(
+                    $"[NOWPayments ManualCheck] payment_id missing; searching NOWPayments by invoice/order. source={source}, orderId={payment.OrderId}, invoiceId={invoiceId}, invoiceUrl={payment.InvoiceUrl ?? data.InvoiceUrl}");
+
+                status = await _nowPayments.FindPaymentStatusByInvoiceOrOrderAsync(
+                    invoiceId,
+                    payment.OrderId ?? data.OrderId,
+                    cancellationToken);
+
+                if (status == null)
+                {
+                    Console.WriteLine($"[NOWPayments ManualCheck] no remote payment found for invoice/order. source={source}, orderId={payment.OrderId}, invoiceId={invoiceId}");
+                    await _botClient.CustomSendTextMessageAsync(
+                        chatId: chatId,
+                        text: "هنوز پرداختی برای این فاکتور در لیست پرداخت‌های NOWPayments پیدا نشد.\n" +
+                              "اگر پرداخت را تازه انجام داده‌اید چند دقیقه بعد دوباره بررسی کنید.\n\n" +
+                              $"<a href=\"{System.Net.WebUtility.HtmlEncode(payment.InvoiceUrl ?? data.InvoiceUrl ?? "")}\">باز کردن فاکتور</a>",
+                        parseMode: ParseMode.Html,
+                        replyMarkup: mainReplyMarkup,
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                Console.WriteLine(
+                    $"[NOWPayments ManualCheck] remote status received by invoice/order. source={source}, orderId={payment.OrderId}, paymentId={status.payment_id}, invoiceId={status.invoice_id}, status={status.payment_status}, actuallyPaid={status.actually_paid}, payAmount={status.pay_amount}, payCurrency={status.pay_currency}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[NOWPayments ManualCheck] remote status failed. source={source}, orderId={payment.OrderId}, paymentId={payment.PaymentId ?? data.PaymentId}, invoiceId={payment.InvoiceId ?? data.InvoiceId}, error={ex.Message}");
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: $"خطا در بررسی وضعیت پرداخت: <code>{System.Net.WebUtility.HtmlEncode(ex.Message)}</code>",
+                parseMode: ParseMode.Html,
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        data.Apply(status);
+        payment.SetNowPaymentsData(data);
+        payment.OutcomeAmount = data.PayAmount == 0 ? payment.OutcomeAmount : data.PayAmount;
+        payment.BaseAmount = data.PriceAmount == 0 ? payment.BaseAmount : data.PriceAmount;
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+        Console.WriteLine($"[NOWPayments ManualCheck] local payment updated. source={source}, orderId={payment.OrderId}, paymentId={payment.PaymentId}, status={payment.PaymentStatus}, added={payment.IsAddedToBalance}");
+
+        if (NowPaymentsStatuses.IsPaid(data.PaymentStatus))
+        {
+            var settlement = await _nowPaymentsSettlementService.ApplyFinishedPaymentAsync(
+                payment,
+                source,
+                chatId,
+                cancellationToken);
+            Console.WriteLine($"[NOWPayments ManualCheck] settlement result. source={source}, orderId={payment.OrderId}, paymentId={payment.PaymentId}, settlement={settlement.Status}, before={settlement.BeforeBalance}, after={settlement.AfterBalance}");
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: BuildCryptoManualCheckSettlementText(payment, data, settlement),
+                parseMode: ParseMode.Html,
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+        }
+        else if (NowPaymentsStatuses.IsPartiallyPaid(data.PaymentStatus))
+        {
+            var partialAmountToman = CalculatePartialCryptoChargeToman(payment, data);
+            var text = BuildPartialCryptoPaymentText(payment, data, partialAmountToman);
+            var replyMarkup = BuildPartialCryptoPaymentKeyboard(payment);
+            Console.WriteLine($"[NOWPayments ManualCheck] partial payment. source={source}, orderId={payment.OrderId}, paymentId={payment.PaymentId}, partialAmountToman={partialAmountToman}");
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: text,
+                parseMode: ParseMode.Html,
+                replyMarkup: replyMarkup,
+                cancellationToken: cancellationToken);
+        }
+        else
+        {
+            var text = $"وضعیت فعلی پرداخت: <code>{System.Net.WebUtility.HtmlEncode(data.PaymentStatus ?? "unknown")}</code>\n" +
+                       "بعد از تایید شبکه، موجودی شما به صورت خودکار شارژ می‌شود.";
+
+            if (NowPaymentsStatuses.IsFinalFailure(data.PaymentStatus))
+                text = $"این پرداخت با وضعیت <code>{System.Net.WebUtility.HtmlEncode(data.PaymentStatus)}</code> بسته شده و قابل شارژ نیست.";
+
+            Console.WriteLine($"[NOWPayments ManualCheck] not settled. source={source}, orderId={payment.OrderId}, paymentId={payment.PaymentId}, status={data.PaymentStatus}");
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: text,
+                parseMode: ParseMode.Html,
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    private async Task ProcessCryptoPartialSettlementCallback(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var messageId = callbackQuery.Message?.MessageId ?? 0;
+        var idText = callbackQuery.Data.Replace("settle_crypto_partial_", "");
+
+        if (!int.TryParse(idText, out var paymentDbId))
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "شناسه پرداخت ناقص معتبر نیست.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        var payment = await _userDbContext.SwapinoPaymentInfos.FirstOrDefaultAsync(
+            p => p.Id == paymentDbId,
+            cancellationToken);
+
+        if (payment == null)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "پرداخت مورد نظر پیدا نشد.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (payment.IsAddedToBalance)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "اعتبار این پرداخت قبلاً به کیف پول شما اضافه شده است.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        var data = payment.GetNowPaymentsData();
+        if (string.IsNullOrWhiteSpace(payment.PaymentId ?? data.PaymentId))
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "شناسه پرداخت NOWPayments هنوز ثبت نشده است. کمی بعد دوباره بررسی کنید.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        try
+        {
+            var status = await _nowPayments.GetPaymentStatusAsync(payment.PaymentId ?? data.PaymentId, cancellationToken);
+            data.Apply(status);
+            payment.SetNowPaymentsData(data);
+            payment.OutcomeAmount = data.PayAmount == 0 ? payment.OutcomeAmount : data.PayAmount;
+            payment.BaseAmount = data.PriceAmount == 0 ? payment.BaseAmount : data.PriceAmount;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: $"خطا در بررسی مجدد پرداخت: <code>{System.Net.WebUtility.HtmlEncode(ex.Message)}</code>",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (NowPaymentsStatuses.IsPaid(data.PaymentStatus))
+        {
+            await _nowPaymentsSettlementService.ApplyFinishedPaymentAsync(
+                payment,
+                "manual-check-after-partial",
+                chatId,
+                cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (!NowPaymentsStatuses.IsPartiallyPaid(data.PaymentStatus))
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: $"این پرداخت در وضعیت <code>{System.Net.WebUtility.HtmlEncode(data.PaymentStatus ?? "unknown")}</code> است و فعلاً قابل شارژ نسبی نیست.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        var partialAmountToman = CalculatePartialCryptoChargeToman(payment, data);
+        if (partialAmountToman <= 0)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "مقدار پرداخت‌شده برای شارژ نسبی قابل محاسبه نیست. لطفاً ادامه مبلغ را پرداخت کنید یا با پشتیبانی تماس بگیرید.",
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildPartialCryptoPaymentKeyboard(payment),
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        var settlement = await _nowPaymentsSettlementService.ApplyPartialPaymentAsync(
+            payment,
+            partialAmountToman,
+            "manual-partial-check",
+            chatId,
+            cancellationToken);
+
+        if (settlement.Status == NowPaymentsSettlementStatus.Applied)
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: $"پرداخت ناقص به اندازه <code>{partialAmountToman.FormatCurrency()}</code> به کیف پول شما اضافه شد.",
+                parseMode: ParseMode.Html,
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+        }
+        else
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: $"شارژ نسبی انجام نشد. وضعیت: <code>{settlement.Status}</code>",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+        }
+
+        await AnswerCallbackSafely(callbackQuery, cancellationToken);
+    }
+
+    private static string BuildPartialCryptoPaymentText(
+        SwapinoPaymentInfo payment,
+        NowPaymentsPaymentRecordData data,
+        long partialAmountToman)
+    {
+        var expectedPayAmount = GetExpectedCryptoPayAmount(payment, data);
+        var actuallyPaid = GetActuallyPaidCryptoAmount(payment, data);
+        var remaining = expectedPayAmount > actuallyPaid
+            ? expectedPayAmount - actuallyPaid
+            : 0;
+        var payCurrency = payment.PayCurrency ?? data.PayCurrency ?? "crypto";
+        var baseCurrency = payment.BaseCurrency ?? data.PriceCurrency ?? "usdtbsc";
+        var baseAmount = payment.BaseAmount == 0 ? data.PriceAmount : payment.BaseAmount;
+
+        var builder = new StringBuilder();
+        builder.AppendLine("⚠️ <b>پرداخت شما ناقص ثبت شده است.</b>");
+        builder.AppendLine();
+        builder.AppendLine($"🧾 سفارش: <code>{Html(payment.OrderId)}</code>");
+        builder.AppendLine($"📌 وضعیت: <code>{Html(data.PaymentStatus ?? payment.PaymentStatus ?? "partially_paid")}</code>");
+        builder.AppendLine($"💵 مبلغ سفارش: <code>{Html(FormatCryptoDecimal(baseAmount))} {Html(baseCurrency)}</code>");
+        builder.AppendLine($"🪙 مبلغ مورد انتظار: <code>{Html(FormatCryptoDecimal(expectedPayAmount))} {Html(payCurrency)}</code>");
+        builder.AppendLine($"✅ پرداخت‌شده: <code>{Html(FormatCryptoDecimal(actuallyPaid))} {Html(payCurrency)}</code>");
+
+        if (remaining > 0)
+            builder.AppendLine($"⏳ باقی‌مانده: <code>{Html(FormatCryptoDecimal(remaining))} {Html(payCurrency)}</code>");
+
+        builder.AppendLine();
+        if (partialAmountToman > 0)
+        {
+            builder.AppendLine($"💰 معادل قابل شارژ فعلی: <code>{Html(partialAmountToman.FormatCurrency())}</code>");
+            builder.AppendLine();
+            builder.AppendLine("می‌توانید باقی مبلغ را از همان فاکتور پرداخت کنید، یا فقط همین مقدار پرداخت‌شده را به کیف پول خود اضافه کنید.");
+        }
+        else
+        {
+            builder.AppendLine("مقدار پرداخت‌شده هنوز برای شارژ نسبی قابل محاسبه نیست. لطفاً کمی بعد دوباره بررسی کنید یا ادامه مبلغ را پرداخت کنید.");
+        }
+
+        return builder.ToString();
+    }
+
+    private static InlineKeyboardMarkup BuildPartialCryptoPaymentKeyboard(SwapinoPaymentInfo payment)
+    {
+        var rows = new List<InlineKeyboardButton[]>();
+        var invoiceUrl = payment.InvoiceUrl ?? payment.GetNowPaymentsData().InvoiceUrl;
+        if (!string.IsNullOrWhiteSpace(invoiceUrl))
+        {
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithUrl("پرداخت باقی‌مانده", invoiceUrl)
+            });
+        }
+
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData("شارژ به اندازه پرداختی", $"settle_crypto_partial_{payment.Id}")
+        });
+
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"check_crypto_payment_{payment.OrderId}")
+        });
+
+        return new InlineKeyboardMarkup(rows);
+    }
+
+    private static long CalculatePartialCryptoChargeToman(SwapinoPaymentInfo payment, NowPaymentsPaymentRecordData data)
+    {
+        if (payment == null || payment.AmountToman <= 0 || data == null)
+            return 0;
+
+        var expectedPayAmount = GetExpectedCryptoPayAmount(payment, data);
+        var actuallyPaid = GetActuallyPaidCryptoAmount(payment, data);
+
+        if (expectedPayAmount <= 0 || actuallyPaid <= 0)
+        {
+            var baseAmount = payment.BaseAmount == 0 ? data.PriceAmount : payment.BaseAmount;
+            var actuallyPaidAtFiat = payment.ActuallyPaidAtFiat == 0 ? data.ActuallyPaidAtFiat : payment.ActuallyPaidAtFiat;
+            if (baseAmount <= 0 || actuallyPaidAtFiat <= 0)
+                return 0;
+
+            return ClampPartialTomanAmount(payment.AmountToman, actuallyPaidAtFiat / baseAmount);
+        }
+
+        return ClampPartialTomanAmount(payment.AmountToman, actuallyPaid / expectedPayAmount);
+    }
+
+    private static decimal GetExpectedCryptoPayAmount(SwapinoPaymentInfo payment, NowPaymentsPaymentRecordData data)
+    {
+        if (data?.PayAmount > 0)
+            return data.PayAmount;
+
+        if (payment?.OutcomeAmount > 0)
+            return payment.OutcomeAmount;
+
+        return 0;
+    }
+
+    private static decimal GetActuallyPaidCryptoAmount(SwapinoPaymentInfo payment, NowPaymentsPaymentRecordData data)
+    {
+        if (data?.ActuallyPaid > 0)
+            return data.ActuallyPaid;
+
+        if (data?.AmountReceived > 0)
+            return data.AmountReceived;
+
+        if (payment?.ActuallyPaid > 0)
+            return payment.ActuallyPaid;
+
+        return 0;
+    }
+
+    private static long ClampPartialTomanAmount(long originalAmountToman, decimal ratio)
+    {
+        if (ratio <= 0)
+            return 0;
+
+        if (ratio > 1)
+            ratio = 1;
+
+        return (long)Math.Floor(originalAmountToman * ratio);
+    }
+
+    private static string FormatCryptoDecimal(decimal value)
+    {
+        return value.ToString("0.########", CultureInfo.InvariantCulture);
+    }
+
+    private async Task AnswerCallbackSafely(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _botClient.AnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+        }
+        catch (Exception)
+        {
+            Console.WriteLine("Bad Request: query is too old and response timeout expired or query ID is invalid");
+        }
+    }
+
+    private static string BuildZibalStatusText(InquiryResponse inquiry, PaymentVerificationResponse verify = null)
+    {
+        var builder = new StringBuilder();
+        builder.Append($"inquiry_status={inquiry?.Status}");
+        builder.Append($", inquiry_result={inquiry?.Result}");
+        builder.Append($", inquiry_message={inquiry?.Message ?? string.Empty}");
+
+        if (verify != null)
+        {
+            builder.Append($", verify_status={verify.Status}");
+            builder.Append($", verify_result={verify.Result}");
+            builder.Append($", verify_message={verify.Message ?? string.Empty}");
+            builder.Append($", ref_number={verify.RefNumber ?? string.Empty}");
+        }
+
+        return builder.ToString();
+    }
+
+    private static string BuildZibalUserMessage(long trackId, InquiryResponse inquiry, PaymentVerificationResponse verify)
+    {
+        if (inquiry == null)
+            return "امکان بررسی وضعیت پرداخت وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید.";
+
+        if (inquiry.Status == -1)
+            return $"نشست شماره `{trackId}` هنوز در انتظار پرداخت است.";
+
+        if (inquiry.Status == 2 && verify != null)
+        {
+            if (verify.Result == 100 || verify.Result == 201)
+                return "پرداخت با موفقیت تایید شد و اعتبار به حساب شما اضافه شد.";
+
+            return $"پرداخت انجام شده، اما تایید نهایی زیبال موفق نبود.\nکد پیگیری: `{trackId}`\nکد پاسخ: `{verify.Result}`\nلطفاً چند دقیقه بعد دوباره بررسی کنید یا با پشتیبانی تماس بگیرید.";
+        }
+
+        var statusText = inquiry.Status switch
+        {
+            3 => "پرداخت لغو شده است.",
+            4 => "پرداخت ناموفق بوده است.",
+            5 => "نشست پرداخت منقضی شده است.",
+            _ => "پرداخت در وضعیت موفق قرار ندارد."
+        };
+
+        return $"{statusText}\nکد پیگیری: `{trackId}`\nکد وضعیت زیبال: `{inquiry.Status}`";
+    }
+
+    private static bool IsFinalUnsuccessfulZibalStatus(int status)
+    {
+        return status == 3 || status == 4 || status == 5;
     }
 
     public async Task ZibalAddtoBalance(ZibalPaymentInfo zpi, AppConfig appConfig, CredUser credUser, long chatid, bool isAdmin)
@@ -1625,13 +2591,152 @@ public class TelegramBotService : IHostedService
     }
     private CredUser GetCreduserFromMessage(Message message)
     {
-        // Extract the information from the message
-        long telegramUserId = message.From.Id;
-        long chatId = message.Chat.Id;
-        string username = message.From.Username ?? "";
-        string firstName = message.From.FirstName;
-        string lastName = message.From.LastName ?? "";
-        return new CredUser { TelegramUserId = telegramUserId, ChatID = chatId, IsColleague = false, FirstName = firstName, LastName = lastName, Username = username };
+        return GetCreduserFromTelegramUser(message.From, message.Chat.Id);
+    }
+
+    private CredUser GetCreduserFromTelegramUser(Telegram.Bot.Types.User telegramUser, long chatId)
+    {
+        return new CredUser
+        {
+            TelegramUserId = telegramUser.Id,
+            ChatID = chatId,
+            IsColleague = false,
+            FirstName = telegramUser.FirstName ?? string.Empty,
+            LastName = telegramUser.LastName ?? string.Empty,
+            Username = telegramUser.Username ?? string.Empty,
+            LanguageCode = telegramUser.LanguageCode ?? string.Empty
+        };
+    }
+
+    private CredUser GetCreduserFromUpdate(Update update)
+    {
+        if (update?.Message?.From != null)
+            return GetCreduserFromTelegramUser(update.Message.From, update.Message.Chat.Id);
+
+        if (update?.CallbackQuery?.From != null)
+            return GetCreduserFromTelegramUser(
+                update.CallbackQuery.From,
+                update.CallbackQuery.Message?.Chat.Id ?? update.CallbackQuery.From.Id);
+
+        return null;
+    }
+
+    private bool IsSuperAdminUser(long telegramUserId)
+    {
+        return telegramUserId != 0 && _appConfig.AdminsUserIds?.Contains(telegramUserId) == true;
+    }
+
+    private async Task<bool> TryHandleUserActivityLogCommandAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CredUser credUser,
+        CancellationToken cancellationToken)
+    {
+        if (message?.Text == null)
+            return false;
+
+        var text = message.Text.Trim();
+        if (!text.StartsWith("/userlog", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (text.Equals("/userlog_on", StringComparison.OrdinalIgnoreCase) ||
+            text.Equals("/userlog on", StringComparison.OrdinalIgnoreCase))
+        {
+            _userActivityLog.SetEnabled(true);
+            await _userActivityLog.LogBotActionAsync(
+                "user_activity_log_settings_changed",
+                credUser,
+                true,
+                new Dictionary<string, object>
+                {
+                    ["enabled"] = true,
+                    ["level"] = _userActivityLog.CurrentLevel,
+                    ["changedByCommand"] = text
+                },
+                cancellationToken);
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: $"لاگ رفتار کاربران روشن شد.\nسطح فعلی: {_userActivityLog.CurrentLevel}\nفایل: {_userActivityLog.CurrentFilePath}",
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        if (text.Equals("/userlog_off", StringComparison.OrdinalIgnoreCase) ||
+            text.Equals("/userlog off", StringComparison.OrdinalIgnoreCase))
+        {
+            await _userActivityLog.LogBotActionAsync(
+                "user_activity_log_settings_changed",
+                credUser,
+                true,
+                new Dictionary<string, object>
+                {
+                    ["enabled"] = false,
+                    ["level"] = _userActivityLog.CurrentLevel,
+                    ["changedByCommand"] = text
+                },
+                cancellationToken);
+
+            _userActivityLog.SetEnabled(false);
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "لاگ رفتار کاربران خاموش شد. برای روشن کردن دوباره از /userlog_on استفاده کنید.",
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        if (text.Equals("/userlog_status", StringComparison.OrdinalIgnoreCase) ||
+            text.Equals("/userlog status", StringComparison.OrdinalIgnoreCase) ||
+            text.Equals("/userlog", StringComparison.OrdinalIgnoreCase))
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: $"وضعیت لاگ رفتار کاربران:\nفعال: {_userActivityLog.IsEnabled}\nسطح: {_userActivityLog.CurrentLevel}\nفایل: {_userActivityLog.CurrentFilePath}\n\nفرمان‌ها:\n/userlog_on\n/userlog_off\n/userlog_level_error\n/userlog_level_warning\n/userlog_level_info\n/userlog_level_debug",
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        var level = text.StartsWith("/userlog_level_", StringComparison.OrdinalIgnoreCase)
+            ? text.Substring("/userlog_level_".Length)
+            : text.StartsWith("/userlog level ", StringComparison.OrdinalIgnoreCase)
+                ? text.Substring("/userlog level ".Length)
+                : null;
+
+        if (!string.IsNullOrWhiteSpace(level))
+        {
+            if (!_userActivityLog.TrySetLevel(level, out var normalizedLevel))
+            {
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "سطح لاگ معتبر نیست. یکی از این مقدارها را بفرستید: error, warning, info, debug",
+                    cancellationToken: cancellationToken);
+                return true;
+            }
+
+            await _userActivityLog.LogBotActionAsync(
+                "user_activity_log_settings_changed",
+                credUser,
+                true,
+                new Dictionary<string, object>
+                {
+                    ["enabled"] = _userActivityLog.IsEnabled,
+                    ["level"] = normalizedLevel,
+                    ["changedByCommand"] = text
+                },
+                cancellationToken);
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: $"سطح لاگ روی {normalizedLevel} تنظیم شد.",
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        await botClient.SendTextMessageAsync(
+            chatId: message.Chat.Id,
+            text: "فرمان لاگ نامعتبر است. برای دیدن راهنما /userlog_status را بفرستید.",
+            cancellationToken: cancellationToken);
+        return true;
     }
     private ReplyKeyboardMarkup GetMessageSendConfirmationKeyboard()
     {
@@ -1661,7 +2766,22 @@ public class TelegramBotService : IHostedService
     }
     private string[] GetAdminActions()
     {
-        string[] actions = new string[] { "➕ Add credit", "➖ Reduce credit", "🚀 Promote as admin", "❌ Demote as admin", "ℹ️ See User Account", "📨 Send message to all", "ℹ️ See All account of user", "✔️ Verify payment", "📑 Menu" };
+        string[] actions = new string[]
+        {
+            "🚫 Ban user",
+            "✅ Unban user",
+            "➕ Add credit",
+            "➖ Reduce credit",
+            "🚀 Promote as admin",
+            "❌ Demote as admin",
+            "ℹ️ See User Account",
+            "📨 Send message to all",
+            "✉️ Send message to user",
+            "ℹ️ See All account of user",
+            "🗑 Delete expired accounts",
+            "✔️ Verify payment",
+            "📑 Menu"
+        };
         return actions;
     }
 
@@ -1784,8 +2904,12 @@ public class TelegramBotService : IHostedService
 
         if (update.Message is not { } message)
             return;
+        var chatId = message.Chat.Id;
+
+
         if (message is not null && message.Type == MessageType.Contact && message.Contact != null)
         {
+            await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
             Contact userContact;
             userContact = message.Contact;
             bool isValidPhoneNumber = await CheckUserPhoneNumber(message.Chat.Id, message);
@@ -1794,7 +2918,7 @@ public class TelegramBotService : IHostedService
                 await _credentialsDbContext.SavePhoneNumber(message.From.Id, message.Contact.PhoneNumber);
                 await botClient.CustomSendTextMessageAsync(
                              chatId: message.Chat.Id,
-                             text: "شماره شما با موفقیت دریافت شد. برای درییافت اکانت رایگان روی گزینه دریافت اکانت رایگان مجدد کلیک کنید. ",
+                             text: "شماره شما با موفقیت تایید شد. حالا دوباره گزینه مورد نظرتان را انتخاب کنید.",
                              replyMarkup: MainReplyMarkupKeyboardFa());
                 return;
             }
@@ -1807,8 +2931,10 @@ public class TelegramBotService : IHostedService
         if (message.Text is not { } messageText)
             return;
 
+        Console.WriteLine($"Received a '{message.Text}' message in chat {chatId}.");
+
+
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
-        await _credentialsDbContext.SaveUserStatus(credUser);
         var user = await _userDbContext.GetUserStatus(message.From.Id);
 
         var isJoined = await isJoinedToChannel(_appConfig.ChannelIds.Select(c => c.Replace("https://t.me/", "@")), message.From.Id);
@@ -1879,7 +3005,7 @@ public class TelegramBotService : IHostedService
 
         }
 
-        else if (message.Text == "🏠منو" || message.Text == "لغو")
+        else if (message.Text == "🏠منو" || message.Text == "لغو" || message.Text == "منوی اصلی")
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
@@ -1887,6 +3013,99 @@ public class TelegramBotService : IHostedService
                 chatId: message.Chat.Id,
                 text: "منوی اصلی",
                 replyMarkup: MainReplyMarkupKeyboardFa());
+        }
+
+        else if (message.Text == "📌 قابلیت‌های ربات" || message.Text == "قابلیت‌های ربات")
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: BuildBotCapabilitiesMessage(credUser),
+                parseMode: ParseMode.Html,
+                replyMarkup: MainReplyMarkupKeyboardFa());
+            return;
+        }
+
+        else if (await _xuiV3BotFlowService.TryHandleAccountActionAsync(
+            botClient,
+            message,
+            credUser,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            await _userDbContext.ClearUserStatus(user);
+            return;
+        }
+        else if (await _xuiV3BotFlowService.TryHandleDeleteExpiredAccountsAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
+        else if (await _xuiV3BotFlowService.TryHandleAccountSearchAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
+        else if (await _xuiV3BotFlowService.TryHandleColleagueRequestAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
+        else if (await _xuiV3BotFlowService.TryHandlePurchaseTextAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
+        else if (await _xuiV3BotFlowService.TryHandleRenewAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
+        else if (await _xuiV3BotFlowService.TryHandleFreeTrialAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
+        else if (await _xuiV3BotFlowService.TryHandleAccountCounterLookupAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
         }
 
         else if (StartsWithEnableOrDisable(message.Text))
@@ -2012,28 +3231,44 @@ public class TelegramBotService : IHostedService
 
         }
 
-        else if (message.Text == "💰شارژ حساب کاربری")
+        else if (message.Text == "شارژ حساب کاربری")
         {
+            // await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+            // var text = "درحال حاضر شارژ حساب فقط از طریق ادمین امکان پذیر می‌باشد.برای شارژ حساب خود به ادمین پیام دهید و پیام زیر را برای ایشان فوروارد کنید: /n @vpsnetiran_vpn /n به زودی پرداخت ریالی و ترونی به ربات اضافه خواهد شد.";
+            // await botClient.CustomSendTextMessageAsync(
+            //                 chatId: message.Chat.Id,
+            //                 text: text,
+            //                 replyMarkup: new ReplyKeyboardRemove());
+
+            // text = await GetUserProfileMessage(credUser);
+            // await botClient.CustomSendTextMessageAsync(
+            //     chatId: message.Chat.Id,
+            //     text: text,
+            //     replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
-            var text = "درحال حاضر شارژ حساب فقط از طریق ادمین امکان پذیر می‌باشد.برای شارژ حساب خود به ادمین پیام دهید و پیام زیر را برای ایشان فوروارد کنید: /n @vpsnetiran_vpn /n به زودی پرداخت ریالی و ترونی به ربات اضافه خواهد شد.";
-            await botClient.CustomSendTextMessageAsync(
-                            chatId: message.Chat.Id,
-                            text: text,
-                            replyMarkup: new ReplyKeyboardRemove());
 
-            text = await GetUserProfileMessage(credUser);
-            await botClient.CustomSendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: text,
-                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            user.PaymentMethod = "crypto";
+            user.Flow = "charge";
+            user.LastStep = "payment_method_selection";
+            await _userDbContext.SaveUserStatus(user);
+
+
 
         }
 
         else if (message.Text == "💳خرید اکانت جدید")
         {
+            if (string.Equals(_appConfig.XuiApiVersionMode, "v3", StringComparison.OrdinalIgnoreCase))
+            {
+                var xuiUser = await _userDbContext.GetUserStatus(message.From.Id);
+                if (await _xuiV3BotFlowService.TryStartPurchaseAsync(botClient, message, credUser, xuiUser, cancellationToken))
+                    return;
+            }
+
             var replyKeboard = PriceReplyMarkupKeyboardFa(credUser.IsColleague, false);
 
             await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
@@ -2070,9 +3305,9 @@ public class TelegramBotService : IHostedService
             }
             else if (message.Text == "راهنمای اپل 📱")
             {
-                List<InlineKeyboardButton[]> rows = _appConfig.IosTutorial.Select(url => new InlineKeyboardButton[]
+                List<InlineKeyboardButton[]> rows = _appConfig.IosTutorial.Select((url, index) => new InlineKeyboardButton[]
                     {
-                        InlineKeyboardButton.WithUrl("آموزش", url)
+                        InlineKeyboardButton.WithUrl(GetTutorialButtonText(index), url)
                     }).ToList();
 
                 // Create the InlineKeyboardMarkup
@@ -2095,9 +3330,9 @@ public class TelegramBotService : IHostedService
             }
             else if (message.Text == "راهنمای اندروید 📱")
             {
-                List<InlineKeyboardButton[]> rows = _appConfig.AndroidTutorial.Select(url => new InlineKeyboardButton[]
+                List<InlineKeyboardButton[]> rows = _appConfig.AndroidTutorial.Select((url, index) => new InlineKeyboardButton[]
                     {
-                        InlineKeyboardButton.WithUrl("آموزش", url)
+                        InlineKeyboardButton.WithUrl(GetTutorialButtonText(index), url)
                     }).ToList();
 
                 // Create the InlineKeyboardMarkup
@@ -2118,9 +3353,9 @@ public class TelegramBotService : IHostedService
             else if (message.Text == "راهنمای ویندوز 💻")
             {
 
-                List<InlineKeyboardButton[]> rows = _appConfig.WindowsTutorial.Select(url => new InlineKeyboardButton[]
+                List<InlineKeyboardButton[]> rows = _appConfig.WindowsTutorial.Select((url, index) => new InlineKeyboardButton[]
                     {
-                        InlineKeyboardButton.WithUrl("آموزش", url)
+                        InlineKeyboardButton.WithUrl(GetTutorialButtonText(index), url)
                     }).ToList();
 
                 // Create the InlineKeyboardMarkup
@@ -2153,12 +3388,21 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "⚙️ مدیریت اکانت")
         {
-            ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
+            var accountManagementRows = new List<KeyboardButton[]>
             {
                 new KeyboardButton[] { "مشاهده وضعیت حساب","تمدید اکانت"},
-                new KeyboardButton[] { "وضعیت اکانت های من","شارژ حساب کاربری" },
-                new KeyboardButton[] { "منوی اصلی" },
-            })
+                new KeyboardButton[] { "وضعیت اکانت های من","🔎 جستجوی اکانت" },
+                new KeyboardButton[] { "حذف اکانت های منقضی" },
+            };
+
+            if (credUser?.IsColleague != true)
+                accountManagementRows.Add(new KeyboardButton[] { "🤝 درخواست همکاری" });
+
+            accountManagementRows.Add(new KeyboardButton[] { "💰شارژ حساب کاربری" });
+            accountManagementRows.Add(new KeyboardButton[] { "📌 قابلیت‌های ربات" });
+            accountManagementRows.Add(new KeyboardButton[] { "منوی اصلی" });
+
+            ReplyKeyboardMarkup replyKeyboardMarkup = new(accountManagementRows)
             {
                 ResizeKeyboard = true, // This will make the keyboard buttons resize to fit their container
                 OneTimeKeyboard = true // This will hide the keyboard after a button is pressed (optional)
@@ -2186,6 +3430,21 @@ public class TelegramBotService : IHostedService
             }
             else if (message.Text == "تایید نهایی")
             {
+                if (user.PaymentMethod == "zibal")
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "درگاه پرداخت ریالی فعلاً غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
                 await botClient.CustomSendTextMessageAsync(
                                                                             chatId: message.Chat.Id,
                                                                             text: "لطفاً چند ثانیه صبر کنید.",
@@ -2319,20 +3578,412 @@ public class TelegramBotService : IHostedService
 
                 else if (user.PaymentMethod == "crypto")
                 {
-                }
-                else
-                {
+                    long amount = Convert.ToInt64(user.ConfigLink);
+                    var payment = SwapinoPaymentInfo.CreateCryptoCharge(
+                        credUser.TelegramUserId,
+                        amount,
+                        _appConfig.NowpaymentIpnUrl,
+                        chatId: message.Chat.Id,
+                        baseCurrency: _appConfig.NowpaymentPriceCurrency);
+
+                    _userDbContext.SwapinoPaymentInfos.Add(payment);
+                    await _userDbContext.SaveChangesAsync();
+
+                    try
+                    {
+                        var priceCurrency = string.IsNullOrWhiteSpace(_appConfig.NowpaymentPriceCurrency)
+                            ? "usdtbsc"
+                            : _appConfig.NowpaymentPriceCurrency;
+
+                        Console.WriteLine($"[NOWPayments] Creating invoice for user={credUser.TelegramUserId}, amount={amount}, orderId={payment.OrderId}, priceCurrency={priceCurrency}, payCurrency=all");
+
+                        var nowPayment = await _nowPayments.CreateInvoiceAsync(
+                            amount,
+                            payment.OrderId,
+                            $"Wallet charge {payment.OrderId}",
+                            null,
+                            priceCurrency,
+                            cancellationToken);
+
+                        payment.RawRequestJson = JsonConvert.SerializeObject(new
+                        {
+                            orderId = payment.OrderId,
+                            invoiceId = nowPayment.id,
+                            invoiceUrl = nowPayment.invoice_url,
+                            paymentId = (string)null,
+                            amountToman = amount,
+                            priceCurrency,
+                            payCurrency = (string)null,
+                            usdtIrtPrice = nowPayment.LocalUsdtIrtPrice,
+                            priceSource = nowPayment.LocalPriceSource,
+                            usedFallbackPrice = nowPayment.LocalUsedFallbackPrice,
+                            priceIsRial = nowPayment.LocalPriceIsRial,
+                            calculatedPriceAmount = nowPayment.price_amount,
+                            callbackUrl = _appConfig.NowpaymentIpnUrl
+                        });
+                        payment.RawResponseJson = JsonConvert.SerializeObject(nowPayment);
+                        Console.WriteLine(
+                            $"[NOWPayments] Invoice created. orderId={payment.OrderId}, invoiceId={nowPayment.id}, invoiceUrl={nowPayment.invoice_url}, ipnCallbackUrl={_appConfig.NowpaymentIpnUrl}, priceCurrency={nowPayment.price_currency}, priceAmount={nowPayment.price_amount}, paymentId=");
+                        var data = NowPaymentsPaymentRecordData.FromInvoiceResponse(nowPayment);
+                        data.OrderId = payment.OrderId;
+                        payment.SetNowPaymentsData(data);
+                        payment.BaseAmount = nowPayment.price_amount;
+                        payment.BaseCurrency = nowPayment.price_currency;
+                        await _userDbContext.SaveChangesAsync();
+
+                        var msg = await GetNowPaymentsPaymentMessage(credUser, payment);
+                        var inlineKeyboardMarkup = new InlineKeyboardMarkup(new[]
+                        {
+                            new[]
+                            {
+                                InlineKeyboardButton.WithUrl(text: "باز کردن فاکتور", url: nowPayment.invoice_url)
+                            },
+                            new[]
+                            {
+                                InlineKeyboardButton.WithCallbackData(text: "بررسی وضعیت", callbackData: $"check_crypto_payment_{payment.OrderId}")
+                            }
+                        });
+
+                        Message latestMsg;
+                        if (!string.IsNullOrWhiteSpace(nowPayment.invoice_url))
+                        {
+                            using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(nowPayment.invoice_url, 200));
+                            latestMsg = await botClient.SendPhotoAsync(
+                                message.Chat.Id,
+                                InputFile.FromStream(qrStream),
+                                caption: msg,
+                                parseMode: ParseMode.Html,
+                                replyMarkup: inlineKeyboardMarkup,
+                                cancellationToken: cancellationToken);
+                        }
+                        else
+                        {
+                            latestMsg = await botClient.CustomSendTextMessageAsync(
+                                chatId: message.Chat.Id,
+                                text: msg,
+                                replyMarkup: inlineKeyboardMarkup,
+                                parseMode: ParseMode.Html,
+                                cancellationToken: cancellationToken);
+                        }
+
+                        await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: "منوی اصلی",
+                            replyMarkup: MainReplyMarkupKeyboardFa(),
+                            cancellationToken: cancellationToken);
+
+                        if (latestMsg != null)
+                            payment.TelMsgId = latestMsg.MessageId;
+
+                            await _userDbContext.SaveChangesAsync();
+                    }
+                    catch (NowPaymentsApiException ex)
+                    {
+                        Console.WriteLine("[NOWPayments] API exception while creating payment:");
+                        Console.WriteLine(ex.ToString());
+
+                        payment.Result = JsonConvert.SerializeObject(new
+                        {
+                            error = ex.Message,
+                            statusCode = ex.StatusCode,
+                            requestMethod = ex.RequestMethod,
+                            requestUri = ex.RequestUri,
+                            requestBody = ex.RequestBody,
+                            responseBody = ex.ResponseBody,
+                            orderId = payment.OrderId,
+                            createdAt = DateTime.UtcNow
+                        });
+                        await _userDbContext.SaveChangesAsync();
+
+                        await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: "NOWPayments درخواست را رد کرده است. جزئیات خطا در ترمینال ثبت شد.",
+                            replyMarkup: MainReplyMarkupKeyboardFa(),
+                            cancellationToken: cancellationToken);
+                    }
+                    catch (InvalidOperationException ex) when (ex.Message.Contains("minimum for usd->"))
+                    {
+                        Console.WriteLine("[NOWPayments] Minimum amount validation failed:");
+                        Console.WriteLine(ex.ToString());
+
+                        payment.Result = JsonConvert.SerializeObject(new
+                        {
+                            error = ex.Message,
+                            orderId = payment.OrderId,
+                            createdAt = DateTime.UtcNow
+                        });
+                        await _userDbContext.SaveChangesAsync();
+
+                        await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: "مبلغ وارد شده از حداقل مجاز NOWPayments کمتر است. جزئیات دقیق در ترمینال ثبت شد.",
+                            replyMarkup: MainReplyMarkupKeyboardFa(),
+                            cancellationToken: cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("[NOWPayments] Unexpected exception while creating payment:");
+                        Console.WriteLine(ex.ToString());
+
+                        payment.Result = JsonConvert.SerializeObject(new
+                        {
+                            error = ex.Message,
+                            orderId = payment.OrderId,
+                            createdAt = DateTime.UtcNow
+                        });
+                        await _userDbContext.SaveChangesAsync();
+
+                        await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: "ایجاد پرداخت ارز دیجیتال ناموفق بود. جزئیات خطا در ترمینال ثبت شد.",
+                            replyMarkup: MainReplyMarkupKeyboardFa(),
+                            cancellationToken: cancellationToken);
+                    }
 
                 }
+
+                else
+                {
+                }
+            }
+        }
+        else if (user.LastStep == "payment_method_selection" && user.Flow == "charge")
+        {
+
+            // The user entered a valid number
+            var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                       {
+            new []
+            {
+                new KeyboardButton("تایید نهایی"),
+            },
+            new []
+            {
+                new KeyboardButton("انصراف"),
+            },
+        });
+
+            if (message.Text == "درگاه سواپینو(غیرفعال)")
+            {
+                user.LastStep = "payment_method_selection";
+                user.Flow = "charge";
+                user.PaymentMethod = string.Empty;
+                await _userDbContext.SaveUserStatus(user);
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "این درگاه فعلاً غیرفعال است. لطفاً یکی از درگاه‌های فعال را انتخاب کنید.",
+                    replyMarkup: BuildChargePaymentMethodKeyboard(),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+            else if (message.Text == "درگاه ریالی" || message.Text == "درگاه ریالی (غیرفعال)")
+            {
+                user.LastStep = "payment_method_selection";
+                user.Flow = "charge";
+                user.PaymentMethod = string.Empty;
+                await _userDbContext.SaveUserStatus(user);
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "درگاه پرداخت ریالی فعلاً غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                    replyMarkup: BuildChargePaymentMethodKeyboard(),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+            else if (message.Text == "درگاه ارز دیجیتال")
+            {
+                user.PaymentMethod = "crypto";
+            }
+
+            user.LastStep = "confirmation";
+            user.Flow = "charge";
+            await _userDbContext.SaveUserStatus(user);
+
+
+            var gatewayName = user.PaymentMethod == "crypto"
+                ? "درگاه ارز دیجیتال"
+                : user.PaymentMethod == "zibal"
+                    ? "درگاه ریالی"
+                    : "درگاه پرداخت";
+
+            var text = $"✅ شما مقدار {Convert.ToInt64(user.ConfigLink).FormatCurrency()} را برای شارژ حساب خود وارد کرده‌اید.\n" +
+                       $"درگاه انتخابی: {gatewayName}\n" +
+                       "برای ادامه، گزینه تایید نهایی را بزنید. در غیر این صورت انصراف را انتخاب کنید.";
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: text,
+                parseMode: ParseMode.Html,
+                replyMarkup: confirmationKeyboard);
+            return;
+
+
+        }
+
+        else if (message.Text == "💰شارژ حساب کاربری")
+        {
+            var keyboardButtons = new List<List<KeyboardButton>>();
+            var allPrices = _appConfig.Price.Union(_appConfig.PriceCommon).Union(_appConfig.PriceColleagues);
+            foreach (var priceConfig in allPrices)
+            {
+
+                var buttonText = $"{Convert.ToInt64(priceConfig.Price).FormatCurrency()}";
+                keyboardButtons.Add(new List<KeyboardButton> { new KeyboardButton(buttonText) });
             }
 
 
+            // Add a "Back" button at the end
+            keyboardButtons.Add(new List<KeyboardButton> { new KeyboardButton("بازگشت") });
 
-
-
-
-            else if (user.LastStep == "payment_method_selection" && user.Flow == "charge")
+            var keyboard = new ReplyKeyboardMarkup(keyboardButtons)
             {
+                ResizeKeyboard = true,
+                OneTimeKeyboard = true
+            };
+
+
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
+            var msg = $"لطفاً میزان شارژ اکانت خود را انتخاب یا به تومان وارد کنید. به عنوان مثال {MinimumChargeAmountToman} معادل 100 هزارتومان است.\nحداقل میزان شارژ 100 هزارتومان است.";
+            //msg = "برای شارژ حساب کاربری به آیدی زیر پیام دهید: \n @vpnetiran_admin";
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: msg.EscapeMarkdown(),
+                replyMarkup: keyboard, parseMode: ParseMode.Markdown);
+
+
+        }
+
+        else if (user.LastStep == "enter charge amount" && user.Flow == "charge")
+        {
+            // Usage
+            bool canConvert = message.Text.PersianNumbersToEnglish().ToValidNumber().TryConvertToLong(out long longValue);
+            if (canConvert)
+            {
+                if (longValue < MinimumChargeAmountToman)
+                {
+                    await botClient.CustomSendTextMessageAsync(
+                                        chatId: message.Chat.Id,
+                                        text: $" شما مقدار {longValue.FormatCurrency()} را برای شارژ حساب خود وارد کرده اید. \n" + " ❕ حداقل میزان شارژ 100 هزار تومان است\n" + "\n" + "مبلغ مد نظر خود را مجدد وارد کنید",
+                                        replyMarkup: new ReplyKeyboardRemove());
+                    return;
+                }
+                // use longValue
+                user.ConfigLink = longValue.ToString();
+                user.LastStep = "payment_method_selection";
+                user.Flow = "charge";
+                await _userDbContext.SaveUserStatus(user);
+
+
+                // The user entered a valid number
+                var paymentmethod = BuildChargePaymentMethodKeyboard();
+
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"✅ شما مقدار {longValue.FormatCurrency()}  را برای شارژ حساب خود وارد کرده اید. \n" + "لطفاً درگاه مورد نظر خود را برای پرداخت آنلاین انتخاب نمائید.",
+                    replyMarkup: paymentmethod);
+                return;
+
+            }
+            else
+            {
+                // handle the case where it's not a valid long
+                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
+                var msg = "عدد وارد شده صحیح نمیباشد. لطفاً مبلغ را به تومان و به عدد وارد کنید و گزینه ارسال را بزنید.";
+                msg += "\n  در صورتی که میخواهید به منوی اصلی  برگردید روی استارت کلیک کنید /start";
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: msg,
+                    replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
+
+            }
+            return;
+
+        }
+
+        else if (message.Text == "مشاهده وضعیت حساب")
+        {
+            var text = await GetUserProfileMessage(credUser);
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: text,
+                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+        }
+        else if (message.Text == "وضعیت اکانت های من")
+        {
+            if (await _xuiV3BotFlowService.TryHandleMyAccountsAsync(
+                botClient,
+                message,
+                credUser,
+                MainReplyMarkupKeyboardFa(),
+                cancellationToken))
+            {
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                return;
+            }
+
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "لطفاً چند ثانیه صبر کنید. دریافت اطلاعات از سرورها ممکن است لحظاتی طول بکشد ...",
+                replyMarkup: new ReplyKeyboardRemove());
+
+            var accounts = await TryGetَAllClient(credUser.TelegramUserId);
+            if (accounts.Count < 1)
+            {
+
+                await botClient.CustomSendTextMessageAsync(
+               chatId: message.Chat.Id,
+               text: "شما هنوز هیچ اکانتی از مجموعه ما ندارید.",
+               replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                return;
+            }
+            await SendMessageWithClientInfo(credUser.ChatID, credUser.IsColleague, accounts);
+
+
+            await botClient.CustomSendTextMessageAsync(
+               chatId: message.Chat.Id,
+               text: "منوی اصلی",
+               replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            return;
+        }
+        else if (message.Text == "تمدید اکانت")
+        {
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "لطفاً لینک Vmess یا نام اکانت خود را برای ربات ارسال کنید:",
+                replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
+
+        }
+        else if (user.Flow == "update" && user.LastStep == "get-traffic")
+        {
+            var isSuccessful = int.TryParse(message.Text, out int res);
+            if (!isSuccessful)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "خطا! \n ترافیک را به گیگابایت و با اعداد انگلیسی تایپ کنید \n" + "به عنوان مثال 20 معادل بیست گیگابایت خواهد بود \n روی /start برای شروع مجدد کلیک کنید.",
+                        replyMarkup: new ReplyKeyboardRemove());
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                return;
+            }
+
+            long price = res * 1000;
+            if (credUser.AccountBalance >= price)
+            {
+
+                user.Flow = "update";
+                user.LastStep = "ask_confirmation";
+                user._ConfigPrice = price.ToString();
+                user.Type = "tunnel";
+                user.TotoalGB = res.ToString();
+                user.SelectedPeriod = "0 Month";
+
+
+                await _userDbContext.SaveUserStatus(user);
+
 
                 // The user entered a valid number
                 var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
@@ -2347,447 +3998,232 @@ public class TelegramBotService : IHostedService
             },
         });
 
-                if (message.Text == "درگاه سواپینو(غیرفعال)")
-                {
-                    user.PaymentMethod = "swapino";
-                }
-                else if (message.Text == "درگاه ریالی")
-                {
-                    user.PaymentMethod = "zibal";
-                }
-                else if (message.Text == "درگاه ارز دیجیتال")
-                {
-                    user.PaymentMethod = "crypto";
-                }
-
-                user.LastStep = "confirmation";
-                user.Flow = "charge";
-                await _userDbContext.SaveUserStatus(user);
-
-
-                // fuck
-                // await botClient.CustomSendTextMessageAsync(
-                //     chatId: message.Chat.Id,
-                //     text: $"✅ شما مقدار {Convert.ToInt64(user.ConfigLink).FormatCurrency()}  را برای شارژ حساب خود وارد کرده اید. \n" + $"درگاه انتخابی:{message.Text} \n " + " ❕ برای شارژ حساب، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
-                //     replyMarkup: confirmationKeyboard);
-                // return;
-
-                var text = "✅ برای شارژ حساب کاربری به پشتیبانی پیام دهید ." + "\n" + @"🆔 @vpnetiran\_admin";
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
-                    text: text, parseMode: ParseMode.Markdown,
-                    replyMarkup: MainReplyMarkupKeyboardFa());
-
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                    text: $"✅ شما اعتبار لازم برای تمدید اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
+                    replyMarkup: confirmationKeyboard);
                 return;
 
-
-            }
-
-            else if (message.Text == "شارژ حساب کاربری")
-            {
-                var keyboardButtons = new List<List<KeyboardButton>>();
-                var allPrices = _appConfig.Price.Union(_appConfig.PriceCommon).Union(_appConfig.PriceColleagues);
-                foreach (var priceConfig in allPrices)
-                {
-
-                    var buttonText = $"{Convert.ToInt64(priceConfig.Price).FormatCurrency()}";
-                    keyboardButtons.Add(new List<KeyboardButton> { new KeyboardButton(buttonText) });
-                }
-
-
-                // Add a "Back" button at the end
-                keyboardButtons.Add(new List<KeyboardButton> { new KeyboardButton("بازگشت") });
-
-                var keyboard = new ReplyKeyboardMarkup(keyboardButtons)
-                {
-                    ResizeKeyboard = true,
-                    OneTimeKeyboard = true
-                };
-
-
-                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
-                var msg = "لطفاً میزان شارژ اکانت خود را انتخاب یا به تومان وارد کنید. به عنوان مثال 150000 معادل 150 هزارتومان است." + $"حداقل میزان شارژ 150 هزارتومان است.";
-                //msg = "برای شارژ حساب کاربری به آیدی زیر پیام دهید: \n @vpnetiran_admin";
-                await botClient.CustomSendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: msg.EscapeMarkdown(),
-                    replyMarkup: keyboard, parseMode: ParseMode.Markdown);
-
-
-            }
-            else if (user.LastStep == "enter charge amount" && user.Flow == "charge")
-            {
-                // Usage
-                bool canConvert = message.Text.PersianNumbersToEnglish().ToValidNumber().TryConvertToLong(out long longValue);
-                if (canConvert)
-                {
-                    if (longValue < 50000)
-                    {
-                        await botClient.CustomSendTextMessageAsync(
-                                            chatId: message.Chat.Id,
-                                            text: $" شما مقدار {longValue.FormatCurrency()} را برای شارژ حساب خود وارد کرده اید. \n" + " ❕ حداقل میزان شارژ 50 هزار تومان است\n" + "\n" + "مبلغ مد نظر خود را مجدد وارد کنید",
-                                            replyMarkup: new ReplyKeyboardRemove());
-                        return;
-                    }
-                    // use longValue
-                    user.ConfigLink = longValue.ToString();
-                    user.LastStep = "payment_method_selection";
-                    user.Flow = "charge";
-                    await _userDbContext.SaveUserStatus(user);
-
-
-                    // The user entered a valid number
-                    var paymentmethod = new ReplyKeyboardMarkup(new[]
-                               {
-            // new []
-            // {
-            //     new KeyboardButton("درگاه سواپینو(غیرفعال)"),
-            // },
-            new []
-            {
-                new KeyboardButton("درگاه ریالی"),
-                new KeyboardButton("درگاه ارز دیجیتال")
-            },
-        });
-
-
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: $"✅ شما مقدار {longValue.FormatCurrency()}  را برای شارژ حساب خود وارد کرده اید. \n" + "لطفاً درگاه مورد نظر خود را برای پرداخت آنلاین انتخاب نمائید.",
-                        replyMarkup: paymentmethod);
-                    return;
-
-                }
-                else
-                {
-                    // handle the case where it's not a valid long
-                    await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
-                    var msg = "عدد وارد شده صحیح نمیباشد. لطفاً مبلغ را به تومان و به عدد وارد کنید و گزینه ارسال را بزنید.";
-                    msg += "\n  در صورتی که میخواهید به منوی اصلی  برگردید روی استارت کلیک کنید /start";
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: msg,
-                        replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
-
-                }
-                return;
-
-            }
-
-            else if (message.Text == "مشاهده وضعیت حساب")
-            {
-                var text = await GetUserProfileMessage(credUser);
-                await botClient.CustomSendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: text,
-                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-            }
-            else if (message.Text == "وضعیت اکانت های من")
-            {
-
-                await botClient.CustomSendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: "لطفاً چند ثانیه صبر کنید. دریافت اطلاعات از سرورها ممکن است لحظاتی طول بکشد ...",
-                    replyMarkup: new ReplyKeyboardRemove());
-
-                var accounts = await TryGetَAllClient(credUser.TelegramUserId);
-                if (accounts.Count < 1)
-                {
-
-                    await botClient.CustomSendTextMessageAsync(
-                   chatId: message.Chat.Id,
-                   text: "شما هنوز هیچ اکانتی از مجموعه ما ندارید.",
-                   replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                    return;
-                }
-                await SendMessageWithClientInfo(credUser.ChatID, credUser.IsColleague, accounts);
-
-
-                await botClient.CustomSendTextMessageAsync(
-                   chatId: message.Chat.Id,
-                   text: "منوی اصلی",
-                   replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-                return;
-            }
-            else if (message.Text == "تمدید اکانت")
-            {
-                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
-                await botClient.CustomSendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: "لطفاً لینک Vmess یا نام اکانت خود را برای ربات ارسال کنید:",
-                    replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
-
-            }
-            else if (user.Flow == "update" && user.LastStep == "get-traffic")
-            {
-                var isSuccessful = int.TryParse(message.Text, out int res);
-                if (!isSuccessful)
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                            chatId: message.Chat.Id,
-                            text: "خطا! \n ترافیک را به گیگابایت و با اعداد انگلیسی تایپ کنید \n" + "به عنوان مثال 20 معادل بیست گیگابایت خواهد بود \n روی /start برای شروع مجدد کلیک کنید.",
-                            replyMarkup: new ReplyKeyboardRemove());
-                    await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-                    return;
-                }
-
-                long price = res * 1000;
-                if (credUser.AccountBalance >= price)
-                {
-
-                    user.Flow = "update";
-                    user.LastStep = "ask_confirmation";
-                    user._ConfigPrice = price.ToString();
-                    user.Type = "tunnel";
-                    user.TotoalGB = res.ToString();
-                    user.SelectedPeriod = "0 Month";
-
-
-                    await _userDbContext.SaveUserStatus(user);
-
-
-                    // The user entered a valid number
-                    var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
-                               {
-            new []
-            {
-                new KeyboardButton("تایید نهایی"),
-            },
-            new []
-            {
-                new KeyboardButton("انصراف"),
-            },
-        });
-
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: $"✅ شما اعتبار لازم برای تمدید اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
-                        replyMarkup: confirmationKeyboard);
-                    return;
-
-                }
-
-                else
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                                       chatId: message.Chat.Id,
-                                       text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
-                                       replyMarkup: MainReplyMarkupKeyboardFa());
-                    await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-
-                    return;
-                }
-
-            }
-
-            else if (message.Text == "تمدید حجمی" && user.Flow == "update")
-            {
-                user.LastStep = "get-traffic";
-                await _userDbContext.SaveUserStatus(user);
-
-                await botClient.CustomSendTextMessageAsync(
-                                    chatId: message.Chat.Id,
-                                    text: "ترافیک مورد نظر را به عدد ارسال کنید. هر گیگابایت معادل 1000 تومان از حساب شما کسر خواهد شد.",
-                                    replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
-
-            }
-            else if (user.Flow == "update" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
-            {
-                await FinalizeRenewCustomerAccount(_botClient, user, credUser, message);
-
-            }
-            else if (user.Flow == "update" && user.LastStep == "set-renew-type" && message.Text.Contains("تمدید"))
-            {
-                long price = TryParsPrice(message.Text);
-                if (price == 0)
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                                        chatId: message.Chat.Id,
-                                        text: "خطا",
-                                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                    await _userDbContext.ClearUserStatus(user);
-                    return;
-                }
-
-                if (CheckButtonCorrectness(credUser.IsColleague, message.Text, true) == false)
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: "خطا",
-                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                    await _userDbContext.ClearUserStatus(user);
-                    return;
-                }
-
-                if (credUser.AccountBalance >= price)
-                {
-
-                    await PrepareAccount(message.Text, credUser, user, true);
-                    user.Flow = "update";
-                    user.LastStep = "ask_confirmation";
-                    user._ConfigPrice = price.ToString();
-                    await _userDbContext.SaveUserStatus(user);
-
-
-                    // The user entered a valid number
-                    var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
-                               {
-            new []
-            {
-                new KeyboardButton("تایید نهایی"),
-            },
-            new []
-            {
-                new KeyboardButton("انصراف"),
-            },
-        });
-
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: $"✅ شما اعتبار لازم برای تمدید اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
-                        replyMarkup: confirmationKeyboard);
-                    return;
-
-                }
-
-                else
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                                       chatId: message.Chat.Id,
-                                       text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
-                                       replyMarkup: MainReplyMarkupKeyboardFa());
-                    await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-
-                    return;
-                }
-            }
-
-            else if ((user.Flow == "update" && user.LastStep == "Renew Existing Account") || message.Text.Contains("/renew_"))
-            {
-
-                var replyKeboard = PriceReplyMarkupKeyboardFa(credUser.IsColleague, true);
-
-                var input = message.Text;
-
-                if (message.Text.Contains("/renew_"))
-                    input = message.Text.Replace("/renew_", "");
-
-                if (StartsWithVMessOrVLess(message.Text))
-                {
-                    user.ConfigLink = message.Text;
-                    await _userDbContext.SaveUserStatus(user);
-                }
-                else // if (message.Text.StartsWith("/renew_", StringComparison.OrdinalIgnoreCase))
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: "لطفاً چند لحظه صبر کنید تا اکانت شما را پیدا کنیم. این عملیات ممکن است چند ثانیه طول بکشد...",
-                        replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
-                    // ممکن است که مشکلی در رابطه با ذخیره وی مس  در  دیتا بیس وجود داشته باشد.
-                    var client = await ApiService.FetchClientByEmail(input, credUser.TelegramUserId);
-                    if (client.ClientExtend == null)
-                    {
-                        await botClient.CustomSendTextMessageAsync(
-                                        chatId: message.Chat.Id,
-                                        text: "اکانت مورد نظر پیدا نشد.",
-                                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                        await _userDbContext.ClearUserStatus(user);
-                        return;
-
-                    }
-                }
-
-                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "set-renew-type", Flow = "update" });
-
-                await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: "یک گزینه را انتخاب نمائید:",
-                        replyMarkup: replyKeboard, parseMode: ParseMode.Markdown);
-
-            }
-
-            else if (user.Flow == "create" && user.LastStep == "Create New Account" && message.Text.Contains("خرید"))
-            {
-                long price = TryParsPrice(message.Text);
-                if (price == 0)
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                                        chatId: message.Chat.Id,
-                                        text: "خطا",
-                                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                    await _userDbContext.ClearUserStatus(user);
-                    return;
-                }
-
-                if (CheckButtonCorrectness(credUser.IsColleague, message.Text, false) == false)
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: "خطا",
-                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                    await _userDbContext.ClearUserStatus(user);
-                    return;
-                }
-
-                if (credUser.AccountBalance >= price)
-                {
-                    await PrepareAccount(message.Text, credUser, user, false);
-                    user.Flow = "create";
-                    user.LastStep = "ask_confirmation";
-                    user._ConfigPrice = price.ToString();
-                    await _userDbContext.SaveUserStatus(user);
-
-
-                    // The user entered a valid number
-                    var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
-                               {
-            new []
-            {
-                new KeyboardButton("تایید نهایی"),
-            },
-            new []
-            {
-                new KeyboardButton("انصراف"),
-            },
-        });
-
-                    await botClient.CustomSendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: $"✅ شما اعتبار لازم برای ساخت اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
-                        replyMarkup: confirmationKeyboard);
-                    return;
-
-                }
-                else
-                {
-                    await botClient.CustomSendTextMessageAsync(
-                                       chatId: message.Chat.Id,
-                                       text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
-                                       replyMarkup: MainReplyMarkupKeyboardFa());
-                    return;
-                }
-
-            }
-            else if (user.Flow == "create" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
-            {
-                await FinalizeCustomerAccount(_botClient, user, credUser, message);
             }
 
             else
             {
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
                 await botClient.CustomSendTextMessageAsync(
-                                           chatId: message.Chat.Id,
-                                           text: "مشکلی به وجود امد. لطفاً از اول تلاش کنید.",
-                                            replyMarkup: MainReplyMarkupKeyboardFa());
+                                   chatId: message.Chat.Id,
+                                   text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
+                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+                return;
+            }
+
+        }
+
+        else if (message.Text == "تمدید حجمی" && user.Flow == "update")
+        {
+            user.LastStep = "get-traffic";
+            await _userDbContext.SaveUserStatus(user);
+
+            await botClient.CustomSendTextMessageAsync(
+                                chatId: message.Chat.Id,
+                                text: "ترافیک مورد نظر را به عدد ارسال کنید. هر گیگابایت معادل 1000 تومان از حساب شما کسر خواهد شد.",
+                                replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
+
+        }
+        else if (user.Flow == "update" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
+        {
+            await FinalizeRenewCustomerAccount(_botClient, user, credUser, message);
+
+        }
+        else if (user.Flow == "update" && user.LastStep == "set-renew-type" && message.Text.Contains("تمدید"))
+        {
+            long price = TryParsPrice(message.Text);
+            if (price == 0)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                    chatId: message.Chat.Id,
+                                    text: "خطا",
+                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            if (CheckButtonCorrectness(credUser.IsColleague, message.Text, true) == false)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "خطا",
+                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            if (credUser.AccountBalance >= price)
+            {
+
+                await PrepareAccount(message.Text, credUser, user, true);
+                user.Flow = "update";
+                user.LastStep = "ask_confirmation";
+                user._ConfigPrice = price.ToString();
+                await _userDbContext.SaveUserStatus(user);
+
+
+                // The user entered a valid number
+                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                           {
+            new []
+            {
+                new KeyboardButton("تایید نهایی"),
+            },
+            new []
+            {
+                new KeyboardButton("انصراف"),
+            },
+        });
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"✅ شما اعتبار لازم برای تمدید اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
+                    replyMarkup: confirmationKeyboard);
+                return;
 
             }
 
-            return;
+            else
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                   chatId: message.Chat.Id,
+                                   text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
+                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+                return;
+            }
         }
+
+        else if ((user.Flow == "update" && user.LastStep == "Renew Existing Account") || message.Text.Contains("/renew_"))
+        {
+
+            var replyKeboard = PriceReplyMarkupKeyboardFa(credUser.IsColleague, true);
+
+            var input = message.Text;
+
+            if (message.Text.Contains("/renew_"))
+                input = message.Text.Replace("/renew_", "");
+
+            if (StartsWithVMessOrVLess(message.Text))
+            {
+                user.ConfigLink = message.Text;
+                await _userDbContext.SaveUserStatus(user);
+            }
+            else // if (message.Text.StartsWith("/renew_", StringComparison.OrdinalIgnoreCase))
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "لطفاً چند لحظه صبر کنید تا اکانت شما را پیدا کنیم. این عملیات ممکن است چند ثانیه طول بکشد...",
+                    replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
+                // ممکن است که مشکلی در رابطه با ذخیره وی مس  در  دیتا بیس وجود داشته باشد.
+                var client = await ApiService.FetchClientByEmail(input, credUser.TelegramUserId);
+                if (client.ClientExtend == null)
+                {
+                    await botClient.CustomSendTextMessageAsync(
+                                    chatId: message.Chat.Id,
+                                    text: "اکانت مورد نظر پیدا نشد.",
+                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                    await _userDbContext.ClearUserStatus(user);
+                    return;
+
+                }
+            }
+
+            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "set-renew-type", Flow = "update" });
+
+            await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "یک گزینه را انتخاب نمائید:",
+                    replyMarkup: replyKeboard, parseMode: ParseMode.Markdown);
+
+        }
+
+        else if (user.Flow == "create" && user.LastStep == "Create New Account" && message.Text.Contains("خرید"))
+        {
+            long price = TryParsPrice(message.Text);
+            if (price == 0)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                    chatId: message.Chat.Id,
+                                    text: "خطا",
+                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            if (CheckButtonCorrectness(credUser.IsColleague, message.Text, false) == false)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "خطا",
+                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
+                await _userDbContext.ClearUserStatus(user);
+                return;
+            }
+
+            if (credUser.AccountBalance >= price)
+            {
+                await PrepareAccount(message.Text, credUser, user, false);
+                user.Flow = "create";
+                user.LastStep = "ask_confirmation";
+                user._ConfigPrice = price.ToString();
+                await _userDbContext.SaveUserStatus(user);
+
+
+                // The user entered a valid number
+                var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
+                           {
+            new []
+            {
+                new KeyboardButton("تایید نهایی"),
+            },
+            new []
+            {
+                new KeyboardButton("انصراف"),
+            },
+        });
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"✅ شما اعتبار لازم برای ساخت اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
+                    replyMarkup: confirmationKeyboard);
+                return;
+
+            }
+            else
+            {
+                await botClient.CustomSendTextMessageAsync(
+                                   chatId: message.Chat.Id,
+                                   text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
+                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                return;
+            }
+
+        }
+        else if (user.Flow == "create" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
+        {
+            await FinalizeCustomerAccount(_botClient, user, credUser, message);
+        }
+
+        else
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await botClient.CustomSendTextMessageAsync(
+                                       chatId: message.Chat.Id,
+                                       text: "مشکلی به وجود امد. لطفاً از اول تلاش کنید.",
+                                        replyMarkup: MainReplyMarkupKeyboardFa());
+
+        }
+
+        return;
+
     }
 
     private async Task EditMessageWithCallback(ITelegramBotClient botClient, long chatid, int messageId)
@@ -3249,7 +4685,7 @@ public class TelegramBotService : IHostedService
         }
     }
 
-    Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
+    async Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
     {
         var ErrorMessage = exception switch
         {
@@ -3258,8 +4694,18 @@ public class TelegramBotService : IHostedService
             _ => exception.ToString()
         };
 
+        await _userActivityLog.LogErrorAsync(
+            "telegram_polling_error",
+            exception,
+            null,
+            false,
+            new Dictionary<string, object>
+            {
+                ["source"] = "Telegram polling"
+            },
+            cancellationToken);
+
         Console.WriteLine(ErrorMessage);
-        return Task.CompletedTask;
     }
 
     async Task<string> GetUserProfileMessage(CredUser credUser)
@@ -3283,6 +4729,108 @@ public class TelegramBotService : IHostedService
         return text.EscapeMarkdown();
     }
 
+    private static string BuildBotCapabilitiesMessage(CredUser credUser)
+    {
+        var roleText = credUser?.IsColleague == true ? "همکار" : "کاربر عادی";
+        var builder = new StringBuilder();
+
+        builder.AppendLine("📌 <b>قابلیت‌های مهم ربات</b>");
+        builder.AppendLine();
+        builder.AppendLine($"نوع حساب شما: <code>{Html(roleText)}</code>");
+        builder.AppendLine();
+        builder.AppendLine("با این ربات می‌توانید:");
+        builder.AppendLine();
+        builder.AppendLine("🛒 <b>خرید اکانت</b>");
+        builder.AppendLine("انتخاب سرویس، حجم دلخواه، مدت زمان، تعداد اکانت و ثبت کامنت اختصاصی.");
+        builder.AppendLine();
+        builder.AppendLine("👤 <b>مدیریت اکانت‌ها</b>");
+        builder.AppendLine("مشاهده همه اکانت‌ها، صفحه‌بندی، جستجو، دیدن جزئیات، تمدید، حذف تکی و تغییر لینک.");
+        builder.AppendLine();
+        builder.AppendLine("🔎 <b>جستجوی سریع</b>");
+        builder.AppendLine("جستجو با نام اکانت، بخشی از کامنت یا UUID کامل کانفیگ.");
+        builder.AppendLine();
+        builder.AppendLine("🔁 <b>تمدید و تغییر لینک</b>");
+        builder.AppendLine("تمدید با حجم دلخواه و ساخت لینک جدید در صورت لو رفتن اطلاعات اکانت.");
+        builder.AppendLine();
+        builder.AppendLine("🧹 <b>حذف اکانت‌های منقضی</b>");
+        builder.AppendLine("نمایش و حذف یکجای اکانت‌هایی که حجم یا زمان آن‌ها تمام شده است.");
+        builder.AppendLine();
+        builder.AppendLine("💰 <b>شارژ حساب</b>");
+        builder.AppendLine("شارژ کیف پول از مسیرهای پرداخت فعال ربات.");
+        builder.AppendLine();
+        builder.AppendLine("🌟 <b>اکانت تست رایگان</b>");
+        builder.AppendLine("دریافت تست دوره‌ای برای بررسی کیفیت سرویس‌ها، در صورت داشتن شرایط.");
+
+        if (credUser?.IsColleague == true)
+        {
+            builder.AppendLine();
+            builder.AppendLine("💎 <b>امکانات همکاران</b>");
+            builder.AppendLine("قیمت همکار، ساخت چند اکانت در یک سفارش و دسترسی سریع به اکانت‌ها با شماره اکانت.");
+        }
+        else
+        {
+            builder.AppendLine();
+            builder.AppendLine("🤝 <b>درخواست همکاری</b>");
+            builder.AppendLine("اگر فروش هفتگی شما به حد نصاب برسد، می‌توانید از بخش مدیریت اکانت درخواست همکاری ثبت کنید.");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("📋 <b>دستورهای عمومی و اکانت</b>");
+        builder.AppendLine();
+        builder.AppendLine("🔹 <code>/start</code>");
+        builder.AppendLine("شروع مجدد ربات، پاک کردن وضعیت موقت کاربر و برگشت به منوی اصلی.");
+        builder.AppendLine();
+        builder.AppendLine("🔹 <code>/renew_EMAIL</code>");
+        builder.AppendLine("شروع تمدید اکانت با نام اکانت یا همان ایمیل.");
+        builder.AppendLine("مثال:");
+        builder.AppendLine("<code>/renew_vniaccXXXXX</code>");
+        builder.AppendLine();
+        builder.AppendLine("🔹 <code>/enable_EMAIL</code>");
+        builder.AppendLine("فعال کردن اکانت با نام اکانت یا ایمیل.");
+        builder.AppendLine("ابتدا از پنل نسخه ۳ انجام می‌شود و در صورت نیاز مسیر قدیمی نسخه ۲ بررسی می‌شود.");
+        builder.AppendLine("مثال:");
+        builder.AppendLine("<code>/enable_vniaccXXXXX</code>");
+        builder.AppendLine();
+        builder.AppendLine("🔹 <code>/disable_EMAIL</code>");
+        builder.AppendLine("غیرفعال کردن اکانت با نام اکانت یا ایمیل.");
+        builder.AppendLine("ابتدا از پنل نسخه ۳ انجام می‌شود و در صورت نیاز مسیر قدیمی نسخه ۲ بررسی می‌شود.");
+        builder.AppendLine("مثال:");
+        builder.AppendLine("<code>/disable_vniaccXXXXX</code>");
+        builder.AppendLine();
+        builder.AppendLine("🔹 <code>/account_NUMBER</code>");
+        builder.AppendLine("جستجوی اکانت همکار بر اساس شماره اکانت.");
+        builder.AppendLine("این دستور فقط برای همکاران فعال است.");
+        builder.AppendLine("مثال:");
+        builder.AppendLine("<code>/account_34</code>");
+        builder.AppendLine();
+        builder.AppendLine("همچنین می‌توانید فقط عدد اکانت را بدون پیشوند ارسال کنید:");
+        builder.AppendLine("<code>34</code>");
+        builder.AppendLine();
+        builder.AppendLine("برای شروع، از دکمه‌های پایین صفحه استفاده کنید.");
+        return builder.ToString();
+    }
+
+    private static string Html(string value)
+    {
+        return System.Net.WebUtility.HtmlEncode(value ?? string.Empty);
+    }
+
+    private static ReplyKeyboardMarkup BuildChargePaymentMethodKeyboard()
+    {
+        return new ReplyKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                new KeyboardButton("درگاه ریالی (غیرفعال)"),
+                new KeyboardButton("درگاه ارز دیجیتال")
+            }
+        })
+        {
+            ResizeKeyboard = true,
+            OneTimeKeyboard = true
+        };
+    }
+
 
     async Task<string> GetZipalPaymentMessage(CredUser credUser, bool isSuperAdmin, ZibalPaymentInfo zpi, string paymentLink)
     {
@@ -3303,6 +4851,48 @@ public class TelegramBotService : IHostedService
 
         return text;
     }
+
+    async Task<string> GetNowPaymentsPaymentMessage(CredUser credUser, SwapinoPaymentInfo payment)
+    {
+        await _credentialsDbContext.GetUserStatus(credUser);
+        var data = payment.GetNowPaymentsData();
+        var baseCurrency = System.Net.WebUtility.HtmlEncode((payment.BaseCurrency ?? data.PriceCurrency ?? "usdtbsc").ToUpperInvariant());
+        var baseAmount = (payment.BaseAmount == 0 ? data.PriceAmount : payment.BaseAmount).ToString("0.########", CultureInfo.InvariantCulture);
+        var invoiceUrl = System.Net.WebUtility.HtmlEncode(payment.InvoiceUrl ?? data.InvoiceUrl ?? "");
+        var paymentId = System.Net.WebUtility.HtmlEncode(payment.PaymentId ?? data.PaymentId ?? "");
+        var orderId = System.Net.WebUtility.HtmlEncode(payment.OrderId);
+
+        string text = "✅ درگاه پرداخت ارز دیجیتال برای شما ایجاد شد.\n";
+        text += $"💵 مبلغ شارژ کیف پول: {payment.AmountToman.FormatCurrency()}\n";
+        text += $"💲 ارز مبنا: <code>{baseAmount} {baseCurrency}</code>\n";
+        if (data.UsdtIrtPrice > 0)
+        {
+            var dollarPriceToman = data.PriceIsRial
+                ? data.UsdtIrtPrice / 10m
+                : data.UsdtIrtPrice;
+            var priceNote = data.UsedFallbackPrice ? "قیمت پیش‌فرض" : "قیمت لحظه‌ای نوبیتکس";
+            text += $"💱 نرخ تتر/دلار زمان ساخت فاکتور: <code>{dollarPriceToman:0,0} تومان</code> ({priceNote})\n";
+        }
+        text += $"🧾 شماره سفارش: <code>{orderId}</code>\n";
+        if (!string.IsNullOrWhiteSpace(invoiceUrl))
+            text += $"🔗 لینک فاکتور: <a href=\"{invoiceUrl}\">باز کردن صفحه پرداخت</a>\n";
+        if (!string.IsNullOrWhiteSpace(paymentId))
+            text += $"🧾 شناسه پرداخت: <code>{paymentId}</code>\n";
+        text += "\nشما می‌توانید از هر ارز دیجیتالی که NOWPayments پشتیبانی می‌کند پرداخت را انجام دهید. پس از تایید شبکه، شارژ کیف پول شما از طریق IPN به صورت خودکار انجام می‌شود.";
+
+        return text;
+    }
+
+    private static string GetTutorialButtonText(int index)
+    {
+        return index switch
+        {
+            0 => "آموزش نصب کانفیگ لینک",
+            1 => "آموزش نصب سابلینک",
+            _ => $"آموزش شماره {index + 1}"
+        };
+    }
+
     string[] GetPrices(bool isColleague, bool isForRenew)
     {
 
@@ -3455,25 +5045,41 @@ public class TelegramBotService : IHostedService
     {
         var keyboard = new ReplyKeyboardMarkup(new[]
         {
-        new[]
-        {
-            new KeyboardButton("➕ Create New Account"),
-        },
-        new[]
-        {
-            new KeyboardButton("🔄 Renew Existing Account"),
-        },
-        new[]
-        {
-            new KeyboardButton("ℹ️ Get Account Info"),
-        },
-        new[]
-        {
-            new KeyboardButton("📑 Menu"), new KeyboardButton("🗽 Admin"),
-        }
+            new[]
+            {
+                new KeyboardButton("➕ Create New Account"),
+            },
+            new[]
+            {
+                new KeyboardButton("🔄 Renew Existing Account"),
+            },
+            new[]
+            {
+                new KeyboardButton("ℹ️ Get Account Info"),
+            },
+            new[]
+            {
+                new KeyboardButton("📑 Menu"), new KeyboardButton("🗽 Admin"),
+            }
         });
 
         return keyboard;
+    }
+
+    private async Task SendBlockedUserMessageAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        CancellationToken cancellationToken)
+    {
+        var support = string.IsNullOrWhiteSpace(_appConfig.SupportAccount)
+            ? "@v2raysshvpn_admin"
+            : _appConfig.SupportAccount.Trim();
+
+        await botClient.SendTextMessageAsync(
+            chatId: chatId,
+            text: $"به علت تخلف مسدود شدید و امکان استفاده از ربات را ندارید.\nبرای پیگیری می‌توانید به پشتیبانی تلگرام پیام بدهید:\n<code>{System.Net.WebUtility.HtmlEncode(support)}</code>",
+            parseMode: ParseMode.Html,
+            cancellationToken: cancellationToken);
     }
 
     static ReplyKeyboardMarkup GetAccountTypeKeyboard()
@@ -3731,7 +5337,7 @@ public class TelegramBotService : IHostedService
         {
             await _botClient.SendTextMessageAsync(chatId: chatId,
                                                    text: "خطا. لطفاً شماره اکانت خودتان را وارد کنید.",
-                                                   replyMarkup: GetMainMenuKeyboard());
+                                                   replyMarkup: MainReplyMarkupKeyboardFa());
         }
         return false;
     }

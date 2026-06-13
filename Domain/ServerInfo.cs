@@ -2,6 +2,9 @@ using Adminbot.Domain;
 
 public class ServerInfo
 {
+    public string ApiVersion { get; set; } = "auto";
+    public int? PanelMajorVersion { get; set; }
+    public string ApiToken { get; set; }
     public string Username { get; set; }
     public string Name { get; set; }
     public string Password { get; set; }

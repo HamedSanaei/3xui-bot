@@ -39,6 +39,10 @@ public class User
     public DateTime LastFreeAcc { get; set; } = DateTime.MinValue;
     public string PaymentMethod { get; set; } = "credit";
     public int AccountCounter { get; set; }
+    public int PendingAccountCount { get; set; }
+    public string PendingUserComment { get; set; }
+    public DateTime LastFreeNationalAcc { get; set; } = DateTime.MinValue;
+    public DateTime LastFreeNormalAcc { get; set; } = DateTime.MinValue;
 
 }
 public class CookieData

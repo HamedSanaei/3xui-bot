@@ -1,128 +1,279 @@
-
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
-using Adminbot.Utils;
 using Microsoft.AspNetCore.Mvc;
-
+using Microsoft.EntityFrameworkCore;
+using Newtonsoft.Json;
 
 [ApiController]
 [Route("nowpayments-ipn")]
 public class PaymentController : ControllerBase
 {
-    private readonly UserDbContext _userDbcontext;
-    private readonly CredentialsDbContext _credentialsDbContext;
-    //private readonly IConfiguration config;
-    private readonly AppConfig _appConfig;
-    private readonly ILogger<TelegramLogger> _logger;
+    private static readonly SemaphoreSlim IpnLock = new SemaphoreSlim(1, 1);
 
-    public PaymentController(UserDbContext userDbContext, CredentialsDbContext credentialsDbContext, IConfiguration config, ILogger<TelegramLogger> logger)
+    private readonly UserDbContext _userDbcontext;
+    private readonly AppConfig _appConfig;
+    private readonly NowPaymentsSettlementService _settlementService;
+    private readonly ILogger<PaymentController> _logger;
+
+    public PaymentController(
+        UserDbContext userDbContext,
+        IConfiguration config,
+        NowPaymentsSettlementService settlementService,
+        ILogger<PaymentController> logger)
     {
-        this._userDbcontext = userDbContext;
-        this._credentialsDbContext = credentialsDbContext;
+        _userDbcontext = userDbContext;
         _appConfig = config.Get<AppConfig>();
+        _settlementService = settlementService;
         _logger = logger;
     }
 
     [HttpPost]
-    public async Task<IActionResult> Receive()
+    public async Task<IActionResult> Receive(CancellationToken cancellationToken)
     {
+        var requestId = Guid.NewGuid().ToString("N")[..8];
         using var reader = new StreamReader(Request.Body);
-        var body = await reader.ReadToEndAsync();
+        var body = await reader.ReadToEndAsync(cancellationToken);
 
         var signature = Request.Headers["x-nowpayments-sig"].FirstOrDefault();
-        var secret = _appConfig.IpnSecretKey;
+        LogIpnResult(
+            requestId,
+            stage: "received",
+            statusCode: null,
+            result: "NOWPayments IPN callback received.",
+            body: body,
+            signatureIsValid: null);
 
-        if (string.IsNullOrEmpty(signature) ||
-            !VerifySignature(body, signature, secret))
+        bool isValidSignature;
+        try
         {
-            return Unauthorized();
+            isValidSignature = NowPaymentsIpnSignature.Verify(body, signature, _appConfig.IpnSecretKey);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Invalid NOWPayments IPN JSON while checking signature.");
+            LogIpnResult(
+                requestId,
+                stage: "invalid-json-signature-check",
+                statusCode: StatusCodes.Status400BadRequest,
+                result: "Invalid IPN JSON while checking signature.",
+                body: body,
+                signatureIsValid: false,
+                extra: ex.Message);
+            return BadRequest(new { message = "Invalid IPN payload." });
         }
 
-        var ipn = System.Text.Json.JsonSerializer.Deserialize<NowPaymentsIpn>(body);
+        if (!isValidSignature)
+        {
+            LogIpnResult(
+                requestId,
+                stage: "signature-invalid",
+                statusCode: StatusCodes.Status401Unauthorized,
+                result: "Invalid NOWPayments signature.",
+                body: body,
+                signatureIsValid: false);
+            return Unauthorized(new { message = "Invalid NOWPayments signature." });
+        }
+
+        NowPaymentsIpn ipn;
+        try
+        {
+            ipn = JsonConvert.DeserializeObject<NowPaymentsIpn>(body);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Invalid NOWPayments IPN payload.");
+            LogIpnResult(
+                requestId,
+                stage: "invalid-json-payload",
+                statusCode: StatusCodes.Status400BadRequest,
+                result: "Invalid IPN payload JSON.",
+                body: body,
+                signatureIsValid: true,
+                extra: ex.Message);
+            return BadRequest(new { message = "Invalid IPN payload." });
+        }
 
         if (ipn == null)
-            return BadRequest();
-
-        // پیدا کردن پرداخت
-        SwapinoPaymentInfo payment = null;
-
-        if (!string.IsNullOrEmpty(ipn.order_id))
         {
-            payment = _userDbcontext.SwapinoPaymentInfos
-                .FirstOrDefault(p => p.Payment_Id.ToString() == ipn.order_id);
-        }
-        else
-        {
-            payment = _userDbcontext.SwapinoPaymentInfos
-                .FirstOrDefault(p => p.Payment_Id.ToString() == ipn.payment_id.ToString());
+            LogIpnResult(
+                requestId,
+                stage: "empty-payload",
+                statusCode: StatusCodes.Status400BadRequest,
+                result: "Empty IPN payload.",
+                body: body,
+                signatureIsValid: true);
+            return BadRequest(new { message = "Empty IPN payload." });
         }
 
+        LogIpnResult(
+            requestId,
+            stage: "signature-valid",
+            statusCode: null,
+            result: "IPN signature is valid.",
+            ipn: ipn,
+            body: body,
+            signatureIsValid: true);
 
-        payment.Payment_Status = ipn.payment_status;
-        payment.Pay_Amount = ipn.pay_amount;
-        payment.Price_Amount = ipn.price_amount;
-        payment.Pay_Currency = ipn.pay_currency;
-        payment.Actually_Paid = ipn.actually_paid;
-        payment.Updated_At = DateTime.UtcNow;
-        var findedUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
-        long beforeBalance = findedUser.AccountBalance;
-
-
-        if (ipn.payment_status == "finished")
+        await IpnLock.WaitAsync(cancellationToken);
+        try
         {
-            if (payment.IsAddedToBallance == true) return Conflict(new
+            var payment = await FindPaymentAsync(ipn, cancellationToken);
+            if (payment == null)
             {
-                message = "Payment has already been added to balance."
+                _logger.LogWarning(
+                    "NOWPayments IPN received for unknown order. OrderId={OrderId}, PaymentId={PaymentId}",
+                    ipn.order_id,
+                    ipn.payment_id);
+
+                LogIpnResult(
+                    requestId,
+                    stage: "payment-not-found",
+                    statusCode: StatusCodes.Status404NotFound,
+                    result: "Payment was not found in local database.",
+                    ipn: ipn,
+                    body: body,
+                    signatureIsValid: true);
+                return NotFound(new { message = "Payment was not found." });
+            }
+
+            ApplyIpnToPayment(payment, ipn);
+            payment.RawIpnJson = body;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            LogIpnResult(
+                requestId,
+                stage: "payment-updated",
+                statusCode: null,
+                result: "IPN data applied to local payment record.",
+                ipn: ipn,
+                payment: payment,
+                body: body,
+                signatureIsValid: true);
+
+            if (!NowPaymentsStatuses.IsPaid(ipn.payment_status))
+            {
+                LogIpnResult(
+                    requestId,
+                    stage: "accepted-not-paid",
+                    statusCode: StatusCodes.Status200OK,
+                    result: "IPN accepted; payment is not finished yet.",
+                    ipn: ipn,
+                    payment: payment,
+                    body: body,
+                    signatureIsValid: true);
+                return Ok(new
+                {
+                    message = "IPN accepted.",
+                    status = ipn.payment_status,
+                    orderId = payment.OrderId
+                });
+            }
+
+            var settlement = await _settlementService.ApplyFinishedPaymentAsync(
+                payment,
+                "ipn",
+                cancellationToken: cancellationToken);
+
+            LogIpnResult(
+                requestId,
+                stage: "accepted-paid",
+                statusCode: StatusCodes.Status200OK,
+                result: "IPN accepted; finished payment settlement processed.",
+                ipn: ipn,
+                payment: payment,
+                settlement: settlement,
+                body: body,
+                signatureIsValid: true);
+            return Ok(new
+            {
+                message = "IPN accepted.",
+                status = ipn.payment_status,
+                settlement = settlement.Status.ToString(),
+                orderId = payment.OrderId
             });
-
-            //notify user
-            await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.RialAmount);
         }
-        long afterBalance = await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
-
-        // فقط یکبار انجام بده
-        payment.IsAddedToBallance = true;
-        payment.IpN_Processed = true;
-
-        await _userDbcontext.SaveChangesAsync();
-
-        var start = "درگاه پرداخت Nowpayments \n";
-        var logMesseage = $"{start}یوزر <code>{payment.TelegramUserId}</code> \n {findedUser} \n به مبلغ {(payment.RialAmount / 10).FormatCurrency()}" + " حساب کاربری خود را شارژ کرد." + $"\n موجودی قبل از شارژ {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از شارژ {afterBalance.FormatCurrency()} \n";
-
-
-
-        return Ok();
+        finally
+        {
+            IpnLock.Release();
+        }
     }
 
-    private bool VerifySignature(string requestBody, string signature, string secret)
+    private void LogIpnResult(
+        string requestId,
+        string stage,
+        int? statusCode,
+        string result,
+        NowPaymentsIpn ipn = null,
+        SwapinoPaymentInfo payment = null,
+        NowPaymentsSettlementResult settlement = null,
+        string body = null,
+        bool? signatureIsValid = null,
+        string extra = null)
     {
-        using var hmac = new System.Security.Cryptography.HMACSHA512(
-            System.Text.Encoding.UTF8.GetBytes(secret));
+        var remoteIp = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var forwardedFor = Request.Headers["X-Forwarded-For"].FirstOrDefault() ?? "";
+        var cfConnectingIp = Request.Headers["CF-Connecting-IP"].FirstOrDefault() ?? "";
+        var userAgent = Request.Headers["User-Agent"].FirstOrDefault() ?? "";
+        var signature = Request.Headers["x-nowpayments-sig"].FirstOrDefault();
+        var signatureState = signatureIsValid.HasValue
+            ? (signatureIsValid.Value ? "valid" : "invalid")
+            : "not-checked";
+        var secretState = string.IsNullOrWhiteSpace(_appConfig?.IpnSecretKey)
+            ? "missing"
+            : "configured";
 
-        var hash = hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(requestBody));
-        var computedSignature = BitConverter.ToString(hash)
-            .Replace("-", "")
-            .ToLower();
-
-        return computedSignature == signature;
+        Console.WriteLine("========== NOWPayments IPN ==========");
+        Console.WriteLine($"[NOWPayments IPN] requestId={requestId}, stage={stage}, result={result}");
+        Console.WriteLine($"[NOWPayments IPN] responseStatus={(statusCode.HasValue ? statusCode.Value.ToString() : "pending")}");
+        Console.WriteLine($"[NOWPayments IPN] remoteIp={remoteIp}, xForwardedFor={forwardedFor}, cfConnectingIp={cfConnectingIp}, userAgent={userAgent}");
+        Console.WriteLine($"[NOWPayments IPN] signatureHeader={(string.IsNullOrWhiteSpace(signature) ? "missing" : "present")}, signature={signatureState}, ipnSecret={secretState}");
+        Console.WriteLine($"[NOWPayments IPN] orderId={ipn?.order_id ?? payment?.OrderId ?? ""}, paymentId={ipn?.payment_id ?? payment?.PaymentId ?? ""}, invoiceId={ipn?.invoice_id ?? payment?.InvoiceId ?? ""}, status={ipn?.payment_status ?? payment?.PaymentStatus ?? ""}");
+        Console.WriteLine($"[NOWPayments IPN] localPayment={(payment == null ? "not-found" : $"found:id={payment.Id}, user={payment.TelegramUserId}, added={payment.IsAddedToBalance}")}");
+        Console.WriteLine($"[NOWPayments IPN] settlement={(settlement == null ? "not-applied" : settlement.Status.ToString())}");
+        if (!string.IsNullOrWhiteSpace(extra))
+            Console.WriteLine($"[NOWPayments IPN] extra={extra}");
+        Console.WriteLine($"[NOWPayments IPN] rawBody={body ?? ""}");
+        Console.WriteLine("=====================================");
     }
 
-    private async Task ActivateUserPlan(SwapinoPaymentInfo payment)
+    private async Task<SwapinoPaymentInfo> FindPaymentAsync(NowPaymentsIpn ipn, CancellationToken cancellationToken)
     {
-        // if (!payment.IsAddedToBallance)
-        // {
+        if (!string.IsNullOrWhiteSpace(ipn.order_id))
+        {
+            var byOrderId = await _userDbcontext.SwapinoPaymentInfos
+                .FirstOrDefaultAsync(p => p.OrderId == ipn.order_id, cancellationToken);
+            if (byOrderId != null)
+                return byOrderId;
+        }
 
-        //     await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.RialAmount);
-        //     _credentialsDbContext.SaveChanges();
-        //     logMesseage = $"{start}یوزر <code>{payment.Order_Id}</code> \n {findedUser} \n به مبلغ {(zpi.Amount / 10).FormatCurrency()}" + " حساب کاربری خود را شارژ کرد." + $"\n موجودی قبل از شارژ {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از شارژ {afterBalance.FormatCurrency()} \n" + msg;
+        if (string.IsNullOrWhiteSpace(ipn.payment_id))
+            return null;
 
-        //     _logger.LogPayment(logMesseage);
+        var recentPayments = await _userDbcontext.SwapinoPaymentInfos
+            .OrderByDescending(p => p.Id)
+            .Take(200)
+            .ToListAsync(cancellationToken);
 
+        return recentPayments.FirstOrDefault(p =>
+            string.Equals(p.GetNowPaymentsData().PaymentId, ipn.payment_id, StringComparison.OrdinalIgnoreCase));
+    }
 
-        //     //change buttons!
-        //     await EditMessageWithCallback(_botClient, zpi.ChatId, Convert.ToInt32(zpi.TelMsgId));
+    private static void ApplyIpnToPayment(SwapinoPaymentInfo payment, NowPaymentsIpn ipn)
+    {
+        var data = payment.GetNowPaymentsData();
+        data.Apply(ipn);
+        payment.SetNowPaymentsData(data);
 
-        // }
+        payment.IpnCallbackUrl ??= data.InvoiceUrl;
+        payment.BaseAmount = data.PriceAmount == 0 ? payment.BaseAmount : data.PriceAmount;
+        payment.OutcomeAmount = data.PayAmount == 0 ? payment.OutcomeAmount : data.PayAmount;
+        payment.PaymentStatus = data.PaymentStatus ?? payment.PaymentStatus;
+        payment.PaymentId = data.PaymentId ?? payment.PaymentId;
+        payment.InvoiceId = data.InvoiceId ?? payment.InvoiceId;
+        payment.InvoiceUrl = data.InvoiceUrl ?? payment.InvoiceUrl;
+        payment.PayAddress = data.PayAddress ?? payment.PayAddress;
+        payment.PayCurrency = data.PayCurrency ?? payment.PayCurrency;
+        payment.PayinHash = data.PayinHash ?? payment.PayinHash;
+        payment.PayoutHash = data.PayoutHash ?? payment.PayoutHash;
+        payment.UpdatedAtUtc = DateTime.UtcNow;
     }
 }
-
