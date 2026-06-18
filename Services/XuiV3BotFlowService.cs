@@ -3343,7 +3343,10 @@ public class XuiV3BotFlowService
 
     private static string FormatExpiry(long expiryTime)
     {
-        if (expiryTime <= 0)
+        if (expiryTime < 0)
+            return $"{FormatFirstUseDurationDays(expiryTime)} روز بعد از اولین اتصال";
+
+        if (expiryTime == 0)
             return "نامحدود";
 
         return DateTimeOffset
@@ -3439,6 +3442,9 @@ public class XuiV3BotFlowService
             $"سرویس `{result.ServiceName}`",
             $"حجم هر اکانت `{XuiV3PurchaseService.FormatTrafficSize(result.TrafficBytes, result.TrafficGb)}`"
         };
+
+        if (result.IsUnlimited && details.Count > 4)
+            details[4] = $"حد مصرف منصفانه هر اکانت `{XuiV3PurchaseService.FormatTrafficSize(result.TrafficBytes, result.TrafficGb)}`";
 
         if (result.DurationDays <= 0)
             details.Add("انقضا `نامحدود`");
@@ -4777,7 +4783,10 @@ public class XuiV3BotFlowService
 
     private static string FormatV3Expiry(long expiryTime)
     {
-        if (expiryTime <= 0)
+        if (expiryTime < 0)
+            return $"📅 انقضا: {FormatFirstUseDurationDays(expiryTime)} روز بعد از اولین اتصال";
+
+        if (expiryTime == 0)
             return "📅 انقضا: نامحدود";
 
         var expiryUtc = DateTimeOffset.FromUnixTimeMilliseconds(expiryTime).UtcDateTime;
@@ -4932,11 +4941,19 @@ public class XuiV3BotFlowService
     private static string FormatDeleteExpiry(XuiV3Client client)
     {
         var expiryTime = GetExpiryTime(client);
-        if (expiryTime <= 0)
+        if (expiryTime < 0)
+            return $"{FormatFirstUseDurationDays(expiryTime)} روز بعد از اولین اتصال";
+
+        if (expiryTime == 0)
             return "نامحدود";
 
         var expiryUtc = DateTimeOffset.FromUnixTimeMilliseconds(expiryTime).UtcDateTime;
         return expiryUtc.AddMinutes(210).ConvertToHijriShamsi();
+    }
+
+    private static int FormatFirstUseDurationDays(long expiryTime)
+    {
+        return Math.Max(1, (int)Math.Ceiling(Math.Abs(expiryTime) / (double)TimeSpan.FromDays(1).TotalMilliseconds));
     }
 
     private static string FormatDeleteTraffic(XuiV3Client client)
@@ -4952,6 +4969,9 @@ public class XuiV3BotFlowService
 
     private static long GetUsedBytes(XuiV3Client client)
     {
+        if (client == null)
+            return 0;
+
         var traffic = client.Traffic;
         return (traffic?.Up ?? ReadLongExtra(client, "up")) +
                (traffic?.Down ?? ReadLongExtra(client, "down"));
@@ -4959,25 +4979,34 @@ public class XuiV3BotFlowService
 
     private static long GetTotalBytes(XuiV3Client client)
     {
+        if (client == null)
+            return 0;
+
         if (client.TotalGB > 0)
             return client.TotalGB;
 
-        if (client.Traffic?.TotalGB > 0)
-            return client.Traffic.TotalGB;
+        var trafficTotalGb = client.Traffic?.TotalGB ?? 0;
+        if (trafficTotalGb > 0)
+            return trafficTotalGb;
 
-        if (client.Traffic?.Total > 0)
-            return client.Traffic.Total;
+        var trafficTotal = client.Traffic?.Total ?? 0;
+        if (trafficTotal > 0)
+            return trafficTotal;
 
         return ReadLongExtra(client, "totalGB");
     }
 
     private static long GetExpiryTime(XuiV3Client client)
     {
+        if (client == null)
+            return 0;
+
         if (client.ExpiryTime != 0)
             return client.ExpiryTime;
 
-        if (client.Traffic?.ExpiryTime != 0)
-            return client.Traffic.ExpiryTime;
+        var trafficExpiryTime = client.Traffic?.ExpiryTime ?? 0;
+        if (trafficExpiryTime != 0)
+            return trafficExpiryTime;
 
         return ReadLongExtra(client, "expiryTime");
     }

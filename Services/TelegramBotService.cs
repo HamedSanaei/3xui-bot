@@ -30,6 +30,8 @@ public class TelegramBotService : IHostedService
     private BroadcastManager _broadcastManager;
     private readonly NowPayments _nowPayments;
     private readonly NowPaymentsSettlementService _nowPaymentsSettlementService;
+    private readonly HooshPay _hooshPay;
+    private readonly HooshPaySettlementService _hooshPaySettlementService;
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
     private readonly XuiV3AdminFlowService _xuiV3AdminFlowService;
     private readonly UserActivityLogService _userActivityLog;
@@ -43,6 +45,8 @@ public class TelegramBotService : IHostedService
         BroadcastManager broadcastManager,
         NowPayments nowPayments,
         NowPaymentsSettlementService nowPaymentsSettlementService,
+        HooshPay hooshPay,
+        HooshPaySettlementService hooshPaySettlementService,
         XuiV3BotFlowService xuiV3BotFlowService,
         XuiV3AdminFlowService xuiV3AdminFlowService,
         UserActivityLogService userActivityLog)
@@ -56,6 +60,8 @@ public class TelegramBotService : IHostedService
         _broadcastManager = broadcastManager;
         _nowPayments = nowPayments;
         _nowPaymentsSettlementService = nowPaymentsSettlementService;
+        _hooshPay = hooshPay;
+        _hooshPaySettlementService = hooshPaySettlementService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _xuiV3AdminFlowService = xuiV3AdminFlowService;
         _userActivityLog = userActivityLog;
@@ -119,7 +125,6 @@ public class TelegramBotService : IHostedService
 
     private async Task HandleUpdateCoreAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-
 
         if (update.CallbackQuery is { } callbackQuery)
         {
@@ -1621,6 +1626,13 @@ public class TelegramBotService : IHostedService
                 return;
             }
 
+            if (callbackQuery.Data.StartsWith("check_hooshpay_payment_") ||
+                callbackQuery.Data.StartsWith("hpchk_"))
+            {
+                await ProcessHooshPayPaymentCallback(callbackQuery, cancellationToken);
+                return;
+            }
+
             if (callbackQuery.Data.StartsWith("settle_crypto_partial_"))
             {
                 await ProcessCryptoPartialSettlementCallback(callbackQuery, cancellationToken);
@@ -1940,6 +1952,175 @@ public class TelegramBotService : IHostedService
         }
 
         await AnswerCallbackSafely(callbackQuery, cancellationToken);
+    }
+
+    private async Task ProcessHooshPayPaymentCallback(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var messageId = callbackQuery.Message?.MessageId ?? 0;
+        var lookupValue = callbackQuery.Data.StartsWith("hpchk_", StringComparison.Ordinal)
+            ? callbackQuery.Data.Replace("hpchk_", "")
+            : callbackQuery.Data.Replace("check_hooshpay_payment_", "");
+        Console.WriteLine($"[HooshPay ManualCheck] start user={callbackQuery.From.Id}, chat={chatId}, lookup={lookupValue}");
+
+        HooshPayPaymentInfo payment = null;
+        if (int.TryParse(lookupValue, out var paymentId))
+        {
+            payment = await _userDbContext.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+        }
+
+        payment ??= await _userDbContext.HooshPayPaymentInfos.FirstOrDefaultAsync(
+            p => p.OrderId == lookupValue,
+            cancellationToken);
+        if (payment == null)
+        {
+            Console.WriteLine($"[HooshPay ManualCheck] payment not found. lookup={lookupValue}");
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "پرداخت مورد نظر پیدا نشد.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (payment.IsAddedToBalance)
+        {
+            Console.WriteLine($"[HooshPay ManualCheck] already added. orderId={payment.OrderId}, invoiceUid={payment.InvoiceUid}, user={payment.TelegramUserId}");
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "اعتبار این پرداخت قبلاً به کیف پول شما اضافه شده است و دوباره شارژ نمی‌شود.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(payment.InvoiceUid))
+        {
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: "شناسه فاکتور HooshPay برای این پرداخت ثبت نشده است.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        HooshPayVerifyResponse verify;
+        try
+        {
+            var invoice = await _hooshPay.GetInvoiceAsync(payment.InvoiceUid, cancellationToken);
+            payment.Apply(invoice?.data);
+            payment.RawResponseJson = JsonConvert.SerializeObject(invoice);
+
+            verify = await _hooshPay.VerifyInvoiceAsync(payment.InvoiceUid, cancellationToken);
+            payment.Apply(verify?.data);
+            if (!string.IsNullOrWhiteSpace(verify?.status))
+                payment.PaymentStatus = verify.status;
+            payment.RawResponseJson = JsonConvert.SerializeObject(new
+            {
+                invoice,
+                verify
+            });
+
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+            Console.WriteLine($"[HooshPay ManualCheck] remote status received. orderId={payment.OrderId}, invoiceUid={payment.InvoiceUid}, status={payment.PaymentStatus}, paid={verify?.paid}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[HooshPay ManualCheck] remote status failed. orderId={payment.OrderId}, invoiceUid={payment.InvoiceUid}, error={ex.Message}");
+            payment.ErrorMessage = ex.Message;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: $"خطا در بررسی وضعیت پرداخت: <code>{Html(ex.Message)}</code>",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            await AnswerCallbackSafely(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (verify?.paid == true || HooshPayStatuses.IsPaid(payment.PaymentStatus))
+        {
+            payment.PaymentStatus = HooshPayStatuses.Paid;
+            var settlement = await _hooshPaySettlementService.ApplyFinishedPaymentAsync(
+                payment,
+                "manual-check",
+                chatId,
+                cancellationToken);
+
+            Console.WriteLine($"[HooshPay ManualCheck] settlement result. orderId={payment.OrderId}, invoiceUid={payment.InvoiceUid}, settlement={settlement.Status}, before={settlement.BeforeBalance}, after={settlement.AfterBalance}");
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: BuildHooshPayManualCheckSettlementText(payment, settlement),
+                parseMode: ParseMode.Html,
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+
+            if (messageId != 0)
+                await EditMessageWithCallback(_botClient, chatId, messageId);
+        }
+        else
+        {
+            var text = $"وضعیت فعلی پرداخت: <code>{Html(payment.PaymentStatus ?? "unknown")}</code>\n" +
+                       "بعد از تایید پرداخت، موجودی شما از طریق IPN یا بررسی دستی شارژ می‌شود.";
+
+            if (HooshPayStatuses.IsFinalFailure(payment.PaymentStatus))
+                text = $"این پرداخت با وضعیت <code>{Html(payment.PaymentStatus)}</code> بسته شده و قابل شارژ نیست.";
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: chatId,
+                text: text,
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+        }
+
+        await AnswerCallbackSafely(callbackQuery, cancellationToken);
+    }
+
+    private static string BuildHooshPayManualCheckSettlementText(
+        HooshPayPaymentInfo payment,
+        NowPaymentsSettlementResult settlement)
+    {
+        var status = Html(payment?.PaymentStatus ?? "unknown");
+        var orderId = Html(payment?.OrderId ?? "");
+        var invoiceUid = Html(payment?.InvoiceUid ?? "");
+        var amount = Html((payment?.AmountToman ?? 0).FormatCurrency());
+        var payableAmount = Html((payment?.PayableAmountToman ?? 0).FormatCurrency());
+
+        if (settlement?.Status == NowPaymentsSettlementStatus.Applied)
+        {
+            return "✅ پرداخت شما با موفقیت تایید شد و کیف پول شارژ شد.\n\n" +
+                   $"📌 وضعیت: <code>{status}</code>\n" +
+                   $"🧾 Order ID: <code>{orderId}</code>\n" +
+                   $"🧾 Invoice UID: <code>{invoiceUid}</code>\n" +
+                   $"💰 مبلغ شارژ: <code>{amount}</code>\n" +
+                   $"💳 مبلغ پرداختی: <code>{payableAmount}</code>\n" +
+                   $"💳 موجودی قبل: <code>{Html(settlement.BeforeBalance.FormatCurrency())}</code>\n" +
+                   $"💳 موجودی بعد: <code>{Html(settlement.AfterBalance.FormatCurrency())}</code>";
+        }
+
+        if (settlement?.Status == NowPaymentsSettlementStatus.AlreadyAdded)
+        {
+            return "ℹ️ اعتبار این پرداخت قبلاً به کیف پول شما اضافه شده است.\n\n" +
+                   $"📌 وضعیت: <code>{status}</code>\n" +
+                   $"🧾 Order ID: <code>{orderId}</code>\n" +
+                   $"🧾 Invoice UID: <code>{invoiceUid}</code>\n" +
+                   $"💳 موجودی فعلی: <code>{Html(settlement.AfterBalance.FormatCurrency())}</code>";
+        }
+
+        if (settlement?.Status == NowPaymentsSettlementStatus.UserNotFound)
+            return "پرداخت در سمت HooshPay تایید شده، اما کاربر مربوط به این پرداخت در دیتابیس پیدا نشد.";
+
+        return $"پرداخت تایید شد، اما شارژ کیف پول انجام نشد. وضعیت تسویه: <code>{Html(settlement?.Status.ToString() ?? "unknown")}</code>";
     }
 
     private static string BuildCryptoManualCheckSettlementText(
@@ -3517,6 +3698,11 @@ public class TelegramBotService : IHostedService
 
                 }
 
+                else if (user.PaymentMethod == "hooshpay")
+                {
+                    await CreateHooshPayWalletChargeAsync(message, credUser, user, cancellationToken);
+                }
+
                 else if (user.PaymentMethod == "swapino")
                 {
 
@@ -3675,7 +3861,7 @@ public class TelegramBotService : IHostedService
                         if (latestMsg != null)
                             payment.TelMsgId = latestMsg.MessageId;
 
-                            await _userDbContext.SaveChangesAsync();
+                        await _userDbContext.SaveChangesAsync();
                     }
                     catch (NowPaymentsApiException ex)
                     {
@@ -3777,6 +3963,10 @@ public class TelegramBotService : IHostedService
                     cancellationToken: cancellationToken);
                 return;
             }
+            else if (message.Text == "درگاه ریالی هوش‌پی")
+            {
+                user.PaymentMethod = "hooshpay";
+            }
             else if (message.Text == "درگاه ریالی" || message.Text == "درگاه ریالی (غیرفعال)")
             {
                 user.LastStep = "payment_method_selection";
@@ -3803,6 +3993,8 @@ public class TelegramBotService : IHostedService
 
             var gatewayName = user.PaymentMethod == "crypto"
                 ? "درگاه ارز دیجیتال"
+                : user.PaymentMethod == "hooshpay"
+                    ? "درگاه ریالی هوش‌پی"
                 : user.PaymentMethod == "zibal"
                     ? "درگاه ریالی"
                     : "درگاه پرداخت";
@@ -4821,7 +5013,7 @@ public class TelegramBotService : IHostedService
         {
             new[]
             {
-                new KeyboardButton("درگاه ریالی (غیرفعال)"),
+                new KeyboardButton("درگاه ریالی هوش‌پی"),
                 new KeyboardButton("درگاه ارز دیجیتال")
             }
         })
@@ -4829,6 +5021,129 @@ public class TelegramBotService : IHostedService
             ResizeKeyboard = true,
             OneTimeKeyboard = true
         };
+    }
+
+    private async Task CreateHooshPayWalletChargeAsync(
+        Message message,
+        CredUser credUser,
+        User user,
+        CancellationToken cancellationToken)
+    {
+        long amount = Convert.ToInt64(user.ConfigLink);
+        var payment = HooshPayPaymentInfo.CreateWalletCharge(
+            credUser.TelegramUserId,
+            amount,
+            _appConfig.HooshPayIpnUrl,
+            _appConfig.HooshPayReturnUrl,
+            message.Chat.Id);
+
+        _userDbContext.HooshPayPaymentInfos.Add(payment);
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+
+        try
+        {
+            payment.RawRequestJson = JsonConvert.SerializeObject(new
+            {
+                amount,
+                fee_mode = HooshPayFeeModes.Buyer,
+                order_id = payment.OrderId,
+                callback_url = _appConfig.HooshPayIpnUrl,
+                return_url = _appConfig.HooshPayReturnUrl
+            });
+
+            Console.WriteLine($"[HooshPay] Creating invoice for user={credUser.TelegramUserId}, amount={amount}, orderId={payment.OrderId}, feeMode={HooshPayFeeModes.Buyer}");
+
+            var invoice = await _hooshPay.CreateInvoiceAsync(
+                amount,
+                payment.OrderId,
+                $"Wallet charge {payment.OrderId}",
+                cancellationToken);
+
+            payment.RawResponseJson = JsonConvert.SerializeObject(invoice);
+            if (invoice?.data == null)
+                throw new InvalidOperationException("HooshPay invoice response did not contain data.");
+
+            payment.Apply(invoice.data);
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            var msg = await GetHooshPayPaymentMessage(credUser, payment);
+            var inlineKeyboardMarkup = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithUrl(text: "پرداخت آنلاین", url: payment.PaymentUrl)
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(text: "بررسی وضعیت", callbackData: $"hpchk_{payment.Id}")
+                }
+            });
+
+            Message latestMsg;
+            if (!string.IsNullOrWhiteSpace(payment.PaymentUrl))
+            {
+                using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(payment.PaymentUrl, 200));
+                latestMsg = await _botClient.SendPhotoAsync(
+                    message.Chat.Id,
+                    InputFile.FromStream(qrStream),
+                    caption: msg,
+                    parseMode: ParseMode.Html,
+                    replyMarkup: inlineKeyboardMarkup,
+                    cancellationToken: cancellationToken);
+            }
+            else
+            {
+                latestMsg = await _botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: msg,
+                    replyMarkup: inlineKeyboardMarkup,
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "منوی اصلی",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+
+            if (latestMsg != null)
+                payment.TelMsgId = latestMsg.MessageId;
+
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (HooshPayApiException ex)
+        {
+            Console.WriteLine("[HooshPay] API exception while creating invoice:");
+            Console.WriteLine(ex.ToString());
+
+            payment.ErrorCode = ex.StatusCode.ToString(CultureInfo.InvariantCulture);
+            payment.ErrorMessage = ex.Message;
+            payment.RawResponseJson = ex.ResponseBody;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "HooshPay درخواست را رد کرده است. جزئیات خطا در ترمینال ثبت شد.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[HooshPay] Unexpected exception while creating invoice:");
+            Console.WriteLine(ex.ToString());
+
+            payment.ErrorMessage = ex.Message;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            await _botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "ایجاد پرداخت ریالی HooshPay ناموفق بود. جزئیات خطا در ترمینال ثبت شد.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
     }
 
 
@@ -4848,6 +5163,35 @@ public class TelegramBotService : IHostedService
         text += $"\u200F <a href=\"{paymentLink}\">🏧   برای پرداخت کلیک کنید.</a> \n";
         if (!isSuperAdmin)
             text += "❗️نکات زیر را حتماً مد نظر قرار دهید:" + "\n" + "2. بعد از تکمیل پرداخت روی گزینه پرداخت کردم بزنید تا حساب شما شارژ شود." + "\n" + "3. ساعت 12 شب تا  بامداد1 سیکل تسویه بانک مرکزی است و در این مدت امکان پرداخت وجود ندارد." + "\n" + "4. نیم ساعت پس از ایجاد لینک پرداخت، نشست منقضی میشود و امکان پرداخت آن وجود ندارد. لذا سعی کنید بلافاصله بعد از ایجاد درگاه، آنرا پرداخت کنید." + "\n" + "5. هنگام پرداخت VPN خود را خاموش کنید." + "\n" + "6. در صورت بروز هرگونه مشکل با آیدی پشتیبانی(@vpnetiran_admin) در تماس باشید." + "\n";
+
+        return text;
+    }
+
+    async Task<string> GetHooshPayPaymentMessage(CredUser credUser, HooshPayPaymentInfo payment)
+    {
+        await _credentialsDbContext.GetUserStatus(credUser);
+
+        var paymentUrl = System.Net.WebUtility.HtmlEncode(payment.PaymentUrl ?? "");
+        var orderId = System.Net.WebUtility.HtmlEncode(payment.OrderId ?? "");
+        var invoiceUid = System.Net.WebUtility.HtmlEncode(payment.InvoiceUid ?? "");
+        var trackingCode = System.Net.WebUtility.HtmlEncode(payment.TrackingCode ?? "");
+        var payableAmount = payment.PayableAmountToman > 0
+            ? payment.PayableAmountToman
+            : payment.AmountToman + payment.FeeAmountToman;
+
+        string text = "✅ درگاه پرداخت ریالی HooshPay برای شما ایجاد شد.\n";
+        text += $"💰 مبلغ شارژ کیف پول: {payment.AmountToman.FormatCurrency()}\n";
+        text += $"💳 مبلغ قابل پرداخت با کارمزد: {payableAmount.FormatCurrency()}\n";
+        if (payment.FeeAmountToman > 0)
+            text += $"🧾 کارمزد درگاه: {payment.FeeAmountToman.FormatCurrency()}\n";
+        text += $"🧾 شماره سفارش: <code>{orderId}</code>\n";
+        if (!string.IsNullOrWhiteSpace(invoiceUid))
+            text += $"🧾 شناسه فاکتور: <code>{invoiceUid}</code>\n";
+        if (!string.IsNullOrWhiteSpace(trackingCode))
+            text += $"🔎 کد پیگیری: <code>{trackingCode}</code>\n";
+        if (!string.IsNullOrWhiteSpace(paymentUrl))
+            text += $"🔗 لینک پرداخت: <a href=\"{paymentUrl}\">باز کردن صفحه پرداخت</a>\n";
+        text += "\nپس از تایید پرداخت، شارژ کیف پول شما از طریق IPN به صورت خودکار انجام می‌شود. اگر لازم بود می‌توانید از دکمه بررسی وضعیت استفاده کنید.";
 
         return text;
     }

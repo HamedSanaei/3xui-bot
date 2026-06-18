@@ -37,7 +37,7 @@ namespace Adminbot.Utils
             {
                 Timeout = TimeSpan.FromSeconds(10)
             };
-            client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Adminbot/1.0");
+            client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Adminbot/1.1.0");
             client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
             return client;
         }

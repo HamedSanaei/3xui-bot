@@ -9,22 +9,46 @@ using Newtonsoft.Json;
 public class PaymentController : ControllerBase
 {
     private static readonly SemaphoreSlim IpnLock = new SemaphoreSlim(1, 1);
+    private static readonly SemaphoreSlim HooshPayIpnLock = new SemaphoreSlim(1, 1);
 
     private readonly UserDbContext _userDbcontext;
     private readonly AppConfig _appConfig;
     private readonly NowPaymentsSettlementService _settlementService;
+    private readonly HooshPaySettlementService _hooshPaySettlementService;
     private readonly ILogger<PaymentController> _logger;
 
     public PaymentController(
         UserDbContext userDbContext,
         IConfiguration config,
         NowPaymentsSettlementService settlementService,
+        HooshPaySettlementService hooshPaySettlementService,
         ILogger<PaymentController> logger)
     {
         _userDbcontext = userDbContext;
         _appConfig = config.Get<AppConfig>();
         _settlementService = settlementService;
+        _hooshPaySettlementService = hooshPaySettlementService;
         _logger = logger;
+    }
+
+    [HttpGet]
+    public IActionResult Probe()
+    {
+        var remoteIp = HttpContext.Connection.RemoteIpAddress?.ToString();
+        var forwardedFor = Request.Headers["X-Forwarded-For"].FirstOrDefault();
+        var cfConnectingIp = Request.Headers["CF-Connecting-IP"].FirstOrDefault();
+        var userAgent = Request.Headers.UserAgent.FirstOrDefault();
+
+        Console.WriteLine(
+            $"[NOWPayments IPN Probe] GET reached app. remoteIp={remoteIp}, xForwardedFor={forwardedFor}, cfConnectingIp={cfConnectingIp}, userAgent={userAgent}");
+
+        return Ok(new
+        {
+            status = "online",
+            endpoint = "nowpayments-ipn",
+            expectedMethod = "POST",
+            message = "NOWPayments IPN endpoint is online. Send POST callbacks to this URL."
+        });
     }
 
     [HttpPost]
@@ -120,6 +144,8 @@ public class PaymentController : ControllerBase
             var payment = await FindPaymentAsync(ipn, cancellationToken);
             if (payment == null)
             {
+                await LogPaymentLookupMissAsync(ipn, cancellationToken);
+
                 _logger.LogWarning(
                     "NOWPayments IPN received for unknown order. OrderId={OrderId}, PaymentId={PaymentId}",
                     ipn.order_id,
@@ -197,6 +223,184 @@ public class PaymentController : ControllerBase
         }
     }
 
+    [HttpGet("/hooshpay-ipn")]
+    public IActionResult ProbeHooshPay()
+    {
+        var remoteIp = HttpContext.Connection.RemoteIpAddress?.ToString();
+        var forwardedFor = Request.Headers["X-Forwarded-For"].FirstOrDefault();
+        var cfConnectingIp = Request.Headers["CF-Connecting-IP"].FirstOrDefault();
+        var userAgent = Request.Headers.UserAgent.FirstOrDefault();
+
+        Console.WriteLine(
+            $"[HooshPay IPN Probe] GET reached app. remoteIp={remoteIp}, xForwardedFor={forwardedFor}, cfConnectingIp={cfConnectingIp}, userAgent={userAgent}");
+
+        return Ok(new
+        {
+            status = "online",
+            endpoint = "hooshpay-ipn",
+            expectedMethod = "POST",
+            message = "HooshPay IPN endpoint is online. Send POST callbacks to this URL."
+        });
+    }
+
+    [HttpPost("/hooshpay-ipn")]
+    public async Task<IActionResult> ReceiveHooshPay(CancellationToken cancellationToken)
+    {
+        var requestId = Guid.NewGuid().ToString("N")[..8];
+        using var reader = new StreamReader(Request.Body);
+        var body = await reader.ReadToEndAsync(cancellationToken);
+        var signature = Request.Headers["X-HooshPay-Signature"].FirstOrDefault();
+
+        LogHooshPayIpnResult(
+            requestId,
+            stage: "received",
+            statusCode: null,
+            result: "HooshPay IPN callback received.",
+            body: body,
+            signatureIsValid: null);
+
+        bool isValidSignature;
+        try
+        {
+            isValidSignature = HooshPaySignature.Verify(body, signature, _appConfig.HooshPayIpnSecretKey);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Invalid HooshPay IPN JSON while checking signature.");
+            LogHooshPayIpnResult(
+                requestId,
+                stage: "invalid-json-signature-check",
+                statusCode: StatusCodes.Status400BadRequest,
+                result: "Invalid IPN JSON while checking signature.",
+                body: body,
+                signatureIsValid: false,
+                extra: ex.Message);
+            return BadRequest(new { message = "Invalid IPN payload." });
+        }
+
+        if (!isValidSignature)
+        {
+            LogHooshPayIpnResult(
+                requestId,
+                stage: "signature-invalid",
+                statusCode: StatusCodes.Status401Unauthorized,
+                result: "Invalid HooshPay signature.",
+                body: body,
+                signatureIsValid: false);
+            return Unauthorized(new { message = "Invalid HooshPay signature." });
+        }
+
+        HooshPayIpn ipn;
+        try
+        {
+            ipn = JsonConvert.DeserializeObject<HooshPayIpn>(body);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Invalid HooshPay IPN payload.");
+            LogHooshPayIpnResult(
+                requestId,
+                stage: "invalid-json-payload",
+                statusCode: StatusCodes.Status400BadRequest,
+                result: "Invalid IPN payload JSON.",
+                body: body,
+                signatureIsValid: true,
+                extra: ex.Message);
+            return BadRequest(new { message = "Invalid IPN payload." });
+        }
+
+        if (ipn == null)
+        {
+            LogHooshPayIpnResult(
+                requestId,
+                stage: "empty-payload",
+                statusCode: StatusCodes.Status400BadRequest,
+                result: "Empty IPN payload.",
+                body: body,
+                signatureIsValid: true);
+            return BadRequest(new { message = "Empty IPN payload." });
+        }
+
+        await HooshPayIpnLock.WaitAsync(cancellationToken);
+        try
+        {
+            var payment = await FindHooshPayPaymentAsync(ipn, cancellationToken);
+            if (payment == null)
+            {
+                await LogHooshPayPaymentLookupMissAsync(ipn, cancellationToken);
+                LogHooshPayIpnResult(
+                    requestId,
+                    stage: "payment-not-found",
+                    statusCode: StatusCodes.Status404NotFound,
+                    result: "Payment was not found in local database.",
+                    ipn: ipn,
+                    body: body,
+                    signatureIsValid: true);
+                return NotFound(new { message = "Payment was not found." });
+            }
+
+            payment.Apply(ipn);
+            payment.RawIpnJson = body;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+
+            LogHooshPayIpnResult(
+                requestId,
+                stage: "payment-updated",
+                statusCode: null,
+                result: "IPN data applied to local payment record.",
+                ipn: ipn,
+                payment: payment,
+                body: body,
+                signatureIsValid: true);
+
+            if (!HooshPayStatuses.IsPaid(ipn.status))
+            {
+                LogHooshPayIpnResult(
+                    requestId,
+                    stage: "accepted-not-paid",
+                    statusCode: StatusCodes.Status200OK,
+                    result: "IPN accepted; payment is not paid yet.",
+                    ipn: ipn,
+                    payment: payment,
+                    body: body,
+                    signatureIsValid: true);
+                return Ok(new
+                {
+                    message = "IPN accepted.",
+                    status = ipn.status,
+                    orderId = payment.OrderId
+                });
+            }
+
+            var settlement = await _hooshPaySettlementService.ApplyFinishedPaymentAsync(
+                payment,
+                "ipn",
+                cancellationToken: cancellationToken);
+
+            LogHooshPayIpnResult(
+                requestId,
+                stage: "accepted-paid",
+                statusCode: StatusCodes.Status200OK,
+                result: "IPN accepted; paid payment settlement processed.",
+                ipn: ipn,
+                payment: payment,
+                settlement: settlement,
+                body: body,
+                signatureIsValid: true);
+            return Ok(new
+            {
+                message = "IPN accepted.",
+                status = ipn.status,
+                settlement = settlement.Status.ToString(),
+                orderId = payment.OrderId
+            });
+        }
+        finally
+        {
+            HooshPayIpnLock.Release();
+        }
+    }
+
     private void LogIpnResult(
         string requestId,
         string stage,
@@ -235,6 +439,92 @@ public class PaymentController : ControllerBase
         Console.WriteLine("=====================================");
     }
 
+    private void LogHooshPayIpnResult(
+        string requestId,
+        string stage,
+        int? statusCode,
+        string result,
+        HooshPayIpn ipn = null,
+        HooshPayPaymentInfo payment = null,
+        NowPaymentsSettlementResult settlement = null,
+        string body = null,
+        bool? signatureIsValid = null,
+        string extra = null)
+    {
+        var remoteIp = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var forwardedFor = Request.Headers["X-Forwarded-For"].FirstOrDefault() ?? "";
+        var cfConnectingIp = Request.Headers["CF-Connecting-IP"].FirstOrDefault() ?? "";
+        var userAgent = Request.Headers["User-Agent"].FirstOrDefault() ?? "";
+        var signature = Request.Headers["X-HooshPay-Signature"].FirstOrDefault();
+        var signatureState = signatureIsValid.HasValue
+            ? (signatureIsValid.Value ? "valid" : "invalid")
+            : "not-checked";
+        var secretState = string.IsNullOrWhiteSpace(_appConfig?.HooshPayIpnSecretKey)
+            ? "missing"
+            : "configured";
+
+        Console.WriteLine("========== HooshPay IPN ==========");
+        Console.WriteLine($"[HooshPay IPN] requestId={requestId}, stage={stage}, result={result}");
+        Console.WriteLine($"[HooshPay IPN] responseStatus={(statusCode.HasValue ? statusCode.Value.ToString() : "pending")}");
+        Console.WriteLine($"[HooshPay IPN] remoteIp={remoteIp}, xForwardedFor={forwardedFor}, cfConnectingIp={cfConnectingIp}, userAgent={userAgent}");
+        Console.WriteLine($"[HooshPay IPN] signatureHeader={(string.IsNullOrWhiteSpace(signature) ? "missing" : "present")}, signature={signatureState}, ipnSecret={secretState}");
+        Console.WriteLine($"[HooshPay IPN] orderId={ipn?.order_id ?? payment?.OrderId ?? ""}, invoice={ipn?.invoice ?? payment?.InvoiceUid ?? ""}, status={ipn?.status ?? payment?.PaymentStatus ?? ""}, trackingCode={ipn?.tracking_code ?? payment?.TrackingCode ?? ""}");
+        Console.WriteLine($"[HooshPay IPN] localPayment={(payment == null ? "not-found" : $"found:id={payment.Id}, user={payment.TelegramUserId}, added={payment.IsAddedToBalance}")}");
+        Console.WriteLine($"[HooshPay IPN] settlement={(settlement == null ? "not-applied" : settlement.Status.ToString())}");
+        if (!string.IsNullOrWhiteSpace(extra))
+            Console.WriteLine($"[HooshPay IPN] extra={extra}");
+        Console.WriteLine($"[HooshPay IPN] rawBody={body ?? ""}");
+        Console.WriteLine("===================================");
+    }
+
+    private async Task<HooshPayPaymentInfo> FindHooshPayPaymentAsync(HooshPayIpn ipn, CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(ipn.order_id))
+        {
+            var byOrderId = await _userDbcontext.HooshPayPaymentInfos
+                .FirstOrDefaultAsync(p => p.OrderId == ipn.order_id, cancellationToken);
+            if (byOrderId != null)
+                return byOrderId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(ipn.invoice))
+        {
+            var byInvoiceUid = await _userDbcontext.HooshPayPaymentInfos
+                .FirstOrDefaultAsync(p => p.InvoiceUid == ipn.invoice, cancellationToken);
+            if (byInvoiceUid != null)
+                return byInvoiceUid;
+        }
+
+        return null;
+    }
+
+    private async Task LogHooshPayPaymentLookupMissAsync(HooshPayIpn ipn, CancellationToken cancellationToken)
+    {
+        var totalCount = await _userDbcontext.HooshPayPaymentInfos.CountAsync(cancellationToken);
+        var latestPayments = await _userDbcontext.HooshPayPaymentInfos
+            .OrderByDescending(p => p.Id)
+            .Take(5)
+            .Select(p => new
+            {
+                p.Id,
+                p.OrderId,
+                p.InvoiceUid,
+                p.TelegramUserId,
+                p.CreatedAtUtc,
+                p.PaymentStatus
+            })
+            .ToListAsync(cancellationToken);
+
+        Console.WriteLine(
+            $"[HooshPay IPN] lookup miss diagnostics: db=./Data/users.db, totalPayments={totalCount}, incomingOrderId={ipn?.order_id}, incomingInvoice={ipn?.invoice}");
+
+        foreach (var payment in latestPayments)
+        {
+            Console.WriteLine(
+                $"[HooshPay IPN] recent local payment: id={payment.Id}, orderId={payment.OrderId}, invoiceUid={payment.InvoiceUid}, user={payment.TelegramUserId}, createdAtUtc={payment.CreatedAtUtc:O}, status={payment.PaymentStatus}");
+        }
+    }
+
     private async Task<SwapinoPaymentInfo> FindPaymentAsync(NowPaymentsIpn ipn, CancellationToken cancellationToken)
     {
         if (!string.IsNullOrWhiteSpace(ipn.order_id))
@@ -245,8 +535,21 @@ public class PaymentController : ControllerBase
                 return byOrderId;
         }
 
-        if (string.IsNullOrWhiteSpace(ipn.payment_id))
-            return null;
+        if (!string.IsNullOrWhiteSpace(ipn.invoice_id))
+        {
+            var byInvoiceId = await _userDbcontext.SwapinoPaymentInfos
+                .FirstOrDefaultAsync(p => p.InvoiceId == ipn.invoice_id, cancellationToken);
+            if (byInvoiceId != null)
+                return byInvoiceId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(ipn.payment_id))
+        {
+            var byPaymentId = await _userDbcontext.SwapinoPaymentInfos
+                .FirstOrDefaultAsync(p => p.PaymentId == ipn.payment_id, cancellationToken);
+            if (byPaymentId != null)
+                return byPaymentId;
+        }
 
         var recentPayments = await _userDbcontext.SwapinoPaymentInfos
             .OrderByDescending(p => p.Id)
@@ -254,7 +557,43 @@ public class PaymentController : ControllerBase
             .ToListAsync(cancellationToken);
 
         return recentPayments.FirstOrDefault(p =>
-            string.Equals(p.GetNowPaymentsData().PaymentId, ipn.payment_id, StringComparison.OrdinalIgnoreCase));
+        {
+            var data = p.GetNowPaymentsData();
+            return (!string.IsNullOrWhiteSpace(ipn.payment_id) &&
+                    string.Equals(data.PaymentId, ipn.payment_id, StringComparison.OrdinalIgnoreCase)) ||
+                   (!string.IsNullOrWhiteSpace(ipn.invoice_id) &&
+                    string.Equals(data.InvoiceId, ipn.invoice_id, StringComparison.OrdinalIgnoreCase)) ||
+                   (!string.IsNullOrWhiteSpace(ipn.order_id) &&
+                    string.Equals(data.OrderId, ipn.order_id, StringComparison.OrdinalIgnoreCase));
+        });
+    }
+
+    private async Task LogPaymentLookupMissAsync(NowPaymentsIpn ipn, CancellationToken cancellationToken)
+    {
+        var totalCount = await _userDbcontext.SwapinoPaymentInfos.CountAsync(cancellationToken);
+        var latestPayments = await _userDbcontext.SwapinoPaymentInfos
+            .OrderByDescending(p => p.Id)
+            .Take(5)
+            .Select(p => new
+            {
+                p.Id,
+                p.OrderId,
+                p.InvoiceId,
+                p.PaymentId,
+                p.TelegramUserId,
+                p.CreatedAtUtc,
+                p.PaymentStatus
+            })
+            .ToListAsync(cancellationToken);
+
+        Console.WriteLine(
+            $"[NOWPayments IPN] lookup miss diagnostics: db=./Data/users.db, totalPayments={totalCount}, incomingOrderId={ipn?.order_id}, incomingInvoiceId={ipn?.invoice_id}, incomingPaymentId={ipn?.payment_id}");
+
+        foreach (var payment in latestPayments)
+        {
+            Console.WriteLine(
+                $"[NOWPayments IPN] recent local payment: id={payment.Id}, orderId={payment.OrderId}, invoiceId={payment.InvoiceId}, paymentId={payment.PaymentId}, user={payment.TelegramUserId}, createdAtUtc={payment.CreatedAtUtc:O}, status={payment.PaymentStatus}");
+        }
     }
 
     private static void ApplyIpnToPayment(SwapinoPaymentInfo payment, NowPaymentsIpn ipn)

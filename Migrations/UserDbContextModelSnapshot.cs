@@ -163,6 +163,116 @@ namespace Adminbot.Migrations
                     b.ToTable("SwapinoPaymentInfos");
                 });
 
+            modelBuilder.Entity("Adminbot.Domain.HooshPayPaymentInfo", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("AmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("BalanceAfter")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("BalanceBefore")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("ChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ErrorCode")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ErrorMessage")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("FeeAmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("FeeMode")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<decimal>("FeePercent")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("InvoiceUid")
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("IpnCallbackUrl")
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("IsAddedToBalance")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("MerchantCreditToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("OrderId")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("PaidAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("PayableAmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("PaymentStatus")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PaymentUrl")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RawIpnJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RawRequestJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RawResponseJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ReturnUrl")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("SettledAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("TelMsgId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("TrackingCode")
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ChatId");
+
+                    b.HasIndex("InvoiceUid");
+
+                    b.HasIndex("OrderId")
+                        .IsUnique();
+
+                    b.HasIndex("TelegramUserId");
+
+                    b.ToTable("HooshPayPaymentInfos");
+                });
+
             modelBuilder.Entity("Adminbot.Domain.ZibalPaymentInfo", b =>
                 {
                     b.Property<int>("Id")

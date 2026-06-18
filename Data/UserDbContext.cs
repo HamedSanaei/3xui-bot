@@ -3,16 +3,27 @@ using Microsoft.EntityFrameworkCore;
 
 public class UserDbContext : DbContext
 {
+    private static string _databasePath = "./Data/users.db";
+
     public DbSet<User> Users { get; set; }
     public DbSet<CookieData> Cookies { get; set; }
     public DbSet<SwapinoPaymentInfo> SwapinoPaymentInfos { get; set; }
+    public DbSet<HooshPayPaymentInfo> HooshPayPaymentInfos { get; set; }
 
     public DbSet<ZibalPaymentInfo> ZibalPaymentInfos { get; set; }
 
+    public static string DatabasePath => _databasePath;
+
+    public static void ConfigureDatabasePath(string databasePath)
+    {
+        if (!string.IsNullOrWhiteSpace(databasePath))
+            _databasePath = databasePath;
+    }
+
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
-        optionsBuilder.UseSqlite("Data Source=./Data/users.db");
-
+        if (!optionsBuilder.IsConfigured)
+            optionsBuilder.UseSqlite($"Data Source={_databasePath};Cache=Shared");
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -36,6 +47,22 @@ public class UserDbContext : DbContext
             entity.Property(x => x.PaymentId).HasMaxLength(120);
             entity.Property(x => x.PaymentStatus).HasMaxLength(64);
             entity.Property(x => x.PayAddress).HasMaxLength(256);
+        });
+
+        modelBuilder.Entity<HooshPayPaymentInfo>(entity =>
+        {
+            entity.ToTable("HooshPayPaymentInfos");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.OrderId).IsRequired().HasMaxLength(120);
+            entity.HasIndex(x => x.OrderId).IsUnique();
+            entity.HasIndex(x => x.InvoiceUid);
+            entity.HasIndex(x => x.TelegramUserId);
+            entity.HasIndex(x => x.ChatId);
+            entity.Property(x => x.InvoiceUid).HasMaxLength(120);
+            entity.Property(x => x.FeeMode).HasMaxLength(32);
+            entity.Property(x => x.PaymentStatus).HasMaxLength(64);
+            entity.Property(x => x.TrackingCode).HasMaxLength(120);
         });
     }
 

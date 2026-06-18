@@ -18,6 +18,7 @@ public class BroadcastManager : IHostedService, IDisposable
     private readonly int _maxRetryCount;
     private readonly int _capacity;
     private Task _workerTask;
+    private int _disposed;
 
     public BroadcastManager(
         ITelegramBotClient bot,
@@ -219,7 +220,18 @@ public class BroadcastManager : IHostedService, IDisposable
 
     public void Dispose()
     {
-        _shutdown.Cancel();
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            return;
+
+        try
+        {
+            if (!_shutdown.IsCancellationRequested)
+                _shutdown.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
         _shutdown.Dispose();
     }
 

@@ -1073,6 +1073,9 @@ public class ApiServicev3
             ? 0
             : DateTimeOffset.UtcNow.AddDays(durationDays).ToUnixTimeMilliseconds();
 
+        if (options.StartExpiryAfterFirstUse && durationDays > 0)
+            expiryTime = -(long)TimeSpan.FromDays(durationDays).TotalMilliseconds;
+
         return new XuiV3ClientPayload
         {
             Email = email,
@@ -1158,6 +1161,7 @@ public class XuiV3CreateAccountOptions
     public string SubId { get; set; }
     public string Comment { get; set; }
     public bool UseVisionFlow { get; set; }
+    public bool StartExpiryAfterFirstUse { get; set; }
 }
 
 public class XuiV3AccountCreationResult

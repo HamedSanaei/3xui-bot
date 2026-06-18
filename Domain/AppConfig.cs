@@ -24,9 +24,18 @@ namespace Adminbot.Domain
         public string UserActivityLogLevel { get; set; } = "Information";
         public string UserActivityLogFilePath { get; set; } = "./Data/Logs/user-activity-{shamsiDate}.jsonl";
         public int UserActivityLogMaxExceptionDepth { get; set; } = 1;
+        public string UserDatabasePath { get; set; } = "./Data/users.db";
+        public string CredentialsDatabasePath { get; set; } = "./Data/credentials.db";
         public int BroadcastDelayMs { get; set; } = 250;
         public int BroadcastMaxRetryCount { get; set; } = 3;
         public int BroadcastQueueCapacity { get; set; } = 10000;
+        public bool HttpsEnabled { get; set; } = true;
+        public int HttpsPort { get; set; } = 443;
+        public int HttpPort { get; set; } = 80;
+        public string HttpsCertificatePath { get; set; } = "./Data/tofanservice.ir cf15years/cert.crt";
+        public string HttpsCertificateKeyPath { get; set; } = "./Data/tofanservice.ir cf15years/private.key";
+        public string HttpsCertificatePfxPath { get; set; }
+        public string HttpsCertificatePassword { get; set; }
         public string NowPaymentApiKey { get; set; }
         public string NowPaymentJwtToken { get; set; }
         public string NowPaymentEmail { get; set; }
@@ -44,6 +53,11 @@ namespace Adminbot.Domain
         public string NowpaymentSuccessUrl { get; set; }
         public string NowpaymentCancelUrl { get; set; }
         public string NowpaymentIpnUrl { get; set; }
+        public string HooshPayApiKey { get; set; }
+        public string HooshPayIpnSecretKey { get; set; }
+        public string HooshPayBaseUrl { get; set; } = "https://pay.hooshnet.com";
+        public string HooshPayIpnUrl { get; set; }
+        public string HooshPayReturnUrl { get; set; }
         public string Iransocks5 { get; set; }
         public string AbanTetherTrxUrl { get; set; }
         public string AbanTetherUsdtUrl { get; set; }

@@ -172,7 +172,10 @@ public class XuiV3PurchaseService
         var text = "سفارش جدید\n";
         text += $"نوع سرویس: {resolved.Service.DisplayName}\n";
         text += $"تعداد اکانت: {accountCount}\n";
-        text += $"حجم هر اکانت: {FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb)}\n";
+        text += resolved.IsUnlimited
+            ? $"حد مصرف منصفانه هر اکانت: {FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb)}\n"
+            : $"حجم هر اکانت: {FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb)}\n";
+
         text += resolved.DurationDays <= 0
             ? "مدت: نامحدود\n"
             : $"مدت: {resolved.DurationDays} روز\n";
@@ -234,6 +237,7 @@ public class XuiV3PurchaseService
                 TrafficBytes = trafficBytes,
                 DurationDays = resolved.DurationDays,
                 LimitIp = resolved.LimitIp,
+                StartExpiryAfterFirstUse = resolved.IsUnlimited,
                 Comment = BuildClientComment(user, resolved, inboundIds, serverInfo, metadataOptions, trafficBytes, priceToman),
                 SaveUserStatus = metadataOptions.SaveUserStatus
             },
@@ -263,6 +267,7 @@ public class XuiV3PurchaseService
             TotalRequestedPriceToman = (options.PriceTomanOverride ?? resolved.PriceToman) * accountCount,
             ServiceKey = resolved.Service.Key,
             ServiceName = resolved.Service.DisplayName,
+            IsUnlimited = resolved.IsUnlimited,
             TrafficGb = resolved.TrafficGb,
             TrafficBytes = options.TrafficBytes > 0 ? options.TrafficBytes : resolved.TrafficBytes,
             DurationDays = resolved.DurationDays
@@ -418,9 +423,10 @@ public class XuiV3PurchaseService
         if (result == null || !result.Success)
             return $"ساخت اکانت ناموفق بود.\n{result?.Message}";
 
+        var trafficLabel = IsUnlimitedAccount(result.Comment) ? "حد مصرف منصفانه" : "حجم";
         var text = "✅ اکانت شما با موفقیت ساخته شد.\n\n";
         text += $"👤 نام اکانت: <code>{System.Net.WebUtility.HtmlEncode(result.Email)}</code>\n";
-        text += $"📦 حجم: <b>{System.Net.WebUtility.HtmlEncode(FormatTrafficSize(result.TrafficBytes, result.TrafficGb))}</b>\n";
+        text += $"📦 {trafficLabel}: <b>{System.Net.WebUtility.HtmlEncode(FormatTrafficSize(result.TrafficBytes, result.TrafficGb))}</b>\n";
         text += $"📅 تاریخ انقضا: <b>{System.Net.WebUtility.HtmlEncode(FormatExpiry(result.ExpiryTime))}</b>\n\n";
 
         if (!string.IsNullOrWhiteSpace(result.SubLink))
@@ -439,7 +445,10 @@ public class XuiV3PurchaseService
 
     private static string FormatExpiry(long expiryTime)
     {
-        if (expiryTime <= 0)
+        if (expiryTime < 0)
+            return $"{Math.Max(1, (int)Math.Ceiling(Math.Abs(expiryTime) / (double)TimeSpan.FromDays(1).TotalMilliseconds))} روز بعد از اولین اتصال";
+
+        if (expiryTime == 0)
             return "نامحدود";
 
         return DateTimeOffset
@@ -471,6 +480,22 @@ public class XuiV3PurchaseService
             return $"{trafficBytes / gb:0.##} GB";
 
         return $"{trafficBytes / mb:0.##} MB";
+    }
+
+    private static bool IsUnlimitedAccount(string comment)
+    {
+        if (string.IsNullOrWhiteSpace(comment))
+            return false;
+
+        try
+        {
+            var metadata = JsonConvert.DeserializeObject<XuiV3ClientMetadata>(comment);
+            return string.Equals(metadata?.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private XuiV3ServiceDefinition FindService(string serviceKey)
@@ -580,6 +605,7 @@ public class XuiV3BulkCreationResult
     public long TotalSuccessfulPriceToman { get; set; }
     public string ServiceKey { get; set; }
     public string ServiceName { get; set; }
+    public bool IsUnlimited { get; set; }
     public int TrafficGb { get; set; }
     public long TrafficBytes { get; set; }
     public int DurationDays { get; set; }

@@ -1969,12 +1969,13 @@ public class XuiV3AdminFlowService
         var commentText = string.IsNullOrWhiteSpace(user.PendingUserComment)
             ? "ندارد"
             : user.PendingUserComment;
+        var trafficLabel = resolved.IsUnlimited ? "حد مصرف منصفانه هر اکانت" : "حجم هر اکانت";
 
         return "✅ خلاصه ساخت اکانت نسخه ۳\n\n" +
                $"👤 مالک اکانت: <code>{Html(user.ConfigLink)}</code>\n" +
                $"🧩 نوع سرویس: <code>{Html(resolved.Service.DisplayName)}</code>\n" +
                $"📌 پلن: <code>{Html(planText)}</code>\n" +
-               $"📦 حجم هر اکانت: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb))}</code>\n" +
+               $"📦 {trafficLabel}: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb))}</code>\n" +
                $"⏳ زمان: <code>{Html(durationText)}</code>\n" +
                $"👥 محدودیت کاربر/IP: <code>{resolved.LimitIp}</code>\n" +
                $"🔢 تعداد اکانت: <code>{accountCount}</code>\n" +
@@ -2150,7 +2151,7 @@ public class XuiV3AdminFlowService
         sb.AppendLine($"سرویس `{result.ServiceName}`");
         sb.AppendLine($"تعداد درخواست `{result.RequestedCount}`");
         sb.AppendLine($"تعداد موفق `{result.SuccessfulCount}`");
-        sb.AppendLine($"حجم هر اکانت `{XuiV3PurchaseService.FormatTrafficSize(result.TrafficBytes, result.TrafficGb)}`");
+        sb.AppendLine($"{(string.Equals(metadata?.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase) ? "حد مصرف منصفانه هر اکانت" : "حجم هر اکانت")} `{XuiV3PurchaseService.FormatTrafficSize(result.TrafficBytes, result.TrafficGb)}`");
         sb.AppendLine($"مدت `{(result.DurationDays <= 0 ? "نامحدود" : result.DurationDays + " روز")}`");
 
         if (!string.IsNullOrWhiteSpace(metadata?.UserComment))
@@ -2286,9 +2287,12 @@ public class XuiV3AdminFlowService
     {
         var expiryText = FormatExpiry(creation.ExpiryTime);
         var metadata = TryReadMetadata(creation.Comment);
+        var trafficLabel = string.Equals(metadata?.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase)
+            ? "حد مصرف منصفانه"
+            : "حجم";
         var text = "✅ اکانت نسخه ۳ با موفقیت ساخته شد.\n\n" +
                $"👤 نام اکانت: <code>{Html(creation.Email)}</code>\n" +
-               $"📦 حجم: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(creation.TrafficBytes, creation.TrafficGb))}</code>\n" +
+               $"📦 {trafficLabel}: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(creation.TrafficBytes, creation.TrafficGb))}</code>\n" +
                $"⏳ انقضا: <code>{Html(expiryText)}</code>\n" +
                $"🔗 Inbound IDs: <code>{Html(string.Join(",", creation.InboundIds ?? new List<int>()))}</code>\n\n" +
                "🔗 سابلینک:\n" +
@@ -2567,7 +2571,10 @@ public class XuiV3AdminFlowService
     private static string FormatDeleteExpiry(XuiV3Client client)
     {
         var expiryTime = GetExpiryTime(client);
-        if (expiryTime <= 0)
+        if (expiryTime < 0)
+            return $"{FormatFirstUseDurationDays(expiryTime)} روز بعد از اولین اتصال";
+
+        if (expiryTime == 0)
             return "نامحدود";
 
         var expiryUtc = DateTimeOffset.FromUnixTimeMilliseconds(expiryTime).UtcDateTime;
@@ -2658,11 +2665,14 @@ public class XuiV3AdminFlowService
 
         if (metadata != null)
         {
+            var metadataTrafficLabel = string.Equals(metadata.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase)
+                ? "حد مصرف منصفانه"
+                : "حجم";
             text += "\n🧾 متادیتا:\n" +
                     $"نوع سرویس: <code>{Html(metadata.ServiceKey)}</code>\n" +
                     $"نام سرویس: <code>{Html(metadata.ServiceName)}</code>\n" +
                     $"پلن: <code>{Html(metadata.PlanKey)}</code>\n" +
-                    $"حجم: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(metadata.TrafficBytes, metadata.TrafficGb))}</code>\n" +
+                    $"{metadataTrafficLabel}: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(metadata.TrafficBytes, metadata.TrafficGb))}</code>\n" +
                     $"مدت: <code>{metadata.DurationDays} days</code>\n" +
                     $"قیمت: <code>{Html(metadata.PriceToman.FormatCurrency())}</code>\n" +
                     $"اینباندها: <code>{Html(string.Join(",", metadata.InboundIds ?? new List<int>()))}</code>\n";
@@ -2765,13 +2775,21 @@ public class XuiV3AdminFlowService
 
     private static string FormatExpiry(long expiryTime)
     {
-        if (expiryTime <= 0)
+        if (expiryTime < 0)
+            return $"{FormatFirstUseDurationDays(expiryTime)} روز بعد از اولین اتصال";
+
+        if (expiryTime == 0)
             return "نامحدود";
 
         return DateTimeOffset.FromUnixTimeMilliseconds(expiryTime)
             .UtcDateTime
             .AddMinutes(210)
             .ConvertToHijriShamsi();
+    }
+
+    private static int FormatFirstUseDurationDays(long expiryTime)
+    {
+        return Math.Max(1, (int)Math.Ceiling(Math.Abs(expiryTime) / (double)TimeSpan.FromDays(1).TotalMilliseconds));
     }
 
     private static long ReadLongExtra(XuiV3Client client, string key)
