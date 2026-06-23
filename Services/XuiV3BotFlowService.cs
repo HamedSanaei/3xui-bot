@@ -941,9 +941,10 @@ public class XuiV3BotFlowService
         }
 
         var currentExpiryBeforeRenew = GetExpiryTime(client);
-        var payload = BuildRenewPayload(client, resolved, allowExternalUuidRenew ? "uuid-search-renew" : "user-renew", credUser.TelegramUserId);
+        var renewal = XuiV3RenewalPolicy.Calculate(client, resolved, allowExternalUuidRenew ? "uuid-search-renew" : "user-renew", credUser.TelegramUserId);
+        var payload = renewal.Payload;
         Console.WriteLine(
-            $"[XUIv3] renew payload user={credUser.TelegramUserId}, email={client.Email}, durationDays={resolved.DurationDays}, currentExpiry={currentExpiryBeforeRenew}, newExpiry={payload.ExpiryTime}, currentExpiryText={FormatExpiry(currentExpiryBeforeRenew)}, newExpiryText={FormatExpiry(payload.ExpiryTime)}");
+            $"[XUIv3] renew payload user={credUser.TelegramUserId}, email={client.Email}, durationDays={resolved.DurationDays}, currentExpiry={currentExpiryBeforeRenew}, newExpiry={payload.ExpiryTime}, currentExpiryText={FormatExpiry(currentExpiryBeforeRenew)}, newExpiryText={FormatExpiry(payload.ExpiryTime)}, resetTraffic={renewal.ShouldResetTraffic}, totalBytesAfter={renewal.TotalBytesAfterRenew}, targetAvailableBytes={renewal.TargetAvailableTrafficBytes}");
 
         var updateResponse = await ApiServicev3.UpdateClientAsync(serverInfo, _configuration, client.Email, payload, cancellationToken);
         if (!updateResponse.Success)
@@ -969,6 +970,7 @@ public class XuiV3BotFlowService
             return;
         }
 
+        var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
         var beforeBalance = credUser.AccountBalance;
         await _credentialsDbContext.Pay(credUser, resolved.PriceToman);
         var afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
@@ -978,6 +980,11 @@ public class XuiV3BotFlowService
         client.ExpiryTime = payload.ExpiryTime;
         client.Comment = payload.Comment;
         client.Enable = payload.Enable;
+        if (trafficResetApplied && client.Traffic != null)
+        {
+            client.Traffic.Up = 0;
+            client.Traffic.Down = 0;
+        }
 
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
@@ -994,8 +1001,11 @@ public class XuiV3BotFlowService
             details: new[]
             {
                 $"نام اکانت `{client.Email}`",
-                $"حجم اضافه `{resolved.TrafficGb} GB`",
+                renewal.IsUnlimited
+                    ? $"حد مصرف منصفانه قابل استفاده `{renewal.TargetAvailableTrafficGb} GB`"
+                    : $"حجم اضافه `{resolved.TrafficGb} GB`",
                 $"زمان اضافه `{(resolved.DurationDays <= 0 ? "نامحدود" : $"{resolved.DurationDays} روز")}`",
+                $"ریست مصرف `{(renewal.ShouldResetTraffic ? (trafficResetApplied ? "انجام شد" : "ناموفق") : "نیاز نبود")}`",
                 $"سابلینک `{ApiServicev3.BuildSubscriptionLink(serverInfo, client.SubId ?? client.Email)}`",
                 $"کامنت `{client.Comment}`"
             });
@@ -1009,7 +1019,10 @@ public class XuiV3BotFlowService
                 ["serviceKey"] = service.Key,
                 ["serviceName"] = service.DisplayName,
                 ["trafficAddedGb"] = resolved.TrafficGb,
+                ["targetAvailableGbAfterRenew"] = renewal.TargetAvailableTrafficGb,
                 ["durationAddedDays"] = resolved.DurationDays,
+                ["finalDurationDays"] = renewal.FinalDurationDays,
+                ["trafficResetApplied"] = trafficResetApplied,
                 ["priceToman"] = resolved.PriceToman,
                 ["balanceBeforeToman"] = beforeBalance,
                 ["balanceAfterToman"] = afterBalance,
@@ -1021,6 +1034,28 @@ public class XuiV3BotFlowService
                 ["rootPath"] = serverInfo.RootPath
             },
             cancellationToken);
+    }
+
+    private async Task<bool> ResetRenewedTrafficIfNeededAsync(
+        ServerInfo serverInfo,
+        string email,
+        XuiV3RenewalCalculation renewal,
+        CancellationToken cancellationToken)
+    {
+        if (renewal?.ShouldResetTraffic != true)
+            return false;
+
+        var resetResponse = await ApiServicev3.ResetClientTrafficAsync(serverInfo, _configuration, email, cancellationToken);
+        if (resetResponse.Success)
+            return true;
+
+        Console.WriteLine($"[XUIv3] renew traffic reset failed email={email}, msg={resetResponse.Msg}. Trying updateTraffic fallback.");
+        var fallbackResponse = await ApiServicev3.UpdateClientTrafficAsync(serverInfo, _configuration, email, 0, 0, cancellationToken);
+        if (fallbackResponse.Success)
+            return true;
+
+        Console.WriteLine($"[XUIv3] renew traffic reset fallback failed email={email}, msg={fallbackResponse.Msg}");
+        return false;
     }
 
     public async Task<bool> TryStartPurchaseAsync(
@@ -3944,8 +3979,8 @@ public class XuiV3BotFlowService
 
         var resolved = _purchaseService.ResolvePurchase(selection, isColleague);
         var durationText = resolved.DurationDays <= 0 ? "نامحدود / لایف‌تایم" : $"{resolved.DurationDays} روز";
+        XuiV3RenewalCalculation renewal = null;
         var usedBytes = 0L;
-        var totalBytes = 0L;
 
         try
         {
@@ -3953,8 +3988,8 @@ public class XuiV3BotFlowService
             var client = await FindClientByEmailAsync(serverInfo, user.ConfigLink, telegramUserId, cancellationToken);
             if (client != null)
             {
-                usedBytes = GetUsedBytes(client);
-                totalBytes = GetTotalBytes(client);
+                renewal = XuiV3RenewalPolicy.Calculate(client, resolved, "renew-summary", telegramUserId);
+                usedBytes = renewal.UsedBytes;
             }
         }
         catch (Exception ex)
@@ -3962,104 +3997,32 @@ public class XuiV3BotFlowService
             Console.WriteLine($"[XUIv3] renew summary traffic lookup failed user={telegramUserId}, email={user.ConfigLink}: {ex.Message}");
         }
 
-        var totalAfterRenewBytes = totalBytes > 0
-            ? totalBytes + ApiService.ConvertGBToBytes(resolved.TrafficGb)
-            : 0;
+        var totalAfterRenewBytes = renewal?.TotalBytesAfterRenew ?? 0;
+        var trafficLine = renewal == null
+            ? resolved.IsUnlimited
+                ? $"📦 حد مصرف منصفانه پلن تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb))}</code>"
+                : $"📦 حجم اضافه: <code>{resolved.TrafficGb} GB</code>"
+            : renewal.IsUnlimited
+                ? $"📦 حد مصرف منصفانه قابل استفاده بعد از تمدید: <code>{Html(FormatGb(renewal.TargetAvailableTrafficBytes))}</code>"
+                : renewal.ShouldResetTraffic
+                ? $"📦 حجم جدید بعد از ریست مصرف: <code>{Html(FormatGb(renewal.TargetAvailableTrafficBytes))}</code>"
+                : $"📦 حجم کلی بعد از تمدید: <code>{Html(FormatGb(totalAfterRenewBytes))}</code>";
 
         var text = new StringBuilder();
         text.AppendLine("✅ وضعیت تمدید");
         text.AppendLine();
         text.AppendLine($"👤 اکانت: <code>{Html(user.ConfigLink)}</code>");
         text.AppendLine($"🧩 سرویس: <code>{Html(resolved.Service.DisplayName)}</code>");
-        text.AppendLine($"📦 حجم اضافه: <code>{resolved.TrafficGb} GB</code>");
-        text.AppendLine($"📦 حجم کلی بعد از تمدید: <code>{Html(FormatGb(totalAfterRenewBytes))}</code>");
+        text.AppendLine(resolved.IsUnlimited
+            ? $"📦 پلن تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb))}</code>"
+            : $"📦 حجم اضافه: <code>{resolved.TrafficGb} GB</code>");
+        text.AppendLine(trafficLine);
         text.AppendLine($"🔋 مصرف شده تا کنون: <code>{Html(FormatGb(usedBytes, zeroAsUnknown: false))}</code>");
+        if (renewal?.ShouldResetTraffic == true)
+            text.AppendLine("🔄 اکانت منقضی شده است؛ مصرف قبلی ریست می‌شود و حجم تمدید جایگزین حجم قبلی خواهد شد.");
         text.AppendLine($"⏳ زمان اضافه: <code>{Html(durationText)}</code>");
         text.AppendLine($"💰 قیمت: <code>{Html(resolved.PriceToman.FormatCurrency())}</code>");
         return text.ToString();
-    }
-
-    private static XuiV3ClientPayload BuildRenewPayload(
-        XuiV3Client client,
-        XuiV3ResolvedPurchase resolved,
-        string action,
-        long actorTelegramUserId = 0)
-    {
-        var currentTotalBytes = GetTotalBytes(client);
-        var updatedTotalBytes = currentTotalBytes + ApiService.ConvertGBToBytes(resolved.TrafficGb);
-        var currentExpiryTime = GetExpiryTime(client);
-        var updatedExpiryTime = CalculateRenewedExpiryTime(currentExpiryTime, resolved.DurationDays);
-        var ownerTelegramUserId = GetClientOwnerTelegramId(client);
-        if (ownerTelegramUserId <= 0)
-            ownerTelegramUserId = actorTelegramUserId > 0 ? actorTelegramUserId : client.TgId;
-
-        var metadata = TryReadMetadata(client.Comment) ?? new XuiV3ClientMetadata
-        {
-            TelegramUserId = ownerTelegramUserId,
-            ServiceKey = resolved.Service.Key,
-            ServiceName = resolved.Service.DisplayName,
-            ServiceKind = resolved.Service.Kind
-        };
-
-        metadata.TelegramUserId = ownerTelegramUserId;
-        metadata.ServiceKey = resolved.Service.Key;
-        metadata.ServiceName = resolved.Service.DisplayName;
-        metadata.ServiceKind = resolved.Service.Kind;
-        metadata.PlanKey = resolved.IsUnlimited ? resolved.UnlimitedPlan?.Key : resolved.Duration?.Key;
-        metadata.PlanName = resolved.IsUnlimited ? resolved.UnlimitedPlan?.DisplayName : resolved.Duration?.DisplayName;
-        metadata.LimitIp = resolved.LimitIp;
-        metadata.PriceToman = resolved.PriceToman;
-        metadata.LastUpdatedByTelegramUserId = actorTelegramUserId > 0 ? actorTelegramUserId : ownerTelegramUserId;
-        metadata.LastAction = action;
-        metadata.LastRenewedAtUtc = DateTime.UtcNow;
-        metadata.TrafficGb = Convert.ToInt32(Math.Max(0, updatedTotalBytes).ConvertBytesToGB());
-        if (resolved.DurationDays <= 0)
-            metadata.DurationDays = 0;
-        else
-            metadata.DurationDays += resolved.DurationDays;
-        metadata.Renewals ??= new List<XuiV3ClientRenewalRecord>();
-        metadata.Renewals.Add(new XuiV3ClientRenewalRecord
-        {
-            ActorTelegramUserId = actorTelegramUserId > 0 ? actorTelegramUserId : ownerTelegramUserId,
-            AddedTrafficGb = resolved.TrafficGb,
-            AddedDurationDays = resolved.DurationDays,
-            TotalBytesAfter = updatedTotalBytes,
-            ExpiryTimeAfter = updatedExpiryTime
-        });
-
-        return new XuiV3ClientPayload
-        {
-            Email = client.Email,
-            Uuid = client.Uuid,
-            Password = client.Password,
-            TotalGB = updatedTotalBytes,
-            ExpiryTime = updatedExpiryTime,
-            TgId = ownerTelegramUserId,
-            LimitIp = client.LimitIp,
-            Enable = true,
-            SubId = client.SubId,
-            Flow = client.Flow,
-            Comment = JsonConvert.SerializeObject(metadata, Formatting.None),
-            Group = client.Group,
-            Reverse = client.Reverse,
-            Extra = client.Extra
-        };
-    }
-
-    private static long CalculateRenewedExpiryTime(long currentExpiryTime, int addedDurationDays)
-    {
-        if (addedDurationDays <= 0)
-            return 0;
-
-        var now = DateTimeOffset.UtcNow;
-        var baseDate = currentExpiryTime > 0
-            ? DateTimeOffset.FromUnixTimeMilliseconds(currentExpiryTime)
-            : now;
-
-        if (baseDate < now)
-            baseDate = now;
-
-        return baseDate.AddDays(addedDurationDays).ToUnixTimeMilliseconds();
     }
 
     private static XuiV3DurationOption TryGetDurationFromText(XuiV3ServiceDefinition service, string text)

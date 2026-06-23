@@ -50,9 +50,13 @@ namespace Adminbot.Domain
         public string XuiV3SubLinkBaseUrl { get; set; }
         public string XuiV3ServicePlansPath { get; set; } = "./Data/xui-v3-service-plans.json";
         public int XuiV3RequestTimeoutSeconds { get; set; } = 60;
+        public bool AccountExpiryReminderEnabled { get; set; } = true;
+        public int AccountExpiryReminderHourIran { get; set; } = 8;
+        public int[] AccountExpiryReminderDays { get; set; } = new[] { 12, 3, 2 };
         public string NowpaymentSuccessUrl { get; set; }
         public string NowpaymentCancelUrl { get; set; }
         public string NowpaymentIpnUrl { get; set; }
+        public long MinimumWalletChargeAmountToman { get; set; } = 100_000;
         public string HooshPayApiKey { get; set; }
         public string HooshPayIpnSecretKey { get; set; }
         public string HooshPayBaseUrl { get; set; } = "https://pay.hooshnet.com";

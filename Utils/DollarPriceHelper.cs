@@ -16,9 +16,11 @@ namespace Adminbot.Utils
         {
             var endpoints = new[]
             {
-                ("https://api.nobitex.ir/v3/orderbook/USDTIRT", "nobitex:v3-orderbook-USDTIRT"),
+                ("https://apiv2.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=rls", "nobitex:apiv2-market-stats-usdt-rls"),
+                ("https://apiv2.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:apiv2-market-stats-usdt-irt"),
                 ("https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=rls", "nobitex:market-stats-usdt-rls"),
-                ("https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:market-stats-usdt-irt")
+                ("https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:market-stats-usdt-irt"),
+                ("https://api.nobitex.ir/v3/orderbook/USDTIRT", "nobitex:v3-orderbook-USDTIRT")
             };
 
             foreach (var (url, source) in endpoints)
@@ -91,10 +93,13 @@ namespace Adminbot.Utils
                 if (!stats.TryGetProperty(pairKey, out var pair) || pair.ValueKind != JsonValueKind.Object)
                     continue;
 
+                var isRialPair = pairKey.Contains("rls", StringComparison.OrdinalIgnoreCase);
                 foreach (var field in new[] { "latest", "dayClose", "bestSell", "bestBuy", "lastTradePrice" })
                 {
                     if (pair.TryGetProperty(field, out var token) && TryReadLong(token, out var value))
-                        return value;
+                        return isRialPair
+                            ? Math.Max(1, value / 10)
+                            : value;
                 }
             }
 

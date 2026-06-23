@@ -19,8 +19,6 @@ using Adminbot.Domain.Logging;
 
 public class TelegramBotService : IHostedService
 {
-    private const long MinimumChargeAmountToman = 100_000L;
-
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
@@ -99,6 +97,11 @@ public class TelegramBotService : IHostedService
         // Add your cleanup code here
         return Task.CompletedTask;
     }
+
+    private long MinimumChargeAmountToman =>
+        _appConfig?.MinimumWalletChargeAmountToman > 0
+            ? _appConfig.MinimumWalletChargeAmountToman
+            : 100_000L;
 
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
@@ -1422,34 +1425,31 @@ public class TelegramBotService : IHostedService
             if (message.Text == "Yes Send!")
             {
                 var allUsers = _credentialsDbContext.Users
-                    .Select(x => x.ChatID)
+                    .Select(x => x.ChatID > 0 ? x.ChatID : x.TelegramUserId)
                     .Where(chatId => chatId > 0)
                     .Distinct()
                     .ToList();
 
                 if (allUsers.Count == 0)
+                {
+                    await botClient.SendTextMessageAsync(
+                        message.Chat.Id,
+                        "هیچ کاربری برای ارسال پیام عمومی پیدا نشد.",
+                        replyMarkup: GetMainMenuKeyboard());
+                    await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
                     return;
+                }
 
                 if (channelPost != null)
                 {
                     var template = new BroadcastManager.BroadcastItem
                     {
-                        FromChatId = new ChatId(channelPost.ChannelName),
+                        FromChatId = BuildForwardSourceChatId(channelPost.ChannelName),
                         MessageId = channelPost.PostNumber,
                         IsForward = true
                     };
 
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await _broadcastManager.EnqueueAsync(allUsers, template, CancellationToken.None);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Broadcast enqueue failed.");
-                        }
-                    });
+                    await StartBroadcastJobAsync(botClient, message, allUsers, template, cancellationToken);
                 }
                 else
                 {
@@ -1459,23 +1459,8 @@ public class TelegramBotService : IHostedService
                         IsForward = false
                     };
 
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await _broadcastManager.EnqueueAsync(allUsers, template, CancellationToken.None);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Broadcast enqueue failed.");
-                        }
-                    });
+                    await StartBroadcastJobAsync(botClient, message, allUsers, template, cancellationToken);
                 }
-
-                await botClient.SendTextMessageAsync(
-                    message.Chat.Id,
-                    $"ارسال برای {allUsers.Count} کاربر در صف پس‌زمینه قرار گرفت.",
-                    replyMarkup: GetMainMenuKeyboard());
 
                 await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
@@ -1620,6 +1605,12 @@ public class TelegramBotService : IHostedService
             if (callbackQuery.Data.Contains("Paid!"))
                 return;
 
+            if (callbackQuery.Data.StartsWith("broadcast_status_", StringComparison.Ordinal))
+            {
+                await ProcessBroadcastStatusCallback(callbackQuery, cancellationToken);
+                return;
+            }
+
             if (callbackQuery.Data.StartsWith("check_crypto_payment_"))
             {
                 await ProcessCryptoPaymentCallback(callbackQuery, cancellationToken);
@@ -1670,6 +1661,94 @@ public class TelegramBotService : IHostedService
                 cancellationToken: cancellationToken);
 
             await AnswerCallbackSafely(callbackQuery, cancellationToken);
+        }
+    }
+
+    private async Task ProcessBroadcastStatusCallback(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        var jobId = callbackQuery.Data.Replace("broadcast_status_", "");
+        var job = _broadcastManager.GetJob(jobId);
+        if (job == null)
+        {
+            await _botClient.AnswerCallbackQueryAsync(
+                callbackQuery.Id,
+                text: "وضعیت این ارسال پیدا نشد.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (job.RequestedByTelegramUserId != callbackQuery.From.Id && !IsSuperAdminUser(callbackQuery.From.Id))
+        {
+            await _botClient.AnswerCallbackQueryAsync(
+                callbackQuery.Id,
+                text: "فقط ادمین شروع‌کننده ارسال می‌تواند این وضعیت را بروزرسانی کند.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        await _broadcastManager.RefreshStatusMessageAsync(jobId, cancellationToken);
+        await _botClient.AnswerCallbackQueryAsync(
+            callbackQuery.Id,
+            text: "وضعیت بروزرسانی شد.",
+            cancellationToken: cancellationToken);
+    }
+
+    private async Task StartBroadcastJobAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        IReadOnlyCollection<long> allUsers,
+        BroadcastManager.BroadcastItem template,
+        CancellationToken cancellationToken)
+    {
+        Message statusMessage = null;
+        try
+        {
+            statusMessage = await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: $"در حال آماده‌سازی ارسال عمومی برای <code>{allUsers.Count}</code> کاربر...",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+
+            var job = await _broadcastManager.EnqueueAsync(
+                allUsers,
+                template,
+                message.Chat.Id,
+                statusMessage.MessageId,
+                message.From.Id,
+                CancellationToken.None);
+
+            await _broadcastManager.RefreshStatusMessageAsync(job.Id, cancellationToken);
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "ارسال عمومی شروع شد. وضعیت را از پیام بالا پیگیری کنید.",
+                replyMarkup: GetMainMenuKeyboard(),
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Broadcast start failed. admin={message.From?.Id}, error={ex}");
+            var errorText = $"شروع ارسال عمومی با خطا روبه‌رو شد:\n<code>{Html(ex.Message)}</code>";
+            if (statusMessage != null)
+            {
+                await botClient.EditMessageTextAsync(
+                    chatId: message.Chat.Id,
+                    messageId: statusMessage.MessageId,
+                    text: errorText,
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+            else
+            {
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: errorText,
+                    parseMode: ParseMode.Html,
+                    replyMarkup: GetMainMenuKeyboard(),
+                    cancellationToken: cancellationToken);
+            }
         }
     }
 
@@ -4035,7 +4114,8 @@ public class TelegramBotService : IHostedService
 
 
             await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
-            var msg = $"لطفاً میزان شارژ اکانت خود را انتخاب یا به تومان وارد کنید. به عنوان مثال {MinimumChargeAmountToman} معادل 100 هزارتومان است.\nحداقل میزان شارژ 100 هزارتومان است.";
+            var minimumChargeAmount = MinimumChargeAmountToman;
+            var msg = $"لطفاً میزان شارژ اکانت خود را انتخاب یا به تومان وارد کنید. به عنوان مثال {minimumChargeAmount} معادل {minimumChargeAmount.FormatCurrency()} است.\nحداقل میزان شارژ {minimumChargeAmount.FormatCurrency()} است.";
             //msg = "برای شارژ حساب کاربری به آیدی زیر پیام دهید: \n @vpnetiran_admin";
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -4051,11 +4131,12 @@ public class TelegramBotService : IHostedService
             bool canConvert = message.Text.PersianNumbersToEnglish().ToValidNumber().TryConvertToLong(out long longValue);
             if (canConvert)
             {
-                if (longValue < MinimumChargeAmountToman)
+                var minimumChargeAmount = MinimumChargeAmountToman;
+                if (longValue < minimumChargeAmount)
                 {
                     await botClient.CustomSendTextMessageAsync(
                                         chatId: message.Chat.Id,
-                                        text: $" شما مقدار {longValue.FormatCurrency()} را برای شارژ حساب خود وارد کرده اید. \n" + " ❕ حداقل میزان شارژ 100 هزار تومان است\n" + "\n" + "مبلغ مد نظر خود را مجدد وارد کنید",
+                                        text: $" شما مقدار {longValue.FormatCurrency()} را برای شارژ حساب خود وارد کرده اید. \n" + $" ❕ حداقل میزان شارژ {minimumChargeAmount.FormatCurrency()} است\n" + "\n" + "مبلغ مد نظر خود را مجدد وارد کنید",
                                         replyMarkup: new ReplyKeyboardRemove());
                     return;
                 }
@@ -5178,12 +5259,16 @@ public class TelegramBotService : IHostedService
         var payableAmount = payment.PayableAmountToman > 0
             ? payment.PayableAmountToman
             : payment.AmountToman + payment.FeeAmountToman;
+        var payableAmountRial = payableAmount * 10;
 
         string text = "✅ درگاه پرداخت ریالی HooshPay برای شما ایجاد شد.\n";
         text += $"💰 مبلغ شارژ کیف پول: {payment.AmountToman.FormatCurrency()}\n";
         text += $"💳 مبلغ قابل پرداخت با کارمزد: {payableAmount.FormatCurrency()}\n";
+        text += $"💳 مبلغ دقیق قابل پرداخت به ریال: <code>{payableAmountRial:0,0}</code>\n";
         if (payment.FeeAmountToman > 0)
             text += $"🧾 کارمزد درگاه: {payment.FeeAmountToman.FormatCurrency()}\n";
+        text += "\n⚠️ کارمزد درگاه هوش‌پی ۱۵ درصد است و به مبلغ شما اضافه می‌شود. اگر نمی‌خواهید کارمزد پرداخت کنید، از درگاه ارز دیجیتال استفاده کنید.\n";
+        text += "⚠️ مبلغ پرداخت را دقیقاً مطابق عدد نمایش داده‌شده در صفحه پرداخت و تا ریال آخر واریز کنید. در پرداخت کارت‌به‌کارت، هر اختلافی باعث گم شدن پرداخت و تایید نشدن آن می‌شود و مجموعه ما مسئولیتی در قبال مبلغ گم‌شده نمی‌پذیرد.\n";
         text += $"🧾 شماره سفارش: <code>{orderId}</code>\n";
         if (!string.IsNullOrWhiteSpace(invoiceUid))
             text += $"🧾 شناسه فاکتور: <code>{invoiceUid}</code>\n";
@@ -5714,7 +5799,7 @@ public class TelegramBotService : IHostedService
 
 
         ChannelInfo channelInfo = null;
-        var match = Regex.Match(link, @"^https://t.me/(?<channelname>[^/]+)/(?<postnumber>\d+)$");
+        var match = Regex.Match(link?.Trim() ?? string.Empty, @"^https?://t\.me/(?<channelname>@?[A-Za-z0-9_]+)/(?<postnumber>\d+)/?$", RegexOptions.IgnoreCase);
         // var match = Regex.Match(link, @"https://t.me/(?<channelname>[^/]+)/(?<postnumber>\d+)");
         if (match.Success)
         {
@@ -5731,5 +5816,16 @@ public class TelegramBotService : IHostedService
         return channelInfo;
 
     }
-}
 
+    private static ChatId BuildForwardSourceChatId(string channelName)
+    {
+        var value = (channelName ?? string.Empty).Trim();
+        if (long.TryParse(value, out var numericChatId))
+            return new ChatId(numericChatId);
+
+        if (!value.StartsWith("@", StringComparison.Ordinal))
+            value = "@" + value;
+
+        return new ChatId(value);
+    }
+}

@@ -40,6 +40,7 @@ class Program
         builder.Services.AddSingleton<UserActivityLogService>();
         builder.Services.AddSingleton<XuiV3BotFlowService>();
         builder.Services.AddSingleton<XuiV3AdminFlowService>();
+        builder.Services.AddHostedService<XuiV3AccountExpiryReminderService>();
 
         builder.Services.AddHostedService<TelegramBotService>();
 

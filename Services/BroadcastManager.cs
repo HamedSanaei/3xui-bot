@@ -1,5 +1,8 @@
 using System.Threading.Channels;
+using System.Collections.Concurrent;
+using System.Text;
 using Adminbot.Domain;
+using Adminbot.Utils;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -7,12 +10,14 @@ using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
 
 public class BroadcastManager : IHostedService, IDisposable
 {
     private readonly ITelegramBotClient _bot;
     private readonly ILogger<BroadcastManager> _logger;
     private readonly Channel<BroadcastItem> _queue;
+    private readonly ConcurrentDictionary<string, BroadcastJob> _jobs = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _shutdown = new();
     private readonly int _delayMs;
     private readonly int _maxRetryCount;
@@ -44,11 +49,7 @@ public class BroadcastManager : IHostedService, IDisposable
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _workerTask ??= Task.Run(() => ProcessQueueAsync(_shutdown.Token), CancellationToken.None);
-        _logger.LogInformation(
-            "Broadcast worker started. delayMs={DelayMs}, maxRetry={MaxRetry}, capacity={Capacity}",
-            _delayMs,
-            _maxRetryCount,
-            _capacity);
+        Console.WriteLine($"Broadcast worker started. delayMs={_delayMs}, maxRetry={_maxRetryCount}, capacity={_capacity}");
         return Task.CompletedTask;
     }
 
@@ -69,7 +70,13 @@ public class BroadcastManager : IHostedService, IDisposable
         }
     }
 
-    public async Task<int> EnqueueAsync(IEnumerable<long> chatIds, BroadcastItem template, CancellationToken cancellationToken = default)
+    public async Task<BroadcastJob> EnqueueAsync(
+        IEnumerable<long> chatIds,
+        BroadcastItem template,
+        long adminChatId,
+        int statusMessageId,
+        long requestedByTelegramUserId,
+        CancellationToken cancellationToken = default)
     {
         if (template == null)
             throw new ArgumentNullException(nameof(template));
@@ -78,11 +85,24 @@ public class BroadcastManager : IHostedService, IDisposable
             .Where(id => id > 0)
             .Distinct()
             .ToList() ?? new List<long>();
+        var job = new BroadcastJob
+        {
+            Id = Guid.NewGuid().ToString("N")[..10],
+            AdminChatId = adminChatId,
+            StatusMessageId = statusMessageId,
+            RequestedByTelegramUserId = requestedByTelegramUserId,
+            Total = normalizedChatIds.Count,
+            IsForward = template.IsForward,
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+        _jobs[job.Id] = job;
 
         foreach (var id in normalizedChatIds)
         {
             await _queue.Writer.WriteAsync(new BroadcastItem
             {
+                JobId = job.Id,
                 ChatId = id,
                 Text = template.Text,
                 FromChatId = template.FromChatId,
@@ -91,8 +111,8 @@ public class BroadcastManager : IHostedService, IDisposable
             }, cancellationToken);
         }
 
-        _logger.LogInformation("Broadcast queued for {Count} users.", normalizedChatIds.Count);
-        return normalizedChatIds.Count;
+        Console.WriteLine($"Broadcast queued. jobId={job.Id}, total={normalizedChatIds.Count}, admin={requestedByTelegramUserId}");
+        return job;
     }
 
     private async Task ProcessQueueAsync(CancellationToken cancellationToken)
@@ -101,37 +121,36 @@ public class BroadcastManager : IHostedService, IDisposable
         {
             while (_queue.Reader.TryRead(out var item))
             {
-                await SendWithRetryAsync(item, cancellationToken);
+                var result = await SendWithRetryAsync(item, cancellationToken);
+                ApplyResult(item, result);
+                if (TryGetCompletedJob(item.JobId, out var job))
+                    await CompleteJobAsync(job, cancellationToken);
+
                 await DelayBetweenMessagesAsync(cancellationToken);
             }
         }
     }
 
-    private async Task SendWithRetryAsync(BroadcastItem item, CancellationToken cancellationToken)
+    private async Task<BroadcastSendResult> SendWithRetryAsync(BroadcastItem item, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
                 await SendAsync(item, ParseMode.Markdown, cancellationToken);
-                _logger.LogInformation("Broadcast sent. chatId={ChatId}", item.ChatId);
-                return;
+                return BroadcastSendResult.CreateSent(item.Attempt);
             }
             catch (ApiRequestException ex) when (ex.ErrorCode == 429 && ex.Parameters?.RetryAfter != null)
             {
                 item.Attempt++;
                 if (item.Attempt > _maxRetryCount)
                 {
-                    _logger.LogWarning("Broadcast skipped after retry limit. chatId={ChatId}, error={Error}", item.ChatId, ex.Message);
-                    return;
+                    Console.WriteLine($"Broadcast failed after retry limit. jobId={item.JobId}, chatId={item.ChatId}, error={ex.Message}");
+                    return BroadcastSendResult.CreateFailed(item.Attempt, ex.ErrorCode, ex.Message);
                 }
 
                 var retryAfter = TimeSpan.FromSeconds(ex.Parameters.RetryAfter.Value + 1);
-                _logger.LogWarning(
-                    "Telegram rate limit hit. waiting={RetryAfterSeconds}s, chatId={ChatId}, attempt={Attempt}",
-                    retryAfter.TotalSeconds,
-                    item.ChatId,
-                    item.Attempt);
+                Console.WriteLine($"Broadcast rate limited. jobId={item.JobId}, waiting={retryAfter.TotalSeconds}s, chatId={item.ChatId}, attempt={item.Attempt}");
 
                 await Task.Delay(retryAfter, cancellationToken);
             }
@@ -140,36 +159,35 @@ public class BroadcastManager : IHostedService, IDisposable
                 try
                 {
                     await SendAsync(item, null, cancellationToken);
-                    _logger.LogInformation("Broadcast sent without Markdown. chatId={ChatId}", item.ChatId);
-                    return;
+                    return BroadcastSendResult.CreateSent(item.Attempt, markdownFallback: true);
                 }
                 catch (ApiRequestException fallbackEx)
                 {
-                    LogTelegramSkip(item, fallbackEx);
-                    return;
+                    return ClassifyTelegramFailure(item, fallbackEx);
                 }
             }
             catch (ApiRequestException ex)
             {
-                LogTelegramSkip(item, ex);
-                return;
+                return ClassifyTelegramFailure(item, ex);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                return;
+                return BroadcastSendResult.CreateFailed(item.Attempt, 0, "Broadcast stopped.");
             }
             catch (Exception ex)
             {
                 item.Attempt++;
                 if (item.Attempt > _maxRetryCount)
                 {
-                    _logger.LogWarning(ex, "Broadcast failed after retry limit. chatId={ChatId}", item.ChatId);
-                    return;
+                    Console.WriteLine($"Broadcast failed after retry limit. jobId={item.JobId}, chatId={item.ChatId}, error={ex.Message}");
+                    return BroadcastSendResult.CreateFailed(item.Attempt, 0, ex.Message);
                 }
 
                 await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
             }
         }
+
+        return BroadcastSendResult.CreateFailed(item.Attempt, 0, "Broadcast stopped.");
     }
 
     private Task SendAsync(BroadcastItem item, ParseMode? parseMode, CancellationToken cancellationToken)
@@ -196,19 +214,209 @@ public class BroadcastManager : IHostedService, IDisposable
             await Task.Delay(_delayMs, cancellationToken);
     }
 
-    private void LogTelegramSkip(BroadcastItem item, ApiRequestException ex)
+    private BroadcastSendResult ClassifyTelegramFailure(BroadcastItem item, ApiRequestException ex)
     {
         if (ex.ErrorCode == 403)
         {
-            _logger.LogInformation("Broadcast skipped because user blocked bot. chatId={ChatId}", item.ChatId);
-            return;
+            Console.WriteLine($"Broadcast skipped: blocked. jobId={item.JobId}, chatId={item.ChatId}");
+            return BroadcastSendResult.CreateBlocked(item.Attempt, ex.ErrorCode, ex.Message);
         }
 
-        _logger.LogWarning(
-            "Broadcast skipped. chatId={ChatId}, telegramErrorCode={ErrorCode}, message={Message}",
-            item.ChatId,
-            ex.ErrorCode,
-            ex.Message);
+        Console.WriteLine($"Broadcast skipped. jobId={item.JobId}, chatId={item.ChatId}, telegramErrorCode={ex.ErrorCode}, message={ex.Message}");
+        return BroadcastSendResult.CreateFailed(item.Attempt, ex.ErrorCode, ex.Message);
+    }
+
+    private void ApplyResult(BroadcastItem item, BroadcastSendResult result)
+    {
+        if (!_jobs.TryGetValue(item.JobId, out var job))
+            return;
+
+        lock (job.SyncRoot)
+        {
+            job.Processed++;
+            job.RetryAttempts += Math.Max(0, result.RetryAttempts);
+            if (result.Sent)
+                job.Sent++;
+            else if (result.Blocked)
+                job.Blocked++;
+            else
+                job.Failed++;
+
+            if (result.MarkdownFallback)
+                job.MarkdownFallbackSent++;
+
+            if (!string.IsNullOrWhiteSpace(result.ErrorMessage))
+            {
+                job.LastError = result.ErrorMessage;
+                job.LastErrorCode = result.ErrorCode;
+            }
+
+            job.UpdatedAtUtc = DateTime.UtcNow;
+        }
+    }
+
+    private bool TryGetCompletedJob(string jobId, out BroadcastJob job)
+    {
+        job = null;
+        if (string.IsNullOrWhiteSpace(jobId) || !_jobs.TryGetValue(jobId, out var current))
+            return false;
+
+        lock (current.SyncRoot)
+        {
+            if (current.CompletedAtUtc.HasValue || current.Processed < current.Total)
+                return false;
+
+            current.CompletedAtUtc = DateTime.UtcNow;
+            current.UpdatedAtUtc = current.CompletedAtUtc.Value;
+            job = current;
+            return true;
+        }
+    }
+
+    private async Task CompleteJobAsync(BroadcastJob job, CancellationToken cancellationToken)
+    {
+        await RefreshStatusMessageAsync(job.Id, cancellationToken);
+
+        try
+        {
+            await SendFinalSummaryAsync(job, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Broadcast final summary failed. jobId={job.Id}, error={ex.Message}");
+        }
+    }
+
+    public BroadcastJob GetJob(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+            return null;
+
+        _jobs.TryGetValue(jobId, out var job);
+        return job;
+    }
+
+    public async Task RefreshStatusMessageAsync(string jobId, CancellationToken cancellationToken = default)
+    {
+        var job = GetJob(jobId);
+        if (job == null || job.AdminChatId == 0 || job.StatusMessageId == 0)
+            return;
+
+        try
+        {
+            await EditStatusMessageAsync(job, cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ex.Message?.IndexOf("message is not modified", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Broadcast status refresh failed. jobId={job.Id}, error={ex.Message}");
+        }
+    }
+
+    private async Task EditStatusMessageAsync(BroadcastJob job, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _bot.EditMessageTextAsync(
+                chatId: job.AdminChatId,
+                messageId: job.StatusMessageId,
+                text: BuildStatusText(job),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildStatusKeyboard(job),
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode == 429 && ex.Parameters?.RetryAfter != null)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(ex.Parameters.RetryAfter.Value + 1), cancellationToken);
+            await _bot.EditMessageTextAsync(
+                chatId: job.AdminChatId,
+                messageId: job.StatusMessageId,
+                text: BuildStatusText(job),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildStatusKeyboard(job),
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    private async Task SendFinalSummaryAsync(BroadcastJob job, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _bot.SendTextMessageAsync(
+                chatId: job.AdminChatId,
+                text: BuildStatusText(job, finalSummary: true),
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode == 429 && ex.Parameters?.RetryAfter != null)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(ex.Parameters.RetryAfter.Value + 1), cancellationToken);
+            await _bot.SendTextMessageAsync(
+                chatId: job.AdminChatId,
+                text: BuildStatusText(job, finalSummary: true),
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    public static InlineKeyboardMarkup BuildStatusKeyboard(BroadcastJob job)
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("به‌روزرسانی وضعیت", $"broadcast_status_{job.Id}")
+            }
+        });
+    }
+
+    public static string BuildStatusText(BroadcastJob job, bool finalSummary = false)
+    {
+        if (job == null)
+            return "وضعیت ارسال عمومی پیدا نشد.";
+
+        lock (job.SyncRoot)
+        {
+            var isDone = job.CompletedAtUtc.HasValue || job.Processed >= job.Total;
+            var title = finalSummary || isDone
+                ? "✅ ارسال عمومی تمام شد"
+                : "📨 وضعیت ارسال عمومی";
+            var percent = job.Total <= 0 ? 100 : (int)Math.Floor(job.Processed * 100m / job.Total);
+            var elapsed = (job.CompletedAtUtc ?? DateTime.UtcNow) - job.CreatedAtUtc;
+            var builder = new StringBuilder();
+            builder.AppendLine($"<b>{Html(title)}</b>");
+            builder.AppendLine();
+            builder.AppendLine($"شناسه ارسال: <code>{Html(job.Id)}</code>");
+            builder.AppendLine($"نوع ارسال: <code>{(job.IsForward ? "forward" : "text")}</code>");
+            builder.AppendLine($"کل مقصدها: <code>{job.Total}</code>");
+            builder.AppendLine($"پردازش‌شده: <code>{job.Processed}</code> / <code>{job.Total}</code> (<code>{percent}%</code>)");
+            builder.AppendLine($"موفق: <code>{job.Sent}</code>");
+            builder.AppendLine($"ربات را بسته/بلاک کرده‌اند: <code>{job.Blocked}</code>");
+            builder.AppendLine($"خطاهای دیگر: <code>{job.Failed}</code>");
+            builder.AppendLine($"تلاش مجدد: <code>{job.RetryAttempts}</code>");
+            if (job.MarkdownFallbackSent > 0)
+                builder.AppendLine($"ارسال بدون Markdown: <code>{job.MarkdownFallbackSent}</code>");
+            if (!string.IsNullOrWhiteSpace(job.LastError))
+                builder.AppendLine($"آخرین خطا: <code>{Html(job.LastErrorCode == 0 ? job.LastError : $"{job.LastErrorCode}: {job.LastError}")}</code>");
+            builder.AppendLine($"زمان سپری‌شده: <code>{FormatDuration(elapsed)}</code>");
+            builder.AppendLine($"آخرین بروزرسانی: <code>{Html(DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi())}</code>");
+            return builder.ToString();
+        }
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration.TotalHours >= 1)
+            return $"{(int)duration.TotalHours:0}:{duration.Minutes:00}:{duration.Seconds:00}";
+
+        return $"{duration.Minutes:00}:{duration.Seconds:00}";
+    }
+
+    private static string Html(string value)
+    {
+        return System.Net.WebUtility.HtmlEncode(value ?? string.Empty);
     }
 
     private static bool LooksLikeMarkdownError(ApiRequestException ex)
@@ -238,10 +446,52 @@ public class BroadcastManager : IHostedService, IDisposable
     public class BroadcastItem
     {
         public long ChatId { get; set; }
+        public string JobId { get; set; }
         public string Text { get; set; }
         public ChatId FromChatId { get; set; }
         public int MessageId { get; set; }
         public bool IsForward { get; set; }
         internal int Attempt { get; set; }
+    }
+
+    public class BroadcastJob
+    {
+        internal object SyncRoot { get; } = new();
+        public string Id { get; set; }
+        public long AdminChatId { get; set; }
+        public int StatusMessageId { get; set; }
+        public long RequestedByTelegramUserId { get; set; }
+        public int Total { get; set; }
+        public int Processed { get; set; }
+        public int Sent { get; set; }
+        public int Blocked { get; set; }
+        public int Failed { get; set; }
+        public int RetryAttempts { get; set; }
+        public int MarkdownFallbackSent { get; set; }
+        public bool IsForward { get; set; }
+        public int LastErrorCode { get; set; }
+        public string LastError { get; set; }
+        public DateTime CreatedAtUtc { get; set; }
+        public DateTime UpdatedAtUtc { get; set; }
+        public DateTime? CompletedAtUtc { get; set; }
+    }
+
+    private class BroadcastSendResult
+    {
+        public bool Sent { get; set; }
+        public bool Blocked { get; set; }
+        public bool MarkdownFallback { get; set; }
+        public int RetryAttempts { get; set; }
+        public int ErrorCode { get; set; }
+        public string ErrorMessage { get; set; }
+
+        public static BroadcastSendResult CreateSent(int retryAttempts, bool markdownFallback = false)
+            => new() { Sent = true, RetryAttempts = retryAttempts, MarkdownFallback = markdownFallback };
+
+        public static BroadcastSendResult CreateBlocked(int retryAttempts, int errorCode, string errorMessage)
+            => new() { Blocked = true, RetryAttempts = retryAttempts, ErrorCode = errorCode, ErrorMessage = errorMessage };
+
+        public static BroadcastSendResult CreateFailed(int retryAttempts, int errorCode, string errorMessage)
+            => new() { RetryAttempts = retryAttempts, ErrorCode = errorCode, ErrorMessage = errorMessage };
     }
 }

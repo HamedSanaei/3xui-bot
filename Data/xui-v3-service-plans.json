@@ -72,8 +72,8 @@
         "tunnel"
       ],
       "pricePerGb": {
-        "user": 15000,
-        "colleague": 9000
+        "user": 9000,
+        "colleague": 5000
       },
       "trafficOptionsGb": [
         50,

@@ -70,7 +70,7 @@ namespace Adminbot.Domain
         public static string CreateOrderId(long telegramUserId)
         {
             var suffix = Guid.NewGuid().ToString("N")[..8];
-            return $"HooshPay-{DateTime.UtcNow:yyyyMMddHHmmss}-{telegramUserId}-{suffix}";
+            return $"TelBotHoosh-{DateTime.UtcNow:yyyyMMddHHmmss}-{telegramUserId}-{suffix}";
         }
 
         public void Apply(HooshPayInvoiceData data)

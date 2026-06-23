@@ -42,6 +42,8 @@ public class XuiV3AdminFlowService
     private readonly AppConfig _appConfig;
     private readonly NowPayments _nowPayments;
     private readonly NowPaymentsSettlementService _settlementService;
+    private readonly HooshPay _hooshPay;
+    private readonly HooshPaySettlementService _hooshPaySettlementService;
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly ILogger<XuiV3AdminFlowService> _logger;
     private readonly UserActivityLogService _activityLog;
@@ -52,6 +54,8 @@ public class XuiV3AdminFlowService
         IConfiguration configuration,
         NowPayments nowPayments,
         NowPaymentsSettlementService settlementService,
+        HooshPay hooshPay,
+        HooshPaySettlementService hooshPaySettlementService,
         XuiV3PurchaseService purchaseService,
         ILogger<XuiV3AdminFlowService> logger,
         UserActivityLogService activityLog)
@@ -62,6 +66,8 @@ public class XuiV3AdminFlowService
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         _nowPayments = nowPayments;
         _settlementService = settlementService;
+        _hooshPay = hooshPay;
+        _hooshPaySettlementService = hooshPaySettlementService;
         _purchaseService = purchaseService;
         _logger = logger;
         _activityLog = activityLog;
@@ -280,7 +286,7 @@ public class XuiV3AdminFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "شناسه NOWPayments را ارسال کنید.\nاگر `Order ID` بفرستید، پرداخت به صورت دستی تایید و تسویه می‌شود.\nاگر `Payment ID` یا `Invoice ID` بفرستید، فقط وضعیت از NOWPayments بررسی می‌شود:",
+                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً به موجودی اضافه نشده باشد، شارژ کیف پول انجام می‌شود:",
                 parseMode: ParseMode.Markdown,
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
@@ -846,7 +852,7 @@ public class XuiV3AdminFlowService
         var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
-            text: BuildRenewSummary(refreshedUser),
+            text: await BuildRenewSummaryAsync(refreshedUser, cancellationToken),
             parseMode: ParseMode.Html,
             replyMarkup: BuildYesNoKeyboard("Yes Renew!", "No Don't Create!"),
             cancellationToken: cancellationToken);
@@ -892,10 +898,12 @@ public class XuiV3AdminFlowService
         var client = clientResponse.Obj;
         var addTrafficGb = int.TryParse(currentUser.TotoalGB, out var parsedTraffic) ? parsedTraffic : 0;
         var addDays = int.TryParse(currentUser.SelectedPeriod, out var parsedDays) ? parsedDays : 0;
+        var service = TryFindService(currentUser.SelectedCountry) ?? ResolveServiceForClient(client);
         var currentExpiryBeforeRenew = GetExpiryTime(client);
-        var updatedClient = BuildRenewPayload(client, addTrafficGb, addDays, message.From.Id);
+        var renewal = XuiV3RenewalPolicy.CalculateAdmin(client, service, addTrafficGb, addDays, "admin-renew", message.From.Id);
+        var updatedClient = renewal.Payload;
         Console.WriteLine(
-            $"[XUIv3] admin renew payload actor={message.From.Id}, email={client.Email}, durationDays={addDays}, currentExpiry={currentExpiryBeforeRenew}, newExpiry={updatedClient.ExpiryTime}, currentExpiryText={FormatExpiry(currentExpiryBeforeRenew)}, newExpiryText={FormatExpiry(updatedClient.ExpiryTime)}");
+            $"[XUIv3] admin renew payload actor={message.From.Id}, email={client.Email}, durationDays={addDays}, currentExpiry={currentExpiryBeforeRenew}, newExpiry={updatedClient.ExpiryTime}, currentExpiryText={FormatExpiry(currentExpiryBeforeRenew)}, newExpiryText={FormatExpiry(updatedClient.ExpiryTime)}, resetTraffic={renewal.ShouldResetTraffic}, totalBytesAfter={renewal.TotalBytesAfterRenew}, targetAvailableBytes={renewal.TargetAvailableTrafficBytes}");
 
         var updateResponse = await ApiServicev3.UpdateClientAsync(serverInfo, _configuration, client.Email, updatedClient, cancellationToken);
         if (!updateResponse.Success)
@@ -904,10 +912,17 @@ public class XuiV3AdminFlowService
             return;
         }
 
+        var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
         client.TotalGB = updatedClient.TotalGB;
         client.ExpiryTime = updatedClient.ExpiryTime;
         client.Comment = updatedClient.Comment;
         client.TgId = updatedClient.TgId;
+        client.Enable = updatedClient.Enable;
+        if (trafficResetApplied && client.Traffic != null)
+        {
+            client.Traffic.Up = 0;
+            client.Traffic.Down = 0;
+        }
 
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
@@ -929,7 +944,10 @@ public class XuiV3AdminFlowService
                 ["targetTelegramUserId"] = client.TgId,
                 ["accountEmail"] = client.Email,
                 ["trafficAddedGb"] = addTrafficGb,
+                ["targetAvailableGbAfterRenew"] = renewal.TargetAvailableTrafficGb,
                 ["durationAddedDays"] = addDays,
+                ["finalDurationDays"] = renewal.FinalDurationDays,
+                ["trafficResetApplied"] = trafficResetApplied,
                 ["totalGbAfterRenew"] = GetTotalBytes(client).ConvertBytesToGB(),
                 ["usedGb"] = GetUsedBytes(client).ConvertBytesToGB(),
                 ["expiryShamsi"] = FormatExpiry(client.ExpiryTime),
@@ -940,6 +958,28 @@ public class XuiV3AdminFlowService
             },
             cancellationToken);
 
+    }
+
+    private async Task<bool> ResetRenewedTrafficIfNeededAsync(
+        ServerInfo serverInfo,
+        string email,
+        XuiV3RenewalCalculation renewal,
+        CancellationToken cancellationToken)
+    {
+        if (renewal?.ShouldResetTraffic != true)
+            return false;
+
+        var resetResponse = await ApiServicev3.ResetClientTrafficAsync(serverInfo, _configuration, email, cancellationToken);
+        if (resetResponse.Success)
+            return true;
+
+        Console.WriteLine($"[XUIv3] admin renew traffic reset failed email={email}, msg={resetResponse.Msg}. Trying updateTraffic fallback.");
+        var fallbackResponse = await ApiServicev3.UpdateClientTrafficAsync(serverInfo, _configuration, email, 0, 0, cancellationToken);
+        if (fallbackResponse.Success)
+            return true;
+
+        Console.WriteLine($"[XUIv3] admin renew traffic reset fallback failed email={email}, msg={fallbackResponse.Msg}");
+        return false;
     }
 
     private async Task HandleGetAccountInfoAsync(
@@ -1014,7 +1054,10 @@ public class XuiV3AdminFlowService
 
         if (payment == null)
         {
-            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments با این شناسه پیدا نشد.", cancellationToken);
+            if (await TryHandleHooshPayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
+                return;
+
+            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments یا HooshPay با این شناسه پیدا نشد.", cancellationToken);
             return;
         }
 
@@ -1095,6 +1138,115 @@ public class XuiV3AdminFlowService
             BuildPaymentInfo(payment, data, settlement),
             cancellationToken,
             ParseMode.Html);
+    }
+
+    private async Task<bool> TryHandleHooshPayStatusAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        User currentUser,
+        IReplyMarkup mainMenu,
+        string input,
+        CancellationToken cancellationToken)
+    {
+        HooshPayPaymentInfo payment = null;
+        if (int.TryParse(input, out var paymentId))
+            payment = await _userDbContext.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+
+        payment ??= await _userDbContext.HooshPayPaymentInfos.FirstOrDefaultAsync(
+            p => p.OrderId == input || p.InvoiceUid == input,
+            cancellationToken);
+
+        if (payment == null)
+            return false;
+
+        NowPaymentsSettlementResult settlement = null;
+        HooshPayInvoiceResponse invoice = null;
+        HooshPayVerifyResponse verify = null;
+
+        if (string.IsNullOrWhiteSpace(payment.InvoiceUid))
+        {
+            await FinishWithMessageAsync(
+                botClient,
+                message.Chat.Id,
+                currentUser,
+                mainMenu,
+                "شناسه فاکتور HooshPay برای این پرداخت ثبت نشده است.\n\n" + BuildHooshPayPaymentInfo(payment, settlement),
+                cancellationToken,
+                ParseMode.Html);
+            return true;
+        }
+
+        try
+        {
+            invoice = await _hooshPay.GetInvoiceAsync(payment.InvoiceUid, cancellationToken);
+            payment.Apply(invoice?.data);
+
+            verify = await _hooshPay.VerifyInvoiceAsync(payment.InvoiceUid, cancellationToken);
+            payment.Apply(verify?.data);
+            if (!string.IsNullOrWhiteSpace(verify?.status))
+                payment.PaymentStatus = verify.status;
+
+            payment.RawResponseJson = JsonConvert.SerializeObject(new
+            {
+                invoice,
+                verify
+            });
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            payment.ErrorMessage = ex.Message;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            await FinishWithMessageAsync(
+                botClient,
+                message.Chat.Id,
+                currentUser,
+                mainMenu,
+                $"خطا در بررسی وضعیت HooshPay:\n<code>{Html(ex.Message)}</code>\n\n" + BuildHooshPayPaymentInfo(payment, settlement),
+                cancellationToken,
+                ParseMode.Html);
+            return true;
+        }
+
+        if (verify?.paid == true || HooshPayStatuses.IsPaid(payment.PaymentStatus))
+        {
+            payment.PaymentStatus = HooshPayStatuses.Paid;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+            settlement = await _hooshPaySettlementService.ApplyFinishedPaymentAsync(
+                payment,
+                "admin-check",
+                payment.ChatId == 0 ? null : payment.ChatId,
+                cancellationToken);
+        }
+
+        var actorCredUser = await GetActivityActorAsync(message.From.Id);
+        await _activityLog.LogBotActionAsync(
+            "hooshpay_status_checked",
+            actorCredUser,
+            true,
+            new Dictionary<string, object>
+            {
+                ["orderId"] = payment.OrderId ?? string.Empty,
+                ["invoiceUid"] = payment.InvoiceUid ?? string.Empty,
+                ["paymentStatus"] = payment.PaymentStatus ?? string.Empty,
+                ["settlementStatus"] = settlement?.Status.ToString() ?? "not-applied",
+                ["amountToman"] = payment.AmountToman,
+                ["payableAmountToman"] = payment.PayableAmountToman,
+                ["isAddedToBalance"] = payment.IsAddedToBalance
+            },
+            cancellationToken);
+
+        await FinishWithMessageAsync(
+            botClient,
+            message.Chat.Id,
+            currentUser,
+            mainMenu,
+            BuildHooshPayPaymentInfo(payment, settlement),
+            cancellationToken,
+            ParseMode.Html);
+        return true;
     }
 
     private async Task HandleDeleteExpiredTargetUserAsync(
@@ -2039,7 +2191,14 @@ public class XuiV3AdminFlowService
             serverInfo,
             selection,
             serverInfo.Url,
-            cancellationToken);
+            cancellationToken,
+            new XuiV3AccountMetadataOptions
+            {
+                CreatedByTelegramUserId = actorTelegramUserId,
+                LastUpdatedByTelegramUserId = actorTelegramUserId,
+                LastAction = "admin-create",
+                SaveUserStatus = false
+            });
 
         if (!creation.Success)
             return creation;
@@ -2091,8 +2250,6 @@ public class XuiV3AdminFlowService
                              ChatID = targetTelegramUserId,
                              AccountBalance = 0
                          };
-        var targetFlowUser = await _userDbContext.GetUserStatus(targetTelegramUserId);
-
         var serverInfo = BuildConfiguredPanelServerInfo();
         return await _purchaseService.CreateBulkAccountsAsync(
             targetUser,
@@ -2106,8 +2263,8 @@ public class XuiV3AdminFlowService
                 CreatedByTelegramUserId = actorTelegramUserId,
                 LastUpdatedByTelegramUserId = actorTelegramUserId,
                 LastAction = "admin-create",
-                NextAccountCounter = targetFlowUser.AccountCounter + 1,
-                SaveUserStatus = true
+                NextAccountCounter = 0,
+                SaveUserStatus = false
             },
             cancellationToken);
     }
@@ -2304,79 +2461,44 @@ public class XuiV3AdminFlowService
         return text;
     }
 
-    private static string BuildRenewSummary(User user)
+    private async Task<string> BuildRenewSummaryAsync(User user, CancellationToken cancellationToken)
     {
         var trafficGb = int.TryParse(user.TotoalGB, out var parsedTraffic) ? parsedTraffic : 0;
         var days = int.TryParse(user.SelectedPeriod, out var parsedDays) ? parsedDays : 0;
         var durationText = days <= 0 ? "نامحدود / لایف‌تایم" : $"{days} روز";
+        XuiV3RenewalCalculation renewal = null;
+
+        try
+        {
+            var serverInfo = BuildConfiguredPanelServerInfo();
+            var clientResponse = await ApiServicev3.GetClientAsync(serverInfo, _configuration, user.ConfigLink, cancellationToken);
+            if (clientResponse.Success && clientResponse.Obj != null)
+            {
+                var service = TryFindService(user.SelectedCountry) ?? ResolveServiceForClient(clientResponse.Obj);
+                renewal = XuiV3RenewalPolicy.CalculateAdmin(clientResponse.Obj, service, trafficGb, days, "admin-renew-summary", user.Id);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[XUIv3] admin renew summary lookup failed actor={user.Id}, email={user.ConfigLink}: {ex.Message}");
+        }
+
+        var trafficLine = renewal?.IsUnlimited == true
+            ? $"📦 حد مصرف منصفانه قابل استفاده بعد از تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.TargetAvailableTrafficBytes))}</code>\n"
+            : renewal?.ShouldResetTraffic == true
+                ? $"📦 حجم جدید بعد از ریست مصرف: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.TargetAvailableTrafficBytes))}</code>\n"
+                : $"📦 حجم اضافه: <code>{trafficGb} GB</code>\n";
+
+        var resetLine = renewal?.ShouldResetTraffic == true
+            ? "🔄 اکانت منقضی شده است؛ مصرف قبلی ریست می‌شود و حجم تمدید جایگزین حجم قبلی خواهد شد.\n"
+            : "";
 
         return "✅ خلاصه تمدید اکانت نسخه ۳\n\n" +
                $"👤 اکانت: <code>{Html(user.ConfigLink)}</code>\n" +
-               $"📦 حجم اضافه: <code>{trafficGb} GB</code>\n" +
+               trafficLine +
+               resetLine +
                $"⏳ زمان اضافه: <code>{Html(durationText)}</code>\n\n" +
                "مالک اکانت از روی خود پنل حفظ می‌شود و به آیدی سوپرادمین تغییر نمی‌کند.";
-    }
-
-    private static XuiV3ClientPayload BuildRenewPayload(
-        XuiV3Client client,
-        int addTrafficGb,
-        int addDays,
-        long actorTelegramUserId)
-    {
-        var currentTotalBytes = GetTotalBytes(client);
-        var updatedTotalBytes = currentTotalBytes + ApiService.ConvertGBToBytes(addTrafficGb);
-        var currentExpiryTime = GetExpiryTime(client);
-        var updatedExpiryTime = CalculateRenewedExpiryTime(currentExpiryTime, addDays);
-
-        var metadata = TryReadMetadata(client.Comment) ?? new XuiV3ClientMetadata
-        {
-            TelegramUserId = client.TgId,
-            ServiceKey = "unknown",
-            ServiceName = "unknown"
-        };
-
-        metadata.TelegramUserId = client.TgId;
-        metadata.LastUpdatedByTelegramUserId = actorTelegramUserId;
-        metadata.LastAction = "admin-renew";
-        metadata.LastRenewedAtUtc = DateTime.UtcNow;
-        metadata.TrafficGb = Convert.ToInt32(Math.Max(0, updatedTotalBytes).ConvertBytesToGB());
-        if (addDays <= 0)
-            metadata.DurationDays = 0;
-        else
-            metadata.DurationDays += addDays;
-        metadata.Renewals ??= new List<XuiV3ClientRenewalRecord>();
-        metadata.Renewals.Add(new XuiV3ClientRenewalRecord
-        {
-            ActorTelegramUserId = actorTelegramUserId,
-            AddedTrafficGb = addTrafficGb,
-            AddedDurationDays = addDays,
-            TotalBytesAfter = updatedTotalBytes,
-            ExpiryTimeAfter = updatedExpiryTime
-        });
-
-        var payload = CopyClientPayload(client);
-        payload.TotalGB = updatedTotalBytes;
-        payload.ExpiryTime = updatedExpiryTime;
-        payload.TgId = client.TgId;
-        payload.Enable = true;
-        payload.Comment = JsonConvert.SerializeObject(metadata, Formatting.None);
-        return payload;
-    }
-
-    private static long CalculateRenewedExpiryTime(long currentExpiryTime, int addedDurationDays)
-    {
-        if (addedDurationDays <= 0)
-            return 0;
-
-        var now = DateTimeOffset.UtcNow;
-        var baseDate = currentExpiryTime > 0
-            ? DateTimeOffset.FromUnixTimeMilliseconds(currentExpiryTime)
-            : now;
-
-        if (baseDate < now)
-            baseDate = now;
-
-        return baseDate.AddDays(addedDurationDays).ToUnixTimeMilliseconds();
     }
 
     private static XuiV3ClientPayload CopyClientPayload(XuiV3Client client)
@@ -2706,6 +2828,30 @@ public class XuiV3AdminFlowService
                $"Payin Hash: <code>{Html(payment.PayinHash ?? data.PayinHash)}</code>\n" +
                $"Payout Hash: <code>{Html(payment.PayoutHash ?? data.PayoutHash)}</code>\n" +
                $"Invoice URL: <code>{Html(payment.InvoiceUrl ?? data.InvoiceUrl)}</code>";
+    }
+
+    private static string BuildHooshPayPaymentInfo(
+        HooshPayPaymentInfo payment,
+        NowPaymentsSettlementResult settlement)
+    {
+        return "وضعیت پرداخت HooshPay\n\n" +
+               $"Order ID: <code>{Html(payment.OrderId)}</code>\n" +
+               $"Invoice UID: <code>{Html(payment.InvoiceUid)}</code>\n" +
+               $"Telegram User: <code>{payment.TelegramUserId}</code>\n" +
+               $"Chat ID: <code>{payment.ChatId}</code>\n" +
+               $"Amount Toman: <code>{Html(payment.AmountToman.FormatCurrency())}</code>\n" +
+               $"Payable Amount: <code>{Html(payment.PayableAmountToman.FormatCurrency())}</code>\n" +
+               $"Merchant Credit: <code>{Html(payment.MerchantCreditToman.FormatCurrency())}</code>\n" +
+               $"Fee: <code>{Html(payment.FeeAmountToman.FormatCurrency())}</code>\n" +
+               $"Fee Percent: <code>{payment.FeePercent}</code>\n" +
+               $"Fee Mode: <code>{Html(payment.FeeMode)}</code>\n" +
+               $"Status: <code>{Html(payment.PaymentStatus)}</code>\n" +
+               $"Tracking Code: <code>{Html(payment.TrackingCode)}</code>\n" +
+               $"Added To Balance: <code>{payment.IsAddedToBalance}</code>\n" +
+               $"Settlement: <code>{Html(settlement?.Status.ToString() ?? "not-applied")}</code>\n" +
+               $"Balance Before: <code>{Html(payment.BalanceBefore?.FormatCurrency())}</code>\n" +
+               $"Balance After: <code>{Html(payment.BalanceAfter?.FormatCurrency())}</code>\n" +
+               $"Payment URL: <code>{Html(payment.PaymentUrl)}</code>";
     }
 
     private ServerInfo BuildConfiguredPanelServerInfo()

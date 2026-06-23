@@ -69,9 +69,10 @@ public static class TelegramBotClientExtensions
 
         try
         {
+            var normalizedFromChatId = NormalizeForwardSourceChatId(fromChatId);
             await botClient.ForwardMessageAsync(
                 chatId: chatId,
-                fromChatId: $"@{fromChatId}",
+                fromChatId: normalizedFromChatId,
                 messageId: messageId
             );
             // Console.WriteLine("Message forwarded successfully.");
@@ -80,6 +81,18 @@ public static class TelegramBotClientExtensions
         {
             Console.WriteLine($"An error occurred while forwarding the message: {ex.Message}");
         }
+    }
+
+    private static ChatId NormalizeForwardSourceChatId(string fromChatId)
+    {
+        var value = (fromChatId ?? string.Empty).Trim();
+        if (long.TryParse(value, out var numericChatId))
+            return new ChatId(numericChatId);
+
+        if (!value.StartsWith("@", StringComparison.Ordinal))
+            value = "@" + value;
+
+        return new ChatId(value);
     }
 
 
