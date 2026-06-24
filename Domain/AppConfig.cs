@@ -52,7 +52,7 @@ namespace Adminbot.Domain
         public int XuiV3RequestTimeoutSeconds { get; set; } = 60;
         public bool AccountExpiryReminderEnabled { get; set; } = true;
         public int AccountExpiryReminderHourIran { get; set; } = 8;
-        public int[] AccountExpiryReminderDays { get; set; } = new[] { 12, 3, 2 };
+        public int[] AccountExpiryReminderDays { get; set; } = new[] { 7, 3, 1 };
         public string NowpaymentSuccessUrl { get; set; }
         public string NowpaymentCancelUrl { get; set; }
         public string NowpaymentIpnUrl { get; set; }

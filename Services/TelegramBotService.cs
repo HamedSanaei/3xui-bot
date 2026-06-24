@@ -19,6 +19,10 @@ using Adminbot.Domain.Logging;
 
 public class TelegramBotService : IHostedService
 {
+    private const string BroadcastAudienceAll = "all";
+    private const string BroadcastAudienceCustomers = "customers";
+    private const string BroadcastAudienceColleagues = "colleagues";
+
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
@@ -30,6 +34,7 @@ public class TelegramBotService : IHostedService
     private readonly NowPaymentsSettlementService _nowPaymentsSettlementService;
     private readonly HooshPay _hooshPay;
     private readonly HooshPaySettlementService _hooshPaySettlementService;
+    private readonly XuiV3PurchaseService _xuiV3PurchaseService;
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
     private readonly XuiV3AdminFlowService _xuiV3AdminFlowService;
     private readonly UserActivityLogService _userActivityLog;
@@ -45,6 +50,7 @@ public class TelegramBotService : IHostedService
         NowPaymentsSettlementService nowPaymentsSettlementService,
         HooshPay hooshPay,
         HooshPaySettlementService hooshPaySettlementService,
+        XuiV3PurchaseService xuiV3PurchaseService,
         XuiV3BotFlowService xuiV3BotFlowService,
         XuiV3AdminFlowService xuiV3AdminFlowService,
         UserActivityLogService userActivityLog)
@@ -60,6 +66,7 @@ public class TelegramBotService : IHostedService
         _nowPaymentsSettlementService = nowPaymentsSettlementService;
         _hooshPay = hooshPay;
         _hooshPaySettlementService = hooshPaySettlementService;
+        _xuiV3PurchaseService = xuiV3PurchaseService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _xuiV3AdminFlowService = xuiV3AdminFlowService;
         _userActivityLog = userActivityLog;
@@ -185,7 +192,7 @@ public class TelegramBotService : IHostedService
         if (isSuperAdmin && await TryHandleUserActivityLogCommandAsync(botClient, message, messageCredUser, cancellationToken))
             return;
 
-        if (await TryHandleNowPaymentsSuccessStartAsync(
+        if (await TryHandleNowPaymentsReturnStartAsync(
             botClient,
             message,
             messageCredUser,
@@ -804,9 +811,10 @@ public class TelegramBotService : IHostedService
             currentUser.LastStep = "confirm-public-message";
             await _userDbContext.SaveUserStatus(currentUser);
 
+            var audienceLabel = GetBroadcastAudienceLabel(currentUser.SubLink);
             await botClient.CustomSendTextMessageAsync(
                             chatId: message.Chat.Id,
-                            text: "This is Your message. Are  you Sure to send it to all of your users?",
+                            text: $"این پیام برای «{audienceLabel}» آماده شده است. آیا ارسال شود؟",
                             replyMarkup: GetMessageSendConfirmationKeyboard());
 
             var forwardMessage = GetChannelAndPost(message.Text);
@@ -1410,31 +1418,20 @@ public class TelegramBotService : IHostedService
         }
 
         //send public message:
-        else if (message.Text == "Yes Send!" && currentUser.Flow == "admin" && currentUser.LastStep == "confirm-public-message")
+        else if (currentUser.Flow == "admin" && currentUser.LastStep == "confirm-public-message")
         {
             var channelPost = GetChannelAndPost(currentUser.ConfigLink);
-
-            InlineKeyboardMarkup inlineKeyboard = new(new[]
-              {
-                 // first row
-                        new []
-                {
-                    InlineKeyboardButton.WithUrl(text:"ارتباط با پشتیبانی",url:_appConfig.SupportAccount),
-                    InlineKeyboardButton.WithUrl(text:"کانال ما",url:_appConfig.MainChannel),
-                },});
             if (message.Text == "Yes Send!")
             {
-                var allUsers = _credentialsDbContext.Users
-                    .Select(x => x.ChatID > 0 ? x.ChatID : x.TelegramUserId)
-                    .Where(chatId => chatId > 0)
-                    .Distinct()
-                    .ToList();
+                var audience = NormalizeBroadcastAudience(currentUser.SubLink);
+                var audienceLabel = GetBroadcastAudienceLabel(audience);
+                var allUsers = GetBroadcastRecipients(audience);
 
                 if (allUsers.Count == 0)
                 {
                     await botClient.SendTextMessageAsync(
                         message.Chat.Id,
-                        "هیچ کاربری برای ارسال پیام عمومی پیدا نشد.",
+                        $"هیچ گیرنده‌ای برای ارسال پیام عمومی به «{audienceLabel}» پیدا نشد.",
                         replyMarkup: GetMainMenuKeyboard());
                     await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
                     return;
@@ -1503,12 +1500,21 @@ public class TelegramBotService : IHostedService
             }
             else if (message.Text == "Preview message")
             {
-                await botClient.CustomSendTextMessageAsync(
-                                                                chatId: message.From.Id,
-                                                                text: currentUser.ConfigLink,
-                                                                parseMode: ParseMode.Markdown,
-                                                                replyMarkup: GetMessageSendConfirmationKeyboard()
-                                                                );
+                if (channelPost != null)
+                {
+                    await _botClient.CustomForwardMessage(
+                        chatId: message.Chat.Id,
+                        fromChatId: channelPost.ChannelName,
+                        messageId: channelPost.PostNumber);
+                }
+                else
+                {
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.From.Id,
+                        text: currentUser.ConfigLink,
+                        parseMode: ParseMode.Markdown,
+                        replyMarkup: GetMessageSendConfirmationKeyboard());
+                }
             }
             else if (message.Text == "No Don't Send!")
             {
@@ -1543,13 +1549,14 @@ public class TelegramBotService : IHostedService
             else if (message.Text == "📨 Send message to all")
             {
                 currentUser.Flow = "admin";
-                currentUser.LastStep = "Get-public-message";
+                currentUser.LastStep = "select-public-message-audience";
+                currentUser.SubLink = string.Empty;
                 await _userDbContext.SaveUserStatus(currentUser);
 
                 await botClient.CustomSendTextMessageAsync(
                                 chatId: message.Chat.Id,
-                                text: "Type your message and Send it:",
-                                replyMarkup: new ReplyKeyboardRemove());
+                                text: "مخاطب پیام عمومی را انتخاب کنید:",
+                                replyMarkup: BuildBroadcastAudienceKeyboard());
                 return;
             }
 
@@ -1611,6 +1618,12 @@ public class TelegramBotService : IHostedService
                 return;
             }
 
+            if (callbackQuery.Data.StartsWith("broadcast_scope_", StringComparison.Ordinal))
+            {
+                await ProcessBroadcastAudienceCallback(callbackQuery, cancellationToken);
+                return;
+            }
+
             if (callbackQuery.Data.StartsWith("check_crypto_payment_"))
             {
                 await ProcessCryptoPaymentCallback(callbackQuery, cancellationToken);
@@ -1662,6 +1675,75 @@ public class TelegramBotService : IHostedService
 
             await AnswerCallbackSafely(callbackQuery, cancellationToken);
         }
+    }
+
+    private async Task ProcessBroadcastAudienceCallback(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        if (!IsSuperAdminUser(callbackQuery.From.Id))
+        {
+            await _botClient.AnswerCallbackQueryAsync(
+                callbackQuery.Id,
+                text: "این بخش فقط برای سوپرادمین‌هاست.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var messageId = callbackQuery.Message?.MessageId;
+        var selected = callbackQuery.Data.Replace("broadcast_scope_", "", StringComparison.Ordinal);
+
+        if (string.Equals(selected, "back", StringComparison.OrdinalIgnoreCase))
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = callbackQuery.From.Id });
+
+            if (messageId.HasValue)
+            {
+                await _botClient.EditMessageTextAsync(
+                    chatId: chatId,
+                    messageId: messageId.Value,
+                    text: "ارسال پیام عمومی لغو شد.",
+                    cancellationToken: cancellationToken);
+            }
+
+            await _botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: "Admin:",
+                replyMarkup: GetAdminKeyboard(),
+                cancellationToken: cancellationToken);
+
+            await _botClient.AnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var audience = NormalizeBroadcastAudience(selected);
+        var currentUser = await _userDbContext.GetUserStatus(callbackQuery.From.Id);
+        currentUser.Flow = "admin";
+        currentUser.LastStep = "Get-public-message";
+        currentUser.SubLink = audience;
+        await _userDbContext.SaveUserStatus(currentUser);
+
+        var audienceLabel = GetBroadcastAudienceLabel(audience);
+        if (messageId.HasValue)
+        {
+            await _botClient.EditMessageTextAsync(
+                chatId: chatId,
+                messageId: messageId.Value,
+                text: $"مخاطب انتخاب شد: <b>{Html(audienceLabel)}</b>\n\nحالا متن پیام یا لینک پست کانال را ارسال کنید.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+        }
+
+        await _botClient.SendTextMessageAsync(
+            chatId: chatId,
+            text: "Type your message and Send it:",
+            replyMarkup: new ReplyKeyboardRemove(),
+            cancellationToken: cancellationToken);
+
+        await _botClient.AnswerCallbackQueryAsync(
+            callbackQuery.Id,
+            text: "مخاطب پیام عمومی ثبت شد.",
+            cancellationToken: cancellationToken);
     }
 
     private async Task ProcessBroadcastStatusCallback(CallbackQuery callbackQuery, CancellationToken cancellationToken)
@@ -2244,18 +2326,23 @@ public class TelegramBotService : IHostedService
                $"🧾 Order ID: <code>{orderId}</code>";
     }
 
-    private async Task<bool> TryHandleNowPaymentsSuccessStartAsync(
+    private async Task<bool> TryHandleNowPaymentsReturnStartAsync(
         ITelegramBotClient botClient,
         Message message,
         CredUser credUser,
         IReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
-        if (message?.Text == null || !IsNowPaymentsSuccessStart(message.Text))
+        if (message?.Text == null)
+            return false;
+
+        var isSuccess = IsNowPaymentsSuccessStart(message.Text);
+        var isCancel = IsNowPaymentsCancelStart(message.Text);
+        if (!isSuccess && !isCancel)
             return false;
 
         var telegramUserId = message.From?.Id ?? credUser?.TelegramUserId ?? 0;
-        Console.WriteLine($"[NOWPayments SuccessUrl] received success start. user={telegramUserId}, chat={message.Chat.Id}, text={message.Text}");
+        Console.WriteLine($"[NOWPayments ReturnUrl] received start. user={telegramUserId}, chat={message.Chat.Id}, text={message.Text}, success={isSuccess}, cancel={isCancel}");
 
         var payment = await _userDbContext.SwapinoPaymentInfos
             .Where(p => p.TelegramUserId == telegramUserId && !p.IsAddedToBalance)
@@ -2264,10 +2351,26 @@ public class TelegramBotService : IHostedService
 
         if (payment == null)
         {
-            Console.WriteLine($"[NOWPayments SuccessUrl] no pending crypto payment found. user={telegramUserId}");
+            Console.WriteLine($"[NOWPayments ReturnUrl] no pending crypto payment found. user={telegramUserId}");
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "پرداخت در حال انتظاری برای حساب شما پیدا نشد. اگر کیف پول قبلاً شارژ شده، نیازی به اقدام دوباره نیست.",
+                text: isCancel
+                    ? "پرداخت در حال انتظاری برای بستن پیدا نشد. اگر قبلاً کنسل شده باشد، نیازی به اقدام دوباره نیست."
+                    : "پرداخت در حال انتظاری برای حساب شما پیدا نشد. اگر کیف پول قبلاً شارژ شده، نیازی به اقدام دوباره نیست.",
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        if (isCancel)
+        {
+            payment.PaymentStatus = "cancelled_by_user";
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "پرداخت توسط کاربر کنسل شد و فاکتور مربوطه در درگاه پرداخت به صورت بسته شده درآمد.",
                 replyMarkup: mainReplyMarkup,
                 cancellationToken: cancellationToken);
             return true;
@@ -2275,7 +2378,7 @@ public class TelegramBotService : IHostedService
 
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
-            text: "بازگشت از درگاه پرداخت دریافت شد. در حال بررسی وضعیت پرداخت از NOWPayments هستم...",
+            text: "پرداخت از سمت درگاه پرداخت تایید شد.\nدر حال بررسی وضعیت پرداخت از NOWPayments هستم...",
             cancellationToken: cancellationToken);
 
         await CheckAndSettleCryptoPaymentCoreAsync(
@@ -2300,6 +2403,18 @@ public class TelegramBotService : IHostedService
                normalized.Equals("/start=payment_success", StringComparison.OrdinalIgnoreCase) ||
                normalized.Equals("payment_success", StringComparison.OrdinalIgnoreCase) ||
                normalized.StartsWith("/start payment_success", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsNowPaymentsCancelStart(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        var normalized = text.Trim();
+        return normalized.Equals("/start payment_cancel", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("/start=payment_cancel", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("payment_cancel", StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith("/start payment_cancel", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task CheckAndSettleCryptoPaymentCoreAsync(
@@ -3009,12 +3124,75 @@ public class TelegramBotService : IHostedService
             },
             new []
             {
+                new KeyboardButton("Preview message"),
+            },
+            new []
+            {
                 new KeyboardButton("No Don't Send!"),
             },
 
         });
         return confirmationKeyboard;
     }
+
+    private static InlineKeyboardMarkup BuildBroadcastAudienceKeyboard()
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("کاربران عادی", "broadcast_scope_customers"),
+                InlineKeyboardButton.WithCallbackData("همکاران", "broadcast_scope_colleagues")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("کل کاربران", "broadcast_scope_all")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("برگشت به منوی قبل", "broadcast_scope_back")
+            }
+        });
+    }
+
+    private static string NormalizeBroadcastAudience(string audience)
+    {
+        return (audience ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            BroadcastAudienceCustomers => BroadcastAudienceCustomers,
+            BroadcastAudienceColleagues => BroadcastAudienceColleagues,
+            BroadcastAudienceAll => BroadcastAudienceAll,
+            _ => BroadcastAudienceAll
+        };
+    }
+
+    private static string GetBroadcastAudienceLabel(string audience)
+    {
+        return NormalizeBroadcastAudience(audience) switch
+        {
+            BroadcastAudienceCustomers => "کاربران عادی",
+            BroadcastAudienceColleagues => "همکاران",
+            _ => "کل کاربران"
+        };
+    }
+
+    private List<long> GetBroadcastRecipients(string audience)
+    {
+        var normalizedAudience = NormalizeBroadcastAudience(audience);
+        var query = _credentialsDbContext.Users.AsNoTracking();
+
+        if (normalizedAudience == BroadcastAudienceCustomers)
+            query = query.Where(x => !x.IsColleague);
+        else if (normalizedAudience == BroadcastAudienceColleagues)
+            query = query.Where(x => x.IsColleague);
+
+        return query
+            .Select(x => x.ChatID > 0 ? x.ChatID : x.TelegramUserId)
+            .Where(chatId => chatId > 0)
+            .Distinct()
+            .ToList();
+    }
+
     private List<string> GetLocations()
     {
 
@@ -3287,6 +3465,18 @@ public class TelegramBotService : IHostedService
             return;
         }
 
+        else if (message.Text == "📋 تعرفه‌ها" || message.Text == "تعرفه‌ها")
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: _xuiV3PurchaseService.BuildTariffsText(credUser?.IsColleague == true),
+                parseMode: ParseMode.Html,
+                replyMarkup: MainReplyMarkupKeyboardFa());
+            return;
+        }
+
         else if (await _xuiV3BotFlowService.TryHandleAccountActionAsync(
             botClient,
             message,
@@ -3298,6 +3488,16 @@ public class TelegramBotService : IHostedService
             return;
         }
         else if (await _xuiV3BotFlowService.TryHandleDeleteExpiredAccountsAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
+        else if (await _xuiV3BotFlowService.TryHandleAccountCommentTextAsync(
             botClient,
             message,
             credUser,
@@ -3652,14 +3852,18 @@ public class TelegramBotService : IHostedService
             {
                 new KeyboardButton[] { "مشاهده وضعیت حساب","تمدید اکانت"},
                 new KeyboardButton[] { "وضعیت اکانت های من","🔎 جستجوی اکانت" },
-                new KeyboardButton[] { "حذف اکانت های منقضی" },
             };
 
             if (credUser?.IsColleague != true)
-                accountManagementRows.Add(new KeyboardButton[] { "🤝 درخواست همکاری" });
+                accountManagementRows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "🤝 درخواست همکاری" });
+            else
+                accountManagementRows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "📌 قابلیت‌های ربات" });
 
-            accountManagementRows.Add(new KeyboardButton[] { "💰شارژ حساب کاربری" });
-            accountManagementRows.Add(new KeyboardButton[] { "📌 قابلیت‌های ربات" });
+            if (credUser?.IsColleague != true)
+                accountManagementRows.Add(new KeyboardButton[] { "📌 قابلیت‌های ربات", "💳خرید اکانت جدید" });
+            else
+                accountManagementRows.Add(new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" });
+
             accountManagementRows.Add(new KeyboardButton[] { "منوی اصلی" });
 
             ReplyKeyboardMarkup replyKeyboardMarkup = new(accountManagementRows)
@@ -4094,14 +4298,23 @@ public class TelegramBotService : IHostedService
         else if (message.Text == "💰شارژ حساب کاربری")
         {
             var keyboardButtons = new List<List<KeyboardButton>>();
-            var allPrices = _appConfig.Price.Union(_appConfig.PriceCommon).Union(_appConfig.PriceColleagues);
-            foreach (var priceConfig in allPrices)
+            var allPrices = _appConfig.Price
+                .Concat(_appConfig.PriceCommon)
+                .Concat(_appConfig.PriceColleagues)
+                .Select(priceConfig => Convert.ToInt64(priceConfig.Price))
+                .Where(price => price > 0)
+                .Distinct()
+                .OrderBy(price => price)
+                .ToList();
+
+            for (var index = 0; index < allPrices.Count; index += 4)
             {
-
-                var buttonText = $"{Convert.ToInt64(priceConfig.Price).FormatCurrency()}";
-                keyboardButtons.Add(new List<KeyboardButton> { new KeyboardButton(buttonText) });
+                keyboardButtons.Add(allPrices
+                    .Skip(index)
+                    .Take(4)
+                    .Select(price => new KeyboardButton(price.FormatCurrency()))
+                    .ToList());
             }
-
 
             // Add a "Back" button at the end
             keyboardButtons.Add(new List<KeyboardButton> { new KeyboardButton("بازگشت") });
@@ -4115,12 +4328,15 @@ public class TelegramBotService : IHostedService
 
             await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
             var minimumChargeAmount = MinimumChargeAmountToman;
-            var msg = $"لطفاً میزان شارژ اکانت خود را انتخاب یا به تومان وارد کنید. به عنوان مثال {minimumChargeAmount} معادل {minimumChargeAmount.FormatCurrency()} است.\nحداقل میزان شارژ {minimumChargeAmount.FormatCurrency()} است.";
+            var msg = "💰 <b>شارژ کیف پول</b>\n\n" +
+                      "👇 از مبلغ‌های پیشنهادی پایین استفاده کنید یا مبلغ دلخواه را به تومان و با عدد وارد کنید.\n" +
+                      $"⚠️ حداقل مبلغ شارژ: <code>{minimumChargeAmount.FormatCurrency()}</code>\n" +
+                      $"✍️ مثال: <code>{minimumChargeAmount}</code>";
             //msg = "برای شارژ حساب کاربری به آیدی زیر پیام دهید: \n @vpnetiran_admin";
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: msg.EscapeMarkdown(),
-                replyMarkup: keyboard, parseMode: ParseMode.Markdown);
+                text: msg,
+                replyMarkup: keyboard, parseMode: ParseMode.Html);
 
 
         }
@@ -4660,6 +4876,12 @@ public class TelegramBotService : IHostedService
 
                 if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage.EscapeMarkdown());
 
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "✅ تمدید با موفقیت انجام شد.\n\n" +
+                          BuildPlainBalanceDeductionText(beforeBalance, Convert.ToInt64(user._ConfigPrice), afterBalance),
+                    replyMarkup: MainReplyMarkupKeyboardFa());
+
                 if (user.SelectedPeriod == "1 Day")
                 {
                     user.LastFreeAcc = DateTime.Now;
@@ -4756,6 +4978,12 @@ public class TelegramBotService : IHostedService
                 var logMesseage = $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
 
                 if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage.EscapeMarkdown());
+
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "✅ خرید با موفقیت انجام شد.\n\n" +
+                          BuildPlainBalanceDeductionText(beforeBalance, Convert.ToInt64(user._ConfigPrice), afterBalance),
+                    replyMarkup: MainReplyMarkupKeyboardFa());
 
                 if (user.SelectedPeriod == "1 Day")
                 {
@@ -5002,6 +5230,13 @@ public class TelegramBotService : IHostedService
         return text.EscapeMarkdown();
     }
 
+    private static string BuildPlainBalanceDeductionText(long beforeBalance, long deductedAmount, long afterBalance)
+    {
+        return $"💳 موجودی قبل: {beforeBalance.FormatCurrency()}\n" +
+               $"💸 مبلغ کسر شده: {deductedAmount.FormatCurrency()}\n" +
+               $"💰 موجودی باقی‌مانده: {afterBalance.FormatCurrency()}";
+    }
+
     private static string BuildBotCapabilitiesMessage(CredUser credUser)
     {
         var roleText = credUser?.IsColleague == true ? "همکار" : "کاربر عادی";
@@ -5014,7 +5249,10 @@ public class TelegramBotService : IHostedService
         builder.AppendLine("با این ربات می‌توانید:");
         builder.AppendLine();
         builder.AppendLine("🛒 <b>خرید اکانت</b>");
-        builder.AppendLine("انتخاب سرویس، حجم دلخواه، مدت زمان، تعداد اکانت و ثبت کامنت اختصاصی.");
+        builder.AppendLine("انتخاب سرویس نت عادی، نت ملی یا نامحدود با مصرف منصفانه، تعداد اکانت و ثبت کامنت اختصاصی.");
+        builder.AppendLine();
+        builder.AppendLine("📋 <b>تعرفه‌های داینامیک</b>");
+        builder.AppendLine("تعرفه‌ها همیشه بر اساس نوع حساب شما، یعنی کاربر عادی یا همکار، نمایش داده می‌شود.");
         builder.AppendLine();
         builder.AppendLine("👤 <b>مدیریت اکانت‌ها</b>");
         builder.AppendLine("مشاهده همه اکانت‌ها، صفحه‌بندی، جستجو، دیدن جزئیات، تمدید، حذف تکی و تغییر لینک.");
@@ -5023,13 +5261,16 @@ public class TelegramBotService : IHostedService
         builder.AppendLine("جستجو با نام اکانت، بخشی از کامنت یا UUID کامل کانفیگ.");
         builder.AppendLine();
         builder.AppendLine("🔁 <b>تمدید و تغییر لینک</b>");
-        builder.AppendLine("تمدید با حجم دلخواه و ساخت لینک جدید در صورت لو رفتن اطلاعات اکانت.");
+        builder.AppendLine("تمدید با پلن‌های فعال ربات، تمدید مستقیم از پیام هشدار انقضا و ساخت لینک جدید در صورت لو رفتن اطلاعات اکانت.");
+        builder.AppendLine();
+        builder.AppendLine("⏰ <b>هشدار انقضا</b>");
+        builder.AppendLine("برای اکانت‌های قابل تمدید، ۷ روز، ۳ روز و ۱ روز قبل از انقضا پیام یادآوری همراه با دکمه تمدید ارسال می‌شود.");
         builder.AppendLine();
         builder.AppendLine("🧹 <b>حذف اکانت‌های منقضی</b>");
         builder.AppendLine("نمایش و حذف یکجای اکانت‌هایی که حجم یا زمان آن‌ها تمام شده است.");
         builder.AppendLine();
         builder.AppendLine("💰 <b>شارژ حساب</b>");
-        builder.AppendLine("شارژ کیف پول از مسیرهای پرداخت فعال ربات.");
+        builder.AppendLine("شارژ کیف پول از درگاه ریالی HooshPay یا پرداخت ارز دیجیتال، با ثبت و بررسی وضعیت پرداخت.");
         builder.AppendLine();
         builder.AppendLine("🌟 <b>اکانت تست رایگان</b>");
         builder.AppendLine("دریافت تست دوره‌ای برای بررسی کیفیت سرویس‌ها، در صورت داشتن شرایط.");
@@ -5415,10 +5656,13 @@ public class TelegramBotService : IHostedService
 
         ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
                {
-                    new KeyboardButton[] { "💳خرید اکانت جدید", "🏠منو","💻 ارتباط با ادمین" },
-                    new KeyboardButton[] { "💡راهنما نصب", "🌟اکانت رایگان","⚙️ مدیریت اکانت" }})
+                    new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
+                    new KeyboardButton[] { "📋 تعرفه‌ها", "⚙️ مدیریت اکانت" },
+                    new KeyboardButton[] { "🌟اکانت رایگان", "💡راهنما نصب" },
+                    new KeyboardButton[] { "💻 ارتباط با ادمین" },
+                    new KeyboardButton[] { "🏠منو" }})
         {
-            ResizeKeyboard = false
+            ResizeKeyboard = true
         };
         return replyKeyboardMarkup;
 
@@ -5444,7 +5688,8 @@ public class TelegramBotService : IHostedService
                           {
                     new KeyboardButton[] { prices[0], prices[1] },
                     new KeyboardButton[] { prices[2],prices[3] },
-                    new KeyboardButton[] { "🏠منو" ,"تمدید حجمی" }})
+                    new KeyboardButton[] { "تمدید حجمی" },
+                    new KeyboardButton[] { "🏠منو" }})
             {
                 ResizeKeyboard = true,
                 OneTimeKeyboard = true
@@ -5488,7 +5733,11 @@ public class TelegramBotService : IHostedService
             },
             new[]
             {
-                new KeyboardButton("📑 Menu"), new KeyboardButton("🗽 Admin"),
+                new KeyboardButton("🗽 Admin"),
+            },
+            new[]
+            {
+                new KeyboardButton("📑 Menu"),
             }
         });
 

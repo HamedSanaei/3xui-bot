@@ -8,12 +8,14 @@ using Newtonsoft.Json;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
 
 public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
 {
     private readonly IConfiguration _configuration;
     private readonly ITelegramBotClient _botClient;
     private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly XuiV3PurchaseService _purchaseService;
     private readonly AppConfig _appConfig;
     private readonly TimeZoneInfo _iranTimeZone;
     private readonly CancellationTokenSource _shutdown = new();
@@ -24,11 +26,13 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
     public XuiV3AccountExpiryReminderService(
         IConfiguration configuration,
         ITelegramBotClient botClient,
-        CredentialsDbContext credentialsDbContext)
+        CredentialsDbContext credentialsDbContext,
+        XuiV3PurchaseService purchaseService)
     {
         _configuration = configuration;
         _botClient = botClient;
         _credentialsDbContext = credentialsDbContext;
+        _purchaseService = purchaseService;
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         _iranTimeZone = ResolveIranTimeZone();
     }
@@ -98,11 +102,15 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
         var nowIran = ToIranTime(DateTime.UtcNow);
         var todayIran = nowIran.Date;
         var reminderDays = GetReminderDays().ToHashSet();
+        var enabledServices = _purchaseService.GetEnabledServices();
         var dueByUser = new Dictionary<long, List<ExpiryReminderItem>>();
 
         foreach (var client in clientsResponse.Obj ?? new List<XuiV3Client>())
         {
             if (client == null || client.Enable == false)
+                continue;
+
+            if (!XuiV3ClientPlanEligibility.IsClientInActiveServiceInbounds(client, enabledServices))
                 continue;
 
             var ownerTelegramUserId = GetOwnerTelegramUserId(client);
@@ -122,6 +130,7 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
             var item = new ExpiryReminderItem
             {
                 Email = client.Email ?? "",
+                ClientId = client.Id,
                 DaysLeft = daysLeft,
                 ExpiryIranDate = expiryIranDate
             };
@@ -168,6 +177,7 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
                     chatId: chatId,
                     text: BuildReminderMessage(freshItems),
                     parseMode: ParseMode.Html,
+                    replyMarkup: BuildReminderKeyboard(freshItems),
                     cancellationToken: cancellationToken);
                 sent++;
             }
@@ -226,7 +236,7 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
     private IEnumerable<int> GetReminderDays()
     {
         return (_appConfig.AccountExpiryReminderDays == null || _appConfig.AccountExpiryReminderDays.Length == 0
-                ? new[] { 12, 3, 2 }
+                ? new[] { 7, 3, 1 }
                 : _appConfig.AccountExpiryReminderDays)
             .Where(day => day > 0)
             .Distinct()
@@ -331,6 +341,8 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
             sb.AppendLine();
             sb.AppendLine($"اکانت شما با نام <code>{Html(item.Email)}</code> تا <b>{item.DaysLeft}</b> روز دیگر منقضی می‌شود.");
             sb.AppendLine("لطفاً قبل از منقضی شدن، از داخل ربات تمدیدش کنید تا سرویس قطع نشود.");
+            sb.AppendLine();
+            sb.AppendLine("برای تمدید سریع می‌توانید از دکمه پایین استفاده کنید.");
             return sb.ToString();
         }
 
@@ -342,7 +354,23 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
 
         sb.AppendLine();
         sb.AppendLine("لطفاً قبل از منقضی شدن، از داخل ربات تمدیدشان کنید تا سرویس قطع نشود.");
+        sb.AppendLine("برای تمدید سریع هر اکانت، از دکمه‌های پایین استفاده کنید.");
         return sb.ToString();
+    }
+
+    private static InlineKeyboardMarkup BuildReminderKeyboard(List<ExpiryReminderItem> items)
+    {
+        var rows = items
+            .Where(item => item.ClientId > 0)
+            .Select(item => new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    $"تمدید {item.Email}",
+                    XuiV3PurchaseCallbacks.AccountRenew(item.ClientId, 0))
+            })
+            .ToArray();
+
+        return rows.Length == 0 ? null : new InlineKeyboardMarkup(rows);
     }
 
     private static string Html(string value)
@@ -362,6 +390,7 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
     private sealed class ExpiryReminderItem
     {
         public string Email { get; set; }
+        public int ClientId { get; set; }
         public int DaysLeft { get; set; }
         public DateTime ExpiryIranDate { get; set; }
     }

@@ -871,9 +871,11 @@ namespace Adminbot.Domain
             var outcomeAmount = payment.OutcomeAmount == 0 ? data.OutcomeAmount : payment.OutcomeAmount;
             var outcomeCurrency = payment.OutcomeCurrency ?? data.OutcomeCurrency;
 
+            var userSummary = TelegramUserLinkFormatter.HtmlSummary(credUser);
+            if (string.IsNullOrWhiteSpace(userSummary))
+                userSummary = $"👤 کاربر: <code>{Html(payment.TelegramUserId.ToString())}</code>";
             var logMessage = "✅ پرداخت ارز دیجیتال تایید شد\n\n" +
-                             $"👤 کاربر: <code>{Html(payment.TelegramUserId.ToString())}</code>\n" +
-                             $"{Html(credUser?.ToString())}\n\n" +
+                             $"{userSummary}\n\n" +
                              $"💰 مبلغ شارژ: <code>{Html(payment.AmountToman.FormatCurrency())}</code>\n" +
                              $"💵 ارز مبنا: <code>{Html(FormatDecimal(baseAmount))} {Html(baseCurrency)}</code>\n" +
                              $"🪙 ارز پرداختی: <code>{Html(FormatDecimal(payAmount))} {Html(payCurrency)}</code>\n" +

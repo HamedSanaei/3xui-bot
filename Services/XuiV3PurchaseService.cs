@@ -192,10 +192,72 @@ public class XuiV3PurchaseService
         return text;
     }
 
+    public string BuildTariffsText(bool isColleague)
+    {
+        var roleText = isColleague ? "همکار" : "کاربر عادی";
+        var builder = new System.Text.StringBuilder();
+        builder.AppendLine("📋 <b>تعرفه سرویس‌ها</b>");
+        builder.AppendLine($"نوع حساب شما: <code>{Html(roleText)}</code>");
+        builder.AppendLine();
+        builder.AppendLine("⭐ پیشنهاد ما برای استفاده روزمره، پلن‌های نامحدود با حد مصرف منصفانه است.");
+        builder.AppendLine("🛡 برای شرایط قطعی اینترنت، اختلال شدید یا شرایط جنگی، حتماً یک کانفیگ <b>نت ملی</b> با زمان انقضای <b>نامحدود</b> هم داشته باشید.");
+        builder.AppendLine("📍 در حال حاضر لوکیشن‌های آلمان، آمریکا و فنلاند فعال هستند و به‌زودی لوکیشن‌های بیشتری مثل ترکیه هم اضافه می‌شود.");
+
+        foreach (var service in GetEnabledServices())
+        {
+            builder.AppendLine();
+            builder.AppendLine("━━━━━━━━━━━━");
+
+            if (service.IsUnlimited)
+            {
+                builder.AppendLine($"♾ <b>{Html(service.DisplayName)}</b>");
+                var plans = service.UnlimitedPlans?
+                    .Where(plan => plan.IsEnabled)
+                    .OrderBy(plan => plan.Days)
+                    .ToList() ?? new List<XuiV3UnlimitedPlan>();
+
+                foreach (var plan in plans)
+                {
+                    builder.AppendLine($"• <b>{Html(plan.DisplayName)}</b>");
+                    builder.AppendLine($"  مدت: <code>{plan.Days} روز</code> | حد مصرف منصفانه: <code>{plan.FairUsageGb} GB</code>");
+                    builder.AppendLine($"  کاربران مجاز: <code>{plan.MaxUsers}</code> | قیمت: <code>{Html(plan.Price.GetForRole(isColleague).FormatCurrency())}</code>");
+                }
+            }
+            else
+            {
+                var titleIcon = string.Equals(service.Key, "national", StringComparison.OrdinalIgnoreCase) ? "🛡" : "🌐";
+                builder.AppendLine($"{titleIcon} <b>{Html(service.DisplayName)}</b>");
+                builder.AppendLine($"قیمت هر گیگ: <code>{Html(service.GetPricePerGb(isColleague).FormatCurrency())}</code>");
+
+                if (service.TrafficOptionsGb?.Any() == true)
+                    builder.AppendLine($"حجم‌ها: <code>{Html(string.Join(" / ", service.TrafficOptionsGb.OrderBy(x => x).Select(x => $"{x}GB")))}</code>");
+
+                var durations = service.DurationOptions?
+                    .OrderBy(duration => duration.Days)
+                    .Select(duration => duration.Days <= 0
+                        ? duration.DisplayName
+                        : $"{duration.DisplayName} ({duration.Days} روز)")
+                    .ToList() ?? new List<string>();
+
+                if (durations.Count > 0)
+                    builder.AppendLine($"مدت‌ها: <code>{Html(string.Join(" / ", durations))}</code>");
+            }
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("برای خرید از «💳خرید اکانت جدید» و برای افزایش موجودی از «💰شارژ حساب کاربری» استفاده کنید.");
+        return builder.ToString();
+    }
+
     public bool CanAfford(CredUser user, XuiV3PurchaseSelection selection)
     {
         var resolved = ResolvePurchase(selection, user.IsColleague);
         return user.AccountBalance >= resolved.PriceToman * NormalizeAccountCount(selection.AccountCount);
+    }
+
+    private static string Html(string value)
+    {
+        return System.Net.WebUtility.HtmlEncode(value ?? string.Empty);
     }
 
     public async Task<XuiV3AccountCreationResult> CreateAccountAsync(
@@ -753,6 +815,16 @@ public static class XuiV3PurchaseCallbacks
         return $"{Prefix}:asch:{clientId}:{Math.Max(0, page)}";
     }
 
+    public static string AccountComment(int clientId, int page)
+    {
+        return $"{Prefix}:acom:{clientId}:{Math.Max(0, page)}";
+    }
+
+    public static string AccountSearchComment(int clientId, int page)
+    {
+        return $"{Prefix}:ascom:{clientId}:{Math.Max(0, page)}";
+    }
+
     public static bool TryParse(string callbackData, out XuiV3PurchaseCallback callback)
     {
         callback = null;
@@ -793,7 +865,8 @@ public static class XuiV3PurchaseCallbacks
              callback.Action == "aren" ||
              callback.Action == "adelask" ||
              callback.Action == "adel" ||
-             callback.Action == "ach") &&
+             callback.Action == "ach" ||
+             callback.Action == "acom") &&
             parts.Length >= 4)
         {
             if (int.TryParse(parts[2], out var clientId))
@@ -806,7 +879,8 @@ public static class XuiV3PurchaseCallbacks
              callback.Action == "asren" ||
              callback.Action == "asdelask" ||
              callback.Action == "asdel" ||
-             callback.Action == "asch") &&
+             callback.Action == "asch" ||
+             callback.Action == "ascom") &&
             parts.Length >= 4)
         {
             if (int.TryParse(parts[2], out var clientId))

@@ -322,9 +322,12 @@ namespace Adminbot.Domain
             long afterBalance,
             string source)
         {
+            var userSummary = TelegramUserLinkFormatter.HtmlSummary(credUser);
+            if (string.IsNullOrWhiteSpace(userSummary))
+                userSummary = $"👤 کاربر: <code>{Html(payment.TelegramUserId.ToString())}</code>";
+
             var logMessage = "✅ پرداخت ریالی HooshPay تایید شد\n\n" +
-                             $"👤 کاربر: <code>{Html(payment.TelegramUserId.ToString())}</code>\n" +
-                             $"{Html(credUser?.ToString())}\n\n" +
+                             $"{userSummary}\n\n" +
                              $"💰 مبلغ شارژ: <code>{Html(payment.AmountToman.FormatCurrency())}</code>\n" +
                              $"💳 مبلغ پرداختی کاربر: <code>{Html(payment.PayableAmountToman.FormatCurrency())}</code>\n" +
                              $"🧾 کارمزد: <code>{Html(payment.FeeAmountToman.FormatCurrency())}</code>\n" +

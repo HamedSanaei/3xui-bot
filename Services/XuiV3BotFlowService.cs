@@ -23,6 +23,10 @@ public class XuiV3BotFlowService
     private const string AccountSearchFlowName = "xui-v3-account-search";
     private const string AccountSearchStepQuery = "account-search-query";
     private const string AccountSearchStepResults = "account-search-results";
+    private const string AccountCommentFlowName = "xui-v3-account-comment";
+    private const string AccountCommentStepText = "account-comment-text";
+    private const string AccountCommentSourceList = "list";
+    private const string AccountCommentSourceSearch = "search";
     private const string ExternalUuidRenewPaymentMethod = "xui-v3-uuid-renew";
     private const string PurchaseFlowName = "xui-v3";
     private const string PurchaseStepSelectService = "select-service";
@@ -204,9 +208,9 @@ public class XuiV3BotFlowService
 
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
-            text: BuildV3ClientInfo(client, serverInfo, credUser.IsColleague),
+            text: BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
             parseMode: ParseMode.Html,
-            replyMarkup: BuildAccountDetailsKeyboard(client, 0, credUser.IsColleague),
+            replyMarkup: BuildAccountDetailsKeyboard(client, 0, credUser.IsColleague, IsClientRenewable(client)),
             cancellationToken: cancellationToken);
 
         return true;
@@ -276,6 +280,72 @@ public class XuiV3BotFlowService
             0,
             cancellationToken);
 
+        return true;
+    }
+
+    public async Task<bool> TryHandleAccountCommentTextAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CredUser credUser,
+        User user,
+        IReplyMarkup mainReplyMarkup,
+        CancellationToken cancellationToken)
+    {
+        if (!IsEnabledForPurchaseFlow() ||
+            string.IsNullOrWhiteSpace(message?.Text) ||
+            user?.Flow != AccountCommentFlowName)
+            return false;
+
+        var text = message.Text.Trim();
+        if (IsCancel(text))
+        {
+            await _userDbContext.ClearUserStatus(user);
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "تغییر کامنت لغو شد.",
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        if (user.LastStep != AccountCommentStepText)
+            return false;
+
+        if (IsBlankCommentInput(text))
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "کامنت نمی‌تواند خالی یا «بدون کامنت» باشد. لطفاً متن کامنت جدید را ارسال کنید یا «انصراف» را بزنید.",
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        if (!int.TryParse(user.ConfigLink, out var clientId) || clientId <= 0)
+        {
+            await _userDbContext.ClearUserStatus(user);
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "شناسه اکانت برای تغییر کامنت معتبر نیست. لطفاً دوباره از لیست اکانت‌ها اقدام کنید.",
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        var fromSearch = string.Equals(user.SelectedCountry, AccountCommentSourceSearch, StringComparison.OrdinalIgnoreCase);
+        var page = int.TryParse(user.SubLink, out var parsedPage) ? parsedPage : 0;
+        await ApplyAccountCommentAsync(
+            botClient,
+            message.Chat.Id,
+            0,
+            credUser,
+            clientId,
+            page,
+            fromSearch,
+            text,
+            mainReplyMarkup,
+            cancellationToken);
+
+        await _userDbContext.ClearUserStatus(user);
         return true;
     }
 
@@ -460,6 +530,16 @@ public class XuiV3BotFlowService
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "اکانت پیدا شد، ولی مالک آن با حساب تلگرام شما یکی نیست.",
+                    replyMarkup: mainReplyMarkup,
+                    cancellationToken: cancellationToken);
+                return true;
+            }
+
+            if (!IsClientRenewable(client))
+            {
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "این اکانت مربوط به inboundهای فعال پلن‌های فعلی ربات نیست و از طریق ربات قابل تمدید نیست.",
                     replyMarkup: mainReplyMarkup,
                     cancellationToken: cancellationToken);
                 return true;
@@ -988,7 +1068,10 @@ public class XuiV3BotFlowService
 
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
-            text: "✅ تمدید با موفقیت انجام شد.\n\n" + BuildV3ClientInfo(client, serverInfo, credUser.IsColleague),
+            text: "✅ تمدید با موفقیت انجام شد.\n\n" +
+                  BuildHtmlBalanceDeductionText(beforeBalance, resolved.PriceToman, afterBalance) +
+                  "\n\n" +
+                  BuildV3ClientInfo(client, serverInfo, credUser.IsColleague),
             parseMode: ParseMode.Html,
             replyMarkup: mainReplyMarkup,
             cancellationToken: cancellationToken);
@@ -1665,6 +1748,20 @@ public class XuiV3BotFlowService
             return true;
         }
 
+        if (callback.Action == "ascom")
+        {
+            await HandleAccountCommentStartCallbackAsync(
+                botClient,
+                chatId,
+                messageId,
+                credUser,
+                callback.ClientId,
+                callback.Page ?? 0,
+                true,
+                cancellationToken);
+            return true;
+        }
+
         if (callback.Action == "acct")
         {
             await HandleAccountStateCallbackAsync(
@@ -1706,6 +1803,20 @@ public class XuiV3BotFlowService
         if (callback.Action == "ach")
         {
             await HandleAccountChangeLinkCallbackAsync(
+                botClient,
+                chatId,
+                messageId,
+                credUser,
+                callback.ClientId,
+                callback.Page ?? 0,
+                false,
+                cancellationToken);
+            return true;
+        }
+
+        if (callback.Action == "acom")
+        {
+            await HandleAccountCommentStartCallbackAsync(
                 botClient,
                 chatId,
                 messageId,
@@ -2192,7 +2303,10 @@ public class XuiV3BotFlowService
                 await _userDbContext.ClearUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: chatId,
-                    text: "منوی اصلی",
+                    text: "✅ خرید با موفقیت انجام شد.\n\n" +
+                          BuildHtmlBalanceDeductionText(bulkBeforeBalance, bulkResult.TotalSuccessfulPriceToman, bulkAfterBalance) +
+                          "\n\nمنوی اصلی",
+                    parseMode: ParseMode.Html,
                     replyMarkup: mainReplyMarkup,
                     cancellationToken: cancellationToken);
                 return true;
@@ -2243,8 +2357,8 @@ public class XuiV3BotFlowService
         });
 
         const string text = "عبارت جستجو را بفرستید.\n\n" +
-                            "اگر UUID کامل کانفیگ را بفرستید، کل پنل بررسی می‌شود و حتی اگر اکانت متعلق به شما نباشد فقط امکان تمدید آن فعال می‌شود.\n\n" +
-                            "اگر یک متن معمولی بفرستید، فقط بین اکانت‌های خودتان و روی نام اکانت و کامنت کاربر جستجو می‌کنم.";
+                            "می‌توانید نام اکانت، شماره اکانت، بخشی از کامنت، UUID، ساب‌لینک، Subscription ID، لینک vless یا لینک vmess را ارسال کنید.\n\n" +
+                            "اگر اکانت پیدا شده متعلق به شما نباشد، فقط امکان تمدید آن فعال می‌شود.";
 
         if (messageId != 0)
         {
@@ -2333,6 +2447,14 @@ public class XuiV3BotFlowService
         }
 
         var allClients = response.Obj ?? new List<XuiV3Client>();
+        await _userDbContext.SaveUserStatus(new User
+        {
+            Id = credUser.TelegramUserId,
+            Flow = AccountSearchFlowName,
+            LastStep = AccountSearchStepResults,
+            ConfigLink = query
+        });
+
         if (TryExtractUuidQuery(query, out var uuid))
         {
             var uuidClient = allClients.FirstOrDefault(client => ClientUuidEquals(client, uuid));
@@ -2350,8 +2472,10 @@ public class XuiV3BotFlowService
             }
 
             var isOwner = ClientBelongsToUser(uuidClient, credUser.TelegramUserId);
-            var text = BuildUuidSearchResultText(uuidClient, serverInfo, isOwner);
-            var keyboard = BuildUuidSearchResultKeyboard(uuidClient);
+            var text = BuildDirectSearchResultText(uuidClient, serverInfo, isOwner, "UUID", uuid);
+            var keyboard = isOwner
+                ? BuildAccountSearchDetailsKeyboard(uuidClient, page, IsClientRenewable(uuidClient))
+                : BuildUuidSearchResultKeyboard(uuidClient, IsClientRenewable(uuidClient));
 
             await SendOrEditTextAsync(
                 botClient,
@@ -2364,20 +2488,35 @@ public class XuiV3BotFlowService
             return;
         }
 
+        if (TryExtractSubIdQuery(query, out var subId))
+        {
+            var subIdClient = allClients.FirstOrDefault(client => ClientSubIdEquals(client, subId));
+            if (subIdClient != null)
+            {
+                var isOwner = ClientBelongsToUser(subIdClient, credUser.TelegramUserId);
+                var text = BuildDirectSearchResultText(subIdClient, serverInfo, isOwner, "Subscription ID", subId);
+                var keyboard = isOwner
+                    ? BuildAccountSearchDetailsKeyboard(subIdClient, page, IsClientRenewable(subIdClient))
+                    : BuildUuidSearchResultKeyboard(subIdClient, IsClientRenewable(subIdClient));
+
+                await SendOrEditTextAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    text,
+                    ParseMode.Html,
+                    keyboard,
+                    cancellationToken);
+                return;
+            }
+        }
+
         var results = allClients
             .Where(client => ClientBelongsToUser(client, credUser.TelegramUserId))
             .Where(client => ClientMatchesSearchQuery(client, normalizedQuery))
             .OrderBy(client => IsExpiredOrDepleted(client) ? 0 : 1)
             .ThenBy(client => client.Email)
             .ToList();
-
-        await _userDbContext.SaveUserStatus(new User
-        {
-            Id = credUser.TelegramUserId,
-            Flow = AccountSearchFlowName,
-            LastStep = AccountSearchStepResults,
-            ConfigLink = query
-        });
 
         if (results.Count == 0)
         {
@@ -2511,8 +2650,9 @@ public class XuiV3BotFlowService
         }
 
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var text = BuildV3ClientInfo(client, serverInfo, credUser.IsColleague);
-        var keyboard = BuildAccountDetailsKeyboard(client, page, credUser.IsColleague);
+        var canRenew = IsClientRenewable(client);
+        var text = BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, canRenew);
+        var keyboard = BuildAccountDetailsKeyboard(client, page, credUser.IsColleague, canRenew);
 
         if (messageId != 0)
         {
@@ -2552,6 +2692,15 @@ public class XuiV3BotFlowService
             await botClient.SendTextMessageAsync(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای تمدید پیدا نشد یا متعلق به حساب شما نیست.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (!IsClientRenewable(client))
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: "این اکانت مربوط به inboundهای فعال پلن‌های فعلی ربات نیست و از طریق ربات قابل تمدید نیست.",
                 cancellationToken: cancellationToken);
             return;
         }
@@ -2887,9 +3036,9 @@ public class XuiV3BotFlowService
             botClient,
             chatId,
             messageId,
-            BuildV3ClientInfo(client, serverInfo, credUser.IsColleague),
+            BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
             ParseMode.Html,
-            BuildAccountSearchDetailsKeyboard(client, page),
+            BuildAccountSearchDetailsKeyboard(client, page, IsClientRenewable(client)),
             cancellationToken);
     }
 
@@ -2914,6 +3063,15 @@ public class XuiV3BotFlowService
                 text: allowExternalRenew
                     ? "اکانت مورد نظر برای تمدید پیدا نشد."
                     : "اکانت مورد نظر برای تمدید پیدا نشد یا متعلق به حساب شما نیست.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (!IsClientRenewable(client))
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: "این اکانت مربوط به inboundهای فعال پلن‌های فعلی ربات نیست و از طریق ربات قابل تمدید نیست.",
                 cancellationToken: cancellationToken);
             return;
         }
@@ -3109,7 +3267,7 @@ public class XuiV3BotFlowService
                 chatId,
                 messageId,
                 $"متاسفانه عملیات مورد نظر انجام نشد.\n{updateResponse.Msg}",
-                replyMarkup: BuildAccountSearchDetailsKeyboard(client, page),
+                replyMarkup: BuildAccountSearchDetailsKeyboard(client, page, IsClientRenewable(client)),
                 cancellationToken: cancellationToken);
             return;
         }
@@ -3132,10 +3290,124 @@ public class XuiV3BotFlowService
             botClient,
             chatId,
             messageId,
-            BuildV3ClientInfo(client, serverInfo, credUser.IsColleague),
+            BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
             ParseMode.Html,
-            BuildAccountSearchDetailsKeyboard(client, page),
+            BuildAccountSearchDetailsKeyboard(client, page, IsClientRenewable(client)),
             cancellationToken);
+    }
+
+    private async Task HandleAccountCommentStartCallbackAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        int messageId,
+        CredUser credUser,
+        int? clientId,
+        int page,
+        bool fromSearch,
+        CancellationToken cancellationToken)
+    {
+        var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
+        if (client == null)
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: "اکانت مورد نظر برای تغییر کامنت پیدا نشد یا متعلق به حساب شما نیست.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        await _userDbContext.SaveUserStatus(new User
+        {
+            Id = credUser.TelegramUserId,
+            Flow = AccountCommentFlowName,
+            LastStep = AccountCommentStepText,
+            ConfigLink = client.Id.ToString(),
+            SubLink = page.ToString(),
+            SelectedCountry = fromSearch ? AccountCommentSourceSearch : AccountCommentSourceList
+        });
+
+        var metadata = TryReadMetadata(client.Comment);
+        var currentComment = string.IsNullOrWhiteSpace(metadata?.UserComment)
+            ? "ثبت نشده"
+            : metadata.UserComment.Trim();
+        var backCallback = fromSearch
+            ? XuiV3PurchaseCallbacks.AccountSearchView(client.Id, page)
+            : XuiV3PurchaseCallbacks.AccountView(client.Id, page);
+
+        await SendOrEditTextAsync(
+            botClient,
+            chatId,
+            messageId,
+            $"اکانت: <code>{Html(client.Email)}</code>\nکامنت فعلی: <code>{Html(currentComment)}</code>\n\nکامنت جدید را ارسال کنید. کامنت خالی یا «بدون کامنت» پذیرفته نمی‌شود.",
+            ParseMode.Html,
+            new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("بازگشت", backCallback) },
+                new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) }
+            }),
+            cancellationToken);
+    }
+
+    private async Task ApplyAccountCommentAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        int messageId,
+        CredUser credUser,
+        int clientId,
+        int page,
+        bool fromSearch,
+        string newComment,
+        IReplyMarkup mainReplyMarkup,
+        CancellationToken cancellationToken)
+    {
+        var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
+        if (client == null)
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: "اکانت مورد نظر برای تغییر کامنت پیدا نشد یا متعلق به حساب شما نیست.",
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var serverInfo = BuildConfiguredPanelServerInfo();
+        var payload = BuildUpdateCommentPayload(client, newComment, credUser.TelegramUserId);
+        var updateResponse = await ApiServicev3.UpdateClientAsync(serverInfo, _configuration, client.Email, payload, cancellationToken);
+        if (!updateResponse.Success)
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: $"تغییر کامنت ناموفق بود.\n{updateResponse.Msg}",
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        await _activityLog.LogBotActionAsync(
+            fromSearch ? "xui_v3_account_comment_updated_search" : "xui_v3_account_comment_updated",
+            credUser,
+            false,
+            new Dictionary<string, object>
+            {
+                ["accountEmail"] = client.Email,
+                ["newComment"] = newComment,
+                ["panelUrl"] = serverInfo.Url,
+                ["rootPath"] = serverInfo.RootPath,
+                ["source"] = fromSearch ? "account_search" : "account_list"
+            },
+            cancellationToken);
+
+        client.Comment = payload.Comment;
+        await botClient.SendTextMessageAsync(
+            chatId: chatId,
+            text: "✅ کامنت اکانت با موفقیت تغییر کرد.\n\n" +
+                  BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
+            parseMode: ParseMode.Html,
+            replyMarkup: fromSearch
+                ? BuildAccountSearchDetailsKeyboard(client, page, IsClientRenewable(client))
+                : BuildAccountDetailsKeyboard(client, page, credUser.IsColleague, IsClientRenewable(client)),
+            cancellationToken: cancellationToken);
     }
 
     private async Task<XuiV3Client> GetOwnedClientByIdAsync(
@@ -3197,10 +3469,16 @@ public class XuiV3BotFlowService
         return builder.ToString();
     }
 
-    private static string BuildUuidSearchResultText(XuiV3Client client, ServerInfo serverInfo, bool isOwner)
+    private static string BuildDirectSearchResultText(
+        XuiV3Client client,
+        ServerInfo serverInfo,
+        bool isOwner,
+        string identifierLabel,
+        string identifierValue)
     {
         var builder = new StringBuilder();
-        builder.AppendLine("نتیجه جستجوی UUID");
+        builder.AppendLine("نتیجه جستجوی اکانت");
+        builder.AppendLine($"{Html(identifierLabel)}: <code>{Html(identifierValue)}</code>");
         builder.AppendLine();
         builder.AppendLine(isOwner
             ? "این اکانت متعلق به حساب شماست."
@@ -3273,14 +3551,15 @@ public class XuiV3BotFlowService
         return new InlineKeyboardMarkup(rows);
     }
 
-    private static InlineKeyboardMarkup BuildAccountDetailsKeyboard(XuiV3Client client, int page, bool isColleague)
+    private static InlineKeyboardMarkup BuildAccountDetailsKeyboard(XuiV3Client client, int page, bool isColleague, bool canRenew)
     {
-        var rows = new List<InlineKeyboardButton[]>
-        {
-            new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", XuiV3PurchaseCallbacks.AccountRenew(client.Id, page)) },
-            new[] { InlineKeyboardButton.WithCallbackData("تغییر لینک", XuiV3PurchaseCallbacks.AccountChangeLink(client.Id, page)) },
-            new[] { InlineKeyboardButton.WithCallbackData("حذف همین اکانت", XuiV3PurchaseCallbacks.AccountDeleteAsk(client.Id, page)) }
-        };
+        var rows = new List<InlineKeyboardButton[]>();
+        if (canRenew)
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", XuiV3PurchaseCallbacks.AccountRenew(client.Id, page)) });
+
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تغییر لینک", XuiV3PurchaseCallbacks.AccountChangeLink(client.Id, page)) });
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تغییر کامنت", XuiV3PurchaseCallbacks.AccountComment(client.Id, page)) });
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("حذف همین اکانت", XuiV3PurchaseCallbacks.AccountDeleteAsk(client.Id, page)) });
 
         var actionText = client.Enable ? "غیرفعال کردن" : "فعال کردن";
         var callbackData = client.Enable
@@ -3293,14 +3572,15 @@ public class XuiV3BotFlowService
         return new InlineKeyboardMarkup(rows);
     }
 
-    private static InlineKeyboardMarkup BuildAccountSearchDetailsKeyboard(XuiV3Client client, int page)
+    private static InlineKeyboardMarkup BuildAccountSearchDetailsKeyboard(XuiV3Client client, int page, bool canRenew)
     {
-        var rows = new List<InlineKeyboardButton[]>
-        {
-            new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", XuiV3PurchaseCallbacks.AccountSearchRenew(client.Id, page)) },
-            new[] { InlineKeyboardButton.WithCallbackData("تغییر لینک", XuiV3PurchaseCallbacks.AccountSearchChangeLink(client.Id, page)) },
-            new[] { InlineKeyboardButton.WithCallbackData("حذف همین اکانت", XuiV3PurchaseCallbacks.AccountSearchDeleteAsk(client.Id, page)) }
-        };
+        var rows = new List<InlineKeyboardButton[]>();
+        if (canRenew)
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", XuiV3PurchaseCallbacks.AccountSearchRenew(client.Id, page)) });
+
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تغییر لینک", XuiV3PurchaseCallbacks.AccountSearchChangeLink(client.Id, page)) });
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تغییر کامنت", XuiV3PurchaseCallbacks.AccountSearchComment(client.Id, page)) });
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("حذف همین اکانت", XuiV3PurchaseCallbacks.AccountSearchDeleteAsk(client.Id, page)) });
 
         var actionText = client.Enable ? "غیرفعال کردن" : "فعال کردن";
         var callbackData = client.Enable
@@ -3313,15 +3593,20 @@ public class XuiV3BotFlowService
         return new InlineKeyboardMarkup(rows);
     }
 
-    private static InlineKeyboardMarkup BuildUuidSearchResultKeyboard(XuiV3Client client)
+    private static InlineKeyboardMarkup BuildUuidSearchResultKeyboard(XuiV3Client client, bool canRenew)
     {
-        return new InlineKeyboardMarkup(new[]
+        var rows = new List<InlineKeyboardButton[]>();
+        if (canRenew)
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", XuiV3PurchaseCallbacks.AccountUuidRenew(client.Id)) });
+
+        rows.AddRange(new[]
         {
-            new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", XuiV3PurchaseCallbacks.AccountUuidRenew(client.Id)) },
             new[] { InlineKeyboardButton.WithCallbackData("جستجوی جدید", XuiV3PurchaseCallbacks.AccountSearchStart()) },
             new[] { InlineKeyboardButton.WithCallbackData("بازگشت به لیست کلی", XuiV3PurchaseCallbacks.AccountList(0)) },
             new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) }
         });
+
+        return new InlineKeyboardMarkup(rows);
     }
 
     private static InlineKeyboardMarkup BuildSearchStartKeyboard()
@@ -3360,7 +3645,7 @@ public class XuiV3BotFlowService
         {
             await botClient.SendTextMessageAsync(
                 chatId: chatId,
-                text: BuildV3ClientInfo(client, serverInfo, isColleague),
+                text: BuildV3ClientInfo(client, serverInfo, isColleague, IsClientRenewable(client)),
                 parseMode: ParseMode.Html,
                 replyMarkup: BuildV3AccountKeyboard(client, isColleague),
                 cancellationToken: cancellationToken);
@@ -3374,6 +3659,13 @@ public class XuiV3BotFlowService
 
         return _purchaseService.GetEnabledServices().FirstOrDefault(service =>
             string.Equals(service.Key, serviceKey, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private bool IsClientRenewable(XuiV3Client client)
+    {
+        return XuiV3ClientPlanEligibility.IsClientInActiveServiceInbounds(
+            client,
+            _purchaseService.GetEnabledServices());
     }
 
     private static string FormatExpiry(long expiryTime)
@@ -3417,35 +3709,34 @@ public class XuiV3BotFlowService
             normalizedDetails.Add(detail);
         }
 
-        message.AppendLine(title);
-        message.AppendLine($"یوزر `{credUser.TelegramUserId}`");
+        message.AppendLine(Html(title));
 
         var userSummary = FormatCredUserSummary(credUser);
         if (!string.IsNullOrWhiteSpace(userSummary))
             message.AppendLine(userSummary);
 
-        message.AppendLine($"مبلغ `{priceToman.FormatCurrency()}`");
+        message.AppendLine($"مبلغ <code>{Html(priceToman.FormatCurrency())}</code>");
 
         if (beforeBalance.HasValue)
-            message.AppendLine($"موجودی قبل از خرید `{beforeBalance.Value.FormatCurrency()}`");
+            message.AppendLine($"موجودی قبل از خرید <code>{Html(beforeBalance.Value.FormatCurrency())}</code>");
 
         if (afterBalance.HasValue)
-            message.AppendLine($"موجودی پس از خرید `{afterBalance.Value.FormatCurrency()}`");
+            message.AppendLine($"موجودی پس از خرید <code>{Html(afterBalance.Value.FormatCurrency())}</code>");
 
         if (metadataFromComment != null)
         {
-            message.AppendLine($"تاریخ ساخت `{FormatMetadataCreatedAt(metadataFromComment)}`");
+            message.AppendLine($"تاریخ ساخت <code>{Html(FormatMetadataCreatedAt(metadataFromComment))}</code>");
 
             if (!string.IsNullOrWhiteSpace(metadataFromComment.ServiceName))
-                message.AppendLine($"سرویس `{metadataFromComment.ServiceName}`");
+                message.AppendLine($"سرویس <code>{Html(metadataFromComment.ServiceName)}</code>");
         }
 
         foreach (var detail in normalizedDetails)
         {
-            message.AppendLine(detail);
+            message.AppendLine(Html(detail));
         }
 
-        _logger.LogInformation(message.ToString().EscapeMarkdown());
+        _logger.LogPayment(message.ToString());
     }
 
     private static string BuildBulkFailureText(XuiV3BulkCreationResult result)
@@ -3542,37 +3833,23 @@ public class XuiV3BotFlowService
         return metadata.CreatedAtUtc.AddMinutes(210).ConvertToHijriShamsi();
     }
 
+    private static string BuildHtmlBalanceDeductionText(long beforeBalance, long deductedAmount, long afterBalance)
+    {
+        return $"💳 موجودی قبل: <code>{Html(beforeBalance.FormatCurrency())}</code>\n" +
+               $"💸 مبلغ کسر شده: <code>{Html(deductedAmount.FormatCurrency())}</code>\n" +
+               $"💰 موجودی باقی‌مانده: <code>{Html(afterBalance.FormatCurrency())}</code>";
+    }
+
     private static string FormatCredUserSummary(CredUser credUser)
     {
         if (credUser == null)
             return string.Empty;
 
-        var parts = new List<string>();
-        var fullName = string.Join(" ", new[] { credUser.FirstName, credUser.LastName }
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .Select(value => value.Trim()));
-
-        if (!string.IsNullOrWhiteSpace(fullName))
-            parts.Add($"نام `{fullName}`");
-
-        if (!string.IsNullOrWhiteSpace(credUser.Username))
-            parts.Add($"یوزرنیم `@{credUser.Username.Trim().TrimStart('@')}`");
-
-        parts.Add($"نوع `{(credUser.IsColleague ? "همکار" : "کاربر عادی")}`");
-
-        return string.Join("\n", parts);
+        return TelegramUserLinkFormatter.HtmlSummary(credUser);
     }
 
     private static string BuildColleagueRequestLogMessage(CredUser credUser)
     {
-        var fullName = string.Join(" ", new[] { credUser?.FirstName, credUser?.LastName }
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .Select(value => value.Trim()));
-
-        var username = string.IsNullOrWhiteSpace(credUser?.Username)
-            ? "ندارد"
-            : "@" + credUser.Username.Trim().TrimStart('@');
-
         var phone = string.IsNullOrWhiteSpace(credUser?.PhoneNumber)
             ? "ثبت نشده"
             : credUser.PhoneNumber.Trim();
@@ -3584,8 +3861,8 @@ public class XuiV3BotFlowService
         var now = DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi();
 
         return "🤝 <b>درخواست همکاری جدید</b>\n\n" +
-               $"👤 نام: <code>{Html(string.IsNullOrWhiteSpace(fullName) ? "ثبت نشده" : fullName)}</code>\n" +
-               $"🔹 یوزرنیم: <code>{Html(username)}</code>\n" +
+               $"👤 نام: {TelegramUserLinkFormatter.HtmlUserLink(credUser)}\n" +
+               $"🔹 یوزرنیم: {TelegramUserLinkFormatter.HtmlUsername(credUser)}\n" +
                $"🆔 آیدی عددی: <code>{credUser?.TelegramUserId ?? 0}</code>\n" +
                $"💬 Chat ID: <code>{credUser?.ChatID ?? 0}</code>\n" +
                $"📱 شماره تلفن: <code>{Html(phone)}</code>\n" +
@@ -4122,6 +4399,16 @@ public class XuiV3BotFlowService
                value.Equals("بدون کامنت", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsBlankCommentInput(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return true;
+
+        var value = text.Trim();
+        return value.Equals(SkipCommentText, StringComparison.OrdinalIgnoreCase) ||
+               value.Equals("بدون کامنت", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static XuiV3ClientMetadata TryReadMetadata(string comment)
     {
         if (string.IsNullOrWhiteSpace(comment))
@@ -4185,6 +4472,9 @@ public class XuiV3BotFlowService
         if (string.IsNullOrWhiteSpace(text))
             return false;
 
+        if (TryExtractVmessUuidQuery(text, out uuid))
+            return true;
+
         var match = System.Text.RegularExpressions.Regex.Match(
             text,
             @"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
@@ -4197,11 +4487,89 @@ public class XuiV3BotFlowService
         return true;
     }
 
+    private static bool TryExtractVmessUuidQuery(string text, out string uuid)
+    {
+        uuid = null;
+        if (string.IsNullOrWhiteSpace(text) ||
+            !text.Trim().StartsWith("vmess://", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        try
+        {
+            var payload = text.Trim().Substring("vmess://".Length).Trim();
+            payload = payload.Replace('-', '+').Replace('_', '/');
+            var padding = payload.Length % 4;
+            if (padding > 0)
+                payload = payload.PadRight(payload.Length + (4 - padding), '=');
+
+            var json = Encoding.UTF8.GetString(Convert.FromBase64String(payload));
+            var vmess = JsonConvert.DeserializeObject<VMessConfiguration>(json);
+            if (vmess?.Id != Guid.Empty)
+            {
+                uuid = vmess.Id.ToString();
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[XUIv3] vmess search parse failed: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    private static bool TryExtractSubIdQuery(string text, out string subId)
+    {
+        subId = null;
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        var value = text.Trim();
+        if (value.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase) ||
+            value.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+            (uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) ||
+             uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)))
+        {
+            var segments = uri.AbsolutePath
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .Select(Uri.UnescapeDataString)
+                .Where(segment => !string.IsNullOrWhiteSpace(segment))
+                .ToList();
+
+            if (segments.Count == 0)
+                return false;
+
+            subId = segments[^1].Trim();
+            return !string.IsNullOrWhiteSpace(subId);
+        }
+
+        if (value.Contains(' ') || value.Contains('\n') || value.Contains('\r'))
+            return false;
+
+        subId = value.Trim().Trim('/');
+        return !string.IsNullOrWhiteSpace(subId);
+    }
+
     private static bool ClientUuidEquals(XuiV3Client client, string uuid)
     {
         return client != null &&
                !string.IsNullOrWhiteSpace(client.Uuid) &&
                string.Equals(client.Uuid.Trim(), uuid, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ClientSubIdEquals(XuiV3Client client, string subId)
+    {
+        if (client == null || string.IsNullOrWhiteSpace(subId))
+            return false;
+
+        var normalized = subId.Trim().Trim('/');
+        return (!string.IsNullOrWhiteSpace(client.SubId) &&
+                string.Equals(client.SubId.Trim(), normalized, StringComparison.OrdinalIgnoreCase)) ||
+               (!string.IsNullOrWhiteSpace(client.Email) &&
+                string.Equals(client.Email.Trim(), normalized, StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool ClientMatchesSearchQuery(XuiV3Client client, string normalizedQuery)
@@ -4394,6 +4762,43 @@ public class XuiV3BotFlowService
         };
     }
 
+    private static XuiV3ClientPayload BuildUpdateCommentPayload(
+        XuiV3Client client,
+        string newUserComment,
+        long actorTelegramUserId)
+    {
+        var metadata = TryReadMetadata(client.Comment) ?? new XuiV3ClientMetadata
+        {
+            TelegramUserId = GetClientOwnerTelegramId(client) > 0 ? GetClientOwnerTelegramId(client) : actorTelegramUserId,
+            CreatedAtUtc = DateTime.UtcNow
+        };
+
+        if (metadata.TelegramUserId <= 0)
+            metadata.TelegramUserId = GetClientOwnerTelegramId(client) > 0 ? GetClientOwnerTelegramId(client) : actorTelegramUserId;
+
+        metadata.UserComment = newUserComment?.Trim();
+        metadata.LastUpdatedByTelegramUserId = actorTelegramUserId;
+        metadata.LastAction = "update-comment";
+
+        return new XuiV3ClientPayload
+        {
+            Email = client.Email,
+            Uuid = client.Uuid,
+            Password = client.Password,
+            TotalGB = GetTotalBytes(client),
+            ExpiryTime = GetExpiryTime(client),
+            TgId = metadata.TelegramUserId,
+            LimitIp = client.LimitIp,
+            Enable = client.Enable,
+            SubId = string.IsNullOrWhiteSpace(client.SubId) ? client.Email : client.SubId,
+            Flow = client.Flow,
+            Comment = JsonConvert.SerializeObject(metadata, Formatting.None),
+            Group = client.Group,
+            Reverse = client.Reverse,
+            Extra = client.Extra
+        };
+    }
+
     private static InlineKeyboardMarkup BuildChangeLinkResultKeyboard(int clientId, int page, bool fromSearch)
     {
         return new InlineKeyboardMarkup(new[]
@@ -4470,12 +4875,6 @@ public class XuiV3BotFlowService
         ServerInfo serverInfo)
     {
         var metadata = TryReadMetadata(client.Comment);
-        var actorFullName = string.Join(" ", new[] { actor?.FirstName, actor?.LastName }
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .Select(value => value.Trim()));
-        var actorUsername = string.IsNullOrWhiteSpace(actor?.Username)
-            ? "ندارد"
-            : "@" + actor.Username.Trim().TrimStart('@');
         var actorRole = actor?.IsColleague == true ? "همکار" : "کاربر عادی";
         var ownerTelegramUserId = GetClientOwnerTelegramId(client);
         var totalBytes = GetTotalBytes(client);
@@ -4489,8 +4888,8 @@ public class XuiV3BotFlowService
         var builder = new StringBuilder();
         builder.AppendLine("🔁 <b>گزارش تغییر لینک اکانت نسخه ۳</b>");
         builder.AppendLine();
-        builder.AppendLine($"👤 انجام‌دهنده: <code>{Html(string.IsNullOrWhiteSpace(actorFullName) ? "ثبت نشده" : actorFullName)}</code>");
-        builder.AppendLine($"🔹 یوزرنیم: <code>{Html(actorUsername)}</code>");
+        builder.AppendLine($"👤 انجام‌دهنده: {TelegramUserLinkFormatter.HtmlUserLink(actor)}");
+        builder.AppendLine($"🔹 یوزرنیم: {TelegramUserLinkFormatter.HtmlUsername(actor)}");
         builder.AppendLine($"🆔 آیدی عددی انجام‌دهنده: <code>{actor?.TelegramUserId ?? 0}</code>");
         builder.AppendLine($"👥 نوع کاربر: <code>{Html(actorRole)}</code>");
         builder.AppendLine($"📌 مالک اکانت روی پنل: <code>{ownerTelegramUserId}</code>");
@@ -4699,7 +5098,7 @@ public class XuiV3BotFlowService
                 cancellationToken);
 
             client.Enable = enable;
-            var updatedText = BuildV3ClientInfo(client, serverInfo, credUser.IsColleague);
+            var updatedText = BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client));
             var updatedKeyboard = BuildV3AccountKeyboard(client, credUser.IsColleague);
 
             if (messageId != 0)
