@@ -11,7 +11,8 @@ namespace Adminbot.Domain
                 return string.Empty;
 
             var label = BuildDisplayName(user);
-            return $"<a href=\"tg://user?id={user.TelegramUserId}\">{Html(label)}</a>";
+            var href = BuildUserHref(user);
+            return $"<a href=\"{Html(href)}\">{Html(label)}</a>";
         }
 
         public static string HtmlUsername(CredUser user)
@@ -47,6 +48,11 @@ namespace Adminbot.Domain
                 return "@" + user.Username.Trim().TrimStart('@');
 
             return user.TelegramUserId.ToString();
+        }
+
+        private static string BuildUserHref(CredUser user)
+        {
+            return $"tg://user?id={user.TelegramUserId}";
         }
 
         private static string Html(string value)

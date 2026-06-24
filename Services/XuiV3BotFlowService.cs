@@ -3733,7 +3733,7 @@ public class XuiV3BotFlowService
 
         foreach (var detail in normalizedDetails)
         {
-            message.AppendLine(Html(detail));
+            message.AppendLine(HtmlLogDetail(detail));
         }
 
         _logger.LogPayment(message.ToString());
@@ -3838,6 +3838,27 @@ public class XuiV3BotFlowService
         return $"💳 موجودی قبل: <code>{Html(beforeBalance.FormatCurrency())}</code>\n" +
                $"💸 مبلغ کسر شده: <code>{Html(deductedAmount.FormatCurrency())}</code>\n" +
                $"💰 موجودی باقی‌مانده: <code>{Html(afterBalance.FormatCurrency())}</code>";
+    }
+
+    private static string HtmlLogDetail(string detail)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+            return string.Empty;
+
+        var parts = detail.Split('`');
+        if (parts.Length == 1)
+            return Html(detail);
+
+        var builder = new StringBuilder();
+        for (var i = 0; i < parts.Length; i++)
+        {
+            if (i % 2 == 0)
+                builder.Append(Html(parts[i]));
+            else
+                builder.Append("<code>").Append(Html(parts[i])).Append("</code>");
+        }
+
+        return builder.ToString();
     }
 
     private static string FormatCredUserSummary(CredUser credUser)
