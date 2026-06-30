@@ -310,8 +310,9 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
         if (client.ExpiryTime != 0)
             return client.ExpiryTime;
 
-        if (client.Traffic?.ExpiryTime != 0)
-            return client.Traffic.ExpiryTime;
+        var trafficExpiryTime = client.Traffic?.ExpiryTime ?? 0;
+        if (trafficExpiryTime != 0)
+            return trafficExpiryTime;
 
         return ReadLongExtra(client, "expiryTime");
     }

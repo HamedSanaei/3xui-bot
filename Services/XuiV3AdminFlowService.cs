@@ -34,6 +34,8 @@ public class XuiV3AdminFlowService
     private const string StepSendPrivateTarget = "send-private-target";
     private const string StepSendPrivateMessage = "send-private-message";
     private const string StepSendPrivateConfirm = "send-private-confirm";
+    private const int MaxDetailedAccountInfoMessages = 5;
+    private const int MaxTelegramTextLength = 3900;
     private const string SkipCommentText = "ادامه بدون کامنت";
 
     private readonly UserDbContext _userDbContext;
@@ -1029,14 +1031,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        foreach (var client in matches)
-        {
-            await botClient.SendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: BuildClientInfo(client, serverInfo),
-                parseMode: ParseMode.Html,
-                cancellationToken: cancellationToken);
-        }
+        await SendAccountInfoResultsAsync(botClient, message.Chat.Id, matches, serverInfo, cancellationToken);
 
         await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "منوی اصلی", cancellationToken);
     }
@@ -2806,6 +2801,69 @@ public class XuiV3AdminFlowService
         return text;
     }
 
+    private static async Task SendAccountInfoResultsAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        IReadOnlyList<XuiV3Client> matches,
+        ServerInfo serverInfo,
+        CancellationToken cancellationToken)
+    {
+        if (matches.Count <= MaxDetailedAccountInfoMessages)
+        {
+            foreach (var client in matches)
+            {
+                await botClient.SendTextMessageAsync(
+                    chatId: chatId,
+                    text: BuildClientInfo(client, serverInfo),
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+
+            return;
+        }
+
+        foreach (var text in BuildCompactAccountInfoMessages(matches))
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: text,
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    private static IEnumerable<string> BuildCompactAccountInfoMessages(IReadOnlyList<XuiV3Client> clients)
+    {
+        var header = $"Found <code>{clients.Count}</code> accounts. Sending compact list to avoid Telegram flood limits.\n";
+        header += "For full details, search the exact email/client name.\n\n";
+
+        var builder = new StringBuilder(header);
+        for (var index = 0; index < clients.Count; index++)
+        {
+            var line = BuildCompactAccountInfoLine(clients[index], index + 1);
+            if (builder.Length > header.Length && builder.Length + line.Length > MaxTelegramTextLength)
+            {
+                yield return builder.ToString();
+                builder.Clear();
+                builder.Append(header);
+            }
+
+            builder.Append(line);
+        }
+
+        if (builder.Length > header.Length)
+            yield return builder.ToString();
+    }
+
+    private static string BuildCompactAccountInfoLine(XuiV3Client client, int index)
+    {
+        var status = client.Enable ? "active" : "disabled";
+        var email = string.IsNullOrWhiteSpace(client.Email) ? "-" : client.Email;
+        var traffic = FormatTraffic(client);
+        var expiry = FormatExpiry(GetExpiryTime(client));
+        return $"{index}. <code>{Html(email)}</code> ID:<code>{client.Id}</code> <code>{status}</code> <code>{Html(traffic)}</code> exp:<code>{Html(expiry)}</code>\n";
+    }
+
     private static string BuildPaymentInfo(
         SwapinoPaymentInfo payment,
         NowPaymentsPaymentRecordData data,
@@ -2913,8 +2971,9 @@ public class XuiV3AdminFlowService
         if (client.ExpiryTime != 0)
             return client.ExpiryTime;
 
-        if (client.Traffic?.ExpiryTime != 0)
-            return client.Traffic.ExpiryTime;
+        var trafficExpiryTime = client.Traffic?.ExpiryTime ?? 0;
+        if (trafficExpiryTime != 0)
+            return trafficExpiryTime;
 
         return ReadLongExtra(client, "expiryTime");
     }

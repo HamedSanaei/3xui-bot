@@ -15,81 +15,87 @@ using Newtonsoft.Json.Linq;
 public class ApiService
 {
     public static async Task<string> LoginAndGetSessionCookie(ServerInfo serverInfo)
-
     {
-
-        System.Net.ServicePointManager.SecurityProtocol =
-    SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
-
-        HttpClient httpClient = new HttpClient();
-        string username = serverInfo.Username;
-        string password = serverInfo.Password;
-        string apiUrl = serverInfo.Url;
-        string rootPath = serverInfo.RootPath;
-
-        string completeSessionCookie = string.Empty;
-        var loginData = new
+        try
         {
-            Username = username,
-            Password = password
-        };
+            System.Net.ServicePointManager.SecurityProtocol =
+                SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
 
-        //check the databas if exist return
-        var context = new UserDbContext();
-        var dbCookie = await context.Cookies.FirstOrDefaultAsync(c => c.Url == apiUrl);
-        if (dbCookie != null)
-        {
-            string cookie = dbCookie.SessionCookie;
-            DateTimeOffset currentUtcTime = DateTimeOffset.UtcNow;
-
-
-            if (dbCookie.ExpirationDate > currentUtcTime && await IsCookieValid(serverInfo, cookie))
-                return dbCookie.SessionCookie;
-        }
-        if (dbCookie?.ExpirationDate < DateTimeOffset.UtcNow || dbCookie == null)
-        {
-            // valid nist 
-            // Set the base address of your API
-            httpClient.BaseAddress = new Uri(apiUrl);
-            HttpResponseMessage response = await httpClient.PostAsJsonAsync($"/{rootPath}/login", loginData);
-
-            if (response.IsSuccessStatusCode)
+            if (serverInfo == null)
             {
-                // Read the content as a string
-                string responseContent = await response.Content.ReadAsStringAsync();
+                Console.WriteLine("[ApiService] Login failed: serverInfo is null.");
+                return null;
+            }
 
-                // Retrieve the session cookie if present
-                IEnumerable<string> setCookieHeaders;
-                if (response.Headers.TryGetValues("Set-Cookie", out setCookieHeaders))
+            string username = serverInfo.Username;
+            string password = serverInfo.Password;
+            string apiUrl = serverInfo.Url;
+            string rootPath = serverInfo.RootPath?.Trim('/');
+
+            if (string.IsNullOrWhiteSpace(apiUrl) || !Uri.TryCreate(apiUrl, UriKind.Absolute, out var baseUri))
+            {
+                Console.WriteLine($"[ApiService] Login failed: invalid server Url '{apiUrl}'.");
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(rootPath))
+            {
+                Console.WriteLine($"[ApiService] Login failed: RootPath is empty for '{apiUrl}'.");
+                return null;
+            }
+
+            string completeSessionCookie = string.Empty;
+            var loginData = new
+            {
+                Username = username,
+                Password = password
+            };
+
+            using var httpClient = new HttpClient { BaseAddress = baseUri };
+            using var context = new UserDbContext();
+            var dbCookie = await context.Cookies.FirstOrDefaultAsync(c => c.Url == apiUrl);
+            if (dbCookie != null)
+            {
+                string cookie = dbCookie.SessionCookie;
+                DateTimeOffset currentUtcTime = DateTimeOffset.UtcNow;
+
+                if (!string.IsNullOrWhiteSpace(cookie)
+                    && dbCookie.ExpirationDate > currentUtcTime
+                    && await IsCookieValid(serverInfo, cookie))
                 {
-                    // Extract the session cookie from the Set-Cookie header
+                    return dbCookie.SessionCookie;
+                }
+            }
+
+            if (dbCookie?.ExpirationDate < DateTimeOffset.UtcNow || dbCookie == null)
+            {
+                HttpResponseMessage response = await httpClient.PostAsJsonAsync($"/{rootPath}/login", loginData);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine($"Error: {response.StatusCode} - {response.ReasonPhrase}");
+                    Console.WriteLine("Error: there is a problem with retreieving or getting new cookie!");
+                    return null;
+                }
+
+                if (response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
+                {
                     completeSessionCookie = setCookieHeaders.FirstOrDefault(cookie => cookie.StartsWith("session") || cookie.StartsWith("3x-ui="));
-                    //     var allSetCookies = setCookieHeaders.Where(cookie => cookie.StartsWith("session") || cookie.StartsWith("3x-ui")).ToList();
-
-                    //     // for newer version of 3xui
-                    //     if (allSetCookies[0].Contains("3x-ui"))
-                    //     {
-
-                    //         completeSessionCookie = allSetCookies.Last();
-                    //     }
-                    //     // for older panels
-                    //     else
-                    //     {
-                    //         completeSessionCookie = setCookieHeaders.FirstOrDefault(cookie => cookie.StartsWith("session"));
-
-                    //     }
-                    // 
                 }
-                else
+
+                if (string.IsNullOrWhiteSpace(completeSessionCookie))
                 {
-                    // Handle the case where extraction fails
-                    Console.WriteLine("Failed to extract expiration date from the cookie.");
+                    Console.WriteLine($"[ApiService] Login failed: Set-Cookie header was not found for '{apiUrl}'.");
+                    return null;
                 }
 
-                // Do something with the session cookie, e.g., store it for future use
-                //Console.WriteLine($"Complete Session Cookie: {completeSessionCookie}");
                 TryExtractExpirationDate(completeSessionCookie, out var expirationDate);
                 var purecookie = GetSessionCookie(completeSessionCookie);
+                if (string.IsNullOrWhiteSpace(purecookie))
+                {
+                    Console.WriteLine($"[ApiService] Login failed: session cookie could not be parsed for '{apiUrl}'.");
+                    return null;
+                }
 
                 if (dbCookie != null)
                 {
@@ -100,20 +106,20 @@ public class ApiService
                 }
                 else
                 {
-                    CookieData cookieData = new CookieData { Id = new Guid(), Url = apiUrl, ExpirationDate = expirationDate, SessionCookie = purecookie };
+                    CookieData cookieData = new CookieData { Id = Guid.NewGuid(), Url = apiUrl, ExpirationDate = expirationDate, SessionCookie = purecookie };
                     await context.Cookies.AddAsync(cookieData);
                     await context.SaveChangesAsync();
                 }
 
-            }
-            else
-            {
-                // Handle the case where the request was not successful
-                Console.WriteLine($"Error: {response.StatusCode} - {response.ReasonPhrase}");
-                Console.WriteLine($"Error: there is a problem with retreieving or getting new cookie!");
+                return purecookie;
             }
         }
-        return GetSessionCookie(completeSessionCookie);
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ApiService] LoginAndGetSessionCookie failed: {ex}");
+        }
+
+        return null;
     }
 
     private static async Task<bool> IsCookieValid(ServerInfo serverInfo, string cookie)

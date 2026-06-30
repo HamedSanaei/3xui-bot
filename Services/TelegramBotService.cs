@@ -22,6 +22,7 @@ public class TelegramBotService : IHostedService
     private const string BroadcastAudienceAll = "all";
     private const string BroadcastAudienceCustomers = "customers";
     private const string BroadcastAudienceColleagues = "colleagues";
+    private const int MaxAccountInfoMessagesPerRequest = 5;
 
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
@@ -5112,6 +5113,7 @@ public class TelegramBotService : IHostedService
     {
         const int MaxMessageLength = 4096; // Telegram max message length
         StringBuilder messageBuilder = new StringBuilder();
+        var sentMessages = 0;
         string clientInfo = "وضعیت اکانت های شما به شرح زیر است: \n";
         foreach (var client in clients)
         {
@@ -5172,6 +5174,15 @@ public class TelegramBotService : IHostedService
             {
                 // Send the current message
                 await _botClient.CustomSendTextMessageAsync(chatId, messageBuilder.ToString().EscapeMarkdown(), parseMode: ParseMode.Markdown);
+                sentMessages++;
+                if (sentMessages >= MaxAccountInfoMessagesPerRequest)
+                {
+                    await _botClient.SendTextMessageAsync(
+                        chatId,
+                        $"Too many accounts found ({clients.Count}). Showing only the first {MaxAccountInfoMessagesPerRequest} message pages to avoid Telegram rate limits. Please search or renew by exact account name.",
+                        parseMode: ParseMode.Markdown);
+                    return;
+                }
                 messageBuilder.Clear(); // Clear the builder for the next message
             }
 
@@ -5782,6 +5793,8 @@ public class TelegramBotService : IHostedService
 
     async Task<bool> CreateAccount(AccountDto accountDto)
     {
+        try
+        {
         bool result;
         var sessionCookie = await ApiService.LoginAndGetSessionCookie(accountDto.ServerInfo);
         if (sessionCookie != null)
@@ -5798,6 +5811,12 @@ public class TelegramBotService : IHostedService
             result = false;
         }
         return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "CreateAccount failed for user {TelegramUserId} on country {SelectedCountry}.", accountDto?.TelegramUserId, accountDto?.SelectedCountry);
+            return false;
+        }
     }
 
     async Task<bool> UpdateAccount(AccountDtoUpdate accountDto)
