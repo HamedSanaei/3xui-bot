@@ -30,6 +30,8 @@ namespace Adminbot.Domain
         public List<int> InboundIds { get; set; } = new List<int>();
         public bool MultiInbound { get; set; }
         public string PanelUrl { get; set; }
+        public string CreatedByBotId { get; set; }
+        public string LastUpdatedByBotId { get; set; }
         public long? CreatedByTelegramUserId { get; set; }
         public long? LastUpdatedByTelegramUserId { get; set; }
         public string LastAction { get; set; }

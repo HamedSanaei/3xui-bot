@@ -60,6 +60,11 @@ namespace Adminbot.Domain
         public long? TelMsgId { get; set; }
         public string ErrorCode { get; set; }
         public string ErrorMessage { get; set; }
+        public string BotId { get; set; } = BotContextAccessor.DefaultBotId;
+        public string BotUsername { get; set; } = BotContextAccessor.DefaultBotId;
+        public string PaymentPurpose { get; set; } = TenantBotPaymentPurposes.WalletCharge;
+        public int? TenantBotOrderId { get; set; }
+        public long? TenantOwnerTelegramUserId { get; set; }
 
         [NotMapped]
         public string Payment_Id
@@ -129,6 +134,8 @@ namespace Adminbot.Domain
                 BaseCurrency = string.IsNullOrWhiteSpace(baseCurrency) ? "usdtbsc" : baseCurrency,
                 TelegramUserId = telegramUserId,
                 ChatId = chatId ?? 0,
+                BotId = BotContextAccessor.CurrentBotId,
+                BotUsername = BotContextAccessor.CurrentBotUsername,
                 CreatedAtUtc = DateTime.UtcNow,
                 Result = new NowPaymentsPaymentRecordData().ToJson()
             };
@@ -271,6 +278,8 @@ namespace Adminbot.Domain
             string orderDescription,
             string payCurrency = null,
             string priceCurrency = null,
+            string successUrl = null,
+            string cancelUrl = null,
             CancellationToken cancellationToken = default)
         {
             priceCurrency ??= _appConfig.NowpaymentPriceCurrency;
@@ -287,8 +296,8 @@ namespace Adminbot.Domain
                 ipn_callback_url = _appConfig.NowpaymentIpnUrl,
                 order_id = orderId,
                 order_description = orderDescription,
-                success_url = _appConfig.NowpaymentSuccessUrl,
-                cancel_url = _appConfig.NowpaymentCancelUrl,
+                success_url = string.IsNullOrWhiteSpace(successUrl) ? _appConfig.NowpaymentSuccessUrl : successUrl,
+                cancel_url = string.IsNullOrWhiteSpace(cancelUrl) ? _appConfig.NowpaymentCancelUrl : cancelUrl,
                 is_fixed_rate = false,
                 is_fee_paid_by_user = false
             };
@@ -664,18 +673,27 @@ namespace Adminbot.Domain
     {
         private readonly UserDbContext _userDbContext;
         private readonly CredentialsDbContext _credentialsDbContext;
-        private readonly ITelegramBotClient _botClient;
+        private readonly BotClientProvider _botClientProvider;
+        private readonly BotRegistry _botRegistry;
+        private readonly BotContextAccessor _botContextAccessor;
+        private readonly WalletLedgerService _walletLedgerService;
         private readonly ILogger<NowPaymentsSettlementService> _logger;
 
         public NowPaymentsSettlementService(
             UserDbContext userDbContext,
             CredentialsDbContext credentialsDbContext,
-            ITelegramBotClient botClient,
+            BotClientProvider botClientProvider,
+            BotRegistry botRegistry,
+            BotContextAccessor botContextAccessor,
+            WalletLedgerService walletLedgerService,
             ILogger<NowPaymentsSettlementService> logger)
         {
             _userDbContext = userDbContext;
             _credentialsDbContext = credentialsDbContext;
-            _botClient = botClient;
+            _botClientProvider = botClientProvider;
+            _botRegistry = botRegistry;
+            _botContextAccessor = botContextAccessor;
+            _walletLedgerService = walletLedgerService;
             _logger = logger;
         }
 
@@ -707,8 +725,27 @@ namespace Adminbot.Domain
             await _userDbContext.SaveChangesAsync(cancellationToken);
 
             var afterBalance = payment.BalanceAfter ?? await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
-            await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
-            LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+            await _walletLedgerService.RecordAsync(
+                payment.TelegramUserId,
+                WalletLedgerDirections.Credit,
+                payment.AmountToman,
+                beforeBalance,
+                afterBalance,
+                WalletLedgerReasons.WalletCharge,
+                provider: "nowpayments",
+                referenceType: nameof(SwapinoPaymentInfo),
+                referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
+                orderId: payment.OrderId,
+                description: "NOWPayments wallet charge",
+                botId: payment.BotId,
+                botUsername: payment.BotUsername,
+                botType: BotInstanceTypes.Owned,
+                cancellationToken: cancellationToken);
+            using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+            {
+                await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
+                LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+            }
 
             return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
         }
@@ -762,8 +799,27 @@ namespace Adminbot.Domain
             await _userDbContext.SaveChangesAsync(cancellationToken);
 
             var afterBalance = payment.BalanceAfter ?? await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
-            await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
-            LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+            await _walletLedgerService.RecordAsync(
+                payment.TelegramUserId,
+                WalletLedgerDirections.Credit,
+                creditedAmountToman,
+                beforeBalance,
+                afterBalance,
+                WalletLedgerReasons.WalletCharge,
+                provider: "nowpayments_partial",
+                referenceType: nameof(SwapinoPaymentInfo),
+                referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
+                orderId: payment.OrderId,
+                description: "NOWPayments partial wallet charge",
+                botId: payment.BotId,
+                botUsername: payment.BotUsername,
+                botType: BotInstanceTypes.Owned,
+                cancellationToken: cancellationToken);
+            using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+            {
+                await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
+                LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+            }
 
             return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
         }
@@ -837,12 +893,14 @@ namespace Adminbot.Domain
             if (chatId == 0)
                 return;
 
+            var botClient = _botClientProvider.GetClient(payment.BotId);
+
             var text = $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
                        "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.";
 
             try
             {
-                await _botClient.SendTextMessageAsync(
+                await botClient.SendTextMessageAsync(
                     chatId: chatId,
                     text: text,
                     parseMode: ParseMode.Html,
@@ -906,6 +964,16 @@ namespace Adminbot.Domain
         private static string FormatDecimal(decimal value)
         {
             return value.ToString("0.########", CultureInfo.InvariantCulture);
+        }
+
+        private BotRuntimeContext CreatePaymentBotContext(SwapinoPaymentInfo payment)
+        {
+            var bot = _botRegistry.GetById(payment.BotId);
+            return new BotRuntimeContext
+            {
+                Config = bot,
+                Client = _botClientProvider.GetClient(bot?.Id)
+            };
         }
     }
 

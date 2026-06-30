@@ -13,6 +13,13 @@ using Telegram.Bot.Types.Enums;
 
 namespace Adminbot.Domain
 {
+    /// <summary>
+    /// Local <c>users.db</c> record for a HooshPay invoice.
+    /// </summary>
+    /// <remarks>
+    /// The same table is used for wallet top-ups and tenant storefront direct purchases.
+    /// <see cref="PaymentPurpose"/> decides which settlement service may process the paid invoice.
+    /// </remarks>
     public class HooshPayPaymentInfo
     {
         [Key]
@@ -45,7 +52,22 @@ namespace Adminbot.Domain
         public long? BalanceAfter { get; set; }
         public string ErrorCode { get; set; }
         public string ErrorMessage { get; set; }
+        public string BotId { get; set; } = BotContextAccessor.DefaultBotId;
+        public string BotUsername { get; set; } = BotContextAccessor.DefaultBotId;
+        // Distinguishes wallet top-ups from tenant storefront orders during IPN settlement.
+        public string PaymentPurpose { get; set; } = TenantBotPaymentPurposes.WalletCharge;
+        public int? TenantBotOrderId { get; set; }
+        public long? TenantOwnerTelegramUserId { get; set; }
 
+        /// <summary>
+        /// Creates a new local HooshPay payment row for charging a user's shared wallet balance.
+        /// </summary>
+        /// <param name="telegramUserId">Telegram user id whose wallet will be charged after payment confirmation.</param>
+        /// <param name="amountToman">Wallet charge amount in toman, excluding the HooshPay buyer fee.</param>
+        /// <param name="callbackUrl">IPN callback URL sent to HooshPay.</param>
+        /// <param name="returnUrl">Telegram return URL used after the user leaves the gateway.</param>
+        /// <param name="chatId">Optional chat id used for payment status messages.</param>
+        /// <returns>Initialized pending payment row. The caller must add it to <see cref="UserDbContext.HooshPayPaymentInfos"/>.</returns>
         public static HooshPayPaymentInfo CreateWalletCharge(
             long telegramUserId,
             long amountToman,
@@ -62,17 +84,29 @@ namespace Adminbot.Domain
                 ReturnUrl = returnUrl,
                 TelegramUserId = telegramUserId,
                 ChatId = chatId ?? 0,
+                BotId = BotContextAccessor.CurrentBotId,
+                BotUsername = BotContextAccessor.CurrentBotUsername,
+                PaymentPurpose = TenantBotPaymentPurposes.WalletCharge,
                 PaymentStatus = HooshPayStatuses.Pending,
                 CreatedAtUtc = DateTime.UtcNow
             };
         }
 
+        /// <summary>
+        /// Builds the public order id used for HooshPay wallet charge invoices created by the Telegram bot.
+        /// </summary>
+        /// <param name="telegramUserId">Telegram user id included in the order id for diagnostics.</param>
+        /// <returns>Unique order id with <c>TelBotHoosh</c> prefix, UTC timestamp, user id, and random suffix.</returns>
         public static string CreateOrderId(long telegramUserId)
         {
             var suffix = Guid.NewGuid().ToString("N")[..8];
             return $"TelBotHoosh-{DateTime.UtcNow:yyyyMMddHHmmss}-{telegramUserId}-{suffix}";
         }
 
+        /// <summary>
+        /// Applies invoice data returned by create, get, or verify API calls without overwriting known values with blanks.
+        /// </summary>
+        /// <param name="data">Invoice data returned from HooshPay.</param>
         public void Apply(HooshPayInvoiceData data)
         {
             if (data == null)
@@ -92,6 +126,10 @@ namespace Adminbot.Domain
             UpdatedAtUtc = DateTime.UtcNow;
         }
 
+        /// <summary>
+        /// Applies HooshPay webhook data to the local payment row.
+        /// </summary>
+        /// <param name="ipn">Verified HooshPay IPN payload.</param>
         public void Apply(HooshPayIpn ipn)
         {
             if (ipn == null)
@@ -110,6 +148,13 @@ namespace Adminbot.Domain
         }
     }
 
+    /// <summary>
+    /// Minimal HooshPay API client used by wallet charges and tenant storefront purchases.
+    /// </summary>
+    /// <remarks>
+    /// The client sends <c>X-API-KEY</c>, always requests <c>fee_mode = buyer</c>, and stores raw request/response
+    /// data in the caller's payment row for auditability.
+    /// </remarks>
     public class HooshPay
     {
         private static readonly JsonSerializerSettings RequestJsonSettings = new JsonSerializerSettings
@@ -121,11 +166,20 @@ namespace Adminbot.Domain
         private readonly AppConfig _appConfig;
         private readonly HttpClient _httpClient;
 
+        /// <summary>
+        /// Creates a HooshPay client with a default <see cref="HttpClient"/>.
+        /// </summary>
+        /// <param name="configuration">Application configuration containing HooshPay API settings.</param>
         public HooshPay(IConfiguration configuration)
             : this(configuration, new HttpClient())
         {
         }
 
+        /// <summary>
+        /// Creates a HooshPay client with an injected HTTP client for runtime use or tests.
+        /// </summary>
+        /// <param name="configuration">Application configuration containing HooshPay API settings.</param>
+        /// <param name="httpClient">HTTP client used for HooshPay API calls.</param>
         public HooshPay(IConfiguration configuration, HttpClient httpClient)
         {
             _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -133,10 +187,22 @@ namespace Adminbot.Domain
             _httpClient.BaseAddress ??= BuildBaseApiUri(_appConfig.HooshPayBaseUrl);
         }
 
+        /// <summary>
+        /// Creates a HooshPay invoice.
+        /// </summary>
+        /// <param name="amountToman">Merchant amount in toman before buyer fee.</param>
+        /// <param name="orderId">Local order id used to match IPN callbacks.</param>
+        /// <param name="description">Invoice description visible in HooshPay.</param>
+        /// <param name="callbackUrl">Optional IPN URL; configuration fallback is used when empty.</param>
+        /// <param name="returnUrl">Optional Telegram return URL; configuration fallback is used when empty.</param>
+        /// <param name="cancellationToken">Cancellation token for the HTTP call.</param>
+        /// <returns>HooshPay invoice creation response containing uid, payment URL, fee, and status.</returns>
         public async Task<HooshPayCreateInvoiceResponse> CreateInvoiceAsync(
             long amountToman,
             string orderId,
             string description,
+            string callbackUrl = null,
+            string returnUrl = null,
             CancellationToken cancellationToken = default)
         {
             var request = new HooshPayCreateInvoiceRequest
@@ -145,8 +211,8 @@ namespace Adminbot.Domain
                 fee_mode = HooshPayFeeModes.Buyer,
                 order_id = orderId,
                 description = description,
-                callback_url = _appConfig.HooshPayIpnUrl,
-                return_url = _appConfig.HooshPayReturnUrl
+                callback_url = string.IsNullOrWhiteSpace(callbackUrl) ? _appConfig.HooshPayIpnUrl : callbackUrl,
+                return_url = string.IsNullOrWhiteSpace(returnUrl) ? _appConfig.HooshPayReturnUrl : returnUrl
             };
 
             return await SendAsync<HooshPayCreateInvoiceResponse>(
@@ -156,6 +222,12 @@ namespace Adminbot.Domain
                 cancellationToken);
         }
 
+        /// <summary>
+        /// Reads the latest invoice state from HooshPay.
+        /// </summary>
+        /// <param name="invoiceUid">HooshPay invoice uid.</param>
+        /// <param name="cancellationToken">Cancellation token for the HTTP call.</param>
+        /// <returns>Invoice response with the current gateway data.</returns>
         public async Task<HooshPayInvoiceResponse> GetInvoiceAsync(
             string invoiceUid,
             CancellationToken cancellationToken = default)
@@ -167,6 +239,12 @@ namespace Adminbot.Domain
                 cancellationToken);
         }
 
+        /// <summary>
+        /// Verifies an invoice and asks HooshPay whether the payment is paid.
+        /// </summary>
+        /// <param name="invoiceUid">HooshPay invoice uid.</param>
+        /// <param name="cancellationToken">Cancellation token for the HTTP call.</param>
+        /// <returns>Verification response including the boolean paid flag and invoice data.</returns>
         public async Task<HooshPayVerifyResponse> VerifyInvoiceAsync(
             string invoiceUid,
             CancellationToken cancellationToken = default)
@@ -178,6 +256,17 @@ namespace Adminbot.Domain
                 cancellationToken);
         }
 
+        /// <summary>
+        /// Sends a JSON request to the HooshPay API and deserializes the response.
+        /// </summary>
+        /// <typeparam name="T">Expected response DTO type.</typeparam>
+        /// <param name="method">HTTP method.</param>
+        /// <param name="relativeUrl">API path relative to <c>/api/v1/</c>.</param>
+        /// <param name="body">Optional JSON request body.</param>
+        /// <param name="cancellationToken">Cancellation token for the HTTP call.</param>
+        /// <returns>Deserialized HooshPay response.</returns>
+        /// <exception cref="InvalidOperationException">Thrown when the API key is missing.</exception>
+        /// <exception cref="HooshPayApiException">Thrown when HooshPay returns an error or empty response.</exception>
         private async Task<T> SendAsync<T>(
             HttpMethod method,
             string relativeUrl,
@@ -225,6 +314,11 @@ namespace Adminbot.Domain
             return result;
         }
 
+        /// <summary>
+        /// Normalizes the configured HooshPay base URL into the API root URI.
+        /// </summary>
+        /// <param name="baseUrl">Configured root URL; empty values use the official HooshPay host.</param>
+        /// <returns>Absolute URI ending in <c>/api/v1/</c>.</returns>
         private static Uri BuildBaseApiUri(string baseUrl)
         {
             var root = string.IsNullOrWhiteSpace(baseUrl)
@@ -235,25 +329,58 @@ namespace Adminbot.Domain
         }
     }
 
+    /// <summary>
+    /// Settles paid HooshPay wallet-charge invoices.
+    /// </summary>
+    /// <remarks>
+    /// Tenant storefront orders are intentionally excluded by <see cref="HooshPayPaymentInfo.PaymentPurpose"/>
+    /// and are fulfilled by <see cref="TenantBotService.ApplyPaidTenantOrderAsync"/>.
+    /// </remarks>
     public class HooshPaySettlementService
     {
         private readonly UserDbContext _userDbContext;
         private readonly CredentialsDbContext _credentialsDbContext;
-        private readonly ITelegramBotClient _botClient;
+        private readonly BotClientProvider _botClientProvider;
+        private readonly BotRegistry _botRegistry;
+        private readonly BotContextAccessor _botContextAccessor;
+        private readonly WalletLedgerService _walletLedgerService;
         private readonly ILogger<HooshPaySettlementService> _logger;
 
+        /// <summary>
+        /// Creates the wallet-charge settlement service.
+        /// </summary>
+        /// <param name="userDbContext">Runtime database containing HooshPay rows.</param>
+        /// <param name="credentialsDbContext">Shared wallet/profile database.</param>
+        /// <param name="botClientProvider">Factory/cache for sending messages through the correct bot.</param>
+        /// <param name="botRegistry">Runtime bot registry used to resolve payment bot metadata.</param>
+        /// <param name="botContextAccessor">Async bot context accessor used while notifying and logging.</param>
+        /// <param name="logger">Application logger.</param>
         public HooshPaySettlementService(
             UserDbContext userDbContext,
             CredentialsDbContext credentialsDbContext,
-            ITelegramBotClient botClient,
+            BotClientProvider botClientProvider,
+            BotRegistry botRegistry,
+            BotContextAccessor botContextAccessor,
+            WalletLedgerService walletLedgerService,
             ILogger<HooshPaySettlementService> logger)
         {
             _userDbContext = userDbContext;
             _credentialsDbContext = credentialsDbContext;
-            _botClient = botClient;
+            _botClientProvider = botClientProvider;
+            _botRegistry = botRegistry;
+            _botContextAccessor = botContextAccessor;
+            _walletLedgerService = walletLedgerService;
             _logger = logger;
         }
 
+        /// <summary>
+        /// Adds a paid HooshPay wallet invoice to the user's wallet exactly once.
+        /// </summary>
+        /// <param name="payment">Local HooshPay payment row that belongs to a wallet charge.</param>
+        /// <param name="source">Settlement source, for example IPN or manual check.</param>
+        /// <param name="notifyChatId">Optional chat id override for the user notification.</param>
+        /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
+        /// <returns>Settlement result describing applied, duplicate, or missing-user state.</returns>
         public async Task<NowPaymentsSettlementResult> ApplyFinishedPaymentAsync(
             HooshPayPaymentInfo payment,
             string source,
@@ -282,12 +409,38 @@ namespace Adminbot.Domain
             await _userDbContext.SaveChangesAsync(cancellationToken);
 
             var afterBalance = payment.BalanceAfter ?? await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
-            await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
-            LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+            await _walletLedgerService.RecordAsync(
+                payment.TelegramUserId,
+                WalletLedgerDirections.Credit,
+                payment.AmountToman,
+                beforeBalance,
+                afterBalance,
+                WalletLedgerReasons.WalletCharge,
+                provider: "hooshpay",
+                referenceType: nameof(HooshPayPaymentInfo),
+                referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
+                orderId: payment.OrderId,
+                description: "HooshPay wallet charge",
+                botId: payment.BotId,
+                botUsername: payment.BotUsername,
+                botType: BotInstanceTypes.Owned,
+                cancellationToken: cancellationToken);
+            using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+            {
+                await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
+                LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+            }
 
             return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
         }
 
+        /// <summary>
+        /// Sends the wallet charge confirmation through the same bot that created the payment.
+        /// </summary>
+        /// <param name="credUser">Wallet user who received credit.</param>
+        /// <param name="payment">Settled payment row.</param>
+        /// <param name="notifyChatId">Optional chat id override.</param>
+        /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
         private async Task NotifyUserAsync(
             CredUser credUser,
             HooshPayPaymentInfo payment,
@@ -298,12 +451,14 @@ namespace Adminbot.Domain
             if (chatId == 0)
                 return;
 
+            var botClient = _botClientProvider.GetClient(payment.BotId);
+
             var text = $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
                        "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.";
 
             try
             {
-                await _botClient.SendTextMessageAsync(
+                await botClient.SendTextMessageAsync(
                     chatId: chatId,
                     text: text,
                     parseMode: ParseMode.Html,
@@ -315,6 +470,14 @@ namespace Adminbot.Domain
             }
         }
 
+        /// <summary>
+        /// Writes the HooshPay wallet-charge settlement log to the configured logger channel.
+        /// </summary>
+        /// <param name="payment">Settled payment row.</param>
+        /// <param name="credUser">Wallet user shown in the log.</param>
+        /// <param name="beforeBalance">Wallet balance before settlement.</param>
+        /// <param name="afterBalance">Wallet balance after settlement.</param>
+        /// <param name="source">Settlement source shown in the log.</param>
         private void LogPayment(
             HooshPayPaymentInfo payment,
             CredUser credUser,
@@ -343,12 +506,35 @@ namespace Adminbot.Domain
             _logger.LogPayment(logMessage);
         }
 
+        /// <summary>
+        /// Encodes text before inserting it into Telegram HTML messages.
+        /// </summary>
+        /// <param name="value">Raw text that may contain HTML-sensitive characters.</param>
+        /// <returns>HTML-encoded text; null becomes an empty string.</returns>
         private static string Html(string value)
         {
             return System.Net.WebUtility.HtmlEncode(value ?? string.Empty);
         }
+
+        /// <summary>
+        /// Builds a bot runtime context from the bot metadata stored on the payment row.
+        /// </summary>
+        /// <param name="payment">Payment row that contains <c>BotId</c>.</param>
+        /// <returns>Runtime context used while sending settlement notifications and logs.</returns>
+        private BotRuntimeContext CreatePaymentBotContext(HooshPayPaymentInfo payment)
+        {
+            var bot = _botRegistry.GetById(payment.BotId);
+            return new BotRuntimeContext
+            {
+                Config = bot,
+                Client = _botClientProvider.GetClient(bot?.Id)
+            };
+        }
     }
 
+    /// <summary>
+    /// HooshPay fee policy values accepted by the invoice API.
+    /// </summary>
     public static class HooshPayFeeModes
     {
         public const string Seller = "seller";
@@ -356,6 +542,9 @@ namespace Adminbot.Domain
         public const string Split = "split";
     }
 
+    /// <summary>
+    /// HooshPay status values used by invoice responses and IPN payloads.
+    /// </summary>
     public static class HooshPayStatuses
     {
         public const string Pending = "pending";
@@ -364,11 +553,21 @@ namespace Adminbot.Domain
         public const string Cancelled = "cancelled";
         public const string Failed = "failed";
 
+        /// <summary>
+        /// Checks whether a HooshPay status represents a successfully paid invoice.
+        /// </summary>
+        /// <param name="status">Gateway status string.</param>
+        /// <returns><c>true</c> only for <c>paid</c>.</returns>
         public static bool IsPaid(string status)
         {
             return string.Equals(status, Paid, StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// Checks whether a HooshPay status is a terminal non-paid state.
+        /// </summary>
+        /// <param name="status">Gateway status string.</param>
+        /// <returns><c>true</c> for expired, cancelled, or failed invoices.</returns>
         public static bool IsFinalFailure(string status)
         {
             return string.Equals(status, Expired, StringComparison.OrdinalIgnoreCase) ||
@@ -377,8 +576,18 @@ namespace Adminbot.Domain
         }
     }
 
+    /// <summary>
+    /// Verifies HooshPay webhook signatures by sorting JSON keys and applying HMAC-SHA256.
+    /// </summary>
     public static class HooshPaySignature
     {
+        /// <summary>
+        /// Validates the <c>X-HooshPay-Signature</c> header for an IPN body.
+        /// </summary>
+        /// <param name="requestBody">Raw JSON body received by the controller.</param>
+        /// <param name="receivedSignature">Signature header sent by HooshPay.</param>
+        /// <param name="secret">Configured HooshPay IPN secret key.</param>
+        /// <returns><c>true</c> when the computed signature matches using fixed-time comparison.</returns>
         public static bool Verify(string requestBody, string receivedSignature, string secret)
         {
             if (string.IsNullOrWhiteSpace(requestBody) ||
@@ -401,6 +610,11 @@ namespace Adminbot.Domain
                    CryptographicOperations.FixedTimeEquals(computedBytes, receivedBytes);
         }
 
+        /// <summary>
+        /// Recursively sorts JSON object keys so signature calculation is stable.
+        /// </summary>
+        /// <param name="token">JSON token to sort.</param>
+        /// <returns>Sorted clone of the supplied token.</returns>
         private static JToken SortToken(JToken token)
         {
             if (token is JObject obj)
@@ -419,6 +633,9 @@ namespace Adminbot.Domain
         }
     }
 
+    /// <summary>
+    /// Request DTO for <c>POST /api/v1/invoices</c>.
+    /// </summary>
     public class HooshPayCreateInvoiceRequest
     {
         public long amount { get; set; }
@@ -429,18 +646,27 @@ namespace Adminbot.Domain
         public string return_url { get; set; }
     }
 
+    /// <summary>
+    /// Response DTO returned after creating a HooshPay invoice.
+    /// </summary>
     public class HooshPayCreateInvoiceResponse
     {
         public bool success { get; set; }
         public HooshPayInvoiceData data { get; set; }
     }
 
+    /// <summary>
+    /// Response DTO returned when reading an existing HooshPay invoice.
+    /// </summary>
     public class HooshPayInvoiceResponse
     {
         public bool success { get; set; }
         public HooshPayInvoiceData data { get; set; }
     }
 
+    /// <summary>
+    /// Response DTO returned by HooshPay invoice verification.
+    /// </summary>
     public class HooshPayVerifyResponse
     {
         public bool success { get; set; }
@@ -449,6 +675,9 @@ namespace Adminbot.Domain
         public HooshPayInvoiceData data { get; set; }
     }
 
+    /// <summary>
+    /// Shared invoice data payload returned by HooshPay create, get, verify, and IPN operations.
+    /// </summary>
     public class HooshPayInvoiceData
     {
         public string uid { get; set; }
@@ -468,6 +697,9 @@ namespace Adminbot.Domain
         public IDictionary<string, JToken> Data { get; set; }
     }
 
+    /// <summary>
+    /// Webhook payload sent by HooshPay to the <c>/hooshpay-ipn</c> endpoint.
+    /// </summary>
     public class HooshPayIpn
     {
         public string @event { get; set; }
@@ -486,6 +718,9 @@ namespace Adminbot.Domain
         public IDictionary<string, JToken> Data { get; set; }
     }
 
+    /// <summary>
+    /// Exception thrown when HooshPay returns an unsuccessful or unusable API response.
+    /// </summary>
     public class HooshPayApiException : Exception
     {
         public string RequestMethod { get; }
@@ -494,6 +729,14 @@ namespace Adminbot.Domain
         public string ResponseBody { get; }
         public string RequestBody { get; }
 
+        /// <summary>
+        /// Creates an exception that preserves the request and response details needed for diagnostics.
+        /// </summary>
+        /// <param name="requestMethod">HTTP method used for the failed request.</param>
+        /// <param name="requestUri">Absolute request URL.</param>
+        /// <param name="statusCode">HTTP status code returned by HooshPay.</param>
+        /// <param name="responseBody">Raw response body returned by HooshPay.</param>
+        /// <param name="requestBody">Optional raw request body sent to HooshPay.</param>
         public HooshPayApiException(string requestMethod, string requestUri, int statusCode, string responseBody, string requestBody = null)
             : base($"HooshPay API request failed with status {statusCode} for {requestMethod} {requestUri}: {responseBody}")
         {
@@ -504,6 +747,10 @@ namespace Adminbot.Domain
             RequestBody = requestBody;
         }
 
+        /// <summary>
+        /// Returns a diagnostic string that includes HTTP metadata and the raw HooshPay payloads.
+        /// </summary>
+        /// <returns>Detailed exception text.</returns>
         public override string ToString()
         {
             return $"{base.ToString()}\nRequestMethod: {RequestMethod}\nRequestUri: {RequestUri}\nStatusCode: {StatusCode}\nRequestBody: {RequestBody}\nResponseBody: {ResponseBody}";

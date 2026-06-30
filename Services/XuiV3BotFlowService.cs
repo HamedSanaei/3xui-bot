@@ -8,6 +8,7 @@ using Telegram.Bot.Types.ReplyMarkups;
 using Newtonsoft.Json;
 using Microsoft.Extensions.Logging;
 using System.Text;
+using System.Globalization;
 using Adminbot.Domain.Logging;
 
 public class XuiV3BotFlowService
@@ -55,7 +56,39 @@ public class XuiV3BotFlowService
     private readonly AppConfig _appConfig;
     private readonly ILogger<XuiV3BotFlowService> _logger;
     private readonly UserActivityLogService _activityLog;
+    private readonly WalletLedgerService _walletLedgerService;
 
+    /// <summary>
+    /// Creates the shared XUI v3 customer-flow service used by owned bots and tenant storefront bots.
+    /// </summary>
+    /// <param name="purchaseService">
+    /// Resolves XUI v3 service plans, prices, and account-creation payloads from the configured plan file.
+    /// </param>
+    /// <param name="sessionStore">
+    /// Stores temporary purchase selections keyed by the Telegram user id while a customer moves through
+    /// the multi-step purchase flow.
+    /// </param>
+    /// <param name="userDbContext">
+    /// The users database context that stores bot-scoped conversation state and temporary flow values.
+    /// </param>
+    /// <param name="credentialsDbContext">
+    /// The shared credentials database context that owns wallet balances and credential user profiles.
+    /// The schema of this database is not changed by this service.
+    /// </param>
+    /// <param name="configuration">Application configuration used for XUI panel and plan settings.</param>
+    /// <param name="logger">Logger used for operational diagnostics that are not customer-facing.</param>
+    /// <param name="activityLog">
+    /// Structured activity logger used for audit entries related to XUI account operations.
+    /// </param>
+    /// <param name="walletLedgerService">
+    /// Append-only wallet ledger writer. It records wallet debits for purchases and renewals in toman so
+    /// customers and admins can audit balance changes later.
+    /// </param>
+    /// <remarks>
+    /// This service is intentionally shared between owned bots and tenant storefronts. Tenant callers must
+    /// set the active bot context before invoking it so state reads and callback handling stay scoped to the
+    /// bot that received the Telegram update.
+    /// </remarks>
     public XuiV3BotFlowService(
         XuiV3PurchaseService purchaseService,
         XuiV3PurchaseSessionStore sessionStore,
@@ -63,7 +96,8 @@ public class XuiV3BotFlowService
         CredentialsDbContext credentialsDbContext,
         IConfiguration configuration,
         ILogger<XuiV3BotFlowService> logger,
-        UserActivityLogService activityLog)
+        UserActivityLogService activityLog,
+        WalletLedgerService walletLedgerService)
     {
         _purchaseService = purchaseService;
         _sessionStore = sessionStore;
@@ -73,11 +107,64 @@ public class XuiV3BotFlowService
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         _logger = logger;
         _activityLog = activityLog;
+        _walletLedgerService = walletLedgerService;
     }
 
     public bool IsEnabledForPurchaseFlow()
     {
         return string.Equals(_appConfig.XuiApiVersionMode, "v3", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Detects every reply-keyboard label that should open the shared XUI v3 "my accounts" flow.
+    /// </summary>
+    /// <param name="text">
+    /// Telegram message text from an owned bot or tenant storefront. The value may be null or empty.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the text is one of the owned-bot or tenant-bot labels for listing the sender's accounts.
+    /// </returns>
+    /// <remarks>
+    /// Tenant storefronts use the shorter "اکانت‌های من" label while the original owned bot uses
+    /// "وضعیت اکانت های من". Keeping both labels here lets tenant bots reuse this flow instead of duplicating
+    /// account-list code.
+    /// </remarks>
+    private static bool IsMyAccountsCommand(string text)
+    {
+        var normalized = text?.Trim();
+        return string.Equals(normalized, "وضعیت اکانت های من", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, "اکانت‌های من", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, "اکانت های من", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Detects every reply-keyboard label that should start the shared account-search flow.
+    /// </summary>
+    /// <param name="text">
+    /// Telegram message text from an owned bot or tenant storefront. The value may be null or empty.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the text asks the bot to collect a search query for an XUI v3 account.
+    /// </returns>
+    private static bool IsAccountSearchCommand(string text)
+    {
+        var normalized = text?.Trim();
+        return string.Equals(normalized, "🔎 جستجوی اکانت", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, "جستجوی اکانت", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Detects every reply-keyboard label that should start the shared account-renewal flow.
+    /// </summary>
+    /// <param name="text">
+    /// Telegram message text from an owned bot or tenant storefront. The value may be null or empty.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the text asks the bot to start renewal for an existing XUI v3 account.
+    /// </returns>
+    private static bool IsRenewCommand(string text)
+    {
+        return string.Equals(text?.Trim(), "تمدید اکانت", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<bool> TryHandleMyAccountsAsync(
@@ -87,7 +174,7 @@ public class XuiV3BotFlowService
         IReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
-        if (!IsEnabledForPurchaseFlow() || message?.Text != "وضعیت اکانت های من")
+        if (!IsEnabledForPurchaseFlow() || !IsMyAccountsCommand(message?.Text))
             return false;
 
         await botClient.SendTextMessageAsync(
@@ -228,8 +315,7 @@ public class XuiV3BotFlowService
             return false;
 
         var text = message.Text.Trim();
-        var isStart = string.Equals(text, "🔎 جستجوی اکانت", StringComparison.OrdinalIgnoreCase) ||
-                      string.Equals(text, "جستجوی اکانت", StringComparison.OrdinalIgnoreCase);
+        var isStart = IsAccountSearchCommand(text);
 
         if (user?.Flow != AccountSearchFlowName && !isStart)
             return false;
@@ -468,7 +554,7 @@ public class XuiV3BotFlowService
         }
 
         var text = message.Text.Trim();
-        if (text == "تمدید اکانت")
+        if (IsRenewCommand(text))
         {
             if (!await EnsurePhoneVerifiedAsync(botClient, message.Chat.Id, credUser, cancellationToken))
                 return true;
@@ -1054,16 +1140,34 @@ public class XuiV3BotFlowService
         var beforeBalance = credUser.AccountBalance;
         await _credentialsDbContext.Pay(credUser, resolved.PriceToman);
         var afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
+        // Wallet debits are written after the shared credentials balance changes so the
+        // ledger mirrors the persisted before/after balance that admins and users can audit.
+        await _walletLedgerService.RecordAsync(
+            credUser.TelegramUserId,
+            WalletLedgerDirections.Debit,
+            resolved.PriceToman,
+            beforeBalance,
+            afterBalance,
+            WalletLedgerReasons.AccountRenew,
+            provider: "wallet",
+            referenceType: "xui-v3-client",
+            referenceId: client.Email,
+            orderId: null,
+            description: $"XuiV3 renewal {client.Email}",
+            cancellationToken: cancellationToken);
         await _userDbContext.ClearUserStatus(user);
 
         client.TotalGB = payload.TotalGB;
         client.ExpiryTime = payload.ExpiryTime;
         client.Comment = payload.Comment;
         client.Enable = payload.Enable;
-        if (trafficResetApplied && client.Traffic != null)
+        // Some v3 panel responses omit traffic counters. The panel reset has already been requested;
+        // mirror it locally only when counters are present in the response model.
+        var traffic = client.Traffic;
+        if (trafficResetApplied && traffic != null)
         {
-            client.Traffic.Up = 0;
-            client.Traffic.Down = 0;
+            traffic.Up = 0;
+            traffic.Down = 0;
         }
 
         await botClient.SendTextMessageAsync(
@@ -2265,6 +2369,21 @@ public class XuiV3BotFlowService
                 if (bulkResult.TotalSuccessfulPriceToman > 0)
                     await _credentialsDbContext.Pay(credUser, bulkResult.TotalSuccessfulPriceToman);
                 var bulkAfterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
+                // One ledger row represents the whole successful bulk purchase so the order can be
+                // audited without creating a noisy transaction per generated account.
+                await _walletLedgerService.RecordAsync(
+                    credUser.TelegramUserId,
+                    WalletLedgerDirections.Debit,
+                    bulkResult.TotalSuccessfulPriceToman,
+                    bulkBeforeBalance,
+                    bulkAfterBalance,
+                    WalletLedgerReasons.AccountPurchase,
+                    provider: "wallet",
+                    referenceType: "xui-v3-bulk",
+                    referenceId: bulkResult.BulkOrderId,
+                    orderId: bulkResult.BulkOrderId,
+                    description: string.Join(", ", bulkResult.CreatedAccounts.Select(x => x.Email).Take(10)),
+                    cancellationToken: cancellationToken);
 
                 LogV3Purchase(
                     title: accountCount > 1 ? "ساخت انبوه اکانت نسخه ۳" : "ساخت اکانت نسخه ۳",
@@ -2827,6 +2946,7 @@ public class XuiV3BotFlowService
                 ["rootPath"] = serverInfo.RootPath
             },
             cancellationToken);
+        LogAccountDelete(client, credUser, "list");
 
         await SafeEditMessageTextAsync(
             botClient,
@@ -3216,6 +3336,7 @@ public class XuiV3BotFlowService
                 ["rootPath"] = serverInfo.RootPath
             },
             cancellationToken);
+        LogAccountDelete(client, credUser, "search");
 
         await SendOrEditTextAsync(
             botClient,
@@ -4940,6 +5061,34 @@ public class XuiV3BotFlowService
         return builder.ToString();
     }
 
+    /// <summary>
+    /// Sends an operational Telegram log after a user-owned XUI v3 account is deleted.
+    /// </summary>
+    /// <param name="client">Deleted XUI client as it existed before the panel delete call.</param>
+    /// <param name="credUser">Telegram user who requested the delete action.</param>
+    /// <param name="source">Delete surface, such as account list or search results.</param>
+    /// <remarks>
+    /// The delete operation has already succeeded before this method is called. The log is best-effort and
+    /// does not participate in the panel transaction, but it gives admins the same visibility as link changes.
+    /// </remarks>
+    private void LogAccountDelete(XuiV3Client client, CredUser credUser, string source)
+    {
+        var metadata = TryReadMetadata(client.Comment);
+        var builder = new StringBuilder();
+        builder.AppendLine("🗑 <b>گزارش حذف اکانت نسخه ۳</b>");
+        builder.AppendLine();
+        builder.AppendLine(TelegramUserLinkFormatter.HtmlSummary(credUser));
+        builder.AppendLine($"مسیر حذف: <code>{Html(source)}</code>");
+        builder.AppendLine($"اکانت: <code>{Html(client.Email)}</code>");
+        builder.AppendLine($"UUID: <code>{Html(client.Uuid)}</code>");
+        builder.AppendLine($"ساب‌لینک: <code>{Html(client.SubId)}</code>");
+        builder.AppendLine($"مالک متادیتا: <code>{Html((metadata?.TelegramUserId ?? 0).ToString(CultureInfo.InvariantCulture))}</code>");
+        builder.AppendLine($"BotId: <code>{Html(BotContextAccessor.CurrentBotId)}</code>");
+        builder.AppendLine($"BotType: <code>{Html(BotContextAccessor.CurrentBotType)}</code>");
+        builder.AppendLine($"زمان: <code>{Html(DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi())}</code>");
+        _logger.LogPayment(builder.ToString());
+    }
+
     private static long GetClientOwnerTelegramId(XuiV3Client client)
     {
         if (client != null && client.TgId > 0)
@@ -5350,6 +5499,21 @@ public class XuiV3BotFlowService
         return $"{usedText} از {totalBytes.ConvertBytesToGB():0.##} GB";
     }
 
+    /// <summary>
+    /// Reads consumed upload and download bytes for a user-facing XUI v3 client card.
+    /// </summary>
+    /// <param name="client">
+    /// XUI v3 client returned by the panel. The value may be null, and the nested <c>Traffic</c> object may be
+    /// omitted by recent v3 responses.
+    /// </param>
+    /// <returns>
+    /// Total used bytes. Missing upload/download counters are treated as zero after checking the raw
+    /// <c>Extra["up"]</c> and <c>Extra["down"]</c> fallback fields.
+    /// </returns>
+    /// <remarks>
+    /// This helper is used by "my accounts", account search, renewal previews, and delete confirmations.
+    /// It must never throw for <c>traffic == null</c> because those paths run inside Telegram update handlers.
+    /// </remarks>
     private static long GetUsedBytes(XuiV3Client client)
     {
         if (client == null)
@@ -5360,6 +5524,20 @@ public class XuiV3BotFlowService
                (traffic?.Down ?? ReadLongExtra(client, "down"));
     }
 
+    /// <summary>
+    /// Reads the configured traffic limit for a user-facing XUI v3 client card.
+    /// </summary>
+    /// <param name="client">
+    /// XUI v3 client returned by the panel. The nested <c>Traffic</c> object may be null.
+    /// </param>
+    /// <returns>
+    /// Traffic limit in bytes, or <c>0</c> when no limit was supplied by top-level fields, nested traffic fields,
+    /// or the raw <c>Extra["totalGB"]</c> fallback.
+    /// </returns>
+    /// <remarks>
+    /// Lookup order is top-level <c>TotalGB</c>, <c>Traffic.TotalGB</c>, <c>Traffic.Total</c>, then
+    /// <c>Extra["totalGB"]</c>. This preserves compatibility with different 3x-ui v3 response shapes.
+    /// </remarks>
     private static long GetTotalBytes(XuiV3Client client)
     {
         if (client == null)
@@ -5379,6 +5557,21 @@ public class XuiV3BotFlowService
         return ReadLongExtra(client, "totalGB");
     }
 
+    /// <summary>
+    /// Reads the expiry value for a user-facing XUI v3 client card.
+    /// </summary>
+    /// <param name="client">
+    /// XUI v3 client returned by the panel. The value may be null, and <c>Traffic</c> may be absent.
+    /// </param>
+    /// <returns>
+    /// Expiry timestamp in Unix milliseconds, <c>0</c> for unlimited/no expiry, or a negative first-use duration
+    /// used by 3x-ui to start validity from the first connection.
+    /// </returns>
+    /// <remarks>
+    /// Lookup order is top-level <c>ExpiryTime</c>, <c>Traffic.ExpiryTime</c>, then <c>Extra["expiryTime"]</c>.
+    /// Keeping this null-safe prevents "my accounts" and account-search messages from crashing when the panel
+    /// omits the traffic object.
+    /// </remarks>
     private static long GetExpiryTime(XuiV3Client client)
     {
         if (client == null)

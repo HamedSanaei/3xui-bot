@@ -4,6 +4,14 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 
+/// <summary>
+/// Receives payment gateway callbacks and routes paid invoices to the correct settlement service.
+/// </summary>
+/// <remarks>
+/// NOWPayments is used for crypto wallet charges. HooshPay is used for rial wallet charges and tenant storefront orders.
+/// Tenant HooshPay rows are detected by <see cref="HooshPayPaymentInfo.PaymentPurpose"/> and are fulfilled by
+/// <see cref="TenantBotService.ApplyPaidTenantOrderAsync"/> instead of the wallet settlement path.
+/// </remarks>
 [ApiController]
 [Route("nowpayments-ipn")]
 public class PaymentController : ControllerBase
@@ -15,22 +23,38 @@ public class PaymentController : ControllerBase
     private readonly AppConfig _appConfig;
     private readonly NowPaymentsSettlementService _settlementService;
     private readonly HooshPaySettlementService _hooshPaySettlementService;
+    private readonly TenantBotService _tenantBotService;
     private readonly ILogger<PaymentController> _logger;
 
+    /// <summary>
+    /// Creates the payment controller with all settlement services required by the IPN endpoints.
+    /// </summary>
+    /// <param name="userDbContext">Runtime database containing local payment records.</param>
+    /// <param name="config">Application configuration containing gateway secrets.</param>
+    /// <param name="settlementService">NOWPayments wallet settlement service.</param>
+    /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
+    /// <param name="tenantBotService">Tenant storefront fulfillment service for direct HooshPay orders.</param>
+    /// <param name="logger">Controller logger.</param>
     public PaymentController(
         UserDbContext userDbContext,
         IConfiguration config,
         NowPaymentsSettlementService settlementService,
         HooshPaySettlementService hooshPaySettlementService,
+        TenantBotService tenantBotService,
         ILogger<PaymentController> logger)
     {
         _userDbcontext = userDbContext;
         _appConfig = config.Get<AppConfig>();
         _settlementService = settlementService;
         _hooshPaySettlementService = hooshPaySettlementService;
+        _tenantBotService = tenantBotService;
         _logger = logger;
     }
 
+    /// <summary>
+    /// Health-check endpoint for the NOWPayments IPN route.
+    /// </summary>
+    /// <returns>HTTP 200 with endpoint diagnostics.</returns>
     [HttpGet]
     public IActionResult Probe()
     {
@@ -51,6 +75,14 @@ public class PaymentController : ControllerBase
         });
     }
 
+    /// <summary>
+    /// Receives, verifies, stores, and settles NOWPayments IPN callbacks.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token for body reading, database work, and settlement.</param>
+    /// <returns>
+    /// HTTP 200 when the callback is accepted, 401 for invalid signatures, 400 for invalid JSON,
+    /// or 404 when no local payment row can be matched.
+    /// </returns>
     [HttpPost]
     public async Task<IActionResult> Receive(CancellationToken cancellationToken)
     {
@@ -194,10 +226,15 @@ public class PaymentController : ControllerBase
                 });
             }
 
-            var settlement = await _settlementService.ApplyFinishedPaymentAsync(
-                payment,
-                "ipn",
-                cancellationToken: cancellationToken);
+            var settlement = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
+                ? await _tenantBotService.ApplyPaidTenantOrderAsync(
+                    payment,
+                    "ipn",
+                    CancellationToken: cancellationToken)
+                : await _settlementService.ApplyFinishedPaymentAsync(
+                    payment,
+                    "ipn",
+                    cancellationToken: cancellationToken);
 
             LogIpnResult(
                 requestId,
@@ -223,6 +260,10 @@ public class PaymentController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Health-check endpoint for the HooshPay IPN route.
+    /// </summary>
+    /// <returns>HTTP 200 with endpoint diagnostics.</returns>
     [HttpGet("/hooshpay-ipn")]
     public IActionResult ProbeHooshPay()
     {
@@ -243,6 +284,14 @@ public class PaymentController : ControllerBase
         });
     }
 
+    /// <summary>
+    /// Receives, verifies, stores, and settles HooshPay IPN callbacks.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token for body reading, database work, and settlement.</param>
+    /// <returns>
+    /// HTTP 200 when the callback is accepted, 401 for invalid signatures, 400 for invalid JSON,
+    /// or 404 when no local payment row can be matched.
+    /// </returns>
     [HttpPost("/hooshpay-ipn")]
     public async Task<IActionResult> ReceiveHooshPay(CancellationToken cancellationToken)
     {
@@ -372,10 +421,16 @@ public class PaymentController : ControllerBase
                 });
             }
 
-            var settlement = await _hooshPaySettlementService.ApplyFinishedPaymentAsync(
-                payment,
-                "ipn",
-                cancellationToken: cancellationToken);
+            // Tenant orders create accounts and credit owners; wallet charges only add user balance.
+            var settlement = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
+                ? await _tenantBotService.ApplyPaidTenantOrderAsync(
+                    payment,
+                    "ipn",
+                    CancellationToken: cancellationToken)
+                : await _hooshPaySettlementService.ApplyFinishedPaymentAsync(
+                    payment,
+                    "ipn",
+                    cancellationToken: cancellationToken);
 
             LogHooshPayIpnResult(
                 requestId,
@@ -401,6 +456,19 @@ public class PaymentController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Writes structured console diagnostics for each stage of NOWPayments IPN processing.
+    /// </summary>
+    /// <param name="requestId">Short per-request id used to correlate log lines.</param>
+    /// <param name="stage">Processing stage name.</param>
+    /// <param name="statusCode">HTTP status that will be returned, when known.</param>
+    /// <param name="result">Human-readable processing result.</param>
+    /// <param name="ipn">Parsed IPN payload, when available.</param>
+    /// <param name="payment">Matched local payment row, when available.</param>
+    /// <param name="settlement">Settlement result, when settlement has run.</param>
+    /// <param name="body">Raw callback body.</param>
+    /// <param name="signatureIsValid">Signature validation state.</param>
+    /// <param name="extra">Optional diagnostic detail.</param>
     private void LogIpnResult(
         string requestId,
         string stage,
@@ -439,6 +507,19 @@ public class PaymentController : ControllerBase
         Console.WriteLine("=====================================");
     }
 
+    /// <summary>
+    /// Writes structured console diagnostics for each stage of HooshPay IPN processing.
+    /// </summary>
+    /// <param name="requestId">Short per-request id used to correlate log lines.</param>
+    /// <param name="stage">Processing stage name.</param>
+    /// <param name="statusCode">HTTP status that will be returned, when known.</param>
+    /// <param name="result">Human-readable processing result.</param>
+    /// <param name="ipn">Parsed HooshPay IPN payload, when available.</param>
+    /// <param name="payment">Matched local HooshPay payment row, when available.</param>
+    /// <param name="settlement">Settlement result, when settlement has run.</param>
+    /// <param name="body">Raw callback body.</param>
+    /// <param name="signatureIsValid">Signature validation state.</param>
+    /// <param name="extra">Optional diagnostic detail.</param>
     private void LogHooshPayIpnResult(
         string requestId,
         string stage,
@@ -477,6 +558,12 @@ public class PaymentController : ControllerBase
         Console.WriteLine("===================================");
     }
 
+    /// <summary>
+    /// Finds the local HooshPay payment row for a webhook by order id or invoice uid.
+    /// </summary>
+    /// <param name="ipn">Verified HooshPay IPN payload.</param>
+    /// <param name="cancellationToken">Cancellation token for the database lookup.</param>
+    /// <returns>Matched payment row, or null when the callback cannot be matched.</returns>
     private async Task<HooshPayPaymentInfo> FindHooshPayPaymentAsync(HooshPayIpn ipn, CancellationToken cancellationToken)
     {
         if (!string.IsNullOrWhiteSpace(ipn.order_id))
@@ -498,6 +585,11 @@ public class PaymentController : ControllerBase
         return null;
     }
 
+    /// <summary>
+    /// Logs extra HooshPay database diagnostics when an IPN cannot be matched to a local payment row.
+    /// </summary>
+    /// <param name="ipn">Incoming IPN that failed lookup.</param>
+    /// <param name="cancellationToken">Cancellation token for diagnostic database queries.</param>
     private async Task LogHooshPayPaymentLookupMissAsync(HooshPayIpn ipn, CancellationToken cancellationToken)
     {
         var totalCount = await _userDbcontext.HooshPayPaymentInfos.CountAsync(cancellationToken);
@@ -525,6 +617,12 @@ public class PaymentController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Finds the local NOWPayments payment row by order id, invoice id, payment id, or legacy JSON metadata.
+    /// </summary>
+    /// <param name="ipn">Verified NOWPayments IPN payload.</param>
+    /// <param name="cancellationToken">Cancellation token for database lookup.</param>
+    /// <returns>Matched payment row, or null when the callback cannot be matched.</returns>
     private async Task<SwapinoPaymentInfo> FindPaymentAsync(NowPaymentsIpn ipn, CancellationToken cancellationToken)
     {
         if (!string.IsNullOrWhiteSpace(ipn.order_id))
@@ -568,6 +666,11 @@ public class PaymentController : ControllerBase
         });
     }
 
+    /// <summary>
+    /// Logs extra NOWPayments database diagnostics when an IPN cannot be matched to a local payment row.
+    /// </summary>
+    /// <param name="ipn">Incoming IPN that failed lookup.</param>
+    /// <param name="cancellationToken">Cancellation token for diagnostic database queries.</param>
     private async Task LogPaymentLookupMissAsync(NowPaymentsIpn ipn, CancellationToken cancellationToken)
     {
         var totalCount = await _userDbcontext.SwapinoPaymentInfos.CountAsync(cancellationToken);
@@ -596,6 +699,11 @@ public class PaymentController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Copies NOWPayments IPN fields into both the normalized columns and the legacy JSON payload on the payment row.
+    /// </summary>
+    /// <param name="payment">Local payment row to update.</param>
+    /// <param name="ipn">Verified NOWPayments IPN payload.</param>
     private static void ApplyIpnToPayment(SwapinoPaymentInfo payment, NowPaymentsIpn ipn)
     {
         var data = payment.GetNowPaymentsData();

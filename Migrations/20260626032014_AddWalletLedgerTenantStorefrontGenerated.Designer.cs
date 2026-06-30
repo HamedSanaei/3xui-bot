@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -9,9 +10,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    partial class UserDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260626032014_AddWalletLedgerTenantStorefrontGenerated")]
+    partial class AddWalletLedgerTenantStorefrontGenerated
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.8");
@@ -84,9 +87,6 @@ namespace Adminbot.Migrations
 
                     b.Property<int>("TenantPriceMarkupPercent")
                         .HasColumnType("INTEGER");
-
-                    b.Property<string>("TenantTutorialsJson")
-                        .HasColumnType("TEXT");
 
                     b.Property<string>("TenantWelcomeText")
                         .HasColumnType("TEXT");
@@ -640,10 +640,6 @@ namespace Adminbot.Migrations
                         .HasMaxLength(140)
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("OrderKind")
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT");
-
                     b.Property<long?>("OwnerBalanceAfter")
                         .HasColumnType("INTEGER");
 
@@ -680,10 +676,6 @@ namespace Adminbot.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("TargetAccountEmail")
-                        .HasMaxLength(160)
-                        .HasColumnType("TEXT");
-
                     b.Property<string>("TenantBotId")
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
@@ -717,8 +709,6 @@ namespace Adminbot.Migrations
 
                     b.HasIndex("OrderId")
                         .IsUnique();
-
-                    b.HasIndex("OrderKind");
 
                     b.HasIndex("OwnerTelegramUserId");
 

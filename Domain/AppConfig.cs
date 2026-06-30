@@ -13,12 +13,12 @@ namespace Adminbot.Domain
 
         }
         public List<long> AdminsUserIds { get; set; }
+        public List<BotInstanceConfig> Bots { get; set; } = new();
+        public BotInstanceConfig SalesAssistantBot { get; set; } = new();
         public string BotToken { get; set; }
         public string IpnSecretKey { get; set; }
         public string SupportAccount { get; set; }
         public string MainChannel { get; set; }
-        public long TrafficPriceUser { get; set; }
-        public long TrafficPriceShop { get; set; }
         public string LoggerChannel { get; set; }
         public bool UserActivityLogEnabled { get; set; } = true;
         public string UserActivityLogLevel { get; set; } = "Information";
@@ -56,7 +56,6 @@ namespace Adminbot.Domain
         public string NowpaymentSuccessUrl { get; set; }
         public string NowpaymentCancelUrl { get; set; }
         public string NowpaymentIpnUrl { get; set; }
-        public long MinimumWalletChargeAmountToman { get; set; } = 100_000;
         public string HooshPayApiKey { get; set; }
         public string HooshPayIpnSecretKey { get; set; }
         public string HooshPayBaseUrl { get; set; } = "https://pay.hooshnet.com";

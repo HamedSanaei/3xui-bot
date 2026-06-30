@@ -24,6 +24,8 @@ namespace Adminbot.Domain
         public int AttemptsRemaining { get; set; } = 30; // Default to 30 attempts
         public bool IsPaid { get; set; } = false;
         public bool IsExpired { get; set; } = false;
+        public string BotId { get; set; } = BotContextAccessor.DefaultBotId;
+        public string BotUsername { get; set; } = BotContextAccessor.DefaultBotId;
 
 
 

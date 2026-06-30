@@ -609,6 +609,8 @@ public class XuiV3PurchaseService
             InboundIds = inboundIds ?? new List<int>(),
             MultiInbound = resolved.Service.MultiInbound,
             PanelUrl = serverInfo?.Url,
+            CreatedByBotId = string.IsNullOrWhiteSpace(metadataOptions.CreatedByBotId) ? BotContextAccessor.CurrentBotId : metadataOptions.CreatedByBotId,
+            LastUpdatedByBotId = string.IsNullOrWhiteSpace(metadataOptions.LastUpdatedByBotId) ? BotContextAccessor.CurrentBotId : metadataOptions.LastUpdatedByBotId,
             CreatedByTelegramUserId = metadataOptions.CreatedByTelegramUserId ?? user.TelegramUserId,
             LastUpdatedByTelegramUserId = metadataOptions.LastUpdatedByTelegramUserId ?? user.TelegramUserId,
             LastAction = string.IsNullOrWhiteSpace(metadataOptions.LastAction) ? "customer-create" : metadataOptions.LastAction
@@ -635,6 +637,8 @@ public class XuiV3AccountMetadataOptions
     public long? PriceTomanOverride { get; set; }
     public long? CreatedByTelegramUserId { get; set; }
     public long? LastUpdatedByTelegramUserId { get; set; }
+    public string CreatedByBotId { get; set; }
+    public string LastUpdatedByBotId { get; set; }
     public string LastAction { get; set; }
     public int AccountCounter { get; set; }
     public bool SaveUserStatus { get; set; } = true;

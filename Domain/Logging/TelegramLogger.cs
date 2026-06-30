@@ -7,6 +7,7 @@ using System;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Adminbot.Utils;
+using Adminbot.Domain;
 
 
 
@@ -18,18 +19,29 @@ namespace Adminbot.Domain.Logging
     {
         private readonly string _categoryName;
         private readonly Func<string, LogLevel, bool> _filter;
-        private readonly ITelegramBotClient _botClient;
-        private readonly string _channelId;
-        private readonly string _backupChannelId;
+        private readonly BotClientProvider _botClientProvider;
+        private readonly BotRegistry _botRegistry;
+        private readonly BotContextAccessor _botContextAccessor;
+        private readonly string _fallbackChannelId;
+        private readonly string _fallbackBackupChannelId;
 
 
-        public TelegramLogger(string categoryName, Func<string, LogLevel, bool> filter, ITelegramBotClient botClient, string channelId, string backupChannelId)
+        public TelegramLogger(
+            string categoryName,
+            Func<string, LogLevel, bool> filter,
+            BotClientProvider botClientProvider,
+            BotRegistry botRegistry,
+            BotContextAccessor botContextAccessor,
+            string fallbackChannelId,
+            string fallbackBackupChannelId)
         {
             _categoryName = categoryName;
             _filter = filter;
-            _botClient = botClient;
-            _channelId = channelId;
-            _backupChannelId = backupChannelId;
+            _botClientProvider = botClientProvider;
+            _botRegistry = botRegistry;
+            _botContextAccessor = botContextAccessor;
+            _fallbackChannelId = fallbackChannelId;
+            _fallbackBackupChannelId = fallbackBackupChannelId;
         }
 
         public IDisposable BeginScope<TState>(TState state) => default;
@@ -44,14 +56,16 @@ namespace Adminbot.Domain.Logging
             }
 
             var message = formatter(state, exception);
+            // Telegram logging is best-effort. Never block or fail the bot update pipeline because
+            // a log channel is missing, the logger bot cannot post, or Telegram rejects an entity.
             if (eventId.Id == 1000 && eventId.Name == "Payment")
             {
-                LogPayment(message).Wait();
+                _ = Task.Run(() => LogPayment(message));
                 // BackupDatabas().Wait();
             }
             else
             {
-                SendMessageToChannelAsync(message).Wait();
+                _ = Task.Run(() => SendMessageToChannelAsync(message));
                 //BackupDatabas().Wait();
 
             }
@@ -82,8 +96,8 @@ namespace Adminbot.Domain.Logging
 
 
             await using Stream stream = System.IO.File.OpenRead("./Data/credentials_backup.db");
-            Message message = await _botClient.SendDocumentAsync(
-                chatId: _backupChannelId,
+            Message message = await CurrentBotClient.SendDocumentAsync(
+                chatId: CurrentBackupChannelId,
                 document: InputFile.FromStream(stream: stream, fileName: "credentials.db"),
                 caption: DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi());
         }
@@ -96,8 +110,8 @@ namespace Adminbot.Domain.Logging
                 ;
 
                 // Send message using ParseMode.Html
-                await _botClient.SendTextMessageAsync(
-                    _channelId,
+                await CurrentBotClient.SendTextMessageAsync(
+                    CurrentLoggerChannelId,
                     message,
                     parseMode: Telegram.Bot.Types.Enums.ParseMode.Html
                 );
@@ -114,7 +128,7 @@ namespace Adminbot.Domain.Logging
         {
             try
             {
-                await _botClient.SendTextMessageAsync(_channelId, message, parseMode: Telegram.Bot.Types.Enums.ParseMode.Markdown);
+                await CurrentBotClient.SendTextMessageAsync(CurrentLoggerChannelId, message);
             }
             catch (Exception ex)
             {
@@ -122,6 +136,18 @@ namespace Adminbot.Domain.Logging
                 // You might want to log to a local file here as a fallback
             }
         }
+
+        private ITelegramBotClient CurrentBotClient => _botClientProvider.GetClient(CurrentBotConfig?.Id);
+
+        private BotInstanceConfig CurrentBotConfig => _botContextAccessor.Current?.Config ?? _botRegistry.DefaultBot;
+
+        private string CurrentLoggerChannelId => string.IsNullOrWhiteSpace(CurrentBotConfig?.LoggerChannel)
+            ? _fallbackChannelId
+            : CurrentBotConfig.LoggerChannel;
+
+        private string CurrentBackupChannelId => string.IsNullOrWhiteSpace(CurrentBotConfig?.BackupChannel)
+            ? _fallbackBackupChannelId
+            : CurrentBotConfig.BackupChannel;
 
     }
 }

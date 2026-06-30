@@ -10,6 +10,15 @@ using Microsoft.Extensions.Logging;
 using System.Text;
 using Telegram.Bot.Exceptions;
 
+/// <summary>
+/// Handles super-admin XuiV3 operations: creating accounts for users, renewing accounts,
+/// deleting expired users, private messaging, and manually checking payment status.
+/// </summary>
+/// <remarks>
+/// The multi-tenant addition affects this service in the manual HooshPay check path.
+/// When a paid HooshPay row belongs to a tenant storefront, settlement is delegated to
+/// <see cref="TenantBotService.ApplyPaidTenantOrderAsync"/> instead of charging a user's wallet.
+/// </remarks>
 public class XuiV3AdminFlowService
 {
     private const string FlowName = "xui-v3-admin";
@@ -46,10 +55,25 @@ public class XuiV3AdminFlowService
     private readonly NowPaymentsSettlementService _settlementService;
     private readonly HooshPay _hooshPay;
     private readonly HooshPaySettlementService _hooshPaySettlementService;
+    private readonly TenantBotService _tenantBotService;
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly ILogger<XuiV3AdminFlowService> _logger;
     private readonly UserActivityLogService _activityLog;
 
+    /// <summary>
+    /// Creates the super-admin XuiV3 flow service and injects the payment and tenant services needed by admin tools.
+    /// </summary>
+    /// <param name="userDbContext">Runtime database containing admin flow state and payment rows.</param>
+    /// <param name="credentialsDbContext">Shared profile and wallet database.</param>
+    /// <param name="configuration">Application configuration containing XuiV3 and payment settings.</param>
+    /// <param name="nowPayments">NOWPayments API client for manual crypto payment checks.</param>
+    /// <param name="settlementService">NOWPayments wallet settlement service.</param>
+    /// <param name="hooshPay">HooshPay API client for manual rial payment checks.</param>
+    /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
+    /// <param name="tenantBotService">Tenant storefront settlement service for direct tenant orders.</param>
+    /// <param name="purchaseService">Shared XuiV3 purchase and renewal service.</param>
+    /// <param name="logger">Service logger.</param>
+    /// <param name="activityLog">File-based activity logger for admin actions.</param>
     public XuiV3AdminFlowService(
         UserDbContext userDbContext,
         CredentialsDbContext credentialsDbContext,
@@ -58,6 +82,7 @@ public class XuiV3AdminFlowService
         NowPaymentsSettlementService settlementService,
         HooshPay hooshPay,
         HooshPaySettlementService hooshPaySettlementService,
+        TenantBotService tenantBotService,
         XuiV3PurchaseService purchaseService,
         ILogger<XuiV3AdminFlowService> logger,
         UserActivityLogService activityLog)
@@ -70,16 +95,30 @@ public class XuiV3AdminFlowService
         _settlementService = settlementService;
         _hooshPay = hooshPay;
         _hooshPaySettlementService = hooshPaySettlementService;
+        _tenantBotService = tenantBotService;
         _purchaseService = purchaseService;
         _logger = logger;
         _activityLog = activityLog;
     }
 
+    /// <summary>
+    /// Checks whether the application is currently configured to use XuiV3 admin flows.
+    /// </summary>
+    /// <returns><c>true</c> when <c>XuiApiVersionMode</c> is <c>v3</c>.</returns>
     public bool IsEnabled()
     {
         return string.Equals(_appConfig.XuiApiVersionMode, "v3", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Attempts to handle a super-admin message as part of the XuiV3 admin flow.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the current bot.</param>
+    /// <param name="message">Incoming admin message.</param>
+    /// <param name="currentUser">Bot-scoped admin state row.</param>
+    /// <param name="mainMenu">Reply keyboard returned when a flow finishes.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram, database, payment, and panel operations.</param>
+    /// <returns><c>true</c> when the message was consumed by this service; otherwise <c>false</c>.</returns>
     public async Task<bool> TryHandleMessageAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -920,10 +959,13 @@ public class XuiV3AdminFlowService
         client.Comment = updatedClient.Comment;
         client.TgId = updatedClient.TgId;
         client.Enable = updatedClient.Enable;
-        if (trafficResetApplied && client.Traffic != null)
+        // Some 3x-ui v3 responses omit the traffic object. The panel-side reset is already done;
+        // only mirror the reset locally when the response actually carried counters.
+        var traffic = client.Traffic;
+        if (trafficResetApplied && traffic != null)
         {
-            client.Traffic.Up = 0;
-            client.Traffic.Down = 0;
+            traffic.Up = 0;
+            traffic.Down = 0;
         }
 
         await botClient.SendTextMessageAsync(
@@ -1135,6 +1177,22 @@ public class XuiV3AdminFlowService
             ParseMode.Html);
     }
 
+    /// <summary>
+    /// Handles the super-admin manual HooshPay payment check command.
+    /// </summary>
+    /// <remarks>
+    /// The input may be an internal payment id, HooshPay order id, or invoice uid.
+    /// Paid wallet-charge rows are settled through <see cref="HooshPaySettlementService"/>.
+    /// Paid tenant-order rows are settled through <see cref="TenantBotService"/> to create the account
+    /// and credit only the colleague owner's profit.
+    /// </remarks>
+    /// <param name="botClient">Telegram client used to answer the admin.</param>
+    /// <param name="message">Admin message that contains the payment identifier.</param>
+    /// <param name="currentUser">Bot-scoped admin state used to finish the flow.</param>
+    /// <param name="mainMenu">Reply keyboard shown after the check finishes.</param>
+    /// <param name="input">Payment id, order id, or invoice uid supplied by the admin.</param>
+    /// <param name="cancellationToken">Cancellation token for API, database, and Telegram calls.</param>
+    /// <returns><c>true</c> when a HooshPay row was found and handled; otherwise <c>false</c>.</returns>
     private async Task<bool> TryHandleHooshPayStatusAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1209,11 +1267,17 @@ public class XuiV3AdminFlowService
         {
             payment.PaymentStatus = HooshPayStatuses.Paid;
             await _userDbContext.SaveChangesAsync(cancellationToken);
-            settlement = await _hooshPaySettlementService.ApplyFinishedPaymentAsync(
-                payment,
-                "admin-check",
-                payment.ChatId == 0 ? null : payment.ChatId,
-                cancellationToken);
+            // Admin manual checks must respect payment purpose to avoid charging tenant customers' wallets.
+            settlement = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
+                ? await _tenantBotService.ApplyPaidTenantOrderAsync(
+                    payment,
+                    "admin-check",
+                    cancellationToken)
+                : await _hooshPaySettlementService.ApplyFinishedPaymentAsync(
+                    payment,
+                    "admin-check",
+                    payment.ChatId == 0 ? null : payment.ChatId,
+                    cancellationToken);
         }
 
         var actorCredUser = await GetActivityActorAsync(message.From.Id);
@@ -2517,24 +2581,63 @@ public class XuiV3AdminFlowService
         };
     }
 
+    /// <summary>
+    /// Reads the configured traffic limit for an XUI v3 client without requiring the nested traffic object.
+    /// </summary>
+    /// <param name="client">
+    /// XUI v3 client returned by the panel. The value may be null or may have a null <c>Traffic</c> property
+    /// when the panel omits traffic counters from an account-info response.
+    /// </param>
+    /// <returns>
+    /// Traffic limit in bytes. Returns <c>0</c> when the panel did not provide a limit in top-level fields,
+    /// nested traffic fields, or the raw <c>Extra</c> dictionary.
+    /// </returns>
+    /// <remarks>
+    /// The lookup order matches the v3 payload variants seen in production: top-level <c>TotalGB</c> first,
+    /// then <c>Traffic.TotalGB</c>, then <c>Traffic.Total</c>, and finally <c>Extra["totalGB"]</c>.
+    /// Keeping this helper null-safe prevents admin account-status and renewal screens from crashing when
+    /// <c>traffic == null</c>.
+    /// </remarks>
     private static long GetTotalBytes(XuiV3Client client)
     {
+        if (client == null)
+            return 0;
+
         if (client.TotalGB > 0)
             return client.TotalGB;
 
-        if (client.Traffic?.TotalGB > 0)
-            return client.Traffic.TotalGB;
+        var traffic = client.Traffic;
+        if (traffic?.TotalGB > 0)
+            return traffic.TotalGB;
 
-        if (client.Traffic?.Total > 0)
-            return client.Traffic.Total;
+        if (traffic?.Total > 0)
+            return traffic.Total;
 
         return ReadLongExtra(client, "totalGB");
     }
 
+    /// <summary>
+    /// Reads consumed upload and download bytes for an XUI v3 client without assuming traffic counters exist.
+    /// </summary>
+    /// <param name="client">
+    /// XUI v3 client returned by the panel. The nested <c>Traffic</c> property may be null.
+    /// </param>
+    /// <returns>
+    /// Sum of uploaded and downloaded bytes. Missing counters are treated as zero and then resolved from
+    /// <c>Extra["up"]</c> and <c>Extra["down"]</c> when available.
+    /// </returns>
+    /// <remarks>
+    /// Admin account-info rendering calls this method for every result row. It must never throw for partially
+    /// populated v3 clients because those exceptions stop the Telegram update handler.
+    /// </remarks>
     private static long GetUsedBytes(XuiV3Client client)
     {
-        return (client.Traffic?.Up ?? ReadLongExtra(client, "up")) +
-               (client.Traffic?.Down ?? ReadLongExtra(client, "down"));
+        if (client == null)
+            return 0;
+
+        var traffic = client.Traffic;
+        return (traffic?.Up ?? ReadLongExtra(client, "up")) +
+               (traffic?.Down ?? ReadLongExtra(client, "down"));
     }
 
     private static bool IsExpired(long expiryTime)
@@ -2888,6 +2991,12 @@ public class XuiV3AdminFlowService
                $"Invoice URL: <code>{Html(payment.InvoiceUrl ?? data.InvoiceUrl)}</code>";
     }
 
+    /// <summary>
+    /// Builds the HTML status summary shown to super-admins after a HooshPay manual check.
+    /// </summary>
+    /// <param name="payment">Local HooshPay payment row.</param>
+    /// <param name="settlement">Optional settlement result when the payment was paid and settlement ran.</param>
+    /// <returns>HTML-formatted payment status text.</returns>
     private static string BuildHooshPayPaymentInfo(
         HooshPayPaymentInfo payment,
         NowPaymentsSettlementResult settlement)
@@ -2912,6 +3021,10 @@ public class XuiV3AdminFlowService
                $"Payment URL: <code>{Html(payment.PaymentUrl)}</code>";
     }
 
+    /// <summary>
+    /// Converts globally configured XuiV3 panel settings into the <see cref="ServerInfo"/> used by admin operations.
+    /// </summary>
+    /// <returns>Configured XuiV3 panel descriptor.</returns>
     private ServerInfo BuildConfiguredPanelServerInfo()
     {
         if (string.IsNullOrWhiteSpace(_appConfig.XuiV3ApiBaseUrl))
@@ -2930,6 +3043,11 @@ public class XuiV3AdminFlowService
         };
     }
 
+    /// <summary>
+    /// Loads the credential user used as the actor in activity logs.
+    /// </summary>
+    /// <param name="telegramUserId">Telegram user id of the admin actor.</param>
+    /// <returns>Credential user row, or a minimal fallback row when the admin is not in credentials.db.</returns>
     private async Task<CredUser> GetActivityActorAsync(long telegramUserId)
     {
         return await _credentialsDbContext.GetUserStatusWithId(telegramUserId)
@@ -2955,19 +3073,49 @@ public class XuiV3AdminFlowService
         }
     }
 
+    /// <summary>
+    /// Formats traffic usage for admin account-info messages.
+    /// </summary>
+    /// <param name="client">
+    /// XUI v3 client whose traffic may be present only in top-level fields or the raw <c>Extra</c> dictionary.
+    /// </param>
+    /// <returns>
+    /// Human-readable traffic usage such as <c>1.25 GB / 10.00 GB</c> or <c>1.25 GB / unlimited</c>.
+    /// </returns>
+    /// <remarks>
+    /// This method delegates to the null-safe traffic helpers so rendering admin account details remains stable
+    /// for panel responses that omit <c>traffic</c>.
+    /// </remarks>
     private static string FormatTraffic(XuiV3Client client)
     {
-        var usedBytes = (client.Traffic?.Up ?? ReadLongExtra(client, "up")) +
-                        (client.Traffic?.Down ?? ReadLongExtra(client, "down"));
-        var totalBytes = client.TotalGB > 0 ? client.TotalGB : client.Traffic?.TotalGB ?? client.Traffic?.Total ?? 0;
+        var usedBytes = GetUsedBytes(client);
+        var totalBytes = GetTotalBytes(client);
         if (totalBytes <= 0)
             return $"{usedBytes.ConvertBytesToGB():F2} GB / unlimited";
 
         return $"{usedBytes.ConvertBytesToGB():F2} GB / {totalBytes.ConvertBytesToGB():F2} GB";
     }
 
+    /// <summary>
+    /// Reads the client expiry timestamp without requiring the nested XUI traffic object.
+    /// </summary>
+    /// <param name="client">
+    /// XUI v3 client returned by the panel. The value may be null, and <c>Traffic</c> may be absent.
+    /// </param>
+    /// <returns>
+    /// Expiry timestamp in Unix milliseconds, <c>0</c> for unlimited/no expiry, or a negative first-use duration
+    /// when the panel stores first-connection validity.
+    /// </returns>
+    /// <remarks>
+    /// Lookup order is top-level <c>ExpiryTime</c>, nested <c>Traffic.ExpiryTime</c>, then
+    /// <c>Extra["expiryTime"]</c>. The null guard is required because admin account status must not crash when
+    /// 3x-ui returns <c>traffic: null</c>.
+    /// </remarks>
     private static long GetExpiryTime(XuiV3Client client)
     {
+        if (client == null)
+            return 0;
+
         if (client.ExpiryTime != 0)
             return client.ExpiryTime;
 

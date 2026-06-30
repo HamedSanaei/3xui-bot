@@ -13,7 +13,9 @@ using Telegram.Bot.Types.ReplyMarkups;
 public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
 {
     private readonly IConfiguration _configuration;
-    private readonly ITelegramBotClient _botClient;
+    private readonly BotClientProvider _botClientProvider;
+    private readonly BotRegistry _botRegistry;
+    private readonly BotContextAccessor _botContextAccessor;
     private readonly CredentialsDbContext _credentialsDbContext;
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly AppConfig _appConfig;
@@ -25,12 +27,16 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
 
     public XuiV3AccountExpiryReminderService(
         IConfiguration configuration,
-        ITelegramBotClient botClient,
+        BotClientProvider botClientProvider,
+        BotRegistry botRegistry,
+        BotContextAccessor botContextAccessor,
         CredentialsDbContext credentialsDbContext,
         XuiV3PurchaseService purchaseService)
     {
         _configuration = configuration;
-        _botClient = botClient;
+        _botClientProvider = botClientProvider;
+        _botRegistry = botRegistry;
+        _botContextAccessor = botContextAccessor;
         _credentialsDbContext = credentialsDbContext;
         _purchaseService = purchaseService;
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -103,7 +109,7 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
         var todayIran = nowIran.Date;
         var reminderDays = GetReminderDays().ToHashSet();
         var enabledServices = _purchaseService.GetEnabledServices();
-        var dueByUser = new Dictionary<long, List<ExpiryReminderItem>>();
+        var dueByUser = new Dictionary<string, List<ExpiryReminderItem>>(StringComparer.Ordinal);
 
         foreach (var client in clientsResponse.Obj ?? new List<XuiV3Client>())
         {
@@ -113,7 +119,8 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
             if (!XuiV3ClientPlanEligibility.IsClientInActiveServiceInbounds(client, enabledServices))
                 continue;
 
-            var ownerTelegramUserId = GetOwnerTelegramUserId(client);
+            var metadata = TryReadMetadata(client.Comment);
+            var ownerTelegramUserId = GetOwnerTelegramUserId(client, metadata);
             if (ownerTelegramUserId <= 0 || IsSuperAdmin(ownerTelegramUserId))
                 continue;
 
@@ -132,13 +139,17 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
                 Email = client.Email ?? "",
                 ClientId = client.Id,
                 DaysLeft = daysLeft,
-                ExpiryIranDate = expiryIranDate
+                ExpiryIranDate = expiryIranDate,
+                BotId = string.IsNullOrWhiteSpace(metadata?.CreatedByBotId)
+                    ? BotContextAccessor.DefaultBotId
+                    : metadata.CreatedByBotId
             };
 
-            if (!dueByUser.TryGetValue(ownerTelegramUserId, out var items))
+            var groupKey = BuildReminderGroupKey(item.BotId, ownerTelegramUserId);
+            if (!dueByUser.TryGetValue(groupKey, out var items))
             {
                 items = new List<ExpiryReminderItem>();
-                dueByUser[ownerTelegramUserId] = items;
+                dueByUser[groupKey] = items;
             }
 
             items.Add(item);
@@ -148,13 +159,16 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
         var skipped = 0;
         foreach (var group in dueByUser)
         {
-            var credUser = await _credentialsDbContext.GetUserStatusWithId(group.Key);
+            var (botId, telegramUserId) = ParseReminderGroupKey(group.Key);
+            var credUser = await _credentialsDbContext.GetUserStatusWithId(telegramUserId);
             if (credUser == null || credUser.IsBlocked)
             {
                 skipped++;
                 continue;
             }
 
+            var bot = _botRegistry.GetById(botId);
+            var botClient = _botClientProvider.GetClient(bot?.Id);
             var chatId = credUser.ChatID > 0 ? credUser.ChatID : credUser.TelegramUserId;
             if (chatId <= 0)
             {
@@ -165,7 +179,7 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
             var freshItems = group.Value
                 .OrderBy(item => item.DaysLeft)
                 .ThenBy(item => item.Email, StringComparer.OrdinalIgnoreCase)
-                .Where(item => MarkNotSent(todayIran, group.Key, item))
+                .Where(item => MarkNotSent(todayIran, botId, telegramUserId, item))
                 .ToList();
 
             if (freshItems.Count == 0)
@@ -173,12 +187,15 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
 
             try
             {
-                await _botClient.SendTextMessageAsync(
-                    chatId: chatId,
-                    text: BuildReminderMessage(freshItems),
-                    parseMode: ParseMode.Html,
-                    replyMarkup: BuildReminderKeyboard(freshItems),
-                    cancellationToken: cancellationToken);
+                using (_botContextAccessor.Push(new BotRuntimeContext { Config = bot, Client = botClient }))
+                {
+                    await botClient.SendTextMessageAsync(
+                        chatId: chatId,
+                        text: BuildReminderMessage(freshItems),
+                        parseMode: ParseMode.Html,
+                        replyMarkup: BuildReminderKeyboard(freshItems),
+                        cancellationToken: cancellationToken);
+                }
                 sent++;
             }
             catch (ApiRequestException ex) when (ex.ErrorCode == 403)
@@ -243,9 +260,9 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
             .OrderByDescending(day => day);
     }
 
-    private bool MarkNotSent(DateTime todayIran, long telegramUserId, ExpiryReminderItem item)
+    private bool MarkNotSent(DateTime todayIran, string botId, long telegramUserId, ExpiryReminderItem item)
     {
-        var key = $"{todayIran:yyyyMMdd}:{telegramUserId}:{item.DaysLeft}:{item.Email}";
+        var key = $"{todayIran:yyyyMMdd}:{botId}:{telegramUserId}:{item.DaysLeft}:{item.Email}";
         return _sentKeys.TryAdd(key, 0);
     }
 
@@ -278,13 +295,26 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
         return TimeZoneInfo.CreateCustomTimeZone("Iran Standard Time", TimeSpan.FromMinutes(210), "Iran Standard Time", "Iran Standard Time");
     }
 
-    private static long GetOwnerTelegramUserId(XuiV3Client client)
+    private static long GetOwnerTelegramUserId(XuiV3Client client, XuiV3ClientMetadata metadata)
     {
         if (client?.TgId > 0)
             return client.TgId;
 
-        var metadata = TryReadMetadata(client?.Comment);
         return metadata?.TelegramUserId > 0 ? metadata.TelegramUserId : 0;
+    }
+
+    private static string BuildReminderGroupKey(string botId, long telegramUserId)
+    {
+        return $"{(string.IsNullOrWhiteSpace(botId) ? BotContextAccessor.DefaultBotId : botId)}:{telegramUserId}";
+    }
+
+    private static (string BotId, long TelegramUserId) ParseReminderGroupKey(string key)
+    {
+        var parts = (key ?? "").Split(':', 2);
+        if (parts.Length == 2 && long.TryParse(parts[1], out var userId))
+            return (parts[0], userId);
+
+        return (BotContextAccessor.DefaultBotId, 0);
     }
 
     private static XuiV3ClientMetadata TryReadMetadata(string comment)
@@ -394,5 +424,6 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
         public int ClientId { get; set; }
         public int DaysLeft { get; set; }
         public DateTime ExpiryIranDate { get; set; }
+        public string BotId { get; set; }
     }
 }

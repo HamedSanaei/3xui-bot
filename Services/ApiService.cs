@@ -14,35 +14,112 @@ using Newtonsoft.Json.Linq;
 
 public class ApiService
 {
+    /// <summary>
+    /// Logs a non-fatal legacy panel login failure without throwing into Telegram update handlers.
+    /// </summary>
+    /// <param name="message">Short diagnostic message describing the failed login step.</param>
+    /// <param name="exception">Optional exception raised by URL parsing, HTTP, cookie parsing, or database access.</param>
+    /// <remarks>
+    /// The legacy account-creation flow treats a null cookie as a recoverable login failure. Logging here is
+    /// intentionally console-based because this static service does not own an <c>ILogger</c> instance.
+    /// </remarks>
+    private static void LogLoginCookieFailure(string message, Exception exception = null)
+    {
+        Console.WriteLine(exception == null
+            ? $"[ApiService] Login cookie failure: {message}"
+            : $"[ApiService] Login cookie failure: {message}. {exception.GetType().Name}: {exception.Message}");
+    }
+
+    /// <summary>
+    /// Builds an absolute-path route for legacy x-ui panels while tolerating an empty root path.
+    /// </summary>
+    /// <param name="rootPath">
+    /// Optional x-ui root path from server configuration. Leading and trailing slashes are ignored.
+    /// Empty values mean the panel endpoint is mounted at the domain root.
+    /// </param>
+    /// <param name="suffix">
+    /// Endpoint suffix such as <c>login</c> or <c>panel/api/inbounds/list</c>. Leading slashes are ignored.
+    /// </param>
+    /// <returns>A route beginning with one slash and containing no duplicate slash caused by an empty root path.</returns>
+    private static string BuildPanelRoute(string rootPath, string suffix)
+    {
+        var normalizedRoot = (rootPath ?? string.Empty).Trim('/');
+        var normalizedSuffix = (suffix ?? string.Empty).TrimStart('/');
+        return string.IsNullOrWhiteSpace(normalizedRoot)
+            ? "/" + normalizedSuffix
+            : "/" + normalizedRoot + "/" + normalizedSuffix;
+    }
+
+    /// <summary>
+    /// Validates the minimum server settings required for a legacy x-ui login request.
+    /// </summary>
+    /// <param name="serverInfo">Server configuration selected by the purchase flow.</param>
+    /// <param name="baseUri">
+    /// Absolute HTTP or HTTPS base URI parsed from <paramref name="serverInfo"/> when validation succeeds.
+    /// </param>
+    /// <returns><c>true</c> when login can be attempted; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// Invalid configuration is handled as a login failure instead of an exception so Telegram account creation
+    /// can return a normal failure message to the user.
+    /// </remarks>
+    private static bool TryValidateLoginServer(ServerInfo serverInfo, out Uri baseUri)
+    {
+        baseUri = null;
+        if (serverInfo == null)
+        {
+            LogLoginCookieFailure("ServerInfo is null.");
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(serverInfo.Url))
+        {
+            LogLoginCookieFailure("ServerInfo.Url is empty.");
+            return false;
+        }
+
+        if (!Uri.TryCreate(serverInfo.Url.TrimEnd('/'), UriKind.Absolute, out baseUri) ||
+            (baseUri.Scheme != Uri.UriSchemeHttp && baseUri.Scheme != Uri.UriSchemeHttps))
+        {
+            LogLoginCookieFailure($"ServerInfo.Url is invalid: {serverInfo.Url}");
+            baseUri = null;
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Logs into a legacy x-ui panel and returns a reusable session cookie value.
+    /// </summary>
+    /// <param name="serverInfo">
+    /// Legacy x-ui server configuration selected by the account creation or update flow.
+    /// The value may have an empty <c>RootPath</c>, but must contain a valid absolute HTTP or HTTPS <c>Url</c>.
+    /// </param>
+    /// <returns>
+    /// The raw session value without the cookie name when login or cached-cookie validation succeeds;
+    /// otherwise <c>null</c>. A null return means callers must stop account creation/update gracefully.
+    /// </returns>
+    /// <remarks>
+    /// This method is intentionally fail-closed and exception-safe. Null server config, invalid URLs, missing
+    /// <c>Set-Cookie</c> headers, empty cookie values, HTTP failures, database errors, and unexpected exceptions
+    /// are logged and converted to <c>null</c> so Telegram update handlers do not crash.
+    /// </remarks>
     public static async Task<string> LoginAndGetSessionCookie(ServerInfo serverInfo)
+
     {
         try
         {
             System.Net.ServicePointManager.SecurityProtocol =
-                SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+        SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
 
-            if (serverInfo == null)
-            {
-                Console.WriteLine("[ApiService] Login failed: serverInfo is null.");
+            if (!TryValidateLoginServer(serverInfo, out var baseUri))
                 return null;
-            }
 
+            using HttpClient httpClient = new HttpClient();
             string username = serverInfo.Username;
             string password = serverInfo.Password;
-            string apiUrl = serverInfo.Url;
-            string rootPath = serverInfo.RootPath?.Trim('/');
-
-            if (string.IsNullOrWhiteSpace(apiUrl) || !Uri.TryCreate(apiUrl, UriKind.Absolute, out var baseUri))
-            {
-                Console.WriteLine($"[ApiService] Login failed: invalid server Url '{apiUrl}'.");
-                return null;
-            }
-
-            if (string.IsNullOrWhiteSpace(rootPath))
-            {
-                Console.WriteLine($"[ApiService] Login failed: RootPath is empty for '{apiUrl}'.");
-                return null;
-            }
+            string apiUrl = baseUri.ToString().TrimEnd('/');
+            string rootPath = serverInfo.RootPath;
 
             string completeSessionCookie = string.Empty;
             var loginData = new
@@ -50,8 +127,14 @@ public class ApiService
                 Username = username,
                 Password = password
             };
+            string completeSessionCookie = string.Empty;
+            var loginData = new
+            {
+                Username = username,
+                Password = password
+            };
 
-            using var httpClient = new HttpClient { BaseAddress = baseUri };
+            //check the databas if exist return
             using var context = new UserDbContext();
             var dbCookie = await context.Cookies.FirstOrDefaultAsync(c => c.Url == apiUrl);
             if (dbCookie != null)
@@ -59,71 +142,95 @@ public class ApiService
                 string cookie = dbCookie.SessionCookie;
                 DateTimeOffset currentUtcTime = DateTimeOffset.UtcNow;
 
-                if (!string.IsNullOrWhiteSpace(cookie)
-                    && dbCookie.ExpirationDate > currentUtcTime
-                    && await IsCookieValid(serverInfo, cookie))
-                {
+
+                if (!string.IsNullOrWhiteSpace(cookie) &&
+                    dbCookie.ExpirationDate > currentUtcTime &&
+                    await IsCookieValid(serverInfo, cookie))
                     return dbCookie.SessionCookie;
-                }
             }
-
-            if (dbCookie?.ExpirationDate < DateTimeOffset.UtcNow || dbCookie == null)
+            if (dbCookie?.ExpirationDate < DateTimeOffset.UtcNow || dbCookie == null || string.IsNullOrWhiteSpace(dbCookie.SessionCookie))
             {
-                HttpResponseMessage response = await httpClient.PostAsJsonAsync($"/{rootPath}/login", loginData);
+                // valid nist 
+                // Set the base address of your API
+                httpClient.BaseAddress = baseUri;
+                HttpResponseMessage response = await httpClient.PostAsJsonAsync(BuildPanelRoute(rootPath, "login"), loginData);
 
-                if (!response.IsSuccessStatusCode)
+                if (response.IsSuccessStatusCode)
                 {
-                    Console.WriteLine($"Error: {response.StatusCode} - {response.ReasonPhrase}");
-                    Console.WriteLine("Error: there is a problem with retreieving or getting new cookie!");
-                    return null;
-                }
+                    // Read the content as a string
+                    string responseContent = await response.Content.ReadAsStringAsync();
 
-                if (response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
-                {
-                    completeSessionCookie = setCookieHeaders.FirstOrDefault(cookie => cookie.StartsWith("session") || cookie.StartsWith("3x-ui="));
-                }
+                    // Retrieve the session cookie if present
+                    if (response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
+                    {
+                        // Extract the session cookie from the Set-Cookie header
+                        completeSessionCookie = setCookieHeaders.FirstOrDefault(cookie => cookie.StartsWith("session") || cookie.StartsWith("3x-ui="));
+                    }
+                    else
+                    {
+                        LogLoginCookieFailure($"Login response did not include Set-Cookie. Url={apiUrl}");
+                        return null;
+                    }
 
-                if (string.IsNullOrWhiteSpace(completeSessionCookie))
-                {
-                    Console.WriteLine($"[ApiService] Login failed: Set-Cookie header was not found for '{apiUrl}'.");
-                    return null;
-                }
+                    if (string.IsNullOrWhiteSpace(completeSessionCookie))
+                    {
+                        LogLoginCookieFailure($"Login Set-Cookie did not include session or 3x-ui cookie. Url={apiUrl}");
+                        return null;
+                    }
 
-                TryExtractExpirationDate(completeSessionCookie, out var expirationDate);
-                var purecookie = GetSessionCookie(completeSessionCookie);
-                if (string.IsNullOrWhiteSpace(purecookie))
-                {
-                    Console.WriteLine($"[ApiService] Login failed: session cookie could not be parsed for '{apiUrl}'.");
-                    return null;
-                }
+                    // Do something with the session cookie, e.g., store it for future use
+                    TryExtractExpirationDate(completeSessionCookie, out var expirationDate);
+                    var purecookie = GetSessionCookie(completeSessionCookie);
+                    if (string.IsNullOrWhiteSpace(purecookie))
+                    {
+                        LogLoginCookieFailure($"Extracted session cookie is empty. Url={apiUrl}");
+                        return null;
+                    }
 
-                if (dbCookie != null)
-                {
-                    dbCookie.ExpirationDate = expirationDate;
-                    dbCookie.SessionCookie = purecookie;
-                    context.Cookies.Update(dbCookie);
-                    await context.SaveChangesAsync();
+                    if (dbCookie != null)
+                    {
+                        dbCookie.ExpirationDate = expirationDate;
+                        dbCookie.SessionCookie = purecookie;
+                        context.Cookies.Update(dbCookie);
+                        await context.SaveChangesAsync();
+                    }
+                    else
+                    {
+                        CookieData cookieData = new CookieData { Id = Guid.NewGuid(), Url = apiUrl, ExpirationDate = expirationDate, SessionCookie = purecookie };
+                        await context.Cookies.AddAsync(cookieData);
+                        await context.SaveChangesAsync();
+                    }
+
                 }
                 else
                 {
-                    CookieData cookieData = new CookieData { Id = Guid.NewGuid(), Url = apiUrl, ExpirationDate = expirationDate, SessionCookie = purecookie };
-                    await context.Cookies.AddAsync(cookieData);
-                    await context.SaveChangesAsync();
+                    // Handle the case where the request was not successful
+                    LogLoginCookieFailure($"Login HTTP failed. Url={apiUrl}, Status={response.StatusCode}, Reason={response.ReasonPhrase}");
                 }
-
-                return purecookie;
             }
+            return GetSessionCookie(completeSessionCookie);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ApiService] LoginAndGetSessionCookie failed: {ex}");
+            LogLoginCookieFailure("Unexpected login failure.", ex);
+            return null;
         }
-
-        return null;
     }
 
+    /// <summary>
+    /// Verifies a cached x-ui session cookie by calling the inbound list endpoint.
+    /// </summary>
+    /// <param name="serverInfo">Legacy x-ui server configuration used to build the validation URL.</param>
+    /// <param name="cookie">Session cookie value without the cookie name.</param>
+    /// <returns><c>true</c> when the panel accepts the cookie; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// Any malformed URL, empty cookie, HTTP failure, or exception is treated as an invalid cache entry.
+    /// </remarks>
     private static async Task<bool> IsCookieValid(ServerInfo serverInfo, string cookie)
     {
+        if (!TryValidateLoginServer(serverInfo, out var baseUri) || string.IsNullOrWhiteSpace(cookie))
+            return false;
+
         var loginData = new
         {
             Username = serverInfo.Username,
@@ -135,8 +242,8 @@ public class ApiService
 
         // Create a CookieContainer and add your cookie
         var cookieContainer = new CookieContainer();
-        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("session", cookie));
-        cookieContainer.Add(new Uri(serverInfo.Url), new Cookie("3x-ui", cookie));
+        cookieContainer.Add(baseUri, new Cookie("session", cookie));
+        cookieContainer.Add(baseUri, new Cookie("3x-ui", cookie));
 
         // Assign the CookieContainer to the handler
         handler.CookieContainer = cookieContainer;
@@ -147,7 +254,7 @@ public class ApiService
 
         try
         {
-            var route = serverInfo.Url + "/" + serverInfo.RootPath + "/panel/api/inbounds/list";
+            var route = new Uri(baseUri, BuildPanelRoute(serverInfo.RootPath, "panel/api/inbounds/list"));
             HttpResponseMessage response = await httpClient.GetAsync(route);
             if (response.IsSuccessStatusCode)
             {
@@ -161,17 +268,26 @@ public class ApiService
         catch (System.Exception ex)
         {
 
-            Console.WriteLine(ex.Message);
+            LogLoginCookieFailure("Cached cookie validation failed.", ex);
             return false;
         }
 
 
     }
 
+    /// <summary>
+    /// Extracts the raw cookie value from a legacy x-ui Set-Cookie header.
+    /// </summary>
+    /// <param name="cookie">Set-Cookie header value for either <c>session</c> or <c>3x-ui</c>.</param>
+    /// <returns>The cookie value without name/attributes, or <c>null</c> when no supported cookie exists.</returns>
     private static string GetSessionCookie(string cookie)
     {
+        if (string.IsNullOrWhiteSpace(cookie))
+            return null;
 
         var cookieParts = cookie.Split(';');
+        if (cookieParts.Length == 0)
+            return null;
 
         if (cookieParts[0].Trim().StartsWith("session="))
         {

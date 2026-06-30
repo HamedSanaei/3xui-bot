@@ -14,7 +14,7 @@ using Telegram.Bot.Types.ReplyMarkups;
 
 public class BroadcastManager : IHostedService, IDisposable
 {
-    private readonly ITelegramBotClient _bot;
+    private readonly BotClientProvider _botClientProvider;
     private readonly ILogger<BroadcastManager> _logger;
     private readonly Channel<BroadcastItem> _queue;
     private readonly ConcurrentDictionary<string, BroadcastJob> _jobs = new(StringComparer.Ordinal);
@@ -26,11 +26,11 @@ public class BroadcastManager : IHostedService, IDisposable
     private int _disposed;
 
     public BroadcastManager(
-        ITelegramBotClient bot,
+        BotClientProvider botClientProvider,
         IConfiguration configuration,
         ILogger<BroadcastManager> logger)
     {
-        _bot = bot;
+        _botClientProvider = botClientProvider;
         _logger = logger;
 
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -93,6 +93,7 @@ public class BroadcastManager : IHostedService, IDisposable
             RequestedByTelegramUserId = requestedByTelegramUserId,
             Total = normalizedChatIds.Count,
             IsForward = template.IsForward,
+            BotId = BotContextAccessor.CurrentBotId,
             CreatedAtUtc = DateTime.UtcNow,
             UpdatedAtUtc = DateTime.UtcNow
         };
@@ -107,7 +108,8 @@ public class BroadcastManager : IHostedService, IDisposable
                 Text = template.Text,
                 FromChatId = template.FromChatId,
                 MessageId = template.MessageId,
-                IsForward = template.IsForward
+                IsForward = template.IsForward,
+                BotId = job.BotId
             }, cancellationToken);
         }
 
@@ -192,16 +194,17 @@ public class BroadcastManager : IHostedService, IDisposable
 
     private Task SendAsync(BroadcastItem item, ParseMode? parseMode, CancellationToken cancellationToken)
     {
+        var bot = _botClientProvider.GetClient(item.BotId);
         if (item.IsForward)
         {
-            return _bot.ForwardMessageAsync(
+            return bot.ForwardMessageAsync(
                 chatId: item.ChatId,
                 fromChatId: item.FromChatId,
                 messageId: item.MessageId,
                 cancellationToken: cancellationToken);
         }
 
-        return _bot.SendTextMessageAsync(
+        return bot.SendTextMessageAsync(
             chatId: item.ChatId,
             text: item.Text ?? string.Empty,
             parseMode: parseMode,
@@ -317,9 +320,10 @@ public class BroadcastManager : IHostedService, IDisposable
 
     private async Task EditStatusMessageAsync(BroadcastJob job, CancellationToken cancellationToken)
     {
+        var bot = _botClientProvider.GetClient(job.BotId);
         try
         {
-            await _bot.EditMessageTextAsync(
+            await bot.EditMessageTextAsync(
                 chatId: job.AdminChatId,
                 messageId: job.StatusMessageId,
                 text: BuildStatusText(job),
@@ -330,7 +334,7 @@ public class BroadcastManager : IHostedService, IDisposable
         catch (ApiRequestException ex) when (ex.ErrorCode == 429 && ex.Parameters?.RetryAfter != null)
         {
             await Task.Delay(TimeSpan.FromSeconds(ex.Parameters.RetryAfter.Value + 1), cancellationToken);
-            await _bot.EditMessageTextAsync(
+            await bot.EditMessageTextAsync(
                 chatId: job.AdminChatId,
                 messageId: job.StatusMessageId,
                 text: BuildStatusText(job),
@@ -342,9 +346,10 @@ public class BroadcastManager : IHostedService, IDisposable
 
     private async Task SendFinalSummaryAsync(BroadcastJob job, CancellationToken cancellationToken)
     {
+        var bot = _botClientProvider.GetClient(job.BotId);
         try
         {
-            await _bot.SendTextMessageAsync(
+            await bot.SendTextMessageAsync(
                 chatId: job.AdminChatId,
                 text: BuildStatusText(job, finalSummary: true),
                 parseMode: ParseMode.Html,
@@ -353,7 +358,7 @@ public class BroadcastManager : IHostedService, IDisposable
         catch (ApiRequestException ex) when (ex.ErrorCode == 429 && ex.Parameters?.RetryAfter != null)
         {
             await Task.Delay(TimeSpan.FromSeconds(ex.Parameters.RetryAfter.Value + 1), cancellationToken);
-            await _bot.SendTextMessageAsync(
+            await bot.SendTextMessageAsync(
                 chatId: job.AdminChatId,
                 text: BuildStatusText(job, finalSummary: true),
                 parseMode: ParseMode.Html,
@@ -451,6 +456,7 @@ public class BroadcastManager : IHostedService, IDisposable
         public ChatId FromChatId { get; set; }
         public int MessageId { get; set; }
         public bool IsForward { get; set; }
+        public string BotId { get; set; }
         internal int Attempt { get; set; }
     }
 
@@ -469,6 +475,7 @@ public class BroadcastManager : IHostedService, IDisposable
         public int RetryAttempts { get; set; }
         public int MarkdownFallbackSent { get; set; }
         public bool IsForward { get; set; }
+        public string BotId { get; set; }
         public int LastErrorCode { get; set; }
         public string LastError { get; set; }
         public DateTime CreatedAtUtc { get; set; }
