@@ -52,6 +52,7 @@ public class TelegramBotService : IHostedService
     private readonly WalletLedgerService _walletLedgerService;
     private readonly OwnedBotNotificationService _ownedBotNotificationService;
     private readonly GozargahSiteApiClient _gozargahSiteApiClient;
+    private readonly GozargahSiteSyncService _gozargahSiteSyncService;
     private readonly BotContextAccessor _botContextAccessor;
     private ITelegramBotClient ActiveBotClient => _botContextAccessor.Current?.Client ?? _botClient;
     private BotInstanceConfig CurrentBot => _botContextAccessor.Current?.Config;
@@ -67,6 +68,29 @@ public class TelegramBotService : IHostedService
     private string CurrentNowPaymentsSuccessUrl => CurrentBot?.BuildTelegramStartUrl("payment_success") ?? _appConfig.NowpaymentSuccessUrl;
     private string CurrentNowPaymentsCancelUrl => CurrentBot?.BuildTelegramStartUrl("payment_cancel") ?? _appConfig.NowpaymentCancelUrl;
     private string CurrentHooshPayReturnUrl => CurrentBot?.BuildTelegramStartUrl("payment_success") ?? _appConfig.HooshPayReturnUrl;
+
+    /// <summary>
+    /// Refreshes the shared credentials role from the Gozargah website before owned-bot pricing is shown.
+    /// </summary>
+    /// <param name="credUser">
+    /// Shared credentials profile of the Telegram user currently interacting with an owned bot. The instance is updated
+    /// in memory when the website lookup promotes the database row to colleague.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for the website lookup and credentials database update.</param>
+    /// <returns>A task that completes after the optional role refresh has finished.</returns>
+    /// <remarks>
+    /// Tenant storefronts are excluded because their customer prices are controlled by the tenant owner's storefront
+    /// settings. Owned bots sell directly for the platform, so an existing non-banned Gozargah website user receives
+    /// colleague pricing immediately.
+    /// </remarks>
+    private async Task RefreshOwnedBotColleagueRoleFromGozargahAsync(CredUser credUser, CancellationToken cancellationToken)
+    {
+        var botType = CurrentBot?.Type ?? BotInstanceTypes.Owned;
+        if (!string.Equals(botType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        await _gozargahSiteSyncService.PromoteToColleagueIfConnectedSiteUserAsync(credUser, cancellationToken);
+    }
 
     /// <summary>
     /// Creates the shared Telegram service and wires all existing bot flows plus the tenant storefront flow.
@@ -87,6 +111,9 @@ public class TelegramBotService : IHostedService
     /// <param name="tenantBotService">Tenant storefront owner and customer flow service.</param>
     /// <param name="userActivityLog">File-based user activity logger.</param>
     /// <param name="gozargahSiteApiClient">Gozargah website API client used to show colleague site wallet status.</param>
+    /// <param name="gozargahSiteSyncService">
+    /// Gozargah website sync service used to auto-promote connected website users before owned-bot pricing is shown.
+    /// </param>
     /// <param name="botContextAccessor">Async-local current bot context accessor.</param>
     public TelegramBotService(
         ITelegramBotClient botClient,
@@ -108,6 +135,7 @@ public class TelegramBotService : IHostedService
         WalletLedgerService walletLedgerService,
         OwnedBotNotificationService ownedBotNotificationService,
         GozargahSiteApiClient gozargahSiteApiClient,
+        GozargahSiteSyncService gozargahSiteSyncService,
         BotContextAccessor botContextAccessor)
     {
         _botClient = botClient;
@@ -130,6 +158,7 @@ public class TelegramBotService : IHostedService
         _walletLedgerService = walletLedgerService;
         _ownedBotNotificationService = ownedBotNotificationService;
         _gozargahSiteApiClient = gozargahSiteApiClient;
+        _gozargahSiteSyncService = gozargahSiteSyncService;
         _botContextAccessor = botContextAccessor;
     }
 
@@ -3920,6 +3949,7 @@ public class TelegramBotService : IHostedService
         else if (message.Text == "📋 تعرفه‌ها" || message.Text == "تعرفه‌ها")
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
 
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,

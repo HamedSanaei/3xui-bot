@@ -270,12 +270,13 @@ public class SalesAssistantService
             var TENANTSERVICE = _serviceProvider.GetRequiredService<TenantBotService>();
             var result = await TENANTSERVICE.APPROVEMANUALRECEIPTASYNC(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
             var canResend = await IsReceiptOrderFulfilledAsync(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
+            var canApprove = !canResend && await CanRetryReceiptApprovalAsync(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, result, showAlert: true, cancellationToken: CancellationToken);
             await SafeEditMessageReplyMarkupAsync(
                 botClient,
                 CallbackQuery.Message.Chat.Id,
                 CallbackQuery.Message.MessageId,
-                BuildReceiptPostReviewKeyboard(RECEIPTID, canResend),
+                BuildReceiptPostReviewKeyboard(RECEIPTID, canResend, canApprove),
                 CancellationToken);
             return;
         }
@@ -413,8 +414,9 @@ public class SalesAssistantService
                 $"🔗 سابلینک: <code>{Html(order.CreatedSubLink)}</code>\n";
         }
 
-        var canApprove = string.Equals(receipt.Status, TenantManualPaymentReceiptStatuses.Pending, StringComparison.OrdinalIgnoreCase) &&
-                         !order.IsFulfilled;
+        var canApprove = !order.IsFulfilled &&
+                         (string.Equals(receipt.Status, TenantManualPaymentReceiptStatuses.Pending, StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(receipt.Status, TenantManualPaymentReceiptStatuses.Approved, StringComparison.OrdinalIgnoreCase));
         return new ReceiptDetailsView(text, order.IsFulfilled, canApprove);
     }
 
@@ -433,6 +435,35 @@ public class SalesAssistantService
 
         return await _userDbcontext.TenantBotOrders.AnyAsync(
             x => (x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId) && x.IsFulfilled,
+            CancellationToken);
+    }
+
+    /// <summary>
+    /// Checks whether a receipt can show the approve button again after a failed final-confirmation attempt.
+    /// </summary>
+    /// <param name="receiptId">Internal users.db receipt id embedded in the assistant callback.</param>
+    /// <param name="ownerTelegramUserId">Telegram user id of the tenant owner using the assistant bot.</param>
+    /// <param name="CancellationToken">Cancellation token for users.db reads.</param>
+    /// <returns>
+    /// <c>true</c> when the receipt belongs to the owner, is not rejected, and its linked order is still
+    /// unfulfilled; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// XUI account creation can time out after a manual receipt is accepted. The retry button must remain available
+    /// so the owner can run the same idempotent fulfillment path again without asking the customer for another photo.
+    /// </remarks>
+    private async Task<bool> CanRetryReceiptApprovalAsync(int receiptId, long ownerTelegramUserId, CancellationToken CancellationToken)
+    {
+        var receipt = await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == receiptId, CancellationToken);
+        if (receipt == null ||
+            receipt.OwnerTelegramUserId != ownerTelegramUserId ||
+            string.Equals(receipt.Status, TenantManualPaymentReceiptStatuses.Rejected, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return await _userDbcontext.TenantBotOrders.AnyAsync(
+            x => (x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId) && !x.IsFulfilled,
             CancellationToken);
     }
 

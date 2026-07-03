@@ -420,6 +420,28 @@ public class XuiV3PurchaseService
             cancellationToken);
     }
 
+    /// <summary>
+    /// Creates one or more XUI v3 accounts and returns a partial-success result instead of throwing panel failures.
+    /// </summary>
+    /// <param name="user">
+    /// Credentials profile of the Telegram user who owns the created accounts. The Telegram id is stored in panel
+    /// metadata and, when <see cref="XuiV3BulkCreateOptions.SaveUserStatus"/> is enabled, in users.db state rows.
+    /// </param>
+    /// <param name="serverInfo">Configured XUI v3 panel endpoint, credentials, root path, and optional API token.</param>
+    /// <param name="selection">Resolved purchase selection requested by the user or admin flow.</param>
+    /// <param name="selectedCountry">Panel tag or URL stored in the legacy user state for display and audit.</param>
+    /// <param name="options">Optional bulk metadata, account count, override price, and audit settings.</param>
+    /// <param name="cancellationToken">Cancellation token for panel calls, users.db writes, and inter-account delay.</param>
+    /// <returns>
+    /// A bulk creation result containing every successfully created account and the first failure that stopped the
+    /// loop. Panel HTTP timeouts and API exceptions are converted to <see cref="XuiV3BulkCreationFailure"/> so owned,
+    /// tenant, and super-admin flows can show a clean error without crashing the Telegram receiver.
+    /// </returns>
+    /// <remarks>
+    /// The method preserves partial success. If account 1 is created and account 2 times out, callers must charge or
+    /// deliver only the successful accounts and show the failure list for the rest. Shutdown cancellation is not
+    /// swallowed and still propagates through <see cref="OperationCanceledException"/>.
+    /// </remarks>
     public async Task<XuiV3BulkCreationResult> CreateBulkAccountsAsync(
         CredUser user,
         ServerInfo serverInfo,
@@ -469,13 +491,30 @@ public class XuiV3PurchaseService
                 SaveUserStatus = options.SaveUserStatus
             };
 
-            var created = await CreateAccountAsync(
-                user,
-                serverInfo,
-                selection,
-                selectedCountry,
-                cancellationToken,
-                createOptions);
+            XuiV3AccountCreationResult created;
+            try
+            {
+                created = await CreateAccountAsync(
+                    user,
+                    serverInfo,
+                    selection,
+                    selectedCountry,
+                    cancellationToken,
+                    createOptions);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                result.Failures.Add(new XuiV3BulkCreationFailure
+                {
+                    Index = i,
+                    Message = ex.Message
+                });
+                break;
+            }
 
             if (!created.Success)
             {

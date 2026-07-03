@@ -58,6 +58,7 @@ public class XuiV3BotFlowService
     private readonly UserActivityLogService _activityLog;
     private readonly WalletLedgerService _walletLedgerService;
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
+    private readonly BotContextAccessor _botContextAccessor;
 
     /// <summary>
     /// Creates the shared XUI v3 customer-flow service used by owned bots and tenant storefront bots.
@@ -89,6 +90,10 @@ public class XuiV3BotFlowService
     /// Gozargah website sync service used to publish successful XUI v3 account creates, renewals, deletes,
     /// and link changes without making the website database a blocking source of truth.
     /// </param>
+    /// <param name="botContextAccessor">
+    /// Async-local bot context accessor used to decide whether the active flow belongs to an owned bot or a tenant
+    /// storefront and to add bot metadata to operational purchase logs.
+    /// </param>
     /// <remarks>
     /// This service is intentionally shared between owned bots and tenant storefronts. Tenant callers must
     /// set the active bot context before invoking it so state reads and callback handling stay scoped to the
@@ -103,7 +108,8 @@ public class XuiV3BotFlowService
         ILogger<XuiV3BotFlowService> logger,
         UserActivityLogService activityLog,
         WalletLedgerService walletLedgerService,
-        GozargahSiteSyncService gozargahSiteSyncService)
+        GozargahSiteSyncService gozargahSiteSyncService,
+        BotContextAccessor botContextAccessor)
     {
         _purchaseService = purchaseService;
         _sessionStore = sessionStore;
@@ -115,6 +121,7 @@ public class XuiV3BotFlowService
         _activityLog = activityLog;
         _walletLedgerService = walletLedgerService;
         _gozargahSiteSyncService = gozargahSiteSyncService;
+        _botContextAccessor = botContextAccessor;
     }
 
     public bool IsEnabledForPurchaseFlow()
@@ -556,6 +563,7 @@ public class XuiV3BotFlowService
             if (!await EnsurePhoneVerifiedAsync(botClient, message.Chat.Id, credUser, cancellationToken))
                 return true;
 
+            await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
             await HandleRenewFlowStepAsync(botClient, message, credUser, user, mainReplyMarkup, cancellationToken);
             return true;
         }
@@ -590,6 +598,8 @@ public class XuiV3BotFlowService
 
         if (!await EnsurePhoneVerifiedAsync(botClient, message.Chat.Id, credUser, cancellationToken))
             return true;
+
+        await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
 
         var email = NormalizeAccountNameInput(text.Substring("/renew_".Length));
         if (string.IsNullOrWhiteSpace(email))
@@ -1040,6 +1050,7 @@ public class XuiV3BotFlowService
             });
 
             var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
+            await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
             var canUseSiteWallet = await CanUseGozargahSiteWalletAsync(
                 credUser.TelegramUserId,
                 ResolveRenewPriceToman(refreshedUser, credUser.IsColleague),
@@ -1075,6 +1086,7 @@ public class XuiV3BotFlowService
             });
 
             var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
+            await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
             var canUseSiteWallet = await CanUseGozargahSiteWalletAsync(
                 credUser.TelegramUserId,
                 ResolveRenewPriceToman(refreshedUser, credUser.IsColleague),
@@ -1102,6 +1114,7 @@ public class XuiV3BotFlowService
             }
 
             user.PaymentMethod = wantsSiteWalletRenew ? "gozargah_site_wallet" : "credit";
+            await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
             await CompleteRenewAsync(botClient, message, credUser, user, mainReplyMarkup, cancellationToken);
         }
     }
@@ -1405,6 +1418,8 @@ public class XuiV3BotFlowService
             return true;
         }
 
+        await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
+
         await _userDbContext.ClearUserStatus(user);
         var selection = new XuiV3PurchaseSelection();
         _sessionStore.Set(credUser.TelegramUserId, selection);
@@ -1498,6 +1513,8 @@ public class XuiV3BotFlowService
 
         if (!await EnsurePhoneVerifiedAsync(botClient, message.Chat.Id, credUser, cancellationToken))
             return true;
+
+        await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
 
         var selection = _sessionStore.GetOrCreate(credUser.TelegramUserId);
         var serviceKey = string.IsNullOrWhiteSpace(selection.ServiceKey)
@@ -1955,6 +1972,9 @@ public class XuiV3BotFlowService
         var chatId = callbackQuery.Message?.Chat.Id ?? credUser.ChatID;
         var messageId = callbackQuery.Message?.MessageId ?? 0;
         await AnswerCallbackSafelyAsync(botClient, callbackQuery.Id, cancellationToken);
+
+        if (ShouldRefreshColleagueRoleForPurchaseCallback(callback.Action))
+            await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
 
         if (callback.Action == "home")
         {
@@ -4234,6 +4254,7 @@ public class XuiV3BotFlowService
         var userSummary = FormatCredUserSummary(credUser);
         if (!string.IsNullOrWhiteSpace(userSummary))
             message.AppendLine(userSummary);
+        message.Append(BuildCurrentBotPurchaseLogContext());
 
         message.AppendLine($"مبلغ <code>{Html(priceToman.FormatCurrency())}</code>");
 
@@ -4257,6 +4278,97 @@ public class XuiV3BotFlowService
         }
 
         _logger.LogPayment(message.ToString());
+    }
+
+    /// <summary>
+    /// Builds the current bot metadata block added to owned-bot XUI purchase and renewal logs.
+    /// </summary>
+    /// <returns>
+    /// HTML-safe lines that identify the bot id, public username, brand, type, configured channels, and support
+    /// contact for the bot that handled the purchase.
+    /// </returns>
+    /// <remarks>
+    /// The Telegram logger sends payment logs through the default owned bot, so the message itself must include the
+    /// originating bot metadata. Without this block, successful purchases from non-default owned bots look like they
+    /// came from the default brand.
+    /// </remarks>
+    private string BuildCurrentBotPurchaseLogContext()
+    {
+        var bot = _botContextAccessor.Current?.Config;
+        var botId = bot?.Id ?? BotContextAccessor.CurrentBotId;
+        var username = string.IsNullOrWhiteSpace(bot?.Username)
+            ? BotContextAccessor.CurrentBotUsername
+            : bot.Username.Trim().TrimStart('@');
+        var type = bot?.Type ?? BotContextAccessor.CurrentBotType;
+        var channels = string.Equals(type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase)
+            ? bot?.TenantChannelIds
+            : bot?.ChannelIds;
+
+        var builder = new StringBuilder();
+        builder.AppendLine($"BotId: <code>{Html(botId)}</code>");
+        builder.AppendLine($"BotUsername: {FormatTelegramReference(string.IsNullOrWhiteSpace(username) ? null : "@" + username)}");
+        builder.AppendLine($"Brand: <code>{Html(bot?.BrandName)}</code>");
+        builder.AppendLine($"BotType: <code>{Html(type)}</code>");
+        builder.AppendLine($"Channels: {FormatTelegramReferences(channels)}");
+        builder.AppendLine($"Support: {FormatTelegramReference(bot?.SupportAccount)}");
+        if (bot?.OwnerTelegramUserId.HasValue == true)
+            builder.AppendLine($"TenantOwner: <a href=\"tg://user?id={bot.OwnerTelegramUserId.Value}\">{bot.OwnerTelegramUserId.Value}</a>");
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Formats a list of Telegram channel/support references for an HTML purchase log.
+    /// </summary>
+    /// <param name="references">Configured channel ids, usernames, or Telegram links for the current bot.</param>
+    /// <returns>Comma-separated HTML-safe references, or <c>-</c> when no references are configured.</returns>
+    private static string FormatTelegramReferences(IEnumerable<string> references)
+    {
+        var formatted = (references ?? Array.Empty<string>())
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(FormatTelegramReference)
+            .ToArray();
+        return formatted.Length == 0 ? "<code>-</code>" : string.Join(", ", formatted);
+    }
+
+    /// <summary>
+    /// Formats one Telegram username, t.me link, private id, or free-form value for an HTML purchase log.
+    /// </summary>
+    /// <param name="reference">Raw channel or support value from bot configuration.</param>
+    /// <returns>Clickable HTML when the value is public Telegram username/link; otherwise HTML-safe text.</returns>
+    private static string FormatTelegramReference(string reference)
+    {
+        var value = reference?.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return "<code>-</code>";
+
+        if (value.StartsWith("@", StringComparison.Ordinal) && value.Length > 1)
+        {
+            var username = value.TrimStart('@');
+            return $"<a href=\"https://t.me/{HtmlAttribute(username)}\">@{Html(username)}</a>";
+        }
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+            (string.Equals(uri.Host, "t.me", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(uri.Host, "telegram.me", StringComparison.OrdinalIgnoreCase)))
+        {
+            var username = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            var visible = string.IsNullOrWhiteSpace(username) ? value : "@" + username;
+            return $"<a href=\"{HtmlAttribute(uri.ToString())}\">{Html(visible)}</a>";
+        }
+
+        return long.TryParse(value, out _)
+            ? $"<code>{Html(value)}</code>"
+            : Html(value);
+    }
+
+    /// <summary>
+    /// Encodes a value for a Telegram HTML attribute.
+    /// </summary>
+    /// <param name="value">Raw attribute value.</param>
+    /// <returns>HTML-encoded attribute value.</returns>
+    private static string HtmlAttribute(string value)
+    {
+        return System.Net.WebUtility.HtmlEncode(value ?? string.Empty);
     }
 
     private static string BuildBulkFailureText(XuiV3BulkCreationResult result)
@@ -4830,6 +4942,62 @@ public class XuiV3BotFlowService
             cancellationToken);
 
         return eligibility.CanUse;
+    }
+
+    /// <summary>
+    /// Refreshes colleague pricing for an owned-bot user from the Gozargah website account state.
+    /// </summary>
+    /// <param name="credUser">
+    /// Shared credentials profile of the Telegram user whose pricing is about to be calculated. The object is updated
+    /// in memory when the website lookup promotes the database row to colleague.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for the website lookup and credentials database update.</param>
+    /// <returns>A task that completes after the optional role refresh has finished.</returns>
+    /// <remarks>
+    /// This is intentionally limited to owned bots. Tenant storefront customers pay the storefront sale price chosen by
+    /// the tenant owner; auto-promoting those buyers would bypass tenant pricing and break owner profit accounting.
+    /// </remarks>
+    private async Task RefreshOwnedBotColleagueRoleFromGozargahAsync(CredUser credUser, CancellationToken cancellationToken)
+    {
+        if (!ShouldAutoPromoteColleagueFromGozargah())
+            return;
+
+        await _gozargahSiteSyncService.PromoteToColleagueIfConnectedSiteUserAsync(credUser, cancellationToken);
+    }
+
+    /// <summary>
+    /// Determines whether the active bot may use the Gozargah website account to promote the current user.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> for owned bots; <c>false</c> for tenant storefronts, the sales-assistant bot, and unknown contexts.
+    /// </returns>
+    /// <remarks>
+    /// Owned bots sell directly for the platform, so a linked website account maps to colleague pricing. Tenant bots are
+    /// indirect storefronts and must keep their customer pricing isolated from the platform colleague role.
+    /// </remarks>
+    private bool ShouldAutoPromoteColleagueFromGozargah()
+    {
+        var type = _botContextAccessor.Current?.Config?.Type ?? BotContextAccessor.CurrentBotType;
+        return string.Equals(type, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Detects purchase callbacks whose pricing can be affected by a late Gozargah colleague-role refresh.
+    /// </summary>
+    /// <param name="action">Parsed XUI v3 callback action.</param>
+    /// <returns><c>true</c> when the callback may build a price, summary, wallet button, or final debit.</returns>
+    private static bool ShouldRefreshColleagueRoleForPurchaseCallback(string action)
+    {
+        return string.Equals(action, "svc", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "gb", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "dur", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "upl", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "cnt", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "ok", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "sitepay", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "aren", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "asren", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(action, "auren", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

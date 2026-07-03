@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Text;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Adminbot.Utils;
@@ -4020,12 +4021,24 @@ public class TenantBotService
 
                 if (!created.Success)
                 {
-                    order.PaymentStatus = TenantBotOrderStatuses.Failed;
+                    var retryable = IsTenantFulfillmentTimeout(created.Message);
+                    order.PaymentStatus = retryable
+                        ? TenantBotOrderStatuses.ReceiptApproved
+                        : TenantBotOrderStatuses.Failed;
                     order.ErrorMessage = created.Message;
                     order.UpdatedAtUtc = DateTime.UtcNow;
                     await _userDbcontext.SaveChangesAsync(CancellationToken);
-                    await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, created.Message, CancellationToken);
-                    LOGTENANTORDER(order, owner, customer, Source, "account-Create-failed");
+                    if (retryable)
+                    {
+                        await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, created.Message, CancellationToken);
+                        LOGTENANTORDER(order, owner, customer, Source, "account-create-timeout-retryable");
+                    }
+                    else
+                    {
+                        await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, created.Message, CancellationToken);
+                        LOGTENANTORDER(order, owner, customer, Source, "account-Create-failed");
+                    }
+
                     return NowPaymentsSettlementResult.InvalidAmount();
                 }
 
@@ -4070,12 +4083,24 @@ public class TenantBotService
             }
             catch (Exception ex)
             {
-                order.PaymentStatus = TenantBotOrderStatuses.Failed;
+                var retryable = IsTenantFulfillmentTimeout(ex);
+                order.PaymentStatus = retryable
+                    ? TenantBotOrderStatuses.ReceiptApproved
+                    : TenantBotOrderStatuses.Failed;
                 order.ErrorMessage = ex.Message;
                 order.UpdatedAtUtc = DateTime.UtcNow;
                 await _userDbcontext.SaveChangesAsync(CancellationToken);
-                await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, ex.Message, CancellationToken);
-                LOGTENANTORDER(order, owner, customer, Source, "Exception");
+                if (retryable)
+                {
+                    await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, ex.Message, CancellationToken);
+                    LOGTENANTORDER(order, owner, customer, Source, "Exception-timeout-retryable");
+                }
+                else
+                {
+                    await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, ex.Message, CancellationToken);
+                    LOGTENANTORDER(order, owner, customer, Source, "Exception");
+                }
+
                 return NowPaymentsSettlementResult.InvalidAmount();
             }
         }
@@ -4486,6 +4511,9 @@ public class TenantBotService
             return "رسید تایید شد و سفارش پردازش شد.";
         }
 
+        if (IsTenantFulfillmentTimeout(order.ErrorMessage))
+            return "رسید تایید شد، اما پنل ساخت اکانت پاسخ نداد. چند دقیقه دیگر دوباره تایید را بزنید.";
+
         return "تایید رسید ثبت شد ولی ساخت اکانت موفق نبود. لاگ را بررسی کنید.";
     }
 
@@ -4568,6 +4596,120 @@ public class TenantBotService
         }
 
         await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
+    }
+
+    /// <summary>
+    /// Lets a super-admin confirm or retry a tenant storefront order by its public <c>OrderId</c>.
+    /// </summary>
+    /// <param name="orderId">
+    /// Public tenant order id copied from the tenant bot, Sales Assistant, or operational log. The lookup is global
+    /// across tenant owners because only super-admin flows call this method.
+    /// </param>
+    /// <param name="superAdminTelegramUserId">
+    /// Numeric Telegram user id of the super-admin performing the manual confirmation. It is stored as the reviewer
+    /// on audit-only manual receipt rows when the order uses tenant card-to-card payment.
+    /// </param>
+    /// <param name="CancellationToken">Cancellation token for users.db, wallet, XUI, ledger, and Telegram delivery.</param>
+    /// <returns>
+    /// HTML-formatted status text when a tenant order was found and processed; <c>null</c> when the supplied id does
+    /// not belong to a tenant order and the caller should continue checking other payment providers.
+    /// </returns>
+    /// <remarks>
+    /// This method is idempotent. Fulfilled orders are not charged or created again; stored account details are only
+    /// resent. Unfulfilled orders run the same fulfillment path used by IPN, customer checks, owner card approval,
+    /// and Sales Assistant final confirmation.
+    /// </remarks>
+    public async Task<string> CONFIRMTENANTORDERBYSUPERADMINASYNC(
+        string orderId,
+        long superAdminTelegramUserId,
+        CancellationToken CancellationToken)
+    {
+        orderId = orderId?.Trim();
+        if (string.IsNullOrWhiteSpace(orderId))
+            return null;
+
+        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(x => x.OrderId == orderId, CancellationToken);
+        if (order == null)
+            return null;
+
+        if (order.IsFulfilled)
+        {
+            await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: true, sendOwner: true, CancellationToken);
+            return BUILDSUPERADMINTENANTORDERRESULTTEXT(order, null, "این سفارش قبلاً تحویل شده بود؛ مشخصات ذخیره‌شده دوباره برای خریدار و همکار ارسال شد.");
+        }
+
+        NowPaymentsSettlementResult settlement;
+        if (string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
+        {
+            var receipt = await ENSUREMANUALRECEIPTASYNC(order, superAdminTelegramUserId, CancellationToken);
+            receipt.Status = TenantManualPaymentReceiptStatuses.Approved;
+            receipt.ReviewerTelegramUserId = superAdminTelegramUserId;
+            receipt.ApprovedAtUtc ??= DateTime.UtcNow;
+            receipt.FinalConfirmedAtUtc = DateTime.UtcNow;
+            receipt.UpdatedAtUtc = DateTime.UtcNow;
+            order.PaymentStatus = TenantBotOrderStatuses.ReceiptApproved;
+            order.ManualReceiptId = receipt.Id;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+
+            settlement = await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, true, CancellationToken);
+        }
+        else
+        {
+            var hooshPay = await _userDbcontext.HooshPayPaymentInfos.FirstOrDefaultAsync(
+                x => x.TenantBotOrderId == order.Id || x.OrderId == order.OrderId,
+                CancellationToken);
+            if (hooshPay != null)
+            {
+                settlement = await ApplyPaidTenantOrderAsync(hooshPay, "super-admin-orderid-manual", CancellationToken);
+            }
+            else
+            {
+                var nowPayments = await _userDbcontext.SwapinoPaymentInfos.FirstOrDefaultAsync(
+                    x => x.TenantBotOrderId == order.Id || x.OrderId == order.OrderId,
+                    CancellationToken);
+                settlement = nowPayments != null
+                    ? await ApplyPaidTenantOrderAsync(nowPayments, "super-admin-orderid-manual", CancellationToken)
+                    : await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, false, CancellationToken);
+            }
+        }
+
+        var note = settlement?.Status == NowPaymentsSettlementStatus.Applied
+            ? "سفارش تایید و پردازش شد."
+            : settlement?.Status == NowPaymentsSettlementStatus.AlreadyAdded
+                ? "این سفارش قبلاً پردازش شده بود؛ تحویل دوباره ساخته نشد."
+                : IsTenantFulfillmentTimeout(order.ErrorMessage)
+                    ? "تایید ثبت شد، اما پنل ساخت اکانت timeout داد. همین OrderId را چند دقیقه دیگر دوباره بررسی کنید."
+                    : "تایید ثبت شد، اما تکمیل سفارش موفق نبود. خطای سفارش را بررسی کنید.";
+
+        return BUILDSUPERADMINTENANTORDERRESULTTEXT(order, settlement, note);
+    }
+
+    /// <summary>
+    /// Builds the HTML result shown to super-admins after confirming a tenant order by <c>OrderId</c>.
+    /// </summary>
+    /// <param name="order">Tenant order that was found by public order id.</param>
+    /// <param name="settlement">Optional settlement result returned by the fulfillment path.</param>
+    /// <param name="note">Human-readable outcome summary shown at the top of the admin response.</param>
+    /// <returns>HTML-safe Telegram message with order, fulfillment, and latest error details.</returns>
+    private static string BUILDSUPERADMINTENANTORDERRESULTTEXT(
+        TenantBotOrder order,
+        NowPaymentsSettlementResult settlement,
+        string note)
+    {
+        return "✅ <b>بررسی سفارش tenant</b>\n\n" +
+               $"{Html(note)}\n\n" +
+               $"OrderId: <code>{Html(order.OrderId)}</code>\n" +
+               $"ربات: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
+               $"مالک: <code>{order.OwnerTelegramUserId}</code>\n" +
+               $"خریدار: <code>{order.CustomerTelegramUserId}</code>\n" +
+               $"نوع سفارش: <code>{Html(order.OrderKind)}</code>\n" +
+               $"درگاه: <code>{Html(order.PaymentProvider)}</code>\n" +
+               $"وضعیت پرداخت: <code>{Html(order.PaymentStatus)}</code>\n" +
+               $"وضعیت settlement: <code>{Html(settlement?.Status.ToString() ?? "-")}</code>\n" +
+               $"تحویل: <code>{Html(order.IsFulfilled ? "انجام شده" : "انجام نشده")}</code>\n" +
+               $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>\n" +
+               $"خطا: <code>{Html(order.ErrorMessage)}</code>";
     }
 
     /// <summary>
@@ -4714,6 +4856,15 @@ public class TenantBotService
             return;
         }
 
+        if (string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
+        {
+            await botClient.SendTextMessageAsync(
+                ChatId,
+                "پرداخت شما توسط مدیر تایید شده است، اما ساخت اکانت هنوز کامل نشده یا نیاز به تلاش مجدد دارد. لطفاً کمی صبر کنید یا با پشتیبانی فروشگاه تماس بگیرید.",
+                cancellationToken: CancellationToken);
+            return;
+        }
+
         var payment = await _userDbcontext.HooshPayPaymentInfos.FirstOrDefaultAsync(
             x => x.Id == order.HooshPayPaymentInfoId || x.TenantBotOrderId == order.Id,
             CancellationToken);
@@ -4798,21 +4949,27 @@ public class TenantBotService
     /// tenant bot id and customer Telegram user id before this helper is called.
     /// </param>
     /// <returns>
-    /// <c>true</c> when the order uses the tenant owner's card-to-card provider and has not yet reached a paid
-    /// or fulfilled state; otherwise <c>false</c>.
+    /// <c>true</c> when the order uses the tenant owner's card-to-card provider and is still before owner approval;
+    /// otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
     /// Card-to-card tenant orders do not have a HooshPay or NOWPayments invoice to verify. Until the owner or
     /// Sales Assistant confirms the receipt, customer status checks should keep the receipt upload/status
-    /// keyboard visible instead of reporting that no invoice exists.
+    /// keyboard visible. Once the receipt is approved, even if XUI fulfillment times out, the customer should see
+    /// a post-approval retry message rather than another "waiting for payment" message.
     /// </remarks>
     private static bool IsPendingTenantCardOrder(TenantBotOrder order)
     {
         if (order == null || order.IsFulfilled)
             return false;
 
-        return string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase) &&
-               !string.Equals(order.PaymentStatus, TenantBotOrderStatuses.Paid, StringComparison.OrdinalIgnoreCase);
+        if (!string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return string.Equals(order.PaymentStatus, TenantBotOrderStatuses.Pending, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(order.PaymentStatus, TenantBotOrderStatuses.AwaitingReceipt, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(order.PaymentStatus, TenantBotOrderStatuses.ReceiptSubmitted, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(order.PaymentStatus, TenantBotOrderStatuses.ReceiptRejected, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -5109,6 +5266,71 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Notifies a tenant customer that payment is accepted but XUI account delivery is waiting for a retry.
+    /// </summary>
+    /// <param name="order">
+    /// Tenant order whose payment or manual receipt has already been accepted. The order remains unfulfilled and
+    /// must keep enough state for the tenant owner or payment checker to retry the same fulfillment path.
+    /// </param>
+    /// <param name="Error">
+    /// Internal timeout text recorded for operators. The raw value is not shown to the customer because it may
+    /// contain infrastructure details from the XUI panel or HTTP stack.
+    /// </param>
+    /// <param name="CancellationToken">Cancellation token for the best-effort Telegram notification.</param>
+    /// <returns>A task that completes after the notification is sent or skipped.</returns>
+    /// <remarks>
+    /// A panel timeout is not treated as a definitive account-creation failure. The order stays in a retryable
+    /// approved state so Sales Assistant callbacks can attempt fulfillment again without creating wallet or ledger
+    /// changes until the XUI account is actually created.
+    /// </remarks>
+    private async Task NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(TenantBotOrder order, string Error, CancellationToken CancellationToken)
+    {
+        try
+        {
+            await _botClientProvider.GetClient(order.TenantBotId).SendTextMessageAsync(
+                GetTenantCustomerDeliveryChatId(order),
+                "✅ پرداخت شما تایید شد، اما پنل ساخت اکانت در این لحظه پاسخ نداد. سفارش برای تلاش مجدد ثبت شد و پس از ساخت موفق، مشخصات اکانت برای شما ارسال می‌شود.",
+                cancellationToken: CancellationToken);
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>
+    /// Detects XUI or HTTP timeout errors that should keep tenant fulfillment retryable.
+    /// </summary>
+    /// <param name="error">
+    /// Exception or message returned by the XUI creation path. It may be a <see cref="TaskCanceledException"/>,
+    /// <see cref="TimeoutException"/>, Telegram request timeout, or plain provider message.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the error indicates an external timeout and the order should remain retryable; otherwise
+    /// <c>false</c> for definitive validation or business failures.
+    /// </returns>
+    /// <remarks>
+    /// This helper deliberately does not classify every exception as retryable. Duplicate-safe retry is only offered
+    /// for timeout-style failures where the payment is accepted but the panel did not answer in time.
+    /// </remarks>
+    private static bool IsTenantFulfillmentTimeout(object error)
+    {
+        if (error is TimeoutException || error is TaskCanceledException)
+            return true;
+
+        var message = error switch
+        {
+            Exception ex => ex.Message,
+            string text => text,
+            _ => null
+        } ?? string.Empty;
+
+        return message.Contains("HttpClient.Timeout", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("A task was canceled", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// NOTIFIES the colleague owner through the default Bot that A tenant storefront sale was completed.
     /// </summary>
     /// <param name="order">fulfilled tenant order with sale, cost, profit, and balance fields.</param>
@@ -5152,6 +5374,7 @@ public class TenantBotService
                       $"نتیجه: <code>{Html(result)}</code>\n" +
                       $"منبع تایید: <code>{Html(Source)}</code>\n" +
                       $"ربات tenant: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n\n" +
+                      BuildTenantBotPurchaseLogContext(order) +
                       "📌 مالک فروشگاه\n" +
                       $"{TelegramUserLinkFormatter.HtmlSummary(owner)}\n\n" +
                       "📌 مشتری\n" +
@@ -5164,6 +5387,84 @@ public class TenantBotService
                       $"خطا: <code>{Html(order.ErrorMessage)}</code>";
 
         _logger.LogPayment(Message);
+    }
+
+    /// <summary>
+    /// Builds the tenant bot metadata block added to tenant sale and renewal logs.
+    /// </summary>
+    /// <param name="order">
+    /// Tenant order whose <see cref="TenantBotOrder.TenantBotId"/> identifies the storefront that received the
+    /// customer payment.
+    /// </param>
+    /// <returns>
+    /// HTML-safe lines containing bot id, username, brand, type, forced-join channels, and support contact for the
+    /// storefront. Missing runtime settings are represented with <c>-</c>.
+    /// </returns>
+    /// <remarks>
+    /// Tenant payment settlement can happen from IPN or Sales Assistant callbacks where the customer update context is
+    /// not active. Reading the runtime registry from the order id keeps central purchase logs attributable to the
+    /// storefront even outside a normal tenant Telegram update.
+    /// </remarks>
+    private string BuildTenantBotPurchaseLogContext(TenantBotOrder order)
+    {
+        var bot = _botRegistry.GetById(order?.TenantBotId);
+        var username = string.IsNullOrWhiteSpace(bot?.Username)
+            ? order?.TenantBotUsername
+            : bot.Username.Trim().TrimStart('@');
+
+        var builder = new StringBuilder();
+        builder.AppendLine($"BotId: <code>{Html(order?.TenantBotId)}</code>");
+        builder.AppendLine($"BotUsername: {FormatTelegramLogReference(string.IsNullOrWhiteSpace(username) ? null : "@" + username)}");
+        builder.AppendLine($"Brand: <code>{Html(bot?.BrandName)}</code>");
+        builder.AppendLine($"BotType: <code>{Html(bot?.Type ?? BotInstanceTypes.Tenant)}</code>");
+        builder.AppendLine($"Channels: {FormatTelegramLogReferences(bot?.TenantChannelIds)}");
+        builder.AppendLine($"Support: {FormatTelegramLogReference(bot?.SupportAccount)}");
+        builder.AppendLine();
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Formats multiple Telegram references for tenant purchase logs.
+    /// </summary>
+    /// <param name="references">Tenant forced-join channels or related Telegram references.</param>
+    /// <returns>Comma-separated HTML-safe references, or <c>-</c> when no references are configured.</returns>
+    private static string FormatTelegramLogReferences(IEnumerable<string> references)
+    {
+        var formatted = (references ?? Array.Empty<string>())
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(FormatTelegramLogReference)
+            .ToArray();
+        return formatted.Length == 0 ? "<code>-</code>" : string.Join(", ", formatted);
+    }
+
+    /// <summary>
+    /// Formats one Telegram username, t.me link, private id, or free-form value for tenant purchase logs.
+    /// </summary>
+    /// <param name="reference">Raw tenant channel or support value.</param>
+    /// <returns>Clickable HTML when the value is public Telegram username/link; otherwise HTML-safe text.</returns>
+    private static string FormatTelegramLogReference(string reference)
+    {
+        var value = reference?.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return "<code>-</code>";
+
+        var normalizedSupport = NormalizeTenantSupportAccount(value);
+        if (!string.IsNullOrWhiteSpace(normalizedSupport))
+        {
+            var username = normalizedSupport.TrimStart('@');
+            return $"<a href=\"https://t.me/{HtmlAttribute(username)}\">@{Html(username)}</a>";
+        }
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+            (string.Equals(uri.Host, "t.me", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(uri.Host, "telegram.me", StringComparison.OrdinalIgnoreCase)))
+        {
+            return $"<a href=\"{HtmlAttribute(uri.ToString())}\">{Html(value)}</a>";
+        }
+
+        return long.TryParse(value, out _)
+            ? $"<code>{Html(value)}</code>"
+            : Html(value);
     }
 
     /// <summary>
@@ -6477,6 +6778,16 @@ public class TenantBotService
     /// <param name="value">Raw Text that may contain Telegram Html-sensitive characters.</param>
     /// <returns>Html-encoded Text; null becomes an empty string.</returns>
     private static string Html(string value)
+    {
+        return WebUtility.HtmlEncode(value ?? string.Empty);
+    }
+
+    /// <summary>
+    /// Encodes text before inserting it into a Telegram HTML attribute.
+    /// </summary>
+    /// <param name="value">Raw attribute text such as a Telegram username or URL.</param>
+    /// <returns>HTML-encoded attribute text; null becomes an empty string.</returns>
+    private static string HtmlAttribute(string value)
     {
         return WebUtility.HtmlEncode(value ?? string.Empty);
     }

@@ -518,10 +518,17 @@ namespace Adminbot.Domain
         /// <param name="cancellationToken">Cancellation token for the outbound HTTP request.</param>
         /// <returns>
         /// Parsed API response. HTTP errors are converted to unsuccessful responses so callers can persist retry state.
+        /// Expected <c>get_user</c> misses are returned without warning logs because most bot users do not have a
+        /// Gozargah website account.
         /// </returns>
         /// <remarks>
         /// The API key is sent only in the Authorization header and is never written to logs. Configuration errors throw
         /// because callers should not enqueue website traffic when the API endpoint or key is missing.
+        ///
+        /// Logging rule:
+        /// A missing website user during wallet-button eligibility checks is a normal business outcome, not an
+        /// operational API failure. Other HTTP failures still emit warnings so sync, wallet debit, and order lifecycle
+        /// problems remain visible to operators.
         /// </remarks>
         private async Task<GozargahSiteApiResponse<T>> SendAsync<T>(object body, CancellationToken cancellationToken)
         {
@@ -530,6 +537,7 @@ namespace Adminbot.Domain
             if (string.IsNullOrWhiteSpace(_appConfig.GozargahSiteApiKey))
                 throw new InvalidOperationException("GozargahSiteApiKey is not configured.");
 
+            var action = GetActionName(body);
             using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
             using var request = new HttpRequestMessage(HttpMethod.Post, _appConfig.GozargahSiteApiBaseUrl);
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _appConfig.GozargahSiteApiKey);
@@ -539,10 +547,14 @@ namespace Adminbot.Domain
             var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogWarning(
-                    "Gozargah site API returned HTTP {StatusCode}. Body={Body}",
-                    (int)response.StatusCode,
-                    responseText);
+                if (!IsExpectedMissingUserResponse(action, response.StatusCode, responseText))
+                {
+                    _logger.LogWarning(
+                        "Gozargah site API returned HTTP {StatusCode}. Body={Body}",
+                        (int)response.StatusCode,
+                        responseText);
+                }
+
                 return new GozargahSiteApiResponse<T>
                 {
                     Success = false,
@@ -556,6 +568,56 @@ namespace Adminbot.Domain
                        Success = false,
                        Message = "Gozargah site API returned an empty response."
                    };
+        }
+
+        /// <summary>
+        /// Reads the Gozargah API action name from an anonymous request body or dictionary body.
+        /// </summary>
+        /// <param name="body">
+        /// Request body passed to <see cref="SendAsync{T}"/>. It should contain an <c>action</c> property, but may be
+        /// null or malformed when a caller is incorrectly wired.
+        /// </param>
+        /// <returns>
+        /// The action name as sent to the website API, or an empty string when it cannot be resolved. The value is only
+        /// used for logging decisions and is never sent to users.
+        /// </returns>
+        /// <remarks>
+        /// The client accepts both anonymous objects and dictionaries because order payloads are normalized through
+        /// <see cref="BuildOrderBody"/> while user and wallet calls are anonymous objects.
+        /// </remarks>
+        private static string GetActionName(object body)
+        {
+            if (body == null)
+                return string.Empty;
+
+            if (body is IDictionary<string, object> dictionary &&
+                dictionary.TryGetValue("action", out var dictionaryAction))
+                return dictionaryAction?.ToString() ?? string.Empty;
+
+            var action = JObject.FromObject(body)["action"];
+            return action?.ToString() ?? string.Empty;
+        }
+
+        /// <summary>
+        /// Detects the normal "site user does not exist" response from the Gozargah <c>get_user</c> endpoint.
+        /// </summary>
+        /// <param name="action">Action name extracted from the request body.</param>
+        /// <param name="statusCode">HTTP status code returned by the website API.</param>
+        /// <param name="responseText">Raw response body returned by the website API.</param>
+        /// <returns>
+        /// <c>true</c> when the response is the expected missing-user result for <c>get_user</c>; otherwise
+        /// <c>false</c>, meaning the caller should keep normal warning logs.
+        /// </returns>
+        /// <remarks>
+        /// Wallet eligibility checks run before showing the Gozargah website wallet button. Most Telegram users are not
+        /// registered on the website, so logging every 404 would flood the private logger channel without indicating a
+        /// broken integration.
+        /// </remarks>
+        private static bool IsExpectedMissingUserResponse(string action, HttpStatusCode statusCode, string responseText)
+        {
+            return string.Equals(action, "get_user", StringComparison.OrdinalIgnoreCase) &&
+                   statusCode == HttpStatusCode.NotFound &&
+                   responseText?.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         /// <summary>
@@ -649,6 +711,46 @@ namespace Adminbot.Domain
                 return GozargahSiteWalletEligibility.Insufficient(siteUser.Data.Wallet);
 
             return GozargahSiteWalletEligibility.Available(siteUser.Data);
+        }
+
+        /// <summary>
+        /// Promotes a bot user to colleague pricing when the same Telegram id exists on the Gozargah website.
+        /// </summary>
+        /// <param name="credUser">
+        /// Shared credentials profile for the Telegram user currently using an owned bot. The instance is updated in
+        /// memory when the database role changes so later price calculations in the same update use colleague prices.
+        /// </param>
+        /// <param name="cancellationToken">Cancellation token for the website lookup and credentials database update.</param>
+        /// <returns>
+        /// <c>true</c> when the website user exists, is not banned, and the local credentials profile is now marked as
+        /// a colleague; otherwise <c>false</c>. A missing website user is a normal result and is not logged as a warning.
+        /// </returns>
+        /// <remarks>
+        /// This method is used only by owned-bot customer flows before tariff, purchase, or renewal pricing is
+        /// calculated. Tenant storefront customers must not call it because tenant sales use the owner storefront
+        /// pricing model rather than direct colleague pricing for the buyer.
+        /// </remarks>
+        public async Task<bool> PromoteToColleagueIfConnectedSiteUserAsync(
+            CredUser credUser,
+            CancellationToken cancellationToken = default)
+        {
+            if (credUser == null || credUser.TelegramUserId <= 0)
+                return false;
+            if (!_appConfig.GozargahSiteWalletPaymentsEnabled || !_apiClient.IsConfigured())
+                return credUser.IsColleague;
+
+            var siteUser = await _apiClient.GetUserAsync(credUser.TelegramUserId, cancellationToken);
+            if (!siteUser.Success || siteUser.Data == null || siteUser.Data.IsBanned)
+                return false;
+
+            if (!credUser.IsColleague)
+            {
+                var changed = await _credentialsDbContext.PromotOrDemote(credUser.TelegramUserId, true);
+                if (changed)
+                    credUser.IsColleague = true;
+            }
+
+            return credUser.IsColleague;
         }
 
         /// <summary>

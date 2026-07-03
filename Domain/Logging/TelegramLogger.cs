@@ -132,7 +132,7 @@ namespace Adminbot.Domain.Logging
         }
 
         /// <summary>
-        /// Sends an HTML payment/audit log to the current bot logger channel and starts a non-blocking database backup.
+        /// Sends an HTML payment/audit log to the selected operational logger channel and starts a non-blocking database backup.
         /// </summary>
         /// <param name="message">
         /// HTML-safe log text prepared by the payment or tenant flow. The method sends it with
@@ -141,7 +141,9 @@ namespace Adminbot.Domain.Logging
         /// <returns>A task that completes after the log message has been sent.</returns>
         /// <remarks>
         /// The credentials backup is intentionally fire-and-forget. A locked database file, missing backup
-        /// channel, or Telegram document failure must not delay or fail the payment settlement path.
+        /// channel, or Telegram document failure must not delay or fail the payment settlement path. Logs from
+        /// non-default owned bots and tenant storefronts are routed through the default owned bot because only that
+        /// bot is guaranteed to post to the private central logger channel.
         /// </remarks>
         public async Task LogPayment(string message)
         {
@@ -197,17 +199,43 @@ namespace Adminbot.Domain.Logging
             return message[..MaxTelegramLogMessageLength] + "\n...[log truncated for Telegram]";
         }
 
-        private ITelegramBotClient CurrentBotClient => _botClientProvider.GetClient(CurrentBotConfig?.Id);
+        /// <summary>
+        /// Gets the Telegram client that is allowed to post operational logs.
+        /// </summary>
+        /// <remarks>
+        /// Non-default owned bots and tenant storefront bots are not guaranteed to be members of the private central
+        /// operational log channel. The default owned bot sends every operational log so successful purchases from any
+        /// brand or tenant storefront reach the same private channel.
+        /// </remarks>
+        private ITelegramBotClient CurrentBotClient => _botClientProvider.GetClient(CurrentLoggingBotConfig?.Id);
 
+        /// <summary>
+        /// Gets the bot whose update is currently being handled, or the default owned bot when no context exists.
+        /// </summary>
         private BotInstanceConfig CurrentBotConfig => _botContextAccessor.Current?.Config ?? _botRegistry.DefaultBot;
 
-        private string CurrentLoggerChannelId => string.IsNullOrWhiteSpace(CurrentBotConfig?.LoggerChannel)
-            ? _fallbackChannelId
-            : CurrentBotConfig.LoggerChannel;
+        /// <summary>
+        /// Gets the bot configuration that should be used for Telegram log delivery.
+        /// </summary>
+        /// <remarks>
+        /// Operational logs are intentionally routed through the default owned bot because the central logger channel is
+        /// managed by the project owner, not by each brand bot or colleague storefront bot.
+        /// </remarks>
+        private BotInstanceConfig CurrentLoggingBotConfig => _botRegistry.DefaultBot ?? CurrentBotConfig;
 
-        private string CurrentBackupChannelId => string.IsNullOrWhiteSpace(CurrentBotConfig?.BackupChannel)
+        /// <summary>
+        /// Gets the logger channel id for the selected logging bot, falling back to the legacy configured channel.
+        /// </summary>
+        private string CurrentLoggerChannelId => string.IsNullOrWhiteSpace(CurrentLoggingBotConfig?.LoggerChannel)
+            ? _fallbackChannelId
+            : CurrentLoggingBotConfig.LoggerChannel;
+
+        /// <summary>
+        /// Gets the backup channel id for the selected logging bot, falling back to the legacy configured channel.
+        /// </summary>
+        private string CurrentBackupChannelId => string.IsNullOrWhiteSpace(CurrentLoggingBotConfig?.BackupChannel)
             ? _fallbackBackupChannelId
-            : CurrentBotConfig.BackupChannel;
+            : CurrentLoggingBotConfig.BackupChannel;
 
     }
 }

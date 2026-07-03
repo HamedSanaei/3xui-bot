@@ -340,7 +340,7 @@ public class XuiV3AdminFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً به موجودی اضافه نشده باشد، شارژ کیف پول انجام می‌شود:",
+                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
                 parseMode: ParseMode.Markdown,
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
@@ -1132,8 +1132,10 @@ public class XuiV3AdminFlowService
         {
             if (await TryHandleHooshPayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
                 return;
+            if (await TryHandleTenantOrderManualConfirmationAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
+                return;
 
-            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments یا HooshPay با این شناسه پیدا نشد.", cancellationToken);
+            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments، HooshPay یا سفارش tenant با این شناسه پیدا نشد.", cancellationToken);
             return;
         }
 
@@ -1342,6 +1344,61 @@ public class XuiV3AdminFlowService
             currentUser,
             mainMenu,
             BuildHooshPayPaymentInfo(payment, settlement),
+            cancellationToken,
+            ParseMode.Html);
+        return true;
+    }
+
+    /// <summary>
+    /// Attempts to treat the admin payment-check input as a tenant storefront <c>OrderId</c>.
+    /// </summary>
+    /// <param name="botClient">Telegram client used to answer the super-admin.</param>
+    /// <param name="message">Super-admin message containing the possible tenant order id.</param>
+    /// <param name="currentUser">Bot-scoped admin flow state that should be cleared when the order is handled.</param>
+    /// <param name="mainMenu">Admin reply keyboard shown after the check completes.</param>
+    /// <param name="input">Raw identifier entered by the super-admin.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db, XUI, wallet, ledger, and Telegram work.</param>
+    /// <returns>
+    /// <c>true</c> when a tenant order was found and the manual confirmation/retry result was sent to the admin;
+    /// otherwise <c>false</c> so the caller can continue reporting a normal payment-not-found message.
+    /// </returns>
+    /// <remarks>
+    /// This path is intentionally part of the existing "Verify payment" admin flow. It lets super-admins recover a
+    /// tenant order whose card receipt or gateway payment was accepted but XUI fulfillment timed out, without adding
+    /// another account or another ledger row when the order is already fulfilled.
+    /// </remarks>
+    private async Task<bool> TryHandleTenantOrderManualConfirmationAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        User currentUser,
+        IReplyMarkup mainMenu,
+        string input,
+        CancellationToken cancellationToken)
+    {
+        var resultText = await _tenantBotService.CONFIRMTENANTORDERBYSUPERADMINASYNC(
+            input,
+            message.From.Id,
+            cancellationToken);
+        if (resultText == null)
+            return false;
+
+        var actorCredUser = await GetActivityActorAsync(message.From.Id);
+        await _activityLog.LogBotActionAsync(
+            "tenant_order_superadmin_manual_confirmed",
+            actorCredUser,
+            true,
+            new Dictionary<string, object>
+            {
+                ["orderId"] = input ?? string.Empty
+            },
+            cancellationToken);
+
+        await FinishWithMessageAsync(
+            botClient,
+            message.Chat.Id,
+            currentUser,
+            mainMenu,
+            resultText,
             cancellationToken,
             ParseMode.Html);
         return true;
