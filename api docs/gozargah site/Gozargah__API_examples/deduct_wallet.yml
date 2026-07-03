@@ -1,0 +1,28 @@
+info:
+  name: deduct_wallet
+  type: http
+  seq: 6
+
+http:
+  method: POST
+  url: https://api.gozargah.network/api.php
+  headers:
+    - name: Authorization
+      value: Bearer 6$^BeDTW%eLC9v3jblVrDVp3bWtTDaka+ueidv6$BDM=
+    - name: Content-Type
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "action": "deduct_wallet",
+        "telegram_id": "123456789",
+        "amount": 23000
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

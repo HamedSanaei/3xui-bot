@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="fa" dir="ltr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>API Docs</title>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#ffffff;
+  --s1:#f7f8fa;
+  --s2:#f0f2f5;
+  --s3:#e8eaef;
+  --b1:#e3e6eb;
+  --b2:#d3d7df;
+  --t1:#1a2030;
+  --t2:#5b6478;
+  --t3:#9aa3b5;
+  --acc:#3461eb;
+  --acc-bg:#eef2ff;
+  --acc-br:#c7d4fb;
+  --grn:#0c9963;
+  --grn-bg:#e9f9f1;
+  --grn-br:#bfeed8;
+  --ylw:#b5790a;
+  --ylw-bg:#fdf3df;
+  --ylw-br:#f4dfa6;
+  --red:#d8392c;
+  --red-bg:#fdedeb;
+  --red-br:#f6c7c1;
+  --pur:#7c4ee0;
+  --mono:'JetBrains Mono',monospace;
+  --sans:'Vazirmatn',sans-serif;
+  --side:220px;
+  --shadow:0 1px 2px rgba(20,25,40,.04);
+}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--t1);font-family:var(--sans);font-size:14px;line-height:1.75;display:flex;min-height:100vh}
+
+nav{
+  width:var(--side);flex-shrink:0;position:fixed;top:0;left:0;bottom:0;
+  background:var(--s1);border-right:1px solid var(--b1);
+  overflow-y:auto;display:flex;flex-direction:column;z-index:50
+}
+.nlogo{
+  padding:18px 16px 15px;border-bottom:1px solid var(--b1);
+  display:flex;align-items:center;gap:9px
+}
+.nlogo-icon{
+  width:28px;height:28px;border-radius:7px;
+  background:var(--acc-bg);border:1px solid var(--acc-br);
+  display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;color:var(--acc)
+}
+.nlogo h1{font-size:12.5px;font-weight:600;color:var(--t1);line-height:1.2}
+.nlogo span{font-size:10px;color:var(--t3)}
+.ngrp{padding:18px 10px 2px}
+.ngrp-lbl{font-size:9.5px;font-weight:600;letter-spacing:1.1px;text-transform:uppercase;color:var(--t3);padding:0 6px 5px}
+nav a{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:5px 8px;border-radius:6px;font-size:12px;color:var(--t2);
+  text-decoration:none;transition:background .12s,color .12s;gap:6px;margin-bottom:1px
+}
+nav a:hover{background:var(--s2);color:var(--t1)}
+nav a.act{background:var(--acc-bg);color:var(--acc)}
+.nb{font-size:9px;font-weight:700;padding:2px 6px;border-radius:3px;letter-spacing:.4px;flex-shrink:0;font-family:var(--mono)}
+.nb-post{background:var(--grn-bg);color:var(--grn);border:1px solid var(--grn-br)}
+.nb-patch{background:var(--ylw-bg);color:var(--ylw);border:1px solid var(--ylw-br)}
+.nb-del{background:var(--red-bg);color:var(--red);border:1px solid var(--red-br)}
+.nb-get{background:var(--acc-bg);color:var(--acc);border:1px solid var(--acc-br)}
+
+main{margin-left:var(--side);flex:1;padding:44px 48px 90px;max-width:780px}
+
+.ph{margin-bottom:44px}
+.ph-eye{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:600;letter-spacing:.7px;text-transform:uppercase;color:var(--acc);margin-bottom:10px}
+.ph h2{font-size:24px;font-weight:600;color:var(--t1);line-height:1.3;margin-bottom:8px}
+.ph p{color:var(--t2);max-width:460px;line-height:1.8;font-size:13.5px}
+.ph hr{border:none;border-top:1px solid var(--b1);margin-top:24px}
+
+section{margin-bottom:64px;scroll-margin-top:36px}
+hr.sd{border:none;border-top:1px solid var(--b1);margin:0 0 64px}
+
+.eh{display:flex;align-items:center;gap:9px;margin-bottom:12px;flex-wrap:wrap}
+.em{font-size:10.5px;font-weight:700;padding:3px 9px;border-radius:4px;letter-spacing:.5px;font-family:var(--mono)}
+.em.post{background:var(--grn-bg);color:var(--grn);border:1px solid var(--grn-br)}
+.em.patch{background:var(--ylw-bg);color:var(--ylw);border:1px solid var(--ylw-br)}
+.em.delete{background:var(--red-bg);color:var(--red);border:1px solid var(--red-br)}
+.em.get{background:var(--acc-bg);color:var(--acc);border:1px solid var(--acc-br)}
+.ep{font-family:var(--mono);font-size:12px;color:var(--t2);background:var(--s2);padding:3px 9px;border-radius:4px;border:1px solid var(--b1)}
+.et{font-size:16px;font-weight:600;color:var(--t1)}
+.ed{color:var(--t2);font-size:13px;margin-bottom:20px;line-height:1.8;max-width:500px}
+
+.al{display:flex;gap:10px;padding:11px 14px;border-radius:7px;font-size:12.5px;line-height:1.7;margin-bottom:14px}
+.al-info{background:var(--acc-bg);border:1px solid var(--acc-br)}
+.al-warn{background:var(--ylw-bg);border:1px solid var(--ylw-br)}
+.al-ic{font-size:13px;margin-top:2px;flex-shrink:0}
+.al-info .al-ic{color:var(--acc)}.al-warn .al-ic{color:var(--ylw)}
+.al-b{color:var(--t1);font-size:12.5px}
+.al-b strong{font-weight:600}
+
+.plbl{font-size:10px;font-weight:600;letter-spacing:.9px;text-transform:uppercase;color:var(--t3);margin-bottom:8px}
+.pt{border:1px solid var(--b1);border-radius:8px;overflow:hidden;margin-bottom:16px;box-shadow:var(--shadow)}
+.pr{display:grid;grid-template-columns:148px 76px 72px 1fr;border-bottom:1px solid var(--b1)}
+.pr:last-child{border-bottom:none}
+.pr.hd{background:var(--s2)}
+.pr.hd .pc{font-size:9.5px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;color:var(--t3)}
+.pc{padding:8px 13px;font-size:12px;color:var(--t1);align-self:start}
+.pn{font-family:var(--mono);font-size:11.5px;color:var(--pur)}
+.pty{color:var(--t2);font-size:11.5px}
+.pd{color:var(--t2);font-size:12px;line-height:1.6}
+.pr:not(.hd):hover{background:var(--s1)}
+
+.bdg{display:inline-block;font-size:9px;font-weight:700;padding:2px 6px;border-radius:3px;letter-spacing:.3px;font-family:var(--mono)}
+.b-r{background:var(--red-bg);color:var(--red);border:1px solid var(--red-br)}
+.b-o{background:var(--acc-bg);color:var(--acc);border:1px solid var(--acc-br)}
+
+.cb{border:1px solid var(--b1);border-radius:8px;overflow:hidden;margin-top:2px;box-shadow:var(--shadow)}
+.ct{display:flex;align-items:center;background:var(--s2);border-bottom:1px solid var(--b1)}
+.tabs{display:flex}
+.tab{padding:8px 13px;font-size:11.5px;color:var(--t3);cursor:pointer;border-bottom:2px solid transparent;background:none;border-top:none;border-left:none;border-right:none;font-family:var(--sans);transition:color .12s;font-weight:500}
+.tab.on{color:var(--acc);border-bottom-color:var(--acc)}
+.cpb{margin-left:auto;margin-right:8px;cursor:pointer;font-size:10.5px;padding:3px 9px;border-radius:4px;border:1px solid var(--b2);background:var(--bg);color:var(--t2);font-family:var(--sans);transition:all .12s}
+.cpb:hover{border-color:var(--acc);color:var(--acc)}
+.cpb.ok{color:var(--grn);border-color:var(--grn-br);background:var(--grn-bg)}
+.tp{display:none}.tp.on{display:block}
+pre{padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:12px;line-height:1.8;color:#283146;background:#fbfbfc}
+.k{color:#c41a16}.s{color:#0c7a3d}.n{color:#1158c7}.k2{color:#a431c4}.cm{color:#9aa3b5}.bl{color:#b5790a}
+
+.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:7px}
+.si{display:flex;align-items:center;gap:9px;padding:8px 12px;border-radius:6px;border:1px solid var(--b1);background:var(--s1);font-size:12px}
+.sc{font-family:var(--mono);font-size:12.5px;font-weight:700;min-width:32px}
+.sc.s2{color:var(--grn)}.sc.s4{color:var(--ylw)}.sc.s5{color:var(--red)}
+.sd-{color:var(--t2)}
+
+.it{border:1px solid var(--b1);border-radius:7px;overflow:hidden;margin-bottom:14px;box-shadow:var(--shadow)}
+.ir{display:flex;border-bottom:1px solid var(--b1)}
+.ir:last-child{border-bottom:none}
+.ik{width:140px;flex-shrink:0;padding:9px 14px;font-size:11.5px;color:var(--t2);background:var(--s2)}
+.iv{padding:9px 14px;font-size:12px;display:flex;align-items:center;gap:5px;flex-wrap:wrap;color:var(--t1)}
+
+code{font-family:var(--mono);font-size:11px;background:var(--s2);color:var(--pur);padding:1px 5px;border-radius:3px;border:1px solid var(--b1)}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nlogo">
+    <div class="nlogo-icon">⚡</div>
+    <div>
+      <h1>API Docs</h1>
+      <span>v1.0 · PHP REST</span>
+    </div>
+  </div>
+  <div class="ngrp">
+    <div class="ngrp-lbl">شروع</div>
+    <a href="#overview">معرفی</a>
+    <a href="#auth">احراز هویت</a>
+    <a href="#errors">کدهای خطا</a>
+  </div>
+  <div class="ngrp">
+    <div class="ngrp-lbl">سفارش‌ها</div>
+    <a href="#create-order">ایجاد سفارش <span class="nb nb-post">POST</span></a>
+    <a href="#update-order">ویرایش سفارش <span class="nb nb-patch">PATCH</span></a>
+    <a href="#delete-order">حذف سفارش <span class="nb nb-del">DELETE</span></a>
+  </div>
+  <div class="ngrp">
+    <div class="ngrp-lbl">کاربران</div>
+    <a href="#get-user">اطلاعات کاربر <span class="nb nb-get">GET</span></a>
+    <a href="#deduct-wallet">کسر کیف‌پول <span class="nb nb-post">POST</span></a>
+  </div>
+</nav>
+
+<main>
+  <div class="ph">
+    <div class="ph-eye">📡 REST API Reference</div>
+    <h2>مستندات API</h2>
+    <p>تمام endpoint های موجود در <code>api.php</code> اینجا شرح داده شده‌اند. همه درخواست‌ها نیاز به Bearer Token دارند و پاسخ‌ها به فرمت JSON برگردانده می‌شوند.</p>
+    <hr/>
+  </div>
+
+  <section id="overview">
+    <div class="eh"><div class="et">معرفی</div></div>
+    <div class="it" style="margin-bottom:14px">
+      <div class="ir"><div class="ik">Base URL</div><div class="iv"><code>https://api.gozargah.network/api.php</code></div></div>
+      <div class="ir"><div class="ik">Content-Type</div><div class="iv"><code>application/json; charset=utf-8</code></div></div>
+      <div class="ir"><div class="ik">متدهای مجاز</div><div class="iv"><code>GET</code><code>POST</code><code>PATCH</code><code>DELETE</code></div></div>
+      <div class="ir"><div class="ik">فرمت پاسخ</div><div class="iv">JSON</div></div>
+    </div>
+    <p class="ed">هر درخواست باید فیلد <code>action</code> داشته باشد. مقادیر مجاز: <code>create_order</code> · <code>update_order</code> · <code>delete_order</code> · <code>get_user</code> · <code>deduct_wallet</code></p>
+  </section>
+
+  <section id="auth">
+    <div class="eh"><div class="et">احراز هویت</div></div>
+    <div class="al al-info">
+      <span class="al-ic">🔑</span>
+      <div class="al-b"><strong>Bearer Token</strong> — همه درخواست‌ها باید هدر <code>Authorization</code> با مقدار <code>Bearer &lt;token&gt;</code> داشته باشند.</div>
+    </div>
+    <div class="cb">
+      <div class="ct"><div class="tabs"><button class="tab on">HTTP Header</button></div><button class="cpb" onclick="cp(this)">کپی</button></div>
+      <div class="tp on"><pre>Authorization: Bearer YOUR_SECRET_TOKEN</pre></div>
+    </div>
+    <div class="al al-warn" style="margin-top:10px">
+      <span class="al-ic">⚠️</span>
+      <div class="al-b"><strong>قبل از deploy</strong> حتماً توکن را به یک مقدار امن تغییر دهید.</div>
+    </div>
+  </section>
+
+  <section id="errors">
+    <div class="eh"><div class="et">کدهای وضعیت HTTP</div></div>
+    <div class="sg" style="margin-bottom:16px">
+      <div class="si"><span class="sc s2">200</span><span class="sd-">موفق</span></div>
+      <div class="si"><span class="sc s2">201</span><span class="sd-">ایجاد شد</span></div>
+      <div class="si"><span class="sc s4">400</span><span class="sd-">JSON نامعتبر</span></div>
+      <div class="si"><span class="sc s4">401</span><span class="sd-">احراز هویت ناموفق</span></div>
+      <div class="si"><span class="sc s4">404</span><span class="sd-">یافت نشد</span></div>
+      <div class="si"><span class="sc s4">405</span><span class="sd-">متد مجاز نیست</span></div>
+      <div class="si"><span class="sc s4">422</span><span class="sd-">خطای اعتبارسنجی</span></div>
+      <div class="si"><span class="sc s5">500</span><span class="sd-">خطای پایگاه داده</span></div>
+    </div>
+    <div class="cb">
+      <div class="ct"><div class="tabs"><button class="tab on">فرمت پاسخ خطا</button></div><button class="cpb" onclick="cp(this)">کپی</button></div>
+      <div class="tp on"><pre>{
+  <span class="k2">"success"</span>: <span class="bl">false</span>,
+  <span class="k2">"message"</span>: <span class="s">"Field 'name' is required."</span>
+}</pre></div>
+    </div>
+  </section>
+
+  <hr class="sd"/>
+
+  <section id="create-order">
+    <div class="eh">
+      <span class="em post">POST</span>
+      <span class="ep">https://api.gozargah.network/api.php</span>
+      <span class="et">ایجاد سفارش</span>
+    </div>
+    <p class="ed">یک سفارش جدید در جدول <code>orders</code> ایجاد می‌کند و <code>id</code> رکورد جدید را برمی‌گرداند.</p>
+    <div class="plbl">پارامترهای ورودی</div>
+    <div class="pt">
+      <div class="pr hd"><div class="pc">فیلد</div><div class="pc">نوع</div><div class="pc">وضعیت</div><div class="pc">توضیح</div></div>
+      <div class="pr"><div class="pc pn">action</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">باید <code>"create_order"</code> باشد</div></div>
+      <div class="pr"><div class="pc pn">plan_id</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">شناسه پلن</div></div>
+      <div class="pr"><div class="pc pn">inbound</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">ایدی اینباند ها</div></div>
+      <div class="pr"><div class="pc pn">arranged_plan_id</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">شناسه پلن اماده</div></div>
+      <div class="pr"><div class="pc pn">name</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">نام سفارش (نباید خالی باشد)</div></div>
+      <div class="pr"><div class="pc pn">uuid</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">شناسه (UUID)</div></div>
+      <div class="pr"><div class="pc pn">comment</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">توضیحات</div></div>
+      <div class="pr"><div class="pc pn">price</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">قیمت به تومان (مثل <code>"49000"</code>)</div></div>
+      <div class="pr"><div class="pc pn">volume</div><div class="pc pty">number</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">حجم بر حسب GB — صحیح یا اعشاری (<code>10</code> یا <code>10.5</code>)</div></div>
+      <div class="pr"><div class="pc pn">date</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">مدت زمان اکانت به صورت عددی</div></div>
+      <div class="pr"><div class="pc pn">username</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">نام کاربری</div></div>
+      <div class="pr"><div class="pc pn">tracking_code</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">کد رهگیری</div></div>
+      <div class="pr"><div class="pc pn">sub</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">لینک اشتراک کاربر</div></div>
+      <div class="pr"><div class="pc pn">trial</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd"><code>0</code> = اکانت معمولی &nbsp;·&nbsp; <code>1</code> = اکانت آزمایشی</div></div>
+      <div class="pr"><div class="pc pn">bot</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd"><code>0</code> = دستی ساخته شده &nbsp;·&nbsp; <code>1</code> = توسط ربات ساخته شده</div></div>
+    </div>
+    <div class="cb">
+      <div class="ct">
+        <div class="tabs">
+          <button class="tab on" onclick="sw(this,'co-q')">درخواست</button>
+          <button class="tab" onclick="sw(this,'co-r')">پاسخ ✅ 201</button>
+        </div>
+        <button class="cpb" onclick="cp(this)">کپی</button>
+      </div>
+      <div class="tp on" id="co-q"><pre>{
+  <span class="k2">"action"</span>:           <span class="s">"create_order"</span>,
+  <span class="k2">"plan_id"</span>:          <span class="n">3</span>,
+  <span class="k2">"inbound"</span>:         <span class="s">"vless"</span>,
+  <span class="k2">"arranged_plan_id"</span>: <span class="n">7</span>,
+  <span class="k2">"name"</span>:            <span class="s">"user_order_abc"</span>,
+  <span class="k2">"uuid"</span>:            <span class="s">"550e8400-e29b-41d4-a716-446655440000"</span>,
+  <span class="k2">"comment"</span>:         <span class="s">"سفارش تست"</span>,
+  <span class="k2">"price"</span>:           <span class="s">"49000"</span>,
+  <span class="k2">"volume"</span>:          <span class="n">10.5</span>,
+  <span class="k2">"date"</span>:            <span class="n">1719619200</span>,
+  <span class="k2">"username"</span>:        <span class="s">"john_doe"</span>,
+  <span class="k2">"tracking_code"</span>:   <span class="s">"TRK-001"</span>,
+  <span class="k2">"sub"</span>:             <span class="s">"https://sub.example.com/link/john_doe"</span>,
+  <span class="k2">"trial"</span>:           <span class="n">0</span>,
+  <span class="k2">"bot"</span>:             <span class="n">0</span>
+}</pre></div>
+      <div class="tp" id="co-r"><pre>{
+  <span class="k2">"success"</span>: <span class="bl">true</span>,
+  <span class="k2">"action"</span>:  <span class="s">"create_order"</span>,
+  <span class="k2">"message"</span>: <span class="s">"Order created successfully."</span>,
+  <span class="k2">"id"</span>:      <span class="n">42</span>
+}</pre></div>
+    </div>
+  </section>
+
+  <hr class="sd"/>
+
+  <section id="update-order">
+    <div class="eh">
+      <span class="em patch">PATCH</span>
+      <span class="ep">https://api.gozargah.network/api.php</span>
+      <span class="et">ویرایش سفارش</span>
+    </div>
+    <p class="ed">سفارش را با <code>name</code> پیدا کرده و فیلدهای ارسال‌شده را به‌روز می‌کند. حداقل یک فیلد الزامی است.</p>
+    <div class="al al-info">
+      <span class="al-ic">ℹ️</span>
+      <div class="al-b">برای تغییر نام سفارش، <strong><code>new_name</code></strong> را ارسال کنید. فیلد <code>name</code> همیشه برای جستجو استفاده می‌شود.</div>
+    </div>
+    <div class="plbl">پارامترهای ورودی</div>
+    <div class="pt">
+      <div class="pr hd"><div class="pc">فیلد</div><div class="pc">نوع</div><div class="pc">وضعیت</div><div class="pc">توضیح</div></div>
+      <div class="pr"><div class="pc pn">action</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">باید <code>"update_order"</code> باشد</div></div>
+      <div class="pr"><div class="pc pn">name</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">نام فعلی سفارش (برای جستجو)</div></div>
+      <div class="pr"><div class="pc pn">new_name</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">نام جدید برای تغییر نام سفارش</div></div>
+      <div class="pr"><div class="pc pn">plan_id</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">شناسه پلن</div></div>
+      <div class="pr"><div class="pc pn">inbound</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">ایدی اینباند ها</div></div>
+      <div class="pr"><div class="pc pn">arranged_plan_id</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">شناسه پلن ترتیب‌داده‌شده</div></div>
+      <div class="pr"><div class="pc pn">uuid</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">شناسه یکتا</div></div>
+      <div class="pr"><div class="pc pn">comment</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">توضیحات</div></div>
+      <div class="pr"><div class="pc pn">price</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">قیمت به تومان</div></div>
+      <div class="pr"><div class="pc pn">volume</div><div class="pc pty">number</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">حجم — صحیح یا اعشاری</div></div>
+      <div class="pr"><div class="pc pn">date</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">مدت زمان اکانت به صورت عددی</div></div>
+      <div class="pr"><div class="pc pn">username</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">نام کاربری</div></div>
+      <div class="pr"><div class="pc pn">tracking_code</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">کد رهگیری</div></div>
+      <div class="pr"><div class="pc pn">sub</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd">لینک اشتراک کاربر</div></div>
+      <div class="pr"><div class="pc pn">trial</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd"><code>0</code> = معمولی &nbsp;·&nbsp; <code>1</code> = آزمایشی</div></div>
+      <div class="pr"><div class="pc pn">bot</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-o">اختیاری</span></div><div class="pc pd"><code>0</code> = دستی &nbsp;·&nbsp; <code>1</code> = ربات</div></div>
+    </div>
+    <div class="cb">
+      <div class="ct">
+        <div class="tabs">
+          <button class="tab on" onclick="sw(this,'uo-q')">درخواست</button>
+          <button class="tab" onclick="sw(this,'uo-r')">پاسخ ✅ 200</button>
+        </div>
+        <button class="cpb" onclick="cp(this)">کپی</button>
+      </div>
+      <div class="tp on" id="uo-q"><pre>{
+  <span class="k2">"action"</span>:   <span class="s">"update_order"</span>,
+  <span class="k2">"name"</span>:     <span class="s">"user_order_abc"</span>,
+  <span class="k2">"price"</span>:    <span class="s">"59000"</span>,
+  <span class="k2">"volume"</span>:   <span class="n">20</span>,
+  <span class="k2">"new_name"</span>: <span class="s">"user_order_xyz"</span>
+}</pre></div>
+      <div class="tp" id="uo-r"><pre>{
+  <span class="k2">"success"</span>:        <span class="bl">true</span>,
+  <span class="k2">"action"</span>:         <span class="s">"update_order"</span>,
+  <span class="k2">"message"</span>:        <span class="s">"Order updated successfully."</span>,
+  <span class="k2">"id"</span>:             <span class="n">42</span>,
+  <span class="k2">"updated_fields"</span>: [<span class="s">"price"</span>, <span class="s">"volume"</span>, <span class="s">"name"</span>]
+}</pre></div>
+    </div>
+  </section>
+
+  <hr class="sd"/>
+
+  <section id="delete-order">
+    <div class="eh">
+      <span class="em delete">DELETE</span>
+      <span class="ep">https://api.gozargah.network/api.php</span>
+      <span class="et">حذف سفارش</span>
+    </div>
+    <p class="ed">سفارش مشخص‌شده با <code>name</code> را حذف می‌کند. اگر چند رکورد با این نام وجود داشته باشد، آخرین مورد حذف می‌شود.</p>
+    <div class="plbl">پارامترهای ورودی</div>
+    <div class="pt">
+      <div class="pr hd"><div class="pc">فیلد</div><div class="pc">نوع</div><div class="pc">وضعیت</div><div class="pc">توضیح</div></div>
+      <div class="pr"><div class="pc pn">action</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">باید <code>"delete_order"</code> باشد</div></div>
+      <div class="pr"><div class="pc pn">name</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">نام سفارش برای حذف</div></div>
+    </div>
+    <div class="cb">
+      <div class="ct">
+        <div class="tabs">
+          <button class="tab on" onclick="sw(this,'do-q')">درخواست</button>
+          <button class="tab" onclick="sw(this,'do-r')">پاسخ ✅ 200</button>
+        </div>
+        <button class="cpb" onclick="cp(this)">کپی</button>
+      </div>
+      <div class="tp on" id="do-q"><pre>{
+  <span class="k2">"action"</span>: <span class="s">"delete_order"</span>,
+  <span class="k2">"name"</span>:   <span class="s">"user_order_abc"</span>
+}</pre></div>
+      <div class="tp" id="do-r"><pre>{
+  <span class="k2">"success"</span>: <span class="bl">true</span>,
+  <span class="k2">"action"</span>:  <span class="s">"delete_order"</span>,
+  <span class="k2">"message"</span>: <span class="s">"Order deleted successfully."</span>,
+  <span class="k2">"id"</span>:      <span class="n">42</span>
+}</pre></div>
+    </div>
+  </section>
+
+  <hr class="sd"/>
+
+  <section id="get-user">
+    <div class="eh">
+      <span class="em get">GET</span>
+      <span class="ep">https://api.gozargah.network/api.php</span>
+      <span class="et">اطلاعات کاربر</span>
+    </div>
+    <p class="ed">اطلاعات کاربر را با <code>telegram_id</code> از جدول <code>user</code> برمی‌گرداند.</p>
+    <div class="plbl">پارامترهای ورودی</div>
+    <div class="pt">
+      <div class="pr hd"><div class="pc">فیلد</div><div class="pc">نوع</div><div class="pc">وضعیت</div><div class="pc">توضیح</div></div>
+      <div class="pr"><div class="pc pn">action</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">باید <code>"get_user"</code> باشد</div></div>
+      <div class="pr"><div class="pc pn">telegram_id</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">شناسه تلگرام کاربر</div></div>
+    </div>
+    <div class="cb">
+      <div class="ct">
+        <div class="tabs">
+          <button class="tab on" onclick="sw(this,'gu-q')">درخواست</button>
+          <button class="tab" onclick="sw(this,'gu-r')">پاسخ ✅ 200</button>
+        </div>
+        <button class="cpb" onclick="cp(this)">کپی</button>
+      </div>
+      <div class="tp on" id="gu-q"><pre><span class="cm">GET https://api.gozargah.network/api.php?action=get_user&telegram_id=123456789</span>
+
+<span class="cm">یا به صورت JSON body:</span>
+{
+  <span class="k2">"action"</span>:      <span class="s">"get_user"</span>,
+  <span class="k2">"telegram_id"</span>: <span class="s">"123456789"</span>
+}</pre></div>
+      <div class="tp" id="gu-r"><pre>{
+  <span class="k2">"success"</span>: <span class="bl">true</span>,
+  <span class="k2">"action"</span>:  <span class="s">"get_user"</span>,
+  <span class="k2">"data"</span>: {
+    <span class="k2">"username"</span>:    <span class="s">"john_doe"</span>,
+    <span class="k2">"telegram_id"</span>: <span class="s">"123456789"</span>,
+    <span class="k2">"email"</span>:       <span class="s">"john@example.com"</span>,
+    <span class="k2">"wallet"</span>:      <span class="n">50000</span>,
+    <span class="k2">"ban"</span>:         <span class="n">0</span>
+  }
+}</pre></div>
+    </div>
+  </section>
+
+  <hr class="sd"/>
+
+  <section id="deduct-wallet">
+    <div class="eh">
+      <span class="em post">POST</span>
+      <span class="ep">https://api.gozargah.network/api.php</span>
+      <span class="et">کسر از کیف‌پول</span>
+    </div>
+    <p class="ed">مبلغی را از کیف‌پول کاربر کسر می‌کند. این عملیات با تراکنش پایگاه داده و قفل سطر (<code>FOR UPDATE</code>) انجام می‌شود تا از race condition جلوگیری شود.</p>
+    <div class="al al-warn">
+      <span class="al-ic">⚠️</span>
+      <div class="al-b"><strong>توجه:</strong> این endpoint موجودی را بررسی نمی‌کند — کیف‌پول می‌تواند منفی شود. اعتبارسنجی موجودی باید در لایه اپلیکیشن انجام شود.</div>
+    </div>
+    <div class="plbl">پارامترهای ورودی</div>
+    <div class="pt">
+      <div class="pr hd"><div class="pc">فیلد</div><div class="pc">نوع</div><div class="pc">وضعیت</div><div class="pc">توضیح</div></div>
+      <div class="pr"><div class="pc pn">action</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">باید <code>"deduct_wallet"</code> باشد</div></div>
+      <div class="pr"><div class="pc pn">telegram_id</div><div class="pc pty">string</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">شناسه تلگرام کاربر</div></div>
+      <div class="pr"><div class="pc pn">amount</div><div class="pc pty">integer</div><div class="pc"><span class="bdg b-r">الزامی</span></div><div class="pc pd">مبلغ کسر به تومان (باید بزرگتر از صفر باشد)</div></div>
+    </div>
+    <div class="cb">
+      <div class="ct">
+        <div class="tabs">
+          <button class="tab on" onclick="sw(this,'dw-q')">درخواست</button>
+          <button class="tab" onclick="sw(this,'dw-r')">پاسخ ✅ 200</button>
+        </div>
+        <button class="cpb" onclick="cp(this)">کپی</button>
+      </div>
+      <div class="tp on" id="dw-q"><pre>{
+  <span class="k2">"action"</span>:      <span class="s">"deduct_wallet"</span>,
+  <span class="k2">"telegram_id"</span>: <span class="s">"123456789"</span>,
+  <span class="k2">"amount"</span>:      <span class="n">15000</span>
+}</pre></div>
+      <div class="tp" id="dw-r"><pre>{
+  <span class="k2">"success"</span>: <span class="bl">true</span>,
+  <span class="k2">"action"</span>:  <span class="s">"deduct_wallet"</span>,
+  <span class="k2">"message"</span>: <span class="s">"Wallet deducted successfully."</span>,
+  <span class="k2">"data"</span>: {
+    <span class="k2">"telegram_id"</span>:     <span class="s">"123456789"</span>,
+    <span class="k2">"amount"</span>:          <span class="n">15000</span>,
+    <span class="k2">"previous_wallet"</span>: <span class="n">50000</span>,
+    <span class="k2">"current_wallet"</span>:  <span class="n">35000</span>
+  }
+}</pre></div>
+    </div>
+  </section>
+</main>
+
+<script>
+function sw(btn,id){
+  const b=btn.closest('.cb');
+  b.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  b.querySelectorAll('.tp').forEach(p=>p.classList.remove('on'));
+  btn.classList.add('on');
+  document.getElementById(id).classList.add('on');
+}
+function cp(btn){
+  const b=btn.closest('.cb');
+  const p=b.querySelector('.tp.on pre')||b.querySelector('pre');
+  navigator.clipboard.writeText(p.innerText.trim()).then(()=>{
+    btn.textContent='کپی شد ✓';btn.classList.add('ok');
+    setTimeout(()=>{btn.textContent='کپی';btn.classList.remove('ok')},2000);
+  });
+}
+const secs=[...document.querySelectorAll('section[id]')];
+const lnks=[...document.querySelectorAll('nav a')];
+window.addEventListener('scroll',()=>{
+  let cur='';
+  secs.forEach(s=>{if(window.scrollY>=s.offsetTop-80)cur=s.id});
+  lnks.forEach(l=>l.classList.toggle('act',l.getAttribute('href')==='#'+cur));
+},{passive:true});
+</script>
+</body>
+</html>

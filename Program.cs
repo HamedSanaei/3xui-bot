@@ -56,12 +56,15 @@ class Program
         builder.Services.AddSingleton<XuiV3PurchaseSessionStore>();
         builder.Services.AddSingleton<UserActivityLogService>();
         builder.Services.AddSingleton<WalletLedgerService>();
+        builder.Services.AddSingleton<GozargahSiteApiClient>();
+        builder.Services.AddSingleton<GozargahSiteSyncService>();
         builder.Services.AddSingleton<OwnedBotNotificationService>();
         builder.Services.AddSingleton<SalesAssistantService>();
         builder.Services.AddSingleton<TenantBotService>();
         builder.Services.AddSingleton<XuiV3BotFlowService>();
         builder.Services.AddSingleton<XuiV3AdminFlowService>();
         builder.Services.AddHostedService<XuiV3AccountExpiryReminderService>();
+        builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
 
         builder.Services.AddSingleton<TelegramBotService>();
         builder.Services.AddSingleton<MultiBotHostedService>();

@@ -12,6 +12,7 @@ namespace Adminbot.Domain
     /// </remarks>
     public class WalletLedgerService
     {
+        private const string GozargahSiteWalletProvider = "gozargah_site_wallet";
         private readonly UserDbContext _userDbContext;
 
         /// <summary>
@@ -103,7 +104,12 @@ namespace Adminbot.Domain
         /// <param name="page">Zero-based page index; negative values are treated as zero.</param>
         /// <param name="pageSize">Requested page size; clamped to a safe range of 1 through 20 rows.</param>
         /// <param name="cancellationToken">Cancellation token for the users.db query.</param>
-        /// <returns>A page of ledger entries and the total count available for pagination.</returns>
+        /// <returns>A page of bot-wallet ledger entries and the total count available for pagination.</returns>
+        /// <remarks>
+        /// Website-wallet payments are deliberately excluded because their balance source is the Gozargah website,
+        /// not the bot wallet in <c>credentials.db</c>. Showing them beside bot-wallet debits makes users think the
+        /// same purchase was charged twice.
+        /// </remarks>
         public async Task<(List<WalletLedgerEntry> Items, int TotalCount)> GetPageAsync(
             long telegramUserId,
             int page,
@@ -113,7 +119,8 @@ namespace Adminbot.Domain
             page = Math.Max(0, page);
             pageSize = Math.Clamp(pageSize, 1, 20);
             var query = _userDbContext.WalletLedgerEntries
-                .Where(x => x.TelegramUserId == telegramUserId)
+                .Where(x => x.TelegramUserId == telegramUserId &&
+                            (x.Provider == null || x.Provider != GozargahSiteWalletProvider))
                 .OrderByDescending(x => x.CreatedAtUtc)
                 .ThenByDescending(x => x.Id);
 
@@ -128,11 +135,18 @@ namespace Adminbot.Domain
         /// <param name="telegramUserId">Telegram user id used as the ownership guard for the lookup.</param>
         /// <param name="id">Internal users.db ledger entry id selected from an inline callback.</param>
         /// <param name="cancellationToken">Cancellation token for the users.db query.</param>
-        /// <returns>The matching ledger entry, or null when the id does not belong to the user.</returns>
+        /// <returns>
+        /// The matching bot-wallet ledger entry, or null when the id does not belong to the user or represents a
+        /// website-wallet debit that should not be shown in the bot-wallet history.
+        /// </returns>
         public Task<WalletLedgerEntry> GetByIdAsync(long telegramUserId, int id, CancellationToken cancellationToken = default)
         {
             return _userDbContext.WalletLedgerEntries
-                .FirstOrDefaultAsync(x => x.Id == id && x.TelegramUserId == telegramUserId, cancellationToken);
+                .FirstOrDefaultAsync(
+                    x => x.Id == id &&
+                         x.TelegramUserId == telegramUserId &&
+                         (x.Provider == null || x.Provider != GozargahSiteWalletProvider),
+                    cancellationToken);
         }
     }
 }

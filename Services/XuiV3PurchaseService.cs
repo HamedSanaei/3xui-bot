@@ -29,6 +29,30 @@ public class XuiV3PurchaseService
             .ToList();
     }
 
+    /// <summary>
+    /// Resolves a raw Telegram purchase or renewal selection into the concrete XUI v3 plan, price, traffic, and duration.
+    /// </summary>
+    /// <param name="selection">
+    /// The selected service and either a metered traffic/duration pair or an unlimited plan key.
+    /// Metered traffic is expressed in GB and is validated against the service's configured minimum.
+    /// </param>
+    /// <param name="isColleague">
+    /// Whether colleague base pricing should be used. Tenant storefronts pass <c>false</c> for public sale
+    /// pricing and call the same method again with <c>true</c> when calculating owner base cost.
+    /// </param>
+    /// <returns>
+    /// A normalized purchase result containing the enabled service definition, traffic bytes, duration days,
+    /// limit IP, and toman price. The returned object is safe to use for account creation and invoice totals.
+    /// </returns>
+    /// <remarks>
+    /// This method is the shared policy gate for owned bots and tenant bots. Any metered purchase or renewal
+    /// that bypasses the visible traffic keyboards still reaches this validation before price calculation or
+    /// account creation, so stale callbacks and typed values cannot buy less than the configured minimum.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="selection"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the service, unlimited plan, duration, traffic, or configured minimum is invalid.
+    /// </exception>
     public XuiV3ResolvedPurchase ResolvePurchase(XuiV3PurchaseSelection selection, bool isColleague)
     {
         if (selection == null)
@@ -66,6 +90,10 @@ public class XuiV3PurchaseService
         if (selection.TrafficGb == null || selection.TrafficGb <= 0)
             throw new InvalidOperationException("TrafficGb is required for metered plans.");
 
+        var minimumTrafficGb = GetMinimumTrafficGb(service);
+        if (selection.TrafficGb.Value < minimumTrafficGb)
+            throw new InvalidOperationException($"Minimum traffic for service '{service.Key}' is {minimumTrafficGb} GB.");
+
         var duration = service.DurationOptions.FirstOrDefault(d =>
             string.Equals(d.Key, selection.DurationKey, StringComparison.OrdinalIgnoreCase));
 
@@ -99,10 +127,21 @@ public class XuiV3PurchaseService
         return new InlineKeyboardMarkup(rows);
     }
 
+    /// <summary>
+    /// Builds the metered traffic selection keyboard for an enabled XUI v3 service.
+    /// </summary>
+    /// <param name="serviceKey">Configured service key from <c>xui-v3-service-plans.json</c>.</param>
+    /// <returns>
+    /// An inline keyboard containing only configured traffic options that satisfy the service minimum, plus a back button.
+    /// </returns>
+    /// <remarks>
+    /// The minimum filter keeps owned-bot callback options consistent with typed traffic validation and tenant
+    /// storefront pricing. Custom typed traffic may still exceed the shown options.
+    /// </remarks>
     public InlineKeyboardMarkup BuildTrafficKeyboard(string serviceKey)
     {
         var service = FindService(serviceKey);
-        var rows = service.TrafficOptionsGb
+        var rows = GetVisibleTrafficOptions(service)
             .Chunk(2)
             .Select(chunk => chunk
                 .Select(gb => InlineKeyboardButton.WithCallbackData(
@@ -113,6 +152,59 @@ public class XuiV3PurchaseService
             .ToArray();
 
         return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>
+    /// Gets the effective minimum metered traffic for a service.
+    /// </summary>
+    /// <param name="service">
+    /// Service definition loaded from the plan file. Unlimited services may be passed, but the result is used
+    /// only for metered services.
+    /// </param>
+    /// <returns>
+    /// Minimum traffic in GB. Missing, zero, or negative configuration values fall back to <c>1</c> GB.
+    /// </returns>
+    /// <remarks>
+    /// This helper is static so owned-bot and tenant-bot state machines can use the same policy before calling
+    /// <see cref="ResolvePurchase"/> and can show a friendly Persian error instead of surfacing an exception.
+    /// </remarks>
+    public static int GetMinimumTrafficGb(XuiV3ServiceDefinition service)
+    {
+        return Math.Max(1, service?.MinimumTrafficGb ?? 1);
+    }
+
+    /// <summary>
+    /// Returns traffic options that should be shown to customers for a metered service.
+    /// </summary>
+    /// <param name="service">Metered service definition loaded from the plan file.</param>
+    /// <returns>
+    /// Configured traffic options in ascending order after removing values below the service minimum. The
+    /// collection can be empty when the plan file has no visible preset values.
+    /// </returns>
+    /// <remarks>
+    /// The method does not limit custom typed traffic; it only controls preset keyboard buttons.
+    /// </remarks>
+    public static IReadOnlyList<int> GetVisibleTrafficOptions(XuiV3ServiceDefinition service)
+    {
+        var minimumTrafficGb = GetMinimumTrafficGb(service);
+        return service?.TrafficOptionsGb?
+            .Where(gb => gb >= minimumTrafficGb)
+            .Distinct()
+            .OrderBy(gb => gb)
+            .ToList() ?? new List<int>();
+    }
+
+    /// <summary>
+    /// Checks whether a metered traffic amount satisfies the configured service minimum.
+    /// </summary>
+    /// <param name="service">Metered service definition that owns the traffic policy.</param>
+    /// <param name="trafficGb">Customer-selected traffic amount in GB.</param>
+    /// <returns>
+    /// <c>true</c> when <paramref name="trafficGb"/> is greater than or equal to the configured minimum; otherwise <c>false</c>.
+    /// </returns>
+    public static bool MeetsMinimumTraffic(XuiV3ServiceDefinition service, int trafficGb)
+    {
+        return trafficGb >= GetMinimumTrafficGb(service);
     }
 
     public InlineKeyboardMarkup BuildDurationKeyboard(string serviceKey, int trafficGb)
@@ -192,6 +284,27 @@ public class XuiV3PurchaseService
         return text;
     }
 
+    /// <summary>
+    /// Builds the HTML tariff message shown to owned-bot customers and colleagues.
+    /// </summary>
+    /// <param name="isColleague">
+    /// <c>true</c> when the caller is a colleague and colleague prices should be shown;
+    /// <c>false</c> when normal customer prices should be shown.
+    /// </param>
+    /// <returns>
+    /// HTML-formatted Persian text that is safe to send with <c>ParseMode.Html</c>. The text includes
+    /// only enabled plans and filters metered traffic options below each service's configured minimum.
+    /// </returns>
+    /// <remarks>
+    /// The tariff message is derived from <c>xui-v3-service-plans.json</c>. This method does not persist
+    /// any data and does not calculate a payable invoice; it is only a read-only presentation helper.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var text = purchaseService.BuildTariffsText(credUser.IsColleague);
+    /// await botClient.SendTextMessageAsync(chatId, text, parseMode: ParseMode.Html);
+    /// </code>
+    /// </example>
     public string BuildTariffsText(bool isColleague)
     {
         var roleText = isColleague ? "همکار" : "کاربر عادی";
@@ -229,8 +342,9 @@ public class XuiV3PurchaseService
                 builder.AppendLine($"{titleIcon} <b>{Html(service.DisplayName)}</b>");
                 builder.AppendLine($"قیمت هر گیگ: <code>{Html(service.GetPricePerGb(isColleague).FormatCurrency())}</code>");
 
-                if (service.TrafficOptionsGb?.Any() == true)
-                    builder.AppendLine($"حجم‌ها: <code>{Html(string.Join(" / ", service.TrafficOptionsGb.OrderBy(x => x).Select(x => $"{x}GB")))}</code>");
+                var visibleTrafficOptions = GetVisibleTrafficOptions(service);
+                if (visibleTrafficOptions.Count > 0)
+                    builder.AppendLine($"حجم‌ها: <code>{Html(string.Join(" / ", visibleTrafficOptions.Select(x => $"{x}GB")))}</code>");
 
                 var durations = service.DurationOptions?
                     .OrderBy(duration => duration.Days)
@@ -734,6 +848,22 @@ public static class XuiV3PurchaseCallbacks
         return $"{Prefix}:ok:{selection.ServiceKey}:{selection.TrafficGb}:{selection.DurationKey}";
     }
 
+    /// <summary>
+    /// Builds callback data for confirming an XUI v3 purchase with the Gozargah website wallet.
+    /// </summary>
+    /// <param name="selection">Selected service, traffic, duration, or unlimited plan.</param>
+    /// <returns>
+    /// Callback data that carries the same purchase selection as <see cref="Confirm"/> while marking the
+    /// payment source as the Gozargah website wallet.
+    /// </returns>
+    public static string SiteWalletConfirm(XuiV3PurchaseSelection selection)
+    {
+        if (!string.IsNullOrWhiteSpace(selection.UnlimitedPlanKey))
+            return $"{Prefix}:sitepay:{selection.ServiceKey}:u:{selection.UnlimitedPlanKey}";
+
+        return $"{Prefix}:sitepay:{selection.ServiceKey}:{selection.TrafficGb}:{selection.DurationKey}";
+    }
+
     public static string AccountCount(int count)
     {
         return $"{Prefix}:cnt:{Math.Max(1, Math.Min(count, XuiV3PurchaseService.MaxBulkAccountCount))}";
@@ -924,7 +1054,7 @@ public static class XuiV3PurchaseCallbacks
         if (callback.Action == "upl" && parts.Length >= 4)
             callback.UnlimitedPlanKey = parts[3];
 
-        if (callback.Action == "ok" && parts.Length >= 5)
+        if ((callback.Action == "ok" || callback.Action == "sitepay") && parts.Length >= 5)
         {
             if (parts[3] == "u")
             {

@@ -25,6 +25,14 @@ public class UserDbContext : DbContext
     public DbSet<TenantBotLedgerEntry> TenantBotLedgerEntries { get; set; }
     public DbSet<WalletLedgerEntry> WalletLedgerEntries { get; set; }
     public DbSet<TenantManualPaymentReceipt> TenantManualPaymentReceipts { get; set; }
+    /// <summary>
+    /// Outbox rows for synchronizing successful XUI operations from the bot to the Gozargah website.
+    /// </summary>
+    /// <remarks>
+    /// Rows are written to <c>users.db</c> after bot-side create, update, rename, or delete operations and are
+    /// retried by the background worker until the website API accepts them or marks them as skipped.
+    /// </remarks>
+    public DbSet<GozargahSiteSyncEvent> GozargahSiteSyncEvents { get; set; }
     public DbSet<CookieData> Cookies { get; set; }
     public DbSet<SwapinoPaymentInfo> SwapinoPaymentInfos { get; set; }
     public DbSet<HooshPayPaymentInfo> HooshPayPaymentInfos { get; set; }
@@ -211,6 +219,32 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.OwnerTelegramUserId);
             entity.HasIndex(x => x.CustomerTelegramUserId);
             entity.HasIndex(x => x.Status);
+        });
+
+        modelBuilder.Entity<GozargahSiteSyncEvent>(entity =>
+        {
+            entity.ToTable("GozargahSiteSyncEvents");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.BotId).HasMaxLength(64);
+            entity.Property(x => x.TenantBotId).HasMaxLength(64);
+            entity.Property(x => x.Operation).HasMaxLength(32);
+            entity.Property(x => x.Status).HasMaxLength(32);
+            entity.Property(x => x.Email).HasMaxLength(160);
+            entity.Property(x => x.PreviousEmail).HasMaxLength(160);
+            entity.Property(x => x.Uuid).HasMaxLength(64);
+            entity.Property(x => x.SubId).HasMaxLength(160);
+            entity.Property(x => x.SiteOrderId).HasMaxLength(64);
+            entity.HasIndex(x => x.BotId);
+            entity.HasIndex(x => x.TenantBotId);
+            entity.HasIndex(x => x.TelegramUserId);
+            entity.HasIndex(x => x.OwnerTelegramUserId);
+            entity.HasIndex(x => x.BuyerTelegramUserId);
+            entity.HasIndex(x => x.Email);
+            entity.HasIndex(x => x.Uuid);
+            entity.HasIndex(x => x.SubId);
+            entity.HasIndex(x => x.Status);
+            entity.HasIndex(x => new { x.Operation, x.Email, x.PreviousEmail, x.Uuid, x.SubId });
         });
 
         modelBuilder.Entity<ZibalPaymentInfo>(entity =>

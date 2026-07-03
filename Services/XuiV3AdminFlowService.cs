@@ -57,6 +57,7 @@ public class XuiV3AdminFlowService
     private readonly HooshPaySettlementService _hooshPaySettlementService;
     private readonly TenantBotService _tenantBotService;
     private readonly XuiV3PurchaseService _purchaseService;
+    private readonly GozargahSiteSyncService _gozargahSiteSyncService;
     private readonly ILogger<XuiV3AdminFlowService> _logger;
     private readonly UserActivityLogService _activityLog;
 
@@ -72,6 +73,10 @@ public class XuiV3AdminFlowService
     /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
     /// <param name="tenantBotService">Tenant storefront settlement service for direct tenant orders.</param>
     /// <param name="purchaseService">Shared XuiV3 purchase and renewal service.</param>
+    /// <param name="gozargahSiteSyncService">
+    /// Gozargah website sync service used by super-admin historical sync, admin account creation, and admin renewal.
+    /// It writes to an outbox first, so website API failures do not roll back successful 3x-ui operations.
+    /// </param>
     /// <param name="logger">Service logger.</param>
     /// <param name="activityLog">File-based activity logger for admin actions.</param>
     public XuiV3AdminFlowService(
@@ -84,6 +89,7 @@ public class XuiV3AdminFlowService
         HooshPaySettlementService hooshPaySettlementService,
         TenantBotService tenantBotService,
         XuiV3PurchaseService purchaseService,
+        GozargahSiteSyncService gozargahSiteSyncService,
         ILogger<XuiV3AdminFlowService> logger,
         UserActivityLogService activityLog)
     {
@@ -97,6 +103,7 @@ public class XuiV3AdminFlowService
         _hooshPaySettlementService = hooshPaySettlementService;
         _tenantBotService = tenantBotService;
         _purchaseService = purchaseService;
+        _gozargahSiteSyncService = gozargahSiteSyncService;
         _logger = logger;
         _activityLog = activityLog;
     }
@@ -128,6 +135,12 @@ public class XuiV3AdminFlowService
     {
         if (!IsEnabled() || message?.Text == null)
             return false;
+
+        if (string.Equals(message.Text, "Sync Gozargah Site", StringComparison.OrdinalIgnoreCase))
+        {
+            await HandleGozargahHistoricalSyncAsync(botClient, message, currentUser, mainMenu, cancellationToken);
+            return true;
+        }
 
         if (currentUser?.Flow == FlowName && currentUser.LastStep == StepCreateTargetUser)
         {
@@ -717,6 +730,19 @@ public class XuiV3AdminFlowService
             await Task.Delay(250, cancellationToken);
         }
 
+        if (long.TryParse(currentUser.ConfigLink, out var syncTargetTelegramUserId))
+        {
+            foreach (var createdAccount in bulkResult.CreatedAccounts)
+            {
+                await _gozargahSiteSyncService.QueueCreateAsync(
+                    syncTargetTelegramUserId,
+                    syncTargetTelegramUserId,
+                    createdAccount,
+                    bulkResult.BulkOrderId,
+                    cancellationToken: cancellationToken);
+            }
+        }
+
         if (bulkResult.Failures.Count > 0)
         {
             await botClient.SendTextMessageAsync(
@@ -1001,6 +1027,19 @@ public class XuiV3AdminFlowService
                 ["comment"] = client.Comment
             },
             cancellationToken);
+
+        var renewMetadata = TryReadMetadata(client.Comment);
+        var syncOwnerTelegramUserId = client.TgId != 0 ? client.TgId : renewMetadata?.TelegramUserId ?? 0;
+        if (syncOwnerTelegramUserId > 0)
+        {
+            await _gozargahSiteSyncService.QueueUpdateAsync(
+                syncOwnerTelegramUserId,
+                syncOwnerTelegramUserId,
+                client,
+                serverInfo,
+                $"admin-renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                cancellationToken: cancellationToken);
+        }
 
     }
 
@@ -1864,6 +1903,105 @@ public class XuiV3AdminFlowService
             text: "عملیات لغو شد.",
             replyMarkup: mainMenu ?? new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs the super-admin initiated historical sync from XUI v3 panel clients into the Gozargah website API.
+    /// </summary>
+    /// <param name="botClient">Telegram client of the current admin bot that receives progress and summary messages.</param>
+    /// <param name="message">Super-admin Telegram message that requested the historical sync command.</param>
+    /// <param name="currentUser">Bot-scoped admin state row that is cleared after the command completes.</param>
+    /// <param name="mainMenu">Admin menu keyboard returned after the one-shot command completes.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram, database, panel, and website API calls.</param>
+    /// <returns>A task that completes after all eligible panel clients have been queued and attempted once.</returns>
+    /// <remarks>
+    /// The command is intentionally manual and is not run at startup. Each eligible client is sent through the
+    /// same outbox path used by realtime sync, so repeated historical runs are idempotent from the bot side and
+    /// transient website API failures remain retryable in <c>GozargahSiteSyncEvents</c>.
+    /// </remarks>
+    private async Task HandleGozargahHistoricalSyncAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        User currentUser,
+        IReplyMarkup mainMenu,
+        CancellationToken cancellationToken)
+    {
+        if (!_appConfig.GozargahSiteSyncEnabled)
+        {
+            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "Gozargah site sync is disabled in configuration.", cancellationToken);
+            return;
+        }
+
+        await botClient.SendTextMessageAsync(
+            chatId: message.Chat.Id,
+            text: "Starting Gozargah historical sync. This may take a while...",
+            replyMarkup: new ReplyKeyboardRemove(),
+            cancellationToken: cancellationToken);
+
+        var serverInfo = BuildConfiguredPanelServerInfo();
+        var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        if (!clientsResponse.Success)
+        {
+            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, $"XUI client read failed.\n{clientsResponse.Msg}", cancellationToken);
+            return;
+        }
+
+        var checkedCount = 0;
+        var queuedCount = 0;
+        var succeededCount = 0;
+        var skippedCount = 0;
+        var failedCount = 0;
+
+        foreach (var client in clientsResponse.Obj ?? new List<XuiV3Client>())
+        {
+            checkedCount++;
+
+            if (ResolveServiceForClient(client) == null)
+            {
+                skippedCount++;
+                continue;
+            }
+
+            var metadata = TryReadMetadata(client.Comment);
+            var ownerTelegramUserId = client.TgId != 0 ? client.TgId : metadata?.TelegramUserId ?? 0;
+            if (ownerTelegramUserId <= 0)
+            {
+                skippedCount++;
+                continue;
+            }
+
+            var syncEvent = await _gozargahSiteSyncService.QueueUpdateAsync(
+                ownerTelegramUserId,
+                ownerTelegramUserId,
+                client,
+                serverInfo,
+                $"historical-{client.Email}",
+                cancellationToken: cancellationToken);
+
+            if (syncEvent == null)
+            {
+                skippedCount++;
+                continue;
+            }
+
+            queuedCount++;
+            if (string.Equals(syncEvent.Status, GozargahSiteSyncStatuses.Succeeded, StringComparison.OrdinalIgnoreCase))
+                succeededCount++;
+            else if (string.Equals(syncEvent.Status, GozargahSiteSyncStatuses.Skipped, StringComparison.OrdinalIgnoreCase))
+                skippedCount++;
+            else
+                failedCount++;
+        }
+
+        var summary =
+            "<b>Gozargah historical sync finished</b>\n\n" +
+            $"Checked: <code>{checkedCount}</code>\n" +
+            $"Queued: <code>{queuedCount}</code>\n" +
+            $"Succeeded now: <code>{succeededCount}</code>\n" +
+            $"Skipped: <code>{skippedCount}</code>\n" +
+            $"Pending/failed for retry: <code>{failedCount}</code>";
+
+        await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, summary, cancellationToken, ParseMode.Html);
     }
 
     private ReplyKeyboardMarkup BuildServiceReplyKeyboard()

@@ -81,6 +81,14 @@ namespace Adminbot.Domain
         public List<string> FallbackInboundTypes { get; set; } = new List<string>();
         public XuiV3RolePrice PricePerGb { get; set; } = new XuiV3RolePrice();
         public List<int> TrafficOptionsGb { get; set; } = new List<int>();
+        /// <summary>
+        /// Minimum traffic, in GB, that can be purchased or renewed for this metered service.
+        /// </summary>
+        /// <remarks>
+        /// The value is read from <c>xui-v3-service-plans.json</c> and is intentionally ignored for
+        /// unlimited services because their traffic is fixed by the selected fair-usage plan.
+        /// </remarks>
+        public int MinimumTrafficGb { get; set; } = 1;
         public List<XuiV3DurationOption> DurationOptions { get; set; } = new List<XuiV3DurationOption>();
         public List<XuiV3UnlimitedPlan> UnlimitedPlans { get; set; } = new List<XuiV3UnlimitedPlan>();
 

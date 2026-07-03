@@ -216,15 +216,18 @@ public class SalesAssistantService
             return;
         }
 
-        if (parts[0] == "DETAIL")
+        if (parts[0] == "DETAIL" || parts[0] == "DETAILF")
         {
             var details = await BuildReceiptDetailsTextAsync(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
+            var keyboard = parts[0] == "DETAILF"
+                ? BuildReceiptFinalConfirmationKeyboard(RECEIPTID)
+                : BuildReceiptPostReviewKeyboard(RECEIPTID, details.CanResend, details.CanApprove);
             await SafeEditMessageCaptionAsync(
                 botClient,
                 CallbackQuery.Message.Chat.Id,
                 CallbackQuery.Message.MessageId,
                 details.Text,
-                BuildReceiptPostReviewKeyboard(RECEIPTID, details.CanResend),
+                keyboard,
                 CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
             return;
@@ -244,12 +247,7 @@ public class SalesAssistantService
                 botClient,
                 CallbackQuery.Message.Chat.Id,
                 CallbackQuery.Message.MessageId,
-                new InlineKeyboardMarkup(new[]
-                {
-                    new[] { InlineKeyboardButton.WithCallbackData("✅ تایید نهایی", CALLBACKPREFIX + $"final:{RECEIPTID}") },
-                    new[] { InlineKeyboardButton.WithCallbackData("↩‌ انصراف", CALLBACKPREFIX + $"Cancel:{RECEIPTID}") },
-                    new[] { InlineKeyboardButton.WithCallbackData("🔎 مشاهده جزئیات", CALLBACKPREFIX + $"DETAIL:{RECEIPTID}") }
-                }),
+                BuildReceiptFinalConfirmationKeyboard(RECEIPTID),
                 CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "برای انجام قطعی، تایید نهایی را بزنید.", cancellationToken: CancellationToken);
             return;
@@ -309,18 +307,53 @@ public class SalesAssistantService
     /// </summary>
     /// <param name="receiptId">Internal users.db receipt id embedded in callback data.</param>
     /// <param name="canResend">Whether the linked order is fulfilled and account details can be resent.</param>
-    /// <returns>Inline keyboard for detail lookup and optional account resend.</returns>
-    private static InlineKeyboardMarkup BuildReceiptPostReviewKeyboard(int receiptId, bool canResend)
+    /// <param name="canApprove">
+    /// Whether the receipt is still pending and the owner should retain the approve/reject controls after
+    /// opening the detail view.
+    /// </param>
+    /// <returns>Inline keyboard for review, detail lookup, and optional account resend.</returns>
+    /// <remarks>
+    /// Pending receipts must keep approval controls even after the owner opens details. Otherwise the owner
+    /// loses the ability to finish a valid receipt from the same assistant message.
+    /// </remarks>
+    private static InlineKeyboardMarkup BuildReceiptPostReviewKeyboard(int receiptId, bool canResend, bool canApprove = false)
     {
-        var rows = new List<InlineKeyboardButton[]>
+        var rows = new List<InlineKeyboardButton[]>();
+
+        if (canApprove)
         {
-            new[] { InlineKeyboardButton.WithCallbackData("🔎 مشاهده جزئیات", CALLBACKPREFIX + $"DETAIL:{receiptId}") }
-        };
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("✅ تایید", CALLBACKPREFIX + $"APPROVE:{receiptId}"),
+                InlineKeyboardButton.WithCallbackData("❌ رد", CALLBACKPREFIX + $"REJECT:{receiptId}")
+            });
+        }
+
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔎 مشاهده جزئیات", CALLBACKPREFIX + $"DETAIL:{receiptId}") });
 
         if (canResend)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("📤 ارسال مجدد مشخصات", CALLBACKPREFIX + $"RESEND:{receiptId}") });
 
         return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>
+    /// Builds the second-step confirmation keyboard after an owner clicks approve for a receipt.
+    /// </summary>
+    /// <param name="receiptId">Internal users.db receipt id awaiting final confirmation.</param>
+    /// <returns>Inline keyboard with final confirmation, cancellation, and a context-preserving detail button.</returns>
+    /// <remarks>
+    /// The detail button uses <c>DETAILF</c> so viewing details during the final-confirmation step does not
+    /// replace the keyboard with the first-step approve/reject controls.
+    /// </remarks>
+    private static InlineKeyboardMarkup BuildReceiptFinalConfirmationKeyboard(int receiptId)
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData("✅ تایید نهایی", CALLBACKPREFIX + $"final:{receiptId}") },
+            new[] { InlineKeyboardButton.WithCallbackData("↩‌ انصراف", CALLBACKPREFIX + $"Cancel:{receiptId}") },
+            new[] { InlineKeyboardButton.WithCallbackData("🔎 مشاهده جزئیات", CALLBACKPREFIX + $"DETAILF:{receiptId}") }
+        });
     }
 
     /// <summary>
@@ -343,10 +376,10 @@ public class SalesAssistantService
     {
         var receipt = await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == receiptId, CancellationToken);
         if (receipt == null)
-            return new ReceiptDetailsView("رسید پیدا نشد.", false);
+            return new ReceiptDetailsView("رسید پیدا نشد.", false, false);
 
         if (receipt.OwnerTelegramUserId != ownerTelegramUserId)
-            return new ReceiptDetailsView("این رسید متعلق به ربات فروشگاهی شما نیست.", false);
+            return new ReceiptDetailsView("این رسید متعلق به ربات فروشگاهی شما نیست.", false, false);
 
         var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId,
@@ -363,7 +396,7 @@ public class SalesAssistantService
         if (order == null)
         {
             text += "\nسفارش مرتبط با این رسید پیدا نشد.";
-            return new ReceiptDetailsView(text, false);
+            return new ReceiptDetailsView(text, false, false);
         }
 
         text +=
@@ -380,7 +413,9 @@ public class SalesAssistantService
                 $"🔗 سابلینک: <code>{Html(order.CreatedSubLink)}</code>\n";
         }
 
-        return new ReceiptDetailsView(text, order.IsFulfilled);
+        var canApprove = string.Equals(receipt.Status, TenantManualPaymentReceiptStatuses.Pending, StringComparison.OrdinalIgnoreCase) &&
+                         !order.IsFulfilled;
+        return new ReceiptDetailsView(text, order.IsFulfilled, canApprove);
     }
 
     /// <summary>
@@ -518,10 +553,12 @@ public class SalesAssistantService
         /// </summary>
         /// <param name="text">HTML caption text to show under the receipt photo.</param>
         /// <param name="canResend">Whether the linked order is fulfilled and resend controls should be shown.</param>
-        public ReceiptDetailsView(string text, bool canResend)
+        /// <param name="canApprove">Whether approve/reject controls should remain visible under the receipt.</param>
+        public ReceiptDetailsView(string text, bool canResend, bool canApprove)
         {
             Text = text;
             CanResend = canResend;
+            CanApprove = canApprove;
         }
 
         /// <summary>
@@ -533,5 +570,10 @@ public class SalesAssistantService
         /// Whether the linked order is fulfilled and resend controls should be shown.
         /// </summary>
         public bool CanResend { get; }
+
+        /// <summary>
+        /// Whether the receipt is still pending and can be approved or rejected by the owner.
+        /// </summary>
+        public bool CanApprove { get; }
     }
 }

@@ -17,6 +17,10 @@ namespace Adminbot.Domain.Logging
 
     public class TelegramLogger : ILogger
     {
+        /// <summary>
+        /// Maximum plain-text log length sent to Telegram, kept below Telegram's hard 4096-character limit.
+        /// </summary>
+        private const int MaxTelegramLogMessageLength = 3900;
         private readonly string _categoryName;
         private readonly Func<string, LogLevel, bool> _filter;
         private readonly BotClientProvider _botClientProvider;
@@ -73,6 +77,15 @@ namespace Adminbot.Domain.Logging
         }
 
 
+        /// <summary>
+        /// Creates and sends a best-effort copy of <c>credentials.db</c> to the configured backup channel.
+        /// </summary>
+        /// <returns>A task that completes after the backup is sent or skipped because the file could not be copied.</returns>
+        /// <remarks>
+        /// SQLite keeps the credentials database open while the bot is running. The backup copy therefore opens
+        /// the source file with read/write sharing and returns immediately when copying fails; logging must never
+        /// block payment processing or crash the Telegram receiver.
+        /// </remarks>
         private async Task BackupDatabas()
         {
 
@@ -81,42 +94,66 @@ namespace Adminbot.Domain.Logging
 
             try
             {
-                // This will create a copy of your database file.
-                System.IO.File.Copy(sourceDbPath, backupDbPath, overwrite: true);
-
-                // Now you can send the backup file to Telegram as needed.
-                // ... (code to send the file) ...
+                await using var source = new System.IO.FileStream(
+                    sourceDbPath,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.Read,
+                    System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete);
+                await using var destination = new System.IO.FileStream(
+                    backupDbPath,
+                    System.IO.FileMode.Create,
+                    System.IO.FileAccess.Write,
+                    System.IO.FileShare.None);
+                await source.CopyToAsync(destination);
             }
             catch (IOException ex)
             {
-                // Handle the case where the file could not be copied.
                 Console.WriteLine("An error occurred while copying the database: " + ex.Message);
-                // You may choose to log the error or inform the user.
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("An unexpected error occurred while copying the database: " + ex.Message);
+                return;
             }
 
-
-            await using Stream stream = System.IO.File.OpenRead("./Data/credentials_backup.db");
-            Message message = await CurrentBotClient.SendDocumentAsync(
-                chatId: CurrentBackupChannelId,
-                document: InputFile.FromStream(stream: stream, fileName: "credentials.db"),
-                caption: DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi());
+            try
+            {
+                await using Stream stream = System.IO.File.OpenRead("./Data/credentials_backup.db");
+                await CurrentBotClient.SendDocumentAsync(
+                    chatId: CurrentBackupChannelId,
+                    document: InputFile.FromStream(stream: stream, fileName: "credentials.db"),
+                    caption: DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi());
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("An error occurred while sending the database backup: " + ex.Message);
+            }
         }
 
+        /// <summary>
+        /// Sends an HTML payment/audit log to the current bot logger channel and starts a non-blocking database backup.
+        /// </summary>
+        /// <param name="message">
+        /// HTML-safe log text prepared by the payment or tenant flow. The method sends it with
+        /// <see cref="Telegram.Bot.Types.Enums.ParseMode.Html"/>.
+        /// </param>
+        /// <returns>A task that completes after the log message has been sent.</returns>
+        /// <remarks>
+        /// The credentials backup is intentionally fire-and-forget. A locked database file, missing backup
+        /// channel, or Telegram document failure must not delay or fail the payment settlement path.
+        /// </remarks>
         public async Task LogPayment(string message)
         {
             try
             {
-                // Escape HTML-sensitive characters for proper rendering in HTML mode
-                ;
-
-                // Send message using ParseMode.Html
                 await CurrentBotClient.SendTextMessageAsync(
                     CurrentLoggerChannelId,
                     message,
                     parseMode: Telegram.Bot.Types.Enums.ParseMode.Html
                 );
 
-                BackupDatabas().Wait();
+                _ = Task.Run(BackupDatabas);
             }
             catch (Exception ex)
             {
@@ -128,13 +165,36 @@ namespace Adminbot.Domain.Logging
         {
             try
             {
-                await CurrentBotClient.SendTextMessageAsync(CurrentLoggerChannelId, message);
+                await CurrentBotClient.SendTextMessageAsync(CurrentLoggerChannelId, TruncateForTelegramLog(message));
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Exception caught in logger: {ex.Message}");
                 // You might want to log to a local file here as a fallback
             }
+        }
+
+        /// <summary>
+        /// Truncates a plain-text application log so Telegram accepts it as one message.
+        /// </summary>
+        /// <param name="message">
+        /// Plain-text log message generated by Microsoft.Extensions.Logging. The value may be empty or may include
+        /// a full exception stack trace.
+        /// </param>
+        /// <returns>
+        /// The original message when it fits Telegram's message size limit; otherwise a shortened message with a
+        /// marker that tells admins the stack was truncated.
+        /// </returns>
+        /// <remarks>
+        /// Telegram rejects text messages above its size limit with <c>message is too long</c>. Logger failures must
+        /// never create a second noisy exception while the bot is already handling another failure.
+        /// </remarks>
+        private static string TruncateForTelegramLog(string message)
+        {
+            if (string.IsNullOrEmpty(message) || message.Length <= MaxTelegramLogMessageLength)
+                return message ?? string.Empty;
+
+            return message[..MaxTelegramLogMessageLength] + "\n...[log truncated for Telegram]";
         }
 
         private ITelegramBotClient CurrentBotClient => _botClientProvider.GetClient(CurrentBotConfig?.Id);

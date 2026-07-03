@@ -1,0 +1,40 @@
+info:
+  name: Create
+  type: http
+  seq: 1
+
+http:
+  method: POST
+  url: https://api.gozargah.network/api.php
+  headers:
+    - name: Authorization
+      value: Bearer 6$^BeDTW%eLC9v3jblVrDVp3bWtTDaka+ueidv6$BDM=
+    - name: Content-Type
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+          "action": "create_order",
+          "plan_id": 2,
+          "inbound": "166, 188, 189",
+          "arranged_plan_id": 0,
+          "name": "79cdwctaor",
+          "uuid": "4b6b209c-b260-4aca-af84-edcb21dd6d64",
+          "comment": "Created from API",
+          "price": "120000",
+          "volume": "7",
+          "date": 30,
+          "username": "sar88",
+          "tracking_code": "TRK-123456asfasfa",
+          "sub": "https://sub.vnetiran.com/blog/bgc9m8cub0b8chc0",
+          "trial": 0,
+          "bot": 1
+        }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

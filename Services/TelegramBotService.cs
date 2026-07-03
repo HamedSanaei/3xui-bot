@@ -51,6 +51,7 @@ public class TelegramBotService : IHostedService
     private readonly UserActivityLogService _userActivityLog;
     private readonly WalletLedgerService _walletLedgerService;
     private readonly OwnedBotNotificationService _ownedBotNotificationService;
+    private readonly GozargahSiteApiClient _gozargahSiteApiClient;
     private readonly BotContextAccessor _botContextAccessor;
     private ITelegramBotClient ActiveBotClient => _botContextAccessor.Current?.Client ?? _botClient;
     private BotInstanceConfig CurrentBot => _botContextAccessor.Current?.Config;
@@ -85,6 +86,7 @@ public class TelegramBotService : IHostedService
     /// <param name="xuiV3AdminFlowService">Super-admin XuiV3 management flow.</param>
     /// <param name="tenantBotService">Tenant storefront owner and customer flow service.</param>
     /// <param name="userActivityLog">File-based user activity logger.</param>
+    /// <param name="gozargahSiteApiClient">Gozargah website API client used to show colleague site wallet status.</param>
     /// <param name="botContextAccessor">Async-local current bot context accessor.</param>
     public TelegramBotService(
         ITelegramBotClient botClient,
@@ -105,6 +107,7 @@ public class TelegramBotService : IHostedService
         UserActivityLogService userActivityLog,
         WalletLedgerService walletLedgerService,
         OwnedBotNotificationService ownedBotNotificationService,
+        GozargahSiteApiClient gozargahSiteApiClient,
         BotContextAccessor botContextAccessor)
     {
         _botClient = botClient;
@@ -126,6 +129,7 @@ public class TelegramBotService : IHostedService
         _userActivityLog = userActivityLog;
         _walletLedgerService = walletLedgerService;
         _ownedBotNotificationService = ownedBotNotificationService;
+        _gozargahSiteApiClient = gozargahSiteApiClient;
         _botContextAccessor = botContextAccessor;
     }
 
@@ -197,11 +201,17 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
-    /// Wraps core update handling with activity-log error capture.
+    /// Wraps core update handling with activity-log error capture and non-fatal delivery handling.
     /// </summary>
     /// <param name="botClient">Telegram client that should answer the update.</param>
     /// <param name="update">Telegram update being processed.</param>
     /// <param name="cancellationToken">Cancellation token from polling.</param>
+    /// <remarks>
+    /// Telegram can throw per-user delivery errors when a customer blocks an owned bot, tenant bot, or assistant bot.
+    /// It can also raise transient request timeouts while sending a reply. Those errors are logged as skipped
+    /// deliveries and are not rethrown, so the polling loop does not treat one unreachable chat or one slow Telegram
+    /// request as a receiver failure. All other exceptions are still logged and rethrown for the polling error pipeline.
+    /// </remarks>
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
         try
@@ -211,6 +221,54 @@ public class TelegramBotService : IHostedService
         catch (Exception ex)
         {
             var credUser = GetCreduserFromUpdate(update);
+            if (IsUserDeliveryPollingError(ex))
+            {
+                await _userActivityLog.LogWarningAsync(
+                    "handle_update_delivery_skipped",
+                    credUser,
+                    IsSuperAdminUser(credUser?.TelegramUserId ?? 0),
+                    new Dictionary<string, object>
+                    {
+                        ["updateType"] = update?.Type.ToString() ?? "unknown",
+                        ["telegramError"] = ex.Message ?? string.Empty,
+                        ["botId"] = BotContextAccessor.CurrentBotId ?? string.Empty
+                    },
+                    cancellationToken);
+
+                _logger.LogWarning(
+                    "Telegram update delivery skipped because the chat is unreachable. botId={BotId}, userId={UserId}, chatId={ChatId}, telegramError={TelegramError}",
+                    BotContextAccessor.CurrentBotId,
+                    credUser?.TelegramUserId,
+                    update?.Message?.Chat.Id ?? update?.CallbackQuery?.Message?.Chat.Id,
+                    ex.Message);
+                return;
+            }
+
+            if (IsExternalOperationTimeout(ex, cancellationToken))
+            {
+                await _userActivityLog.LogWarningAsync(
+                    "handle_update_external_timeout",
+                    credUser,
+                    IsSuperAdminUser(credUser?.TelegramUserId ?? 0),
+                    new Dictionary<string, object>
+                    {
+                        ["updateType"] = update?.Type.ToString() ?? "unknown",
+                        ["timeoutError"] = ex.Message ?? string.Empty,
+                        ["botId"] = BotContextAccessor.CurrentBotId ?? string.Empty
+                    },
+                    cancellationToken);
+
+                _logger.LogWarning(
+                    ex,
+                    "Telegram update external operation timed out. botId={BotId}, userId={UserId}, chatId={ChatId}",
+                    BotContextAccessor.CurrentBotId,
+                    credUser?.TelegramUserId,
+                    update?.Message?.Chat.Id ?? update?.CallbackQuery?.Message?.Chat.Id);
+
+                await SendBestEffortTimeoutMessageAsync(botClient, update, cancellationToken);
+                return;
+            }
+
             await _userActivityLog.LogErrorAsync(
                 "handle_update_failed",
                 ex,
@@ -3602,6 +3660,7 @@ public class TelegramBotService : IHostedService
             "✉️ Send message to user",
             "ℹ️ See All account of user",
             "🗑 Delete expired accounts",
+            "Sync Gozargah Site",
             "✔️ Verify payment",
             "📑 Menu"
         };
@@ -3760,7 +3819,8 @@ public class TelegramBotService : IHostedService
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
         var user = await _userDbContext.GetUserStatus(message.From.Id);
 
-        var isJoined = await isJoinedToChannel(CurrentChannelIds.Select(c => c.Replace("https://t.me/", "@")), message.From.Id);
+        var mandatoryJoinChannels = BuildMandatoryJoinChannels(CurrentChannelIds);
+        var isJoined = await isJoinedToChannel(mandatoryJoinChannels.Select(c => c.ChatId), message.From.Id);
         // var isJoined = false;
         if (!isJoined)
         {
@@ -3771,20 +3831,27 @@ public class TelegramBotService : IHostedService
             {
                 ResizeKeyboard = false
             };
-            string toRemove = "https://t.me/";
             List<InlineKeyboardButton[]> rows = new List<InlineKeyboardButton[]>();
-            foreach (var url in CurrentChannelIds)
+            foreach (var channel in mandatoryJoinChannels.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
             {
-                rows.Add(new[] { InlineKeyboardButton.WithUrl(url.Replace(toRemove, ""), url) });
+                rows.Add(new[] { InlineKeyboardButton.WithUrl(channel.Label, channel.Url) });
             }
 
-            InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows.ToArray());
-
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await botClient.CustomSendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: "به کانال(های) زیر بپیوندید و روی استارت کلیک کنید. \n" + "/start",
-                replyMarkup: inlineKeyboard);
+            if (rows.Count > 0)
+            {
+                InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows.ToArray());
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "به کانال(های) زیر بپیوندید و روی استارت کلیک کنید. \n" + "/start",
+                    replyMarkup: inlineKeyboard);
+            }
+            else
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "برای استفاده از ربات باید عضو کانال‌های معرفی‌شده شوید، اما لینک قابل نمایش برای کانال‌ها تنظیم نشده است. لطفاً به پشتیبانی پیام بدهید.");
+            }
 
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -3930,6 +3997,16 @@ public class TelegramBotService : IHostedService
         {
             return;
         }
+        else if (await _xuiV3BotFlowService.TryHandleFreeTrialAsync(
+            botClient,
+            message,
+            credUser,
+            user,
+            MainReplyMarkupKeyboardFa(),
+            cancellationToken))
+        {
+            return;
+        }
         else if (await _xuiV3BotFlowService.TryHandlePurchaseTextAsync(
             botClient,
             message,
@@ -3941,16 +4018,6 @@ public class TelegramBotService : IHostedService
             return;
         }
         else if (await _xuiV3BotFlowService.TryHandleRenewAsync(
-            botClient,
-            message,
-            credUser,
-            user,
-            MainReplyMarkupKeyboardFa(),
-            cancellationToken))
-        {
-            return;
-        }
-        else if (await _xuiV3BotFlowService.TryHandleFreeTrialAsync(
             botClient,
             message,
             credUser,
@@ -5439,12 +5506,105 @@ public class TelegramBotService : IHostedService
         await _userDbContext.ClearUserStatus(user);
 
     }
+    /// <summary>
+    /// Normalizes configured mandatory-join channel values for Telegram membership checks and join buttons.
+    /// </summary>
+    /// <param name="channelIds">
+    /// Channel identifiers from the current bot configuration. Each item may be a bare username, an <c>@username</c>,
+    /// a <c>https://t.me/...</c> link, or a numeric Telegram channel id.
+    /// </param>
+    /// <returns>
+    /// A list of normalized channel descriptors. <c>ChatId</c> is safe to pass to <c>GetChatMember</c>; <c>Url</c>
+    /// is safe to use in an inline URL button when the source value can be represented as a public Telegram link.
+    /// </returns>
+    /// <remarks>
+    /// The old mandatory-join path prepended <c>@</c> after a simple URL replacement, which could produce invalid
+    /// values such as <c>@@channel</c>. This helper keeps membership checks and button URLs consistent for every
+    /// owned bot, including bot-specific channel settings restored from the database.
+    /// </remarks>
+    private static IReadOnlyList<(string ChatId, string Url, string Label)> BuildMandatoryJoinChannels(IEnumerable<string> channelIds)
+    {
+        return (channelIds ?? Enumerable.Empty<string>())
+            .Select(NormalizeMandatoryJoinChannel)
+            .Where(channel => !string.IsNullOrWhiteSpace(channel.ChatId))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Converts one mandatory-join channel setting into Telegram API and button-safe values.
+    /// </summary>
+    /// <param name="channelId">
+    /// Raw channel value from configuration or the current bot database record. The value is optional; blank values
+    /// return an empty descriptor and are ignored by the caller.
+    /// </param>
+    /// <returns>
+    /// A normalized tuple containing the Telegram chat id for membership checks, a public URL when one can be built,
+    /// and a readable label for the inline join button.
+    /// </returns>
+    /// <remarks>
+    /// Public channel usernames are represented as <c>@username</c> for the Bot API and <c>https://t.me/username</c>
+    /// for user-facing buttons. Numeric private channel ids can be checked by Telegram but cannot automatically be
+    /// converted into a public join link.
+    /// </remarks>
+    private static (string ChatId, string Url, string Label) NormalizeMandatoryJoinChannel(string channelId)
+    {
+        var value = (channelId ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return (string.Empty, string.Empty, string.Empty);
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+            (string.Equals(uri.Host, "t.me", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(uri.Host, "telegram.me", StringComparison.OrdinalIgnoreCase)))
+        {
+            value = uri.AbsolutePath.Trim('/');
+        }
+
+        value = value.Trim().TrimStart('/');
+        if (value.Contains('?'))
+            value = value[..value.IndexOf('?')];
+
+        value = value.TrimStart('@');
+        if (string.IsNullOrWhiteSpace(value))
+            return (string.Empty, string.Empty, string.Empty);
+
+        if (long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+            return (value, string.Empty, value);
+
+        var chatId = "@" + value;
+        return (chatId, $"https://t.me/{value}", chatId);
+    }
+
+    /// <summary>
+    /// Checks whether a Telegram user is a member of all mandatory channels for the active bot.
+    /// </summary>
+    /// <param name="channelIDs">
+    /// Normalized Telegram chat identifiers for mandatory channels. Values should come from
+    /// <see cref="BuildMandatoryJoinChannels(IEnumerable&lt;string&gt;)"/> so usernames are not double-prefixed with <c>@</c>.
+    /// </param>
+    /// <param name="userId">
+    /// Numeric Telegram user id from the incoming update sender. This is the account whose channel membership is checked.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> only when the user is visible as a non-left, non-kicked member of every configured mandatory channel;
+    /// <c>false</c> when the user is missing from at least one channel or when the active bot cannot verify membership.
+    /// </returns>
+    /// <remarks>
+    /// Telegram may return <c>chat not found</c> or <c>member list is inaccessible</c> when the bot is not added to the
+    /// channel or lacks the required channel access. The method fails closed in that case so users cannot bypass the
+    /// mandatory-join gate because of a bad channel setting.
+    /// </remarks>
     private async Task<bool> isJoinedToChannel(IEnumerable<string> channelIDs, long userId)
     {
         bool isJoined = true;
 
         foreach (var c in channelIDs)
         {
+            if (string.IsNullOrWhiteSpace(c))
+            {
+                isJoined = false;
+                continue;
+            }
+
             try
             {
                 var chatMember = await ActiveBotClient.GetChatMemberAsync(c, userId);
@@ -5461,9 +5621,10 @@ public class TelegramBotService : IHostedService
             }
             catch (ApiRequestException ex) when (IsMandatoryJoinChannelAccessError(ex))
             {
+                isJoined = false;
                 _logger.LogWarning(
                     ex,
-                    "Mandatory join check skipped because the current bot cannot access channel members. BotId={BotId}, BotUsername={BotUsername}, Channel={Channel}, UserId={UserId}",
+                    "Mandatory join check failed closed because the current bot cannot access channel members. BotId={BotId}, BotUsername={BotUsername}, Channel={Channel}, UserId={UserId}",
                     BotContextAccessor.CurrentBotId,
                     BotContextAccessor.CurrentBotUsername,
                     c,
@@ -5475,6 +5636,17 @@ public class TelegramBotService : IHostedService
 
     }
 
+    /// <summary>
+    /// Detects Telegram Bot API errors that mean the bot could not verify mandatory channel membership.
+    /// </summary>
+    /// <param name="ex">Telegram API exception thrown by <c>GetChatMember</c>; may be <c>null</c>.</param>
+    /// <returns>
+    /// <c>true</c> when the error is one of Telegram's known inaccessible-channel responses; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Callers use this only to choose the safe failure path for mandatory join. The error is still logged by the
+    /// membership checker because it usually means the bot must be added to the channel or promoted.
+    /// </remarks>
     private static bool IsMandatoryJoinChannelAccessError(ApiRequestException ex)
     {
         var message = ex?.Message ?? string.Empty;
@@ -5633,6 +5805,18 @@ public class TelegramBotService : IHostedService
         }
     }
 
+    /// <summary>
+    /// Handles Telegram polling errors without allowing logging failures to stop bot receivers.
+    /// </summary>
+    /// <param name="botClient">Telegram client whose polling loop reported the error.</param>
+    /// <param name="exception">Exception raised by Telegram polling or by an update handler.</param>
+    /// <param name="cancellationToken">Polling cancellation token supplied by Telegram.Bot.</param>
+    /// <returns>A task that completes after best-effort logging.</returns>
+    /// <remarks>
+    /// The Telegram polling library routes unhandled update-handler exceptions here. Per-user delivery errors,
+    /// such as a customer blocking an owned or tenant bot, are warning-level events and must not crash the
+    /// process. The method catches its own logging failures so the error callback remains non-throwing.
+    /// </remarks>
     public async Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
     {
         var ErrorMessage = exception switch
@@ -5642,18 +5826,156 @@ public class TelegramBotService : IHostedService
             _ => exception.ToString()
         };
 
-        await _userActivityLog.LogErrorAsync(
-            "telegram_polling_error",
-            exception,
-            null,
-            false,
-            new Dictionary<string, object>
+        try
+        {
+            if (IsUserDeliveryPollingError(exception))
             {
-                ["source"] = "Telegram polling"
-            },
-            cancellationToken);
+                await _userActivityLog.LogWarningAsync(
+                    "telegram_polling_delivery_skipped",
+                    null,
+                    false,
+                    new Dictionary<string, object>
+                    {
+                        ["source"] = "Telegram polling",
+                        ["telegramError"] = exception.Message ?? string.Empty
+                    },
+                    cancellationToken);
+            }
+            else
+            {
+                await _userActivityLog.LogErrorAsync(
+                    "telegram_polling_error",
+                    exception,
+                    null,
+                    false,
+                    new Dictionary<string, object>
+                    {
+                        ["source"] = "Telegram polling"
+                    },
+                    cancellationToken);
+            }
+        }
+        catch (Exception logException)
+        {
+            _logger.LogError(
+                logException,
+                "Failed to write Telegram polling error activity log. originalError={OriginalError}",
+                exception.Message);
+        }
 
-        Console.WriteLine(ErrorMessage);
+        var isDeliveryError = IsUserDeliveryPollingError(exception);
+        if (isDeliveryError)
+            _logger.LogWarning("Telegram polling delivery error ignored. {ErrorMessage}", ErrorMessage);
+        else
+            _logger.LogError(exception, "Telegram polling error. {ErrorMessage}", ErrorMessage);
+
+        Console.WriteLine(isDeliveryError ? $"Telegram delivery skipped: {exception.Message}" : ErrorMessage);
+    }
+
+    /// <summary>
+    /// Detects Telegram polling errors caused by one unreachable user chat or one transient Telegram send timeout.
+    /// </summary>
+    /// <param name="exception">Exception raised by Telegram polling or update handling.</param>
+    /// <returns>
+    /// <c>true</c> when the error is a non-fatal blocked-user, deactivated-user, forbidden, chat-not-found, or
+    /// Telegram request-timeout response; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// These errors are expected when users block an owned bot, a tenant bot, or the sales assistant, and when
+    /// Telegram times out while the bot is sending a non-critical reply. They should be visible in logs but must not
+    /// be treated like infrastructure failures.
+    /// </remarks>
+    private static bool IsUserDeliveryPollingError(Exception exception)
+    {
+        if (exception is RequestException requestException)
+        {
+            var requestMessage = requestException.Message ?? string.Empty;
+            return requestMessage.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
+                   requestMessage.Contains("timed out", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (exception is not ApiRequestException apiException)
+            return false;
+
+        var message = apiException.Message ?? string.Empty;
+        return apiException.ErrorCode == 403 ||
+               message.Contains("bot was blocked", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("user is deactivated", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("chat not found", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("forbidden", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Detects non-shutdown HTTP timeouts from external systems used while handling a Telegram update.
+    /// </summary>
+    /// <param name="exception">
+    /// Exception caught by the update wrapper. This is commonly a <see cref="TaskCanceledException"/> from
+    /// <see cref="HttpClient"/> when the XUI panel or another external API exceeds its configured timeout.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Polling cancellation token from Telegram.Bot. When this token is cancelled, the timeout belongs to shutdown
+    /// and must not be swallowed as a recoverable business failure.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the exception represents a transient external timeout that should be logged and handled
+    /// without stopping the receiver; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Gozargah and other owned bots can hit slow 3x-ui panels. Those timeouts should produce a user-facing retry
+    /// message, not a polling failure that is later attributed to the wrong bot.
+    /// </remarks>
+    private static bool IsExternalOperationTimeout(Exception exception, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+            return false;
+
+        if (exception is TimeoutException)
+            return true;
+
+        if (exception is TaskCanceledException)
+            return true;
+
+        var message = exception?.Message ?? string.Empty;
+        return message.Contains("HttpClient.Timeout", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("timed out", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Sends a short best-effort timeout notice to the Telegram chat that triggered the update.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the active owned or tenant bot.</param>
+    /// <param name="update">Update whose message or callback chat should receive the notice.</param>
+    /// <param name="cancellationToken">Polling cancellation token for the Telegram send attempt.</param>
+    /// <returns>A task that completes after the notification is sent or skipped.</returns>
+    /// <remarks>
+    /// This method intentionally swallows Telegram delivery failures. It is already running inside an exception
+    /// handler, so a blocked user or another send timeout must not create a second polling error.
+    /// </remarks>
+    private async Task SendBestEffortTimeoutMessageAsync(
+        ITelegramBotClient botClient,
+        Update update,
+        CancellationToken cancellationToken)
+    {
+        var chatId = update?.Message?.Chat.Id ?? update?.CallbackQuery?.Message?.Chat.Id;
+        if (!chatId.HasValue)
+            return;
+
+        try
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId.Value,
+                text: "ارتباط با پنل یا تلگرام بیش از حد طول کشید. لطفاً چند دقیقه دیگر دوباره تلاش کنید.",
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex) when (IsUserDeliveryPollingError(ex) || IsExternalOperationTimeout(ex, cancellationToken))
+        {
+            _logger.LogWarning(
+                "Skipped timeout notification because Telegram could not deliver it. botId={BotId}, chatId={ChatId}, telegramError={TelegramError}",
+                BotContextAccessor.CurrentBotId,
+                chatId.Value,
+                ex.Message);
+        }
     }
 
     async Task<string> GetUserProfileMessage(CredUser credUser)
@@ -5668,6 +5990,7 @@ public class TelegramBotService : IHostedService
         text += $"‌💰اعتبار حساب: {_credUser.AccountBalance.FormatCurrency()}\n";
         if (_credUser.IsColleague)
         {
+            text += await BuildGozargahSiteWalletStatusLineAsync(_credUser.TelegramUserId);
             text += $"‌🧰 نوع: اکانت شما از نوع همکار 💎می‌باشد. \n";
         }
         else
@@ -5675,6 +5998,41 @@ public class TelegramBotService : IHostedService
             text += "‌🧰 نوع: اکانت شما از نوع کاربر عادی می‌باشد. \n";
         }
         return text.EscapeMarkdown();
+    }
+
+    /// <summary>
+    /// Builds the optional Gozargah website wallet line shown in colleague account status messages.
+    /// </summary>
+    /// <param name="telegramUserId">
+    /// Numeric Telegram user id of the colleague. The Gozargah website API uses the same id to find the linked website user.
+    /// </param>
+    /// <returns>
+    /// A human-readable status line containing the website wallet balance, ban status, or a short unavailable message.
+    /// The returned text is not escaped; <see cref="GetUserProfileMessage(CredUser)"/> escapes the full profile message.
+    /// </returns>
+    /// <remarks>
+    /// This method is display-only. It never debits either wallet and never blocks the owned-bot status flow if the
+    /// website API is unavailable.
+    /// </remarks>
+    private async Task<string> BuildGozargahSiteWalletStatusLineAsync(long telegramUserId)
+    {
+        if (_gozargahSiteApiClient == null || !_gozargahSiteApiClient.IsConfigured())
+            return string.Empty;
+
+        try
+        {
+            var siteUser = await _gozargahSiteApiClient.GetUserAsync(telegramUserId);
+            if (!siteUser.Success || siteUser.Data == null)
+                return $"🌐 موجودی سایت گذرگاه: در دسترس نیست ({siteUser.Message ?? "کاربر پیدا نشد"})\n";
+
+            var banText = siteUser.Data.IsBanned ? " - مسدود در سایت" : string.Empty;
+            return $"🌐 موجودی سایت گذرگاه: {siteUser.Data.Wallet.FormatCurrency()}{banText}\n";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load Gozargah site wallet for colleague profile. userId={TelegramUserId}", telegramUserId);
+            return "🌐 موجودی سایت گذرگاه: خطا در دریافت اطلاعات سایت\n";
+        }
     }
 
     private static string BuildPlainBalanceDeductionText(long beforeBalance, long deductedAmount, long afterBalance)

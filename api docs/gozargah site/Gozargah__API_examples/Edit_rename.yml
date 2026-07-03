@@ -1,0 +1,30 @@
+info:
+  name: Edit_rename
+  type: http
+  seq: 3
+
+http:
+  method: POST
+  url: https://api.gozargah.network/api.php
+  headers:
+    - name: Authorization
+      value: Bearer 6$^BeDTW%eLC9v3jblVrDVp3bWtTDaka+ueidv6$BDM=
+    - name: Content-Type
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "action": "update_order",
+        "name": "79cdwctaor",
+        "new_name": "79cdwctaorDASDSFASFS",
+        "uuid": "30d5ba32-86c9-49d0-aa07-4d31110fa316",
+        "sub": "https://sub.vnetiran.com/blog/juvc3vokh3b0jvf5"
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

@@ -26,6 +26,9 @@ public class TenantBotService
     private const string OWNERCALLBACKPREFIX = "TBM:";
     private const string CUSTOMERCALLBACKPREFIX = "TN:";
     private const string OWNERFLOW = "TENANTBOT-owner";
+    private const string TENANTPURCHASEFLOW = "TENANTBOT-purchase";
+    private const string TENANTPURCHASESTEPTRAFFIC = "purchase-traffic";
+    private const string TENANTPURCHASESTEPDURATION = "purchase-duration";
     private const string STEPTOKEN = "Token";
     private const string STEPMARKUP = "markup";
     private const string STEPSUPPORT = "support";
@@ -57,6 +60,8 @@ public class TenantBotService
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
     private readonly WalletLedgerService _walletLedgerService;
     private readonly SalesAssistantService _salesAssistantService;
+    private readonly GozargahSiteSyncService _gozargahSiteSyncService;
+    private readonly BroadcastManager _broadcastManager;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TenantBotService> _logger;
 
@@ -82,6 +87,14 @@ public class TenantBotService
     /// <param name="SalesAssistantService">
     /// Sales Assistant notifier that sends tenant sale and receipt-review events to the colleague owner.
     /// </param>
+    /// <param name="GozargahSiteSyncService">
+    /// Site sync service used after successful tenant XUI operations. Tenant records are owned by the
+    /// colleague owner on the website while preserving the buyer Telegram id for audit and customer support.
+    /// </param>
+    /// <param name="BroadcastManager">
+    /// Shared broadcast queue used for tenant public messages. Tenant broadcasts use the tenant bot as the
+    /// sender, but keep progress/status updates in the owned bot chat that started the job.
+    /// </param>
     /// <param name="ServiceProvider">service Provider used to REACH MultiBotHostedService for runtime TOGGLE.</param>
     /// <param name="Logger">Logger used for tenant payment/audit channel logs.</param>
     public TenantBotService(
@@ -97,6 +110,8 @@ public class TenantBotService
         XuiV3BotFlowService xuiV3BotFlowService,
         WalletLedgerService WalletLedgerService,
         SalesAssistantService SalesAssistantService,
+        GozargahSiteSyncService GozargahSiteSyncService,
+        BroadcastManager BroadcastManager,
         IServiceProvider ServiceProvider,
         ILogger<TenantBotService> Logger)
     {
@@ -113,6 +128,8 @@ public class TenantBotService
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _walletLedgerService = WalletLedgerService;
         _salesAssistantService = SalesAssistantService;
+        _gozargahSiteSyncService = GozargahSiteSyncService;
+        _broadcastManager = BroadcastManager;
         _serviceProvider = ServiceProvider;
         _logger = Logger;
     }
@@ -449,6 +466,10 @@ public class TenantBotService
         // tenant bots expose A SMALL storefront only; they should not FALL through to the Main Bot Menu.
         if (update.CallbackQuery is { } CallbackQuery)
         {
+            var tenant = await GetCurrentTenantBotAsync(CancellationToken);
+            if (tenant != null)
+                await TouchTenantCustomerStateAsync(tenant, CallbackQuery.From.Id, CancellationToken);
+
             if (IsCustomerCallback(CallbackQuery.Data))
             {
                 await HANDLECUSTOMERCALLBACKASYNC(botClient, CallbackQuery, CredUser, User, CancellationToken);
@@ -471,8 +492,52 @@ public class TenantBotService
         if (update.Message is not { } Message || Message.From == null)
             return true;
 
+        var messageTenant = await GetCurrentTenantBotAsync(CancellationToken);
+        if (messageTenant != null)
+            await TouchTenantCustomerStateAsync(messageTenant, Message.From.Id, CancellationToken);
+
         await HANDLECUSTOMERMESSAGEASYNC(botClient, Message, CredUser, User, CancellationToken);
         return true;
+    }
+
+    /// <summary>
+    /// Ensures a tenant customer has a bot-scoped state row so tenant broadcasts can target everyone who started the storefront.
+    /// </summary>
+    /// <param name="tenant">
+    /// Tenant bot that received the Telegram update. The tenant id is the local runtime id, not the Telegram bot id.
+    /// </param>
+    /// <param name="telegramUserId">
+    /// Numeric Telegram user id from the incoming message or callback sender. This value is tenant-scoped with
+    /// <paramref name="tenant"/> and is used as the broadcast audience key.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Token used to cancel the users.db lookup and write when the update receiver is shutting down.
+    /// </param>
+    /// <returns>A task that completes after the state row has been inserted or touched.</returns>
+    /// <remarks>
+    /// This method deliberately does not call <see cref="UserDbContext.SaveUserStatus(User)"/> because that
+    /// method applies partial legacy flow updates. Broadcast audience tracking must not overwrite purchase,
+    /// renewal, receipt-upload, or comment-change state; it only creates a missing row or updates the timestamp.
+    /// </remarks>
+    private async Task TouchTenantCustomerStateAsync(BotInstance tenant, long telegramUserId, CancellationToken cancellationToken)
+    {
+        if (tenant == null || string.IsNullOrWhiteSpace(tenant.Id) || telegramUserId <= 0)
+            return;
+
+        var existing = await _userDbcontext.BotUserStates.FirstOrDefaultAsync(
+            x => x.BotId == tenant.Id && x.TelegramUserId == telegramUserId,
+            cancellationToken);
+
+        if (existing == null)
+        {
+            _userDbcontext.BotUserStates.Add(BotUserState.FromUser(tenant.Id, new User { Id = telegramUserId }));
+        }
+        else
+        {
+            existing.UpdatedAtUtc = DateTime.UtcNow;
+        }
+
+        await _userDbcontext.SaveChangesAsync(cancellationToken);
     }
 
     /// <summary>
@@ -603,29 +668,26 @@ public class TenantBotService
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData("📊 آمار روزانه", OWNERCALLBACKPREFIX + "stats")
-            },
-            new[]
-            {
+                InlineKeyboardButton.WithCallbackData("📊 آمار روزانه", OWNERCALLBACKPREFIX + "stats"),
                 InlineKeyboardButton.WithCallbackData("📒 تراکنش‌ها", OWNERCALLBACKPREFIX + "ledger"),
-                InlineKeyboardButton.WithCallbackData("💸 تسویه حساب", OWNERCALLBACKPREFIX + "settlement")
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData("📘 راهنمای پنل همکاری", OWNERCALLBACKPREFIX + "guide"),
-                InlineKeyboardButton.WithCallbackData("🧪 تست دستیار فروش", OWNERCALLBACKPREFIX + "assistant-test")
+                InlineKeyboardButton.WithCallbackData("💸 تسویه حساب", OWNERCALLBACKPREFIX + "settlement"),
+                InlineKeyboardButton.WithCallbackData("📘 راهنمای پنل همکاری", OWNERCALLBACKPREFIX + "guide")
             },
             new[]
             {
+                InlineKeyboardButton.WithCallbackData("🧪 تست دستیار فروش", OWNERCALLBACKPREFIX + "assistant-test"),
                 InlineKeyboardButton.WithCallbackData("✅ تایید دستی کارت‌به‌کارت", OWNERCALLBACKPREFIX + "manual-card-confirm")
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData(IsEnabled ? "⛔ خاموش کردن فروشگاه" : "✅ روشن کردن فروشگاه", OWNERCALLBACKPREFIX + "TOGGLE")
+                InlineKeyboardButton.WithCallbackData("🔄 بروزرسانی", OWNERCALLBACKPREFIX + "panel")
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData("🔄 بروزرسانی", OWNERCALLBACKPREFIX + "panel")
+                InlineKeyboardButton.WithCallbackData(IsEnabled ? "⛔ خاموش کردن فروشگاه" : "✅ روشن کردن فروشگاه", OWNERCALLBACKPREFIX + "TOGGLE")
             }
         });
     }
@@ -688,7 +750,7 @@ public class TenantBotService
         var tenant = await GETTENANTBOTBYOWNERASYNC(CallbackQuery.From.Id, CancellationToken);
         var currentSupport = string.IsNullOrWhiteSpace(tenant?.SupportAccount)
             ? "ثبت نشده"
-            : tenant.SupportAccount;
+            : NormalizeTenantSupportAccount(tenant.SupportAccount) ?? tenant.SupportAccount;
 
         var PROMPT = step switch
         {
@@ -769,15 +831,19 @@ public class TenantBotService
             return;
         }
 
-        var duplicate = await _userDbcontext.BotInstances.FirstOrDefaultAsync(
-            x => x.Username == Username && x.OwnerTelegramUserId != owner.TelegramUserId,
-            CancellationToken);
-        if (duplicate != null)
+        var duplicate = await FindTenantTokenConflictAsync(Token, Username, owner.TelegramUserId, CancellationToken);
+        if (duplicate.HasConflict)
         {
             await botClient.SendTextMessageAsync(
                 Message.Chat.Id,
-                "این ربات قبلاً برای کاربر دیگری ثبت شده است.",
+                "این توکن/ربات در حال حاضر برای اکانت یا ربات دیگری استفاده می‌شود. لطفاً توکن دیگری وارد کنید.",
                 cancellationToken: CancellationToken);
+            _logger.LogWarning(
+                "Rejected duplicate tenant bot token. owner={OwnerTelegramUserId}, conflict={ConflictType}, botId={TokenBotId}, username=@{Username}",
+                owner.TelegramUserId,
+                duplicate.ConflictType,
+                TelegramBotTokenIdentity.ExtractBotId(Token),
+                Username);
             return;
         }
 
@@ -805,6 +871,75 @@ public class TenantBotService
             parseMode: ParseMode.Html,
             cancellationToken: CancellationToken);
         await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
+    }
+
+    /// <summary>
+    /// Checks whether a validated tenant bot token or username is already owned by another runtime bot.
+    /// </summary>
+    /// <param name="token">
+    /// Trimmed BotFather token entered by the colleague. The token is compared in memory only and must never be
+    /// written to Telegram messages or operational logs.
+    /// </param>
+    /// <param name="username">
+    /// Username returned by Telegram <c>GetMe</c> for the entered token, without a required leading <c>@</c>.
+    /// </param>
+    /// <param name="ownerTelegramUserId">
+    /// Numeric Telegram user id of the colleague who is saving the token. That owner's existing tenant bot is
+    /// excluded so the owner can re-save or rotate their own token.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Token used to cancel the users.db query when the update handler stops.
+    /// </param>
+    /// <returns>
+    /// A conflict descriptor. <see cref="TenantTokenConflictResult.HasConflict" /> is <c>true</c> when the token,
+    /// token bot id, or username belongs to another tenant owner or to a configured non-tenant bot.
+    /// </returns>
+    /// <remarks>
+    /// This guard runs after Telegram has accepted the token with <c>GetMe</c>. It prevents two tenant owners from
+    /// receiving updates through the same bot and prevents a tenant storefront from reusing an owned bot token.
+    /// </remarks>
+    private async Task<TenantTokenConflictResult> FindTenantTokenConflictAsync(
+        string token,
+        string username,
+        long ownerTelegramUserId,
+        CancellationToken cancellationToken)
+    {
+        var normalizedUsername = TelegramBotTokenIdentity.NormalizeUsername(username);
+        var tenants = await _userDbcontext.BotInstances
+            .Where(x => x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId != ownerTelegramUserId)
+            .ToListAsync(cancellationToken);
+
+        foreach (var tenant in tenants)
+        {
+            if (TelegramBotTokenIdentity.IsSameBotToken(token, tenant.Token))
+                return TenantTokenConflictResult.Conflict("tenant-token");
+
+            if (!string.IsNullOrWhiteSpace(normalizedUsername) &&
+                string.Equals(
+                    normalizedUsername,
+                    TelegramBotTokenIdentity.NormalizeUsername(tenant.Username),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return TenantTokenConflictResult.Conflict("tenant-username");
+            }
+        }
+
+        foreach (var bot in _botRegistry.Bots.Where(x => !string.Equals(x.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase)))
+        {
+            if (TelegramBotTokenIdentity.IsSameBotToken(token, bot.Token))
+                return TenantTokenConflictResult.Conflict("owned-token");
+
+            if (!string.IsNullOrWhiteSpace(normalizedUsername) &&
+                string.Equals(
+                    normalizedUsername,
+                    TelegramBotTokenIdentity.NormalizeUsername(bot.Username),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return TenantTokenConflictResult.Conflict("owned-username");
+            }
+        }
+
+        return TenantTokenConflictResult.None;
     }
 
     /// <summary>
@@ -850,21 +985,22 @@ public class TenantBotService
     /// Token used to cancel database persistence and Telegram replies.
     /// </param>
     /// <remarks>
-    /// The value is normalized to include one leading <c>@</c> and is stored on
+    /// The value is normalized to a public Telegram username with one leading <c>@</c> and is stored on
     /// <see cref="BotInstance.SupportAccount"/>. The setting is tenant-scoped and is shown only in that
-    /// colleague's storefront support flow.
+    /// colleague's storefront support flow. Public <c>t.me</c> links are converted to their username segment
+    /// so customers never see values like <c>@https://t.me/name</c>.
     /// </remarks>
     private async Task SAVETENANTSUPPORTASYNC(ITelegramBotClient botClient, Message Message, CredUser owner, CancellationToken CancellationToken)
     {
-        var support = Message.Text?.Trim();
+        var support = NormalizeTenantSupportAccount(Message.Text);
         if (string.IsNullOrWhiteSpace(support))
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "مقدار پشتیبانی نمی‌تواند خالی باشد.", cancellationToken: CancellationToken);
+            await botClient.SendTextMessageAsync(Message.Chat.Id, "آیدی پشتیبانی معتبر نیست. لطفاً یوزرنیم عمومی تلگرام مثل @SUPPORT_USERNAME یا لینک t.me را ارسال کنید.", cancellationToken: CancellationToken);
             return;
         }
 
         var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
-        tenant.SupportAccount = support.StartsWith("@", StringComparison.Ordinal) ? support : "@" + support.TrimStart('@');
+        tenant.SupportAccount = support;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _userDbcontext.SaveChangesAsync(CancellationToken);
         await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
@@ -1465,7 +1601,8 @@ public class TenantBotService
         if (tenant == null)
             return;
 
-        var audienceCount = await _userDbcontext.BotUserStates.CountAsync(x => x.BotId == tenant.Id, cancellationToken);
+        var recipients = await GetTenantBroadcastRecipientsAsync(tenant, cancellationToken);
+        var audienceCount = recipients.Count;
         var draft = message.Text?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(draft))
         {
@@ -1499,13 +1636,20 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Sends a confirmed tenant broadcast to users who have interacted with that exact tenant bot.
+    /// Queues a confirmed tenant broadcast to users who have interacted with that exact tenant bot.
     /// </summary>
     /// <param name="botClient">Owned bot client used to edit progress for the owner.</param>
     /// <param name="callbackQuery">Owner confirmation callback containing the draft token.</param>
     /// <param name="owner">Colleague owner whose tenant audience receives the broadcast.</param>
     /// <param name="token">Draft token stored in the owner bot state.</param>
     /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
+    /// <remarks>
+    /// The tenant audience is tenant-scoped through <see cref="GetTenantBroadcastRecipientsAsync" />.
+    /// Delivery itself is delegated to <see cref="BroadcastManager"/> so tenant owners get the same retry,
+    /// refresh, live progress, and final summary behavior as super-admin broadcasts. The status message is
+    /// edited by the owned bot that received the owner callback, while each recipient receives the message
+    /// from the tenant bot configured by the colleague.
+    /// </remarks>
     private async Task SENDTENANTBROADCASTASYNC(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -1521,61 +1665,100 @@ public class TenantBotService
             return;
         }
 
-        var recipients = await _userDbcontext.BotUserStates
-            .Where(x => x.BotId == tenant.Id)
-            .Select(x => x.TelegramUserId)
-            .Distinct()
-            .ToListAsync(cancellationToken);
-        var tenantClient = _botClientProvider.GetClient(tenant.Id);
-        var sent = 0;
-        var failed = 0;
-        var blocked = 0;
         var content = state.SubLink;
-        TryParseTelegramPostLink(content, out var fromChat, out var messageId);
+        var recipients = await GetTenantBroadcastRecipientsAsync(tenant, cancellationToken);
+        var template = BuildTenantBroadcastTemplate(content);
 
         await SafeEditMessageTextAsync(
             botClient,
             callbackQuery.Message.Chat.Id,
             callbackQuery.Message.MessageId,
-            $"📢 ارسال پیام عمومی شروع شد.\nمخاطب‌ها: <code>{recipients.Count}</code>",
+            $"در حال آماده‌سازی ارسال عمومی فروشگاه برای <code>{recipients.Count}</code> کاربر...",
             parseMode: ParseMode.Html,
             cancellationToken: cancellationToken);
 
-        foreach (var recipient in recipients)
-        {
-            try
-            {
-                if (fromChat != null && messageId > 0)
-                    await tenantClient.ForwardMessageAsync(recipient, fromChat, messageId, cancellationToken: cancellationToken);
-                else
-                    await tenantClient.SendTextMessageAsync(recipient, content, cancellationToken: cancellationToken);
-                sent++;
-                await Task.Delay(Math.Max(80, _appConfig.BroadcastDelayMs), cancellationToken);
-            }
-            catch (ApiRequestException ex) when (ex.ErrorCode == 403 || ex.Message.Contains("blocked", StringComparison.OrdinalIgnoreCase))
-            {
-                blocked++;
-            }
-            catch
-            {
-                failed++;
-            }
-        }
+        var job = await _broadcastManager.EnqueueAsync(
+            recipients,
+            template,
+            callbackQuery.Message.Chat.Id,
+            callbackQuery.Message.MessageId,
+            owner.TelegramUserId,
+            cancellationToken,
+            senderBotId: tenant.Id);
 
         await _userDbcontext.ClearUserStatus(state);
-        await SafeEditMessageTextAsync(
-            botClient,
+        await _broadcastManager.RefreshStatusMessageAsync(job.Id, cancellationToken);
+        await botClient.SendTextMessageAsync(
             callbackQuery.Message.Chat.Id,
-            callbackQuery.Message.MessageId,
-            "✅ <b>ارسال پیام عمومی تمام شد</b>\n\n" +
-            $"کل مخاطب‌ها: <code>{recipients.Count}</code>\n" +
-            $"ارسال موفق: <code>{sent}</code>\n" +
-            $"بلاک کرده‌اند: <code>{blocked}</code>\n" +
-            $"خطاهای دیگر: <code>{failed}</code>",
-            parseMode: ParseMode.Html,
-            replyMarkup: new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("بازگشت", OWNERCALLBACKPREFIX + "panel") } }),
+            "ارسال عمومی فروشگاه شروع شد. وضعیت را از پیام بالا پیگیری کنید.",
+            replyMarkup: BUILDOWNERPANELKEYBOARD(tenant),
             cancellationToken: cancellationToken);
         await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Converts an owner tenant-broadcast draft into the shared broadcast template model.
+    /// </summary>
+    /// <param name="content">
+    /// Owner-provided broadcast content. A public Telegram post URL is converted to a forward template;
+    /// every other value is sent as plain text by the tenant bot.
+    /// </param>
+    /// <returns>
+    /// A <see cref="BroadcastManager.BroadcastItem"/> without a recipient chat id. The caller supplies the
+    /// tenant-scoped audience when enqueueing the job.
+    /// </returns>
+    /// <remarks>
+    /// This helper deliberately does not read global users. It only decides how the already-approved tenant
+    /// broadcast content should be delivered by <see cref="BroadcastManager"/>.
+    /// </remarks>
+    private static BroadcastManager.BroadcastItem BuildTenantBroadcastTemplate(string content)
+    {
+        if (TryParseTelegramPostLink(content, out var fromChat, out var messageId))
+        {
+            return new BroadcastManager.BroadcastItem
+            {
+                FromChatId = fromChat,
+                MessageId = messageId,
+                IsForward = true
+            };
+        }
+
+        return new BroadcastManager.BroadcastItem
+        {
+            Text = content,
+            IsForward = false
+        };
+    }
+
+    /// <summary>
+    /// Gets the exact Telegram audience for a tenant storefront broadcast.
+    /// </summary>
+    /// <param name="tenant">
+    /// Tenant bot whose private-chat users should receive the broadcast. The method uses
+    /// <see cref="BotInstance.Id"/> as the tenant-scoped key and never reads users from another bot.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for the users.db query.</param>
+    /// <returns>
+    /// A distinct list of numeric Telegram user ids that have a <see cref="BotUserState"/> row for this exact
+    /// tenant bot. The list can be empty when nobody has started or interacted with the storefront yet.
+    /// </returns>
+    /// <remarks>
+    /// This is the only audience source for tenant broadcasts. A colleague owner must not send tenant broadcast
+    /// messages to global owned-bot users, users of another tenant, or users known only from <c>credentials.db</c>.
+    /// Telegram private chats use the numeric user id as the chat id, so the returned ids are safe to pass to
+    /// the tenant bot client for text or forwarded-message delivery.
+    /// </remarks>
+    private async Task<List<long>> GetTenantBroadcastRecipientsAsync(BotInstance tenant, CancellationToken cancellationToken)
+    {
+        if (tenant == null || string.IsNullOrWhiteSpace(tenant.Id))
+            return new List<long>();
+
+        return await _userDbcontext.BotUserStates
+            .Where(x => x.BotId == tenant.Id && x.TelegramUserId > 0)
+            .Select(x => x.TelegramUserId)
+            .Distinct()
+            .OrderBy(x => x)
+            .ToListAsync(cancellationToken);
     }
 
     /// <summary>
@@ -1779,8 +1962,8 @@ public class TenantBotService
     /// <param name="CancellationToken">Cancellation Token.</param>
     /// <remarks>
     /// This method handles tenant-only purchase and payment messages locally, but delegates account-management
-    /// commands to <see cref="XuiV3BotFlowService" />. Purchase payments remain tenant-specific, while shared
-    /// account actions reuse the owned-bot XUI implementation under the current bot context.
+    /// commands to <see cref="XuiV3BotFlowService" />. <c>/start</c> and top-level tenant menu buttons are handled
+    /// before any state-machine step so a stale renewal/search state cannot treat commands as XUI account identifiers.
     /// </remarks>
     private async Task HANDLECUSTOMERMESSAGEASYNC(
         ITelegramBotClient botClient,
@@ -1807,6 +1990,73 @@ public class TenantBotService
 
         var Text = Message.Text?.Trim() ?? string.Empty;
         var tenantReplyKeyboard = BuildTenantReplyKeyboard();
+
+        if (Text.StartsWith("/start", StringComparison.OrdinalIgnoreCase))
+        {
+            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            if (Text.Contains("payment_success", StringComparison.OrdinalIgnoreCase))
+            {
+                await botClient.SendTextMessageAsync(Message.Chat.Id, "پرداخت از سمت درگاه پرداخت تایید شد. در حال بررسی وضعیت سفارش...", cancellationToken: CancellationToken);
+                await CHECKLATESTCUSTOMERORDERASYNC(botClient, Message.Chat.Id, customer.TelegramUserId, CancellationToken);
+                return;
+            }
+
+            if (Text.Contains("payment_cancel", StringComparison.OrdinalIgnoreCase))
+            {
+                await MARKLATESTCUSTOMERORDERCANCELLEDASYNC(botClient, Message.Chat.Id, customer.TelegramUserId, CancellationToken);
+                return;
+            }
+
+            await SendTenantHomeAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
+            return;
+        }
+
+        if (Text == "خرید اکانت" || Text == "💳 خرید اکانت")
+        {
+            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await SendServiceSelectionAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
+            return;
+        }
+
+        if (Text == "تعرفه‌ها" || Text == "📋 تعرفه‌ها")
+        {
+            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await botClient.SendTextMessageAsync(
+                Message.Chat.Id,
+                BUILDTENANTTARIFFSTEXT(tenant),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantReplyKeyboard(),
+                cancellationToken: CancellationToken);
+            return;
+        }
+
+        if (Text == "پشتیبانی" || Text == "💬 پشتیبانی")
+        {
+            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            var support = BuildTenantSupportContactHtml(tenant.SupportAccount);
+            await botClient.SendTextMessageAsync(
+                Message.Chat.Id,
+                $"برای پشتیبانی فروشگاه به این آیدی پیام بدهید:\n{support}",
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantReplyKeyboard(),
+                cancellationToken: CancellationToken);
+            return;
+        }
+
+        if (IsTenantTutorialCommand(Text))
+        {
+            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await SendTenantTutorialsAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
+            return;
+        }
+
+        if (await TRYHANDLETENANTPURCHASETEXTASYNC(
+                botClient,
+                Message,
+                tenant,
+                User,
+                CancellationToken))
+            return;
 
         if (await _xuiV3BotFlowService.TryHandleAccountCommentTextAsync(
                 botClient,
@@ -1847,61 +2097,102 @@ public class TenantBotService
                 CancellationToken))
             return;
 
-        if (Text.StartsWith("/start", StringComparison.OrdinalIgnoreCase))
-        {
-            if (Text.Contains("payment_success", StringComparison.OrdinalIgnoreCase))
-            {
-                await botClient.SendTextMessageAsync(Message.Chat.Id, "پرداخت از سمت درگاه پرداخت تایید شد. در حال بررسی وضعیت سفارش...", cancellationToken: CancellationToken);
-                await CHECKLATESTCUSTOMERORDERASYNC(botClient, Message.Chat.Id, customer.TelegramUserId, CancellationToken);
-                return;
-            }
-
-            if (Text.Contains("payment_cancel", StringComparison.OrdinalIgnoreCase))
-            {
-                await MARKLATESTCUSTOMERORDERCANCELLEDASYNC(botClient, Message.Chat.Id, customer.TelegramUserId, CancellationToken);
-                return;
-            }
-
-            await SendTenantHomeAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
-            return;
-        }
-
-        if (Text == "خرید اکانت" || Text == "💳 خرید اکانت")
-        {
-            await SendServiceSelectionAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
-            return;
-        }
-
-        if (Text == "تعرفه‌ها" || Text == "📋 تعرفه‌ها")
-        {
-            await botClient.SendTextMessageAsync(
-                Message.Chat.Id,
-                BUILDTENANTTARIFFSTEXT(tenant),
-                parseMode: ParseMode.Html,
-                replyMarkup: BuildTenantReplyKeyboard(),
-                cancellationToken: CancellationToken);
-            return;
-        }
-
-        if (Text == "پشتیبانی" || Text == "💬 پشتیبانی")
-        {
-            var support = string.IsNullOrWhiteSpace(tenant.SupportAccount) ? "ثبت نشده" : tenant.SupportAccount;
-            await botClient.SendTextMessageAsync(
-                Message.Chat.Id,
-                $"برای پشتیبانی فروشگاه به این آیدی پیام بدهید:\n{Html(support)}",
-                parseMode: ParseMode.Html,
-                replyMarkup: BuildTenantReplyKeyboard(),
-                cancellationToken: CancellationToken);
-            return;
-        }
-
-        if (IsTenantTutorialCommand(Text))
-        {
-            await SendTenantTutorialsAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
-            return;
-        }
-
         await SendTenantHomeAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
+    }
+
+    /// <summary>
+    /// Handles typed metered traffic while a tenant customer is in the purchase traffic-selection step.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client that received the customer's typed traffic value.</param>
+    /// <param name="message">Incoming customer text message, expected to contain a GB amount such as <c>12</c> or <c>12 GB</c>.</param>
+    /// <param name="tenant">Tenant storefront whose prices will be used after a valid traffic amount is selected.</param>
+    /// <param name="user">
+    /// Bot-scoped customer state. The state belongs to the active tenant bot and carries the selected metered service key.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for users.db state updates and Telegram replies.</param>
+    /// <returns>
+    /// <c>true</c> when the message belonged to the tenant purchase traffic state and was handled; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Tenant purchase originally accepted only inline traffic buttons. This method adds typed custom traffic while
+    /// preserving the existing callback path. It validates the typed amount against the same plan-file
+    /// <c>minimumTrafficGb</c> rule used by owned bots before showing duration choices.
+    /// </remarks>
+    private async Task<bool> TRYHANDLETENANTPURCHASETEXTASYNC(
+        ITelegramBotClient botClient,
+        Message message,
+        BotInstance tenant,
+        User user,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(user?.Flow, TENANTPURCHASEFLOW, StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(user.SelectedCountry))
+        {
+            return false;
+        }
+
+        var text = message.Text?.Trim() ?? string.Empty;
+        if (IsCancelText(text))
+        {
+            await _userDbcontext.ClearUserStatus(user);
+            await botClient.SendTextMessageAsync(
+                message.Chat.Id,
+                "فرایند خرید لغو شد.",
+                replyMarkup: BuildTenantReplyKeyboard(),
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        var service = _purchaseService.GetEnabledServices()
+            .FirstOrDefault(x => string.Equals(x.Key, user.SelectedCountry, StringComparison.OrdinalIgnoreCase));
+        if (service == null || service.IsUnlimited)
+        {
+            await _userDbcontext.ClearUserStatus(user);
+            await SendTenantHomeAsync(botClient, message.Chat.Id, tenant, cancellationToken);
+            return true;
+        }
+
+        if (user.LastStep == TENANTPURCHASESTEPTRAFFIC)
+        {
+            if (!TryParseTenantTrafficSelection(text, service, out var trafficGb))
+            {
+                await botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    BuildTenantMinimumTrafficMessage(service),
+                    replyMarkup: BuildTenantTrafficInlineKeyboard(service),
+                    cancellationToken: cancellationToken);
+                return true;
+            }
+
+            await _userDbcontext.SaveUserStatus(new User
+            {
+                Id = message.From.Id,
+                Flow = TENANTPURCHASEFLOW,
+                LastStep = TENANTPURCHASESTEPDURATION,
+                SelectedCountry = service.Key,
+                TotoalGB = trafficGb.ToString(CultureInfo.InvariantCulture)
+            });
+
+            await SHOWDURATIONOPTIONSASYNC(
+                botClient,
+                message.Chat.Id,
+                null,
+                tenant,
+                service.Key,
+                trafficGb,
+                cancellationToken);
+            return true;
+        }
+
+        await botClient.SendTextMessageAsync(
+            message.Chat.Id,
+            "برای ادامه، مدت سرویس را از دکمه‌های پیام قبلی انتخاب کنید یا انصراف دهید.",
+            replyMarkup: new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("بازگشت به انتخاب سرویس", CUSTOMERCALLBACKPREFIX + "services") }
+            }),
+            cancellationToken: cancellationToken);
+        return true;
     }
 
     /// <summary>
@@ -2038,7 +2329,7 @@ public class TenantBotService
         {
             if (!TryParseTenantTrafficSelection(text, service, out var trafficGb))
             {
-                await botClient.SendTextMessageAsync(message.Chat.Id, "حجم تمدید معتبر نیست. یکی از گزینه‌های زیر را انتخاب کنید.", replyMarkup: BuildTenantRenewTrafficKeyboard(service), cancellationToken: cancellationToken);
+                await botClient.SendTextMessageAsync(message.Chat.Id, BuildTenantMinimumTrafficMessage(service), replyMarkup: BuildTenantRenewTrafficKeyboard(service), cancellationToken: cancellationToken);
                 return;
             }
 
@@ -2143,7 +2434,7 @@ public class TenantBotService
 
         await botClient.SendTextMessageAsync(
             message.Chat.Id,
-            service.IsUnlimited ? "پلن تمدید نامحدود را انتخاب کنید:" : "حجم تمدید را انتخاب کنید:",
+            service.IsUnlimited ? "پلن تمدید نامحدود را انتخاب کنید:" : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
             replyMarkup: service.IsUnlimited ? BuildTenantRenewUnlimitedKeyboard(service, tenant) : BuildTenantRenewTrafficKeyboard(service),
             cancellationToken: cancellationToken);
     }
@@ -2298,8 +2589,7 @@ public class TenantBotService
     /// <returns>Reply keyboard containing traffic options and cancel.</returns>
     private static ReplyKeyboardMarkup BuildTenantRenewTrafficKeyboard(XuiV3ServiceDefinition service)
     {
-        var rows = service.TrafficOptionsGb
-            .OrderBy(x => x)
+        var rows = XuiV3PurchaseService.GetVisibleTrafficOptions(service)
             .Chunk(3)
             .Select(chunk => chunk.Select(x => new KeyboardButton($"{x} GB")).ToArray())
             .Append(new[] { new KeyboardButton("❌ انصراف") })
@@ -2360,17 +2650,82 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Parses a traffic option selected by a tenant customer.
+    /// Parses and validates tenant metered traffic entered by button or typed text.
     /// </summary>
-    /// <param name="text">Customer text such as <c>20 GB</c>.</param>
-    /// <param name="service">Service whose allowed traffic options are validated.</param>
-    /// <param name="trafficGb">Selected traffic in GB when parsing succeeds.</param>
-    /// <returns><c>true</c> when the selected traffic exists in the service plan.</returns>
+    /// <param name="text">Customer text such as <c>20 GB</c>, <c>20</c>, or Persian-digit equivalents.</param>
+    /// <param name="service">Metered service whose minimum traffic rule is enforced.</param>
+    /// <param name="trafficGb">Selected traffic in GB when parsing and minimum validation succeed.</param>
+    /// <returns>
+    /// <c>true</c> when the text contains a positive integer GB amount that is at least the service minimum;
+    /// otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Tenant storefront purchases can use custom typed traffic, so this parser must not require the amount to
+    /// exist in <c>trafficOptionsGb</c>. Preset buttons are only suggestions.
+    /// </remarks>
     private static bool TryParseTenantTrafficSelection(string text, XuiV3ServiceDefinition service, out int trafficGb)
     {
-        var digits = new string((text ?? string.Empty).Where(char.IsDigit).ToArray());
+        var digits = new string(NormalizeTenantDigits(text ?? string.Empty).Where(char.IsDigit).ToArray());
         return int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out trafficGb) &&
-               service.TrafficOptionsGb.Contains(trafficGb);
+               trafficGb > 0 &&
+               XuiV3PurchaseService.MeetsMinimumTraffic(service, trafficGb);
+    }
+
+    /// <summary>
+    /// Builds tenant purchase inline buttons for visible metered traffic presets.
+    /// </summary>
+    /// <param name="service">Metered service whose visible preset values should be shown.</param>
+    /// <returns>Inline keyboard with traffic buttons that satisfy the service minimum, plus a back button.</returns>
+    /// <remarks>
+    /// The keyboard is intentionally not the full policy surface: customers may type any larger custom traffic
+    /// amount, and <see cref="TryParseTenantTrafficSelection"/> validates it.
+    /// </remarks>
+    private static InlineKeyboardMarkup BuildTenantTrafficInlineKeyboard(XuiV3ServiceDefinition service)
+    {
+        var rows = XuiV3PurchaseService.GetVisibleTrafficOptions(service)
+            .Chunk(2)
+            .Select(chunk => chunk
+                .Select(gb => InlineKeyboardButton.WithCallbackData($"{gb} GB", CUSTOMERCALLBACKPREFIX + $"GB:{service.Key}:{gb}"))
+                .ToArray())
+            .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") })
+            .ToArray();
+
+        return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>
+    /// Builds the Persian validation message shown when tenant traffic input is invalid or below the service minimum.
+    /// </summary>
+    /// <param name="service">Metered service whose minimum traffic should be displayed.</param>
+    /// <returns>Customer-facing text explaining that a larger integer GB amount is required.</returns>
+    private static string BuildTenantMinimumTrafficMessage(XuiV3ServiceDefinition service)
+    {
+        if (service == null)
+            return "حجم وارد شده معتبر نیست. لطفاً دوباره تلاش کنید.";
+
+        return $"حجم وارد شده معتبر نیست. حداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است. می‌توانید یکی از دکمه‌ها را بزنید یا عدد دلخواه بزرگ‌تر را وارد کنید.";
+    }
+
+    /// <summary>
+    /// Converts Persian and Arabic digits in customer input to ASCII digits before numeric parsing.
+    /// </summary>
+    /// <param name="text">Raw tenant customer text, possibly containing Persian or Arabic digits.</param>
+    /// <returns>Text with localized decimal digits converted to ASCII digits; null becomes an empty string.</returns>
+    private static string NormalizeTenantDigits(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return string.Empty;
+
+        var builder = new System.Text.StringBuilder(text.Length);
+        foreach (var ch in text)
+        {
+            var numericValue = char.GetNumericValue(ch);
+            builder.Append(numericValue is >= 0 and <= 9 && Math.Abs(numericValue % 1) < double.Epsilon
+                ? (char)('0' + (int)numericValue)
+                : ch);
+        }
+
+        return builder.ToString();
     }
 
     /// <summary>
@@ -2521,8 +2876,37 @@ public class TenantBotService
         var ChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
         var MessageId = CallbackQuery.Message?.MessageId;
 
+        if (action == "joincheck")
+        {
+            var joined = await EnsureTenantCustomerJoinAsync(
+                botClient,
+                ChatId,
+                CallbackQuery.From.Id,
+                tenant,
+                CancellationToken,
+                isJoinRetry: true);
+            if (joined)
+            {
+                await SendTenantHomeAsync(botClient, ChatId, tenant, CancellationToken);
+                await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "عضویت شما تایید شد.", cancellationToken: CancellationToken);
+            }
+            else
+            {
+                await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "هنوز عضو کانال نشده‌اید.", showAlert: true, cancellationToken: CancellationToken);
+            }
+
+            return;
+        }
+
+        if (!await EnsureTenantCustomerJoinAsync(botClient, ChatId, CallbackQuery.From.Id, tenant, CancellationToken))
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "ابتدا در کانال عضو شوید.", showAlert: true, cancellationToken: CancellationToken);
+            return;
+        }
+
         if (action == "home")
         {
+            await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
             await SendTenantHomeAsync(botClient, ChatId, tenant, CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
             return;
@@ -2530,6 +2914,7 @@ public class TenantBotService
 
         if (action == "services")
         {
+            await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
             await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
             return;
@@ -2537,7 +2922,7 @@ public class TenantBotService
 
         if (action.StartsWith("svc:", StringComparison.Ordinal))
         {
-            await SHOWSERVICEOPTIONSASYNC(botClient, ChatId, MessageId, tenant, action["svc:".Length..], CancellationToken);
+            await SHOWSERVICEOPTIONSASYNC(botClient, ChatId, MessageId, tenant, action["svc:".Length..], CallbackQuery.From.Id, CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
             return;
         }
@@ -2546,7 +2931,31 @@ public class TenantBotService
         {
             var parts = action.Split(':');
             if (parts.Length == 3 && int.TryParse(parts[2], out var GB))
-                await SHOWDURATIONOPTIONSASYNC(botClient, ChatId, MessageId, tenant, parts[1], GB, CancellationToken);
+            {
+                var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => string.Equals(x.Key, parts[1], StringComparison.OrdinalIgnoreCase));
+                if (service == null || !XuiV3PurchaseService.MeetsMinimumTraffic(service, GB))
+                {
+                    await EDITORSENDASYNC(
+                        botClient,
+                        ChatId,
+                        MessageId,
+                        BuildTenantMinimumTrafficMessage(service),
+                        service == null ? null : BuildTenantTrafficInlineKeyboard(service),
+                        CancellationToken);
+                }
+                else
+                {
+                    await _userDbcontext.SaveUserStatus(new User
+                    {
+                        Id = CallbackQuery.From.Id,
+                        Flow = TENANTPURCHASEFLOW,
+                        LastStep = TENANTPURCHASESTEPDURATION,
+                        SelectedCountry = service.Key,
+                        TotoalGB = GB.ToString(CultureInfo.InvariantCulture)
+                    });
+                    await SHOWDURATIONOPTIONSASYNC(botClient, ChatId, MessageId, tenant, parts[1], GB, CancellationToken);
+                }
+            }
 
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
             return;
@@ -2557,7 +2966,22 @@ public class TenantBotService
             var parts = action.Split(':');
             if (parts.Length == 4 && int.TryParse(parts[2], out var GB))
             {
+                var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => string.Equals(x.Key, parts[1], StringComparison.OrdinalIgnoreCase));
+                if (service == null || !XuiV3PurchaseService.MeetsMinimumTraffic(service, GB))
+                {
+                    await EDITORSENDASYNC(
+                        botClient,
+                        ChatId,
+                        MessageId,
+                        BuildTenantMinimumTrafficMessage(service),
+                        service == null ? null : BuildTenantTrafficInlineKeyboard(service),
+                        CancellationToken);
+                    await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
+                    return;
+                }
+
                 var selection = new XuiV3PurchaseSelection { ServiceKey = parts[1], TrafficGb = GB, DurationKey = parts[3] };
+                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, MessageId, tenant, selection, CancellationToken);
             }
 
@@ -2571,6 +2995,7 @@ public class TenantBotService
             if (parts.Length == 3)
             {
                 var selection = new XuiV3PurchaseSelection { ServiceKey = parts[1], UnlimitedPlanKey = parts[2] };
+                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, MessageId, tenant, selection, CancellationToken);
             }
 
@@ -2587,6 +3012,7 @@ public class TenantBotService
                 return;
             }
 
+            await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
             await CreateTenantOrderINVOICEASYNC(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             return;
         }
@@ -2605,11 +3031,20 @@ public class TenantBotService
             }
 
             if (Provider == "PAYHP")
+            {
+                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantOrderINVOICEASYNC(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
+            }
             else if (Provider == "PAYNP")
+            {
+                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantNowPaymentsInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
+            }
             else
+            {
+                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantCardOrderAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
+            }
             return;
         }
 
@@ -2695,6 +3130,100 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Builds a clickable Telegram support contact for tenant storefront customers.
+    /// </summary>
+    /// <param name="supportAccount">
+    /// Tenant-scoped support account configured by the colleague owner. The value may be a raw username,
+    /// an <c>@username</c>, a public <c>https://t.me/username</c> link, or a <c>t.me/username</c> value without
+    /// a scheme. Empty values mean no support account has been configured.
+    /// </param>
+    /// <returns>
+    /// HTML-safe text for a Telegram message. Valid Telegram usernames are returned as clickable
+    /// <c>https://t.me/...</c> links with visible <c>@username</c> text; unsupported values are escaped and
+    /// displayed as plain text.
+    /// </returns>
+    /// <remarks>
+    /// The tenant support message is sent with <see cref="ParseMode.Html"/>. This helper keeps owner-provided
+    /// text out of raw HTML while making normal Telegram usernames clickable even when the client does not
+    /// auto-link plain <c>@username</c> text.
+    /// </remarks>
+    private static string BuildTenantSupportContactHtml(string supportAccount)
+    {
+        if (string.IsNullOrWhiteSpace(supportAccount))
+            return "ثبت نشده";
+
+        var normalized = NormalizeTenantSupportAccount(supportAccount);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return Html(supportAccount.Trim());
+
+        var username = normalized.TrimStart('@');
+        var safeUsername = Html(username);
+        return $"<a href=\"https://t.me/{safeUsername}\">@{safeUsername}</a>";
+    }
+
+    /// <summary>
+    /// Normalizes a tenant support contact into a Telegram username with one leading <c>@</c>.
+    /// </summary>
+    /// <param name="supportAccount">
+    /// Owner-provided support contact. The value may be <c>@username</c>, <c>username</c>,
+    /// <c>https://t.me/username</c>, <c>t.me/username</c>, or <c>telegram.me/username</c>.
+    /// </param>
+    /// <returns>
+    /// A normalized <c>@username</c> when the input contains a valid public Telegram username; otherwise <c>null</c>.
+    /// </returns>
+    /// <remarks>
+    /// Tenant support is customer-facing. Storing the canonical username avoids rendering broken values such as
+    /// <c>@https://t.me/name</c> later in support messages, owner panels, and logs.
+    /// </remarks>
+    private static string NormalizeTenantSupportAccount(string supportAccount)
+    {
+        if (string.IsNullOrWhiteSpace(supportAccount))
+            return null;
+
+        var normalized = supportAccount.Trim();
+        if (normalized.StartsWith("@http://", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("@https://", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("@t.me/", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("@telegram.me/", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized[1..];
+        }
+
+        if (normalized.StartsWith("t.me/", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("telegram.me/", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = "https://" + normalized;
+        }
+
+        if (Uri.TryCreate(normalized, UriKind.Absolute, out var uri) &&
+            (string.Equals(uri.Host, "t.me", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(uri.Host, "telegram.me", StringComparison.OrdinalIgnoreCase)))
+        {
+            normalized = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
+        }
+
+        var username = normalized.Trim().TrimStart('@');
+        return IsTelegramUsername(username) ? "@" + username : null;
+    }
+
+    /// <summary>
+    /// Checks whether a value can be used as a public Telegram username link.
+    /// </summary>
+    /// <param name="username">
+    /// Username without the leading <c>@</c>. It must contain only ASCII letters, digits, or underscores.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the value satisfies Telegram's public username shape closely enough to build a
+    /// clickable <c>t.me</c> link; otherwise <c>false</c>.
+    /// </returns>
+    private static bool IsTelegramUsername(string username)
+    {
+        return !string.IsNullOrWhiteSpace(username) &&
+               username.Length is >= 5 and <= 32 &&
+               username.All(ch => char.IsAsciiLetterOrDigit(ch) || ch == '_');
+    }
+
+    /// <summary>
     /// sends or edits the first storefront purchase step where the customer CHOOSES A service.
     /// </summary>
     /// <param name="botClient">tenant Bot client.</param>
@@ -2745,8 +3274,19 @@ public class TenantBotService
     /// <param name="MessageId">optional Message Id to edit.</param>
     /// <param name="tenant">current tenant Bot row.</param>
     /// <param name="ServiceKey">selected xui service key.</param>
+    /// <param name="CustomerTelegramUserId">
+    /// Numeric Telegram user id of the tenant customer. This is stored in users.db state so a typed traffic
+    /// message can continue the same purchase flow after the service callback.
+    /// </param>
     /// <param name="CancellationToken">Cancellation Token.</param>
-    private async Task SHOWSERVICEOPTIONSASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, string ServiceKey, CancellationToken CancellationToken)
+    private async Task SHOWSERVICEOPTIONSASYNC(
+        ITelegramBotClient botClient,
+        ChatId ChatId,
+        int? MessageId,
+        BotInstance tenant,
+        string ServiceKey,
+        long CustomerTelegramUserId,
+        CancellationToken CancellationToken)
     {
         var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => x.Key == ServiceKey);
         if (service == null)
@@ -2754,6 +3294,7 @@ public class TenantBotService
 
         if (service.IsUnlimited)
         {
+            await _userDbcontext.ClearUserStatus(new User { Id = CustomerTelegramUserId });
             var rows = service.UnlimitedPlans
                 .Where(x => x.IsEnabled)
                 .Select(plan =>
@@ -2774,33 +3315,70 @@ public class TenantBotService
             return;
         }
 
-        var TRAFFICROWS = service.TrafficOptionsGb
-            .OrderBy(x => x)
-            .Chunk(2)
-            .Select(Chunk => Chunk
-                .Select(GB => InlineKeyboardButton.WithCallbackData($"{GB} GB", CUSTOMERCALLBACKPREFIX + $"GB:{service.Key}:{GB}"))
-                .ToArray())
-            .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") })
-            .ToArray();
+        await _userDbcontext.SaveUserStatus(new User
+        {
+            Id = CustomerTelegramUserId,
+            Flow = TENANTPURCHASEFLOW,
+            LastStep = TENANTPURCHASESTEPTRAFFIC,
+            SelectedCountry = service.Key
+        });
 
-        await EDITORSENDASYNC(botClient, ChatId, MessageId, "حجم مورد نظر را انتخاب کنید:", new InlineKeyboardMarkup(TRAFFICROWS), CancellationToken);
+        await EDITORSENDASYNC(
+            botClient,
+            ChatId,
+            MessageId,
+            $"حجم مورد نظر را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
+            BuildTenantTrafficInlineKeyboard(service),
+            CancellationToken);
     }
 
     /// <summary>
-    /// SHOWS Duration Options for A Metered service and selected Traffic amount.
+    /// Shows the duration choices for a tenant customer's metered purchase after traffic has been selected.
     /// </summary>
-    /// <param name="botClient">tenant Bot client.</param>
-    /// <param name="ChatId">customer chat Id.</param>
-    /// <param name="MessageId">optional Message Id to edit.</param>
-    /// <param name="tenant">current tenant Bot row.</param>
-    /// <param name="ServiceKey">selected service key.</param>
-    /// <param name="TrafficGb">selected Traffic amount in GB.</param>
-    /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <param name="botClient">
+    /// Telegram client for the tenant storefront that is serving the customer.
+    /// </param>
+    /// <param name="ChatId">
+    /// Telegram chat id where the customer is choosing the plan duration.
+    /// </param>
+    /// <param name="MessageId">
+    /// Optional Telegram message id to edit. When <c>null</c>, a new message is sent instead.
+    /// </param>
+    /// <param name="tenant">
+    /// Tenant bot instance that owns the storefront, pricing markup, and payment settings for this purchase.
+    /// </param>
+    /// <param name="ServiceKey">
+    /// Service key from <c>xui-v3-service-plans.json</c>, such as <c>normal</c> or <c>national</c>.
+    /// </param>
+    /// <param name="TrafficGb">
+    /// Customer-selected metered traffic in GB. The value must satisfy the selected service's
+    /// <c>minimumTrafficGb</c> policy before duration buttons are shown.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// Cancellation token for Telegram and state-validation operations.
+    /// </param>
+    /// <remarks>
+    /// This method is shared by callback traffic buttons and manually typed traffic in tenant bots.
+    /// It rechecks the minimum traffic here so stale callback data or edited messages cannot bypass the
+    /// same pricing policy used by owned bots.
+    /// </remarks>
     private async Task SHOWDURATIONOPTIONSASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, string ServiceKey, int TrafficGb, CancellationToken CancellationToken)
     {
         var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => x.Key == ServiceKey);
         if (service == null)
             return;
+
+        if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, TrafficGb))
+        {
+            await EDITORSENDASYNC(
+                botClient,
+                ChatId,
+                MessageId,
+                BuildTenantMinimumTrafficMessage(service),
+                BuildTenantTrafficInlineKeyboard(service),
+                CancellationToken);
+            return;
+        }
 
         var rows = service.DurationOptions
             .Select(Duration =>
@@ -3694,6 +4272,14 @@ public class TenantBotService
                     botType: BotInstanceTypes.Tenant,
                     cancellationToken: CancellationToken);
 
+                await _gozargahSiteSyncService.QueueCreateAsync(
+                    order.OwnerTelegramUserId,
+                    order.CustomerTelegramUserId,
+                    created,
+                    order.OrderId,
+                    order.TenantBotId,
+                    CancellationToken);
+
                 await NOTIFYTENANTCUSTOMERSUCCESSASYNC(order, created, CancellationToken);
                 await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, CancellationToken);
                 await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, beforeBalance, afterBalance, CancellationToken);
@@ -3843,15 +4429,25 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// final-CONFIRMS A tenant card-to-card receipt from the sales assistant and fulfills the LINKED order once.
+    /// Final-confirms a tenant card-to-card receipt from the Sales Assistant and fulfills the linked order once.
     /// </summary>
-    /// <param name="RECEIPTID">internal users.db Id of the receipt selected in the sales assistant Bot.</param>
-    /// <param name="ReviewerTelegramUserId">Telegram User Id of the assistant User who pressed final confirmation.</param>
-    /// <param name="CancellationToken">Cancellation Token for database, wallet, xui, and Telegram work.</param>
-    /// <returns>Human-readable Persian result shown as A Telegram callback ALERT.</returns>
+    /// <param name="RECEIPTID">
+    /// Internal <c>users.db</c> id of the receipt selected in the Sales Assistant bot.
+    /// </param>
+    /// <param name="ReviewerTelegramUserId">
+    /// Numeric Telegram user id of the tenant owner who pressed final confirmation in the assistant bot.
+    /// The value must match the receipt owner.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// Cancellation token for database updates, owner wallet debit, XUI account creation, ledger writes, and Telegram notifications.
+    /// </param>
+    /// <returns>
+    /// A Persian result string shown as the Telegram callback alert in the Sales Assistant.
+    /// </returns>
     /// <remarks>
-    /// the tenant owner must be the REVIEWER. REPEATED final CONFIRMATIONS are idempotent because fulfilled
-    /// orders are Rejected by <see cref="FULFILLPAIDTENANTORDERASYNC" /> before Any account or ledger is created.
+    /// The tenant owner must be the reviewer. The method is idempotent: fulfilled orders do not create
+    /// another XUI account, ledger entry, or customer delivery. Repeated confirmations only resend account
+    /// details to the owner when useful, keeping the customer from receiving duplicate account messages.
     /// </remarks>
     public async Task<string> APPROVEMANUALRECEIPTASYNC(int RECEIPTID, long ReviewerTelegramUserId, CancellationToken CancellationToken)
     {
@@ -3870,7 +4466,7 @@ public class TenantBotService
 
         if (order.IsFulfilled)
         {
-            await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: true, sendOwner: true, CancellationToken);
+            await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
             return "این سفارش قبلاً تایید و ساخته شده است.";
         }
 
@@ -3903,7 +4499,8 @@ public class TenantBotService
     /// <remarks>
     /// This method is used when a card-to-card receipt was not approved through the Sales Assistant. It creates
     /// a receipt audit row when needed, marks it approved, and delegates fulfillment to the same idempotent
-    /// method used by assistant final confirmation.
+    /// method used by assistant final confirmation. If the order was already fulfilled, the method does not
+    /// create another account or ledger entry and only resends existing account details to the tenant owner.
     /// </remarks>
     private async Task CONFIRMMANUALCARDORDERBYORDERIDASYNC(
         ITelegramBotClient botClient,
@@ -3942,8 +4539,8 @@ public class TenantBotService
         if (order.IsFulfilled)
         {
             await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
-            await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: true, sendOwner: true, CancellationToken);
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "این سفارش قبلاً تایید شده بود. مشخصات اکانت دوباره برای شما و خریدار ارسال شد.", cancellationToken: CancellationToken);
+            await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
+            await botClient.SendTextMessageAsync(Message.Chat.Id, "این سفارش قبلاً تایید شده بود. مشخصات اکانت فقط برای شما دوباره ارسال شد.", cancellationToken: CancellationToken);
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
             return;
         }
@@ -4074,22 +4671,46 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Verifies A specific tenant order AGAINST HooshPay and, when the gateway CONFIRMS payment,
-    /// continues through the same fulfillment path used by the ipn endpoint.
+    /// Verifies a specific tenant order against its payment provider and replays fulfilled account details when needed.
     /// </summary>
     /// <param name="botClient">Telegram client for the tenant Bot that owns the order.</param>
     /// <param name="ChatId">chat that Receives the current payment status.</param>
-    /// <param name="ORDERDBID">internal database Id of the tenant order.</param>
-    /// <param name="CustomerTelegramUserId">customer Id used as an ownership guard for the lookup.</param>
-    /// <param name="CancellationToken">Cancellation Token for HooshPay, database, and Telegram calls.</param>
+    /// <param name="ORDERDBID">Internal users.db id of the tenant order embedded in the tenant callback.</param>
+    /// <param name="CustomerTelegramUserId">
+    /// Numeric Telegram user id of the tenant customer who clicked the status button. The order must belong to
+    /// this user and to the current tenant bot context.
+    /// </param>
+    /// <param name="CancellationToken">Cancellation token for provider API calls, users.db writes, and Telegram replies.</param>
+    /// <remarks>
+    /// This method is used by tenant payment keyboards and payment return checks. It is idempotent: fulfilled
+    /// orders are never built or charged again; their stored account details are resent to the buyer instead.
+    /// </remarks>
     private async Task CheckTenantOrderAsync(ITelegramBotClient botClient, ChatId ChatId, int ORDERDBID, long CustomerTelegramUserId, CancellationToken CancellationToken)
     {
         var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
-            x => x.Id == ORDERDBID && x.CustomerTelegramUserId == CustomerTelegramUserId,
+            x => x.Id == ORDERDBID &&
+                 x.TenantBotId == BotContextAccessor.CurrentBotId &&
+                 x.CustomerTelegramUserId == CustomerTelegramUserId,
             CancellationToken);
         if (order == null)
         {
             await botClient.SendTextMessageAsync(ChatId, "سفارش پیدا نشد.", cancellationToken: CancellationToken);
+            return;
+        }
+
+        if (order.IsFulfilled)
+        {
+            await RESENDFULFILLEDTENANTORDERTOCUSTOMERASYNC(botClient, ChatId, order, CancellationToken);
+            return;
+        }
+
+        if (IsPendingTenantCardOrder(order))
+        {
+            await botClient.SendTextMessageAsync(
+                ChatId,
+                "در انتظار پرداخت و تایید مدیر.",
+                replyMarkup: BuildTenantCardPaymentKeyboard(order),
+                cancellationToken: CancellationToken);
             return;
         }
 
@@ -4125,7 +4746,8 @@ public class TenantBotService
 
             if (NowPaymentsStatuses.IsPaid(CRYPTOPAYMENT.PaymentStatus))
             {
-                await ApplyPaidTenantOrderAsync(CRYPTOPAYMENT, "manual-check", CancellationToken);
+                var settlement = await ApplyPaidTenantOrderAsync(CRYPTOPAYMENT, "manual-check", CancellationToken);
+                await SENDTENANTSETTLEMENTCHECKRESULTASYNC(botClient, ChatId, order, settlement, CancellationToken);
                 return;
             }
 
@@ -4155,7 +4777,8 @@ public class TenantBotService
 
         if (Verify?.paid == true || HooshPayStatuses.IsPaid(payment.PaymentStatus))
         {
-            await ApplyPaidTenantOrderAsync(payment, "manual-check", CancellationToken);
+            var settlement = await ApplyPaidTenantOrderAsync(payment, "manual-check", CancellationToken);
+            await SENDTENANTSETTLEMENTCHECKRESULTASYNC(botClient, ChatId, order, settlement, CancellationToken);
             return;
         }
 
@@ -4165,6 +4788,103 @@ public class TenantBotService
             parseMode: ParseMode.Html,
             replyMarkup: BuildTenantPaymentKeyboard(order, payment),
             cancellationToken: CancellationToken);
+    }
+
+    /// <summary>
+    /// Checks whether an unfulfilled tenant order is waiting for owner-side card-to-card payment review.
+    /// </summary>
+    /// <param name="order">
+    /// Tenant order selected by the current customer status callback. The order must already be guarded by
+    /// tenant bot id and customer Telegram user id before this helper is called.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the order uses the tenant owner's card-to-card provider and has not yet reached a paid
+    /// or fulfilled state; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Card-to-card tenant orders do not have a HooshPay or NOWPayments invoice to verify. Until the owner or
+    /// Sales Assistant confirms the receipt, customer status checks should keep the receipt upload/status
+    /// keyboard visible instead of reporting that no invoice exists.
+    /// </remarks>
+    private static bool IsPendingTenantCardOrder(TenantBotOrder order)
+    {
+        if (order == null || order.IsFulfilled)
+            return false;
+
+        return string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase) &&
+               !string.Equals(order.PaymentStatus, TenantBotOrderStatuses.Paid, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Sends the customer-facing result after a manual tenant payment-status check triggers fulfillment.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client that should answer the customer in the current chat.</param>
+    /// <param name="chatId">Telegram chat id where the status-check result should be posted.</param>
+    /// <param name="order">Tenant order that was checked and may now be fulfilled.</param>
+    /// <param name="settlement">
+    /// Result returned by the idempotent tenant fulfillment path. <c>Applied</c> means a new account was
+    /// created during this check; <c>AlreadyAdded</c> means the order had already been fulfilled.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <returns>A task that completes after the result message and any safe resend attempt finish.</returns>
+    /// <remarks>
+    /// The method is notification-only. It never creates XUI accounts, credits/debits wallets, or writes ledger
+    /// rows. Duplicate callbacks are handled by resending stored account data when the settlement was already
+    /// applied earlier.
+    /// </remarks>
+    private async Task SENDTENANTSETTLEMENTCHECKRESULTASYNC(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        TenantBotOrder order,
+        NowPaymentsSettlementResult settlement,
+        CancellationToken cancellationToken)
+    {
+        if (settlement?.Status == NowPaymentsSettlementStatus.Applied)
+        {
+            await botClient.SendTextMessageAsync(
+                chatId,
+                "✅ پرداخت تایید شد و مشخصات اکانت برای شما ارسال شد.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (settlement?.Status == NowPaymentsSettlementStatus.AlreadyAdded || order.IsFulfilled)
+        {
+            await RESENDFULFILLEDTENANTORDERTOCUSTOMERASYNC(botClient, chatId, order, cancellationToken);
+            return;
+        }
+
+        await botClient.SendTextMessageAsync(
+            chatId,
+            "پرداخت تایید شد، اما تکمیل سفارش با خطا روبه‌رو شد. موضوع برای بررسی ثبت شد.",
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Replays stored account details for a tenant order that has already been fulfilled.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client used to post the explanatory status message.</param>
+    /// <param name="chatId">Telegram chat id where the customer clicked the status-check button.</param>
+    /// <param name="order">Fulfilled tenant order whose stored account details should be resent.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <returns>A task that completes after the resend attempt and status message have finished.</returns>
+    /// <remarks>
+    /// This is the duplicate-safe path for old payment buttons, repeated manual checks, and callbacks after
+    /// IPN or Sales Assistant fulfillment. It does not touch payment status, owner balance, ledger rows, or XUI.
+    /// </remarks>
+    private async Task RESENDFULFILLEDTENANTORDERTOCUSTOMERASYNC(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        TenantBotOrder order,
+        CancellationToken cancellationToken)
+    {
+        var sent = await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: true, sendOwner: false, CancellationToken: cancellationToken);
+        await botClient.SendTextMessageAsync(
+            chatId,
+            sent
+                ? "✅ این سفارش قبلاً تایید شده بود. مشخصات اکانت دوباره برای شما ارسال شد."
+                : "✅ این سفارش قبلاً تایید شده بود، اما مشخصات ذخیره‌شده‌ای برای ارسال مجدد پیدا نشد. لطفاً با پشتیبانی تماس بگیرید.",
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -4194,18 +4914,29 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// sends the created account details, and qr code when A subscription link exists, to the tenant customer.
+    /// Sends the created account details to the tenant customer after fulfillment.
     /// </summary>
     /// <param name="order">fulfilled tenant order containing the target customer chat.</param>
     /// <param name="created">result returned by the XuiV3 purchase service after account creation.</param>
-    /// <param name="CancellationToken">Cancellation Token for Telegram delivery.</param>
+    /// <param name="CancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <remarks>
+    /// Delivery is best-effort and intentionally does not throw back into fulfillment. A Telegram delivery
+    /// failure after XUI creation and ledger writes must not mark the already-created order as failed.
+    /// </remarks>
     private async Task NOTIFYTENANTCUSTOMERSUCCESSASYNC(TenantBotOrder order, XuiV3AccountCreationResult created, CancellationToken CancellationToken)
     {
-        await SENDCREATEDACCOUNTDETAILSASYNC(
-            _botClientProvider.GetClient(order.TenantBotId),
-            order.CustomerChatId,
-            created,
-            CancellationToken);
+        try
+        {
+            await SENDCREATEDACCOUNTDETAILSASYNC(
+                _botClientProvider.GetClient(order.TenantBotId),
+                GetTenantCustomerDeliveryChatId(order),
+                created,
+                CancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Tenant account delivery to customer failed after fulfillment. orderId={OrderId}", order.OrderId);
+        }
     }
 
     /// <summary>
@@ -4235,7 +4966,7 @@ public class TenantBotService
         {
             try
             {
-                await SENDCREATEDACCOUNTDETAILSASYNC(tenantClient, order.CustomerChatId, created, CancellationToken);
+                await SENDCREATEDACCOUNTDETAILSASYNC(tenantClient, GetTenantCustomerDeliveryChatId(order), created, CancellationToken);
             }
             catch (Exception ex)
             {
@@ -4268,6 +4999,26 @@ public class TenantBotService
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Resolves the best Telegram chat id for sending tenant order details to the buyer.
+    /// </summary>
+    /// <param name="order">
+    /// Tenant order that stores both the original customer chat id and the numeric Telegram user id.
+    /// </param>
+    /// <returns>
+    /// The original customer chat id when it is available; otherwise the buyer's Telegram user id as a private
+    /// chat fallback.
+    /// </returns>
+    /// <remarks>
+    /// Older or manually-created tenant orders may have <see cref="TenantBotOrder.CustomerChatId"/> unset.
+    /// Telegram private chat ids normally match user ids, so the fallback lets duplicate checks and manual
+    /// confirmations still deliver account details without changing order or wallet state.
+    /// </remarks>
+    private static ChatId GetTenantCustomerDeliveryChatId(TenantBotOrder order)
+    {
+        return order.CustomerChatId == 0 ? order.CustomerTelegramUserId : order.CustomerChatId;
     }
 
     /// <summary>
@@ -4416,11 +5167,20 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Builds the TARIFF Message shown inside A tenant storefront using public sale prices
-    /// or the tenant owner's custom markup over colleague cost.
+    /// Builds the tariff message shown inside a tenant storefront.
     /// </summary>
-    /// <param name="tenant">tenant Bot whose PRICING markup should be applied.</param>
-    /// <returns>Html-formatted TARIFF Text SUITABLE for Telegram messages.</returns>
+    /// <param name="tenant">
+    /// Tenant bot whose sale-price markup, enabled payment options, and storefront identity should be reflected
+    /// in the message.
+    /// </param>
+    /// <returns>
+    /// HTML-formatted Persian tariff text suitable for Telegram <c>ParseMode.Html</c>. Metered traffic options
+    /// below each service's configured <c>minimumTrafficGb</c> are omitted from the visible examples.
+    /// </returns>
+    /// <remarks>
+    /// Tenant pricing uses the same purchase rules as owned bots, then applies the tenant owner's sale-price
+    /// policy. The method is presentation-only and does not create orders or modify tenant state.
+    /// </remarks>
     private string BUILDTENANTTARIFFSTEXT(BotInstance tenant)
     {
         var Builder = new System.Text.StringBuilder();
@@ -4444,11 +5204,14 @@ public class TenantBotService
             }
             else
             {
-                var traffic = string.Join("، ", service.TrafficOptionsGb.OrderBy(x => x).Select(x => $"{x}GB"));
+                var visibleTrafficOptions = XuiV3PurchaseService.GetVisibleTrafficOptions(service);
+                var traffic = string.Join("، ", visibleTrafficOptions.Select(x => $"{x}GB"));
                 Builder.AppendLine($"• حجم‌ها: <code>{Html(traffic)}</code>");
                 foreach (var duration in service.DurationOptions.OrderBy(x => x.Days))
                 {
-                    var sampleTraffic = service.TrafficOptionsGb.OrderBy(x => x).FirstOrDefault();
+                    var sampleTraffic = visibleTrafficOptions.FirstOrDefault();
+                    if (sampleTraffic <= 0)
+                        continue;
                     var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, TrafficGb = sampleTraffic, DurationKey = duration.Key };
                     var samplePrice = CalculateTenantPrice(tenant, selection).SalePriceToman;
                     Builder.AppendLine($"• {Html(duration.DisplayName)} | نمونه {sampleTraffic}GB: <b>{Html(samplePrice.FormatCurrency())}</b>");
@@ -4897,6 +5660,52 @@ public class TenantBotService
         BotInstance tenant,
         CancellationToken CancellationToken)
     {
+        return await EnsureTenantCustomerJoinAsync(
+            botClient,
+            Message.Chat.Id,
+            Message.From.Id,
+            tenant,
+            CancellationToken);
+    }
+
+    /// <summary>
+    /// Checks the tenant forced-join rule for either a message or a callback query.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client used to call Telegram and send the join prompt.</param>
+    /// <param name="chatId">
+    /// Telegram chat id where the customer should receive the join prompt. This is usually the private chat
+    /// with the tenant bot, not the forced-join channel id.
+    /// </param>
+    /// <param name="telegramUserId">
+    /// Numeric Telegram user id whose channel membership is checked with <c>GetChatMember</c>.
+    /// Usernames or chat ids must not be passed here.
+    /// </param>
+    /// <param name="tenant">
+    /// Tenant bot that owns the forced-join channel list. Only this tenant's configured channels are checked.
+    /// </param>
+    /// <param name="CancellationToken">Cancellation token for Telegram API calls and prompt delivery.</param>
+    /// <param name="isJoinRetry">
+    /// <c>true</c> when the customer clicked the explicit "عضو شدم" button; the rejection message is then
+    /// phrased as a retry result instead of a first-time join prompt.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when forced join is disabled, no channel is configured, or the user is a member of every
+    /// configured channel; otherwise <c>false</c> after a join prompt has been sent.
+    /// </returns>
+    /// <remarks>
+    /// This method is intentionally used before every tenant customer message and callback action. It prevents
+    /// old inline buttons, payment checks, receipt uploads, and menu callbacks from bypassing mandatory join.
+    /// Telegram access errors are treated as a failed check so the storefront remains closed instead of
+    /// crashing or silently allowing the customer through.
+    /// </remarks>
+    private async Task<bool> EnsureTenantCustomerJoinAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        long telegramUserId,
+        BotInstance tenant,
+        CancellationToken CancellationToken,
+        bool isJoinRetry = false)
+    {
         if (!tenant.TenantMandatoryJoinEnabled)
             return true;
 
@@ -4908,17 +5717,27 @@ public class TenantBotService
         {
             try
             {
-                var member = await botClient.GetChatMemberAsync(channel, Message.From.Id, CancellationToken);
+                var member = await botClient.GetChatMemberAsync(channel, telegramUserId, CancellationToken);
                 if (member.Status is ChatMemberStatus.Member or ChatMemberStatus.Administrator or ChatMemberStatus.Creator)
                     continue;
 
-                await SENDTENANTJOINPROMPTASYNC(botClient, Message.Chat.Id, Channels, CancellationToken);
+                await SENDTENANTJOINPROMPTASYNC(
+                    botClient,
+                    chatId,
+                    Channels,
+                    CancellationToken,
+                    isJoinRetry ? "هنوز عضو کانال نشده‌اید. بعد از عضویت دوباره روی «عضو شدم» بزنید." : null);
                 return false;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "tenant forced-join check failed. TenantBotId={TenantBotId}, channel={channel}", tenant.Id, channel);
-                await SENDTENANTJOINPROMPTASYNC(botClient, Message.Chat.Id, Channels, CancellationToken);
+                await SENDTENANTJOINPROMPTASYNC(
+                    botClient,
+                    chatId,
+                    Channels,
+                    CancellationToken,
+                    "امکان تایید عضویت شما وجود ندارد. لطفاً مطمئن شوید در کانال عضو شده‌اید و دوباره تلاش کنید.");
                 return false;
             }
         }
@@ -4968,11 +5787,16 @@ public class TenantBotService
     /// <param name="ChatId">customer chat Id.</param>
     /// <param name="Channels">tenant channel ids or USERNAMES configured by the owner.</param>
     /// <param name="CancellationToken">Cancellation Token for Telegram delivery.</param>
+    /// <param name="PromptText">
+    /// Optional customer-facing text used when a retry or Telegram access error needs a more specific message.
+    /// When null, the default first-time join prompt is sent.
+    /// </param>
     private static async Task SENDTENANTJOINPROMPTASYNC(
         ITelegramBotClient botClient,
         ChatId ChatId,
         IReadOnlyCollection<string> Channels,
-        CancellationToken CancellationToken)
+        CancellationToken CancellationToken,
+        string PromptText = null)
     {
         var rows = Channels
             .Select(channel =>
@@ -4982,12 +5806,12 @@ public class TenantBotService
                     : channel;
                 return new[] { InlineKeyboardButton.WithUrl("عضویت در کانال", URL) };
             })
-            .Append(new[] { InlineKeyboardButton.WithCallbackData("عضو شدم", CUSTOMERCALLBACKPREFIX + "home") })
+            .Append(new[] { InlineKeyboardButton.WithCallbackData("عضو شدم", CUSTOMERCALLBACKPREFIX + "joincheck") })
             .ToArray();
 
         await botClient.SendTextMessageAsync(
             ChatId,
-            "برای استفاده از فروشگاه ابتدا در کانال معرفی‌شده عضو شوید و سپس دوباره تلاش کنید.",
+            PromptText ?? "برای استفاده از فروشگاه ابتدا در کانال معرفی‌شده عضو شوید و سپس دوباره تلاش کنید.",
             replyMarkup: new InlineKeyboardMarkup(rows),
             cancellationToken: CancellationToken);
     }
@@ -5075,6 +5899,10 @@ public class TenantBotService
         if (renewal.ShouldResetTraffic)
             await RESETTENANTRENEWEDTRAFFICASYNC(serverInfo, client.Email, cancellationToken);
 
+        client.TotalGB = renewal.Payload.TotalGB;
+        client.ExpiryTime = renewal.Payload.ExpiryTime;
+        client.Comment = renewal.Payload.Comment;
+
         var beforeBalance = owner.AccountBalance;
         var ownerDelta = debitOwnerBaseCost ? -order.BaseCostToman : order.ProfitToman;
         if (ownerDelta > 0)
@@ -5145,6 +5973,15 @@ public class TenantBotService
             botType: BotInstanceTypes.Tenant,
             cancellationToken: cancellationToken);
 
+        await _gozargahSiteSyncService.QueueUpdateAsync(
+            order.OwnerTelegramUserId,
+            order.CustomerTelegramUserId,
+            client,
+            serverInfo,
+            order.OrderId,
+            order.TenantBotId,
+            cancellationToken);
+
         await SENDTENANTRENEWSUCCESSASYNC(order, renewal, cancellationToken);
         await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, cancellationToken);
         await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, beforeBalance, afterBalance, cancellationToken);
@@ -5211,11 +6048,14 @@ public class TenantBotService
     /// <param name="input">Customer-provided account identifier.</param>
     /// <param name="cancellationToken">Cancellation token for panel API calls.</param>
     /// <returns>
-    /// The matched XUI client, or <c>null</c> when no client matches the normalized identifier.
+    /// The matched XUI client, or <c>null</c> when no client matches the normalized identifier or the panel
+    /// rejects a direct lookup with a not-found response.
     /// </returns>
     /// <remarks>
     /// This method only locates a candidate. Tenant ownership is checked separately by
-    /// <see cref="ClientBelongsToTenantCustomer"/> before renewal is allowed.
+    /// <see cref="ClientBelongsToTenantCustomer"/> before renewal is allowed. Direct <c>GET clients/get</c>
+    /// calls can return HTTP 404 for unknown emails, so those failures are treated as a miss and the method
+    /// falls back to listing clients instead of allowing an exception to stop the tenant receiver.
     /// </remarks>
     private async Task<XuiV3Client> FindTenantClientAsync(ServerInfo serverInfo, string input, CancellationToken cancellationToken)
     {
@@ -5223,27 +6063,52 @@ public class TenantBotService
         if (string.IsNullOrWhiteSpace(candidate))
             return null;
 
-        var direct = await ApiServicev3.GetClientAsync(serverInfo, _configuration, candidate, cancellationToken);
-        if (direct.Success && direct.Obj != null)
-            return direct.Obj;
+        try
+        {
+            var direct = await ApiServicev3.GetClientAsync(serverInfo, _configuration, candidate, cancellationToken);
+            if (direct.Success && direct.Obj != null)
+                return direct.Obj;
+        }
+        catch (XuiV3ApiException ex) when (ex.StatusCode == 404)
+        {
+            _logger.LogInformation(ex, "Tenant renewal direct XUI lookup returned not found. candidate={Candidate}", candidate);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Tenant renewal direct XUI lookup failed. candidate={Candidate}", candidate);
+        }
 
-        var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
-        var clients = clientsResponse.Obj ?? new List<XuiV3Client>();
-        return clients.FirstOrDefault(client =>
-            string.Equals(client.Email, candidate, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(client.Uuid, candidate, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(client.SubId, candidate, StringComparison.OrdinalIgnoreCase));
+        try
+        {
+            var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+            var clients = clientsResponse.Obj ?? new List<XuiV3Client>();
+            return clients.FirstOrDefault(client =>
+                string.Equals(client.Email, candidate, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(client.Uuid, candidate, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(client.SubId, candidate, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Tenant renewal client list lookup failed. candidate={Candidate}", candidate);
+            return null;
+        }
     }
 
     /// <summary>
     /// Normalizes account identifiers entered in tenant renewal flows.
     /// </summary>
     /// <param name="input">Raw customer input such as an email, UUID, VLESS link, VMess link, or subscription URL.</param>
-    /// <returns>A likely email, UUID, or subscription id; empty input returns <c>null</c>.</returns>
+    /// <returns>
+    /// A likely email, UUID, or subscription id. Empty input and Telegram slash commands return <c>null</c>
+    /// because commands must never be sent to the XUI <c>clients/get</c> endpoint as account identifiers.
+    /// </returns>
     private static string NormalizeTenantAccountInput(string input)
     {
         var value = input?.Trim();
         if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        if (value.StartsWith("/", StringComparison.Ordinal))
             return null;
 
         if (value.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
@@ -5287,20 +6152,150 @@ public class TenantBotService
     /// </summary>
     /// <param name="client">XUI client whose metadata and inbound ids are inspected.</param>
     /// <returns>The matching enabled service, or <c>null</c> when the client is outside active plan inbounds.</returns>
+    /// <remarks>
+    /// Tenant normal and unlimited services can share the same XUI inbound ids. Metadata is therefore trusted first.
+    /// If an older or link-changed account has no readable metadata, fallback inference uses the negative
+    /// first-use expiry convention to identify unlimited accounts; otherwise shared public inbounds resolve to
+    /// the normal metered service instead of incorrectly showing unlimited renewal plans.
+    /// </remarks>
     private XuiV3ServiceDefinition ResolveTenantServiceForClient(XuiV3Client client)
     {
         var metadata = TryReadTenantMetadata(client?.Comment);
+        var services = _purchaseService.GetEnabledServices();
         if (!string.IsNullOrWhiteSpace(metadata?.ServiceKey))
         {
-            var byMetadata = _purchaseService.GetEnabledServices()
+            var byMetadata = services
                 .FirstOrDefault(x => string.Equals(x.Key, metadata.ServiceKey, StringComparison.OrdinalIgnoreCase));
             if (byMetadata != null)
                 return byMetadata;
         }
 
         var inboundIds = GetTenantClientInboundIds(client, metadata);
-        return _purchaseService.GetEnabledServices()
-            .FirstOrDefault(service => service.InboundIds.Any(id => inboundIds.Contains(id)));
+        if (inboundIds.Count == 0)
+            return null;
+
+        var nationalService = services.FirstOrDefault(service =>
+            IsNationalTenantService(service) && ServiceHasAnyInbound(service, inboundIds));
+        if (nationalService != null)
+            return nationalService;
+
+        var normalService = services.FirstOrDefault(service =>
+            IsNormalTenantService(service) && ServiceHasAnyInbound(service, inboundIds));
+        if (normalService != null && !LooksLikeUnlimitedTenantClient(client, metadata))
+            return normalService;
+
+        var unlimitedService = services.FirstOrDefault(service =>
+            service.IsUnlimited && ServiceHasAnyInbound(service, inboundIds));
+        if (unlimitedService != null)
+            return unlimitedService;
+
+        return services.FirstOrDefault(service =>
+            !service.IsUnlimited && ServiceHasAnyInbound(service, inboundIds));
+    }
+
+    /// <summary>
+    /// Checks whether a tenant service definition represents the national metered service.
+    /// </summary>
+    /// <param name="service">Service definition loaded from the XUI v3 plan file.</param>
+    /// <returns><c>true</c> when the service key or inbound profile identifies national traffic.</returns>
+    private static bool IsNationalTenantService(XuiV3ServiceDefinition service)
+    {
+        return string.Equals(service?.Key, "national", StringComparison.OrdinalIgnoreCase) ||
+               (service?.InboundProfileKeys?.Any(key => string.Equals(key, "national", StringComparison.OrdinalIgnoreCase)) ?? false);
+    }
+
+    /// <summary>
+    /// Checks whether a tenant service definition represents the normal metered service.
+    /// </summary>
+    /// <param name="service">Service definition loaded from the XUI v3 plan file.</param>
+    /// <returns><c>true</c> when the service key or inbound profile identifies normal metered traffic.</returns>
+    private static bool IsNormalTenantService(XuiV3ServiceDefinition service)
+    {
+        return string.Equals(service?.Key, "normal", StringComparison.OrdinalIgnoreCase) ||
+               (service?.InboundProfileKeys?.Any(key => string.Equals(key, "normal", StringComparison.OrdinalIgnoreCase)) ?? false);
+    }
+
+    /// <summary>
+    /// Checks whether a tenant service overlaps at least one inbound id from an existing XUI client.
+    /// </summary>
+    /// <param name="service">Service definition whose inbound ids are tested.</param>
+    /// <param name="inboundIds">Inbound ids read from the XUI client and its metadata.</param>
+    /// <returns><c>true</c> when the service and client share at least one inbound id.</returns>
+    private static bool ServiceHasAnyInbound(XuiV3ServiceDefinition service, IReadOnlyCollection<int> inboundIds)
+    {
+        return service?.InboundIds != null &&
+               inboundIds != null &&
+               service.InboundIds.Any(inboundIds.Contains);
+    }
+
+    /// <summary>
+    /// Infers whether a tenant client is likely an unlimited account when metadata is missing.
+    /// </summary>
+    /// <param name="client">XUI client read from the panel.</param>
+    /// <param name="metadata">Parsed client metadata, when available.</param>
+    /// <returns>
+    /// <c>true</c> when metadata explicitly says unlimited or the panel expiry uses the negative
+    /// first-use-duration convention used by unlimited plans.
+    /// </returns>
+    /// <remarks>
+    /// This fallback intentionally does not classify by inbound ids alone because normal and unlimited storefront
+    /// plans can share the same inbounds. That exact ambiguity caused metered accounts to show unlimited renewal
+    /// options after link changes when the panel response did not include service metadata.
+    /// </remarks>
+    private static bool LooksLikeUnlimitedTenantClient(XuiV3Client client, XuiV3ClientMetadata metadata)
+    {
+        if (string.Equals(metadata?.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(metadata?.ServiceKey) &&
+            string.Equals(metadata.ServiceKey, "unlimited", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return GetTenantExpiryTime(client) < 0;
+    }
+
+    /// <summary>
+    /// Reads the XUI expiry timestamp from a tenant client using panel fields and known extra payload keys.
+    /// </summary>
+    /// <param name="client">XUI client returned by the panel; may omit the top-level expiry field.</param>
+    /// <returns>Expiry timestamp in milliseconds, <c>0</c> for lifetime, or a negative first-use duration.</returns>
+    private static long GetTenantExpiryTime(XuiV3Client client)
+    {
+        if (client == null)
+            return 0;
+
+        if (client.ExpiryTime != 0)
+            return client.ExpiryTime;
+
+        return ReadTenantLongExtra(client.Extra, "expiryTime", "expiry_time", "expiry");
+    }
+
+    /// <summary>
+    /// Reads a long value from a tenant client's raw XUI extra JSON.
+    /// </summary>
+    /// <param name="extra">Raw extra dictionary returned by the XUI panel.</param>
+    /// <param name="keys">Candidate property names that may hold the desired value.</param>
+    /// <returns>The first parsed long value, or <c>0</c> when no key is present.</returns>
+    private static long ReadTenantLongExtra(IDictionary<string, JToken> extra, params string[] keys)
+    {
+        if (extra == null || keys == null || keys.Length == 0)
+            return 0;
+
+        foreach (var key in keys)
+        {
+            if (string.IsNullOrWhiteSpace(key) || !extra.TryGetValue(key, out var token) || token == null)
+                continue;
+
+            if (token.Type == JTokenType.Integer)
+                return token.Value<long>();
+
+            if (long.TryParse(token.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+                return value;
+        }
+
+        return 0;
     }
 
     /// <summary>
@@ -5633,6 +6628,47 @@ public class TenantBotService
         /// Number of message events logged for the tenant bot that day.
         /// </summary>
         public int MessageCount { get; set; }
+    }
+
+    /// <summary>
+    /// Result object returned by the tenant token duplicate guard.
+    /// </summary>
+    /// <remarks>
+    /// The result intentionally stores only a conflict type label. It does not carry the conflicting token or
+    /// any other secret so it is safe to include in structured logs.
+    /// </remarks>
+    private sealed class TenantTokenConflictResult
+    {
+        /// <summary>
+        /// Shared no-conflict instance used when the token can be assigned to the current tenant owner.
+        /// </summary>
+        public static readonly TenantTokenConflictResult None = new();
+
+        /// <summary>
+        /// Indicates whether another bot already owns the entered token, token bot id, or username.
+        /// </summary>
+        public bool HasConflict { get; private init; }
+
+        /// <summary>
+        /// Non-secret source label such as <c>tenant-token</c> or <c>owned-username</c>.
+        /// </summary>
+        public string ConflictType { get; private init; }
+
+        /// <summary>
+        /// Creates a conflict result with a non-secret reason label.
+        /// </summary>
+        /// <param name="conflictType">
+        /// Short internal label describing which duplicate rule matched. The value must not include a token.
+        /// </param>
+        /// <returns>A result whose <see cref="HasConflict" /> property is <c>true</c>.</returns>
+        public static TenantTokenConflictResult Conflict(string conflictType)
+        {
+            return new TenantTokenConflictResult
+            {
+                HasConflict = true,
+                ConflictType = conflictType
+            };
+        }
     }
 
     /// <summary>

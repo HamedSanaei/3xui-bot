@@ -17,6 +17,34 @@ Treat missing XML documentation on any new or materially changed C# member as an
 
 ---
 
+## Required agent onboarding and code-map workflow
+
+Every AI agent working in this repository MUST treat this `AGENTS.md` file as the first project entry point.
+Before making changes, the agent MUST read this file and use it as the operating manual for understanding the repository rules, documentation expectations, source-text safety requirements, and final-response requirements.
+
+The repository MUST also maintain a root-level `CODE_MAP.md` file. If `CODE_MAP.md` does not exist, the agent MUST create it before or during the first task that modifies the codebase.
+
+`CODE_MAP.md` is a concise, token-efficient map of the project for future AI agents. Its purpose is to let other agents understand the repository quickly without rereading the entire project or wasting tokens on broad file inspection.
+It is not a replacement for source-code verification: agents MUST use the code map for orientation, then verify exact behavior in the real source files before editing.
+
+`CODE_MAP.md` should stay short and practical. Include, when relevant:
+
+- Project purpose and main runtime/application entry points.
+- Architecture overview, including major layers, projects, modules, and important folders.
+- Key services, handlers, stores, repositories, background jobs, and external integrations.
+- Important data models, database context files, migrations, and state/tenant/payment concepts.
+- Build, test, publish, and deployment commands that are known to work.
+- Configuration files, environment variables, and secret-handling notes without exposing actual secrets.
+- Current business rules, edge cases, and implementation gotchas that future agents must know.
+- Recently changed files and the reason they changed, when that helps future work.
+
+After every AI-assisted coding or repository-editing task, the agent MUST update `CODE_MAP.md` when the task changes project structure, important files, architecture, business rules, commands, integrations, or any behavior that future agents should know.
+The update must be concise and must not paste large code blocks, full file contents, generated output, secrets, credentials, tokens, private keys, or irrelevant file lists.
+
+Before finalizing a task, the agent MUST review the diff for both the actual code changes and any `CODE_MAP.md` changes. If `CODE_MAP.md` was not updated because the task did not affect project knowledge, the final response should say that no code-map update was needed.
+
+---
+
 ## Critical source-text safety rule: preserve UTF-8 Persian and emoji text
 
 This repository contains Persian/RTL Telegram messages, payment texts, reply keyboards, inline buttons, admin-panel labels, Sales Assistant messages, and emoji. These strings are production UI. Codex MUST treat every non-ASCII source string as user-visible behavior, not as disposable formatting.
@@ -408,6 +436,8 @@ Before completing any task, Codex MUST review the diff and verify:
 10. Every touched file containing Persian/RTL text or emoji was reviewed in `git diff` for exact readable text, emoji preservation, and casing preservation.
 11. Touched files were checked for mojibake markers such as `Ø`, `Ù`, `Û`, `Ã`, `Â`, `�`, and unexpected `????`.
 12. Any Telegram/customer-facing Persian label changed by the patch was manually compared against the intended label; `dotnet build` alone was not treated as proof that the UI text is correct.
+13. `CODE_MAP.md` was created or updated when the task changed project structure, important files, architecture, business rules, commands, integrations, or future-agent context.
+14. If `CODE_MAP.md` was not updated, the agent can explain why the task did not require a code-map change.
 
 Use `git diff` before finalizing the patch.
 
@@ -415,12 +445,16 @@ Use `git diff` before finalizing the patch.
 
 ## Final response requirement
 
+After coding, Codex must always include a concise `Suggested commit name` or `Suggested commit message` that the user can use for the Git/GitHub commit related to the completed change.
+
 After coding, Codex must include a short section named `Documentation added` and mention:
 
 - Which files received new or updated XML documentation comments.
 - Which important methods, classes, or properties were documented.
 - Which inline comments were added for complex implementation logic.
 - Any area that still needs human review because exact business behavior was ambiguous.
+
+Codex must also mention whether `CODE_MAP.md` was created, updated, or intentionally left unchanged because the task did not affect future-agent project context.
 
 When the patch touches any file containing Persian/RTL text or emoji, Codex must also include a short section named `Source text safety checked` and mention:
 

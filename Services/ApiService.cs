@@ -127,12 +127,6 @@ public class ApiService
                 Username = username,
                 Password = password
             };
-            string completeSessionCookie = string.Empty;
-            var loginData = new
-            {
-                Username = username,
-                Password = password
-            };
 
             //check the databas if exist return
             using var context = new UserDbContext();

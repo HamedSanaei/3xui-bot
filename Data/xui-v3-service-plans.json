@@ -22,6 +22,7 @@
         "user": 145000,
         "colleague": 96000
       },
+      "minimumTrafficGb": 1,
       "trafficOptionsGb": [
         1,
         2,
@@ -75,6 +76,7 @@
         "user": 9000,
         "colleague": 5000
       },
+      "minimumTrafficGb": 10,
       "trafficOptionsGb": [
         50,
         100,

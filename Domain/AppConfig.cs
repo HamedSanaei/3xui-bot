@@ -61,6 +61,34 @@ namespace Adminbot.Domain
         public string HooshPayBaseUrl { get; set; } = "https://pay.hooshnet.com";
         public string HooshPayIpnUrl { get; set; }
         public string HooshPayReturnUrl { get; set; }
+        /// <summary>
+        /// Enables synchronization of XUI v3 account lifecycle events with the Gozargah website API.
+        /// </summary>
+        public bool GozargahSiteSyncEnabled { get; set; }
+        /// <summary>
+        /// API endpoint used for all Gozargah website actions. The API expects the action name in the JSON body.
+        /// </summary>
+        public string GozargahSiteApiBaseUrl { get; set; } = "https://api.gozargah.network/api.php";
+        /// <summary>
+        /// Bearer token used when calling the Gozargah website API. This secret must never be written to logs.
+        /// </summary>
+        public string GozargahSiteApiKey { get; set; }
+        /// <summary>
+        /// Enables the "Gozargah site wallet" payment method inside bot account purchase and renewal flows.
+        /// </summary>
+        public bool GozargahSiteWalletPaymentsEnabled { get; set; }
+        /// <summary>
+        /// Enables realtime create-order sync events after XUI v3 account creation succeeds.
+        /// </summary>
+        public bool GozargahSiteRealtimeCreateSyncEnabled { get; set; } = true;
+        /// <summary>
+        /// Enables realtime update-order sync events after XUI v3 renewal, edit, or link-change succeeds.
+        /// </summary>
+        public bool GozargahSiteRealtimeUpdateSyncEnabled { get; set; } = true;
+        /// <summary>
+        /// Enables realtime delete-order sync events after XUI v3 account deletion succeeds.
+        /// </summary>
+        public bool GozargahSiteRealtimeDeleteSyncEnabled { get; set; } = true;
         public string Iransocks5 { get; set; }
         public string AbanTetherTrxUrl { get; set; }
         public string AbanTetherUsdtUrl { get; set; }

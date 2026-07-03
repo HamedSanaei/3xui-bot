@@ -12,6 +12,15 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
+/// <summary>
+/// Queues and sends Telegram broadcast jobs with retry, progress tracking, and refreshable status messages.
+/// </summary>
+/// <remarks>
+/// A broadcast job can use two different bots: <see cref="BroadcastJob.SenderBotId"/> sends the actual
+/// recipient messages, while <see cref="BroadcastJob.StatusBotId"/> edits the admin/owner progress message.
+/// This keeps tenant broadcasts isolated to the tenant bot audience without moving the owner progress UI out
+/// of the owned bot that started the job.
+/// </remarks>
 public class BroadcastManager : IHostedService, IDisposable
 {
     private readonly BotClientProvider _botClientProvider;
@@ -25,6 +34,17 @@ public class BroadcastManager : IHostedService, IDisposable
     private Task _workerTask;
     private int _disposed;
 
+    /// <summary>
+    /// Creates the shared broadcast queue worker.
+    /// </summary>
+    /// <param name="botClientProvider">
+    /// Runtime Telegram client provider used to resolve both sender bots and status-message bots by internal
+    /// bot id.
+    /// </param>
+    /// <param name="configuration">
+    /// Application configuration that supplies broadcast delay, retry count, and queue capacity.
+    /// </param>
+    /// <param name="logger">Logger used for broadcast delivery and worker failures.</param>
     public BroadcastManager(
         BotClientProvider botClientProvider,
         IConfiguration configuration,
@@ -46,6 +66,11 @@ public class BroadcastManager : IHostedService, IDisposable
         });
     }
 
+    /// <summary>
+    /// Starts the background broadcast queue reader.
+    /// </summary>
+    /// <param name="cancellationToken">Host shutdown token supplied by ASP.NET Core.</param>
+    /// <returns>A completed task after the queue worker has been scheduled.</returns>
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _workerTask ??= Task.Run(() => ProcessQueueAsync(_shutdown.Token), CancellationToken.None);
@@ -53,6 +78,11 @@ public class BroadcastManager : IHostedService, IDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Stops the broadcast queue reader and waits briefly for the current worker loop to exit.
+    /// </summary>
+    /// <param name="cancellationToken">Host shutdown token that limits the wait time.</param>
+    /// <returns>A task that completes when the worker has stopped or the shutdown wait has elapsed.</returns>
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _queue.Writer.TryComplete();
@@ -70,13 +100,47 @@ public class BroadcastManager : IHostedService, IDisposable
         }
     }
 
+    /// <summary>
+    /// Creates a broadcast job and enqueues one delivery item for each destination chat.
+    /// </summary>
+    /// <param name="chatIds">
+    /// Numeric Telegram private chat ids that should receive the broadcast. Values less than or equal to zero
+    /// are ignored and duplicate ids are removed before queueing.
+    /// </param>
+    /// <param name="template">
+    /// Broadcast template containing either plain text or a Telegram source chat/message pair for forwarding.
+    /// The template must not contain a recipient chat id.
+    /// </param>
+    /// <param name="adminChatId">
+    /// Telegram chat id where the refreshable status message already exists. For tenant broadcasts this is the
+    /// colleague owner's owned-bot chat, not a tenant customer chat.
+    /// </param>
+    /// <param name="statusMessageId">Telegram message id of the status/progress message to edit.</param>
+    /// <param name="requestedByTelegramUserId">
+    /// Numeric Telegram user id of the super-admin or tenant owner who started the broadcast. Only this user
+    /// or a super-admin may refresh the status callback.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for queue writes.</param>
+    /// <param name="senderBotId">
+    /// Optional internal bot id that should send recipient messages. Pass a tenant bot id for tenant storefront
+    /// broadcasts. When omitted, the current bot context is used for both delivery and status updates.
+    /// </param>
+    /// <returns>
+    /// The in-memory broadcast job. The caller can pass <see cref="BroadcastJob.Id"/> to
+    /// <see cref="RefreshStatusMessageAsync"/> to immediately render progress.
+    /// </returns>
+    /// <remarks>
+    /// This method is tenant-safe only when the caller supplies an already-filtered audience. It does not read
+    /// users from any database and does not broaden the recipient list.
+    /// </remarks>
     public async Task<BroadcastJob> EnqueueAsync(
         IEnumerable<long> chatIds,
         BroadcastItem template,
         long adminChatId,
         int statusMessageId,
         long requestedByTelegramUserId,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string senderBotId = null)
     {
         if (template == null)
             throw new ArgumentNullException(nameof(template));
@@ -85,6 +149,8 @@ public class BroadcastManager : IHostedService, IDisposable
             .Where(id => id > 0)
             .Distinct()
             .ToList() ?? new List<long>();
+        var statusBotId = BotContextAccessor.CurrentBotId;
+        var deliveryBotId = string.IsNullOrWhiteSpace(senderBotId) ? statusBotId : senderBotId;
         var job = new BroadcastJob
         {
             Id = Guid.NewGuid().ToString("N")[..10],
@@ -93,7 +159,9 @@ public class BroadcastManager : IHostedService, IDisposable
             RequestedByTelegramUserId = requestedByTelegramUserId,
             Total = normalizedChatIds.Count,
             IsForward = template.IsForward,
-            BotId = BotContextAccessor.CurrentBotId,
+            BotId = statusBotId,
+            StatusBotId = statusBotId,
+            SenderBotId = deliveryBotId,
             CreatedAtUtc = DateTime.UtcNow,
             UpdatedAtUtc = DateTime.UtcNow
         };
@@ -109,7 +177,7 @@ public class BroadcastManager : IHostedService, IDisposable
                 FromChatId = template.FromChatId,
                 MessageId = template.MessageId,
                 IsForward = template.IsForward,
-                BotId = job.BotId
+                BotId = job.SenderBotId
             }, cancellationToken);
         }
 
@@ -299,6 +367,17 @@ public class BroadcastManager : IHostedService, IDisposable
         return job;
     }
 
+    /// <summary>
+    /// Re-renders the Telegram status message for an active or completed broadcast job.
+    /// </summary>
+    /// <param name="jobId">In-memory broadcast job id returned by <see cref="EnqueueAsync"/>.</param>
+    /// <param name="cancellationToken">Cancellation token for the Telegram edit call.</param>
+    /// <returns>A task that completes after the status message is edited or skipped.</returns>
+    /// <remarks>
+    /// Status edits use <see cref="BroadcastJob.StatusBotId"/>, not the sender bot. This is important for
+    /// tenant broadcasts where recipients must see the tenant bot but the owner progress message belongs to
+    /// the owned bot chat.
+    /// </remarks>
     public async Task RefreshStatusMessageAsync(string jobId, CancellationToken cancellationToken = default)
     {
         var job = GetJob(jobId);
@@ -320,7 +399,7 @@ public class BroadcastManager : IHostedService, IDisposable
 
     private async Task EditStatusMessageAsync(BroadcastJob job, CancellationToken cancellationToken)
     {
-        var bot = _botClientProvider.GetClient(job.BotId);
+        var bot = _botClientProvider.GetClient(job.StatusBotId ?? job.BotId);
         try
         {
             await bot.EditMessageTextAsync(
@@ -346,7 +425,7 @@ public class BroadcastManager : IHostedService, IDisposable
 
     private async Task SendFinalSummaryAsync(BroadcastJob job, CancellationToken cancellationToken)
     {
-        var bot = _botClientProvider.GetClient(job.BotId);
+        var bot = _botClientProvider.GetClient(job.StatusBotId ?? job.BotId);
         try
         {
             await bot.SendTextMessageAsync(
@@ -366,6 +445,11 @@ public class BroadcastManager : IHostedService, IDisposable
         }
     }
 
+    /// <summary>
+    /// Builds the inline refresh button shown under a broadcast status message.
+    /// </summary>
+    /// <param name="job">Broadcast job whose id is embedded in the callback data.</param>
+    /// <returns>Inline keyboard containing a single refresh button.</returns>
     public static InlineKeyboardMarkup BuildStatusKeyboard(BroadcastJob job)
     {
         return new InlineKeyboardMarkup(new[]
@@ -377,6 +461,15 @@ public class BroadcastManager : IHostedService, IDisposable
         });
     }
 
+    /// <summary>
+    /// Builds the HTML status text for live progress and final broadcast summaries.
+    /// </summary>
+    /// <param name="job">Broadcast job whose counters should be rendered.</param>
+    /// <param name="finalSummary">
+    /// Pass <c>true</c> when the text is being sent as a separate final summary message instead of editing the
+    /// live status message.
+    /// </param>
+    /// <returns>HTML-safe Telegram message text containing total, success, blocked, failed, and retry counts.</returns>
     public static string BuildStatusText(BroadcastJob job, bool finalSummary = false)
     {
         if (job == null)
@@ -448,38 +541,165 @@ public class BroadcastManager : IHostedService, IDisposable
         _shutdown.Dispose();
     }
 
+    /// <summary>
+    /// One queued Telegram delivery item inside a broadcast job.
+    /// </summary>
+    /// <remarks>
+    /// The item is created from a broadcast template and a single destination chat. <see cref="BotId"/> is the
+    /// internal bot id that sends this recipient message and may differ from the job status bot id.
+    /// </remarks>
     public class BroadcastItem
     {
+        /// <summary>
+        /// Numeric Telegram chat id that receives this item.
+        /// </summary>
         public long ChatId { get; set; }
+
+        /// <summary>
+        /// In-memory broadcast job id that owns this item.
+        /// </summary>
         public string JobId { get; set; }
+
+        /// <summary>
+        /// Text to send when <see cref="IsForward"/> is <c>false</c>.
+        /// </summary>
         public string Text { get; set; }
+
+        /// <summary>
+        /// Telegram source chat used when forwarding a channel post.
+        /// </summary>
         public ChatId FromChatId { get; set; }
+
+        /// <summary>
+        /// Telegram message id in <see cref="FromChatId"/> used for forwarded broadcasts.
+        /// </summary>
         public int MessageId { get; set; }
+
+        /// <summary>
+        /// Whether this item should forward an existing Telegram post instead of sending <see cref="Text"/>.
+        /// </summary>
         public bool IsForward { get; set; }
+
+        /// <summary>
+        /// Internal bot id that sends this recipient message.
+        /// </summary>
         public string BotId { get; set; }
+
+        /// <summary>
+        /// Number of retry attempts already consumed for this item.
+        /// </summary>
         internal int Attempt { get; set; }
     }
 
+    /// <summary>
+    /// In-memory progress record for a broadcast job.
+    /// </summary>
+    /// <remarks>
+    /// Jobs are not persisted across process restarts. Counters are updated by the single broadcast worker and
+    /// guarded by <see cref="SyncRoot"/> because Telegram callback refreshes can read them concurrently.
+    /// </remarks>
     public class BroadcastJob
     {
         internal object SyncRoot { get; } = new();
+
+        /// <summary>
+        /// Short in-memory id used in status callback data.
+        /// </summary>
         public string Id { get; set; }
+
+        /// <summary>
+        /// Telegram chat id where the status message is edited and the final summary is sent.
+        /// </summary>
         public long AdminChatId { get; set; }
+
+        /// <summary>
+        /// Telegram message id of the refreshable status message.
+        /// </summary>
         public int StatusMessageId { get; set; }
+
+        /// <summary>
+        /// Telegram user id of the admin or tenant owner who started the broadcast.
+        /// </summary>
         public long RequestedByTelegramUserId { get; set; }
+
+        /// <summary>
+        /// Total number of unique recipient chats queued for the job.
+        /// </summary>
         public int Total { get; set; }
+
+        /// <summary>
+        /// Number of queued recipient items that have reached a terminal sent, blocked, or failed state.
+        /// </summary>
         public int Processed { get; set; }
+
+        /// <summary>
+        /// Number of recipient messages successfully sent or forwarded.
+        /// </summary>
         public int Sent { get; set; }
+
+        /// <summary>
+        /// Number of recipients that blocked the bot or denied private-message delivery.
+        /// </summary>
         public int Blocked { get; set; }
+
+        /// <summary>
+        /// Number of recipient deliveries that failed for non-block reasons after retry handling.
+        /// </summary>
         public int Failed { get; set; }
+
+        /// <summary>
+        /// Total retry attempts consumed across all queued items.
+        /// </summary>
         public int RetryAttempts { get; set; }
+
+        /// <summary>
+        /// Number of text messages resent without Markdown after Telegram rejected Markdown entities.
+        /// </summary>
         public int MarkdownFallbackSent { get; set; }
+
+        /// <summary>
+        /// Whether the broadcast forwards an existing Telegram post instead of sending plain text.
+        /// </summary>
         public bool IsForward { get; set; }
+
+        /// <summary>
+        /// Backward-compatible status bot id. New code should prefer <see cref="StatusBotId"/>.
+        /// </summary>
         public string BotId { get; set; }
+
+        /// <summary>
+        /// Internal bot id that edits progress and sends the final summary.
+        /// </summary>
+        public string StatusBotId { get; set; }
+
+        /// <summary>
+        /// Internal bot id that sends or forwards the broadcast to recipients.
+        /// </summary>
+        public string SenderBotId { get; set; }
+
+        /// <summary>
+        /// Telegram error code from the most recent failed delivery, or zero for non-Telegram failures.
+        /// </summary>
         public int LastErrorCode { get; set; }
+
+        /// <summary>
+        /// Most recent delivery error text, safe only for admin/owner status messages after HTML encoding.
+        /// </summary>
         public string LastError { get; set; }
+
+        /// <summary>
+        /// UTC timestamp when the job was queued.
+        /// </summary>
         public DateTime CreatedAtUtc { get; set; }
+
+        /// <summary>
+        /// UTC timestamp of the latest counter update.
+        /// </summary>
         public DateTime UpdatedAtUtc { get; set; }
+
+        /// <summary>
+        /// UTC timestamp when all queued items reached a terminal state, or <c>null</c> while still running.
+        /// </summary>
         public DateTime? CompletedAtUtc { get; set; }
     }
 

@@ -127,8 +127,13 @@ public class ApiServicev3
             };
         }
 
+        var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
+        var panelClient = panelClientResponse.Success && panelClientResponse.Obj != null
+            ? panelClientResponse.Obj
+            : null;
         var links = await GetClientLinksAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
         var configLink = links.Obj?.FirstOrDefault();
+        var linkUuid = TryExtractUuidFromConfigLink(configLink, out var extractedUuid) ? extractedUuid : null;
         var subLink = BuildSubscriptionLink(accountDto.ServerInfo, client.SubId ?? client.Email);
 
         if (options.SaveUserStatus)
@@ -153,15 +158,16 @@ public class ApiServicev3
         {
             Success = true,
             ApiVersion = XuiPanelApiVersion.V3,
-            Email = client.Email,
-            SubId = client.SubId,
+            Email = panelClient?.Email ?? client.Email,
+            Uuid = FirstNonWhiteSpace(panelClient?.Uuid, linkUuid, client.Uuid),
+            SubId = FirstNonWhiteSpace(panelClient?.SubId, client.SubId),
             ConfigLink = configLink,
             SubLink = subLink,
             TrafficGb = trafficGb,
             TrafficBytes = trafficBytes,
-            ExpiryTime = client.ExpiryTime,
+            ExpiryTime = panelClient?.ExpiryTime ?? client.ExpiryTime,
             DurationDays = options.DurationDays,
-            Comment = client.Comment,
+            Comment = FirstNonWhiteSpace(panelClient?.Comment, client.Comment),
             InboundIds = inboundIds,
             RawResponse = response.Obj
         };
@@ -1055,6 +1061,26 @@ public class ApiServicev3
         return Uri.EscapeDataString(value ?? "");
     }
 
+    /// <summary>
+    /// Builds the client object that is sent to the XUI v3 <c>addClient</c> API.
+    /// </summary>
+    /// <param name="accountDto">
+    /// User-facing account request from the bot flow. It supplies Telegram owner id, selected period, service key,
+    /// traffic fallback, generated email counter, and target panel information.
+    /// </param>
+    /// <param name="options">
+    /// Resolved v3 creation options from the purchase service, including traffic bytes, duration, IP limit, comment
+    /// metadata, subscription id override, and first-use-expiry behavior.
+    /// </param>
+    /// <returns>
+    /// A panel payload with traffic limit in bytes, expiry time in milliseconds, Telegram id, subscription id, and JSON
+    /// comment metadata. The UUID is intentionally left to 3x-ui so the returned result can use the panel's real value.
+    /// </returns>
+    /// <remarks>
+    /// After the add request succeeds, <see cref="CreateUserAccountAsync"/> reads the client back from the panel and
+    /// exposes that real panel UUID through <see cref="XuiV3AccountCreationResult.Uuid"/>. Do not generate an arbitrary
+    /// UUID here, because the Gozargah website sync must match the account actually stored in 3x-ui.
+    /// </remarks>
     private static XuiV3ClientPayload BuildClientPayload(AccountDto accountDto, XuiV3CreateAccountOptions options)
     {
         var trafficGb = options.TrafficGb > 0 ? options.TrafficGb : Convert.ToInt32(accountDto.TotoalGB);
@@ -1088,6 +1114,61 @@ public class ApiServicev3
             Flow = options.UseVisionFlow ? "xtls-rprx-vision" : null,
             Comment = options.Comment
         };
+    }
+
+    /// <summary>
+    /// Extracts the real panel UUID from a direct VLESS or VMess link returned by 3x-ui.
+    /// </summary>
+    /// <param name="configLink">
+    /// Direct configuration link returned by <c>GetClientLinksAsync</c>. VLESS links store the UUID before
+    /// <c>@</c>; VMess links store it in the decoded JSON <c>id</c> field.
+    /// </param>
+    /// <param name="uuid">Extracted UUID when the method returns <c>true</c>; otherwise <c>null</c>.</param>
+    /// <returns><c>true</c> when a valid UUID was found in the panel-generated link; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// This is a fallback for panels that omit <c>uuid</c> from the client lookup response but still return a valid
+    /// direct config link. The value is panel-derived and must not be replaced with a locally generated UUID.
+    /// </remarks>
+    private static bool TryExtractUuidFromConfigLink(string configLink, out string uuid)
+    {
+        uuid = null;
+        if (string.IsNullOrWhiteSpace(configLink))
+            return false;
+
+        var value = configLink.Trim();
+        if (value.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
+        {
+            var rest = value["vless://".Length..];
+            var atIndex = rest.IndexOf('@');
+            if (atIndex > 0 && Guid.TryParse(rest[..atIndex], out var parsed))
+            {
+                uuid = parsed.ToString();
+                return true;
+            }
+        }
+
+        if (value.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase))
+        {
+            var encoded = value["vmess://".Length..].Trim();
+            try
+            {
+                encoded = encoded.PadRight(encoded.Length + ((4 - encoded.Length % 4) % 4), '=');
+                var json = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
+                var token = JObject.Parse(json);
+                var candidate = token["id"]?.ToString();
+                if (Guid.TryParse(candidate, out var parsed))
+                {
+                    uuid = parsed.ToString();
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        return false;
     }
 
     public static string BuildSubscriptionLink(ServerInfo serverInfo, string subId)
@@ -1164,21 +1245,90 @@ public class XuiV3CreateAccountOptions
     public bool StartExpiryAfterFirstUse { get; set; }
 }
 
+/// <summary>
+/// Result returned after the bot creates one XUI v3 client on the configured 3x-ui panel.
+/// </summary>
+/// <remarks>
+/// The object is used both for Telegram delivery and for downstream integrations such as tenant order
+/// fulfillment and the Gozargah site sync outbox. Values come from the panel payload that was accepted by
+/// 3x-ui, so callers may safely use <see cref="Email"/>, <see cref="Uuid"/>, and <see cref="SubId"/> as
+/// idempotency keys for external systems after <see cref="Success"/> is <c>true</c>.
+/// </remarks>
 public class XuiV3AccountCreationResult
 {
+    /// <summary>
+    /// Indicates whether 3x-ui accepted the client creation request.
+    /// </summary>
     public bool Success { get; set; }
+
+    /// <summary>
+    /// API version used for the successful or failed panel operation.
+    /// </summary>
     public XuiPanelApiVersion ApiVersion { get; set; }
+
+    /// <summary>
+    /// Human-readable result message from the bot or panel API.
+    /// </summary>
     public string Message { get; set; }
+
+    /// <summary>
+    /// XUI client email/name generated by the bot and used as the main account identifier.
+    /// </summary>
     public string Email { get; set; }
+
+    /// <summary>
+    /// UUID assigned to the XUI client. This value is required by VLESS links and by website sync payloads.
+    /// </summary>
+    public string Uuid { get; set; }
+
+    /// <summary>
+    /// Subscription id attached to the client. When empty, callers usually fall back to <see cref="Email"/>.
+    /// </summary>
     public string SubId { get; set; }
+
+    /// <summary>
+    /// Direct configuration link returned or built for the created account.
+    /// </summary>
     public string ConfigLink { get; set; }
+
+    /// <summary>
+    /// Subscription URL that can be sent to the Telegram user.
+    /// </summary>
     public string SubLink { get; set; }
+
+    /// <summary>
+    /// Traffic allowance in gigabytes for display and audit metadata.
+    /// </summary>
     public int TrafficGb { get; set; }
+
+    /// <summary>
+    /// Traffic allowance in bytes as sent to the 3x-ui panel.
+    /// </summary>
     public long TrafficBytes { get; set; }
+
+    /// <summary>
+    /// Expiry timestamp in milliseconds, or a negative first-use duration for unlimited accounts.
+    /// </summary>
     public long ExpiryTime { get; set; }
+
+    /// <summary>
+    /// Duration in days selected by the user, or <c>null</c> when the plan does not have a fixed day count.
+    /// </summary>
     public int? DurationDays { get; set; }
+
+    /// <summary>
+    /// JSON comment stored on the XUI client. It contains bot, user, service, plan, and audit metadata.
+    /// </summary>
     public string Comment { get; set; }
+
+    /// <summary>
+    /// XUI inbound ids used when attaching the client to the panel.
+    /// </summary>
     public List<int> InboundIds { get; set; } = new List<int>();
+
+    /// <summary>
+    /// Raw panel response retained for diagnostics. Do not expose this value directly to Telegram users.
+    /// </summary>
     public JToken RawResponse { get; set; }
 }
 

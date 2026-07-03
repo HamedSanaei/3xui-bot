@@ -57,6 +57,7 @@ public class XuiV3BotFlowService
     private readonly ILogger<XuiV3BotFlowService> _logger;
     private readonly UserActivityLogService _activityLog;
     private readonly WalletLedgerService _walletLedgerService;
+    private readonly GozargahSiteSyncService _gozargahSiteSyncService;
 
     /// <summary>
     /// Creates the shared XUI v3 customer-flow service used by owned bots and tenant storefront bots.
@@ -84,6 +85,10 @@ public class XuiV3BotFlowService
     /// Append-only wallet ledger writer. It records wallet debits for purchases and renewals in toman so
     /// customers and admins can audit balance changes later.
     /// </param>
+    /// <param name="gozargahSiteSyncService">
+    /// Gozargah website sync service used to publish successful XUI v3 account creates, renewals, deletes,
+    /// and link changes without making the website database a blocking source of truth.
+    /// </param>
     /// <remarks>
     /// This service is intentionally shared between owned bots and tenant storefronts. Tenant callers must
     /// set the active bot context before invoking it so state reads and callback handling stay scoped to the
@@ -97,7 +102,8 @@ public class XuiV3BotFlowService
         IConfiguration configuration,
         ILogger<XuiV3BotFlowService> logger,
         UserActivityLogService activityLog,
-        WalletLedgerService walletLedgerService)
+        WalletLedgerService walletLedgerService,
+        GozargahSiteSyncService gozargahSiteSyncService)
     {
         _purchaseService = purchaseService;
         _sessionStore = sessionStore;
@@ -108,6 +114,7 @@ public class XuiV3BotFlowService
         _logger = logger;
         _activityLog = activityLog;
         _walletLedgerService = walletLedgerService;
+        _gozargahSiteSyncService = gozargahSiteSyncService;
     }
 
     public bool IsEnabledForPurchaseFlow()
@@ -797,6 +804,17 @@ public class XuiV3BotFlowService
                             ["deletedAccounts"] = string.Join(",", deleted)
                         },
                         cancellationToken);
+
+                    foreach (var deletedClient in eligibleClients.Where(client => deleted.Contains(client.Email, StringComparer.OrdinalIgnoreCase)))
+                    {
+                        await _gozargahSiteSyncService.QueueDeleteAsync(
+                            ResolveGozargahSiteOwnerTelegramUserId(credUser),
+                            credUser.TelegramUserId,
+                            deletedClient,
+                            $"delete-expired-{deletedClient.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                            ResolveGozargahTenantBotId(),
+                            cancellationToken: cancellationToken);
+                    }
                 }
 
                 return true;
@@ -902,6 +920,35 @@ public class XuiV3BotFlowService
         }
     }
 
+    /// <summary>
+    /// Handles a text step in the owned-bot XUI v3 renewal flow.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram client for the currently active owned bot that received the renewal message.
+    /// </param>
+    /// <param name="message">
+    /// Customer or colleague message containing either a cancellation command or a manually entered
+    /// renewal traffic amount in GB.
+    /// </param>
+    /// <param name="credUser">
+    /// Shared credentials profile for the Telegram sender. The colleague flag on this profile controls
+    /// renewal pricing and wallet checks.
+    /// </param>
+    /// <param name="user">
+    /// Bot-scoped conversation state for the renewal flow. The selected service key and target account
+    /// are read from this state and cleared when the flow is cancelled or becomes invalid.
+    /// </param>
+    /// <param name="mainReplyMarkup">
+    /// Reply keyboard used when the renewal flow ends, is cancelled, or must return the user to the main menu.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancellation token for Telegram, database, pricing, and state persistence operations.
+    /// </param>
+    /// <remarks>
+    /// The method validates typed traffic against the service-level minimum from
+    /// <c>xui-v3-service-plans.json</c> before building the renewal summary. Invalid traffic keeps the
+    /// user inside the renewal flow and shows the filtered traffic keyboard again.
+    /// </remarks>
     private async Task HandleRenewFlowStepAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -945,6 +992,16 @@ public class XuiV3BotFlowService
                 return;
             }
 
+            if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, trafficGb))
+            {
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: BuildMinimumTrafficMessage(service),
+                    replyMarkup: BuildTrafficReplyKeyboard(service),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
             await _userDbContext.SaveUserStatus(new User
             {
                 Id = message.From.Id,
@@ -983,11 +1040,15 @@ public class XuiV3BotFlowService
             });
 
             var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
+            var canUseSiteWallet = await CanUseGozargahSiteWalletAsync(
+                credUser.TelegramUserId,
+                ResolveRenewPriceToman(refreshedUser, credUser.IsColleague),
+                cancellationToken);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: await BuildRenewSummaryAsync(refreshedUser, credUser.IsColleague, credUser.TelegramUserId, cancellationToken),
                 parseMode: ParseMode.Html,
-                replyMarkup: BuildConfirmReplyKeyboard(),
+                replyMarkup: BuildConfirmReplyKeyboard(canUseSiteWallet),
                 cancellationToken: cancellationToken);
             return;
         }
@@ -1014,18 +1075,23 @@ public class XuiV3BotFlowService
             });
 
             var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
+            var canUseSiteWallet = await CanUseGozargahSiteWalletAsync(
+                credUser.TelegramUserId,
+                ResolveRenewPriceToman(refreshedUser, credUser.IsColleague),
+                cancellationToken);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: await BuildRenewSummaryAsync(refreshedUser, credUser.IsColleague, credUser.TelegramUserId, cancellationToken),
                 parseMode: ParseMode.Html,
-                replyMarkup: BuildConfirmReplyKeyboard(),
+                replyMarkup: BuildConfirmReplyKeyboard(canUseSiteWallet),
                 cancellationToken: cancellationToken);
             return;
         }
 
         if (user.LastStep == RenewStepConfirm)
         {
-            if (!message.Text.Trim().Equals("تایید تمدید", StringComparison.OrdinalIgnoreCase))
+            var wantsSiteWalletRenew = message.Text.Trim().Equals("تایید تمدید با کیف پول سایت", StringComparison.OrdinalIgnoreCase);
+            if (!message.Text.Trim().Equals("تایید تمدید", StringComparison.OrdinalIgnoreCase) && !wantsSiteWalletRenew)
             {
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -1035,6 +1101,7 @@ public class XuiV3BotFlowService
                 return;
             }
 
+            user.PaymentMethod = wantsSiteWalletRenew ? "gozargah_site_wallet" : "credit";
             await CompleteRenewAsync(botClient, message, credUser, user, mainReplyMarkup, cancellationToken);
         }
     }
@@ -1058,7 +1125,8 @@ public class XuiV3BotFlowService
             };
 
         var resolved = _purchaseService.ResolvePurchase(selection, credUser.IsColleague);
-        if (credUser.AccountBalance < resolved.PriceToman)
+        var useSiteWallet = string.Equals(user.PaymentMethod, "gozargah_site_wallet", StringComparison.OrdinalIgnoreCase);
+        if (!useSiteWallet && credUser.AccountBalance < resolved.PriceToman)
         {
             await _activityLog.LogWarningAsync(
                 "xui_v3_renew_insufficient_balance",
@@ -1080,6 +1148,24 @@ public class XuiV3BotFlowService
                 replyMarkup: mainReplyMarkup,
                 cancellationToken: cancellationToken);
             return;
+        }
+
+        if (useSiteWallet)
+        {
+            var eligibility = await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
+                credUser.TelegramUserId,
+                resolved.PriceToman,
+                cancellationToken);
+            if (!eligibility.CanUse)
+            {
+                await _userDbContext.ClearUserStatus(user);
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: $"پرداخت تمدید با کیف پول سایت گذرگاه ممکن نیست.\n{eligibility.Message}",
+                    replyMarkup: mainReplyMarkup,
+                    cancellationToken: cancellationToken);
+                return;
+            }
         }
 
         await botClient.SendTextMessageAsync(
@@ -1138,23 +1224,56 @@ public class XuiV3BotFlowService
 
         var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
         var beforeBalance = credUser.AccountBalance;
-        await _credentialsDbContext.Pay(credUser, resolved.PriceToman);
-        var afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
-        // Wallet debits are written after the shared credentials balance changes so the
-        // ledger mirrors the persisted before/after balance that admins and users can audit.
-        await _walletLedgerService.RecordAsync(
-            credUser.TelegramUserId,
-            WalletLedgerDirections.Debit,
-            resolved.PriceToman,
-            beforeBalance,
-            afterBalance,
-            WalletLedgerReasons.AccountRenew,
-            provider: "wallet",
-            referenceType: "xui-v3-client",
-            referenceId: client.Email,
-            orderId: null,
-            description: $"XuiV3 renewal {client.Email}",
-            cancellationToken: cancellationToken);
+        var afterBalance = beforeBalance;
+        GozargahSiteWalletDebitResult siteWalletDebitResult = null;
+        if (useSiteWallet)
+        {
+            var debitResult = await _gozargahSiteSyncService.DeductSiteWalletAfterPanelSuccessAsync(
+                credUser.TelegramUserId,
+                resolved.PriceToman,
+                "xui-v3-client",
+                client.Email,
+                $"XuiV3 renewal via Gozargah site wallet: {client.Email}",
+                cancellationToken);
+            if (!debitResult.Success)
+            {
+                await _activityLog.LogWarningAsync(
+                    "gozargah_site_wallet_debit_failed_after_renew",
+                    credUser,
+                    false,
+                    new Dictionary<string, object>
+                    {
+                        ["accountEmail"] = client.Email,
+                        ["priceToman"] = resolved.PriceToman,
+                        ["error"] = debitResult.ErrorMessage ?? string.Empty
+                    },
+                    cancellationToken);
+            }
+            else
+            {
+                siteWalletDebitResult = debitResult;
+            }
+        }
+        else
+        {
+            await _credentialsDbContext.Pay(credUser, resolved.PriceToman);
+            afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
+            // Wallet debits are written after the shared credentials balance changes so the
+            // ledger mirrors the persisted before/after balance that admins and users can audit.
+            await _walletLedgerService.RecordAsync(
+                credUser.TelegramUserId,
+                WalletLedgerDirections.Debit,
+                resolved.PriceToman,
+                beforeBalance,
+                afterBalance,
+                WalletLedgerReasons.AccountRenew,
+                provider: "wallet",
+                referenceType: "xui-v3-client",
+                referenceId: client.Email,
+                orderId: null,
+                description: $"XuiV3 renewal {client.Email}",
+                cancellationToken: cancellationToken);
+        }
         await _userDbContext.ClearUserStatus(user);
 
         client.TotalGB = payload.TotalGB;
@@ -1173,7 +1292,7 @@ public class XuiV3BotFlowService
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
             text: "✅ تمدید با موفقیت انجام شد.\n\n" +
-                  BuildHtmlBalanceDeductionText(beforeBalance, resolved.PriceToman, afterBalance) +
+                  BuildSelectedWalletBalanceText(useSiteWallet, beforeBalance, resolved.PriceToman, afterBalance, siteWalletDebitResult) +
                   "\n\n" +
                   BuildV3ClientInfo(client, serverInfo, credUser.IsColleague),
             parseMode: ParseMode.Html,
@@ -1183,8 +1302,8 @@ public class XuiV3BotFlowService
             title: "تمدید اکانت نسخه ۳",
             credUser: credUser,
             priceToman: resolved.PriceToman,
-            beforeBalance: beforeBalance,
-            afterBalance: afterBalance,
+            beforeBalance: useSiteWallet && siteWalletDebitResult?.Success == true ? siteWalletDebitResult.BeforeWallet : beforeBalance,
+            afterBalance: useSiteWallet && siteWalletDebitResult?.Success == true ? siteWalletDebitResult.AfterWallet : afterBalance,
             details: new[]
             {
                 $"نام اکانت `{client.Email}`",
@@ -1221,6 +1340,15 @@ public class XuiV3BotFlowService
                 ["rootPath"] = serverInfo.RootPath
             },
             cancellationToken);
+
+        await _gozargahSiteSyncService.QueueUpdateAsync(
+            ResolveGozargahSiteOwnerTelegramUserId(credUser),
+            credUser.TelegramUserId,
+            client,
+            serverInfo,
+            $"renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+            ResolveGozargahTenantBotId(),
+            cancellationToken: cancellationToken);
     }
 
     private async Task<bool> ResetRenewedTrafficIfNeededAsync(
@@ -1245,6 +1373,22 @@ public class XuiV3BotFlowService
         return false;
     }
 
+    /// <summary>
+    /// Starts the regular XUI v3 purchase flow for an owned bot or tenant storefront customer.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the bot that received the purchase request.</param>
+    /// <param name="message">Incoming Telegram message that requested a new account purchase.</param>
+    /// <param name="credUser">Shared credentials profile of the buyer, including phone verification and wallet role.</param>
+    /// <param name="user">Bot-scoped conversation state row that will be reset and moved into the purchase flow.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram and users.db operations.</param>
+    /// <returns>
+    /// <c>true</c> when the request was handled by the v3 purchase flow; <c>false</c> when the v3 purchase flow is disabled.
+    /// </returns>
+    /// <remarks>
+    /// The method first removes the persistent reply keyboard before sending inline service buttons. This prevents owned-bot
+    /// users from pressing main-menu buttons in the middle of service, traffic, duration, or unlimited-plan selection.
+    /// Users can still return to the main menu with <c>/start</c>, which is exposed in the owned-bot command menu.
+    /// </remarks>
     public async Task<bool> TryStartPurchaseAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1267,6 +1411,12 @@ public class XuiV3BotFlowService
 
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
+            text: "فرایند خرید شروع شد. برای برگشت به منوی اصلی از /start استفاده کنید.",
+            replyMarkup: new ReplyKeyboardRemove(),
+            cancellationToken: cancellationToken);
+
+        await botClient.SendTextMessageAsync(
+            chatId: message.Chat.Id,
             text: "نوع سرویس را انتخاب کنید:",
             replyMarkup: _purchaseService.BuildServiceKeyboard(),
             cancellationToken: cancellationToken);
@@ -1286,6 +1436,43 @@ public class XuiV3BotFlowService
         return true;
     }
 
+    /// <summary>
+    /// Handles text replies that belong to the XUI v3 purchase state machine.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram bot client for the active owned bot or tenant storefront that received the message.
+    /// </param>
+    /// <param name="message">
+    /// Incoming Telegram message from the buyer. The method only consumes text messages while the bot-scoped
+    /// <paramref name="user"/> state is in the XUI v3 purchase flow.
+    /// </param>
+    /// <param name="credUser">
+    /// Shared credentials profile for the Telegram sender. The profile supplies wallet balance, colleague pricing,
+    /// phone verification state, and the numeric Telegram user id used by the in-memory purchase session.
+    /// </param>
+    /// <param name="user">
+    /// Bot-scoped conversation state from <c>users.db</c>. The state is used as the durable fallback when the in-memory
+    /// purchase session was lost after a restart or when another bot instance handles the next purchase step.
+    /// </param>
+    /// <param name="mainReplyMarkup">
+    /// Reply keyboard that returns the sender to the current bot's main menu after cancel, validation failure, or completion.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancellation token for Telegram, database, payment-precheck, and state-save operations.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the message belonged to the XUI v3 purchase flow and was handled; otherwise <c>false</c> so the
+    /// outer dispatcher can continue with other handlers.
+    /// </returns>
+    /// <remarks>
+    /// The method keeps purchase selection in an in-memory session for compact callback data, but critical fields such as
+    /// selected service and pending account count are also persisted in <paramref name="user"/>. Before building the final
+    /// summary, the service key is rehydrated from the durable state when the session value is blank, preventing crashes
+    /// such as "Service plan '' was not found" after a process restart or cross-instance dispatch.
+    ///
+    /// Metered traffic typed by the user is validated through <see cref="XuiV3PurchaseService.ResolvePurchase" />,
+    /// so owned bots and tenant bots apply the same minimum-traffic policy from the service-plan file.
+    /// </remarks>
     public async Task<bool> TryHandlePurchaseTextAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1313,7 +1500,10 @@ public class XuiV3BotFlowService
             return true;
 
         var selection = _sessionStore.GetOrCreate(credUser.TelegramUserId);
-        var service = FindService(selection.ServiceKey ?? user.SelectedCountry);
+        var serviceKey = string.IsNullOrWhiteSpace(selection.ServiceKey)
+            ? user.SelectedCountry
+            : selection.ServiceKey;
+        var service = FindService(serviceKey);
         if (service == null)
         {
             await botClient.SendTextMessageAsync(
@@ -1363,6 +1553,9 @@ public class XuiV3BotFlowService
                 ? string.Empty
                 : NormalizeUserComment(message.Text);
 
+            // A user may return to the optional-comment step after an app restart or session loss.
+            // Rehydrate the service key from the persisted bot state before building the payment summary.
+            selection.ServiceKey = service.Key;
             selection.AccountCount = XuiV3PurchaseService.NormalizeAccountCount(user.PendingAccountCount);
             selection.UserComment = userComment;
             _sessionStore.Set(credUser.TelegramUserId, selection);
@@ -1379,7 +1572,13 @@ public class XuiV3BotFlowService
                 chatId: message.Chat.Id,
                 text: _purchaseService.BuildSummaryText(selection, credUser.IsColleague),
                 parseMode: ParseMode.Html,
-                replyMarkup: _purchaseService.BuildConfirmKeyboard(selection),
+                replyMarkup: BuildPurchaseConfirmKeyboard(
+                    selection,
+                    await CanUseGozargahSiteWalletAsync(
+                        credUser.TelegramUserId,
+                        _purchaseService.ResolvePurchase(selection, credUser.IsColleague).PriceToman *
+                        XuiV3PurchaseService.NormalizeAccountCount(selection.AccountCount),
+                        cancellationToken)),
                 cancellationToken: cancellationToken);
             return true;
         }
@@ -1401,6 +1600,16 @@ public class XuiV3BotFlowService
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "حجم معتبر نیست. فقط عدد صحیح وارد کنید؛ مثلا 7 یا ۷. سپس دوباره تلاش کنید.",
+                    replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
+                    cancellationToken: cancellationToken);
+                return true;
+            }
+
+            if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, trafficGb))
+            {
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: BuildMinimumTrafficMessage(service),
                     replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
                     cancellationToken: cancellationToken);
                 return true;
@@ -1433,6 +1642,40 @@ public class XuiV3BotFlowService
         return true;
     }
 
+    /// <summary>
+    /// Handles the owned-bot XUI v3 free-trial flow for regular customers.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram bot client for the active owned bot that received the message. The method sends all trial prompts
+    /// and final account details through this client.
+    /// </param>
+    /// <param name="message">
+    /// Text message from the Telegram user. The message may start the trial flow with the free-account keyboard
+    /// button, select the trial service, cancel the flow, or continue an existing trial state.
+    /// </param>
+    /// <param name="credUser">
+    /// Shared credentials user profile for the sender. The numeric Telegram id is used for trial cooldown checks,
+    /// phone verification, account metadata, and clearing any stale purchase session.
+    /// </param>
+    /// <param name="user">
+    /// Bot-scoped conversation state from <c>users.db</c>. When the sender starts a trial from another flow, the
+    /// previous flow is replaced with the trial flow.
+    /// </param>
+    /// <param name="mainReplyMarkup">
+    /// Reply keyboard shown after cancel, rejection, cooldown messages, or successful trial delivery.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancellation token for Telegram sends, database updates, and XUI panel calls.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the message belonged to the trial flow and was handled; otherwise <c>false</c> so the outer
+    /// dispatcher can continue with purchase, renewal, search, or legacy handlers.
+    /// </returns>
+    /// <remarks>
+    /// Starting a trial from the main keyboard intentionally clears any half-built purchase session for the same
+    /// Telegram user. Without that reset, a metered purchase could later reach the summary step without
+    /// <c>TrafficGb</c> and throw an exception.
+    /// </remarks>
     public async Task<bool> TryHandleFreeTrialAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1450,6 +1693,12 @@ public class XuiV3BotFlowService
 
         if (user?.Flow != TrialFlowName && !isTrialStart)
             return false;
+
+        if (isTrialStart && user?.Flow != TrialFlowName)
+        {
+            // Starting a trial from a main keyboard button intentionally cancels any half-built purchase session.
+            _sessionStore.Clear(credUser.TelegramUserId);
+        }
 
         if (IsCancel(text))
         {
@@ -2106,6 +2355,23 @@ public class XuiV3BotFlowService
 
         if (callback.Action == "gb")
         {
+            var service = FindService(callback.ServiceKey);
+            if (service == null || !callback.TrafficGb.HasValue || !XuiV3PurchaseService.MeetsMinimumTraffic(service, callback.TrafficGb.Value))
+            {
+                if (messageId != 0 && service != null)
+                {
+                    await SafeEditMessageTextAsync(
+                        botClient,
+                        chatId: chatId,
+                        messageId: messageId,
+                        text: BuildMinimumTrafficMessage(service),
+                        replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
+                        cancellationToken: cancellationToken);
+                }
+
+                return true;
+            }
+
             selectionState.ServiceKey = callback.ServiceKey;
             selectionState.TrafficGb = callback.TrafficGb;
             selectionState.DurationKey = null;
@@ -2135,6 +2401,23 @@ public class XuiV3BotFlowService
 
         if (callback.Action == "dur")
         {
+            var service = FindService(callback.ServiceKey);
+            if (service == null || !callback.TrafficGb.HasValue || !XuiV3PurchaseService.MeetsMinimumTraffic(service, callback.TrafficGb.Value))
+            {
+                if (messageId != 0 && service != null)
+                {
+                    await SafeEditMessageTextAsync(
+                        botClient,
+                        chatId: chatId,
+                        messageId: messageId,
+                        text: BuildMinimumTrafficMessage(service),
+                        replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
+                        cancellationToken: cancellationToken);
+                }
+
+                return true;
+            }
+
             selectionState.ServiceKey = callback.ServiceKey;
             selectionState.TrafficGb = callback.TrafficGb;
             selectionState.DurationKey = callback.DurationKey;
@@ -2192,7 +2475,7 @@ public class XuiV3BotFlowService
             return true;
         }
 
-        if (callback.Action == "ok")
+        if (callback.Action == "ok" || callback.Action == "sitepay")
         {
             var hasSession = _sessionStore.TryGet(credUser.TelegramUserId, out var selection);
             if (!hasSession || selection == null || string.IsNullOrWhiteSpace(selection.ServiceKey))
@@ -2217,9 +2500,10 @@ public class XuiV3BotFlowService
                 var resolved = _purchaseService.ResolvePurchase(selection, credUser.IsColleague);
                 var accountCount = XuiV3PurchaseService.NormalizeAccountCount(selection.AccountCount);
                 var totalPrice = resolved.PriceToman * accountCount;
+                var useSiteWallet = callback.Action == "sitepay";
                 Console.WriteLine($"[XUIv3] confirm start user={credUser.TelegramUserId} service={resolved.Service.Key} trafficGb={resolved.TrafficGb} durationDays={resolved.DurationDays} count={accountCount} unitPrice={resolved.PriceToman} totalPrice={totalPrice}");
 
-                if (credUser.AccountBalance < totalPrice)
+                if (!useSiteWallet && credUser.AccountBalance < totalPrice)
                 {
                     Console.WriteLine($"[XUIv3] insufficient balance user={credUser.TelegramUserId} balance={credUser.AccountBalance} price={totalPrice}");
                     await _activityLog.LogWarningAsync(
@@ -2252,6 +2536,28 @@ public class XuiV3BotFlowService
                             cancellationToken: cancellationToken);
                     }
                     return true;
+                }
+
+                if (useSiteWallet)
+                {
+                    var eligibility = await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
+                        credUser.TelegramUserId,
+                        totalPrice,
+                        cancellationToken);
+                    if (!eligibility.CanUse)
+                    {
+                        if (messageId != 0)
+                        {
+                            await SafeEditMessageTextAsync(
+                                botClient,
+                                chatId: chatId,
+                                messageId: messageId,
+                                text: $"پرداخت با کیف پول سایت گذرگاه ممکن نیست.\n{eligibility.Message}",
+                                replyMarkup: BuildPurchaseConfirmKeyboard(selection),
+                                cancellationToken: cancellationToken);
+                        }
+                        return true;
+                    }
                 }
 
                 if (messageId != 0)
@@ -2318,6 +2624,47 @@ public class XuiV3BotFlowService
                     return true;
                 }
 
+                GozargahSiteWalletDebitResult siteWalletDebitResult = null;
+                if (useSiteWallet)
+                {
+                    var debitResult = await _gozargahSiteSyncService.DeductSiteWalletAfterPanelSuccessAsync(
+                        credUser.TelegramUserId,
+                        bulkResult.TotalSuccessfulPriceToman,
+                        "xui-v3-bulk",
+                        bulkResult.BulkOrderId,
+                        $"XuiV3 purchase via Gozargah site wallet: {string.Join(", ", bulkResult.CreatedAccounts.Select(x => x.Email).Take(10))}",
+                        cancellationToken);
+                    if (!debitResult.Success)
+                    {
+                        await TryRollbackCreatedAccountsAsync(serverInfo, bulkResult.CreatedAccounts, cancellationToken);
+                        await _activityLog.LogWarningAsync(
+                            "gozargah_site_wallet_debit_failed_after_create",
+                            credUser,
+                            false,
+                            new Dictionary<string, object>
+                            {
+                                ["bulkOrderId"] = bulkResult.BulkOrderId,
+                                ["priceToman"] = bulkResult.TotalSuccessfulPriceToman,
+                                ["createdAccounts"] = string.Join(",", bulkResult.CreatedAccounts.Select(x => x.Email)),
+                                ["error"] = debitResult.ErrorMessage ?? string.Empty
+                            },
+                            cancellationToken);
+
+                        if (messageId != 0)
+                        {
+                            await SafeEditMessageTextAsync(
+                                botClient,
+                                chatId: chatId,
+                                messageId: messageId,
+                                text: "ساخت اکانت روی پنل انجام شد، اما کسر کیف پول سایت گذرگاه ناموفق بود. اکانت‌های ساخته‌شده برای جلوگیری از تحویل بدون پرداخت حذف شدند و موضوع برای بررسی ثبت شد.",
+                                cancellationToken: cancellationToken);
+                        }
+                        return true;
+                    }
+
+                    siteWalletDebitResult = debitResult;
+                }
+
                 if (messageId != 0)
                 {
                     await SafeEditMessageTextAsync(
@@ -2333,6 +2680,14 @@ public class XuiV3BotFlowService
 
                 foreach (var createdAccount in bulkResult.CreatedAccounts)
                 {
+                    await _gozargahSiteSyncService.QueueCreateAsync(
+                        ResolveGozargahSiteOwnerTelegramUserId(credUser),
+                        credUser.TelegramUserId,
+                        createdAccount,
+                        bulkResult.BulkOrderId,
+                        ResolveGozargahTenantBotId(),
+                        cancellationToken: cancellationToken);
+
                     var createdAccountText = _purchaseService.BuildCreatedAccountText(createdAccount);
                     if (!string.IsNullOrWhiteSpace(createdAccount.SubLink))
                     {
@@ -2365,25 +2720,33 @@ public class XuiV3BotFlowService
                         cancellationToken: cancellationToken);
                 }
 
-                var bulkBeforeBalance = credUser.AccountBalance;
-                if (bulkResult.TotalSuccessfulPriceToman > 0)
-                    await _credentialsDbContext.Pay(credUser, bulkResult.TotalSuccessfulPriceToman);
-                var bulkAfterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
-                // One ledger row represents the whole successful bulk purchase so the order can be
-                // audited without creating a noisy transaction per generated account.
-                await _walletLedgerService.RecordAsync(
-                    credUser.TelegramUserId,
-                    WalletLedgerDirections.Debit,
-                    bulkResult.TotalSuccessfulPriceToman,
-                    bulkBeforeBalance,
-                    bulkAfterBalance,
-                    WalletLedgerReasons.AccountPurchase,
-                    provider: "wallet",
-                    referenceType: "xui-v3-bulk",
-                    referenceId: bulkResult.BulkOrderId,
-                    orderId: bulkResult.BulkOrderId,
-                    description: string.Join(", ", bulkResult.CreatedAccounts.Select(x => x.Email).Take(10)),
-                    cancellationToken: cancellationToken);
+                var bulkBeforeBalance = useSiteWallet && siteWalletDebitResult?.Success == true
+                    ? siteWalletDebitResult.BeforeWallet
+                    : credUser.AccountBalance;
+                var bulkAfterBalance = useSiteWallet && siteWalletDebitResult?.Success == true
+                    ? siteWalletDebitResult.AfterWallet
+                    : bulkBeforeBalance;
+                if (!useSiteWallet)
+                {
+                    if (bulkResult.TotalSuccessfulPriceToman > 0)
+                        await _credentialsDbContext.Pay(credUser, bulkResult.TotalSuccessfulPriceToman);
+                    bulkAfterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
+                    // One ledger row represents the whole successful bulk purchase so the order can be
+                    // audited without creating a noisy transaction per generated account.
+                    await _walletLedgerService.RecordAsync(
+                        credUser.TelegramUserId,
+                        WalletLedgerDirections.Debit,
+                        bulkResult.TotalSuccessfulPriceToman,
+                        bulkBeforeBalance,
+                        bulkAfterBalance,
+                        WalletLedgerReasons.AccountPurchase,
+                        provider: "wallet",
+                        referenceType: "xui-v3-bulk",
+                        referenceId: bulkResult.BulkOrderId,
+                        orderId: bulkResult.BulkOrderId,
+                        description: string.Join(", ", bulkResult.CreatedAccounts.Select(x => x.Email).Take(10)),
+                        cancellationToken: cancellationToken);
+                }
 
                 LogV3Purchase(
                     title: accountCount > 1 ? "ساخت انبوه اکانت نسخه ۳" : "ساخت اکانت نسخه ۳",
@@ -2423,7 +2786,7 @@ public class XuiV3BotFlowService
                 await botClient.SendTextMessageAsync(
                     chatId: chatId,
                     text: "✅ خرید با موفقیت انجام شد.\n\n" +
-                          BuildHtmlBalanceDeductionText(bulkBeforeBalance, bulkResult.TotalSuccessfulPriceToman, bulkAfterBalance) +
+                          BuildSelectedWalletBalanceText(useSiteWallet, bulkBeforeBalance, bulkResult.TotalSuccessfulPriceToman, bulkAfterBalance, siteWalletDebitResult) +
                           "\n\nمنوی اصلی",
                     parseMode: ParseMode.Html,
                     replyMarkup: mainReplyMarkup,
@@ -2947,6 +3310,13 @@ public class XuiV3BotFlowService
             },
             cancellationToken);
         LogAccountDelete(client, credUser, "list");
+        await _gozargahSiteSyncService.QueueDeleteAsync(
+            ResolveGozargahSiteOwnerTelegramUserId(credUser),
+            credUser.TelegramUserId,
+            client,
+            $"delete-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+            ResolveGozargahTenantBotId(),
+            cancellationToken: cancellationToken);
 
         await SafeEditMessageTextAsync(
             botClient,
@@ -3064,6 +3434,15 @@ public class XuiV3BotFlowService
             client.TotalGB = payload.TotalGB;
             client.ExpiryTime = payload.ExpiryTime;
             client.Comment = payload.Comment;
+            await _gozargahSiteSyncService.QueueRenameAsync(
+                ResolveGozargahSiteOwnerTelegramUserId(credUser),
+                credUser.TelegramUserId,
+                oldEmail,
+                client,
+                serverInfo,
+                $"change-link-{oldEmail}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                ResolveGozargahTenantBotId(),
+                cancellationToken: cancellationToken);
 
             await _activityLog.LogBotActionAsync(
                 "xui_v3_account_link_changed",
@@ -3337,6 +3716,13 @@ public class XuiV3BotFlowService
             },
             cancellationToken);
         LogAccountDelete(client, credUser, "search");
+        await _gozargahSiteSyncService.QueueDeleteAsync(
+            ResolveGozargahSiteOwnerTelegramUserId(credUser),
+            credUser.TelegramUserId,
+            client,
+            $"delete-search-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+            ResolveGozargahTenantBotId(),
+            cancellationToken: cancellationToken);
 
         await SendOrEditTextAsync(
             botClient,
@@ -3590,7 +3976,20 @@ public class XuiV3BotFlowService
         return builder.ToString();
     }
 
-    private static string BuildDirectSearchResultText(
+    /// <summary>
+    /// Builds the details text for a direct UUID or subscription-id search result.
+    /// </summary>
+    /// <param name="client">Matched XUI client.</param>
+    /// <param name="serverInfo">Panel descriptor used to rebuild the subscription link.</param>
+    /// <param name="isOwner">Whether the matched account belongs to the Telegram user who searched.</param>
+    /// <param name="identifierLabel">Human-readable label for the matched identifier, such as UUID.</param>
+    /// <param name="identifierValue">Identifier value that matched the account.</param>
+    /// <returns>HTML-formatted Persian search result text including account type and account details.</returns>
+    /// <remarks>
+    /// This method is an instance member because the nested account details need the configured service catalog
+    /// to resolve the customer-visible account type.
+    /// </remarks>
+    private string BuildDirectSearchResultText(
         XuiV3Client client,
         ServerInfo serverInfo,
         bool isOwner,
@@ -3961,6 +4360,43 @@ public class XuiV3BotFlowService
                $"💰 موجودی باقی‌مانده: <code>{Html(afterBalance.FormatCurrency())}</code>";
     }
 
+    /// <summary>
+    /// Builds the customer-facing balance summary for the wallet that actually paid for the XUI v3 operation.
+    /// </summary>
+    /// <param name="useSiteWallet">
+    /// <c>true</c> when the selected payment source was the Gozargah website wallet; <c>false</c> for the bot wallet.
+    /// </param>
+    /// <param name="botBeforeBalance">Bot wallet balance in toman before a bot-wallet debit, or fallback display balance.</param>
+    /// <param name="deductedAmount">Paid amount in Iranian toman.</param>
+    /// <param name="botAfterBalance">Bot wallet balance in toman after a bot-wallet debit, or fallback display balance.</param>
+    /// <param name="siteWalletDebitResult">
+    /// Website wallet debit result. Required for site-wallet messages because it contains the website before/after balance.
+    /// </param>
+    /// <returns>
+    /// HTML-safe balance text that names the selected wallet, preventing site-wallet purchases from looking like bot-wallet
+    /// debits.
+    /// </returns>
+    /// <remarks>
+    /// The bot wallet and website wallet have different sources of truth. User-facing messages must not show
+    /// <c>credentials.db</c> balances after a website-wallet payment, because that incorrectly suggests a double charge.
+    /// </remarks>
+    private static string BuildSelectedWalletBalanceText(
+        bool useSiteWallet,
+        long botBeforeBalance,
+        long deductedAmount,
+        long botAfterBalance,
+        GozargahSiteWalletDebitResult siteWalletDebitResult)
+    {
+        if (useSiteWallet && siteWalletDebitResult?.Success == true)
+        {
+            return $"💳 موجودی کیف پول سایت قبل: <code>{Html(siteWalletDebitResult.BeforeWallet.FormatCurrency())}</code>\n" +
+                   $"💸 مبلغ کسر شده از سایت: <code>{Html(deductedAmount.FormatCurrency())}</code>\n" +
+                   $"💰 موجودی کیف پول سایت بعد: <code>{Html(siteWalletDebitResult.AfterWallet.FormatCurrency())}</code>";
+        }
+
+        return BuildHtmlBalanceDeductionText(botBeforeBalance, deductedAmount, botAfterBalance);
+    }
+
     private static string HtmlLogDetail(string detail)
     {
         if (string.IsNullOrWhiteSpace(detail))
@@ -4015,20 +4451,38 @@ public class XuiV3BotFlowService
                $"🕒 زمان درخواست: <code>{Html(now)}</code>";
     }
 
+    /// <summary>
+    /// Resolves the configured XUI v3 service for an existing client.
+    /// </summary>
+    /// <param name="client">
+    /// XUI client read from the panel. The client may contain full JSON metadata, only inbound ids, or only
+    /// legacy panel fields after a link-change/update operation.
+    /// </param>
+    /// <returns>
+    /// The enabled service definition that best matches the client, or <c>null</c> when the account is outside
+    /// all active service inbounds and has no usable metadata.
+    /// </returns>
+    /// <remarks>
+    /// Metadata is trusted before inbound fallback because normal and unlimited services can share the same
+    /// public inbounds. When metadata is missing, negative expiry is used as the unlimited signal; otherwise
+    /// shared public inbounds resolve to the normal metered service so changed-link metered accounts do not
+    /// accidentally show unlimited renewal choices.
+    /// </remarks>
     private XuiV3ServiceDefinition ResolveServiceForClient(XuiV3Client client)
     {
         var metadata = TryReadMetadata(client.Comment);
         var services = _purchaseService.GetEnabledServices();
         var clientInboundIds = GetClientInboundIds(client, metadata);
 
-        if (clientInboundIds.Count == 0)
+        var metadataService = FindService(metadata?.ServiceKey);
+        if (metadataService != null)
         {
-            var metadataService = FindService(metadata?.ServiceKey);
-            if (metadataService != null)
-                Console.WriteLine($"[XUIv3] resolve service by metadata only email={client?.Email}, service={metadataService.Key}");
-
+            Console.WriteLine($"[XUIv3] resolve service by metadata email={client?.Email}, service={metadataService.Key}");
             return metadataService;
         }
+
+        if (clientInboundIds.Count == 0)
+            return null;
 
         var nationalService = services.FirstOrDefault(service =>
             IsNationalService(service) && HasAnyInbound(clientInboundIds, service));
@@ -4038,22 +4492,20 @@ public class XuiV3BotFlowService
             return nationalService;
         }
 
+        var normalService = services.FirstOrDefault(service =>
+            IsNormalService(service) && HasAnyInbound(clientInboundIds, service));
+        if (normalService != null && !LooksLikeUnlimitedClient(client, metadata))
+        {
+            Console.WriteLine($"[XUIv3] resolve service by inbound priority email={client.Email}, service={normalService.Key}, inboundIds=[{string.Join(",", clientInboundIds)}]");
+            return normalService;
+        }
+
         var unlimitedService = services.FirstOrDefault(service =>
             service.IsUnlimited && HasAnyInbound(clientInboundIds, service));
         if (unlimitedService != null)
         {
             Console.WriteLine($"[XUIv3] resolve service by inbound priority email={client.Email}, service={unlimitedService.Key}, inboundIds=[{string.Join(",", clientInboundIds)}]");
             return unlimitedService;
-        }
-
-        var normalService = services.FirstOrDefault(service =>
-            IsNormalService(service) &&
-            IsOnlyInServiceInbounds(clientInboundIds, service) &&
-            HasAnyInbound(clientInboundIds, service));
-        if (normalService != null)
-        {
-            Console.WriteLine($"[XUIv3] resolve service by inbound priority email={client.Email}, service={normalService.Key}, inboundIds=[{string.Join(",", clientInboundIds)}]");
-            return normalService;
         }
 
         var meteredService = services.FirstOrDefault(service =>
@@ -4068,14 +4520,27 @@ public class XuiV3BotFlowService
             return meteredService;
         }
 
-        var metadataFallback = FindService(metadata?.ServiceKey);
-        if (metadataFallback != null)
-        {
-            Console.WriteLine($"[XUIv3] resolve service metadata fallback email={client.Email}, service={metadataFallback.Key}, inboundIds=[{string.Join(",", clientInboundIds)}]");
-            return metadataFallback;
-        }
-
         return null;
+    }
+
+    /// <summary>
+    /// Infers whether an XUI client is likely an unlimited account when metadata is unavailable.
+    /// </summary>
+    /// <param name="client">XUI client read from the panel.</param>
+    /// <param name="metadata">Parsed JSON metadata from the client comment, when available.</param>
+    /// <returns>
+    /// <c>true</c> when metadata explicitly marks the service as unlimited or the panel expiry is negative,
+    /// which is the 3x-ui first-use-duration convention used by unlimited plans.
+    /// </returns>
+    private static bool LooksLikeUnlimitedClient(XuiV3Client client, XuiV3ClientMetadata metadata)
+    {
+        if (string.Equals(metadata?.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (string.Equals(metadata?.ServiceKey, "unlimited", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return GetExpiryTime(client) < 0;
     }
 
     private static List<int> GetClientInboundIds(XuiV3Client client, XuiV3ClientMetadata metadata)
@@ -4212,16 +4677,44 @@ public class XuiV3BotFlowService
         return new string(normalized.Where(ch => !char.IsControl(ch) && ch != '\u200e' && ch != '\u200f').ToArray()).Trim();
     }
 
+    /// <summary>
+    /// Builds the reply keyboard used when a customer chooses or types metered traffic during owned-bot purchase or renewal.
+    /// </summary>
+    /// <param name="service">
+    /// Metered service definition loaded from the XUI v3 plan file. Its <c>minimumTrafficGb</c> setting controls
+    /// which preset buttons are shown.
+    /// </param>
+    /// <returns>
+    /// A reply keyboard containing visible traffic presets greater than or equal to the service minimum and an
+    /// <c>انصراف</c> row. The returned keyboard may contain only cancel when no presets are configured.
+    /// </returns>
+    /// <remarks>
+    /// Customers can still type any integer GB amount; typed values are validated separately against the same
+    /// minimum before a duration or invoice is shown.
+    /// </remarks>
     private static ReplyKeyboardMarkup BuildTrafficReplyKeyboard(XuiV3ServiceDefinition service)
     {
-        var rows = service.TrafficOptionsGb
-            .OrderBy(gb => gb)
+        var rows = XuiV3PurchaseService.GetVisibleTrafficOptions(service)
             .Select(gb => new KeyboardButton($"{gb} GB"))
             .Chunk(3)
             .Select(chunk => chunk.ToArray())
             .Append(new[] { new KeyboardButton("انصراف") });
 
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
+    }
+
+    /// <summary>
+    /// Builds the customer-facing validation message shown when a metered traffic amount is below the plan minimum.
+    /// </summary>
+    /// <param name="service">Metered service whose minimum traffic rule rejected the input.</param>
+    /// <returns>Persian text explaining the minimum allowed traffic in GB.</returns>
+    /// <remarks>
+    /// The text is used before calling the shared resolver so typed values and stale callback buttons fail with a
+    /// readable Telegram message instead of surfacing an internal validation exception.
+    /// </remarks>
+    private static string BuildMinimumTrafficMessage(XuiV3ServiceDefinition service)
+    {
+        return $"حداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است. لطفاً حجم بیشتری وارد کنید.";
     }
 
     private static ReplyKeyboardMarkup BuildDurationReplyKeyboard(XuiV3ServiceDefinition service)
@@ -4248,16 +4741,198 @@ public class XuiV3BotFlowService
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
     }
 
-    private static ReplyKeyboardMarkup BuildConfirmReplyKeyboard()
+    /// <summary>
+    /// Builds the renewal confirmation reply keyboard for the current account renewal state.
+    /// </summary>
+    /// <param name="canUseSiteWallet">
+    /// <c>true</c> when the Gozargah website wallet precheck passed and the site-wallet renewal button may be shown.
+    /// </param>
+    /// <returns>A Telegram reply keyboard with normal renewal confirmation, optional site-wallet renewal, and cancel.</returns>
+    /// <remarks>
+    /// This method only controls button visibility. The final renewal handler repeats the website wallet validation
+    /// before updating 3x-ui because the site balance or ban status can change after the keyboard is rendered.
+    /// </remarks>
+    private ReplyKeyboardMarkup BuildConfirmReplyKeyboard(bool canUseSiteWallet = false)
     {
-        return new ReplyKeyboardMarkup(new[]
+        var rows = new List<KeyboardButton[]>
         {
             new[] { new KeyboardButton("تایید تمدید") },
             new[] { new KeyboardButton("انصراف") }
-        })
+        };
+
+        if (canUseSiteWallet)
+            rows.Insert(1, new[] { new KeyboardButton("تایید تمدید با کیف پول سایت") });
+
+        return new ReplyKeyboardMarkup(rows)
         {
             ResizeKeyboard = true
         };
+    }
+
+    /// <summary>
+    /// Builds the final purchase confirmation keyboard and optionally exposes the Gozargah site wallet.
+    /// </summary>
+    /// <param name="selection">Current XUI v3 purchase selection encoded into callback data.</param>
+    /// <param name="canUseSiteWallet">
+    /// <c>true</c> when the latest Gozargah website wallet precheck found an existing, non-banned user with
+    /// enough balance for the selected purchase amount.
+    /// </param>
+    /// <returns>
+    /// Inline keyboard with the normal bot-wallet confirmation, optional site-wallet confirmation, and cancel/back actions.
+    /// </returns>
+    /// <remarks>
+    /// The callback handler repeats the website wallet precheck because balances can change after this keyboard is rendered.
+    /// </remarks>
+    private InlineKeyboardMarkup BuildPurchaseConfirmKeyboard(XuiV3PurchaseSelection selection, bool canUseSiteWallet = false)
+    {
+        var rows = new List<InlineKeyboardButton[]>
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("تایید با کیف پول ربات", XuiV3PurchaseCallbacks.Confirm(selection)),
+                InlineKeyboardButton.WithCallbackData("انصراف", XuiV3PurchaseCallbacks.Cancel())
+            }
+        };
+
+        if (canUseSiteWallet)
+            rows.Insert(0, new[] { InlineKeyboardButton.WithCallbackData("پرداخت با کیف پول سایت گذرگاه", XuiV3PurchaseCallbacks.SiteWalletConfirm(selection)) });
+
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", XuiV3PurchaseCallbacks.BackToServices()) });
+        return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>
+    /// Checks whether the Gozargah website wallet should be offered for the current final purchase or renewal step.
+    /// </summary>
+    /// <param name="telegramUserId">
+    /// Numeric Telegram user id of the buyer. The Gozargah website API uses this id to find the matching user row.
+    /// </param>
+    /// <param name="amountToman">
+    /// Required payment amount in Iranian toman. Values less than or equal to zero never show the site-wallet button.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for the website API precheck.</param>
+    /// <returns>
+    /// <c>true</c> when the website wallet can be displayed; otherwise <c>false</c>. API failures, banned users,
+    /// missing users, and insufficient balances are all treated as hidden-button conditions.
+    /// </returns>
+    /// <remarks>
+    /// This method controls only Telegram button visibility. The payment callback repeats the same eligibility check
+    /// immediately before account delivery so a stale keyboard cannot spend an insufficient or banned website wallet.
+    /// </remarks>
+    private async Task<bool> CanUseGozargahSiteWalletAsync(long telegramUserId, long amountToman, CancellationToken cancellationToken)
+    {
+        if (amountToman <= 0)
+            return false;
+
+        var eligibility = await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
+            telegramUserId,
+            amountToman,
+            cancellationToken);
+
+        return eligibility.CanUse;
+    }
+
+    /// <summary>
+    /// Resolves the current renewal state's payable amount in toman.
+    /// </summary>
+    /// <param name="user">
+    /// Bot-scoped renewal state row containing the selected service, traffic, duration, or unlimited plan key.
+    /// </param>
+    /// <param name="isColleague">Whether colleague pricing should be used from the XUI v3 service plan file.</param>
+    /// <returns>
+    /// Renewal price in Iranian toman, or <c>0</c> when the state is incomplete and no site-wallet button should be shown.
+    /// </returns>
+    /// <remarks>
+    /// The method mirrors renewal summary selection resolution without reading the panel. Final renewal still recalculates
+    /// price, account ownership, and renewal policy before updating 3x-ui.
+    /// </remarks>
+    private long ResolveRenewPriceToman(User user, bool isColleague)
+    {
+        if (user == null || string.IsNullOrWhiteSpace(user.SelectedCountry))
+            return 0;
+
+        var service = FindService(user.SelectedCountry);
+        var selection = service.IsUnlimited
+            ? new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = user.Type }
+            : new XuiV3PurchaseSelection
+            {
+                ServiceKey = service.Key,
+                TrafficGb = int.TryParse(user.TotoalGB, out var trafficGb) ? trafficGb : 0,
+                DurationKey = user.SelectedPeriod
+            };
+
+        return _purchaseService.ResolvePurchase(selection, isColleague).PriceToman;
+    }
+
+    /// <summary>
+    /// Resolves the Telegram id that should own a synced website order for the current bot runtime.
+    /// </summary>
+    /// <param name="credUser">Credentials profile of the Telegram user performing the account operation.</param>
+    /// <returns>
+    /// Tenant owner Telegram id when the current bot is a tenant storefront; otherwise the acting user's Telegram id.
+    /// </returns>
+    /// <remarks>
+    /// Gozargah website records for tenant storefront purchases belong to the colleague owner, while the buyer is kept
+    /// separately in the sync event. Owned bots use the buyer as the website owner.
+    /// </remarks>
+    private static long ResolveGozargahSiteOwnerTelegramUserId(CredUser credUser)
+    {
+        if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) &&
+            BotContextAccessor.CurrentBotOwnerTelegramUserId.HasValue)
+        {
+            return BotContextAccessor.CurrentBotOwnerTelegramUserId.Value;
+        }
+
+        return credUser?.TelegramUserId ?? 0;
+    }
+
+    /// <summary>
+    /// Resolves the tenant bot id that should be stored with a website sync event.
+    /// </summary>
+    /// <returns>The current bot id for tenant storefronts; otherwise <c>null</c> for owned bots.</returns>
+    /// <remarks>
+    /// The value keeps shared-flow account operations isolated by tenant when a customer uses purchase, renewal,
+    /// delete, or link-change features from a tenant bot.
+    /// </remarks>
+    private static string ResolveGozargahTenantBotId()
+    {
+        return string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase)
+            ? BotContextAccessor.CurrentBotId
+            : null;
+    }
+
+    /// <summary>
+    /// Deletes accounts that were created before a post-create website-wallet debit failed.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel descriptor.</param>
+    /// <param name="createdAccounts">Accounts created in the current purchase attempt.</param>
+    /// <param name="cancellationToken">Cancellation token for panel delete calls.</param>
+    /// <returns>A task that completes after best-effort rollback attempts finish.</returns>
+    /// <remarks>
+    /// This is a compensation path, not a transaction. It prevents accidental delivery after unpaid site-wallet
+    /// failures, but failures are logged and still require admin review.
+    /// </remarks>
+    private async Task TryRollbackCreatedAccountsAsync(
+        ServerInfo serverInfo,
+        IEnumerable<XuiV3AccountCreationResult> createdAccounts,
+        CancellationToken cancellationToken)
+    {
+        foreach (var account in createdAccounts ?? Enumerable.Empty<XuiV3AccountCreationResult>())
+        {
+            if (string.IsNullOrWhiteSpace(account.Email))
+                continue;
+
+            try
+            {
+                var deleteResponse = await ApiServicev3.DeleteClientAsync(serverInfo, _configuration, account.Email, cancellationToken);
+                if (!deleteResponse.Success)
+                    _logger.LogWarning("Rollback delete failed for Gozargah site wallet purchase. email={Email}, msg={Message}", account.Email, deleteResponse.Msg);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Rollback delete threw for Gozargah site wallet purchase. email={Email}", account.Email);
+            }
+        }
     }
 
     private static InlineKeyboardMarkup BuildAccountCountInlineKeyboard()
@@ -5119,7 +5794,22 @@ public class XuiV3BotFlowService
             : normalized.Substring(0, 200);
     }
 
-    private static string BuildV3ClientInfo(XuiV3Client client, ServerInfo serverInfo, bool isColleague, bool showRenewCommand = true)
+    /// <summary>
+    /// Builds the customer-facing account details text for owned and tenant account lists/search results.
+    /// </summary>
+    /// <param name="client">XUI client whose current panel fields should be displayed.</param>
+    /// <param name="serverInfo">Panel descriptor used to rebuild the subscription link.</param>
+    /// <param name="isColleague">Whether colleague-only warning rules should be applied.</param>
+    /// <param name="showRenewCommand">Whether the slash-command renewal hint should be appended.</param>
+    /// <returns>
+    /// HTML-formatted Persian account details text, including the resolved service/account type when available.
+    /// </returns>
+    /// <remarks>
+    /// Tenant search reuses this method. The account type is resolved from metadata first and from active plan
+    /// inbounds second so customers can see whether a found account is normal, national, or unlimited even after
+    /// a link-change operation.
+    /// </remarks>
+    private string BuildV3ClientInfo(XuiV3Client client, ServerInfo serverInfo, bool isColleague, bool showRenewCommand = true)
     {
         var email = Html(client.Email);
         var usedBytes = GetUsedBytes(client);
@@ -5128,9 +5818,12 @@ public class XuiV3BotFlowService
         var subId = string.IsNullOrWhiteSpace(client.SubId) ? client.Email : client.SubId;
         var subLink = ApiServicev3.BuildSubscriptionLink(serverInfo, subId);
         var metadata = TryReadMetadata(client.Comment);
+        var service = ResolveServiceForClient(client);
+        var serviceText = service?.DisplayName ?? metadata?.ServiceName ?? "نامشخص";
 
         var text = new System.Text.StringBuilder();
         text.AppendLine($"👤 نام: <code>{email}</code>");
+        text.AppendLine($"🧩 نوع اکانت: <code>{Html(serviceText)}</code>");
         text.AppendLine(FormatV3Expiry(expiryTime));
         text.AppendLine(FormatV3Traffic(usedBytes, totalBytes));
         if (!string.IsNullOrWhiteSpace(metadata?.UserComment))
