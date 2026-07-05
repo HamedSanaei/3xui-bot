@@ -1446,6 +1446,13 @@ public class TelegramBotService : IHostedService
                             description: "Admin wallet credit",
                             cancellationToken: cancellationToken);
 
+                        LogAdminWalletAdjustment(
+                            message.From,
+                            findedUser,
+                            isCredit: true,
+                            amount,
+                            beforeBalance,
+                            afterBalance);
 
 
                         await botClient.CustomSendTextMessageAsync(
@@ -1500,6 +1507,13 @@ public class TelegramBotService : IHostedService
                             description: "Admin wallet debit",
                             cancellationToken: cancellationToken);
 
+                        LogAdminWalletAdjustment(
+                            message.From,
+                            findedUser,
+                            isCredit: false,
+                            amount,
+                            beforeBalance,
+                            afterBalance);
 
                         await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
@@ -1536,8 +1550,11 @@ public class TelegramBotService : IHostedService
                 }
                 else if (action == "🚀 Promote as admin")
                 {
+                    var wasColleague = findedUser.IsColleague;
                     findedUser.IsColleague = true;
-                    await _credentialsDbContext.PromotOrDemote(findedUser.TelegramUserId, true);
+                    var roleChanged = await _credentialsDbContext.PromotOrDemote(findedUser.TelegramUserId, true);
+                    if (roleChanged)
+                        LogAdminRoleChange(message.From, findedUser, wasColleague, isColleagueAfter: true);
 
 
                     await botClient.CustomSendTextMessageAsync(
@@ -1556,8 +1573,11 @@ public class TelegramBotService : IHostedService
                 else if (action == "❌ Demote as admin")
                 {
                     // Demote as admin logic here
+                    var wasColleague = findedUser.IsColleague;
                     findedUser.IsColleague = false;
-                    await _credentialsDbContext.PromotOrDemote(findedUser.TelegramUserId, false);
+                    var roleChanged = await _credentialsDbContext.PromotOrDemote(findedUser.TelegramUserId, false);
+                    if (roleChanged)
+                        LogAdminRoleChange(message.From, findedUser, wasColleague, isColleagueAfter: false);
 
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
@@ -6257,7 +6277,12 @@ public class TelegramBotService : IHostedService
         {
             var siteUser = await _gozargahSiteApiClient.GetUserAsync(telegramUserId);
             if (!siteUser.Success || siteUser.Data == null)
-                return $"🌐 موجودی سایت گذرگاه: در دسترس نیست ({siteUser.Message ?? "کاربر پیدا نشد"})\n";
+            {
+                var statusText = IsGozargahSiteUserNotConnectedMessage(siteUser.Message)
+                    ? "متصل نشده"
+                    : $"در دسترس نیست ({siteUser.Message ?? "کاربر پیدا نشد"})";
+                return $"🌐 موجودی سایت گذرگاه: {statusText}\n";
+            }
 
             var banText = siteUser.Data.IsBanned ? " - مسدود در سایت" : string.Empty;
             return $"🌐 موجودی سایت گذرگاه: {siteUser.Data.Wallet.FormatCurrency()}{banText}\n";
@@ -6269,11 +6294,140 @@ public class TelegramBotService : IHostedService
         }
     }
 
+    /// <summary>
+    /// Detects the normal Gozargah website response for a Telegram user that has not connected a site account.
+    /// </summary>
+    /// <param name="message">
+    /// Message returned by the Gozargah website <c>get_user</c> response wrapper. It may be a plain API message or
+    /// the local HTTP wrapper text, for example <c>HTTP 404: {"success":false,"message":"not found"}</c>.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the message represents the expected "not connected/not found" state; otherwise <c>false</c>
+    /// so real API failures can still be shown as unavailable.
+    /// </returns>
+    /// <remarks>
+    /// The profile page is customer-facing. A website 404 is not an operational error here; it only means the
+    /// Telegram user has not linked or registered a Gozargah website wallet, so the bot should show "متصل نشده".
+    /// </remarks>
+    private static bool IsGozargahSiteUserNotConnectedMessage(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        return message.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("not found", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("پیدا نشد", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string BuildPlainBalanceDeductionText(long beforeBalance, long deductedAmount, long afterBalance)
     {
         return $"💳 موجودی قبل: {beforeBalance.FormatCurrency()}\n" +
                $"💸 مبلغ کسر شده: {deductedAmount.FormatCurrency()}\n" +
                $"💰 موجودی باقی‌مانده: {afterBalance.FormatCurrency()}";
+    }
+
+    /// <summary>
+    /// Writes the private-channel audit log for a manual admin wallet adjustment.
+    /// </summary>
+    /// <param name="actor">
+    /// Telegram sender who confirmed the admin operation. The value comes from the update sender and is converted
+    /// to a clickable audit identity without storing or exposing any bot token.
+    /// </param>
+    /// <param name="target">
+    /// Credentials user whose shared bot-wallet balance was changed by the admin operation.
+    /// </param>
+    /// <param name="isCredit">
+    /// <c>true</c> when the admin added balance; <c>false</c> when the admin deducted balance.
+    /// </param>
+    /// <param name="amountToman">Adjustment amount in Iranian toman.</param>
+    /// <param name="beforeBalance">Target bot-wallet balance in toman before the adjustment.</param>
+    /// <param name="afterBalance">Target bot-wallet balance in toman after the adjustment.</param>
+    /// <remarks>
+    /// The wallet mutation and ledger write happen before this method is called. This method only mirrors the
+    /// completed financial action to the central private logger channel so admins can audit manual changes later.
+    /// </remarks>
+    private void LogAdminWalletAdjustment(
+        Telegram.Bot.Types.User actor,
+        CredUser target,
+        bool isCredit,
+        long amountToman,
+        long beforeBalance,
+        long afterBalance)
+    {
+        var actorUser = BuildCredUserFromTelegramActor(actor);
+        var actionText = isCredit ? "افزایش موجودی دستی" : "کسر موجودی دستی";
+        var directionIcon = isCredit ? "➕🟢" : "➖🔴";
+
+        var message =
+            $"{directionIcon} <b>{Html(actionText)}</b>\n\n" +
+            "📌 انجام‌دهنده\n" +
+            $"{TelegramUserLinkFormatter.HtmlSummary(actorUser)}\n\n" +
+            "📌 کاربر هدف\n" +
+            $"{TelegramUserLinkFormatter.HtmlSummary(target)}\n\n" +
+            $"مبلغ: <code>{Html(amountToman.FormatCurrency())}</code>\n" +
+            $"موجودی قبل: <code>{Html(beforeBalance.FormatCurrency())}</code>\n" +
+            $"موجودی بعد: <code>{Html(afterBalance.FormatCurrency())}</code>";
+
+        _logger.LogPayment(message);
+    }
+
+    /// <summary>
+    /// Writes the private-channel audit log for a super-admin colleague role change.
+    /// </summary>
+    /// <param name="actor">
+    /// Telegram sender who confirmed the role change. The value is used only to build a clickable admin identity
+    /// for the private audit log.
+    /// </param>
+    /// <param name="target">Credentials user whose colleague pricing flag was changed.</param>
+    /// <param name="wasColleague">Role flag before the admin operation was applied.</param>
+    /// <param name="isColleagueAfter">Role flag after the admin operation was persisted.</param>
+    /// <remarks>
+    /// Role changes affect pricing and tenant-bot access, so both promotion and demotion are logged. The caller
+    /// performs the database update first; this method has no side effects except the private audit log.
+    /// </remarks>
+    private void LogAdminRoleChange(
+        Telegram.Bot.Types.User actor,
+        CredUser target,
+        bool wasColleague,
+        bool isColleagueAfter)
+    {
+        var actorUser = BuildCredUserFromTelegramActor(actor);
+        var actionText = isColleagueAfter ? "ارتقای کاربر به همکار" : "تنزل کاربر به عادی";
+
+        var message =
+            $"👥 <b>{Html(actionText)}</b>\n\n" +
+            "📌 انجام‌دهنده\n" +
+            $"{TelegramUserLinkFormatter.HtmlSummary(actorUser)}\n\n" +
+            "📌 کاربر هدف\n" +
+            $"{TelegramUserLinkFormatter.HtmlSummary(target)}\n\n" +
+            $"نقش قبل: <code>{Html(wasColleague ? "همکار" : "کاربر عادی")}</code>\n" +
+            $"نقش بعد: <code>{Html(isColleagueAfter ? "همکار" : "کاربر عادی")}</code>";
+
+        _logger.LogPayment(message);
+    }
+
+    /// <summary>
+    /// Converts a Telegram update sender into the shared credentials shape used by audit link formatters.
+    /// </summary>
+    /// <param name="actor">
+    /// Telegram sender from the incoming update. A null value is converted to a zero-id placeholder to keep audit
+    /// logging best-effort and non-throwing.
+    /// </param>
+    /// <returns>
+    /// A lightweight credentials user object suitable for HTML audit summaries. The returned object is not tracked
+    /// by EF Core and must not be saved.
+    /// </returns>
+    private static CredUser BuildCredUserFromTelegramActor(Telegram.Bot.Types.User actor)
+    {
+        return new CredUser
+        {
+            TelegramUserId = actor?.Id ?? 0,
+            ChatID = actor?.Id ?? 0,
+            Username = actor?.Username ?? string.Empty,
+            FirstName = actor?.FirstName ?? string.Empty,
+            LastName = actor?.LastName ?? string.Empty,
+            LanguageCode = actor?.LanguageCode ?? string.Empty
+        };
     }
 
     private static string BuildBotCapabilitiesMessage(CredUser credUser)

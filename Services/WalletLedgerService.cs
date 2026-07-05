@@ -106,9 +106,10 @@ namespace Adminbot.Domain
         /// <param name="cancellationToken">Cancellation token for the users.db query.</param>
         /// <returns>A page of bot-wallet ledger entries and the total count available for pagination.</returns>
         /// <remarks>
-        /// Website-wallet payments are deliberately excluded because their balance source is the Gozargah website,
-        /// not the bot wallet in <c>credentials.db</c>. Showing them beside bot-wallet debits makes users think the
-        /// same purchase was charged twice.
+        /// Direct owned-bot website-wallet payments are deliberately excluded because their balance source is the
+        /// Gozargah website, not the bot wallet in <c>credentials.db</c>. Tenant card-to-card base-cost rows are
+        /// included even when the provider is <c>gozargah_site_wallet</c>, because they audit the colleague owner's
+        /// storefront settlement and should be visible in that owner's transaction history.
         /// </remarks>
         public async Task<(List<WalletLedgerEntry> Items, int TotalCount)> GetPageAsync(
             long telegramUserId,
@@ -120,7 +121,10 @@ namespace Adminbot.Domain
             pageSize = Math.Clamp(pageSize, 1, 20);
             var query = _userDbContext.WalletLedgerEntries
                 .Where(x => x.TelegramUserId == telegramUserId &&
-                            (x.Provider == null || x.Provider != GozargahSiteWalletProvider))
+                            (x.Provider == null ||
+                             x.Provider != GozargahSiteWalletProvider ||
+                             x.ReferenceType == "tenant-order" ||
+                             x.ReferenceType == "tenant-renew-order"))
                 .OrderByDescending(x => x.CreatedAtUtc)
                 .ThenByDescending(x => x.Id);
 
@@ -137,7 +141,8 @@ namespace Adminbot.Domain
         /// <param name="cancellationToken">Cancellation token for the users.db query.</param>
         /// <returns>
         /// The matching bot-wallet ledger entry, or null when the id does not belong to the user or represents a
-        /// website-wallet debit that should not be shown in the bot-wallet history.
+        /// direct website-wallet debit that should not be shown in the bot-wallet history. Tenant base-cost
+        /// website-wallet rows are visible because they belong to colleague storefront settlement audit.
         /// </returns>
         public Task<WalletLedgerEntry> GetByIdAsync(long telegramUserId, int id, CancellationToken cancellationToken = default)
         {
@@ -145,7 +150,10 @@ namespace Adminbot.Domain
                 .FirstOrDefaultAsync(
                     x => x.Id == id &&
                          x.TelegramUserId == telegramUserId &&
-                         (x.Provider == null || x.Provider != GozargahSiteWalletProvider),
+                         (x.Provider == null ||
+                          x.Provider != GozargahSiteWalletProvider ||
+                          x.ReferenceType == "tenant-order" ||
+                          x.ReferenceType == "tenant-renew-order"),
                     cancellationToken);
         }
     }

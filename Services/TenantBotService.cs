@@ -4630,19 +4630,18 @@ public class TenantBotService
                     return NowPaymentsSettlementResult.InvalidAmount();
                 }
 
-                var beforeBalance = owner.AccountBalance;
-                var OWNERDELTA = DEBITOWNERBASECOST ? -order.BaseCostToman : order.ProfitToman;
-                if (OWNERDELTA > 0)
-                    await _credentialsDbContext.AddFund(order.OwnerTelegramUserId, OWNERDELTA);
-                else if (OWNERDELTA < 0)
-                    await _credentialsDbContext.Pay(owner, Math.Abs(OWNERDELTA));
-                var afterBalance = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+                var settlement = await SETTLETENANTOWNERWALLETASYNC(
+                    order,
+                    owner,
+                    DEBITOWNERBASECOST,
+                    referenceType: "tenant-order",
+                    CancellationToken);
 
                 order.IsFulfilled = true;
-                order.IsOwnerCredited = OWNERDELTA > 0;
-                order.OwnerWalletDelta = OWNERDELTA;
-                order.OwnerBalanceBefore = beforeBalance;
-                order.OwnerBalanceAfter = afterBalance;
+                order.IsOwnerCredited = settlement.OwnerDelta > 0;
+                order.OwnerWalletDelta = settlement.OwnerDelta;
+                order.OwnerBalanceBefore = settlement.BotWalletBefore;
+                order.OwnerBalanceAfter = settlement.BotWalletAfter;
                 order.PaymentStatus = TenantBotOrderStatuses.Fulfilled;
                 order.FulfillmentSource = Source;
                 order.CreatedAccountEmail = created.Email;
@@ -4661,33 +4660,14 @@ public class TenantBotService
                     CustomerTelegramUserId = order.CustomerTelegramUserId,
                     SalePriceToman = order.SalePriceToman,
                     BaseCostToman = order.BaseCostToman,
-                    ProfitToman = OWNERDELTA,
-                    OwnerBalanceBefore = beforeBalance,
-                    OwnerBalanceAfter = afterBalance,
+                    ProfitToman = settlement.OwnerDelta,
+                    OwnerBalanceBefore = settlement.BotWalletBefore,
+                    OwnerBalanceAfter = settlement.BotWalletAfter,
                     Description = $"tenant Bot sale VIA @{order.TenantBotUsername}",
                     CreatedAtUtc = DateTime.UtcNow
                 });
 
                 await _userDbcontext.SaveChangesAsync(CancellationToken);
-
-                await _walletLedgerService.RecordAsync(
-                    order.OwnerTelegramUserId,
-                    OWNERDELTA >= 0 ? WalletLedgerDirections.Credit : WalletLedgerDirections.Debit,
-                    Math.Abs(OWNERDELTA),
-                    beforeBalance,
-                    afterBalance,
-                    DEBITOWNERBASECOST ? WalletLedgerReasons.TenantCardBaseCost : WalletLedgerReasons.TenantGatewayProfit,
-                    provider: order.PaymentProvider,
-                    referenceType: "tenant-order",
-                    referenceId: order.Id.ToString(CultureInfo.InvariantCulture),
-                    orderId: order.OrderId,
-                    description: DEBITOWNERBASECOST ? "کسر هزینه پایه فروش کارت‌به‌کارت tenant" : "سود فروش tenant با درگاه پلتفرم",
-                    ownerTelegramUserId: order.OwnerTelegramUserId,
-                    counterpartyTelegramUserId: order.CustomerTelegramUserId,
-                    botId: order.TenantBotId,
-                    botUsername: order.TenantBotUsername,
-                    botType: BotInstanceTypes.Tenant,
-                    cancellationToken: CancellationToken);
 
                 await _gozargahSiteSyncService.QueueCreateAsync(
                     order.OwnerTelegramUserId,
@@ -4698,10 +4678,10 @@ public class TenantBotService
                     CancellationToken);
 
                 await NOTIFYTENANTCUSTOMERSUCCESSASYNC(order, created, CancellationToken);
-                await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, CancellationToken);
-                await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, beforeBalance, afterBalance, CancellationToken);
-                LOGTENANTORDER(order, owner, customer, Source, "fulfilled");
-                return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
+                await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, CancellationToken, settlement);
+                await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, settlement.BotWalletBefore, settlement.BotWalletAfter, CancellationToken);
+                LOGTENANTORDER(order, owner, customer, Source, "fulfilled", settlement);
+                return NowPaymentsSettlementResult.Applied(settlement.BotWalletBefore, settlement.BotWalletAfter);
             }
             catch (Exception ex)
             {
@@ -5690,6 +5670,279 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Applies the tenant owner's financial settlement for a fulfilled tenant purchase or renewal.
+    /// </summary>
+    /// <param name="order">
+    /// Tenant order that has already succeeded on the XUI panel and is about to be marked fulfilled locally.
+    /// </param>
+    /// <param name="owner">
+    /// Credentials row for the colleague who owns the tenant storefront. The method refreshes
+    /// <see cref="CredUser.AccountBalance"/> after any bot-wallet mutation.
+    /// </param>
+    /// <param name="debitOwnerBaseCost">
+    /// <c>true</c> for card-to-card flows where the owner received the customer money and must pay base cost;
+    /// <c>false</c> for platform gateways where the owner should receive profit.
+    /// </param>
+    /// <param name="referenceType">
+    /// Ledger reference type, such as <c>tenant-order</c> or <c>tenant-renew-order</c>, used to identify the
+    /// fulfilled local order in wallet history.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for credentials, site-wallet, and ledger operations.</param>
+    /// <returns>
+    /// Settlement result containing bot-wallet before/after values, optional Gozargah website wallet before/after
+    /// values, selected wallet source, owner delta, and any warning that should be shown to the owner.
+    /// </returns>
+    /// <remarks>
+    /// Card-to-card settlement is intentionally ordered: debit the owner's bot wallet when it can cover the base
+    /// cost, otherwise debit the Gozargah website wallet only when it is connected and sufficient, otherwise allow
+    /// the owner's bot wallet to go negative and warn the owner. Platform-gateway settlement never debits the site
+    /// wallet; it only credits tenant profit to the bot wallet and records a live site-wallet snapshot for audit logs.
+    /// </remarks>
+    private async Task<TenantOwnerWalletSettlementResult> SETTLETENANTOWNERWALLETASYNC(
+        TenantBotOrder order,
+        CredUser owner,
+        bool debitOwnerBaseCost,
+        string referenceType,
+        CancellationToken cancellationToken)
+    {
+        var botBefore = owner.AccountBalance;
+        var siteBefore = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
+
+        if (!debitOwnerBaseCost)
+        {
+            var ownerDelta = order.ProfitToman;
+            if (ownerDelta > 0)
+                await _credentialsDbContext.AddFund(order.OwnerTelegramUserId, ownerDelta);
+
+            var botAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+            owner.AccountBalance = botAfter;
+            var siteAfter = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
+
+            await RECORDTENANTOWNERWALLETLEDGERASYNC(
+                order,
+                WalletLedgerDirections.Credit,
+                ownerDelta,
+                botBefore,
+                botAfter,
+                WalletLedgerReasons.TenantGatewayProfit,
+                provider: order.PaymentProvider,
+                referenceType,
+                description: "سود فروش tenant با درگاه پلتفرم",
+                cancellationToken);
+
+            return TenantOwnerWalletSettlementResult.Create(
+                TenantOwnerWalletSources.PlatformGatewayProfit,
+                ownerDelta,
+                botBefore,
+                botAfter,
+                siteBefore,
+                siteAfter);
+        }
+
+        if (botBefore >= order.BaseCostToman)
+        {
+            await _credentialsDbContext.Pay(owner, order.BaseCostToman);
+            var botAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+            owner.AccountBalance = botAfter;
+            var siteAfter = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
+
+            await RECORDTENANTOWNERWALLETLEDGERASYNC(
+                order,
+                WalletLedgerDirections.Debit,
+                order.BaseCostToman,
+                botBefore,
+                botAfter,
+                WalletLedgerReasons.TenantCardBaseCost,
+                provider: order.PaymentProvider,
+                referenceType,
+                description: "کسر هزینه پایه فروش کارت‌به‌کارت tenant از کیف پول ربات",
+                cancellationToken);
+
+            return TenantOwnerWalletSettlementResult.Create(
+                TenantOwnerWalletSources.BotWallet,
+                -order.BaseCostToman,
+                botBefore,
+                botAfter,
+                siteBefore,
+                siteAfter);
+        }
+
+        var siteEligibility = await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
+            order.OwnerTelegramUserId,
+            order.BaseCostToman,
+            cancellationToken);
+        if (siteEligibility.CanUse)
+        {
+            var siteDebit = await _gozargahSiteSyncService.DeductSiteWalletAfterPanelSuccessAsync(
+                order.OwnerTelegramUserId,
+                order.BaseCostToman,
+                referenceType,
+                order.OrderId,
+                $"Tenant card base cost: {order.OrderId}",
+                cancellationToken);
+            if (siteDebit.Success)
+            {
+                var botAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+                owner.AccountBalance = botAfter;
+                var siteDebitBefore = TenantSiteWalletSnapshot.Connected(siteDebit.BeforeWallet);
+                var siteDebitAfter = TenantSiteWalletSnapshot.Connected(siteDebit.AfterWallet);
+
+                await RECORDTENANTOWNERWALLETLEDGERASYNC(
+                    order,
+                    WalletLedgerDirections.Debit,
+                    order.BaseCostToman,
+                    siteDebit.BeforeWallet,
+                    siteDebit.AfterWallet,
+                    WalletLedgerReasons.TenantCardBaseCost,
+                    provider: "gozargah_site_wallet",
+                    referenceType,
+                    description: "کسر هزینه پایه فروش کارت‌به‌کارت tenant از کیف پول سایت گذرگاه",
+                    cancellationToken);
+
+                return TenantOwnerWalletSettlementResult.Create(
+                    TenantOwnerWalletSources.GozargahSiteWallet,
+                    -order.BaseCostToman,
+                    botBefore,
+                    botAfter,
+                    siteDebitBefore,
+                    siteDebitAfter);
+            }
+        }
+
+        await _credentialsDbContext.Pay(owner, order.BaseCostToman);
+        var negativeBotAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+        owner.AccountBalance = negativeBotAfter;
+        var negativeSiteAfter = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
+        var warning =
+            "⚠️ موجودی کیف پول ربات شما برای هزینه پایه کافی نبود و کیف پول سایت گذرگاه هم قابل استفاده نبود. " +
+            "هزینه پایه از کیف پول ربات کسر شد و موجودی شما منفی شد. لطفاً موجودی را افزایش دهید؛ در غیر اینصورت اکانت مشتری ممکن است غیرفعال شود.";
+
+        await RECORDTENANTOWNERWALLETLEDGERASYNC(
+            order,
+            WalletLedgerDirections.Debit,
+            order.BaseCostToman,
+            botBefore,
+            negativeBotAfter,
+            WalletLedgerReasons.TenantCardBaseCost,
+            provider: order.PaymentProvider,
+            referenceType,
+            description: "کسر هزینه پایه فروش کارت‌به‌کارت tenant با منفی شدن کیف پول ربات",
+            cancellationToken);
+
+        return TenantOwnerWalletSettlementResult.Create(
+            TenantOwnerWalletSources.NegativeBotWallet,
+            -order.BaseCostToman,
+            botBefore,
+            negativeBotAfter,
+            siteBefore,
+            negativeSiteAfter,
+            warning);
+    }
+
+    /// <summary>
+    /// Records the wallet ledger row for a tenant owner settlement.
+    /// </summary>
+    /// <param name="order">Tenant order that caused the financial movement.</param>
+    /// <param name="direction">Ledger direction, credit or debit.</param>
+    /// <param name="amountToman">Positive amount in toman to record. Zero values are ignored by the ledger service.</param>
+    /// <param name="beforeBalance">Balance of the selected wallet before the movement.</param>
+    /// <param name="afterBalance">Balance of the selected wallet after the movement.</param>
+    /// <param name="reason">Business reason key used by wallet history and admin audit.</param>
+    /// <param name="provider">Provider/source key, for example <c>tenant_card</c> or <c>gozargah_site_wallet</c>.</param>
+    /// <param name="referenceType">Local reference type for the order.</param>
+    /// <param name="description">Human-readable audit description.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db insert.</param>
+    /// <returns>A task that completes after the ledger row is saved or skipped for a zero amount.</returns>
+    private Task RECORDTENANTOWNERWALLETLEDGERASYNC(
+        TenantBotOrder order,
+        string direction,
+        long amountToman,
+        long beforeBalance,
+        long afterBalance,
+        string reason,
+        string provider,
+        string referenceType,
+        string description,
+        CancellationToken cancellationToken)
+    {
+        return _walletLedgerService.RecordAsync(
+            order.OwnerTelegramUserId,
+            direction,
+            amountToman,
+            beforeBalance,
+            afterBalance,
+            reason,
+            provider: provider,
+            referenceType: referenceType,
+            referenceId: order.Id.ToString(CultureInfo.InvariantCulture),
+            orderId: order.OrderId,
+            description: description,
+            ownerTelegramUserId: order.OwnerTelegramUserId,
+            counterpartyTelegramUserId: order.CustomerTelegramUserId,
+            botId: order.TenantBotId,
+            botUsername: order.TenantBotUsername,
+            botType: BotInstanceTypes.Tenant,
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Reads a display-only Gozargah website wallet snapshot for tenant owner audit logs.
+    /// </summary>
+    /// <param name="ownerTelegramUserId">Telegram user id of the tenant owner whose website wallet should be checked.</param>
+    /// <param name="cancellationToken">Cancellation token for the site-wallet eligibility lookup.</param>
+    /// <returns>
+    /// A snapshot containing either the current site-wallet balance or a short display status such as
+    /// <c>متصل نشده</c> or <c>در دسترس نیست</c>.
+    /// </returns>
+    /// <remarks>
+    /// The lookup uses an amount of zero so it never reserves or debits money. It is used only for logs and owner
+    /// messages; actual site-wallet debits still call the dedicated debit endpoint after account delivery succeeds.
+    /// </remarks>
+    private async Task<TenantSiteWalletSnapshot> GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(
+        long ownerTelegramUserId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var eligibility = await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
+                ownerTelegramUserId,
+                0,
+                cancellationToken);
+
+            if (eligibility.User != null ||
+                eligibility.CanUse ||
+                string.Equals(eligibility.Message, "موجودی کیف پول سایت کافی نیست.", StringComparison.OrdinalIgnoreCase))
+            {
+                return TenantSiteWalletSnapshot.Connected(eligibility.WalletToman);
+            }
+
+            return TenantSiteWalletSnapshot.Unavailable(NORMALIZEGOZARGAHSITEWALLETSTATUS(eligibility.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Tenant owner site-wallet snapshot failed. owner={OwnerTelegramUserId}", ownerTelegramUserId);
+            return TenantSiteWalletSnapshot.Unavailable("در دسترس نیست");
+        }
+    }
+
+    /// <summary>
+    /// Normalizes website wallet lookup messages for tenant audit display.
+    /// </summary>
+    /// <param name="message">Raw user-facing message returned by the Gozargah wallet eligibility helper.</param>
+    /// <returns>A short Persian status safe for tenant sale logs.</returns>
+    private static string NORMALIZEGOZARGAHSITEWALLETSTATUS(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "در دسترس نیست";
+
+        return message.Contains("not found", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("پیدا نشد", StringComparison.OrdinalIgnoreCase)
+            ? "متصل نشده"
+            : "در دسترس نیست";
+    }
+
+    /// <summary>
     /// Detects XUI or HTTP timeout errors that should keep tenant fulfillment retryable.
     /// </summary>
     /// <param name="error">
@@ -5729,10 +5982,27 @@ public class TenantBotService
     /// <param name="owner">Credential record for the colleague who owns the tenant Bot.</param>
     /// <param name="customer">Credential record for the Buyer.</param>
     /// <param name="CancellationToken">Cancellation Token for Telegram delivery.</param>
-    private async Task NOTIFYTENANTOWNERSUCCESSASYNC(TenantBotOrder order, CredUser owner, CredUser customer, CancellationToken CancellationToken)
+    /// <param name="settlement">
+    /// Optional settlement details used to show which wallet paid or received money. Null is allowed for legacy
+    /// callers and shows only the order's persisted bot-wallet balances.
+    /// </param>
+    private async Task NOTIFYTENANTOWNERSUCCESSASYNC(
+        TenantBotOrder order,
+        CredUser owner,
+        CredUser customer,
+        CancellationToken CancellationToken,
+        TenantOwnerWalletSettlementResult settlement = null)
     {
         try
         {
+            var settlementText = settlement == null
+                ? string.Empty
+                : "\n" +
+                  $"منبع تسویه: <code>{Html(settlement.SourceDisplayName)}</code>\n" +
+                  $"کیف پول سایت قبل: <code>{Html(FormatTenantSiteWalletSnapshot(settlement.SiteWalletBefore))}</code>\n" +
+                  $"کیف پول سایت بعد: <code>{Html(FormatTenantSiteWalletSnapshot(settlement.SiteWalletAfter))}</code>" +
+                  (string.IsNullOrWhiteSpace(settlement.WarningMessage) ? string.Empty : $"\n\n{Html(settlement.WarningMessage)}");
+
             var botClient = _botClientProvider.GetClient(_botRegistry.DefaultBot.Id);
             await botClient.SendTextMessageAsync(
                 owner.ChatID == 0 ? owner.TelegramUserId : owner.ChatID,
@@ -5743,7 +6013,8 @@ public class TenantBotService
                 $"هزینه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
                 $"سود اضافه‌شده به موجودی شما: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
                 $"موجودی قبل: <code>{Html(order.OwnerBalanceBefore?.FormatCurrency())}</code>\n" +
-                $"موجودی بعد: <code>{Html(order.OwnerBalanceAfter?.FormatCurrency())}</code>",
+                $"موجودی بعد: <code>{Html(order.OwnerBalanceAfter?.FormatCurrency())}</code>" +
+                settlementText,
                 parseMode: ParseMode.Html,
                 cancellationToken: CancellationToken);
         }
@@ -5760,8 +6031,29 @@ public class TenantBotService
     /// <param name="customer">customer shown in the log.</param>
     /// <param name="Source">settlement Source such as ipn, manual check, or Exception path.</param>
     /// <param name="result">final local result of the order processing Attempt.</param>
-    private void LOGTENANTORDER(TenantBotOrder order, CredUser owner, CredUser customer, string Source, string result)
+    /// <param name="settlement">
+    /// Optional owner settlement result. Successful tenant fulfillment passes this value so the audit log can show
+    /// bot-wallet and Gozargah website-wallet before/after values without adding new database columns.
+    /// </param>
+    private void LOGTENANTORDER(
+        TenantBotOrder order,
+        CredUser owner,
+        CredUser customer,
+        string Source,
+        string result,
+        TenantOwnerWalletSettlementResult settlement = null)
     {
+        var settlementText = settlement == null
+            ? string.Empty
+            : $"منبع تسویه همکار: <code>{Html(settlement.SourceDisplayName)}</code>\n" +
+              $"کیف پول ربات قبل: <code>{Html(settlement.BotWalletBefore.FormatCurrency())}</code>\n" +
+              $"کیف پول ربات بعد: <code>{Html(settlement.BotWalletAfter.FormatCurrency())}</code>\n" +
+              $"کیف پول سایت قبل: <code>{Html(FormatTenantSiteWalletSnapshot(settlement.SiteWalletBefore))}</code>\n" +
+              $"کیف پول سایت بعد: <code>{Html(FormatTenantSiteWalletSnapshot(settlement.SiteWalletAfter))}</code>\n" +
+              (string.IsNullOrWhiteSpace(settlement.WarningMessage)
+                  ? string.Empty
+                  : $"هشدار: <code>{Html(settlement.WarningMessage)}</code>\n");
+
         var Message = "📌 فروش ربات فروشگاهی\n\n" +
                       $"نتیجه: <code>{Html(result)}</code>\n" +
                       $"منبع تایید: <code>{Html(Source)}</code>\n" +
@@ -5775,10 +6067,30 @@ public class TenantBotService
                       $"فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
                       $"هزینه پایه: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
                       $"سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
+                      settlementText +
                       $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>" +
                       BuildTenantOrderErrorLine(order);
 
         _logger.LogPayment(Message);
+    }
+
+    /// <summary>
+    /// Formats a Gozargah website wallet snapshot for tenant owner messages and private audit logs.
+    /// </summary>
+    /// <param name="snapshot">
+    /// Snapshot returned by <see cref="GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(long, CancellationToken)"/> or by a
+    /// successful website-wallet debit.
+    /// </param>
+    /// <returns>
+    /// Formatted balance in toman when the website wallet is connected; otherwise a short status such as
+    /// <c>متصل نشده</c> or <c>در دسترس نیست</c>.
+    /// </returns>
+    private static string FormatTenantSiteWalletSnapshot(TenantSiteWalletSnapshot snapshot)
+    {
+        if (snapshot?.IsConnected == true)
+            return snapshot.WalletToman.GetValueOrDefault().FormatCurrency();
+
+        return string.IsNullOrWhiteSpace(snapshot?.StatusText) ? "در دسترس نیست" : snapshot.StatusText;
     }
 
     /// <summary>
@@ -6654,19 +6966,18 @@ public class TenantBotService
         client.ExpiryTime = renewal.Payload.ExpiryTime;
         client.Comment = renewal.Payload.Comment;
 
-        var beforeBalance = owner.AccountBalance;
-        var ownerDelta = debitOwnerBaseCost ? -order.BaseCostToman : order.ProfitToman;
-        if (ownerDelta > 0)
-            await _credentialsDbContext.AddFund(order.OwnerTelegramUserId, ownerDelta);
-        else if (ownerDelta < 0)
-            await _credentialsDbContext.Pay(owner, Math.Abs(ownerDelta));
-        var afterBalance = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+        var settlement = await SETTLETENANTOWNERWALLETASYNC(
+            order,
+            owner,
+            debitOwnerBaseCost,
+            referenceType: "tenant-renew-order",
+            cancellationToken);
 
         order.IsFulfilled = true;
-        order.IsOwnerCredited = ownerDelta > 0;
-        order.OwnerWalletDelta = ownerDelta;
-        order.OwnerBalanceBefore = beforeBalance;
-        order.OwnerBalanceAfter = afterBalance;
+        order.IsOwnerCredited = settlement.OwnerDelta > 0;
+        order.OwnerWalletDelta = settlement.OwnerDelta;
+        order.OwnerBalanceBefore = settlement.BotWalletBefore;
+        order.OwnerBalanceAfter = settlement.BotWalletAfter;
         order.PaymentStatus = TenantBotOrderStatuses.Fulfilled;
         order.FulfillmentSource = source;
         order.CreatedAccountEmail = client.Email;
@@ -6697,33 +7008,14 @@ public class TenantBotService
             CustomerTelegramUserId = order.CustomerTelegramUserId,
             SalePriceToman = order.SalePriceToman,
             BaseCostToman = order.BaseCostToman,
-            ProfitToman = ownerDelta,
-            OwnerBalanceBefore = beforeBalance,
-            OwnerBalanceAfter = afterBalance,
+            ProfitToman = settlement.OwnerDelta,
+            OwnerBalanceBefore = settlement.BotWalletBefore,
+            OwnerBalanceAfter = settlement.BotWalletAfter,
             Description = $"tenant Bot renewal VIA @{order.TenantBotUsername}",
             CreatedAtUtc = DateTime.UtcNow
         });
 
         await _userDbcontext.SaveChangesAsync(cancellationToken);
-
-        await _walletLedgerService.RecordAsync(
-            order.OwnerTelegramUserId,
-            ownerDelta >= 0 ? WalletLedgerDirections.Credit : WalletLedgerDirections.Debit,
-            Math.Abs(ownerDelta),
-            beforeBalance,
-            afterBalance,
-            debitOwnerBaseCost ? WalletLedgerReasons.TenantCardBaseCost : WalletLedgerReasons.TenantGatewayProfit,
-            provider: order.PaymentProvider,
-            referenceType: "tenant-renew-order",
-            referenceId: order.Id.ToString(CultureInfo.InvariantCulture),
-            orderId: order.OrderId,
-            description: debitOwnerBaseCost ? "کسر هزینه پایه تمدید کارت‌به‌کارت tenant" : "سود تمدید tenant با درگاه پلتفرم",
-            ownerTelegramUserId: order.OwnerTelegramUserId,
-            counterpartyTelegramUserId: order.CustomerTelegramUserId,
-            botId: order.TenantBotId,
-            botUsername: order.TenantBotUsername,
-            botType: BotInstanceTypes.Tenant,
-            cancellationToken: cancellationToken);
 
         await _gozargahSiteSyncService.QueueUpdateAsync(
             order.OwnerTelegramUserId,
@@ -6735,10 +7027,10 @@ public class TenantBotService
             cancellationToken);
 
         await SENDTENANTRENEWSUCCESSASYNC(order, renewal, cancellationToken);
-        await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, cancellationToken);
-        await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, beforeBalance, afterBalance, cancellationToken);
-        LOGTENANTORDER(order, owner, customer, source, "renew-fulfilled");
-        return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
+        await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, cancellationToken, settlement);
+        await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, settlement.BotWalletBefore, settlement.BotWalletAfter, cancellationToken);
+        LOGTENANTORDER(order, owner, customer, source, "renew-fulfilled", settlement);
+        return NowPaymentsSettlementResult.Applied(settlement.BotWalletBefore, settlement.BotWalletAfter);
     }
 
     /// <summary>
@@ -7429,6 +7721,160 @@ public class TenantBotService
             {
                 HasConflict = true,
                 ConflictType = conflictType
+            };
+        }
+    }
+
+    /// <summary>
+    /// Source keys for tenant owner settlement movements.
+    /// </summary>
+    /// <remarks>
+    /// These values are internal audit labels. They describe which wallet paid the base cost or received tenant
+    /// profit and are displayed in private logs and owner notifications.
+    /// </remarks>
+    private static class TenantOwnerWalletSources
+    {
+        /// <summary>
+        /// The tenant owner's bot wallet paid the card-to-card base cost.
+        /// </summary>
+        public const string BotWallet = "bot_wallet";
+
+        /// <summary>
+        /// The tenant owner's Gozargah website wallet paid the card-to-card base cost.
+        /// </summary>
+        public const string GozargahSiteWallet = "gozargah_site_wallet";
+
+        /// <summary>
+        /// The tenant owner's bot wallet was allowed to go negative for card-to-card base cost.
+        /// </summary>
+        public const string NegativeBotWallet = "negative_bot_wallet";
+
+        /// <summary>
+        /// A platform gateway sale credited profit to the tenant owner's bot wallet.
+        /// </summary>
+        public const string PlatformGatewayProfit = "platform_gateway_profit";
+    }
+
+    /// <summary>
+    /// Display-only snapshot of a tenant owner's Gozargah website wallet.
+    /// </summary>
+    private sealed class TenantSiteWalletSnapshot
+    {
+        /// <summary>
+        /// Whether the website wallet exists and its balance was read successfully.
+        /// </summary>
+        public bool IsConnected { get; private init; }
+
+        /// <summary>
+        /// Website wallet balance in toman when <see cref="IsConnected"/> is true.
+        /// </summary>
+        public long? WalletToman { get; private init; }
+
+        /// <summary>
+        /// Short display status such as <c>متصل نشده</c> or <c>در دسترس نیست</c> when not connected.
+        /// </summary>
+        public string StatusText { get; private init; }
+
+        /// <summary>
+        /// Creates a connected website-wallet snapshot.
+        /// </summary>
+        /// <param name="walletToman">Current website wallet balance in toman.</param>
+        /// <returns>Connected snapshot with a readable balance.</returns>
+        public static TenantSiteWalletSnapshot Connected(long walletToman)
+            => new() { IsConnected = true, WalletToman = walletToman };
+
+        /// <summary>
+        /// Creates an unavailable website-wallet snapshot.
+        /// </summary>
+        /// <param name="statusText">Short Persian status safe for owner messages and private logs.</param>
+        /// <returns>Unavailable snapshot with no balance.</returns>
+        public static TenantSiteWalletSnapshot Unavailable(string statusText)
+            => new() { StatusText = string.IsNullOrWhiteSpace(statusText) ? "در دسترس نیست" : statusText };
+    }
+
+    /// <summary>
+    /// Result of settling the tenant owner's wallet side for one fulfilled storefront order.
+    /// </summary>
+    private sealed class TenantOwnerWalletSettlementResult
+    {
+        /// <summary>
+        /// Internal source key from <see cref="TenantOwnerWalletSources"/>.
+        /// </summary>
+        public string WalletSource { get; private init; }
+
+        /// <summary>
+        /// Human-readable Persian source label shown to the owner and in private audit logs.
+        /// </summary>
+        public string SourceDisplayName { get; private init; }
+
+        /// <summary>
+        /// Signed tenant owner financial delta in toman. Positive values credit profit; negative values represent
+        /// a base-cost debit from either bot wallet or website wallet.
+        /// </summary>
+        public long OwnerDelta { get; private init; }
+
+        /// <summary>
+        /// Tenant owner's bot-wallet balance before the settlement.
+        /// </summary>
+        public long BotWalletBefore { get; private init; }
+
+        /// <summary>
+        /// Tenant owner's bot-wallet balance after the settlement.
+        /// </summary>
+        public long BotWalletAfter { get; private init; }
+
+        /// <summary>
+        /// Website wallet snapshot before settlement. It is display-only and may be unavailable.
+        /// </summary>
+        public TenantSiteWalletSnapshot SiteWalletBefore { get; private init; }
+
+        /// <summary>
+        /// Website wallet snapshot after settlement. It is display-only unless the website wallet paid base cost.
+        /// </summary>
+        public TenantSiteWalletSnapshot SiteWalletAfter { get; private init; }
+
+        /// <summary>
+        /// Optional owner-facing warning, currently used when the bot wallet falls back to a negative balance.
+        /// </summary>
+        public string WarningMessage { get; private init; }
+
+        /// <summary>
+        /// Creates a settlement result with source, balances, website snapshots, and optional warning.
+        /// </summary>
+        /// <param name="walletSource">Internal source key from <see cref="TenantOwnerWalletSources"/>.</param>
+        /// <param name="ownerDelta">Signed owner delta in toman.</param>
+        /// <param name="botWalletBefore">Bot-wallet balance before settlement.</param>
+        /// <param name="botWalletAfter">Bot-wallet balance after settlement.</param>
+        /// <param name="siteWalletBefore">Website wallet snapshot before settlement.</param>
+        /// <param name="siteWalletAfter">Website wallet snapshot after settlement.</param>
+        /// <param name="warningMessage">Optional owner-facing warning text.</param>
+        /// <returns>Settlement result consumed by order persistence, ledger, owner messages, and private logs.</returns>
+        public static TenantOwnerWalletSettlementResult Create(
+            string walletSource,
+            long ownerDelta,
+            long botWalletBefore,
+            long botWalletAfter,
+            TenantSiteWalletSnapshot siteWalletBefore,
+            TenantSiteWalletSnapshot siteWalletAfter,
+            string warningMessage = null)
+        {
+            return new TenantOwnerWalletSettlementResult
+            {
+                WalletSource = walletSource,
+                SourceDisplayName = walletSource switch
+                {
+                    TenantOwnerWalletSources.BotWallet => "کیف پول ربات",
+                    TenantOwnerWalletSources.GozargahSiteWallet => "کیف پول سایت گذرگاه",
+                    TenantOwnerWalletSources.NegativeBotWallet => "منفی شدن کیف پول ربات",
+                    TenantOwnerWalletSources.PlatformGatewayProfit => "سود درگاه پلتفرم",
+                    _ => walletSource
+                },
+                OwnerDelta = ownerDelta,
+                BotWalletBefore = botWalletBefore,
+                BotWalletAfter = botWalletAfter,
+                SiteWalletBefore = siteWalletBefore,
+                SiteWalletAfter = siteWalletAfter,
+                WarningMessage = warningMessage
             };
         }
     }
