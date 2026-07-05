@@ -52,6 +52,7 @@ class Program
         builder.Services.AddSingleton<BotContextAccessor>();
         builder.Services.AddSingleton<BotRegistry>();
         builder.Services.AddSingleton<BotClientProvider>();
+        builder.Services.AddSingleton<BotRuntimeStatusStore>();
         builder.Services.AddSingleton<XuiV3PurchaseService>();
         builder.Services.AddSingleton<XuiV3PurchaseSessionStore>();
         builder.Services.AddSingleton<UserActivityLogService>();

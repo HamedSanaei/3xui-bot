@@ -330,6 +330,18 @@ public class TenantBotService
             return true;
         }
 
+        if (action == "reset")
+        {
+            await SHOWTENANTRESETCONFIRMATIONASYNC(botClient, CallbackQuery, CancellationToken);
+            return true;
+        }
+
+        if (action == "reset-confirm")
+        {
+            await RESETTENANTSETTINGSASYNC(botClient, CallbackQuery, CredUser, CancellationToken);
+            return true;
+        }
+
         if (action == "TOGGLE")
         {
             await TOGGLETENANTBOTASYNC(botClient, CallbackQuery, CredUser, CancellationToken);
@@ -549,6 +561,12 @@ public class TenantBotService
     /// <param name="owner">colleague owner profile.</param>
     /// <param name="MessageId">Message Id to edit; null sends A new Message.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <remarks>
+    /// Opening or refreshing the panel probes an existing tenant bot token with Telegram <c>getMe</c>. If Telegram
+    /// proves the token is revoked or unauthorized, the method clears only the token identity fields and disables
+    /// the tenant bot before rendering, while preserving card, support, tutorial, and historical order settings.
+    /// Transient Telegram failures are shown as a warning and never clear the owner configuration.
+    /// </remarks>
     private async Task SHOWOWNERPANELASYNC(
         ITelegramBotClient botClient,
         ChatId ChatId,
@@ -557,7 +575,8 @@ public class TenantBotService
         CancellationToken CancellationToken)
     {
         var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, CancellationToken);
-        var Text = BUILDOWNERPANELTEXT(tenant, owner);
+        var tokenNotice = await VALIDATETENANTTOKENFORPANELASYNC(tenant, CancellationToken);
+        var Text = BUILDOWNERPANELTEXT(tenant, owner, tokenNotice);
         var keyboard = BUILDOWNERPANELKEYBOARD(tenant);
 
         if (MessageId.HasValue)
@@ -586,8 +605,9 @@ public class TenantBotService
     /// </summary>
     /// <param name="tenant">current tenant Bot row, or null if the owner has not created one yet.</param>
     /// <param name="owner">colleague owner profile.</param>
+    /// <param name="tokenNotice">Optional HTML-safe status line produced by token validation before panel rendering.</param>
     /// <returns>Html-formatted panel Text.</returns>
-    private string BUILDOWNERPANELTEXT(BotInstance tenant, CredUser owner)
+    private string BUILDOWNERPANELTEXT(BotInstance tenant, CredUser owner, string tokenNotice = null)
     {
         var hasToken = !string.IsNullOrWhiteSpace(tenant?.Token);
         var IsEnabled = tenant?.Enabled == true;
@@ -602,8 +622,13 @@ public class TenantBotService
             : "خاموش";
         var WELCOME = string.IsNullOrWhiteSpace(tenant?.TenantWelcomeText) ? "ثبت نشده" : "ثبت شده";
 
-        return "🛒 <b>ربات فروشگاهی همکار</b>\n\n" +
-               "با این بخش می‌توانید ربات فروشگاهی خودتان را با توکن BotFather فعال کنید. مشتری‌ها داخل همان ربات خرید می‌کنند، بعد از پرداخت موفق اکانت ساخته می‌شود و سود سفارش به موجودی شما اضافه می‌شود.\n\n" +
+        var text = "🛒 <b>ربات فروشگاهی همکار</b>\n\n" +
+                   "با این بخش می‌توانید ربات فروشگاهی خودتان را با توکن BotFather فعال کنید. مشتری‌ها داخل همان ربات خرید می‌کنند، بعد از پرداخت موفق اکانت ساخته می‌شود و سود سفارش به موجودی شما اضافه می‌شود.\n\n";
+
+        if (!string.IsNullOrWhiteSpace(tokenNotice))
+            text += tokenNotice + "\n\n";
+
+        return text +
                $"{STATUSICON(hasToken)} توکن ربات: <code>{Html(hasToken ? "ثبت شده" : "ثبت نشده")}</code>\n" +
                $"{STATUSICON(hasToken)} یوزرنیم ربات: <code>{Html(Username)}</code>\n" +
                $"{STATUSICON(true)} درصد سود روی قیمت همکار: <code>{markup}%</code>\n" +
@@ -688,9 +713,349 @@ public class TenantBotService
             },
             new[]
             {
+                InlineKeyboardButton.WithCallbackData("♻️ بازنشانی تنظیمات ربات", OWNERCALLBACKPREFIX + "reset")
+            },
+            new[]
+            {
                 InlineKeyboardButton.WithCallbackData(IsEnabled ? "⛔ خاموش کردن فروشگاه" : "✅ روشن کردن فروشگاه", OWNERCALLBACKPREFIX + "TOGGLE")
             }
         });
+    }
+
+    /// <summary>
+    /// Shows the destructive reset confirmation for the tenant owner panel.
+    /// </summary>
+    /// <param name="botClient">
+    /// Owned-brand Telegram client that received the owner callback and can edit the panel message.
+    /// </param>
+    /// <param name="CallbackQuery">
+    /// Callback query from the colleague owner. The callback message is edited in-place when possible.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// Token used to cancel Telegram edit and callback-answer operations when the update pipeline stops.
+    /// </param>
+    /// <remarks>
+    /// Reset removes every owner-configured tenant storefront setting and disables the tenant bot, so this
+    /// method always asks for a second confirmation before <see cref="RESETTENANTSETTINGSASYNC" /> can run.
+    /// </remarks>
+    private async Task SHOWTENANTRESETCONFIRMATIONASYNC(
+        ITelegramBotClient botClient,
+        CallbackQuery CallbackQuery,
+        CancellationToken CancellationToken)
+    {
+        var chatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
+        var messageId = CallbackQuery.Message?.MessageId;
+        var keyboard = new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("✅ تایید بازنشانی", OWNERCALLBACKPREFIX + "reset-confirm")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("↩️ برگشت به پنل", OWNERCALLBACKPREFIX + "panel")
+            }
+        });
+
+        const string text =
+            "♻️ <b>بازنشانی تنظیمات ربات فروشگاهی</b>\n\n" +
+            "با تایید این گزینه، توکن ربات، یوزرنیم ربات، پشتیبانی، متن خوشامد، کارت‌به‌کارت، جوین اجباری، آموزش‌ها و تنظیمات درگاه‌های فروشگاه پاک می‌شود و ربات فروشگاهی خاموش خواهد شد.\n\n" +
+            "سوابق سفارش‌ها، رسیدها، پرداخت‌ها، تراکنش‌ها و کاربران قبلی حذف نمی‌شوند.";
+
+        if (messageId.HasValue)
+        {
+            await SafeEditMessageTextAsync(
+                botClient,
+                chatId,
+                messageId.Value,
+                text,
+                parseMode: ParseMode.Html,
+                replyMarkup: keyboard,
+                cancellationToken: CancellationToken);
+        }
+        else
+        {
+            await botClient.SendTextMessageAsync(
+                chatId,
+                text,
+                parseMode: ParseMode.Html,
+                replyMarkup: keyboard,
+                cancellationToken: CancellationToken);
+        }
+
+        await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
+    }
+
+    /// <summary>
+    /// Resets all owner-configured storefront settings and disables the colleague tenant bot.
+    /// </summary>
+    /// <param name="botClient">
+    /// Owned-brand Telegram client used to edit the owner panel after the reset has been persisted.
+    /// </param>
+    /// <param name="CallbackQuery">
+    /// Confirmation callback from the tenant owner. The sender must be the colleague who owns the tenant row.
+    /// </param>
+    /// <param name="owner">
+    /// Shared credentials profile of the colleague owner whose tenant settings must be reset.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// Token used to cancel users.db writes, runtime stop, cache invalidation, and Telegram replies.
+    /// </param>
+    /// <remarks>
+    /// This method intentionally resets only the mutable storefront configuration stored on <see cref="BotInstance" />.
+    /// It preserves the tenant internal id, owner Telegram id, orders, receipts, ledger entries, payments, and
+    /// customer state so financial and delivery history remains auditable after the owner starts over.
+    /// </remarks>
+    private async Task RESETTENANTSETTINGSASYNC(
+        ITelegramBotClient botClient,
+        CallbackQuery CallbackQuery,
+        CredUser owner,
+        CancellationToken CancellationToken)
+    {
+        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
+
+        ResetTenantStorefrontSettings(tenant, clearAllStorefrontSettings: true);
+        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        _botRegistry.Upsert(tenant);
+        _botClientProvider.Invalidate(tenant.Id);
+
+        await SafeAnswerCallbackQueryAsync(
+            botClient,
+            CallbackQuery.Id,
+            "تنظیمات ربات فروشگاهی بازنشانی شد.",
+            showAlert: true,
+            cancellationToken: CancellationToken);
+
+        await SHOWOWNERPANELASYNC(
+            botClient,
+            CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+            owner,
+            CallbackQuery.Message?.MessageId,
+            CancellationToken);
+    }
+
+    /// <summary>
+    /// Validates the persisted tenant bot token before the owner panel is rendered.
+    /// </summary>
+    /// <param name="tenant">
+    /// Tenant bot row owned by the colleague whose panel is being opened. A null value or a row without a token
+    /// is treated as an unconfigured storefront and does not call Telegram.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// Token used to cancel the Telegram <c>getMe</c> probe and any users.db cleanup if the update stops.
+    /// </param>
+    /// <returns>
+    /// An HTML-safe Persian notice to prepend to the owner panel, or null when no user-visible warning is needed.
+    /// The returned text is safe to include in a message sent with <see cref="ParseMode.Html" />.
+    /// </returns>
+    /// <remarks>
+    /// A clearly revoked or unauthorized token is cleaned immediately because keeping it in the panel causes the
+    /// owner to believe a dead storefront is still configured. Transient Telegram errors such as timeouts or 5xx
+    /// responses do not clear the token; the owner sees a temporary warning and can retry refresh later.
+    /// </remarks>
+    private async Task<string> VALIDATETENANTTOKENFORPANELASYNC(BotInstance tenant, CancellationToken CancellationToken)
+    {
+        if (tenant == null || string.IsNullOrWhiteSpace(tenant.Token))
+            return null;
+
+        try
+        {
+            var client = new TelegramBotClient(tenant.Token);
+            var me = await client.GetMeAsync(CancellationToken);
+            var username = me.Username?.Trim().TrimStart('@');
+            var changed = false;
+
+            if (!string.IsNullOrWhiteSpace(username) &&
+                !string.Equals(tenant.Username, username, StringComparison.OrdinalIgnoreCase))
+            {
+                tenant.Username = username;
+                changed = true;
+            }
+
+            if (string.IsNullOrWhiteSpace(tenant.BrandName) && !string.IsNullOrWhiteSpace(me.FirstName))
+            {
+                tenant.BrandName = me.FirstName;
+                changed = true;
+            }
+
+            if (changed)
+            {
+                tenant.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                _botRegistry.Upsert(tenant);
+                _botClientProvider.Invalidate(tenant.Id);
+            }
+
+            return null;
+        }
+        catch (Exception ex) when (ISTELEGRAMTOKENINVALIDERROR(ex))
+        {
+            await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
+
+            ResetTenantStorefrontSettings(tenant, clearAllStorefrontSettings: false);
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            _botRegistry.Upsert(tenant);
+            _botClientProvider.Invalidate(tenant.Id);
+
+            _logger.LogWarning(
+                "Tenant bot token was invalid during owner panel refresh and was cleared. tenantBotId={TenantBotId}, owner={OwnerTelegramUserId}, reason={Reason}",
+                tenant.Id,
+                tenant.OwnerTelegramUserId,
+                ex.Message);
+
+            return "⚠️ توکن ربات فروشگاهی معتبر نبود و از تنظیمات پاک شد. لطفاً توکن جدید ثبت کنید.";
+        }
+        catch (Exception ex) when (ISTELEGRAMTRANSIENTTOKENCHECKERROR(ex))
+        {
+            _logger.LogDebug(
+                ex,
+                "Tenant bot token validation skipped because Telegram returned a transient error. tenantBotId={TenantBotId}",
+                tenant.Id);
+
+            return "⚠️ فعلاً امکان بررسی توکن ربات فروشگاهی نیست. اگر تلگرام مشکل موقت داشته باشد، دوباره بروزرسانی را بزنید.";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(
+                ex,
+                "Tenant bot token validation skipped because Telegram returned an unknown non-authoritative error. tenantBotId={TenantBotId}",
+                tenant.Id);
+
+            return "⚠️ فعلاً امکان بررسی توکن ربات فروشگاهی نیست. تنظیمات شما پاک نشد؛ کمی بعد دوباره بروزرسانی را بزنید.";
+        }
+    }
+
+    /// <summary>
+    /// Stops a tenant receiver without failing the owner-panel cleanup flow.
+    /// </summary>
+    /// <param name="tenantBotId">
+    /// Internal tenant bot id, for example <c>tenant-123456</c>. This is not a Telegram bot id or chat id.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// Token used to cancel the runtime stop request if the application is shutting down.
+    /// </param>
+    /// <returns>A task that completes after the runtime stop attempt has finished or been logged as failed.</returns>
+    /// <remarks>
+    /// Reset and invalid-token cleanup must update users.db even when the receiver is already stopped or the hosted
+    /// service is unavailable. For that reason this helper logs runtime stop failures and lets the caller continue.
+    /// </remarks>
+    private async Task StopTenantRuntimeBestEffortAsync(string tenantBotId, CancellationToken CancellationToken)
+    {
+        var runtime = _serviceProvider.GetService<MultiBotHostedService>();
+        if (runtime == null || string.IsNullOrWhiteSpace(tenantBotId))
+            return;
+
+        try
+        {
+            await runtime.StopBotAsync(tenantBotId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Tenant bot receiver stop failed during settings cleanup. tenantBotId={TenantBotId}",
+                tenantBotId);
+        }
+    }
+
+    /// <summary>
+    /// Applies either a full storefront reset or an invalid-token cleanup to a tenant bot row.
+    /// </summary>
+    /// <param name="tenant">
+    /// Persisted tenant bot row tracked by <see cref="UserDbContext" />. The caller must save changes after this
+    /// method returns.
+    /// </param>
+    /// <param name="clearAllStorefrontSettings">
+    /// When true, all owner-configured storefront settings are cleared. When false, only token identity and
+    /// enabled state are cleared so unrelated settings like card payment and support remain intact.
+    /// </param>
+    /// <remarks>
+    /// This method deliberately does not delete tenant orders, receipts, ledger entries, customer states, or payment
+    /// rows. Those records are separate audit history and must survive both owner-requested resets and revoked-token
+    /// cleanup.
+    /// </remarks>
+    private static void ResetTenantStorefrontSettings(BotInstance tenant, bool clearAllStorefrontSettings)
+    {
+        tenant.Enabled = false;
+        tenant.Token = null;
+        tenant.Username = null;
+        tenant.UpdatedAtUtc = DateTime.UtcNow;
+
+        if (!clearAllStorefrontSettings)
+            return;
+
+        tenant.BrandName = null;
+        tenant.SupportAccount = null;
+        tenant.TenantWelcomeText = null;
+        tenant.TenantPriceMarkupPercent = 0;
+        tenant.TenantMandatoryJoinEnabled = false;
+        tenant.TenantChannelIdsJson = null;
+        tenant.TenantCardPaymentEnabled = false;
+        tenant.TenantCardNumber = null;
+        tenant.TenantCardHolderName = null;
+        tenant.TenantHooshPayEnabled = true;
+        tenant.TenantNowPaymentsEnabled = true;
+        tenant.TenantTutorialsJson = JsonConvert.SerializeObject(Array.Empty<TenantTutorialLink>());
+    }
+
+    /// <summary>
+    /// Determines whether a Telegram exception proves that a bot token is revoked, invalid, or unauthorized.
+    /// </summary>
+    /// <param name="exception">
+    /// Exception thrown by Telegram <c>getMe</c> or another bot-token validation call. The exception message is
+    /// inspected without logging or exposing the raw token.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the token should be cleared from the tenant row; otherwise <c>false</c>.
+    /// </returns>
+    private static bool ISTELEGRAMTOKENINVALIDERROR(Exception exception)
+    {
+        if (exception is ApiRequestException apiException &&
+            (apiException.ErrorCode == 401 || CONTAINSTOKENINVALIDTEXT(apiException.Message)))
+            return true;
+
+        return CONTAINSTOKENINVALIDTEXT(exception?.Message);
+    }
+
+    /// <summary>
+    /// Determines whether a token validation failure is likely a temporary Telegram/network issue.
+    /// </summary>
+    /// <param name="exception">
+    /// Exception thrown while probing the tenant token. The raw token is never included in this value by callers.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> for timeout, cancellation, rate-limit, and Telegram 5xx errors that should not clear settings.
+    /// </returns>
+    private static bool ISTELEGRAMTRANSIENTTOKENCHECKERROR(Exception exception)
+    {
+        if (exception is TimeoutException || exception is TaskCanceledException)
+            return true;
+
+        if (exception is ApiRequestException apiException)
+            return apiException.ErrorCode == 429 || apiException.ErrorCode >= 500;
+
+        var message = exception?.Message;
+        return !string.IsNullOrWhiteSpace(message) &&
+               (message.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("temporarily", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Checks Telegram error text for invalid-token keywords without exposing the token value.
+    /// </summary>
+    /// <param name="message">Telegram or client-library error message to inspect.</param>
+    /// <returns><c>true</c> when the message describes an invalid, revoked, or unauthorized bot token.</returns>
+    private static bool CONTAINSTOKENINVALIDTEXT(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        return message.Contains("unauthorized", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("invalid token", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("bot token", StringComparison.OrdinalIgnoreCase) &&
+               message.Contains("invalid", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -1142,6 +1507,11 @@ public class TenantBotService
     /// <param name="CallbackQuery">TOGGLE callback from the owner panel.</param>
     /// <param name="owner">colleague owner profile.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <remarks>
+    /// Enabling a tenant bot is only persisted as active when <see cref="MultiBotHostedService.StartBotAsync" />
+    /// actually creates a receiver. If Telegram times out after its bounded retries, this method rolls the tenant
+    /// row back to disabled and shows the owner an alert instead of leaving the panel in a stale "روشن" state.
+    /// </remarks>
     private async Task TOGGLETENANTBOTASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -1190,9 +1560,30 @@ public class TenantBotService
         if (runtime != null)
         {
             if (tenant.Enabled)
-                await runtime.StartBotAsync(tenant.Id, CancellationToken);
+            {
+                var started = await runtime.StartBotAsync(tenant.Id, CancellationToken);
+                if (!started)
+                {
+                    tenant.Enabled = false;
+                    tenant.UpdatedAtUtc = DateTime.UtcNow;
+                    await _userDbcontext.SaveChangesAsync(CancellationToken);
+                    _botRegistry.Upsert(tenant);
+                    _botClientProvider.Invalidate(tenant.Id);
+
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient,
+                        CallbackQuery.Id,
+                        "تلگرام یا شبکه هنگام روشن‌کردن ربات فروشگاهی پاسخ نداد. چند لحظه بعد دوباره روشن کنید.",
+                        showAlert: true,
+                        cancellationToken: CancellationToken);
+                    await SHOWOWNERPANELASYNC(botClient, CallbackQuery.Message.Chat.Id, owner, CallbackQuery.Message.MessageId, CancellationToken);
+                    return;
+                }
+            }
             else
+            {
                 await runtime.StopBotAsync(tenant.Id);
+            }
         }
 
         await SafeAnswerCallbackQueryAsync(botClient, 
@@ -1393,8 +1784,8 @@ public class TenantBotService
             $"مبلغ فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
             $"هزینه پایه: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
             $"سود/کسر همکار: <code>{Html(order.OwnerWalletDelta.FormatCurrency())}</code>\n" +
-            $"موجودی بعد: <code>{Html(order.OwnerBalanceAfter?.FormatCurrency() ?? "-")}</code>\n" +
-            (string.IsNullOrWhiteSpace(order.ErrorMessage) ? string.Empty : $"\nخطا: <code>{Html(order.ErrorMessage)}</code>");
+            $"موجودی بعد: <code>{Html(order.OwnerBalanceAfter?.FormatCurrency() ?? "-")}</code>" +
+            BuildTenantOrderErrorLine(order);
 
         await SafeEditMessageTextAsync(
             botClient,
@@ -4057,6 +4448,7 @@ public class TenantBotService
                 order.CreatedAccountJson = JsonConvert.SerializeObject(created);
                 order.FulfilledAtUtc = DateTime.UtcNow;
                 order.UpdatedAtUtc = DateTime.UtcNow;
+                await CLEARTENANTORDERFULFILLMENTERRORASYNC(order, CancellationToken);
 
                 _userDbcontext.TenantBotLedgerEntries.Add(new TenantBotLedgerEntry
                 {
@@ -4708,8 +5100,8 @@ public class TenantBotService
                $"وضعیت پرداخت: <code>{Html(order.PaymentStatus)}</code>\n" +
                $"وضعیت settlement: <code>{Html(settlement?.Status.ToString() ?? "-")}</code>\n" +
                $"تحویل: <code>{Html(order.IsFulfilled ? "انجام شده" : "انجام نشده")}</code>\n" +
-               $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>\n" +
-               $"خطا: <code>{Html(order.ErrorMessage)}</code>";
+               $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>" +
+               BuildTenantOrderErrorLine(order);
     }
 
     /// <summary>
@@ -5383,10 +5775,68 @@ public class TenantBotService
                       $"فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
                       $"هزینه پایه: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
                       $"سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
-                      $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>\n" +
-                      $"خطا: <code>{Html(order.ErrorMessage)}</code>";
+                      $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>" +
+                      BuildTenantOrderErrorLine(order);
 
         _logger.LogPayment(Message);
+    }
+
+    /// <summary>
+    /// Clears stale tenant-order fulfillment errors after an order is successfully delivered.
+    /// </summary>
+    /// <param name="order">
+    /// Tracked tenant order that has just been marked fulfilled. The method clears the order error and, when a
+    /// manual receipt is linked, clears the tracked receipt error as well.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// Cancellation token for the optional receipt lookup in users.db.
+    /// </param>
+    /// <returns>
+    /// A task that completes after the tracked order and optional receipt have been updated in memory. The caller
+    /// remains responsible for the surrounding <see cref="DbContext.SaveChangesAsync(CancellationToken)" /> call.
+    /// </returns>
+    /// <remarks>
+    /// Tenant fulfillment can time out on the first attempt and later succeed from a retry, owner confirmation, or
+    /// super-admin recovery path. This helper prevents that old timeout text from appearing in successful order
+    /// details, Sales Assistant details, or central purchase logs after the account is actually delivered.
+    /// </remarks>
+    private async Task CLEARTENANTORDERFULFILLMENTERRORASYNC(
+        TenantBotOrder order,
+        CancellationToken CancellationToken)
+    {
+        order.ErrorMessage = null;
+
+        var receipt = order.ManualReceiptId.HasValue
+            ? await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(
+                x => x.Id == order.ManualReceiptId.Value,
+                CancellationToken)
+            : await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(
+                x => x.TenantBotOrderId == order.Id || x.OrderId == order.OrderId,
+                CancellationToken);
+
+        if (receipt != null)
+            receipt.ErrorMessage = null;
+    }
+
+    /// <summary>
+    /// Builds the optional HTML error line for tenant order detail and audit messages.
+    /// </summary>
+    /// <param name="order">
+    /// Tenant order whose latest delivery state controls whether an error should be displayed.
+    /// </param>
+    /// <returns>
+    /// An HTML-safe line break plus error text when the order is still unfulfilled and has an error; otherwise an
+    /// empty string so stale timeout errors are hidden after successful fulfillment.
+    /// </returns>
+    /// <remarks>
+    /// Financial and fulfillment logs should not keep showing historical timeout text once a later retry has
+    /// delivered the account. Failure paths still show the latest error for troubleshooting.
+    /// </remarks>
+    private static string BuildTenantOrderErrorLine(TenantBotOrder order)
+    {
+        return order.IsFulfilled || string.IsNullOrWhiteSpace(order.ErrorMessage)
+            ? string.Empty
+            : $"\nخطا: <code>{Html(order.ErrorMessage)}</code>";
     }
 
     /// <summary>
@@ -6235,6 +6685,7 @@ public class TenantBotService
         });
         order.FulfilledAtUtc = DateTime.UtcNow;
         order.UpdatedAtUtc = DateTime.UtcNow;
+        await CLEARTENANTORDERFULFILLMENTERRORASYNC(order, cancellationToken);
 
         _userDbcontext.TenantBotLedgerEntries.Add(new TenantBotLedgerEntry
         {

@@ -53,6 +53,8 @@ public class TelegramBotService : IHostedService
     private readonly OwnedBotNotificationService _ownedBotNotificationService;
     private readonly GozargahSiteApiClient _gozargahSiteApiClient;
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
+    private readonly BotRegistry _botRegistry;
+    private readonly BotRuntimeStatusStore _botRuntimeStatusStore;
     private readonly BotContextAccessor _botContextAccessor;
     private ITelegramBotClient ActiveBotClient => _botContextAccessor.Current?.Client ?? _botClient;
     private BotInstanceConfig CurrentBot => _botContextAccessor.Current?.Config;
@@ -114,6 +116,10 @@ public class TelegramBotService : IHostedService
     /// <param name="gozargahSiteSyncService">
     /// Gozargah website sync service used to auto-promote connected website users before owned-bot pricing is shown.
     /// </param>
+    /// <param name="botRegistry">Runtime registry used to list configured owned, assistant, and tenant bots.</param>
+    /// <param name="botRuntimeStatusStore">
+    /// Process-local receiver status store used by the super-admin bot status screen.
+    /// </param>
     /// <param name="botContextAccessor">Async-local current bot context accessor.</param>
     public TelegramBotService(
         ITelegramBotClient botClient,
@@ -136,6 +142,8 @@ public class TelegramBotService : IHostedService
         OwnedBotNotificationService ownedBotNotificationService,
         GozargahSiteApiClient gozargahSiteApiClient,
         GozargahSiteSyncService gozargahSiteSyncService,
+        BotRegistry botRegistry,
+        BotRuntimeStatusStore botRuntimeStatusStore,
         BotContextAccessor botContextAccessor)
     {
         _botClient = botClient;
@@ -159,6 +167,8 @@ public class TelegramBotService : IHostedService
         _ownedBotNotificationService = ownedBotNotificationService;
         _gozargahSiteApiClient = gozargahSiteApiClient;
         _gozargahSiteSyncService = gozargahSiteSyncService;
+        _botRegistry = botRegistry;
+        _botRuntimeStatusStore = botRuntimeStatusStore;
         _botContextAccessor = botContextAccessor;
     }
 
@@ -438,6 +448,12 @@ public class TelegramBotService : IHostedService
         //        List<long> allowedValues = _configuration.GetSection("adminsUserIds").Get<List<long>>();
         var currentUser = await _userDbContext.GetUserStatus(message.From.Id);
         //_userDbContext.Users.Attach(currentUser);
+
+        if (message.Text == "🤖 وضعیت ربات‌ها")
+        {
+            await SendRuntimeBotStatusAsync(botClient, message.Chat.Id, cancellationToken);
+            return;
+        }
 
         if (await _xuiV3AdminFlowService.TryHandleMessageAsync(
             botClient,
@@ -3674,6 +3690,149 @@ public class TelegramBotService : IHostedService
 
 
     }
+    /// <summary>
+    /// Sends the current runtime status of every configured, assistant, and tenant bot to a super-admin chat.
+    /// </summary>
+    /// <param name="botClient">Telegram client that received the super-admin command.</param>
+    /// <param name="chatId">Telegram chat id where the status report should be sent.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram send operations.</param>
+    /// <returns>A task that completes after one or more status message chunks are sent.</returns>
+    /// <remarks>
+    /// The report is generated from in-memory receiver status plus <see cref="BotRegistry" /> configuration. It does
+    /// not call Telegram or expose bot tokens, so it is safe to run while Telegram is unstable or while some bots are
+    /// offline.
+    /// </remarks>
+    private async Task SendRuntimeBotStatusAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        CancellationToken cancellationToken)
+    {
+        var snapshots = _botRuntimeStatusStore.GetSnapshots(_botRegistry.Bots);
+        var report = BuildRuntimeBotStatusText(snapshots);
+
+        foreach (var chunk in SplitTelegramPlainText(report, 3800))
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: chunk,
+                replyMarkup: GetMainMenuKeyboard(),
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Builds a plain-text super-admin report from runtime bot status snapshots.
+    /// </summary>
+    /// <param name="snapshots">Status snapshots returned by <see cref="BotRuntimeStatusStore.GetSnapshots" />.</param>
+    /// <returns>Plain Telegram-safe text that contains no Markdown or HTML entities.</returns>
+    /// <remarks>
+    /// The output intentionally avoids parse modes because bot ids and usernames often contain underscores. A parse
+    /// error in this diagnostic command would make it useless exactly when the admin needs it most.
+    /// </remarks>
+    private static string BuildRuntimeBotStatusText(IReadOnlyList<BotRuntimeStatusSnapshot> snapshots)
+    {
+        var builder = new StringBuilder();
+        var now = DateTime.UtcNow;
+        var total = snapshots?.Count ?? 0;
+        var running = snapshots?.Count(x => x.IsReceiverRunning) ?? 0;
+        var enabled = snapshots?.Count(x => x.Enabled) ?? 0;
+
+        builder.AppendLine("🤖 وضعیت ربات‌های در حال اجرای سرویس");
+        builder.AppendLine($"زمان UTC: {now:yyyy-MM-dd HH:mm:ss}");
+        builder.AppendLine($"خلاصه: {running}/{total} listening, enabled={enabled}");
+        builder.AppendLine();
+
+        foreach (var bot in snapshots ?? Array.Empty<BotRuntimeStatusSnapshot>())
+        {
+            var icon = GetRuntimeBotStatusIcon(bot);
+            var username = string.IsNullOrWhiteSpace(bot.Username) ? "بدون username" : "@" + bot.Username.Trim().TrimStart('@');
+            builder.AppendLine($"{icon} {bot.BotId} ({username})");
+            builder.AppendLine($"   type={bot.BotType ?? "unknown"} | brand={bot.BrandName ?? "-"}");
+            builder.AppendLine($"   enabled={bot.Enabled} | token={bot.HasToken} | receiver={bot.IsReceiverRunning}");
+            builder.AppendLine($"   status={bot.Status ?? "-"} | updatedUtc={(bot.UpdatedAtUtc.HasValue ? bot.UpdatedAtUtc.Value.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : "-")}");
+            if (bot.OwnerTelegramUserId.HasValue)
+                builder.AppendLine($"   owner={bot.OwnerTelegramUserId.Value}");
+            if (!string.IsNullOrWhiteSpace(bot.LastError))
+                builder.AppendLine($"   lastError={TrimForStatus(bot.LastError, 180)}");
+            builder.AppendLine();
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Selects a visual status marker for one runtime bot snapshot.
+    /// </summary>
+    /// <param name="snapshot">Bot status snapshot shown in the super-admin report.</param>
+    /// <returns>Emoji marker that summarizes the most important state.</returns>
+    private static string GetRuntimeBotStatusIcon(BotRuntimeStatusSnapshot snapshot)
+    {
+        if (snapshot == null)
+            return "⚪";
+        if (!snapshot.Enabled)
+            return "⚪";
+        if (!snapshot.HasToken)
+            return "🟡";
+        if (snapshot.IsReceiverRunning)
+            return "✅";
+        if (string.Equals(snapshot.Status, "startup_failed", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(snapshot.Status, "invalid_token", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(snapshot.Status, "duplicate", StringComparison.OrdinalIgnoreCase))
+        {
+            return "❌";
+        }
+
+        return "⏸";
+    }
+
+    /// <summary>
+    /// Splits a plain text report into Telegram-sized chunks while preserving line boundaries where possible.
+    /// </summary>
+    /// <param name="text">Plain text to split. The value must already be safe to send without parse mode.</param>
+    /// <param name="maxLength">Maximum chunk length in UTF-16 characters. Use a value below Telegram's hard limit.</param>
+    /// <returns>One or more chunks that can be sent as separate Telegram messages.</returns>
+    private static IEnumerable<string> SplitTelegramPlainText(string text, int maxLength)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            yield return string.Empty;
+            yield break;
+        }
+
+        var builder = new StringBuilder();
+        foreach (var line in text.Replace("\r\n", "\n").Split('\n'))
+        {
+            if (builder.Length + line.Length + 1 > maxLength && builder.Length > 0)
+            {
+                yield return builder.ToString();
+                builder.Clear();
+            }
+
+            builder.AppendLine(line);
+        }
+
+        if (builder.Length > 0)
+            yield return builder.ToString();
+    }
+
+    /// <summary>
+    /// Trims long diagnostic text so one noisy error does not dominate the super-admin status screen.
+    /// </summary>
+    /// <param name="value">Raw non-secret error text.</param>
+    /// <param name="maxLength">Maximum number of characters to keep.</param>
+    /// <returns>The original value when short enough; otherwise a trimmed value with an ellipsis suffix.</returns>
+    private static string TrimForStatus(string value, int maxLength)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+            return value;
+
+        return value.Substring(0, Math.Max(0, maxLength - 1)) + "…";
+    }
+
+    /// <summary>
+    /// Gets the reply-keyboard actions available to super-admin users.
+    /// </summary>
+    /// <returns>Ordered action labels shown in the super-admin keyboard.</returns>
     private string[] GetAdminActions()
     {
         string[] actions = new string[]
@@ -3691,6 +3850,7 @@ public class TelegramBotService : IHostedService
             "🗑 Delete expired accounts",
             "Sync Gozargah Site",
             "✔️ Verify payment",
+            "🤖 وضعیت ربات‌ها",
             "📑 Menu"
         };
         return actions;
@@ -5844,8 +6004,11 @@ public class TelegramBotService : IHostedService
     /// <returns>A task that completes after best-effort logging.</returns>
     /// <remarks>
     /// The Telegram polling library routes unhandled update-handler exceptions here. Per-user delivery errors,
-    /// such as a customer blocking an owned or tenant bot, are warning-level events and must not crash the
-    /// process. The method catches its own logging failures so the error callback remains non-throwing.
+    /// such as a customer blocking an owned or tenant bot, are non-actionable delivery noise and must not crash the
+    /// process or spam the private Telegram logger channel. The method catches its own logging failures so the
+    /// error callback remains non-throwing.
+    /// Telegram 5xx polling bursts are treated as transient provider noise: they are written only as local warning
+    /// activity entries and are not sent to the operational Telegram logger channel.
     /// </remarks>
     public async Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
     {
@@ -5862,6 +6025,19 @@ public class TelegramBotService : IHostedService
             {
                 await _userActivityLog.LogWarningAsync(
                     "telegram_polling_delivery_skipped",
+                    null,
+                    false,
+                    new Dictionary<string, object>
+                    {
+                        ["source"] = "Telegram polling",
+                        ["telegramError"] = exception.Message ?? string.Empty
+                    },
+                    cancellationToken);
+            }
+            else if (IsTransientTelegramPollingError(exception))
+            {
+                await _userActivityLog.LogWarningAsync(
+                    "telegram_polling_transient_skipped",
                     null,
                     false,
                     new Dictionary<string, object>
@@ -5894,12 +6070,15 @@ public class TelegramBotService : IHostedService
         }
 
         var isDeliveryError = IsUserDeliveryPollingError(exception);
+        var isTransientTelegramError = IsTransientTelegramPollingError(exception);
         if (isDeliveryError)
-            _logger.LogWarning("Telegram polling delivery error ignored. {ErrorMessage}", ErrorMessage);
+            _logger.LogDebug("Telegram polling delivery error ignored. {ErrorMessage}", ErrorMessage);
+        else if (isTransientTelegramError)
+            _logger.LogDebug("Transient Telegram polling error ignored. {ErrorMessage}", ErrorMessage);
         else
             _logger.LogError(exception, "Telegram polling error. {ErrorMessage}", ErrorMessage);
 
-        Console.WriteLine(isDeliveryError ? $"Telegram delivery skipped: {exception.Message}" : ErrorMessage);
+        Console.WriteLine(isDeliveryError || isTransientTelegramError ? $"Telegram polling skipped: {exception.Message}" : ErrorMessage);
     }
 
     /// <summary>
@@ -5933,6 +6112,31 @@ public class TelegramBotService : IHostedService
                message.Contains("user is deactivated", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("chat not found", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("forbidden", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Detects temporary Telegram 5xx polling responses that should not be forwarded to the operational log channel.
+    /// </summary>
+    /// <param name="exception">Exception raised by Telegram polling or update handling.</param>
+    /// <returns>
+    /// <c>true</c> when Telegram returned a transient gateway/server response such as 502 Bad Gateway; otherwise
+    /// <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// These errors happen before a user update is available and are retried by the polling loop. They are written
+    /// to the local activity file as warnings but logged only at debug level through <see cref="ILogger"/> so the
+    /// private Telegram logger channel does not receive repeated non-actionable 502 messages.
+    /// </remarks>
+    private static bool IsTransientTelegramPollingError(Exception exception)
+    {
+        if (exception is not ApiRequestException apiException)
+            return false;
+
+        var message = apiException.Message ?? string.Empty;
+        return apiException.ErrorCode is 500 or 502 or 503 or 504 ||
+               message.Contains("bad gateway", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("gateway timeout", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("service unavailable", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

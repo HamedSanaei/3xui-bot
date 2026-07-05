@@ -62,6 +62,11 @@ namespace Adminbot.Domain.Logging
             var message = formatter(state, exception);
             // Telegram logging is best-effort. Never block or fail the bot update pipeline because
             // a log channel is missing, the logger bot cannot post, or Telegram rejects an entity.
+            if (ShouldSuppressChannelDelivery(message, exception))
+            {
+                return;
+            }
+
             if (eventId.Id == 1000 && eventId.Name == "Payment")
             {
                 _ = Task.Run(() => LogPayment(message));
@@ -74,6 +79,79 @@ namespace Adminbot.Domain.Logging
 
             }
 
+        }
+
+        /// <summary>
+        /// Determines whether a provider log should be kept out of the private Telegram logger channel.
+        /// </summary>
+        /// <param name="message">
+        /// Formatted log message produced by the calling logger category. The value can contain only the summary
+        /// text or the provider's compact error text.
+        /// </param>
+        /// <param name="exception">
+        /// Optional exception supplied to the logger. Its message is inspected only for known transient Telegram
+        /// polling noise and never sent to Telegram when suppression matches.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> when the message is operational noise that should stay in local logs only; otherwise
+        /// <c>false</c> so payment, audit, token, XUI, and settlement failures still reach the private channel.
+        /// </returns>
+        /// <remarks>
+        /// Category-level filtering cannot see the final message text, so this method performs a second
+        /// message-level check inside the Telegram provider. It intentionally suppresses only known noisy patterns:
+        /// stale callbacks, unchanged Telegram edits, receipt-photo relay failures that have a text fallback,
+        /// repeated tenant forced-join probes, and Telegram polling 5xx/429/timeouts. Business failures such as
+        /// invalid tokens, duplicate tokens, XUI delivery failures, and payment settlement errors are not suppressed.
+        /// </remarks>
+        private bool ShouldSuppressChannelDelivery(string message, Exception exception)
+        {
+            var combined = string.Join(
+                "\n",
+                new[]
+                {
+                    message ?? string.Empty,
+                    exception?.Message ?? string.Empty
+                }.Where(x => !string.IsNullOrWhiteSpace(x)));
+
+            if (string.IsNullOrWhiteSpace(combined))
+                return false;
+
+            if (ContainsOrdinalIgnoreCase(combined, "Ignoring stale sales-assistant callback answer") ||
+                ContainsOrdinalIgnoreCase(combined, "Ignoring unchanged sales-assistant reply markup") ||
+                ContainsOrdinalIgnoreCase(combined, "Ignoring unchanged sales-assistant receipt caption") ||
+                ContainsOrdinalIgnoreCase(combined, "sales assistant receipt notification failed") ||
+                ContainsOrdinalIgnoreCase(combined, "tenant forced-join validation failed") ||
+                ContainsOrdinalIgnoreCase(combined, "tenant forced-join check failed"))
+            {
+                return true;
+            }
+
+            var isTelegramPollingNoise =
+                ContainsOrdinalIgnoreCase(combined, "Telegram polling") ||
+                ContainsOrdinalIgnoreCase(combined, "polling delivery") ||
+                ContainsOrdinalIgnoreCase(combined, "getUpdates");
+
+            if (!isTelegramPollingNoise)
+                return false;
+
+            return ContainsOrdinalIgnoreCase(combined, "Bad Gateway") ||
+                   ContainsOrdinalIgnoreCase(combined, "gateway timeout") ||
+                   ContainsOrdinalIgnoreCase(combined, "service unavailable") ||
+                   ContainsOrdinalIgnoreCase(combined, "Too Many Requests") ||
+                   ContainsOrdinalIgnoreCase(combined, "Request timed out");
+        }
+
+        /// <summary>
+        /// Checks whether a string contains another string using ordinal, case-insensitive comparison.
+        /// </summary>
+        /// <param name="source">Text to inspect. A null value is treated as no match.</param>
+        /// <param name="value">Needle to find. A null or empty value is treated as no match.</param>
+        /// <returns><c>true</c> when <paramref name="value"/> appears in <paramref name="source"/>; otherwise <c>false</c>.</returns>
+        private static bool ContainsOrdinalIgnoreCase(string source, string value)
+        {
+            return !string.IsNullOrEmpty(source) &&
+                   !string.IsNullOrEmpty(value) &&
+                   source.IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
 

@@ -186,6 +186,69 @@ public class SalesAssistantService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "sales assistant receipt notification failed. RECEIPTID={RECEIPTID}", receipt.Id);
+            await SENDMANUALRECEIPTFALLBACKTEXTASYNC(receipt, Text, keyboard, ex, CancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Sends a text-only Sales Assistant receipt notification when the receipt photo cannot be relayed.
+    /// </summary>
+    /// <param name="receipt">
+    /// Tenant card-to-card receipt row that could not be delivered as a photo. The row supplies the owner chat,
+    /// tenant bot id, order id, amount, and customer Telegram id used in the fallback message.
+    /// </param>
+    /// <param name="baseText">
+    /// HTML-safe receipt text that would normally be used as the photo caption.
+    /// </param>
+    /// <param name="keyboard">
+    /// Inline review keyboard containing approve, reject, and detail callbacks. It must be kept identical to the
+    /// photo path so the owner can still complete the receipt flow from the fallback message.
+    /// </param>
+    /// <param name="originalError">
+    /// The Telegram or file-download exception that prevented photo delivery. Its message is included only as
+    /// HTML-encoded diagnostic text and must not contain secrets or bot tokens.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// Cancellation token for the fallback Telegram send operation.
+    /// </param>
+    /// <returns>A task that completes after the fallback message is sent or skipped because the assistant bot is unavailable.</returns>
+    /// <remarks>
+    /// This method preserves the manual-payment approval path when a tenant bot file id cannot be downloaded or
+    /// re-uploaded by the Sales Assistant bot. It is intentionally best-effort: failure to send the fallback is
+    /// logged but never thrown back into tenant order processing.
+    /// </remarks>
+    private async Task SENDMANUALRECEIPTFALLBACKTEXTASYNC(
+        TenantManualPaymentReceipt receipt,
+        string baseText,
+        InlineKeyboardMarkup keyboard,
+        Exception originalError,
+        CancellationToken CancellationToken)
+    {
+        var assistant = GetAssistantBot();
+        if (assistant == null || string.IsNullOrWhiteSpace(assistant.Token))
+            return;
+
+        var fallbackText =
+            baseText +
+            "\n\n⚠️ ارسال عکس رسید به دستیار فروش انجام نشد، اما تایید همین سفارش از همین پیام ممکن است." +
+            $"\nReceiptId: <code>{receipt.Id}</code>" +
+            $"\nOrderId: <code>{Html(receipt.OrderId)}</code>" +
+            $"\nTenantBot: <code>{Html(receipt.TenantBotId)}</code>" +
+            $"\nCustomerId: <code>{receipt.CustomerTelegramUserId}</code>" +
+            $"\nخطای عکس: <code>{Html(originalError.Message)}</code>";
+
+        try
+        {
+            await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
+                chatId: receipt.OwnerTelegramUserId,
+                text: fallbackText,
+                parseMode: ParseMode.Html,
+                replyMarkup: keyboard,
+                cancellationToken: CancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "sales assistant receipt fallback text failed. RECEIPTID={RECEIPTID}", receipt.Id);
         }
     }
 

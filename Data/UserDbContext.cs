@@ -1,5 +1,6 @@
 using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
+using System.Threading;
 
 /// <summary>
 /// Entity Framework context for <c>users.db</c>.
@@ -16,6 +17,16 @@ using Microsoft.EntityFrameworkCore;
 public class UserDbContext : DbContext
 {
     private static string _databasePath = "./Data/users.db";
+
+    /// <summary>
+    /// Serializes legacy state-helper calls made through the singleton <see cref="UserDbContext"/> service.
+    /// </summary>
+    /// <remarks>
+    /// Most modern code should use scoped/per-operation contexts, but the legacy bot state API is still injected as
+    /// a singleton. This gate prevents overlapping EF Core operations when several bot receivers touch those helper
+    /// methods at the same time.
+    /// </remarks>
+    private readonly SemaphoreSlim _dbGate = new(1, 1);
 
     public DbSet<User> Users { get; set; }
     public DbSet<BotInstance> BotInstances { get; set; }
@@ -43,6 +54,50 @@ public class UserDbContext : DbContext
     /// Current SQLite path used by this context.
     /// </summary>
     public static string DatabasePath => _databasePath;
+
+    /// <summary>
+    /// Runs a legacy users.db helper while holding the singleton context concurrency gate.
+    /// </summary>
+    /// <typeparam name="T">Return type produced by the protected helper operation.</typeparam>
+    /// <param name="operation">
+    /// Asynchronous users.db operation to execute. The delegate must not call another gated helper on the same
+    /// context instance.
+    /// </param>
+    /// <returns>The value returned by <paramref name="operation"/> after the gate is released.</returns>
+    /// <remarks>
+    /// This is a temporary compatibility guard for singleton registration. It keeps state reads/writes from
+    /// colliding across owned and tenant Telegram receivers without changing database schema.
+    /// </remarks>
+    private async Task<T> RunSerializedAsync<T>(Func<Task<T>> operation)
+    {
+        await _dbGate.WaitAsync();
+        try
+        {
+            return await operation();
+        }
+        finally
+        {
+            _dbGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Runs a legacy users.db helper while holding the singleton context concurrency gate.
+    /// </summary>
+    /// <param name="operation">Asynchronous users.db operation that does not return a value.</param>
+    /// <returns>A task that completes after <paramref name="operation"/> finishes and the gate is released.</returns>
+    private async Task RunSerializedAsync(Func<Task> operation)
+    {
+        await _dbGate.WaitAsync();
+        try
+        {
+            await operation();
+        }
+        finally
+        {
+            _dbGate.Release();
+        }
+    }
 
     /// <summary>
     /// Configures the SQLite database path before the application creates or migrates the context.
@@ -278,24 +333,26 @@ public class UserDbContext : DbContext
     public async Task SaveUserStatus(User user)
 
     {
-        var context = new UserDbContext();
-        var botId = GetCurrentBotId();
-        // Schema creation and updates are handled by migrations at application startup.
-
-        var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == user.Id);
-
-        if (existingUser == null)
+        await RunSerializedAsync(async () =>
         {
-            // User does not exist, create a new user
-            context.BotUserStates.Add(BotUserState.FromUser(botId, user));
-        }
-        else
-        {
-            // User already exists, update the user's information if needed
-            existingUser.ApplyPartial(user);
-        }
-        await context.SaveChangesAsync();
+            var context = new UserDbContext();
+            var botId = GetCurrentBotId();
+            // Schema creation and updates are handled by migrations at application startup.
 
+            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == user.Id);
+
+            if (existingUser == null)
+            {
+                // User does not exist, create a new user
+                context.BotUserStates.Add(BotUserState.FromUser(botId, user));
+            }
+            else
+            {
+                // User already exists, update the user's information if needed
+                existingUser.ApplyPartial(user);
+            }
+            await context.SaveChangesAsync();
+        });
     }
 
 
@@ -306,26 +363,28 @@ public class UserDbContext : DbContext
     /// <returns>A task that completes after the clear operation is persisted.</returns>
     public async Task ClearUserStatus(User user)
     {
-        var context = new UserDbContext();
-        var botId = GetCurrentBotId();
-        // context.Database.EnsureCreated(); // Create the database if it doesn't exist
-
-        var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == user.Id);
-
-        if (existingUser == null)
+        await RunSerializedAsync(async () =>
         {
-            // User does not exist, create a new user
-            var newState = BotUserState.FromUser(botId, user);
-            newState.Clear();
-            context.BotUserStates.Add(newState);
-        }
-        else
-        {
-            // User already exists, update the user's information if needed
-            existingUser.Clear();
-        }
-        await context.SaveChangesAsync();
+            var context = new UserDbContext();
+            var botId = GetCurrentBotId();
+            // context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
+            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == user.Id);
+
+            if (existingUser == null)
+            {
+                // User does not exist, create a new user
+                var newState = BotUserState.FromUser(botId, user);
+                newState.Clear();
+                context.BotUserStates.Add(newState);
+            }
+            else
+            {
+                // User already exists, update the user's information if needed
+                existingUser.Clear();
+            }
+            await context.SaveChangesAsync();
+        });
     }
     /// <summary>
     /// Checks whether the current bot has collected all legacy purchase fields needed to create an account.
@@ -337,33 +396,35 @@ public class UserDbContext : DbContext
     /// </returns>
     public async Task<bool> IsUserReadyToCreate(long teluserid)
     {
-
-        UserDbContext context = new UserDbContext();
-        var botId = GetCurrentBotId();
-        // context.Database.EnsureCreated(); // Create the database if it doesn't exist
-
-        var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == teluserid);
-
-        if (existingUser == null)
+        return await RunSerializedAsync(async () =>
         {
-            // User does not exist, create a new user
-            context.BotUserStates.Add(BotUserState.FromUser(botId, new User { Id = teluserid }));
-            return false;
-        }
+            UserDbContext context = new UserDbContext();
+            var botId = GetCurrentBotId();
+            // context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
-        if (existingUser.Type == "realityv6")
-        {
-            existingUser.TotoalGB = "500";
-        }
+            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == teluserid);
 
-        if (!string.IsNullOrEmpty(existingUser.LastStep) && !string.IsNullOrEmpty(existingUser.SelectedCountry) && !string.IsNullOrEmpty(existingUser.SelectedPeriod) && !string.IsNullOrEmpty(existingUser.TotoalGB) && !string.IsNullOrEmpty(existingUser.Type))
-        {
-            return true;
-        }
-        else
-        {
-            return false;
-        }
+            if (existingUser == null)
+            {
+                // User does not exist, create a new user
+                context.BotUserStates.Add(BotUserState.FromUser(botId, new User { Id = teluserid }));
+                return false;
+            }
+
+            if (existingUser.Type == "realityv6")
+            {
+                existingUser.TotoalGB = "500";
+            }
+
+            if (!string.IsNullOrEmpty(existingUser.LastStep) && !string.IsNullOrEmpty(existingUser.SelectedCountry) && !string.IsNullOrEmpty(existingUser.SelectedPeriod) && !string.IsNullOrEmpty(existingUser.TotoalGB) && !string.IsNullOrEmpty(existingUser.Type))
+            {
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        });
 
 
     }
@@ -379,33 +440,35 @@ public class UserDbContext : DbContext
     /// </returns>
     public async Task<bool> IsUserReadyToUpdate(long teluserid)
     {
-
-        UserDbContext context = new UserDbContext();
-        var botId = GetCurrentBotId();
-        // context.Database.EnsureCreated(); // Create the database if it doesn't exist
-
-        var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == teluserid);
-
-        if (existingUser == null)
+        return await RunSerializedAsync(async () =>
         {
-            // User does not exist, create a new user
-            context.BotUserStates.Add(BotUserState.FromUser(botId, new User { Id = teluserid }));
-            return false;
-        }
+            UserDbContext context = new UserDbContext();
+            var botId = GetCurrentBotId();
+            // context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
-        if (existingUser.Type == "realityv6")
-        {
-            existingUser.TotoalGB = "500";
-        }
+            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == teluserid);
 
-        if (!string.IsNullOrEmpty(existingUser.LastStep) && !string.IsNullOrEmpty(existingUser.SelectedPeriod) && !string.IsNullOrEmpty(existingUser.TotoalGB))
-        {
-            return true;
-        }
-        else
-        {
-            return false;
-        }
+            if (existingUser == null)
+            {
+                // User does not exist, create a new user
+                context.BotUserStates.Add(BotUserState.FromUser(botId, new User { Id = teluserid }));
+                return false;
+            }
+
+            if (existingUser.Type == "realityv6")
+            {
+                existingUser.TotoalGB = "500";
+            }
+
+            if (!string.IsNullOrEmpty(existingUser.LastStep) && !string.IsNullOrEmpty(existingUser.SelectedPeriod) && !string.IsNullOrEmpty(existingUser.TotoalGB))
+            {
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        });
 
 
     }
@@ -419,25 +482,26 @@ public class UserDbContext : DbContext
     /// </returns>
     public async Task<User> GetUserStatus(long userId)
     {
-
-
-        var context = new UserDbContext();
-        var botId = GetCurrentBotId();
-        // context.Database.EnsureCreated(); // Create the database if it doesn't exist
-
-        var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == userId);
-
-        if (existingUser != null)
+        return await RunSerializedAsync(async () =>
         {
-            // User does not exist, create a new user
-            return existingUser.ToUser();
-        }
-        else
-        {
-            var newUser = new User { Id = userId };
+            var context = new UserDbContext();
+            var botId = GetCurrentBotId();
+            // context.Database.EnsureCreated(); // Create the database if it doesn't exist
 
-            return newUser;
-        }
+            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == userId);
+
+            if (existingUser != null)
+            {
+                // User does not exist, create a new user
+                return existingUser.ToUser();
+            }
+            else
+            {
+                var newUser = new User { Id = userId };
+
+                return newUser;
+            }
+        });
 
     }
 
