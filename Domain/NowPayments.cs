@@ -677,8 +677,25 @@ namespace Adminbot.Domain
         private readonly BotRegistry _botRegistry;
         private readonly BotContextAccessor _botContextAccessor;
         private readonly WalletLedgerService _walletLedgerService;
+        private readonly NowPayments _nowPayments;
         private readonly ILogger<NowPaymentsSettlementService> _logger;
 
+        /// <summary>
+        /// Creates the settlement service that applies verified NOWPayments wallet charges.
+        /// </summary>
+        /// <param name="userDbContext">users.db context containing NOWPayments rows and settlement metadata.</param>
+        /// <param name="credentialsDbContext">credentials.db context that owns shared wallet balances.</param>
+        /// <param name="botClientProvider">Provider used to notify the correct bot/chat after successful settlement.</param>
+        /// <param name="botRegistry">Runtime bot registry used to resolve the payment's bot context for logging.</param>
+        /// <param name="botContextAccessor">Async-local context accessor used while sending payment logs.</param>
+        /// <param name="walletLedgerService">Append-only ledger writer for successful wallet credits.</param>
+        /// <param name="nowPayments">NOWPayments API client used to re-check provider status during manual admin checks.</param>
+        /// <param name="logger">Application logger for diagnostics that should not mutate payment state.</param>
+        /// <remarks>
+        /// The service never treats an admin-entered order id as proof of payment. Manual confirmation first
+        /// refreshes provider status through <paramref name="nowPayments"/> and only credits the wallet when
+        /// NOWPayments reports a paid status.
+        /// </remarks>
         public NowPaymentsSettlementService(
             UserDbContext userDbContext,
             CredentialsDbContext credentialsDbContext,
@@ -686,6 +703,7 @@ namespace Adminbot.Domain
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
             WalletLedgerService walletLedgerService,
+            NowPayments nowPayments,
             ILogger<NowPaymentsSettlementService> logger)
         {
             _userDbContext = userDbContext;
@@ -694,6 +712,7 @@ namespace Adminbot.Domain
             _botRegistry = botRegistry;
             _botContextAccessor = botContextAccessor;
             _walletLedgerService = walletLedgerService;
+            _nowPayments = nowPayments;
             _logger = logger;
         }
 
@@ -824,6 +843,27 @@ namespace Adminbot.Domain
             return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
         }
 
+        /// <summary>
+        /// Re-checks a NOWPayments row during a super-admin manual confirmation and settles only provider-paid rows.
+        /// </summary>
+        /// <param name="payment">
+        /// Local NOWPayments row selected by order id, payment id, or invoice id. The row may contain only invoice
+        /// data when the customer has not completed payment yet.
+        /// </param>
+        /// <param name="source">Audit source recorded in successful payment logs, such as <c>admin-manual-order</c>.</param>
+        /// <param name="notifyChatId">Optional Telegram chat id to notify after successful wallet credit.</param>
+        /// <param name="cancellationToken">Cancellation token for provider lookup, database writes, ledger, and Telegram notification.</param>
+        /// <returns>
+        /// <see cref="NowPaymentsSettlementStatus.Applied"/> when a provider-paid row was credited;
+        /// <see cref="NowPaymentsSettlementStatus.AlreadyAdded"/> when it was previously credited;
+        /// <see cref="NowPaymentsSettlementStatus.ProviderNotPaid"/> when NOWPayments did not report a paid status.
+        /// </returns>
+        /// <remarks>
+        /// This method replaced the old local force-confirm behavior. It must not set
+        /// <see cref="SwapinoPaymentInfo.PaymentStatus"/> to <c>finished</c> unless the status came from NOWPayments.
+        /// Incomplete statuses such as <c>waiting</c>, <c>wrongasset</c>, and <c>partially_paid</c> are saved as
+        /// diagnostics only and never change wallet balances.
+        /// </remarks>
         public async Task<NowPaymentsSettlementResult> ApplyManualConfirmationAsync(
             SwapinoPaymentInfo payment,
             string source,
@@ -837,50 +877,142 @@ namespace Adminbot.Domain
                 return await ApplyFinishedPaymentAsync(payment, source, notifyChatId, cancellationToken);
 
             var data = payment.GetNowPaymentsData();
-            var now = DateTime.UtcNow;
-
             data.OrderId ??= payment.OrderId;
             data.InvoiceId ??= payment.InvoiceId;
             data.InvoiceUrl ??= payment.InvoiceUrl;
-            data.PaymentId ??= payment.PaymentId;
-            data.ParentPaymentId ??= payment.ParentPaymentId;
-            data.PayAddress ??= payment.PayAddress;
-            data.PayCurrency ??= payment.PayCurrency;
-            data.PriceCurrency ??= payment.BaseCurrency;
-            data.OutcomeCurrency ??= payment.OutcomeCurrency;
-            data.PayinHash ??= payment.PayinHash;
-            data.PayoutHash ??= payment.PayoutHash;
-            data.PriceAmount = data.PriceAmount == 0 ? payment.BaseAmount : data.PriceAmount;
-            data.PayAmount = data.PayAmount == 0 ? payment.OutcomeAmount : data.PayAmount;
-            data.OutcomeAmount = data.OutcomeAmount == 0 ? payment.OutcomeAmount : data.OutcomeAmount;
-            data.PaymentStatus = NowPaymentsStatuses.Finished;
-            data.ActuallyPaid = data.ActuallyPaid == 0
-                ? (payment.ActuallyPaid != 0 ? payment.ActuallyPaid : (data.PayAmount != 0 ? data.PayAmount : data.PriceAmount))
-                : data.ActuallyPaid;
-            data.ActuallyPaidAtFiat = data.ActuallyPaidAtFiat == 0
-                ? (payment.ActuallyPaidAtFiat != 0 ? payment.ActuallyPaidAtFiat : (data.PriceAmount != 0 ? data.PriceAmount : data.ActuallyPaid))
-                : data.ActuallyPaidAtFiat;
-            data.CreatedAt ??= payment.CreatedAtUtc;
-            data.UpdatedAt = now;
 
-            payment.PaymentStatus = NowPaymentsStatuses.Finished;
-            payment.PaidAtUtc ??= now;
+            NowPaymentsPaymentStatusResult remoteStatus = null;
+            try
+            {
+                remoteStatus = await FindRemotePaymentStatusForManualConfirmationAsync(payment, data, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                payment.ErrorCode = "nowpayments_provider_check_failed";
+                payment.ErrorMessage = $"NOWPayments provider check failed; no balance was added. {ex.Message}";
+                await _userDbContext.SaveChangesAsync(cancellationToken);
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
+
+            if (remoteStatus != null)
+                data.Apply(remoteStatus);
+
+            var providerReportedPaid = remoteStatus != null &&
+                                       CanSettleNowPaymentsStatus(remoteStatus.payment_status ?? data.PaymentStatus);
+
+            payment.SetNowPaymentsData(data);
+            payment.RawResponseJson = JsonConvert.SerializeObject(new
+            {
+                manual_confirmation_check = true,
+                source,
+                checked_at_utc = DateTime.UtcNow,
+                order_id = payment.OrderId,
+                payment_id = payment.PaymentId ?? data.PaymentId,
+                invoice_id = payment.InvoiceId ?? data.InvoiceId,
+                remote_status = remoteStatus?.payment_status,
+                can_settle = providerReportedPaid
+            }, Formatting.None);
+
+            if (!providerReportedPaid)
+            {
+                payment.ErrorCode = "nowpayments_provider_not_paid";
+                payment.ErrorMessage = BuildProviderNotPaidMessage(payment, data, remoteStatus);
+                await _userDbContext.SaveChangesAsync(cancellationToken);
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
+
+            payment.PaidAtUtc ??= DateTime.UtcNow;
             payment.ErrorCode = null;
             payment.ErrorMessage = null;
             payment.SetNowPaymentsData(data);
 
-            payment.RawResponseJson = JsonConvert.SerializeObject(new
-            {
-                manual_confirmation = true,
-                source,
-                confirmed_at_utc = now,
-                order_id = payment.OrderId,
-                payment_id = payment.PaymentId,
-                invoice_id = payment.InvoiceId
-            }, Formatting.None);
-
             await _userDbContext.SaveChangesAsync(cancellationToken);
             return await ApplyFinishedPaymentAsync(payment, source, notifyChatId, cancellationToken);
+        }
+
+        /// <summary>
+        /// Refreshes the provider-side NOWPayments status used by a super-admin manual check.
+        /// </summary>
+        /// <param name="payment">
+        /// Local users.db payment row selected by order id, payment id, or invoice id. The row is not settled by this
+        /// method; it is only used to choose the safest provider lookup key.
+        /// </param>
+        /// <param name="data">
+        /// Local serialized NOWPayments data already stored on the payment row. Missing identifiers are read from
+        /// both the row and this record before falling back to invoice/order search.
+        /// </param>
+        /// <param name="cancellationToken">Cancellation token for NOWPayments API calls.</param>
+        /// <returns>
+        /// The provider status result when NOWPayments can identify the payment; otherwise <c>null</c>. A null result
+        /// must be treated as not paid by the caller.
+        /// </returns>
+        /// <remarks>
+        /// Manual confirmation in the bot is a provider re-check, not a local force operation. The method first uses
+        /// a concrete payment id when available, then searches recent provider payments by invoice/order id. It never
+        /// mutates local status to <c>finished</c> by itself.
+        /// </remarks>
+        private async Task<NowPaymentsPaymentStatusResult> FindRemotePaymentStatusForManualConfirmationAsync(
+            SwapinoPaymentInfo payment,
+            NowPaymentsPaymentRecordData data,
+            CancellationToken cancellationToken)
+        {
+            var paymentId = payment.PaymentId ?? data.PaymentId;
+            if (!string.IsNullOrWhiteSpace(paymentId))
+                return await _nowPayments.GetPaymentStatusAsync(paymentId, cancellationToken);
+
+            return await _nowPayments.FindPaymentStatusByInvoiceOrOrderAsync(
+                payment.InvoiceId ?? data.InvoiceId,
+                payment.OrderId ?? data.OrderId,
+                cancellationToken);
+        }
+
+        /// <summary>
+        /// Determines whether a NOWPayments provider status is safe to settle locally.
+        /// </summary>
+        /// <param name="status">
+        /// Provider status returned by NOWPayments. Empty or unknown values are treated as not paid because manual
+        /// admin checks must never create a local payment confirmation without provider evidence.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> only for provider-paid states accepted by <see cref="NowPaymentsStatuses.IsPaid(string)"/>;
+        /// otherwise <c>false</c>.
+        /// </returns>
+        /// <remarks>
+        /// This method exists for the super-admin manual check path. It intentionally rejects incomplete states such
+        /// as <c>waiting</c>, <c>confirming</c>, <c>partially_paid</c>, <c>wrongasset</c>, <c>failed</c>,
+        /// <c>expired</c>, and missing payment ids. Admins must first force/confirm the invoice inside NOWPayments
+        /// and then run the bot check again.
+        /// </remarks>
+        public static bool CanSettleNowPaymentsStatus(string status)
+        {
+            return NowPaymentsStatuses.IsPaid(status);
+        }
+
+        /// <summary>
+        /// Builds the audit message stored on a NOWPayments row when a manual check finds no paid provider status.
+        /// </summary>
+        /// <param name="payment">Local users.db payment row that the admin attempted to verify.</param>
+        /// <param name="data">Merged local and provider data after the remote lookup attempt.</param>
+        /// <param name="remoteStatus">Provider response, or <c>null</c> when NOWPayments did not find a payment.</param>
+        /// <returns>
+        /// A concise diagnostic string safe to show to super-admins and store in users.db.
+        /// </returns>
+        /// <remarks>
+        /// The message deliberately explains the operational rule: incomplete payments must be fixed in
+        /// NOWPayments first. It is not sent to users and does not trigger a payment success log.
+        /// </remarks>
+        private static string BuildProviderNotPaidMessage(
+            SwapinoPaymentInfo payment,
+            NowPaymentsPaymentRecordData data,
+            NowPaymentsPaymentStatusResult remoteStatus)
+        {
+            var status = remoteStatus?.payment_status ?? "not_found_or_unavailable";
+            var paymentId = payment.PaymentId ?? data.PaymentId ?? remoteStatus?.payment_id;
+            var invoiceId = payment.InvoiceId ?? data.InvoiceId ?? remoteStatus?.invoice_id;
+            return "NOWPayments provider status is not paid; no balance was added. " +
+                   $"OrderId={payment.OrderId}; InvoiceId={invoiceId}; PaymentId={paymentId}; " +
+                   $"Status={status}; ActuallyPaid={data.ActuallyPaid}; PayCurrency={payment.PayCurrency ?? data.PayCurrency}; " +
+                   "Confirm or force the payment inside NOWPayments first, then run the bot check again.";
         }
 
         private async Task NotifyUserAsync(
@@ -1017,15 +1149,49 @@ namespace Adminbot.Domain
         {
             return new NowPaymentsSettlementResult { Status = NowPaymentsSettlementStatus.InvalidAmount };
         }
+
+        /// <summary>
+        /// Creates a result for a provider lookup that did not return a paid NOWPayments status.
+        /// </summary>
+        /// <returns>
+        /// Settlement result indicating that no wallet credit or tenant fulfillment was applied because the provider
+        /// status is still incomplete, failed, wrong-asset, or unavailable.
+        /// </returns>
+        public static NowPaymentsSettlementResult ProviderNotPaid()
+        {
+            return new NowPaymentsSettlementResult { Status = NowPaymentsSettlementStatus.ProviderNotPaid };
+        }
     }
 
+    /// <summary>
+    /// Outcome categories returned by local NOWPayments settlement attempts.
+    /// </summary>
     public enum NowPaymentsSettlementStatus
     {
+        /// <summary>
+        /// The payment was applied and the related wallet/order side effects were persisted.
+        /// </summary>
         Applied,
+        /// <summary>
+        /// The payment had already been applied earlier and no duplicate side effects were created.
+        /// </summary>
         AlreadyAdded,
+        /// <summary>
+        /// The requested payment row or tenant order could not be found.
+        /// </summary>
         PaymentNotFound,
+        /// <summary>
+        /// The target credentials user could not be found.
+        /// </summary>
         UserNotFound,
-        InvalidAmount
+        /// <summary>
+        /// The amount or local settlement request was invalid.
+        /// </summary>
+        InvalidAmount,
+        /// <summary>
+        /// NOWPayments did not report a paid status, so local settlement was intentionally skipped.
+        /// </summary>
+        ProviderNotPaid
     }
 
     public static class NowPaymentsStatuses
@@ -1040,9 +1206,23 @@ namespace Adminbot.Domain
         public const string Refunded = "refunded";
         public const string Expired = "expired";
 
+        /// <summary>
+        /// Determines whether a NOWPayments status is accepted as paid for local settlement.
+        /// </summary>
+        /// <param name="status">Raw provider status string returned by NOWPayments IPN or status APIs.</param>
+        /// <returns>
+        /// <c>true</c> for <c>finished</c>, <c>confirmed</c>, or <c>sending</c>; otherwise <c>false</c>.
+        /// </returns>
+        /// <remarks>
+        /// Manual admin checks and tenant fulfillment use this method as the only positive settlement gate.
+        /// Incomplete or problematic statuses such as <c>waiting</c>, <c>confirming</c>, <c>partially_paid</c>,
+        /// <c>wrongasset</c>, <c>failed</c>, <c>refunded</c>, and <c>expired</c> must not credit balances.
+        /// </remarks>
         public static bool IsPaid(string status)
         {
-            return string.Equals(status, Finished, StringComparison.OrdinalIgnoreCase);
+            return string.Equals(status, Finished, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(status, Confirmed, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(status, Sending, StringComparison.OrdinalIgnoreCase);
         }
 
         public static bool IsPartiallyPaid(string status)

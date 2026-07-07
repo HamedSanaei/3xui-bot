@@ -4349,7 +4349,7 @@ public class TenantBotService
 
         return await FULFILLPAIDTENANTORDERASYNC(order, Source, payment, null, false, CancellationToken);
 
-        if (order.IsFulfilled)
+        if (await ISTENANTORDERALREADYFULFILLEDASYNC(order, CancellationToken))
             return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
 
         // fulfillment is idempotent: paid orders Create one account and credit the owner once.
@@ -4507,7 +4507,9 @@ public class TenantBotService
     /// <returns>settlement result INDICATING whether the tenant order was applied or HAD already been fulfilled.</returns>
     /// <remarks>
     /// this method intentionally does not credit the customer wallet. it creates the ORDERED account, credits
-    /// the tenant owner profit, Writes the general wallet ledger, and NOTIFIES the sales assistant.
+    /// the tenant owner profit, Writes the general wallet ledger, and NOTIFIES the sales assistant. Manual
+    /// super-admin sources force a fresh NOWPayments provider lookup and return
+    /// <see cref="NowPaymentsSettlementStatus.ProviderNotPaid"/> unless the provider reports a paid status.
     /// </remarks>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         SwapinoPaymentInfo payment,
@@ -4517,6 +4519,36 @@ public class TenantBotService
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
 
+        var data = payment.GetNowPaymentsData();
+        var requiresProviderRefresh = Source?.IndexOf("manual", StringComparison.OrdinalIgnoreCase) >= 0;
+        if (requiresProviderRefresh || !NowPaymentsStatuses.IsPaid(data.PaymentStatus ?? payment.PaymentStatus))
+        {
+            NowPaymentsPaymentStatusResult remoteStatus = null;
+            try
+            {
+                remoteStatus = await REFRESHTENANTNOWPAYMENTSSTATUSASYNC(payment, data, CancellationToken);
+            }
+            catch (Exception ex)
+            {
+                payment.ErrorCode = "nowpayments_provider_check_failed";
+                payment.ErrorMessage = $"NOWPayments provider check failed before tenant fulfillment. {ex.Message}";
+                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
+
+            if (remoteStatus != null)
+            {
+                data.Apply(remoteStatus);
+                payment.SetNowPaymentsData(data);
+                await _userDbcontext.SaveChangesAsync(CancellationToken);
+            }
+
+            var providerReportedPaid = remoteStatus != null &&
+                                       NowPaymentsStatuses.IsPaid(remoteStatus.payment_status ?? data.PaymentStatus);
+            if (!providerReportedPaid && (requiresProviderRefresh || !NowPaymentsStatuses.IsPaid(data.PaymentStatus ?? payment.PaymentStatus)))
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+
         var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == payment.TenantBotOrderId || x.OrderId == payment.OrderId,
             CancellationToken);
@@ -4524,6 +4556,41 @@ public class TenantBotService
             return NowPaymentsSettlementResult.NotFound();
 
         return await FULFILLPAIDTENANTORDERASYNC(order, Source, null, payment, false, CancellationToken);
+    }
+
+    /// <summary>
+    /// Refreshes a tenant NOWPayments row before manual or repeated fulfillment attempts.
+    /// </summary>
+    /// <param name="payment">
+    /// Local users.db NOWPayments row attached to a tenant order. The row may still contain only invoice data when a
+    /// super-admin enters an order id before the provider has emitted a paid IPN.
+    /// </param>
+    /// <param name="data">
+    /// Parsed NOWPayments data stored on the local row. The method updates this instance only after a provider
+    /// response is returned.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for NOWPayments API calls.</param>
+    /// <returns>
+    /// Provider payment status when NOWPayments can identify the payment; otherwise <c>null</c>.
+    /// </returns>
+    /// <remarks>
+    /// Tenant fulfillment must never rely on a local manual status flip. This helper mirrors the wallet-charge
+    /// manual-check rule: use payment id first, then invoice/order lookup, and fulfill only when the provider status
+    /// is accepted by <see cref="NowPaymentsStatuses.IsPaid(string)"/>.
+    /// </remarks>
+    private async Task<NowPaymentsPaymentStatusResult> REFRESHTENANTNOWPAYMENTSSTATUSASYNC(
+        SwapinoPaymentInfo payment,
+        NowPaymentsPaymentRecordData data,
+        CancellationToken cancellationToken)
+    {
+        var paymentId = payment.PaymentId ?? data.PaymentId;
+        if (!string.IsNullOrWhiteSpace(paymentId))
+            return await _nowPayments.GetPaymentStatusAsync(paymentId, cancellationToken);
+
+        return await _nowPayments.FindPaymentStatusByInvoiceOrOrderAsync(
+            payment.InvoiceId ?? data.InvoiceId,
+            payment.OrderId ?? data.OrderId,
+            cancellationToken);
     }
 
     /// <summary>
@@ -4694,6 +4761,48 @@ public class TenantBotService
                 return NowPaymentsSettlementResult.InvalidAmount();
             }
         }
+    }
+
+    /// <summary>
+    /// Refreshes a tenant order and detects whether fulfillment has already been recorded.
+    /// </summary>
+    /// <param name="order">
+    /// Tenant order entity passed from an IPN, manual check, or Sales Assistant confirmation flow. The entity may be
+    /// stale because the shared <see cref="UserDbContext"/> can already be tracking an older version of the same row.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for the reload and ledger lookup.</param>
+    /// <returns>
+    /// <c>true</c> when the order is already fulfilled or when the unique tenant-order ledger row already exists;
+    /// otherwise <c>false</c> and the caller may continue with account delivery.
+    /// </returns>
+    /// <remarks>
+    /// This is the idempotency gate for tenant fulfillment. A customer can click "check status" while an IPN has
+    /// already fulfilled the same order, and a singleton EF context may still expose a stale pending entity. Reloading
+    /// the row and checking the unique ledger prevents duplicate XUI accounts, duplicate owner settlement, and the
+    /// SQLite <c>UNIQUE constraint failed: TenantBotLedgerEntries.TenantBotOrderId</c> crash.
+    /// </remarks>
+    private async Task<bool> ISTENANTORDERALREADYFULFILLEDASYNC(
+        TenantBotOrder order,
+        CancellationToken cancellationToken)
+    {
+        if (order == null)
+            return false;
+
+        try
+        {
+            await _userDbcontext.Entry(order).ReloadAsync(cancellationToken);
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogDebug(ex, "Tenant order reload skipped before fulfillment. orderId={OrderId}", order.OrderId);
+        }
+
+        if (order.IsFulfilled)
+            return true;
+
+        return await _userDbcontext.TenantBotLedgerEntries
+            .AsNoTracking()
+            .AnyAsync(x => x.TenantBotOrderId == order.Id, cancellationToken);
     }
 
     /// <summary>
@@ -6931,6 +7040,9 @@ public class TenantBotService
         bool debitOwnerBaseCost,
         CancellationToken cancellationToken)
     {
+        if (await ISTENANTORDERALREADYFULFILLEDASYNC(order, cancellationToken))
+            return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
         var serverInfo = BuildConfiguredPanelServerInfo();
         var client = await FindTenantClientAsync(serverInfo, order.TargetAccountEmail, cancellationToken);
         if (client == null || !ClientBelongsToTenantCustomer(client, order.CustomerTelegramUserId, order.TenantBotId))

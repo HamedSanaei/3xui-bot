@@ -28,8 +28,23 @@ namespace Adminbot.Domain.Logging
         private readonly BotContextAccessor _botContextAccessor;
         private readonly string _fallbackChannelId;
         private readonly string _fallbackBackupChannelId;
+        private readonly AppConfig _appConfig;
 
-
+        /// <summary>
+        /// Creates a Telegram-backed logger that can post operational logs and database backups.
+        /// </summary>
+        /// <param name="categoryName">Logger category name supplied by Microsoft.Extensions.Logging.</param>
+        /// <param name="filter">Provider-level filter that decides whether a log level/category should be sent.</param>
+        /// <param name="botClientProvider">Provider used to resolve the current/default Telegram bot client.</param>
+        /// <param name="botRegistry">Runtime registry used to resolve logger and backup channels per bot context.</param>
+        /// <param name="botContextAccessor">Async-local bot context accessor for owned/tenant logging routes.</param>
+        /// <param name="fallbackChannelId">Fallback private logger channel id from legacy configuration.</param>
+        /// <param name="fallbackBackupChannelId">Fallback backup channel id used when the current bot has no backup channel.</param>
+        /// <param name="appConfig">Application configuration containing the resolved database paths to back up.</param>
+        /// <remarks>
+        /// Payment logs are routed to the logger channel while database documents are routed to the backup channel.
+        /// Both operations are best-effort and must never fail payment settlement or Telegram update handling.
+        /// </remarks>
         public TelegramLogger(
             string categoryName,
             Func<string, LogLevel, bool> filter,
@@ -37,7 +52,8 @@ namespace Adminbot.Domain.Logging
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
             string fallbackChannelId,
-            string fallbackBackupChannelId)
+            string fallbackBackupChannelId,
+            AppConfig appConfig)
         {
             _categoryName = categoryName;
             _filter = filter;
@@ -46,6 +62,7 @@ namespace Adminbot.Domain.Logging
             _botContextAccessor = botContextAccessor;
             _fallbackChannelId = fallbackChannelId;
             _fallbackBackupChannelId = fallbackBackupChannelId;
+            _appConfig = appConfig ?? new AppConfig();
         }
 
         public IDisposable BeginScope<TState>(TState state) => default;
@@ -70,13 +87,10 @@ namespace Adminbot.Domain.Logging
             if (eventId.Id == 1000 && eventId.Name == "Payment")
             {
                 _ = Task.Run(() => LogPayment(message));
-                // BackupDatabas().Wait();
             }
             else
             {
                 _ = Task.Run(() => SendMessageToChannelAsync(message));
-                //BackupDatabas().Wait();
-
             }
 
         }
@@ -156,20 +170,34 @@ namespace Adminbot.Domain.Logging
 
 
         /// <summary>
-        /// Creates and sends a best-effort copy of <c>credentials.db</c> to the configured backup channel.
+        /// Creates and sends best-effort copies of all configured runtime databases to the backup channel.
         /// </summary>
-        /// <returns>A task that completes after the backup is sent or skipped because the file could not be copied.</returns>
+        /// <returns>A task that completes after each configured database has been copied and sent or skipped.</returns>
         /// <remarks>
-        /// SQLite keeps the credentials database open while the bot is running. The backup copy therefore opens
-        /// the source file with read/write sharing and returns immediately when copying fails; logging must never
-        /// block payment processing or crash the Telegram receiver.
+        /// SQLite keeps both databases open while the bot is running. Each backup is copied with read/write/delete
+        /// sharing into a temporary file before upload. Failures are isolated per database so a locked
+        /// <c>credentials.db</c> does not prevent <c>users.db</c> from being sent, and backup failures never block
+        /// payment settlement or crash a Telegram receiver.
         /// </remarks>
-        private async Task BackupDatabas()
+        private async Task BackupDatabasesAsync()
         {
+            foreach (var database in GetDatabaseBackupTargets())
+                await BackupDatabaseAsync(database.SourcePath, database.TempPath, database.FileName);
+        }
 
-            string sourceDbPath = "./Data/credentials.db";
-            string backupDbPath = "./Data/credentials_backup.db";
-
+        /// <summary>
+        /// Copies one SQLite database and sends it to the configured backup channel.
+        /// </summary>
+        /// <param name="sourceDbPath">Source database path resolved from configuration.</param>
+        /// <param name="backupDbPath">Temporary backup path used only for Telegram upload.</param>
+        /// <param name="fileName">Document file name shown in Telegram, such as <c>users.db</c>.</param>
+        /// <returns>A task that completes after the copy/send attempt finishes.</returns>
+        /// <remarks>
+        /// The method is fail-soft by design. It logs copy or Telegram upload failures to console and returns so
+        /// the payment log path can continue without surfacing database lock errors to customers or admins.
+        /// </remarks>
+        private async Task BackupDatabaseAsync(string sourceDbPath, string backupDbPath, string fileName)
+        {
             try
             {
                 await using var source = new System.IO.FileStream(
@@ -186,27 +214,49 @@ namespace Adminbot.Domain.Logging
             }
             catch (IOException ex)
             {
-                Console.WriteLine("An error occurred while copying the database: " + ex.Message);
+                Console.WriteLine($"An error occurred while copying {fileName}: {ex.Message}");
                 return;
             }
             catch (Exception ex)
             {
-                Console.WriteLine("An unexpected error occurred while copying the database: " + ex.Message);
+                Console.WriteLine($"An unexpected error occurred while copying {fileName}: {ex.Message}");
                 return;
             }
 
             try
             {
-                await using Stream stream = System.IO.File.OpenRead("./Data/credentials_backup.db");
+                await using Stream stream = System.IO.File.OpenRead(backupDbPath);
                 await CurrentBotClient.SendDocumentAsync(
                     chatId: CurrentBackupChannelId,
-                    document: InputFile.FromStream(stream: stream, fileName: "credentials.db"),
-                    caption: DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi());
+                    document: InputFile.FromStream(stream: stream, fileName: fileName),
+                    caption: $"{fileName} - {DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi()}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine("An error occurred while sending the database backup: " + ex.Message);
+                Console.WriteLine($"An error occurred while sending {fileName} backup: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Gets the database files that should be sent after financial logs.
+        /// </summary>
+        /// <returns>
+        /// Backup targets for <c>credentials.db</c> and <c>users.db</c>, using configured paths when available.
+        /// </returns>
+        /// <remarks>
+        /// The backup channel receives both the shared credentials wallet/profile database and the users runtime
+        /// database because payments, tenant orders, invoices, states, and ledgers now live in <c>users.db</c>.
+        /// </remarks>
+        private IEnumerable<(string SourcePath, string TempPath, string FileName)> GetDatabaseBackupTargets()
+        {
+            yield return (
+                string.IsNullOrWhiteSpace(_appConfig.CredentialsDatabasePath) ? "./Data/credentials.db" : _appConfig.CredentialsDatabasePath,
+                "./Data/credentials_backup.db",
+                "credentials.db");
+            yield return (
+                string.IsNullOrWhiteSpace(_appConfig.UserDatabasePath) ? "./Data/users.db" : _appConfig.UserDatabasePath,
+                "./Data/users_backup.db",
+                "users.db");
         }
 
         /// <summary>
@@ -233,7 +283,7 @@ namespace Adminbot.Domain.Logging
                     parseMode: Telegram.Bot.Types.Enums.ParseMode.Html
                 );
 
-                _ = Task.Run(BackupDatabas);
+                _ = Task.Run(BackupDatabasesAsync);
             }
             catch (Exception ex)
             {

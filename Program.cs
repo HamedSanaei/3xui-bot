@@ -108,7 +108,8 @@ class Program
                 sp.GetRequiredService<BotRegistry>(),
                 sp.GetRequiredService<BotContextAccessor>(),
                 configuration["loggerChannel"],
-                configuration["backupChannel"]
+                configuration["backupChannel"],
+                appConfig
                 ));
         });
 

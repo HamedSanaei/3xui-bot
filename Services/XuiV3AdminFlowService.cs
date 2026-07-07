@@ -3162,11 +3162,38 @@ public class XuiV3AdminFlowService
         return $"{index}. <code>{Html(email)}</code> ID:<code>{client.Id}</code> <code>{status}</code> <code>{Html(traffic)}</code> exp:<code>{Html(expiry)}</code>\n";
     }
 
+    /// <summary>
+    /// Builds the HTML status report shown to super-admins after checking a NOWPayments row.
+    /// </summary>
+    /// <param name="payment">
+    /// Local users.db NOWPayments row selected by order id, invoice id, or payment id.
+    /// </param>
+    /// <param name="data">
+    /// Merged local/provider payment data used to show provider status, amount, currency, and hashes.
+    /// </param>
+    /// <param name="settlement">
+    /// Optional settlement result. <see cref="NowPaymentsSettlementStatus.ProviderNotPaid"/> adds a warning that no
+    /// balance was credited and the admin must confirm the payment inside NOWPayments first.
+    /// </param>
+    /// <returns>HTML-safe Telegram text for the super-admin manual status response.</returns>
+    /// <remarks>
+    /// This method is display-only. It must never mutate the payment row or settle a balance; settlement safety is
+    /// enforced by <see cref="NowPaymentsSettlementService.ApplyManualConfirmationAsync"/>.
+    /// </remarks>
     private static string BuildPaymentInfo(
         SwapinoPaymentInfo payment,
         NowPaymentsPaymentRecordData data,
         NowPaymentsSettlementResult settlement)
     {
+        var providerNotPaidWarning = settlement?.Status == NowPaymentsSettlementStatus.ProviderNotPaid ||
+                                     string.Equals(payment.ErrorCode, "nowpayments_provider_not_paid", StringComparison.OrdinalIgnoreCase) ||
+                                     string.Equals(payment.ErrorCode, "nowpayments_provider_check_failed", StringComparison.OrdinalIgnoreCase)
+            ? "\n\n⚠️ <b>این پرداخت از سمت NOWPayments تایید کامل نشده است و هیچ مبلغی به موجودی کاربر اضافه نشد.</b>\n" +
+              "اگر پرداخت ناقص، wrong asset یا مشکل‌دار است، ابتدا آن را داخل پنل NOWPayments تایید/Force کنید و سپس دوباره همین بررسی را در ربات انجام دهید.\n" +
+              "به وضعیت محلی قبلی اعتماد نمی‌شود؛ معیار فقط وضعیت تازه‌ای است که NOWPayments در همین بررسی برمی‌گرداند.\n" +
+              $"جزئیات خطا: <code>{Html(payment.ErrorMessage)}</code>"
+            : string.Empty;
+
         return "وضعیت پرداخت NOWPayments\n\n" +
                $"Order ID: <code>{Html(payment.OrderId)}</code>\n" +
                $"Invoice ID: <code>{Html(payment.InvoiceId ?? data.InvoiceId)}</code>\n" +
@@ -3183,7 +3210,8 @@ public class XuiV3AdminFlowService
                $"Balance After: <code>{Html(payment.BalanceAfter?.FormatCurrency())}</code>\n" +
                $"Payin Hash: <code>{Html(payment.PayinHash ?? data.PayinHash)}</code>\n" +
                $"Payout Hash: <code>{Html(payment.PayoutHash ?? data.PayoutHash)}</code>\n" +
-               $"Invoice URL: <code>{Html(payment.InvoiceUrl ?? data.InvoiceUrl)}</code>";
+               $"Invoice URL: <code>{Html(payment.InvoiceUrl ?? data.InvoiceUrl)}</code>" +
+               providerNotPaidWarning;
     }
 
     /// <summary>

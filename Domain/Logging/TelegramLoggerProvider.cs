@@ -26,6 +26,7 @@ namespace Adminbot.Domain.Logging
         private readonly BotContextAccessor _botContextAccessor;
         private readonly string _fallbackChannelId;
         private readonly string _fallbackBackupChannelId;
+        private readonly AppConfig _appConfig;
 
         /// <summary>
         /// Initializes a provider that creates <see cref="TelegramLogger"/> instances.
@@ -39,13 +40,15 @@ namespace Adminbot.Domain.Logging
         /// <param name="botContextAccessor">Async-local bot context accessor used while logging tenant/owned bot work.</param>
         /// <param name="fallbackChannelId">Fallback Telegram log channel id when the active bot has no logger channel.</param>
         /// <param name="fallbackBackupChannelId">Fallback Telegram backup channel id used by payment logs.</param>
+        /// <param name="appConfig">Application configuration that contains the active users.db and credentials.db paths.</param>
         public TelegramLoggerProvider(
             Func<string, LogLevel, bool> filter,
             BotClientProvider botClientProvider,
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
             string fallbackChannelId,
-            string fallbackBackupChannelId)
+            string fallbackBackupChannelId,
+            AppConfig appConfig)
         {
             _filter = filter;
             _botClientProvider = botClientProvider;
@@ -53,6 +56,7 @@ namespace Adminbot.Domain.Logging
             _botContextAccessor = botContextAccessor;
             _fallbackChannelId = fallbackChannelId;
             _fallbackBackupChannelId = fallbackBackupChannelId;
+            _appConfig = appConfig ?? new AppConfig();
 
         }
 
@@ -65,7 +69,8 @@ namespace Adminbot.Domain.Logging
                 _botRegistry,
                 _botContextAccessor,
                 _fallbackChannelId,
-                _fallbackBackupChannelId);
+                _fallbackBackupChannelId,
+                _appConfig);
         }
 
         public void Dispose()
