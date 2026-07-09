@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Text;
 using Adminbot.Domain;
 using Adminbot.Utils;
@@ -9,6 +10,11 @@ using Newtonsoft.Json.Linq;
 
 public class ApiServicev3
 {
+    private const int DefaultXuiV3TimeoutSeconds = 60;
+    private const int DefaultXuiV3TransientRetryCount = 3;
+    private const int DefaultXuiV3TransientRetryBaseDelayMs = 1500;
+    private const int DefaultXuiV3TransientRetryMaxDelayMs = 12000;
+
     private static readonly JsonSerializerSettings JsonSettings = new JsonSerializerSettings
     {
         NullValueHandling = NullValueHandling.Ignore
@@ -110,14 +116,68 @@ public class ApiServicev3
         var trafficGb = options.TrafficGb > 0 ? options.TrafficGb : Convert.ToInt32(accountDto.TotoalGB);
         var trafficBytes = options.TrafficBytes > 0 ? options.TrafficBytes : ApiService.ConvertGBToBytes(trafficGb);
         var client = BuildClientPayload(accountDto, options);
-        var response = await AddClientAsync(
-            accountDto.ServerInfo,
-            configuration,
-            new XuiV3ClientCreateRequest { Client = client, InboundIds = inboundIds },
-            cancellationToken);
+        XuiV3ApiResponse<JToken> response;
+        try
+        {
+            response = await AddClientAsync(
+                accountDto.ServerInfo,
+                configuration,
+                new XuiV3ClientCreateRequest { Client = client, InboundIds = inboundIds },
+                cancellationToken);
+        }
+        catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken))
+        {
+            var recovered = await TryRecoverCreatedClientAsync(
+                accountDto,
+                configuration,
+                client,
+                inboundIds,
+                trafficGb,
+                trafficBytes,
+                options,
+                responseObj: null,
+                cancellationToken);
+
+            return recovered ?? BuildTransientCreationFailure(client.Email, ex);
+        }
+        catch (XuiV3ApiException ex) when (CouldIndicateExistingClient(ex))
+        {
+            var recovered = await TryRecoverCreatedClientAsync(
+                accountDto,
+                configuration,
+                client,
+                inboundIds,
+                trafficGb,
+                trafficBytes,
+                options,
+                responseObj: null,
+                cancellationToken);
+
+            if (recovered != null)
+                return recovered;
+
+            throw;
+        }
 
         if (!response.Success)
         {
+            if (CouldIndicateExistingClient(response.Msg))
+            {
+                var recovered = await TryRecoverCreatedClientAsync(
+                    accountDto,
+                    configuration,
+                    client,
+                    inboundIds,
+                    trafficGb,
+                    trafficBytes,
+                    options,
+                    response.Obj,
+                    cancellationToken);
+
+                if (recovered != null)
+                    return recovered;
+            }
+
             return new XuiV3AccountCreationResult
             {
                 Success = false,
@@ -127,14 +187,133 @@ public class ApiServicev3
             };
         }
 
+        try
+        {
+            return await BuildAccountCreationResultAsync(
+                accountDto,
+                configuration,
+                client,
+                inboundIds,
+                trafficGb,
+                trafficBytes,
+                options,
+                response.Obj,
+                cancellationToken);
+        }
+        catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken))
+        {
+            var recovered = await TryRecoverCreatedClientAsync(
+                accountDto,
+                configuration,
+                client,
+                inboundIds,
+                trafficGb,
+                trafficBytes,
+                options,
+                response.Obj,
+                cancellationToken);
+
+            return recovered ?? BuildTransientCreationFailure(client.Email, ex);
+        }
+    }
+
+    /// <summary>
+    /// Builds the final account creation result after the panel has accepted the add-client request.
+    /// </summary>
+    /// <param name="accountDto">
+    /// Bot-facing account request that contains the Telegram owner id, target panel, selected service, period, and
+    /// user-facing traffic values.
+    /// </param>
+    /// <param name="configuration">Application configuration used for XUI v3 API timeout, retry, and token settings.</param>
+    /// <param name="client">The client payload that was submitted to 3x-ui.</param>
+    /// <param name="inboundIds">The active XUI inbound ids that the client was attached to.</param>
+    /// <param name="trafficGb">Display traffic limit in GB for the bot message and saved state.</param>
+    /// <param name="trafficBytes">Traffic limit in bytes that was sent to the panel.</param>
+    /// <param name="options">Resolved creation options that control duration, status persistence, and metadata.</param>
+    /// <param name="responseObj">Raw successful add-client API response from the panel, stored for diagnostics.</param>
+    /// <param name="cancellationToken">Cancellation token for follow-up panel reads and optional state persistence.</param>
+    /// <returns>
+    /// A successful creation result using the real panel client when it can be read, including the real UUID and subId.
+    /// </returns>
+    /// <remarks>
+    /// The add-client endpoint can succeed while later reads are slow after a 3x-ui update. This method is deliberately
+    /// separated from the add step so callers can retry/recover the read side without sending another add request.
+    /// </remarks>
+    private static async Task<XuiV3AccountCreationResult> BuildAccountCreationResultAsync(
+        AccountDto accountDto,
+        IConfiguration configuration,
+        XuiV3ClientPayload client,
+        List<int> inboundIds,
+        int trafficGb,
+        long trafficBytes,
+        XuiV3CreateAccountOptions options,
+        JToken responseObj,
+        CancellationToken cancellationToken)
+    {
         var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
         var panelClient = panelClientResponse.Success && panelClientResponse.Obj != null
             ? panelClientResponse.Obj
             : null;
-        var links = await GetClientLinksAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
-        var configLink = links.Obj?.FirstOrDefault();
+
+        return await BuildAccountCreationResultFromKnownClientAsync(
+            accountDto,
+            configuration,
+            client,
+            panelClient,
+            inboundIds,
+            trafficGb,
+            trafficBytes,
+            options,
+            responseObj,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Builds a creation result from a panel client that is already known or has just been recovered by email.
+    /// </summary>
+    /// <param name="accountDto">Original bot account request that owns the saved state and subscription base link.</param>
+    /// <param name="configuration">Application configuration used for XUI v3 link lookup.</param>
+    /// <param name="client">Submitted client payload used as a fallback when the panel omits a field.</param>
+    /// <param name="panelClient">Client row read back from the panel, or <c>null</c> when only add-client success is known.</param>
+    /// <param name="inboundIds">Inbound ids that were selected from the active service plan.</param>
+    /// <param name="trafficGb">Traffic amount in GB shown to the Telegram user.</param>
+    /// <param name="trafficBytes">Traffic amount in bytes stored in the result for downstream sync and logs.</param>
+    /// <param name="options">Creation options that control whether legacy user state is saved.</param>
+    /// <param name="responseObj">Raw successful add-client response, when available.</param>
+    /// <param name="cancellationToken">Cancellation token for optional link lookup and state persistence.</param>
+    /// <returns>
+    /// A successful creation result. The config link may be <c>null</c> when link retrieval fails after the account row
+    /// is already confirmed on the panel.
+    /// </returns>
+    /// <remarks>
+    /// Link lookup is best-effort once the panel client has been confirmed. Returning the real panel UUID is more
+    /// important than failing the whole purchase because the link endpoint timed out.
+    /// </remarks>
+    private static async Task<XuiV3AccountCreationResult> BuildAccountCreationResultFromKnownClientAsync(
+        AccountDto accountDto,
+        IConfiguration configuration,
+        XuiV3ClientPayload client,
+        XuiV3Client panelClient,
+        List<int> inboundIds,
+        int trafficGb,
+        long trafficBytes,
+        XuiV3CreateAccountOptions options,
+        JToken responseObj,
+        CancellationToken cancellationToken)
+    {
+        XuiV3ApiResponse<List<string>> links = null;
+        try
+        {
+            links = await GetClientLinksAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
+        }
+        catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken))
+        {
+            Console.WriteLine($"[XUIv3] Link lookup failed after account creation. email={client.Email}, error={ex.Message}");
+        }
+
+        var configLink = links?.Obj?.FirstOrDefault();
         var linkUuid = TryExtractUuidFromConfigLink(configLink, out var extractedUuid) ? extractedUuid : null;
-        var subLink = BuildSubscriptionLink(accountDto.ServerInfo, client.SubId ?? client.Email);
+        var subLink = BuildSubscriptionLink(accountDto.ServerInfo, FirstNonWhiteSpace(panelClient?.SubId, client.SubId, client.Email));
 
         if (options.SaveUserStatus)
         {
@@ -169,8 +348,127 @@ public class ApiServicev3
             DurationDays = options.DurationDays,
             Comment = FirstNonWhiteSpace(panelClient?.Comment, client.Comment),
             InboundIds = inboundIds,
-            RawResponse = response.Obj
+            RawResponse = responseObj
         };
+    }
+
+    /// <summary>
+    /// Attempts to recover a successful creation result by reading the client email after a transient add/read failure.
+    /// </summary>
+    /// <param name="accountDto">Original account request containing the target XUI server and Telegram owner id.</param>
+    /// <param name="configuration">Application configuration for XUI v3 retries and authentication.</param>
+    /// <param name="client">Client payload whose email is used as the idempotency key on the panel.</param>
+    /// <param name="inboundIds">Inbound ids selected for the account creation attempt.</param>
+    /// <param name="trafficGb">Traffic amount in GB that should be reported if recovery succeeds.</param>
+    /// <param name="trafficBytes">Traffic amount in bytes that should be reported if recovery succeeds.</param>
+    /// <param name="options">Creation options used for state persistence and metadata.</param>
+    /// <param name="responseObj">Raw add-client response, when the add call completed before the later failure.</param>
+    /// <param name="cancellationToken">Cancellation token for the recovery lookup.</param>
+    /// <returns>
+    /// A successful creation result when the panel contains the client; otherwise <c>null</c> so the caller can return a
+    /// controlled transient failure without creating a duplicate account.
+    /// </returns>
+    /// <remarks>
+    /// This is the duplicate-protection path for ambiguous network failures. It never sends another add-client request;
+    /// it only reads the panel by email and builds the result from the existing row.
+    /// </remarks>
+    private static async Task<XuiV3AccountCreationResult> TryRecoverCreatedClientAsync(
+        AccountDto accountDto,
+        IConfiguration configuration,
+        XuiV3ClientPayload client,
+        List<int> inboundIds,
+        int trafficGb,
+        long trafficBytes,
+        XuiV3CreateAccountOptions options,
+        JToken responseObj,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
+            if (!panelClientResponse.Success || panelClientResponse.Obj == null)
+                return null;
+
+            Console.WriteLine($"[XUIv3] Recovered created client after transient failure. email={client.Email}");
+            return await BuildAccountCreationResultFromKnownClientAsync(
+                accountDto,
+                configuration,
+                client,
+                panelClientResponse.Obj,
+                inboundIds,
+                trafficGb,
+                trafficBytes,
+                options,
+                responseObj,
+                cancellationToken);
+        }
+        catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken) || ex is XuiV3ApiException)
+        {
+            Console.WriteLine($"[XUIv3] Could not recover created client after transient failure. email={client.Email}, error={ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Creates a user-facing failed creation result for a transient XUI v3 transport error.
+    /// </summary>
+    /// <param name="email">Generated account email that was being created.</param>
+    /// <param name="exception">Transient transport exception observed while talking to the panel.</param>
+    /// <returns>
+    /// A failed account creation result that does not expose panel secrets and can be shown by bot flows as a retryable
+    /// panel problem.
+    /// </returns>
+    /// <remarks>
+    /// Returning a normal result object prevents a network glitch from escaping to Telegram polling and stopping the
+    /// active receiver.
+    /// </remarks>
+    private static XuiV3AccountCreationResult BuildTransientCreationFailure(string email, Exception exception)
+    {
+        Console.WriteLine($"[XUIv3] Account creation failed with transient panel transport error. email={email}, error={exception.Message}");
+        return new XuiV3AccountCreationResult
+        {
+            Success = false,
+            ApiVersion = XuiPanelApiVersion.V3,
+            Email = email,
+            Message = "ارتباط با پنل 3x-ui پایدار نبود. لطفاً چند دقیقه دیگر دوباره تلاش کنید."
+        };
+    }
+
+    /// <summary>
+    /// Checks whether an add-client response may mean the previous ambiguous attempt already created the same email.
+    /// </summary>
+    /// <param name="exception">XUI v3 API exception thrown by the add-client endpoint.</param>
+    /// <returns>
+    /// <c>true</c> when the response status/body looks like a duplicate-client response that should be verified by
+    /// reading the client by email; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// This is not a retry rule. It is an idempotency guard used only after add-client returns an existing-client style
+    /// response, which can happen when a previous transport failure hid a successful server-side creation.
+    /// </remarks>
+    private static bool CouldIndicateExistingClient(XuiV3ApiException exception)
+    {
+        if (exception == null)
+            return false;
+
+        return exception.StatusCode == 409 || CouldIndicateExistingClient(exception.ResponseBody);
+    }
+
+    /// <summary>
+    /// Checks whether a panel message appears to describe an already existing client/email.
+    /// </summary>
+    /// <param name="message">Response message or body returned by 3x-ui.</param>
+    /// <returns><c>true</c> when the message contains common duplicate-client wording; otherwise <c>false</c>.</returns>
+    private static bool CouldIndicateExistingClient(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        return message.Contains("already", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("exist", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("duplicate", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("重复", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("تکراری", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>POST /login. Cookie-based UI login. Bearer-token callers do not need this method.</summary>
@@ -729,9 +1027,22 @@ public class ApiServicev3
     /// <summary>POST /panel/api/server/importDB. Restores the panel DB from a local SQLite file path.</summary>
     public static async Task<XuiV3ApiResponse<JToken>> ImportDatabaseAsync(ServerInfo serverInfo, IConfiguration configuration, string dbFilePath, CancellationToken cancellationToken = default)
     {
-        using var content = new MultipartFormDataContent();
-        content.Add(new ByteArrayContent(await File.ReadAllBytesAsync(dbFilePath, cancellationToken)), "db", Path.GetFileName(dbFilePath));
-        var raw = await SendRawAsync(serverInfo, configuration, HttpMethod.Post, "/panel/api/server/importDB", content, true, cancellationToken);
+        var fileName = Path.GetFileName(dbFilePath);
+        var raw = await SendRawWithRetryAsync(
+            serverInfo,
+            configuration,
+            HttpMethod.Post,
+            "/panel/api/server/importDB",
+            async token =>
+            {
+                var content = new MultipartFormDataContent();
+                content.Add(new ByteArrayContent(await File.ReadAllBytesAsync(dbFilePath, token)), "db", fileName);
+                return content;
+            },
+            true,
+            cancellationToken,
+            query: null,
+            requestBodyForLog: "<multipart-db-content>");
         return JsonConvert.DeserializeObject<XuiV3ApiResponse<JToken>>(raw) ?? new XuiV3ApiResponse<JToken>();
     }
 
@@ -884,8 +1195,17 @@ public class ApiServicev3
         IDictionary<string, string> fields,
         CancellationToken cancellationToken)
     {
-        using var content = new FormUrlEncodedContent(fields ?? new Dictionary<string, string>());
-        var raw = await SendRawAsync(serverInfo, configuration, HttpMethod.Post, relativePath, content, true, cancellationToken);
+        var safeFields = fields ?? new Dictionary<string, string>();
+        var raw = await SendRawWithRetryAsync(
+            serverInfo,
+            configuration,
+            HttpMethod.Post,
+            relativePath,
+            _ => Task.FromResult<HttpContent>(new FormUrlEncodedContent(safeFields)),
+            true,
+            cancellationToken,
+            query: null,
+            requestBodyForLog: "<form-content>");
         return JsonConvert.DeserializeObject<XuiV3ApiResponse<T>>(raw) ?? new XuiV3ApiResponse<T>();
     }
 
@@ -899,18 +1219,127 @@ public class ApiServicev3
         CancellationToken cancellationToken)
     {
         var uri = BuildPanelUri(serverInfo, relativePath, null);
-        using var httpClient = CreateHttpClient(configuration);
-        using var request = BuildRequest(method, uri, body, serverInfo, configuration, authenticate);
-        using var response = await httpClient.SendAsync(request, cancellationToken);
-        var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+        return await SendWithRetryAsync(
+            configuration,
+            method,
+            uri,
+            async () =>
+            {
+                using var httpClient = CreateHttpClient(configuration);
+                using var content = BuildContent(body);
+                using var request = BuildRequest(method, uri, content, serverInfo, configuration, authenticate);
+                using var response = await httpClient.SendAsync(request, cancellationToken);
+                var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
 
-        if (!response.IsSuccessStatusCode)
+                if (!response.IsSuccessStatusCode)
+                {
+                    var text = Encoding.UTF8.GetString(bytes);
+                    throw new XuiV3ApiException(method.ToString(), uri.ToString(), (int)response.StatusCode, text, SerializeBodyForLog(body));
+                }
+
+                return bytes;
+            },
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Sends one XUI v3 request and retries transient transport or gateway failures with bounded backoff.
+    /// </summary>
+    /// <param name="serverInfo">Target XUI panel configuration that provides base URL, root path, and bearer token.</param>
+    /// <param name="configuration">Application configuration containing timeout and retry settings.</param>
+    /// <param name="method">HTTP method used by the XUI endpoint.</param>
+    /// <param name="relativePath">Panel-relative path, without duplicating the root path.</param>
+    /// <param name="contentFactory">
+    /// Factory that creates a fresh HTTP content object for each attempt. This is required because <see cref="HttpContent"/>
+    /// instances cannot be safely re-sent after a failed attempt.
+    /// </param>
+    /// <param name="authenticate">Whether the request should include the XUI v3 bearer token.</param>
+    /// <param name="cancellationToken">Cancellation token for the active Telegram update or background operation.</param>
+    /// <param name="query">Optional query string values for endpoints that support filtering or paging.</param>
+    /// <param name="requestBodyForLog">Sanitized request body label used only in exceptions; never include tokens here.</param>
+    /// <returns>The response body as UTF-8 text when the panel returns a successful status code.</returns>
+    /// <remarks>
+    /// HTTP 400/401/403/404/422 responses are treated as panel/business failures and are not retried. HTTP 429 and
+    /// gateway 5xx responses are retried because 3x-ui 3.4.x panels can temporarily stall under account creation load.
+    /// </remarks>
+    private static Task<string> SendRawWithRetryAsync(
+        ServerInfo serverInfo,
+        IConfiguration configuration,
+        HttpMethod method,
+        string relativePath,
+        Func<CancellationToken, Task<HttpContent>> contentFactory,
+        bool authenticate,
+        CancellationToken cancellationToken,
+        IDictionary<string, string> query = null,
+        string requestBodyForLog = null)
+    {
+        var uri = BuildPanelUri(serverInfo, relativePath, query);
+        return SendWithRetryAsync(
+            configuration,
+            method,
+            uri,
+            async () =>
+            {
+                using var httpClient = CreateHttpClient(configuration);
+                using var content = contentFactory == null ? null : await contentFactory(cancellationToken);
+                using var request = BuildRequest(method, uri, content, serverInfo, configuration, authenticate);
+                using var response = await httpClient.SendAsync(request, cancellationToken);
+                var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
+
+                if (!response.IsSuccessStatusCode)
+                    throw new XuiV3ApiException(method.ToString(), uri.ToString(), (int)response.StatusCode, responseText, requestBodyForLog);
+
+                return responseText;
+            },
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Executes an XUI v3 HTTP operation with retry semantics shared by JSON, form, and byte-response endpoints.
+    /// </summary>
+    /// <typeparam name="T">Response type produced by the supplied HTTP operation.</typeparam>
+    /// <param name="configuration">Application configuration that supplies retry count and delay settings.</param>
+    /// <param name="method">HTTP method being sent, used for retry diagnostics.</param>
+    /// <param name="uri">Fully built XUI panel request URI. It must not include bearer tokens or other secrets.</param>
+    /// <param name="operation">Factory that sends exactly one HTTP attempt and returns the parsed response data.</param>
+    /// <param name="cancellationToken">Cancellation token that stops retries when the Telegram update is cancelled.</param>
+    /// <returns>The value returned by the first successful HTTP attempt.</returns>
+    /// <remarks>
+    /// This method deliberately logs retry attempts to the process console instead of the Telegram logger channel. The
+    /// retry details are operational diagnostics and should not spam the private payment/audit channel.
+    /// </remarks>
+    private static async Task<T> SendWithRetryAsync<T>(
+        IConfiguration configuration,
+        HttpMethod method,
+        Uri uri,
+        Func<Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        var appConfig = configuration?.Get<AppConfig>() ?? new AppConfig();
+        var retryCount = appConfig.XuiV3TransientRetryCount < 0
+            ? DefaultXuiV3TransientRetryCount
+            : appConfig.XuiV3TransientRetryCount;
+        var maxAttempts = Math.Max(1, retryCount + 1);
+        Exception lastException = null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            var text = Encoding.UTF8.GetString(bytes);
-            throw new XuiV3ApiException(method.ToString(), uri.ToString(), (int)response.StatusCode, text, null);
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                return await operation();
+            }
+            catch (Exception ex) when (ShouldRetryXuiRequest(ex, cancellationToken, attempt, maxAttempts))
+            {
+                lastException = ex;
+                var delay = GetXuiRetryDelay(appConfig, attempt);
+                Console.WriteLine(
+                    $"[XUIv3] transient API failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}, error={ex.Message}");
+                await Task.Delay(delay, cancellationToken);
+            }
         }
 
-        return bytes;
+        throw lastException ?? new InvalidOperationException("XUI v3 request failed without an exception.");
     }
 
     private static async Task<string> SendRawAsync(
@@ -923,19 +1352,16 @@ public class ApiServicev3
         CancellationToken cancellationToken,
         IDictionary<string, string> query = null)
     {
-        var uri = BuildPanelUri(serverInfo, relativePath, query);
-        using var httpClient = CreateHttpClient(configuration);
-        using var request = BuildRequest(method, uri, body, serverInfo, configuration, authenticate);
-        using var response = await httpClient.SendAsync(request, cancellationToken);
-        var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            var requestBody = body is HttpContent ? "<http-content>" : SerializeBody(body);
-            throw new XuiV3ApiException(method.ToString(), uri.ToString(), (int)response.StatusCode, responseText, requestBody);
-        }
-
-        return responseText;
+        return await SendRawWithRetryAsync(
+            serverInfo,
+            configuration,
+            method,
+            relativePath,
+            _ => Task.FromResult(BuildContent(body)),
+            authenticate,
+            cancellationToken,
+            query,
+            SerializeBodyForLog(body));
     }
 
     private static async Task<string> SendSubscriptionRawAsync(
@@ -967,19 +1393,199 @@ public class ApiServicev3
     private static HttpClient CreateHttpClient(IConfiguration configuration)
     {
         var appConfig = configuration?.Get<AppConfig>() ?? new AppConfig();
-        var timeoutSeconds = appConfig.XuiV3RequestTimeoutSeconds <= 0 ? 60 : appConfig.XuiV3RequestTimeoutSeconds;
+        var timeoutSeconds = appConfig.XuiV3RequestTimeoutSeconds <= 0 ? DefaultXuiV3TimeoutSeconds : appConfig.XuiV3RequestTimeoutSeconds;
         return new HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+    }
+
+    /// <summary>
+    /// Determines whether a failed XUI v3 HTTP attempt is safe to retry.
+    /// </summary>
+    /// <param name="exception">
+    /// Exception thrown by one HTTP attempt. It may be a provider response wrapped in <see cref="XuiV3ApiException"/>
+    /// or a transport exception such as <see cref="HttpRequestException"/>.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancellation token for the active Telegram update. Cancelled shutdown operations are not treated as retryable.
+    /// </param>
+    /// <param name="attempt">The 1-based attempt number that just failed.</param>
+    /// <param name="maxAttempts">Maximum number of attempts allowed for this request.</param>
+    /// <returns>
+    /// <c>true</c> when another attempt should be made; otherwise <c>false</c> so the original error is surfaced.
+    /// </returns>
+    /// <remarks>
+    /// HTTP 429 and gateway 5xx errors are retryable. Normal 3x-ui API validation/auth/not-found errors are not,
+    /// because retrying them can hide a real configuration or business-rule problem.
+    /// </remarks>
+    private static bool ShouldRetryXuiRequest(Exception exception, CancellationToken cancellationToken, int attempt, int maxAttempts)
+    {
+        if (attempt >= maxAttempts || cancellationToken.IsCancellationRequested)
+            return false;
+
+        if (exception is XuiV3ApiException apiException)
+            return IsTransientXuiStatusCode(apiException.StatusCode);
+
+        return IsTransientXuiTransportException(exception, cancellationToken);
+    }
+
+    /// <summary>
+    /// Detects transient network and TLS failures that can happen while the bot talks to the XUI v3 panel.
+    /// </summary>
+    /// <param name="exception">Exception thrown by an XUI v3 request or by a follow-up read after account creation.</param>
+    /// <param name="cancellationToken">Cancellation token for the active operation; shutdown cancellations are ignored.</param>
+    /// <returns>
+    /// <c>true</c> for retryable transport failures such as timeout, DNS/socket failure, TLS bad record MAC, gateway
+    /// failure, or connection reset; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// 3x-ui 3.4.x panels can be slow after add-client operations. Treating these failures as transient prevents one
+    /// failed panel read from escaping to Telegram polling and stopping an owned or tenant bot receiver.
+    /// </remarks>
+    public static bool IsTransientXuiTransportException(Exception exception, CancellationToken cancellationToken = default)
+    {
+        if (exception == null || cancellationToken.IsCancellationRequested)
+            return false;
+
+        if (exception is TimeoutException or TaskCanceledException or OperationCanceledException)
+            return true;
+
+        if (exception is XuiV3ApiException apiException)
+            return IsTransientXuiStatusCode(apiException.StatusCode);
+
+        foreach (var current in FlattenExceptionChain(exception))
+        {
+            if (current is HttpRequestException httpRequestException)
+            {
+                if (httpRequestException.StatusCode.HasValue &&
+                    IsTransientXuiStatusCode((int)httpRequestException.StatusCode.Value))
+                {
+                    return true;
+                }
+
+                return true;
+            }
+
+            if (current is IOException or SocketException)
+                return true;
+
+            var message = current.Message ?? string.Empty;
+            if (ContainsTransientXuiTransportMarker(message))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Checks whether an HTTP status code represents a temporary panel or gateway failure.
+    /// </summary>
+    /// <param name="statusCode">Numeric HTTP status code returned by 3x-ui or the proxy in front of it.</param>
+    /// <returns>
+    /// <c>true</c> for HTTP 429, 502, 503, and 504; otherwise <c>false</c>. Business 4xx errors are intentionally
+    /// excluded.
+    /// </returns>
+    private static bool IsTransientXuiStatusCode(int statusCode)
+    {
+        return statusCode == 429 ||
+               statusCode == 502 ||
+               statusCode == 503 ||
+               statusCode == 504;
+    }
+
+    /// <summary>
+    /// Looks for common transport error fragments emitted by .NET, OpenSSL, proxies, and Telegram-hosted Linux builds.
+    /// </summary>
+    /// <param name="message">Exception message from any level of the exception chain.</param>
+    /// <returns><c>true</c> when the text describes a retryable transport failure.</returns>
+    private static bool ContainsTransientXuiTransportMarker(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        return message.Contains("HttpClient.Timeout", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("decryption failed", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("bad record mac", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("SSL_ERROR_SSL", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("connection reset", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("forcibly closed", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("broken pipe", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("No such host", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("Name or service not known", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("Bad Gateway", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("gateway timeout", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("service unavailable", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Calculates the bounded exponential backoff delay for a retry attempt.
+    /// </summary>
+    /// <param name="appConfig">Runtime configuration containing XUI v3 retry delay settings.</param>
+    /// <param name="failedAttempt">The 1-based attempt number that just failed.</param>
+    /// <returns>A delay between the configured base and maximum retry delay.</returns>
+    private static TimeSpan GetXuiRetryDelay(AppConfig appConfig, int failedAttempt)
+    {
+        var baseDelay = appConfig.XuiV3TransientRetryBaseDelayMs <= 0
+            ? DefaultXuiV3TransientRetryBaseDelayMs
+            : appConfig.XuiV3TransientRetryBaseDelayMs;
+        var maxDelay = appConfig.XuiV3TransientRetryMaxDelayMs <= 0
+            ? DefaultXuiV3TransientRetryMaxDelayMs
+            : appConfig.XuiV3TransientRetryMaxDelayMs;
+        var multiplier = Math.Pow(2, Math.Max(0, failedAttempt - 1));
+        var delayMs = Math.Min(maxDelay, baseDelay * multiplier);
+        return TimeSpan.FromMilliseconds(delayMs);
+    }
+
+    /// <summary>
+    /// Enumerates an exception and all nested inner exceptions from outermost to innermost.
+    /// </summary>
+    /// <param name="exception">Root exception caught from an XUI v3 request or Telegram update handler.</param>
+    /// <returns>An enumerable containing the root exception followed by its inner exceptions.</returns>
+    private static IEnumerable<Exception> FlattenExceptionChain(Exception exception)
+    {
+        for (var current = exception; current != null; current = current.InnerException)
+            yield return current;
+    }
+
+    /// <summary>
+    /// Creates fresh HTTP content for a request attempt from a JSON body or prebuilt content.
+    /// </summary>
+    /// <param name="body">
+    /// Request body object. JSON objects are serialized into a new <see cref="StringContent"/> for every attempt.
+    /// Prebuilt <see cref="HttpContent"/> values should only be used by non-retried legacy callers.
+    /// </param>
+    /// <returns>A disposable HTTP content object, or <c>null</c> for body-less requests.</returns>
+    private static HttpContent BuildContent(object body)
+    {
+        if (body is HttpContent httpContent)
+            return httpContent;
+
+        return body == null
+            ? null
+            : new StringContent(SerializeBody(body), Encoding.UTF8, "application/json");
+    }
+
+    /// <summary>
+    /// Serializes a request body for exception diagnostics without exposing bearer tokens.
+    /// </summary>
+    /// <param name="body">The request body object passed to an XUI v3 API helper.</param>
+    /// <returns>A JSON string, a content placeholder, or <c>null</c> when no body was sent.</returns>
+    private static string SerializeBodyForLog(object body)
+    {
+        return body is HttpContent ? "<http-content>" : SerializeBody(body);
     }
 
     private static HttpRequestMessage BuildRequest(
         HttpMethod method,
         Uri uri,
-        object body,
+        HttpContent content,
         ServerInfo serverInfo,
         IConfiguration configuration,
         bool authenticate)
     {
         var request = new HttpRequestMessage(method, uri);
+        request.Version = HttpVersion.Version11;
+        request.Headers.ConnectionClose = true;
 
         if (authenticate)
         {
@@ -988,14 +1594,8 @@ public class ApiServicev3
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", StripBearerPrefix(token));
         }
 
-        if (body is HttpContent httpContent)
-        {
-            request.Content = httpContent;
-        }
-        else if (body != null)
-        {
-            request.Content = new StringContent(SerializeBody(body), Encoding.UTF8, "application/json");
-        }
+        if (content != null)
+            request.Content = content;
 
         return request;
     }

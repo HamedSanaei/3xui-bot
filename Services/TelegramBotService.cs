@@ -6160,23 +6160,24 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
-    /// Detects non-shutdown HTTP timeouts from external systems used while handling a Telegram update.
+    /// Detects non-shutdown transient failures from external systems used while handling a Telegram update.
     /// </summary>
     /// <param name="exception">
     /// Exception caught by the update wrapper. This is commonly a <see cref="TaskCanceledException"/> from
-    /// <see cref="HttpClient"/> when the XUI panel or another external API exceeds its configured timeout.
+    /// <see cref="HttpClient"/> when the XUI panel times out, or an <see cref="HttpRequestException"/> when the panel
+    /// or Telegram connection fails with a transient TLS/socket problem.
     /// </param>
     /// <param name="cancellationToken">
     /// Polling cancellation token from Telegram.Bot. When this token is cancelled, the timeout belongs to shutdown
     /// and must not be swallowed as a recoverable business failure.
     /// </param>
     /// <returns>
-    /// <c>true</c> when the exception represents a transient external timeout that should be logged and handled
+    /// <c>true</c> when the exception represents a transient external failure that should be logged and handled
     /// without stopping the receiver; otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
-    /// Gozargah and other owned bots can hit slow 3x-ui panels. Those timeouts should produce a user-facing retry
-    /// message, not a polling failure that is later attributed to the wrong bot.
+    /// Gozargah and other owned bots can hit slow 3x-ui panels. Timeouts, TLS bad-record errors, and temporary
+    /// gateway failures should produce a user-facing retry message, not a polling failure that stops the active bot.
     /// </remarks>
     private static bool IsExternalOperationTimeout(Exception exception, CancellationToken cancellationToken)
     {
@@ -6189,10 +6190,19 @@ public class TelegramBotService : IHostedService
         if (exception is TaskCanceledException)
             return true;
 
+        if (ApiServicev3.IsTransientXuiTransportException(exception, cancellationToken))
+            return true;
+
         var message = exception?.Message ?? string.Empty;
         return message.Contains("HttpClient.Timeout", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("timed out", StringComparison.OrdinalIgnoreCase);
+               message.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("decryption failed", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("bad record mac", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("SSL_ERROR_SSL", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("Bad Gateway", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("gateway timeout", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("service unavailable", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

@@ -652,6 +652,7 @@ namespace Adminbot.Domain
         private const int NationalPlanId = 1;
         private const int NormalPlanId = 2;
         private const int UnlimitedPlanId = 5;
+        private static readonly TimeSpan OptionalWebsiteLookupTimeout = TimeSpan.FromSeconds(4);
         private readonly UserDbContext _userDbContext;
         private readonly CredentialsDbContext _credentialsDbContext;
         private readonly GozargahSiteApiClient _apiClient;
@@ -702,7 +703,22 @@ namespace Adminbot.Domain
             if (botUser?.IsBlocked == true)
                 return GozargahSiteWalletEligibility.Blocked("کاربر در ربات مسدود است.");
 
-            var siteUser = await _apiClient.GetUserAsync(telegramUserId, cancellationToken);
+            GozargahSiteApiResponse<GozargahSiteUserData> siteUser;
+            try
+            {
+                using var lookupTimeout = CreateOptionalWebsiteLookupCancellation(cancellationToken);
+                siteUser = await _apiClient.GetUserAsync(telegramUserId, lookupTimeout.Token);
+            }
+            catch (Exception ex) when (IsTransientWebsiteLookupFailure(ex, cancellationToken))
+            {
+                _logger.LogWarning(
+                    "Gozargah site wallet eligibility lookup failed transiently. telegramUserId={TelegramUserId}, amountToman={AmountToman}, error={ErrorMessage}",
+                    telegramUserId,
+                    amountToman,
+                    ex.Message);
+                return GozargahSiteWalletEligibility.Unavailable("در حال حاضر اتصال به کیف پول سایت گذرگاه برقرار نشد.");
+            }
+
             if (!siteUser.Success || siteUser.Data == null)
                 return GozargahSiteWalletEligibility.Unavailable(siteUser.Message ?? "کاربر در سایت گذرگاه پیدا نشد.");
             if (siteUser.Data.IsBanned)
@@ -739,7 +755,22 @@ namespace Adminbot.Domain
             if (!_appConfig.GozargahSiteWalletPaymentsEnabled || !_apiClient.IsConfigured())
                 return credUser.IsColleague;
 
-            var siteUser = await _apiClient.GetUserAsync(credUser.TelegramUserId, cancellationToken);
+            GozargahSiteApiResponse<GozargahSiteUserData> siteUser;
+            try
+            {
+                using var lookupTimeout = CreateOptionalWebsiteLookupCancellation(cancellationToken);
+                siteUser = await _apiClient.GetUserAsync(credUser.TelegramUserId, lookupTimeout.Token);
+            }
+            catch (Exception ex) when (IsTransientWebsiteLookupFailure(ex, cancellationToken))
+            {
+                _logger.LogWarning(
+                    "Gozargah colleague role lookup failed transiently; keeping current bot role. telegramUserId={TelegramUserId}, isColleague={IsColleague}, error={ErrorMessage}",
+                    credUser.TelegramUserId,
+                    credUser.IsColleague,
+                    ex.Message);
+                return credUser.IsColleague;
+            }
+
             if (!siteUser.Success || siteUser.Data == null || siteUser.Data.IsBanned)
                 return false;
 
@@ -751,6 +782,53 @@ namespace Adminbot.Domain
             }
 
             return credUser.IsColleague;
+        }
+
+        /// <summary>
+        /// Detects temporary website lookup failures that must not block owned-bot purchase, tariff, or renewal flows.
+        /// </summary>
+        /// <param name="exception">Exception thrown while checking the Gozargah website user or wallet state.</param>
+        /// <param name="cancellationToken">
+        /// Cancellation token for the active Telegram update. A cancelled shutdown token is not treated as a recoverable
+        /// website outage.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> for timeout, HTTP transport, DNS/socket, and temporary cancellation failures; otherwise
+        /// <c>false</c>.
+        /// </returns>
+        /// <remarks>
+        /// The website lookup is an optional pricing/wallet enrichment step for owned bots. If the website is slow, the
+        /// bot must keep serving the user with the locally known role instead of showing the generic panel timeout
+        /// message before the user can even pick a plan.
+        /// </remarks>
+        private static bool IsTransientWebsiteLookupFailure(Exception exception, CancellationToken cancellationToken)
+        {
+            if (exception == null || cancellationToken.IsCancellationRequested)
+                return false;
+
+            return exception is TimeoutException or TaskCanceledException or HttpRequestException;
+        }
+
+        /// <summary>
+        /// Creates a short-lived cancellation scope for optional Gozargah website user lookups.
+        /// </summary>
+        /// <param name="outerCancellationToken">
+        /// Cancellation token from the Telegram update or background operation. If it is cancelled, the linked lookup is
+        /// cancelled immediately as part of normal shutdown or request cancellation.
+        /// </param>
+        /// <returns>
+        /// A linked cancellation token source that cancels after a short timeout suitable for optional pricing and
+        /// wallet-button enrichment calls.
+        /// </returns>
+        /// <remarks>
+        /// Website user lookup is not the source of truth for XUI account creation. Keeping this timeout short prevents
+        /// a slow website API from delaying owned-bot tariff and purchase menus for every Telegram user.
+        /// </remarks>
+        private static CancellationTokenSource CreateOptionalWebsiteLookupCancellation(CancellationToken outerCancellationToken)
+        {
+            var source = CancellationTokenSource.CreateLinkedTokenSource(outerCancellationToken);
+            source.CancelAfter(OptionalWebsiteLookupTimeout);
+            return source;
         }
 
         /// <summary>

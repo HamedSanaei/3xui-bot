@@ -68,6 +68,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `get_user` HTTP 404 from the Gozargah website means the Telegram user has no website account; wallet-button checks treat it as expected and must not spam the Telegram logger channel.
 - Owned-bot profile/status messages should display Gozargah `get_user` 404/not-found as `متصل نشده`, not as the raw HTTP/API error.
 - A successful non-banned `get_user` lookup means the owned-bot buyer should be promoted to `CredUser.IsColleague=true` before tariffs, purchases, or renewals are priced.
+- Optional Gozargah `get_user` lookups for owned-bot pricing and wallet-button visibility are fail-soft with a short timeout; a slow website API must not block tariff or purchase menus.
 
 ## Current Gotchas
 
@@ -76,6 +77,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Financial `LogPayment` backup sends both `credentials.db` and `users.db` to the configured backup channel; backup failures must stay fail-soft and must not break settlement.
 - XUI v3 panel responses may omit `Traffic`; helpers must use null-safe access and fallback to top-level fields or `Extra`.
 - XUI v3 request timeout is controlled by `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`; slow panels can otherwise time out during `/panel/api/clients/add`.
+- XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `429/502/503/504`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
+- XUI v3 account creation treats generated email as the idempotency key. If `addClient` or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
 - Operational payment/account logs are delivered through the default owned bot to the central logger channel; include origin bot metadata in the message for non-default owned bots and tenant storefronts.
 - Telegram callbacks can be stale; callback answers must be best-effort and must not crash receivers.
 - Telegram blocked-user, deactivated-user, chat-not-found, and Telegram send-timeout errors are per-user/transient delivery failures; update and polling error handlers must log and swallow them without stack traces so one customer or one slow Telegram reply cannot stop or pollute logs for owned, tenant, or assistant bot receivers.

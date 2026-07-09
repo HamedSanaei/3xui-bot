@@ -49,7 +49,25 @@ namespace Adminbot.Domain
         public string XuiV3ApiToken { get; set; }
         public string XuiV3SubLinkBaseUrl { get; set; }
         public string XuiV3ServicePlansPath { get; set; } = "./Data/xui-v3-service-plans.json";
+        /// <summary>
+        /// Maximum time, in seconds, that one HTTP attempt against the XUI v3 panel may run before it is treated as a
+        /// transient panel timeout.
+        /// </summary>
         public int XuiV3RequestTimeoutSeconds { get; set; } = 60;
+        /// <summary>
+        /// Number of additional attempts used for transient XUI v3 transport failures such as TLS record errors,
+        /// request timeouts, HTTP 429, and HTTP 5xx gateway errors.
+        /// </summary>
+        public int XuiV3TransientRetryCount { get; set; } = 3;
+        /// <summary>
+        /// Initial delay, in milliseconds, before retrying a transient XUI v3 API failure.
+        /// </summary>
+        public int XuiV3TransientRetryBaseDelayMs { get; set; } = 1500;
+        /// <summary>
+        /// Maximum retry delay, in milliseconds, used when exponential backoff is applied to transient XUI v3 API
+        /// failures.
+        /// </summary>
+        public int XuiV3TransientRetryMaxDelayMs { get; set; } = 12000;
         public bool AccountExpiryReminderEnabled { get; set; } = true;
         public int AccountExpiryReminderHourIran { get; set; } = 8;
         public int[] AccountExpiryReminderDays { get; set; } = new[] { 7, 3, 1 };
