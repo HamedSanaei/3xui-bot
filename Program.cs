@@ -27,6 +27,11 @@ class Program
     /// </summary>
     /// <param name="args">Command-line arguments passed by the hosting environment.</param>
     /// <returns>A task that completes when the host shuts down.</returns>
+    /// <remarks>
+    /// In addition to the Telegram operational logger, startup registers a fail-soft daily diagnostic file logger for
+    /// warning/error/critical entries. This keeps full exception chains on disk even when channel-noise suppression
+    /// intentionally keeps transient delivery and framework traffic out of the private Telegram logger channel.
+    /// </remarks>
     static async Task Main(string[] args)
     {
 
@@ -111,6 +116,10 @@ class Program
                 configuration["backupChannel"],
                 appConfig
                 ));
+            // Keep the complete operational diagnostic trail on disk even when the Telegram channel suppresses noise.
+            loggingBuilder.Services.AddSingleton<ILoggerProvider>(sp => new DailyErrorFileLoggerProvider(
+                configuration,
+                sp.GetRequiredService<BotContextAccessor>()));
         });
 
         var app = builder.Build();

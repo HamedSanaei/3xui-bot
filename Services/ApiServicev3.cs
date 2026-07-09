@@ -3,8 +3,10 @@ using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
 using Adminbot.Domain;
+using Adminbot.Domain.Logging;
 using Adminbot.Utils;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -138,7 +140,7 @@ public class ApiServicev3
                 responseObj: null,
                 cancellationToken);
 
-            return recovered ?? BuildTransientCreationFailure(client.Email, ex);
+            return recovered ?? BuildTransientCreationFailure(configuration, client.Email, ex);
         }
         catch (XuiV3ApiException ex) when (CouldIndicateExistingClient(ex))
         {
@@ -213,7 +215,7 @@ public class ApiServicev3
                 response.Obj,
                 cancellationToken);
 
-            return recovered ?? BuildTransientCreationFailure(client.Email, ex);
+            return recovered ?? BuildTransientCreationFailure(configuration, client.Email, ex);
         }
     }
 
@@ -309,6 +311,12 @@ public class ApiServicev3
         catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken))
         {
             Console.WriteLine($"[XUIv3] Link lookup failed after account creation. email={client.Email}, error={ex.Message}");
+            DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
+                configuration,
+                LogLevel.Warning,
+                nameof(ApiServicev3),
+                $"XUI v3 link lookup failed after account creation. email={client.Email}",
+                ex);
         }
 
         var configLink = links?.Obj?.FirstOrDefault();
@@ -344,12 +352,77 @@ public class ApiServicev3
             SubLink = subLink,
             TrafficGb = trafficGb,
             TrafficBytes = trafficBytes,
-            ExpiryTime = panelClient?.ExpiryTime ?? client.ExpiryTime,
+            // 3x-ui 3.4.x may return top-level expiryTime as zero while exposing the actual value in traffic or extra.
+            // Resolve all panel representations before falling back to the payload that created this client.
+            ExpiryTime = ResolveCreatedClientExpiryTime(panelClient, client),
             DurationDays = options.DurationDays,
             Comment = FirstNonWhiteSpace(panelClient?.Comment, client.Comment),
             InboundIds = inboundIds,
             RawResponse = responseObj
         };
+    }
+
+    /// <summary>
+    /// Resolves the effective expiry value for a newly created XUI v3 client from all panel response shapes.
+    /// </summary>
+    /// <param name="panelClient">
+    /// Client row read back from 3x-ui after creation. Version 3.4.x may expose its effective expiry in nested traffic
+    /// or extension data while leaving the inherited top-level value at zero.
+    /// </param>
+    /// <param name="submittedClient">
+    /// Original payload sent to the panel. Its expiry is used only when the panel response does not expose a non-zero
+    /// expiry value, preserving a normal fixed-date account from being displayed as unlimited.
+    /// </param>
+    /// <returns>
+    /// The effective Unix-millisecond expiry timestamp, a negative first-use duration, or zero only when both panel
+    /// and submitted payload genuinely represent an unlimited account.
+    /// </returns>
+    /// <remarks>
+    /// This helper affects only the user-facing creation result. It does not change the expiry persisted by 3x-ui.
+    /// </remarks>
+    private static long ResolveCreatedClientExpiryTime(XuiV3Client panelClient, XuiV3ClientPayload submittedClient)
+    {
+        if (panelClient?.ExpiryTime != 0)
+            return panelClient.ExpiryTime;
+
+        var trafficExpiryTime = panelClient?.Traffic?.ExpiryTime ?? 0;
+        if (trafficExpiryTime != 0)
+            return trafficExpiryTime;
+
+        var extraExpiryTime = ReadClientExtraLong(panelClient, "expiryTime", "expiry_time", "expiry");
+        if (extraExpiryTime != 0)
+            return extraExpiryTime;
+
+        return submittedClient?.ExpiryTime ?? 0;
+    }
+
+    /// <summary>
+    /// Reads a long-valued field from the extension data returned by one XUI v3 client response.
+    /// </summary>
+    /// <param name="client">Panel client whose extension JSON should be inspected. Null clients return zero.</param>
+    /// <param name="keys">Candidate JSON property names in priority order.</param>
+    /// <returns>The first parseable non-zero value, or zero when no candidate property is available.</returns>
+    /// <remarks>
+    /// 3x-ui response compatibility varies by panel version, so expiry fields must not rely on one fixed JSON shape.
+    /// </remarks>
+    private static long ReadClientExtraLong(XuiV3Client client, params string[] keys)
+    {
+        if (client?.Extra == null || keys == null)
+            return 0;
+
+        foreach (var key in keys)
+        {
+            if (string.IsNullOrWhiteSpace(key) || !client.Extra.TryGetValue(key, out var token) || token == null)
+                continue;
+
+            if (token.Type == JTokenType.Integer && token.Value<long>() != 0)
+                return token.Value<long>();
+
+            if (long.TryParse(token.ToString(), out var parsed) && parsed != 0)
+                return parsed;
+        }
+
+        return 0;
     }
 
     /// <summary>
@@ -412,6 +485,10 @@ public class ApiServicev3
     /// <summary>
     /// Creates a user-facing failed creation result for a transient XUI v3 transport error.
     /// </summary>
+    /// <param name="configuration">
+    /// Application configuration used to write the complete masked diagnostic file entry for this final transient
+    /// failure. The value comes from the active runtime configuration passed into account creation.
+    /// </param>
     /// <param name="email">Generated account email that was being created.</param>
     /// <param name="exception">Transient transport exception observed while talking to the panel.</param>
     /// <returns>
@@ -420,11 +497,21 @@ public class ApiServicev3
     /// </returns>
     /// <remarks>
     /// Returning a normal result object prevents a network glitch from escaping to Telegram polling and stopping the
-    /// active receiver.
+    /// active receiver. The full transport exception is also written to the daily diagnostic file because this static
+    /// service does not receive an injected application logger.
     /// </remarks>
-    private static XuiV3AccountCreationResult BuildTransientCreationFailure(string email, Exception exception)
+    private static XuiV3AccountCreationResult BuildTransientCreationFailure(
+        IConfiguration configuration,
+        string email,
+        Exception exception)
     {
         Console.WriteLine($"[XUIv3] Account creation failed with transient panel transport error. email={email}, error={exception.Message}");
+        DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
+            configuration,
+            LogLevel.Error,
+            nameof(ApiServicev3),
+            $"XUI v3 account creation ended with a transient transport failure. email={email}",
+            exception);
         return new XuiV3AccountCreationResult
         {
             Success = false,
@@ -1305,8 +1392,8 @@ public class ApiServicev3
     /// <param name="cancellationToken">Cancellation token that stops retries when the Telegram update is cancelled.</param>
     /// <returns>The value returned by the first successful HTTP attempt.</returns>
     /// <remarks>
-    /// This method deliberately logs retry attempts to the process console instead of the Telegram logger channel. The
-    /// retry details are operational diagnostics and should not spam the private payment/audit channel.
+    /// Retry attempts stay out of the private Telegram logger channel, but are written with full exception details to
+    /// the daily diagnostic file so transient panel problems remain reviewable without channel noise.
     /// </remarks>
     private static async Task<T> SendWithRetryAsync<T>(
         IConfiguration configuration,
@@ -1335,6 +1422,12 @@ public class ApiServicev3
                 var delay = GetXuiRetryDelay(appConfig, attempt);
                 Console.WriteLine(
                     $"[XUIv3] transient API failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}, error={ex.Message}");
+                DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
+                    configuration,
+                    LogLevel.Warning,
+                    nameof(ApiServicev3),
+                    $"XUI v3 transient request failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}",
+                    ex);
                 await Task.Delay(delay, cancellationToken);
             }
         }

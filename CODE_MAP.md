@@ -46,6 +46,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 ## Payment and Ledger Rules
 
 - NOWPayments and HooshPay payment records live in `users.db` and can be linked to tenant orders.
+- HooshPay wallet charges may receive a two-stage, super-admin-only provisional credit while the provider remains
+  pending. The row keeps its provider status, writes one `hooshpay_provisional_admin` ledger credit, and stores the
+  approving admin/time. A later official `paid` IPN/manual check writes one reconciliation audit timestamp/log only;
+  it must never create a second wallet credit or ledger entry. Tenant orders and terminal HooshPay failures are never
+  eligible for provisional approval.
 - Super-admin manual NOWPayments checks are provider re-checks only: local code must not set `finished` or credit balances unless NOWPayments returns a paid status (`finished`, `confirmed`, or `sending`).
 - Tenant platform-gateway sales credit owner profit; tenant card-to-card fulfillment debits owner base cost and can allow negative owner balances if configured by business rules.
 - Tenant card-to-card base cost settlement tries the owner's bot wallet first, then the owner's Gozargah website wallet when connected and sufficient, then allows the bot wallet to go negative with an owner warning. This does not auto-disable the customer account in the current phase.
@@ -79,12 +84,20 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - XUI v3 request timeout is controlled by `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`; slow panels can otherwise time out during `/panel/api/clients/add`.
 - XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `429/502/503/504`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
 - XUI v3 account creation treats generated email as the idempotency key. If `addClient` or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
+- XUI v3 creation-result expiry display resolves top-level `ExpiryTime`, nested `Traffic.ExpiryTime`, and client `Extra`
+  before falling back to the submitted payload. This protects normal fixed-date accounts from being displayed as
+  unlimited when newer 3x-ui responses return a zero top-level expiry field.
+- Owned bot `💻 ارتباط با ادمین` reads only the active bot's `SupportAccount`; it must not leak the default brand's
+  support account when the active owned bot has no configured support contact.
 - Operational payment/account logs are delivered through the default owned bot to the central logger channel; include origin bot metadata in the message for non-default owned bots and tenant storefronts.
 - Telegram callbacks can be stale; callback answers must be best-effort and must not crash receivers.
 - Telegram blocked-user, deactivated-user, chat-not-found, and Telegram send-timeout errors are per-user/transient delivery failures; update and polling error handlers must log and swallow them without stack traces so one customer or one slow Telegram reply cannot stop or pollute logs for owned, tenant, or assistant bot receivers.
 - Telegram `409 getUpdates` conflict means another process/receiver is polling the same token. `MultiBotHostedService` stops only the affected receiver and logs a critical message; operators still need to remove the duplicate deployment, old service, screen/tmux process, or webhook/polling conflict that owns the token.
 - XUI/HTTP `TaskCanceledException`, `TimeoutException`, and `HttpClient.Timeout` during update handling are treated as external operation timeouts. The active bot logs `handle_update_external_timeout` and sends a best-effort retry notice instead of turning the panel delay into a Telegram polling failure.
 - `Domain/Logging/TelegramLogger.cs` truncates plain-text application logs before sending them to Telegram so large exception stacks do not trigger `message is too long` and create secondary logger noise.
+- `Domain/Logging/DailyErrorFileLoggerProvider.cs` writes warning/error/critical diagnostics with full exception chains
+  and active bot context to the configurable daily `Data/Logs/errors-{shamsiDate}.log` file. It masks common token,
+  authorization, cookie, API-key, and secret representations and is fail-soft if disk logging is unavailable.
 - In owned customer routing, XUI v3 free-trial messages must be handled before purchase text flow. The trial start clears any half-built purchase session so metered purchases cannot reach summary without `TrafficGb`.
 - Bot token duplication between owned and tenant bots must be rejected or disabled at runtime.
 - `MultiBotHostedService` does a bounded background recovery pass after startup for enabled bots that missed their first Telegram receiver start because of transient `GetMe`/command setup failures. Disabled, duplicate-token, and invalid-token bots are non-retryable; do not replace this with an all-or-nothing startup.

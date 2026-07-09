@@ -422,7 +422,10 @@ public class PaymentController : ControllerBase
             }
 
             // Tenant orders create accounts and credit owners; wallet charges only add user balance.
-            var settlement = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
+            var isTenantOrder = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase);
+            var provisionalReconciled = !isTenantOrder && await _hooshPaySettlementService
+                .RecordProviderConfirmationAfterProvisionalAsync(payment, "ipn", cancellationToken);
+            var settlement = isTenantOrder
                 ? await _tenantBotService.ApplyPaidTenantOrderAsync(
                     payment,
                     "ipn",
@@ -436,7 +439,9 @@ public class PaymentController : ControllerBase
                 requestId,
                 stage: "accepted-paid",
                 statusCode: StatusCodes.Status200OK,
-                result: "IPN accepted; paid payment settlement processed.",
+                result: provisionalReconciled
+                    ? "IPN accepted; provisional wallet credit officially confirmed without a second balance mutation."
+                    : "IPN accepted; paid payment settlement processed.",
                 ipn: ipn,
                 payment: payment,
                 settlement: settlement,

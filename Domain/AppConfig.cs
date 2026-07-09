@@ -24,6 +24,26 @@ namespace Adminbot.Domain
         public string UserActivityLogLevel { get; set; } = "Information";
         public string UserActivityLogFilePath { get; set; } = "./Data/Logs/user-activity-{shamsiDate}.jsonl";
         public int UserActivityLogMaxExceptionDepth { get; set; } = 1;
+        /// <summary>
+        /// Enables the append-only daily diagnostic file that captures warning, error, and critical application logs.
+        /// </summary>
+        /// <remarks>
+        /// This file is independent from the compact user-activity JSONL audit trail. It is intended for operational
+        /// troubleshooting and never contains bot tokens, API keys, cookies, or webhook secrets.
+        /// </remarks>
+        public bool ErrorFileLogEnabled { get; set; } = true;
+        /// <summary>
+        /// Minimum Microsoft.Extensions.Logging level written to the daily diagnostic file.
+        /// </summary>
+        /// <remarks>
+        /// The default <c>Warning</c> records operational problems without copying normal information-level traffic.
+        /// Accepted values use the standard <see cref="Microsoft.Extensions.Logging.LogLevel"/> names.
+        /// </remarks>
+        public string ErrorFileLogMinimumLevel { get; set; } = "Warning";
+        /// <summary>
+        /// UTF-8 append-only diagnostic file path. The <c>{shamsiDate}</c> placeholder is expanded using Tehran time.
+        /// </summary>
+        public string ErrorFileLogFilePath { get; set; } = "./Data/Logs/errors-{shamsiDate}.log";
         public string UserDatabasePath { get; set; } = "./Data/users.db";
         public string CredentialsDatabasePath { get; set; } = "./Data/credentials.db";
         public int BroadcastDelayMs { get; set; } = 250;

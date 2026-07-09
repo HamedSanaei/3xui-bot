@@ -16,6 +16,7 @@ using System;
 using System.Text;
 
 using Adminbot.Domain.Logging;
+using Newtonsoft.Json.Linq;
 
 /// <summary>
 /// Shared Telegram update dispatcher for owned brand bots and tenant storefront bots.
@@ -61,9 +62,17 @@ public class TelegramBotService : IHostedService
     private IEnumerable<string> CurrentChannelIds => CurrentBot != null
         ? CurrentBot.ChannelIds ?? Enumerable.Empty<string>()
         : _appConfig.ChannelIds ?? Enumerable.Empty<string>();
-    private string CurrentSupportAccount => string.IsNullOrWhiteSpace(CurrentBot?.SupportAccount)
-        ? _appConfig.SupportAccount
-        : CurrentBot.SupportAccount;
+    /// <summary>
+    /// Gets the support contact configured for the currently handling owned bot.
+    /// </summary>
+    /// <remarks>
+    /// A resolved runtime bot owns its own support setting. An empty value must remain empty instead of silently
+    /// falling back to the default brand, because showing another brand's support account is customer-facingly wrong.
+    /// The legacy application setting is used only when no multi-bot runtime context exists.
+    /// </remarks>
+    private string CurrentSupportAccount => CurrentBot != null
+        ? CurrentBot.SupportAccount
+        : _appConfig.SupportAccount;
     private string[] CurrentIosTutorial => CurrentBot?.IosTutorial ?? _appConfig.IosTutorial;
     private string[] CurrentAndroidTutorial => CurrentBot?.AndroidTutorial ?? _appConfig.AndroidTutorial;
     private string[] CurrentWindowsTutorial => CurrentBot?.WindowsTutorial ?? _appConfig.WindowsTutorial;
@@ -367,6 +376,15 @@ public class TelegramBotService : IHostedService
             if (_tenantBotService.IsOwnerCallback(callbackQuery.Data))
             {
                 await _tenantBotService.TryHandleOwnerCallbackAsync(botClient, callbackQuery, callbackCredUser, callbackUserState, cancellationToken);
+                return;
+            }
+
+            if (callbackIsSuperAdmin && await _xuiV3AdminFlowService.TryHandleCallbackAsync(
+                botClient,
+                callbackQuery,
+                GetMainMenuKeyboard(),
+                cancellationToken))
+            {
                 return;
             }
 
@@ -2558,7 +2576,9 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-        if (payment.IsAddedToBalance)
+        var needsProvisionalProviderReconciliation = payment.IsProvisionallyApproved &&
+                                                   !payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue;
+        if (payment.IsAddedToBalance && !needsProvisionalProviderReconciliation)
         {
             Console.WriteLine($"[HooshPay ManualCheck] already added. orderId={payment.OrderId}, invoiceUid={payment.InvoiceUid}, user={payment.TelegramUserId}");
             await ActiveBotClient.CustomSendTextMessageAsync(
@@ -2624,7 +2644,14 @@ public class TelegramBotService : IHostedService
         if (verify?.paid == true || HooshPayStatuses.IsPaid(payment.PaymentStatus))
         {
             payment.PaymentStatus = HooshPayStatuses.Paid;
-            var settlement = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
+            var isTenantOrder = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase);
+            if (!isTenantOrder)
+                await _hooshPaySettlementService.RecordProviderConfirmationAfterProvisionalAsync(
+                    payment,
+                    "manual-check",
+                    cancellationToken);
+
+            var settlement = isTenantOrder
                 ? await _tenantBotService.ApplyPaidTenantOrderAsync(
                     payment,
                     "manual-check",
@@ -2649,8 +2676,11 @@ public class TelegramBotService : IHostedService
         }
         else
         {
-            var text = $"وضعیت فعلی پرداخت: <code>{Html(payment.PaymentStatus ?? "unknown")}</code>\n" +
-                       "بعد از تایید پرداخت، موجودی شما از طریق IPN یا بررسی دستی شارژ می‌شود.";
+            var text = needsProvisionalProviderReconciliation
+                ? $"اعتبار این پرداخت قبلاً به صورت موقت شارژ شده است. وضعیت فعلی HooshPay: <code>{Html(payment.PaymentStatus ?? "unknown")}</code>\n" +
+                  "پس از تایید رسمی درگاه، فقط ثبت reconciliation و لاگ انجام می‌شود."
+                : $"وضعیت فعلی پرداخت: <code>{Html(payment.PaymentStatus ?? "unknown")}</code>\n" +
+                  "بعد از تایید پرداخت، موجودی شما از طریق IPN یا بررسی دستی شارژ می‌شود.";
 
             if (HooshPayStatuses.IsFinalFailure(payment.PaymentStatus))
                 text = $"این پرداخت با وضعیت <code>{Html(payment.PaymentStatus)}</code> بسته شده و قابل شارژ نیست.";
@@ -4091,12 +4121,14 @@ public class TelegramBotService : IHostedService
         }
         else if (message.Text == "💻 ارتباط با ادمین")
         {
-
-            var text = "✅ برای ارتباط با پشتیبانی از لینک زیر اقدام کنید." + "\n" + @"🆔 @vpnetiran\_admin";
+            var support = BuildOwnedBotSupportContactHtml(CurrentSupportAccount);
+            var text = string.IsNullOrWhiteSpace(support)
+                ? "پشتیبانی این ربات هنوز تنظیم نشده است. لطفاً بعداً دوباره تلاش کنید."
+                : "✅ برای ارتباط با پشتیبانی از لینک زیر اقدام کنید.\n🆔 " + support;
 
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: text, parseMode: ParseMode.Markdown,
+                text: text, parseMode: ParseMode.Html,
                 replyMarkup: MainReplyMarkupKeyboardFa());
 
             // Save the user's context
@@ -4217,6 +4249,7 @@ public class TelegramBotService : IHostedService
         {
             return;
         }
+
         else if (await _xuiV3BotFlowService.TryHandlePurchaseTextAsync(
             botClient,
             message,
@@ -6646,6 +6679,16 @@ public class TelegramBotService : IHostedService
             Console.WriteLine("[HooshPay] API exception while creating invoice:");
             Console.WriteLine(ex.ToString());
 
+            _logger.LogWarning(
+                ex,
+                "HooshPay invoice creation was rejected. botId={BotId}, userId={UserId}, chatId={ChatId}, orderId={OrderId}, amountToman={AmountToman}, statusCode={StatusCode}",
+                BotContextAccessor.CurrentBotId,
+                credUser.TelegramUserId,
+                message.Chat.Id,
+                payment.OrderId,
+                amount,
+                ex.StatusCode);
+
             payment.ErrorCode = ex.StatusCode.ToString(CultureInfo.InvariantCulture);
             payment.ErrorMessage = ex.Message;
             payment.RawResponseJson = ex.ResponseBody;
@@ -6654,7 +6697,8 @@ public class TelegramBotService : IHostedService
 
             await ActiveBotClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "HooshPay درخواست را رد کرده است. جزئیات خطا در ترمینال ثبت شد.",
+                text: BuildHooshPayInvoiceCreationFailureText(ex),
+                parseMode: ParseMode.Html,
                 replyMarkup: MainReplyMarkupKeyboardFa(),
                 cancellationToken: cancellationToken);
         }
@@ -6662,6 +6706,15 @@ public class TelegramBotService : IHostedService
         {
             Console.WriteLine("[HooshPay] Unexpected exception while creating invoice:");
             Console.WriteLine(ex.ToString());
+
+            _logger.LogError(
+                ex,
+                "HooshPay invoice creation failed unexpectedly. botId={BotId}, userId={UserId}, chatId={ChatId}, orderId={OrderId}, amountToman={AmountToman}",
+                BotContextAccessor.CurrentBotId,
+                credUser.TelegramUserId,
+                message.Chat.Id,
+                payment.OrderId,
+                amount);
 
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
@@ -6673,6 +6726,94 @@ public class TelegramBotService : IHostedService
                 replyMarkup: MainReplyMarkupKeyboardFa(),
                 cancellationToken: cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Builds the customer-safe error message for a rejected HooshPay invoice request.
+    /// </summary>
+    /// <param name="exception">
+    /// HooshPay API exception containing the HTTP status and provider response body. The raw body is parsed only for
+    /// a user-safe provider message and is never inserted into Telegram unescaped.
+    /// </param>
+    /// <returns>
+    /// Persian HTML-safe plain-text message that explains the provider rejection. Amount-limit responses also tell the
+    /// customer to split the charge into multiple payments or use the crypto gateway.
+    /// </returns>
+    /// <remarks>
+    /// Provider response text can be malformed, HTML-like, or unexpectedly long. This method truncates and escapes
+    /// it before Telegram delivery while the complete raw payload remains stored on the local payment row and daily
+    /// diagnostic file for administrators.
+    /// </remarks>
+    private static string BuildHooshPayInvoiceCreationFailureText(HooshPayApiException exception)
+    {
+        var providerMessage = ExtractHooshPayProviderMessage(exception?.ResponseBody);
+        var safeDetails = string.IsNullOrWhiteSpace(providerMessage)
+            ? string.Empty
+            : $"\nجزئیات درگاه: <code>{Html(providerMessage)}</code>";
+
+        if (IsHooshPayAmountLimitFailure(exception, providerMessage))
+        {
+            return "درگاه ریالی HooshPay این مبلغ را برای یک تراکنش نپذیرفت." +
+                   safeDetails +
+                   "\n\nلطفاً مبلغ را در چند تراکنش کوچک‌تر پرداخت کنید یا از درگاه ارز دیجیتال استفاده کنید.";
+        }
+
+        return "HooshPay درخواست پرداخت را رد کرد." + safeDetails +
+               "\nلطفاً مبلغ یا اطلاعات پرداخت را بررسی کنید؛ در صورت تکرار، از درگاه ارز دیجیتال استفاده کنید.";
+    }
+
+    /// <summary>
+    /// Extracts a compact provider message from a HooshPay JSON or plain-text error response.
+    /// </summary>
+    /// <param name="responseBody">Raw error response body returned by HooshPay; it may be JSON, plain text, or empty.</param>
+    /// <returns>At most 300 characters of provider detail suitable for escaped Telegram display, or an empty string.</returns>
+    /// <remarks>
+    /// The response body is intentionally not trusted as HTML and must be escaped by the caller before display.
+    /// </remarks>
+    private static string ExtractHooshPayProviderMessage(string responseBody)
+    {
+        if (string.IsNullOrWhiteSpace(responseBody))
+            return string.Empty;
+
+        try
+        {
+            var token = JToken.Parse(responseBody);
+            var message = token["message"]?.ToString()
+                          ?? token["error"]?.ToString()
+                          ?? token["errors"]?.ToString(Formatting.None);
+            if (!string.IsNullOrWhiteSpace(message))
+                return message.Length <= 300 ? message : message[..300] + "...";
+        }
+        catch (JsonException)
+        {
+            // A non-JSON gateway response is still useful after a conservative length limit is applied below.
+        }
+
+        var compact = responseBody.Trim();
+        return compact.Length <= 300 ? compact : compact[..300] + "...";
+    }
+
+    /// <summary>
+    /// Detects whether a rejected HooshPay request is likely caused by the provider's per-transaction amount limit.
+    /// </summary>
+    /// <param name="exception">HTTP-level HooshPay exception, when available.</param>
+    /// <param name="providerMessage">Compact provider message parsed from the response body.</param>
+    /// <returns><c>true</c> when the rejection indicates an amount, maximum, limit, or ceiling constraint.</returns>
+    /// <remarks>
+    /// HooshPay has returned validation responses with different wording over time, so the check combines validation
+    /// status codes with conservative Persian and English message markers rather than relying on one exact string.
+    /// </remarks>
+    private static bool IsHooshPayAmountLimitFailure(HooshPayApiException exception, string providerMessage)
+    {
+        var text = string.Join(" ", exception?.ResponseBody ?? string.Empty, providerMessage ?? string.Empty);
+        return exception?.StatusCode is 400 or 409 or 422 &&
+               (text.Contains("amount", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("maximum", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("max", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("limit", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("سقف", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("مبلغ", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("حداکثر", StringComparison.OrdinalIgnoreCase));
     }
 
 
@@ -6952,18 +7093,83 @@ public class TelegramBotService : IHostedService
         return keyboard;
     }
 
+    /// <summary>
+    /// Builds one clickable, HTML-safe support reference for an owned bot customer message.
+    /// </summary>
+    /// <param name="supportAccount">
+    /// Support value from the current owned bot configuration. A public Telegram username may be supplied as
+    /// <c>username</c>, <c>@username</c>, <c>t.me/username</c>, or <c>https://t.me/username</c>.
+    /// </param>
+    /// <returns>
+    /// A clickable HTML anchor whose visible text is <c>@username</c>, or an empty string when no valid public
+    /// Telegram support username has been configured for the active bot.
+    /// </returns>
+    /// <remarks>
+    /// This helper is intentionally owned-bot scoped. Tenant storefront support formatting remains in
+    /// <see cref="TenantBotService"/> because tenant owners manage a separate support setting.
+    /// </remarks>
+    private static string BuildOwnedBotSupportContactHtml(string supportAccount)
+    {
+        if (string.IsNullOrWhiteSpace(supportAccount))
+            return string.Empty;
+
+        var normalized = supportAccount.Trim();
+        if (normalized.StartsWith("@http://", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("@https://", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("@t.me/", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("@telegram.me/", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized[1..];
+        }
+
+        if (normalized.StartsWith("t.me/", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("telegram.me/", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = "https://" + normalized;
+        }
+
+        if (Uri.TryCreate(normalized, UriKind.Absolute, out var uri) &&
+            (string.Equals(uri.Host, "t.me", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(uri.Host, "telegram.me", StringComparison.OrdinalIgnoreCase)))
+        {
+            normalized = uri.AbsolutePath.Trim('/');
+        }
+
+        normalized = normalized.Trim().TrimStart('@');
+        if (string.IsNullOrWhiteSpace(normalized) ||
+            normalized.Any(character => !(char.IsLetterOrDigit(character) || character == '_')))
+        {
+            return string.Empty;
+        }
+
+        var safeUsername = Html(normalized);
+        return $"<a href=\"https://t.me/{safeUsername}\">@{safeUsername}</a>";
+    }
+
+    /// <summary>
+    /// Sends the current owned bot's blocked-user notice with its own configured support contact.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the bot that blocked the user.</param>
+    /// <param name="chatId">Telegram chat id that should receive the notice.</param>
+    /// <param name="cancellationToken">Cancellation token for the Telegram send operation.</param>
+    /// <returns>A task that completes after Telegram accepts the notice or throws a delivery exception.</returns>
+    /// <remarks>
+    /// Support identity must stay brand-scoped here as well; an empty support setting is reported instead of leaking
+    /// the default bot's contact to users of another owned brand.
+    /// </remarks>
     private async Task SendBlockedUserMessageAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
         CancellationToken cancellationToken)
     {
-        var support = string.IsNullOrWhiteSpace(CurrentSupportAccount)
-            ? "@v2raysshvpn_admin"
-            : CurrentSupportAccount.Trim();
+        var support = BuildOwnedBotSupportContactHtml(CurrentSupportAccount);
+        var supportText = string.IsNullOrWhiteSpace(support)
+            ? "پشتیبانی این ربات تنظیم نشده است."
+            : support;
 
         await botClient.SendTextMessageAsync(
             chatId: chatId,
-            text: $"به علت تخلف مسدود شدید و امکان استفاده از ربات را ندارید.\nبرای پیگیری می‌توانید به پشتیبانی تلگرام پیام بدهید:\n<code>{System.Net.WebUtility.HtmlEncode(support)}</code>",
+            text: $"به علت تخلف مسدود شدید و امکان استفاده از ربات را ندارید.\nبرای پیگیری می‌توانید به پشتیبانی تلگرام پیام بدهید:\n{supportText}",
             parseMode: ParseMode.Html,
             cancellationToken: cancellationToken);
     }

@@ -52,6 +52,31 @@ namespace Adminbot.Domain
         public long? BalanceAfter { get; set; }
         public string ErrorCode { get; set; }
         public string ErrorMessage { get; set; }
+        /// <summary>
+        /// Indicates that a super-admin provisionally credited this wallet charge before HooshPay reported <c>paid</c>.
+        /// </summary>
+        /// <remarks>
+        /// This sticky audit flag is separate from <see cref="IsAddedToBalance"/>. The latter prevents duplicate wallet
+        /// credits; this flag lets a later official gateway callback be logged as reconciliation rather than another
+        /// successful payment settlement.
+        /// </remarks>
+        public bool IsProvisionallyApproved { get; set; }
+        /// <summary>
+        /// UTC timestamp when a super-admin provisionally credited this wallet charge.
+        /// </summary>
+        public DateTime? ProvisionalApprovedAtUtc { get; set; }
+        /// <summary>
+        /// Numeric Telegram user id of the super-admin who performed the provisional wallet credit.
+        /// </summary>
+        public long? ProvisionalApprovedByTelegramUserId { get; set; }
+        /// <summary>
+        /// UTC timestamp when HooshPay later confirmed a provisionally credited payment as officially paid.
+        /// </summary>
+        /// <remarks>
+        /// A non-null value means the reconciliation audit log was already emitted. Repeated IPNs and manual checks
+        /// must preserve this value and must not create another wallet ledger credit or another confirmation log.
+        /// </remarks>
+        public DateTime? ProviderConfirmedAfterProvisionalAtUtc { get; set; }
         public string BotId { get; set; } = BotContextAccessor.DefaultBotId;
         public string BotUsername { get; set; } = BotContextAccessor.DefaultBotId;
         // Distinguishes wallet top-ups from tenant storefront orders during IPN settlement.
@@ -338,6 +363,14 @@ namespace Adminbot.Domain
     /// </remarks>
     public class HooshPaySettlementService
     {
+        /// <summary>
+        /// Serializes local HooshPay wallet settlement because the runtime currently uses shared singleton contexts.
+        /// </summary>
+        /// <remarks>
+        /// The gate covers official and provisional wallet credits so an IPN and a super-admin confirmation cannot
+        /// observe the same unpaid row and create duplicate balance or ledger mutations.
+        /// </remarks>
+        private static readonly SemaphoreSlim WalletSettlementGate = new(1, 1);
         private readonly UserDbContext _userDbContext;
         private readonly CredentialsDbContext _credentialsDbContext;
         private readonly BotClientProvider _botClientProvider;
@@ -381,6 +414,11 @@ namespace Adminbot.Domain
         /// <param name="notifyChatId">Optional chat id override for the user notification.</param>
         /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
         /// <returns>Settlement result describing applied, duplicate, or missing-user state.</returns>
+        /// <remarks>
+        /// Official and provisional wallet settlement share one process-wide gate so concurrent IPN and super-admin
+        /// work cannot credit the same invoice twice. When a prior provisional credit exists, this method returns
+        /// <c>AlreadyAdded</c>; official reconciliation is recorded separately before this method is called.
+        /// </remarks>
         public async Task<NowPaymentsSettlementResult> ApplyFinishedPaymentAsync(
             HooshPayPaymentInfo payment,
             string source,
@@ -390,48 +428,201 @@ namespace Adminbot.Domain
             if (payment == null)
                 return NowPaymentsSettlementResult.NotFound();
 
-            var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
-            if (credUser == null)
-                return NowPaymentsSettlementResult.UserNotFound();
-
-            if (payment.IsAddedToBalance)
-                return NowPaymentsSettlementResult.AlreadyAdded(credUser.AccountBalance);
-
-            var beforeBalance = credUser.AccountBalance;
-            var added = await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.AmountToman);
-            if (!added)
-                return NowPaymentsSettlementResult.UserNotFound();
-
-            payment.IsAddedToBalance = true;
-            payment.BalanceBefore = beforeBalance;
-            payment.BalanceAfter = await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
-            payment.SettledAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
-
-            var afterBalance = payment.BalanceAfter ?? await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
-            await _walletLedgerService.RecordAsync(
-                payment.TelegramUserId,
-                WalletLedgerDirections.Credit,
-                payment.AmountToman,
-                beforeBalance,
-                afterBalance,
-                WalletLedgerReasons.WalletCharge,
-                provider: "hooshpay",
-                referenceType: nameof(HooshPayPaymentInfo),
-                referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
-                orderId: payment.OrderId,
-                description: "HooshPay wallet charge",
-                botId: payment.BotId,
-                botUsername: payment.BotUsername,
-                botType: BotInstanceTypes.Owned,
-                cancellationToken: cancellationToken);
-            using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+            await WalletSettlementGate.WaitAsync(cancellationToken);
+            try
             {
-                await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
-                LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+                var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
+                if (credUser == null)
+                    return NowPaymentsSettlementResult.UserNotFound();
+
+                if (payment.IsAddedToBalance)
+                    return NowPaymentsSettlementResult.AlreadyAdded(credUser.AccountBalance);
+
+                var beforeBalance = credUser.AccountBalance;
+                var added = await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.AmountToman);
+                if (!added)
+                    return NowPaymentsSettlementResult.UserNotFound();
+
+                payment.IsAddedToBalance = true;
+                payment.BalanceBefore = beforeBalance;
+                payment.BalanceAfter = await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
+                payment.SettledAtUtc = DateTime.UtcNow;
+                await _userDbContext.SaveChangesAsync(cancellationToken);
+
+                var afterBalance = payment.BalanceAfter ?? await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
+                await _walletLedgerService.RecordAsync(
+                    payment.TelegramUserId,
+                    WalletLedgerDirections.Credit,
+                    payment.AmountToman,
+                    beforeBalance,
+                    afterBalance,
+                    WalletLedgerReasons.WalletCharge,
+                    provider: "hooshpay",
+                    referenceType: nameof(HooshPayPaymentInfo),
+                    referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
+                    orderId: payment.OrderId,
+                    description: "HooshPay wallet charge",
+                    botId: payment.BotId,
+                    botUsername: payment.BotUsername,
+                    botType: BotInstanceTypes.Owned,
+                    cancellationToken: cancellationToken);
+                using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+                {
+                    await NotifyUserAsync(credUser, payment, notifyChatId, isProvisional: false, cancellationToken);
+                    LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+                }
+
+                return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
+            }
+            finally
+            {
+                WalletSettlementGate.Release();
+            }
+        }
+
+        /// <summary>
+        /// Provisionally credits one pending HooshPay wallet charge after an explicit two-step super-admin decision.
+        /// </summary>
+        /// <param name="payment">
+        /// Local HooshPay wallet-charge row selected by the super-admin. Tenant storefront orders and terminal provider
+        /// failures are rejected by the caller and rechecked here through the payment-purpose guard.
+        /// </param>
+        /// <param name="approvedByTelegramUserId">
+        /// Numeric Telegram user id of the super-admin making the financial exception. This id is persisted for audit
+        /// and must come from the authenticated Telegram update sender.
+        /// </param>
+        /// <param name="notifyChatId">Optional user chat id override used for the provisional-credit notification.</param>
+        /// <param name="cancellationToken">Cancellation token for users.db, credentials.db, ledger, and Telegram work.</param>
+        /// <returns>
+        /// Applied when one provisional credit and ledger entry were persisted, AlreadyAdded when a prior official or
+        /// provisional settlement already credited the row, or another result when the payment/user is invalid.
+        /// </returns>
+        /// <remarks>
+        /// This is intentionally restricted to wallet charges. It does not create tenant accounts and it does not
+        /// overwrite the provider's pending status. A later official HooshPay paid callback is reconciled by
+        /// <see cref="RecordProviderConfirmationAfterProvisionalAsync"/> without another balance mutation.
+        /// </remarks>
+        public async Task<NowPaymentsSettlementResult> ApplyProvisionalWalletPaymentAsync(
+            HooshPayPaymentInfo payment,
+            long approvedByTelegramUserId,
+            long? notifyChatId = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (payment == null)
+                return NowPaymentsSettlementResult.NotFound();
+
+            if (!IsWalletChargePayment(payment))
+                return NowPaymentsSettlementResult.InvalidAmount();
+
+            await WalletSettlementGate.WaitAsync(cancellationToken);
+            try
+            {
+                var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
+                if (credUser == null)
+                    return NowPaymentsSettlementResult.UserNotFound();
+
+                if (payment.IsAddedToBalance)
+                    return NowPaymentsSettlementResult.AlreadyAdded(credUser.AccountBalance);
+
+                var beforeBalance = credUser.AccountBalance;
+                var added = await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.AmountToman);
+                if (!added)
+                    return NowPaymentsSettlementResult.UserNotFound();
+
+                // Keep provider status intact: this flag records a financial exception, not a fake HooshPay confirmation.
+                payment.IsAddedToBalance = true;
+                payment.IsProvisionallyApproved = true;
+                payment.ProvisionalApprovedAtUtc = DateTime.UtcNow;
+                payment.ProvisionalApprovedByTelegramUserId = approvedByTelegramUserId;
+                payment.BalanceBefore = beforeBalance;
+                payment.BalanceAfter = await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
+                payment.SettledAtUtc = DateTime.UtcNow;
+                await _userDbContext.SaveChangesAsync(cancellationToken);
+
+                var afterBalance = payment.BalanceAfter ?? await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
+                await _walletLedgerService.RecordAsync(
+                    payment.TelegramUserId,
+                    WalletLedgerDirections.Credit,
+                    payment.AmountToman,
+                    beforeBalance,
+                    afterBalance,
+                    WalletLedgerReasons.WalletCharge,
+                    provider: "hooshpay_provisional_admin",
+                    referenceType: nameof(HooshPayPaymentInfo),
+                    referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
+                    orderId: payment.OrderId,
+                    description: $"HooshPay provisional wallet charge approved by {approvedByTelegramUserId}",
+                    botId: payment.BotId,
+                    botUsername: payment.BotUsername,
+                    botType: BotInstanceTypes.Owned,
+                    cancellationToken: cancellationToken);
+                using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+                {
+                    await NotifyUserAsync(credUser, payment, notifyChatId, isProvisional: true, cancellationToken);
+                    LogPayment(payment, credUser, beforeBalance, afterBalance, "admin-provisional");
+                }
+
+                return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
+            }
+            finally
+            {
+                WalletSettlementGate.Release();
+            }
+        }
+
+        /// <summary>
+        /// Records the one-time official HooshPay confirmation that arrives after a provisional wallet credit.
+        /// </summary>
+        /// <param name="payment">
+        /// HooshPay payment row whose provider status has already been refreshed to <c>paid</c> by IPN or a verified
+        /// invoice lookup.
+        /// </param>
+        /// <param name="source">Provider confirmation source, such as <c>ipn</c>, <c>admin-check</c>, or <c>manual-check</c>.</param>
+        /// <param name="cancellationToken">Cancellation token for users.db and logger work.</param>
+        /// <returns>
+        /// <c>true</c> when the official reconciliation timestamp and audit log were written; <c>false</c> when the
+        /// row was not provisional, was not yet provider-paid, or had already been reconciled.
+        /// </returns>
+        /// <remarks>
+        /// No wallet or ledger mutation occurs here. The method exists solely to prove that a super-admin's temporary
+        /// financial exception was later confirmed by HooshPay.
+        /// </remarks>
+        public async Task<bool> RecordProviderConfirmationAfterProvisionalAsync(
+            HooshPayPaymentInfo payment,
+            string source,
+            CancellationToken cancellationToken = default)
+        {
+            if (payment == null ||
+                !payment.IsProvisionallyApproved ||
+                !payment.IsAddedToBalance ||
+                !HooshPayStatuses.IsPaid(payment.PaymentStatus) ||
+                payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue)
+            {
+                return false;
             }
 
-            return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
+            await WalletSettlementGate.WaitAsync(cancellationToken);
+            try
+            {
+                if (payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue)
+                    return false;
+
+                payment.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
+                payment.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbContext.SaveChangesAsync(cancellationToken);
+
+                var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
+                using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+                {
+                    LogProviderConfirmationAfterProvisional(payment, credUser, source);
+                }
+
+                return true;
+            }
+            finally
+            {
+                WalletSettlementGate.Release();
+            }
         }
 
         /// <summary>
@@ -440,11 +631,18 @@ namespace Adminbot.Domain
         /// <param name="credUser">Wallet user who received credit.</param>
         /// <param name="payment">Settled payment row.</param>
         /// <param name="notifyChatId">Optional chat id override.</param>
+        /// <param name="isProvisional">Whether the user should be told this credit was approved before provider confirmation.</param>
         /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
+        /// <returns>A task that completes after the best-effort customer notification attempt finishes.</returns>
+        /// <remarks>
+        /// A Telegram delivery failure is isolated from already persisted wallet and ledger changes; the caller must
+        /// treat the payment row and ledger as the financial source of truth.
+        /// </remarks>
         private async Task NotifyUserAsync(
             CredUser credUser,
             HooshPayPaymentInfo payment,
             long? notifyChatId,
+            bool isProvisional,
             CancellationToken cancellationToken)
         {
             var chatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
@@ -453,8 +651,11 @@ namespace Adminbot.Domain
 
             var botClient = _botClientProvider.GetClient(payment.BotId);
 
-            var text = $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
-                       "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.";
+            var text = isProvisional
+                ? $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر تایید و افزایش یافت.\n" +
+                  "پس از تایید نهایی HooshPay، وضعیت درگاه نیز ثبت می‌شود."
+                : $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
+                  "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.";
 
             try
             {
@@ -504,6 +705,57 @@ namespace Adminbot.Domain
                              $"🕒 زمان ثبت: <code>{Html(DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi())}</code>";
 
             _logger.LogPayment(logMessage);
+        }
+
+        /// <summary>
+        /// Sends the central audit log when HooshPay officially confirms a previously provisional wallet credit.
+        /// </summary>
+        /// <param name="payment">Provisionally credited payment that has now received the provider-paid status.</param>
+        /// <param name="credUser">Wallet owner shown in the audit message, when still present in credentials.db.</param>
+        /// <param name="source">IPN or manual-check source that observed the official provider confirmation.</param>
+        /// <remarks>
+        /// The log deliberately states that no second balance credit was applied. This makes reconciliation visible to
+        /// administrators without misleading them into thinking the same invoice was settled twice.
+        /// </remarks>
+        private void LogProviderConfirmationAfterProvisional(
+            HooshPayPaymentInfo payment,
+            CredUser credUser,
+            string source)
+        {
+            var userSummary = TelegramUserLinkFormatter.HtmlSummary(credUser);
+            if (string.IsNullOrWhiteSpace(userSummary))
+                userSummary = $"👤 کاربر: <code>{Html(payment.TelegramUserId.ToString())}</code>";
+
+            var message = "ℹ️ HooshPay پرداخت موقت را بعداً تایید کرد\n\n" +
+                          userSummary + "\n\n" +
+                          $"🧾 Order ID: <code>{Html(payment.OrderId)}</code>\n" +
+                          $"🧾 Invoice UID: <code>{Html(payment.InvoiceUid)}</code>\n" +
+                          $"💰 مبلغ شارژ: <code>{Html(payment.AmountToman.FormatCurrency())}</code>\n" +
+                          $"📌 وضعیت رسمی درگاه: <code>{Html(payment.PaymentStatus)}</code>\n" +
+                          $"👨‍💼 تایید موقت توسط: <code>{payment.ProvisionalApprovedByTelegramUserId}</code>\n" +
+                          $"📡 منبع تایید رسمی: <code>{Html(source)}</code>\n" +
+                          "🔒 کیف پول و ledger دوباره شارژ نشدند.";
+
+            _logger.LogPayment(message);
+        }
+
+        /// <summary>
+        /// Determines whether a HooshPay row is a bot wallet charge rather than a tenant storefront order.
+        /// </summary>
+        /// <param name="payment">Local HooshPay payment row to classify.</param>
+        /// <returns>
+        /// <c>true</c> for current wallet-charge rows and legacy rows without a purpose value; otherwise <c>false</c>.
+        /// </returns>
+        /// <remarks>
+        /// Legacy pre-tenant rows have a null purpose and must remain compatible with normal wallet settlement.
+        /// </remarks>
+        private static bool IsWalletChargePayment(HooshPayPaymentInfo payment)
+        {
+            return string.IsNullOrWhiteSpace(payment?.PaymentPurpose) ||
+                   string.Equals(
+                       payment.PaymentPurpose,
+                       TenantBotPaymentPurposes.WalletCharge,
+                       StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>

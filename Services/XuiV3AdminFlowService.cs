@@ -43,6 +43,9 @@ public class XuiV3AdminFlowService
     private const string StepSendPrivateTarget = "send-private-target";
     private const string StepSendPrivateMessage = "send-private-message";
     private const string StepSendPrivateConfirm = "send-private-confirm";
+    private const string HooshPayProvisionalStartCallbackPrefix = "x3admin:hp:provisional:";
+    private const string HooshPayProvisionalConfirmCallbackPrefix = "x3admin:hp:provisional-confirm:";
+    private const string HooshPayProvisionalCancelCallbackPrefix = "x3admin:hp:provisional-cancel:";
     private const int MaxDetailedAccountInfoMessages = 5;
     private const int MaxTelegramTextLength = 3900;
     private const string SkipCommentText = "ادامه بدون کامنت";
@@ -1043,6 +1046,109 @@ public class XuiV3AdminFlowService
 
     }
 
+    /// <summary>
+    /// Handles the two-stage super-admin callback flow for provisionally crediting a pending HooshPay wallet charge.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned bot through which the super-admin is working.</param>
+    /// <param name="callbackQuery">Callback issued from the admin-only HooshPay provisional approval message.</param>
+    /// <param name="mainMenu">Super-admin reply keyboard used after a financial decision completes.</param>
+    /// <param name="cancellationToken">Cancellation token for HooshPay verification, users.db, wallet, ledger, and Telegram work.</param>
+    /// <returns>
+    /// <c>true</c> when the callback belonged to the provisional HooshPay flow and was consumed; otherwise <c>false</c>
+    /// so other callback handlers may process it.
+    /// </returns>
+    /// <remarks>
+    /// Only configured super-admin Telegram ids may reach this method. The callback carries only the internal payment
+    /// row id; it never contains an invoice secret, provider key, or raw order payload. The confirm stage refreshes
+    /// HooshPay once more before it makes a provisional financial exception.
+    /// </remarks>
+    public async Task<bool> TryHandleCallbackAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        IReplyMarkup mainMenu,
+        CancellationToken cancellationToken)
+    {
+        var data = callbackQuery?.Data ?? string.Empty;
+        if (!data.StartsWith(HooshPayProvisionalStartCallbackPrefix, StringComparison.Ordinal) &&
+            !data.StartsWith(HooshPayProvisionalConfirmCallbackPrefix, StringComparison.Ordinal) &&
+            !data.StartsWith(HooshPayProvisionalCancelCallbackPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!IsConfiguredSuperAdmin(callbackQuery.From?.Id ?? 0))
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "اجازه انجام این عملیات را ندارید.", true, cancellationToken);
+            return true;
+        }
+
+        var prefix = data.StartsWith(HooshPayProvisionalConfirmCallbackPrefix, StringComparison.Ordinal)
+            ? HooshPayProvisionalConfirmCallbackPrefix
+            : data.StartsWith(HooshPayProvisionalCancelCallbackPrefix, StringComparison.Ordinal)
+                ? HooshPayProvisionalCancelCallbackPrefix
+                : HooshPayProvisionalStartCallbackPrefix;
+        if (!int.TryParse(data[prefix.Length..], out var paymentId) || paymentId <= 0)
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "شناسه پرداخت معتبر نیست.", true, cancellationToken);
+            return true;
+        }
+
+        var payment = await _userDbContext.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+        if (payment == null)
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت مورد نظر پیدا نشد.", true, cancellationToken);
+            return true;
+        }
+
+        if (prefix == HooshPayProvisionalCancelCallbackPrefix)
+        {
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "تایید موقت شارژ لغو شد. هیچ تغییری در کیف پول کاربر انجام نشد.",
+                replyMarkup: null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "لغو شد.", false, cancellationToken);
+            return true;
+        }
+
+        if (prefix == HooshPayProvisionalStartCallbackPrefix)
+        {
+            if (!CanProvisionallyApproveHooshPay(payment))
+            {
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    BuildHooshPayPaymentInfo(payment, settlement: null) +
+                    "\n\nاین پرداخت در وضعیت قابل تایید موقت نیست.",
+                    replyMarkup: null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "این پرداخت قابل تایید موقت نیست.", true, cancellationToken);
+                return true;
+            }
+
+            var confirmationText = "⚠️ <b>تایید موقت شارژ HooshPay</b>\n\n" +
+                                   BuildHooshPayPaymentInfo(payment, settlement: null) +
+                                   "\n\nاین عملیات بدون تایید رسمی HooshPay، کیف پول کاربر را شارژ می‌کند. " +
+                                   "پس از تایید رسمی درگاه، فقط reconciliation و لاگ ثبت می‌شود و شارژ دوباره انجام نمی‌شود.\n\n" +
+                                   "آیا تایید نهایی موقت انجام شود؟";
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("✅ تایید نهایی موقت", HooshPayProvisionalConfirmCallbackPrefix + payment.Id),
+                    InlineKeyboardButton.WithCallbackData("انصراف", HooshPayProvisionalCancelCallbackPrefix + payment.Id)
+                }
+            });
+            await EditProvisionalMessageAsync(botClient, callbackQuery, confirmationText, keyboard, cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "برای تایید نهایی، دکمه سبز را بزنید.", false, cancellationToken);
+            return true;
+        }
+
+        await ConfirmProvisionalHooshPayAsync(botClient, callbackQuery, payment, mainMenu, cancellationToken);
+        return true;
+    }
+
     private async Task<bool> ResetRenewedTrafficIfNeededAsync(
         ServerInfo serverInfo,
         string email,
@@ -1225,7 +1331,8 @@ public class XuiV3AdminFlowService
     /// The input may be an internal payment id, HooshPay order id, or invoice uid.
     /// Paid wallet-charge rows are settled through <see cref="HooshPaySettlementService"/>.
     /// Paid tenant-order rows are settled through <see cref="TenantBotService"/> to create the account
-    /// and credit only the colleague owner's profit.
+    /// and credit only the colleague owner's profit. A still-pending wallet charge may show the first stage of the
+    /// two-step provisional-credit control; terminal failures and tenant orders never receive that control.
     /// </remarks>
     /// <param name="botClient">Telegram client used to answer the admin.</param>
     /// <param name="message">Admin message that contains the payment identifier.</param>
@@ -1309,7 +1416,14 @@ public class XuiV3AdminFlowService
             payment.PaymentStatus = HooshPayStatuses.Paid;
             await _userDbContext.SaveChangesAsync(cancellationToken);
             // Admin manual checks must respect payment purpose to avoid charging tenant customers' wallets.
-            settlement = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
+            var isTenantOrder = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase);
+            if (!isTenantOrder)
+                await _hooshPaySettlementService.RecordProviderConfirmationAfterProvisionalAsync(
+                    payment,
+                    "admin-check",
+                    cancellationToken);
+
+            settlement = isTenantOrder
                 ? await _tenantBotService.ApplyPaidTenantOrderAsync(
                     payment,
                     "admin-check",
@@ -1338,6 +1452,24 @@ public class XuiV3AdminFlowService
             },
             cancellationToken);
 
+        if (settlement == null && CanProvisionallyApproveHooshPay(payment))
+        {
+            await _userDbContext.ClearUserStatus(currentUser);
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: BuildHooshPayPaymentInfo(payment, settlement) +
+                      "\n\nاین پرداخت هنوز از سمت HooshPay تایید نشده است. در صورت مشاهده و تایید دستی پرداخت، می‌توانید شارژ موقت انجام دهید.",
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildProvisionalHooshPayStartKeyboard(payment.Id),
+                cancellationToken: cancellationToken);
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "منوی اصلی",
+                replyMarkup: mainMenu,
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
         await FinishWithMessageAsync(
             botClient,
             message.Chat.Id,
@@ -1347,6 +1479,266 @@ public class XuiV3AdminFlowService
             cancellationToken,
             ParseMode.Html);
         return true;
+    }
+
+    /// <summary>
+    /// Rechecks HooshPay and applies the final super-admin provisional-credit decision for one wallet charge.
+    /// </summary>
+    /// <param name="botClient">Telegram client used to edit the two-stage approval message and restore the admin menu.</param>
+    /// <param name="callbackQuery">Confirmed callback from the configured super-admin.</param>
+    /// <param name="payment">Local HooshPay row selected by its internal users.db id.</param>
+    /// <param name="mainMenu">Super-admin reply keyboard restored after the decision is recorded.</param>
+    /// <param name="cancellationToken">Cancellation token for provider refresh, wallet settlement, ledger, and Telegram work.</param>
+    /// <returns>A task that completes after the payment is officially settled, provisionally settled, or safely rejected.</returns>
+    /// <remarks>
+    /// The provider is refreshed a second time immediately before the financial decision. If it became paid meanwhile,
+    /// normal official settlement is used. Otherwise only a non-final wallet-charge row may receive the documented
+    /// provisional credit. Tenant orders are never eligible for this exception.
+    /// </remarks>
+    private async Task ConfirmProvisionalHooshPayAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        HooshPayPaymentInfo payment,
+        IReplyMarkup mainMenu,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(payment.InvoiceUid))
+                throw new InvalidOperationException("شناسه فاکتور HooshPay برای این پرداخت ثبت نشده است.");
+
+            var invoice = await _hooshPay.GetInvoiceAsync(payment.InvoiceUid, cancellationToken);
+            payment.Apply(invoice?.data);
+            var verify = await _hooshPay.VerifyInvoiceAsync(payment.InvoiceUid, cancellationToken);
+            payment.Apply(verify?.data);
+            if (!string.IsNullOrWhiteSpace(verify?.status))
+                payment.PaymentStatus = verify.status;
+            payment.RawResponseJson = JsonConvert.SerializeObject(new { invoice, verify });
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            if (verify?.paid == true || HooshPayStatuses.IsPaid(payment.PaymentStatus))
+            {
+                payment.PaymentStatus = HooshPayStatuses.Paid;
+                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _hooshPaySettlementService.RecordProviderConfirmationAfterProvisionalAsync(
+                    payment,
+                    "admin-provisional-confirm-refresh",
+                    cancellationToken);
+                var officialSettlement = await _hooshPaySettlementService.ApplyFinishedPaymentAsync(
+                    payment,
+                    "admin-provisional-confirm-refresh",
+                    payment.ChatId == 0 ? null : payment.ChatId,
+                    cancellationToken);
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    "HooshPay در بررسی نهایی پرداخت را تایید کرد؛ شارژ رسمی اعمال شد.\n\n" +
+                    BuildHooshPayPaymentInfo(payment, officialSettlement),
+                    replyMarkup: null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت درگاه تایید و تسویه شد.", false, cancellationToken);
+                return;
+            }
+
+            if (!CanProvisionallyApproveHooshPay(payment))
+            {
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    BuildHooshPayPaymentInfo(payment, settlement: null) +
+                    "\n\nتایید موقت انجام نشد؛ وضعیت جدید درگاه اجازه این عملیات را نمی‌دهد.",
+                    replyMarkup: null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "وضعیت درگاه اجازه تایید موقت نمی‌دهد.", true, cancellationToken);
+                return;
+            }
+
+            var provisionalSettlement = await _hooshPaySettlementService.ApplyProvisionalWalletPaymentAsync(
+                payment,
+                callbackQuery.From.Id,
+                payment.ChatId == 0 ? null : payment.ChatId,
+                cancellationToken);
+            var actor = await GetActivityActorAsync(callbackQuery.From.Id);
+            await _activityLog.LogBotActionAsync(
+                "hooshpay_provisional_wallet_approved",
+                actor,
+                true,
+                new Dictionary<string, object>
+                {
+                    ["orderId"] = payment.OrderId ?? string.Empty,
+                    ["invoiceUid"] = payment.InvoiceUid ?? string.Empty,
+                    ["paymentStatus"] = payment.PaymentStatus ?? string.Empty,
+                    ["settlementStatus"] = provisionalSettlement.Status.ToString(),
+                    ["amountToman"] = payment.AmountToman,
+                    ["approvedByTelegramUserId"] = callbackQuery.From.Id
+                },
+                cancellationToken);
+
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                provisionalSettlement.Status == NowPaymentsSettlementStatus.Applied
+                    ? "✅ شارژ موقت کیف پول با موفقیت ثبت شد.\n\n" + BuildHooshPayPaymentInfo(payment, provisionalSettlement)
+                    : "شارژ موقت انجام نشد.\n\n" + BuildHooshPayPaymentInfo(payment, provisionalSettlement),
+                replyMarkup: null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(
+                botClient,
+                callbackQuery,
+                provisionalSettlement.Status == NowPaymentsSettlementStatus.Applied ? "شارژ موقت ثبت شد." : "شارژ موقت اعمال نشد.",
+                provisionalSettlement.Status != NowPaymentsSettlementStatus.Applied,
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "HooshPay provisional wallet confirmation failed. paymentId={PaymentId}, orderId={OrderId}, approvedBy={ApprovedBy}",
+                payment.Id,
+                payment.OrderId,
+                callbackQuery.From?.Id);
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "تایید موقت انجام نشد. خطا در بررسی نهایی HooshPay:\n<code>" + Html(ex.Message) + "</code>",
+                replyMarkup: null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "خطا در بررسی نهایی HooshPay.", true, cancellationToken);
+        }
+        finally
+        {
+            if (callbackQuery.Message?.Chat.Id is long chatId && chatId != 0)
+            {
+                try
+                {
+                    await botClient.SendTextMessageAsync(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
+                }
+                catch (ApiRequestException ex) when (ex.ErrorCode == 403 || ex.ErrorCode == 400)
+                {
+                    _logger.LogWarning(ex, "Could not restore the super-admin menu after HooshPay provisional decision. chatId={ChatId}", chatId);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Determines whether a local HooshPay row is eligible for an admin provisional wallet credit.
+    /// </summary>
+    /// <param name="payment">Payment row whose latest provider status has already been refreshed.</param>
+    /// <returns>
+    /// <c>true</c> only for an unpaid, non-terminal wallet charge that has not already mutated the user's balance.
+    /// </returns>
+    /// <remarks>
+    /// Tenant orders and paid provider rows use their own normal settlement paths. Final gateway failures are never
+    /// overrideable through this control because the provisional action is for delayed confirmation, not failed payment.
+    /// </remarks>
+    private static bool CanProvisionallyApproveHooshPay(HooshPayPaymentInfo payment)
+    {
+        return payment != null &&
+               !payment.IsAddedToBalance &&
+               !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) &&
+               !HooshPayStatuses.IsPaid(payment.PaymentStatus) &&
+               !HooshPayStatuses.IsFinalFailure(payment.PaymentStatus) &&
+               !string.IsNullOrWhiteSpace(payment.InvoiceUid);
+    }
+
+    /// <summary>
+    /// Builds the first-stage inline keyboard for a pending HooshPay wallet charge that a super-admin may review.
+    /// </summary>
+    /// <param name="paymentId">Internal positive users.db primary key of the HooshPay payment row.</param>
+    /// <returns>Inline keyboard containing the first-stage provisional approval action.</returns>
+    /// <remarks>
+    /// Only the internal numeric id is embedded in callback data, keeping it below Telegram limits and avoiding raw
+    /// provider identifiers in callback payloads.
+    /// </remarks>
+    private static InlineKeyboardMarkup BuildProvisionalHooshPayStartKeyboard(int paymentId)
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("⚠️ تایید موقت شارژ", HooshPayProvisionalStartCallbackPrefix + paymentId)
+            }
+        });
+    }
+
+    /// <summary>
+    /// Edits a provisional approval message while tolerating an unchanged Telegram message.
+    /// </summary>
+    /// <param name="botClient">Telegram client used for the edit.</param>
+    /// <param name="callbackQuery">Callback that owns the editable message.</param>
+    /// <param name="text">HTML-safe replacement text.</param>
+    /// <param name="replyMarkup">Replacement inline keyboard, or null to remove approval actions.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <returns>A task that completes after the edit succeeds or is safely skipped when unchanged.</returns>
+    private static async Task EditProvisionalMessageAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        string text,
+        InlineKeyboardMarkup replyMarkup,
+        CancellationToken cancellationToken)
+    {
+        if (callbackQuery?.Message == null)
+            return;
+
+        try
+        {
+            await botClient.EditMessageTextAsync(
+                callbackQuery.Message.Chat.Id,
+                callbackQuery.Message.MessageId,
+                text,
+                parseMode: ParseMode.Html,
+                replyMarkup: replyMarkup,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ex.Message?.Contains("message is not modified", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            // Telegram already shows the intended state; no financial retry is needed for this presentation-only edit.
+        }
+    }
+
+    /// <summary>
+    /// Answers an admin provisional-payment callback without allowing a stale Telegram query to interrupt settlement.
+    /// </summary>
+    /// <param name="botClient">Telegram client used to answer the callback.</param>
+    /// <param name="callbackQuery">Callback query to answer. Null values are ignored.</param>
+    /// <param name="text">Short user-facing callback toast text.</param>
+    /// <param name="showAlert">Whether Telegram should show an alert rather than a transient toast.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <returns>A task that completes after Telegram accepts or rejects the callback answer.</returns>
+    private static async Task AnswerCallbackSafelyAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        string text,
+        bool showAlert,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(callbackQuery?.Id))
+            return;
+
+        try
+        {
+            await botClient.AnswerCallbackQueryAsync(
+                callbackQuery.Id,
+                text,
+                showAlert: showAlert,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ex.Message?.Contains("query is too old", StringComparison.OrdinalIgnoreCase) == true ||
+                                               ex.Message?.Contains("query ID is invalid", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            // Telegram callback answers expire quickly; the persisted financial operation remains authoritative.
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a Telegram user id belongs to the configured super-admin allow-list.
+    /// </summary>
+    /// <param name="telegramUserId">Numeric Telegram user id supplied by an incoming callback.</param>
+    /// <returns><c>true</c> only when the id is configured as a super-admin.</returns>
+    private bool IsConfiguredSuperAdmin(long telegramUserId)
+    {
+        return telegramUserId > 0 && _appConfig.AdminsUserIds?.Contains(telegramUserId) == true;
     }
 
     /// <summary>
@@ -3238,6 +3630,10 @@ public class XuiV3AdminFlowService
                $"Status: <code>{Html(payment.PaymentStatus)}</code>\n" +
                $"Tracking Code: <code>{Html(payment.TrackingCode)}</code>\n" +
                $"Added To Balance: <code>{payment.IsAddedToBalance}</code>\n" +
+               $"Provisional Approval: <code>{payment.IsProvisionallyApproved}</code>\n" +
+               $"Provisional Approved At: <code>{Html(payment.ProvisionalApprovedAtUtc?.AddMinutes(210).ConvertToHijriShamsi())}</code>\n" +
+               $"Provisional Approved By: <code>{payment.ProvisionalApprovedByTelegramUserId}</code>\n" +
+               $"Provider Confirmed After Provisional: <code>{Html(payment.ProviderConfirmedAfterProvisionalAtUtc?.AddMinutes(210).ConvertToHijriShamsi())}</code>\n" +
                $"Settlement: <code>{Html(settlement?.Status.ToString() ?? "not-applied")}</code>\n" +
                $"Balance Before: <code>{Html(payment.BalanceBefore?.FormatCurrency())}</code>\n" +
                $"Balance After: <code>{Html(payment.BalanceAfter?.FormatCurrency())}</code>\n" +
