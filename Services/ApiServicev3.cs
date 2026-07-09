@@ -700,9 +700,225 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> BulkCreateClientsAsync(ServerInfo serverInfo, IConfiguration configuration, IEnumerable<XuiV3ClientCreateRequest> requests, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/bulkCreate", requests?.ToList() ?? new List<XuiV3ClientCreateRequest>(), true, cancellationToken);
 
-    /// <summary>POST /panel/api/clients/update/{email}. Replaces a client row by email.</summary>
-    public static Task<XuiV3ApiResponse<JToken>> UpdateClientAsync(ServerInfo serverInfo, IConfiguration configuration, string email, XuiV3ClientPayload client, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/update/{EscapePath(email)}", client, true, cancellationToken);
+    /// <summary>
+    /// Replaces an XUI v3 client row by email while normalizing legacy extension fields that newer panel versions
+    /// validate more strictly.
+    /// </summary>
+    /// <param name="serverInfo">
+    /// The configured XUI panel endpoint and authentication settings that own the client. The value must identify a
+    /// reachable v3 panel and must not be written to user-facing messages or logs with its secrets.
+    /// </param>
+    /// <param name="configuration">
+    /// Application configuration used to resolve the request timeout, retry policy, and v3 API token. It must be the
+    /// active runtime configuration and is never serialized into the panel request.
+    /// </param>
+    /// <param name="email">
+    /// The existing XUI client email used by the v3 API as the update path identifier. This is an account identifier,
+    /// not a Telegram username; it must be non-empty and is URL-escaped before the external request.
+    /// </param>
+    /// <param name="client">
+    /// The complete replacement payload assembled from the current panel client. Ownership, UUID, password, subId,
+    /// traffic, expiry, and panel-specific fields must already be preserved by the caller. The payload is copied before
+    /// transport so normalizing <c>allowedIPs</c> does not mutate the caller's tracked client object.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// A token that cancels the XUI HTTP request when the Telegram update or background operation is stopped.
+    /// </param>
+    /// <returns>
+    /// The panel response after the update attempt. A failed response means the panel rejected or could not process the
+    /// update; callers must not assume a renewal, link change, or account-state update was persisted.
+    /// </returns>
+    /// <remarks>
+    /// 3x-ui 3.4.x requires <c>client.allowedIPs</c> to be a JSON string array. Older panel responses can expose the
+    /// same extension field as a string inside <see cref="XuiV3ClientPayload.Extra"/>. Renewals previously copied that
+    /// raw value back to the panel, causing Go to reject it with an unmarshalling error. This shared boundary converts
+    /// only that legacy field to an array, so every update path receives the fix without dropping unrelated panel data.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var response = await ApiServicev3.UpdateClientAsync(
+    ///     serverInfo,
+    ///     configuration,
+    ///     client.Email,
+    ///     renewal.Payload,
+    ///     cancellationToken);
+    /// </code>
+    /// </example>
+    public static Task<XuiV3ApiResponse<JToken>> UpdateClientAsync(
+        ServerInfo serverInfo,
+        IConfiguration configuration,
+        string email,
+        XuiV3ClientPayload client,
+        CancellationToken cancellationToken = default)
+        => SendAsync<JToken>(
+            serverInfo,
+            configuration,
+            HttpMethod.Post,
+            $"/panel/api/clients/update/{EscapePath(email)}",
+            PrepareClientUpdatePayload(client),
+            true,
+            cancellationToken);
+
+    /// <summary>
+    /// Creates an isolated v3 update payload and changes a legacy <c>allowedIPs</c> extension value into the JSON
+    /// string-array shape required by current 3x-ui releases.
+    /// </summary>
+    /// <param name="client">
+    /// The source client payload built from an XUI panel response. It may contain arbitrary panel extension data;
+    /// a null value is allowed only to preserve the prior API behavior of sending a null request body.
+    /// </param>
+    /// <returns>
+    /// A detached payload suitable for serialization. The result is null when <paramref name="client"/> is null.
+    /// The source payload and its extension-data dictionary remain unchanged.
+    /// </returns>
+    /// <remarks>
+    /// The copy is intentionally explicit because update payloads carry identity and access-control fields such as
+    /// UUID, password, Telegram id, subId, flow, group, reverse, and extension data. Omitting one of them can cause a
+    /// panel update to erase existing account settings. Only <c>allowedIPs</c> is normalized, and only when it was
+    /// actually returned as extension data by the panel.
+    /// </remarks>
+    private static XuiV3ClientPayload PrepareClientUpdatePayload(XuiV3ClientPayload client)
+    {
+        if (client == null)
+            return null;
+
+        var extra = client.Extra == null
+            ? null
+            : client.Extra.ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value?.DeepClone(),
+                StringComparer.Ordinal);
+
+        NormalizeAllowedIpsExtension(extra);
+
+        return new XuiV3ClientPayload
+        {
+            Email = client.Email,
+            Uuid = client.Uuid,
+            Password = client.Password,
+            TotalGB = client.TotalGB,
+            ExpiryTime = client.ExpiryTime,
+            TgId = client.TgId,
+            LimitIp = client.LimitIp,
+            Enable = client.Enable,
+            SubId = client.SubId,
+            Flow = client.Flow,
+            Comment = client.Comment,
+            Group = client.Group,
+            Reverse = client.Reverse?.DeepClone(),
+            Extra = extra
+        };
+    }
+
+    /// <summary>
+    /// Normalizes the optional XUI <c>allowedIPs</c> extension in a detached payload dictionary.
+    /// </summary>
+    /// <param name="extra">
+    /// Detached extension data copied from an XUI client payload. The dictionary may be null or may contain arbitrary
+    /// keys returned by different 3x-ui versions. This method only changes keys whose name equals
+    /// <c>allowedIPs</c> without regard to casing.
+    /// </param>
+    /// <remarks>
+    /// Current 3x-ui parses <c>allowedIPs</c> as <c>[]string</c>. A previous panel may return a comma-separated string
+    /// or a JSON-array string, so this method removes every casing variant and writes one canonical JSON array. Keeping
+    /// the conversion at the outgoing API boundary avoids changing the historical panel object held by renewal logic.
+    /// </remarks>
+    private static void NormalizeAllowedIpsExtension(IDictionary<string, JToken> extra)
+    {
+        if (extra == null)
+            return;
+
+        var matchingKeys = extra.Keys
+            .Where(key => string.Equals(key, "allowedIPs", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (matchingKeys.Count == 0)
+            return;
+
+        var source = matchingKeys
+            .Select(key => extra[key])
+            .FirstOrDefault(token => token != null && token.Type != JTokenType.Null);
+
+        foreach (var key in matchingKeys)
+            extra.Remove(key);
+
+        // 3x-ui 3.4.x unmarshals this field into Go []string, so a legacy raw string must never be forwarded.
+        extra["allowedIPs"] = new JArray(ReadAllowedIpValues(source));
+    }
+
+    /// <summary>
+    /// Extracts individual IP or CIDR entries from an XUI extension token without validating the network syntax.
+    /// </summary>
+    /// <param name="source">
+    /// The raw <c>allowedIPs</c> token returned by a panel. It may be a JSON array, a JSON-array string, a
+    /// comma/newline/semicolon-separated string, or null when the legacy field was empty.
+    /// </param>
+    /// <returns>
+    /// Distinct non-empty textual entries in their original order. The collection can be empty, which serializes as
+    /// an empty JSON array and means the panel receives no explicit IP restrictions from this field.
+    /// </returns>
+    /// <remarks>
+    /// This helper deliberately preserves values rather than attempting to decide whether they are valid IPv4, IPv6,
+    /// or CIDR expressions. The panel remains the authority for semantic validation; the bot only fixes the JSON type
+    /// mismatch that otherwise rejects renewals before panel validation can run.
+    /// </remarks>
+    private static IReadOnlyList<string> ReadAllowedIpValues(JToken source)
+    {
+        if (source == null || source.Type == JTokenType.Null)
+            return Array.Empty<string>();
+
+        IEnumerable<string> values;
+        if (source is JArray array)
+        {
+            values = array
+                .Where(item => item != null && item.Type != JTokenType.Null)
+                .Select(item => item.ToString().Trim());
+        }
+        else
+        {
+            var raw = source.ToString().Trim();
+            if (raw.StartsWith("[", StringComparison.Ordinal))
+            {
+                try
+                {
+                    var parsed = JArray.Parse(raw);
+                    values = parsed
+                        .Where(item => item != null && item.Type != JTokenType.Null)
+                        .Select(item => item.ToString().Trim());
+                }
+                catch (JsonReaderException)
+                {
+                    values = SplitAllowedIpValues(raw);
+                }
+            }
+            else
+            {
+                values = SplitAllowedIpValues(raw);
+            }
+        }
+
+        return values
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Splits a legacy textual allowed-IP value into its individual entries.
+    /// </summary>
+    /// <param name="raw">
+    /// The raw string returned by an older panel response. It may contain comma, semicolon, carriage-return, or
+    /// newline separators and may be empty.
+    /// </param>
+    /// <returns>
+    /// Candidate IP or CIDR entries with surrounding whitespace removed. The result can be empty.
+    /// </returns>
+    /// <remarks>
+    /// This method is used only after a JSON-array parse was not applicable. It keeps the normalizer compatible with
+    /// legacy panel values such as <c>1.2.3.4, 5.6.7.8</c> without changing their contents.
+    /// </remarks>
+    private static IEnumerable<string> SplitAllowedIpValues(string raw)
+        => (raw ?? string.Empty).Split(new[] { ',', ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(value => value.Trim());
 
     /// <summary>Fetches a client, changes its enable flag, then updates it through the v3 API.</summary>
     public static Task<XuiV3ApiResponse<JToken>> SetClientEnabledAsync(

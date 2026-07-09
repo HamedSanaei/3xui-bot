@@ -1321,7 +1321,9 @@ public class XuiV3BotFlowService
             {
                 $"نام اکانت `{client.Email}`",
                 renewal.IsUnlimited
-                    ? $"حد مصرف منصفانه قابل استفاده `{renewal.TargetAvailableTrafficGb} GB`"
+                    ? renewal.ShouldResetTraffic
+                        ? $"حجم جدید پس از ریست `{renewal.RenewedTrafficGb} GB`"
+                        : $"حجم اضافه `{renewal.RenewedTrafficGb} GB` - حجم کل پس از تمدید `{XuiV3PurchaseService.FormatTrafficSize(renewal.TotalBytesAfterRenew)}`"
                     : $"حجم اضافه `{resolved.TrafficGb} GB`",
                 $"زمان اضافه `{(resolved.DurationDays <= 0 ? "نامحدود" : $"{resolved.DurationDays} روز")}`",
                 $"ریست مصرف `{(renewal.ShouldResetTraffic ? (trafficResetApplied ? "انجام شد" : "ناموفق") : "نیاز نبود")}`",
@@ -5223,6 +5225,32 @@ public class XuiV3BotFlowService
         };
     }
 
+    /// <summary>
+    /// Builds the owned-bot renewal preview from the selected plan and the latest XUI client state.
+    /// </summary>
+    /// <param name="user">
+    /// Bot-scoped conversation state containing the target account email, service key, and selected renewal plan.
+    /// The state belongs to the active owned bot and Telegram user and must not be reused across bots.
+    /// </param>
+    /// <param name="isColleague">
+    /// Whether colleague pricing applies to this renewal. The value must come from the current credential profile
+    /// after any enabled Gozargah-site colleague promotion check.
+    /// </param>
+    /// <param name="telegramUserId">
+    /// Numeric Telegram id of the customer requesting the preview. It is used for ownership-aware panel lookup and
+    /// audit metadata, not as an XUI inbound or client id.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Token that cancels panel lookup when the Telegram update is stopped or times out.
+    /// </param>
+    /// <returns>
+    /// HTML-safe Persian preview text showing exact traffic addition/replacement, duration addition, reset behavior,
+    /// and price. If panel lookup fails, the text falls back to the selected plan without mutating the account.
+    /// </returns>
+    /// <remarks>
+    /// The method is read-only. Unlimited previews follow <see cref="XuiV3RenewalPolicy"/>: active accounts show the
+    /// exact selected traffic added to the existing quota, while expired accounts show traffic replacement after reset.
+    /// </remarks>
     private async Task<string> BuildRenewSummaryAsync(
         User user,
         bool isColleague,
@@ -5262,10 +5290,12 @@ public class XuiV3BotFlowService
         var totalAfterRenewBytes = renewal?.TotalBytesAfterRenew ?? 0;
         var trafficLine = renewal == null
             ? resolved.IsUnlimited
-                ? $"📦 حد مصرف منصفانه پلن تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb))}</code>"
+                ? $"📦 حجم پلن تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb))}</code>"
                 : $"📦 حجم اضافه: <code>{resolved.TrafficGb} GB</code>"
             : renewal.IsUnlimited
-                ? $"📦 حد مصرف منصفانه قابل استفاده بعد از تمدید: <code>{Html(FormatGb(renewal.TargetAvailableTrafficBytes))}</code>"
+                ? renewal.ShouldResetTraffic
+                    ? $"📦 حجم جدید بعد از ریست مصرف: <code>{Html(FormatGb(renewal.RenewedTrafficBytes))}</code>"
+                    : $"📦 حجم اضافه: <code>{Html(FormatGb(renewal.RenewedTrafficBytes))}</code>\n📦 حجم کل بعد از تمدید: <code>{Html(FormatGb(renewal.TotalBytesAfterRenew))}</code>"
                 : renewal.ShouldResetTraffic
                 ? $"📦 حجم جدید بعد از ریست مصرف: <code>{Html(FormatGb(renewal.TargetAvailableTrafficBytes))}</code>"
                 : $"📦 حجم کلی بعد از تمدید: <code>{Html(FormatGb(totalAfterRenewBytes))}</code>";
@@ -5276,7 +5306,7 @@ public class XuiV3BotFlowService
         text.AppendLine($"👤 اکانت: <code>{Html(user.ConfigLink)}</code>");
         text.AppendLine($"🧩 سرویس: <code>{Html(resolved.Service.DisplayName)}</code>");
         text.AppendLine(resolved.IsUnlimited
-            ? $"📦 پلن تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb))}</code>"
+            ? $"📦 حجم پلن تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb))}</code>"
             : $"📦 حجم اضافه: <code>{resolved.TrafficGb} GB</code>");
         text.AppendLine(trafficLine);
         text.AppendLine($"🔋 مصرف شده تا کنون: <code>{Html(FormatGb(usedBytes, zeroAsUnknown: false))}</code>");

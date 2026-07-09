@@ -3107,6 +3107,22 @@ public class XuiV3AdminFlowService
         return text;
     }
 
+    /// <summary>
+    /// Builds the super-admin renewal preview from explicit traffic/day input and the latest XUI client state.
+    /// </summary>
+    /// <param name="user">
+    /// Admin conversation state containing the target account email, resolved service key, traffic in GB, and duration
+    /// in days. The account owner stored on XUI is preserved and is not replaced by this state's Telegram id.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the read-only XUI lookup used to enrich the preview.</param>
+    /// <returns>
+    /// HTML-safe Persian summary describing exact traffic addition or expired-account replacement, reset behavior,
+    /// and added duration. The method returns a plan-only fallback if panel lookup is unavailable.
+    /// </returns>
+    /// <remarks>
+    /// This method does not update XUI. Unlimited calculations use the same shared policy as customer and tenant
+    /// renewals: no quota is inferred from the final number of days.
+    /// </remarks>
     private async Task<string> BuildRenewSummaryAsync(User user, CancellationToken cancellationToken)
     {
         var trafficGb = int.TryParse(user.TotoalGB, out var parsedTraffic) ? parsedTraffic : 0;
@@ -3130,7 +3146,10 @@ public class XuiV3AdminFlowService
         }
 
         var trafficLine = renewal?.IsUnlimited == true
-            ? $"📦 حد مصرف منصفانه قابل استفاده بعد از تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.TargetAvailableTrafficBytes))}</code>\n"
+            ? renewal.ShouldResetTraffic
+                ? $"📦 حجم جدید بعد از ریست مصرف: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.RenewedTrafficBytes))}</code>\n"
+                : $"📦 حجم اضافه: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.RenewedTrafficBytes))}</code>\n" +
+                  $"📦 حجم کل بعد از تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.TotalBytesAfterRenew))}</code>\n"
             : renewal?.ShouldResetTraffic == true
                 ? $"📦 حجم جدید بعد از ریست مصرف: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.TargetAvailableTrafficBytes))}</code>\n"
                 : $"📦 حجم اضافه: <code>{trafficGb} GB</code>\n";

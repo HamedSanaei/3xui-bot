@@ -2834,12 +2834,30 @@ public class TenantBotService
     /// <summary>
     /// Sends the tenant renewal summary before creating a payable tenant order.
     /// </summary>
-    /// <param name="botClient">Tenant bot client used to send the summary.</param>
-    /// <param name="chatId">Customer chat id receiving the renewal summary.</param>
-    /// <param name="tenant">Tenant bot whose pricing settings apply.</param>
-    /// <param name="customer">Customer requesting the renewal.</param>
-    /// <param name="user">Bot-scoped state containing the target email and selected renewal plan.</param>
-    /// <param name="cancellationToken">Cancellation token for Telegram and panel operations.</param>
+    /// <param name="botClient">
+    /// Telegram client of the tenant storefront that owns this customer conversation. It must match
+    /// <paramref name="tenant"/> so the summary is never sent through another tenant or an owned bot.
+    /// </param>
+    /// <param name="chatId">Telegram chat id of the tenant customer receiving the renewal summary.</param>
+    /// <param name="tenant">
+    /// Tenant bot database row whose owner-defined sale pricing and storefront settings apply. The global XUI plan
+    /// catalog still provides traffic and duration values.
+    /// </param>
+    /// <param name="customer">
+    /// Shared credential profile of the Telegram customer requesting renewal. Its numeric Telegram id is used for
+    /// account ownership checks and renewal metadata; this method does not debit its wallet.
+    /// </param>
+    /// <param name="user">
+    /// Tenant-scoped conversation state containing the target email and selected renewal plan. The state must belong
+    /// to the composite tenant bot id and customer Telegram id currently being handled.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels Telegram and read-only XUI operations for this update.</param>
+    /// <returns>A task that completes after the HTML summary and confirmation keyboard are sent to the customer.</returns>
+    /// <remarks>
+    /// The preview is tenant-isolated and uses tenant sale pricing, but traffic and expiry arithmetic come from the
+    /// shared renewal policy. Active unlimited accounts show direct quota addition; expired unlimited accounts show
+    /// replacement quota and a first-connection duration after reset.
+    /// </remarks>
     private async Task SendTenantRenewSummaryAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -2855,15 +2873,20 @@ public class TenantBotService
         var client = await FindTenantClientAsync(serverInfo, user.ConfigLink, cancellationToken);
         var renewal = client == null ? null : XuiV3RenewalPolicy.Calculate(client, resolved, "tenant-renew-summary", customer.TelegramUserId);
 
-        var fairUsageLine = resolved.IsUnlimited
-            ? $"حد مصرف منصفانه قابل استفاده بعد از تمدید: <code>{Html((renewal?.TargetAvailableTrafficGb ?? resolved.TrafficGb).ToString(CultureInfo.InvariantCulture))} GB</code>\n"
+        var trafficLine = resolved.IsUnlimited
+            ? renewal?.ShouldResetTraffic == true
+                ? $"حجم جدید بعد از ریست مصرف: <code>{Html(resolved.TrafficGb.ToString(CultureInfo.InvariantCulture))} GB</code>\n"
+                : $"حجم اضافه: <code>{Html(resolved.TrafficGb.ToString(CultureInfo.InvariantCulture))} GB</code>\n" +
+                  (renewal == null
+                      ? string.Empty
+                      : $"حجم کل بعد از تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.TotalBytesAfterRenew))}</code>\n")
             : $"حجم تمدید: <code>{Html(resolved.TrafficGb.ToString(CultureInfo.InvariantCulture))} GB</code>\n";
 
         var text =
             "✅ <b>خلاصه تمدید اکانت</b>\n\n" +
             $"اکانت: <code>{Html(user.ConfigLink)}</code>\n" +
             $"سرویس: <b>{Html(resolved.Service.DisplayName)}</b>\n" +
-            fairUsageLine +
+            trafficLine +
             $"مدت افزوده: <code>{Html(resolved.DurationDays <= 0 ? "نامحدود" : resolved.DurationDays + " روز")}</code>\n" +
             (renewal == null ? string.Empty : $"مدت نهایی بعد از تمدید: <code>{Html(renewal.FinalDurationDays <= 0 ? "نامحدود" : renewal.FinalDurationDays + " روز")}</code>\n") +
             $"مبلغ قابل پرداخت: <b>{Html(price.SalePriceToman.FormatCurrency())}</b>\n\n" +
@@ -7101,7 +7124,7 @@ public class TenantBotService
             SubId = client.SubId,
             SubLink = order.CreatedSubLink,
             TrafficGb = resolved.TrafficGb,
-            TrafficBytes = renewal.TargetAvailableTrafficBytes,
+            TrafficBytes = renewal.TotalBytesAfterRenew,
             ExpiryTime = renewal.UpdatedExpiryTime,
             DurationDays = renewal.FinalDurationDays,
             Comment = renewal.Payload.Comment
@@ -7164,9 +7187,20 @@ public class TenantBotService
     /// <summary>
     /// Sends the customer-facing success message for a fulfilled tenant renewal order.
     /// </summary>
-    /// <param name="order">Fulfilled tenant renewal order.</param>
-    /// <param name="renewal">Calculated renewal details applied to the XUI client.</param>
-    /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <param name="order">
+    /// Fulfilled tenant renewal order containing tenant id, customer chat id, payment amount in toman, account email,
+    /// order id, and subscription link. The order must already be persisted as fulfilled.
+    /// </param>
+    /// <param name="renewal">
+    /// Shared renewal result that was successfully applied to XUI. Its exact added traffic, total quota, reset flag,
+    /// and final duration are safe to include in the customer notification.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels only the best-effort Telegram delivery operation.</param>
+    /// <returns>A task that completes after the best-effort tenant-bot notification attempt.</returns>
+    /// <remarks>
+    /// Notification failure is logged and does not roll back account renewal or financial settlement. Unlimited text
+    /// reports the exact selected traffic added, or the replacement traffic when the expired account was reset.
+    /// </remarks>
     private async Task SENDTENANTRENEWSUCCESSASYNC(
         TenantBotOrder order,
         XuiV3RenewalCalculation renewal,
@@ -7180,7 +7214,10 @@ public class TenantBotService
                 $"شماره سفارش: <code>{Html(order.OrderId)}</code>\n" +
                 $"مبلغ پرداختی: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
                 (renewal.IsUnlimited
-                    ? $"حد مصرف منصفانه قابل استفاده: <code>{Html(renewal.TargetAvailableTrafficGb.ToString(CultureInfo.InvariantCulture))} GB</code>\n"
+                    ? renewal.ShouldResetTraffic
+                        ? $"حجم جدید بعد از ریست مصرف: <code>{Html(renewal.RenewedTrafficGb.ToString(CultureInfo.InvariantCulture))} GB</code>\n"
+                        : $"حجم اضافه: <code>{Html(renewal.RenewedTrafficGb.ToString(CultureInfo.InvariantCulture))} GB</code>\n" +
+                          $"حجم کل بعد از تمدید: <code>{Html(XuiV3PurchaseService.FormatTrafficSize(renewal.TotalBytesAfterRenew))}</code>\n"
                     : $"حجم تمدید: <code>{Html(renewal.RenewedTrafficGb.ToString(CultureInfo.InvariantCulture))} GB</code>\n") +
                 $"مدت نهایی: <code>{Html(renewal.FinalDurationDays <= 0 ? "نامحدود" : renewal.FinalDurationDays + " روز")}</code>\n" +
                 $"ساب‌لینک: <code>{Html(order.CreatedSubLink)}</code>";

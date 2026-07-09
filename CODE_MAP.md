@@ -52,6 +52,10 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   it must never create a second wallet credit or ledger entry. Tenant orders and terminal HooshPay failures are never
   eligible for provisional approval.
 - Super-admin manual NOWPayments checks are provider re-checks only: local code must not set `finished` or credit balances unless NOWPayments returns a paid status (`finished`, `confirmed`, or `sending`).
+- Unlimited renewal no longer infers a target fair-usage quota from the final duration. While active, it adds the
+  selected plan's exact traffic to `TotalGB` and adds the exact plan days while preserving positive absolute-expiry or
+  negative first-connection-expiry mode. When expired, it replaces `TotalGB`, resets counters, and writes only the
+  selected plan duration as a negative first-connection expiry. Owned, tenant, and super-admin flows share this rule.
 - Tenant platform-gateway sales credit owner profit; tenant card-to-card fulfillment debits owner base cost and can allow negative owner balances if configured by business rules.
 - Tenant card-to-card base cost settlement tries the owner's bot wallet first, then the owner's Gozargah website wallet when connected and sufficient, then allows the bot wallet to go negative with an owner warning. This does not auto-disable the customer account in the current phase.
 - Tenant platform-gateway sales credit profit to the owner's bot wallet and include a live Gozargah website wallet snapshot in the private sale log; the site wallet is not mutated for gateway profit.
@@ -87,6 +91,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - XUI v3 creation-result expiry display resolves top-level `ExpiryTime`, nested `Traffic.ExpiryTime`, and client `Extra`
   before falling back to the submitted payload. This protects normal fixed-date accounts from being displayed as
   unlimited when newer 3x-ui responses return a zero top-level expiry field.
+- `ApiServicev3.UpdateClientAsync` copies outgoing payloads and normalizes any legacy `Extra.allowedIPs` string into
+  the JSON string-array required by 3x-ui 3.4.x. This protects owned/tenant renewal, link-change, comment, and
+  enable/disable updates without discarding other panel fields.
 - Owned bot `💻 ارتباط با ادمین` reads only the active bot's `SupportAccount`; it must not leak the default brand's
   support account when the active owned bot has no configured support contact.
 - Operational payment/account logs are delivered through the default owned bot to the central logger channel; include origin bot metadata in the message for non-default owned bots and tenant storefronts.
