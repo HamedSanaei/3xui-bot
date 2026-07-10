@@ -1626,6 +1626,15 @@ namespace Adminbot.Domain
         public string Message { get; set; }
 
         /// <summary>
+        /// Indicates that eligibility failed because the user is blocked in the bot or banned on the website.
+        /// </summary>
+        /// <remarks>
+        /// Callers may fall back to another wallet for unavailable or insufficient website wallets, but must not use
+        /// that fallback to bypass an explicit bot-side block or website ban.
+        /// </remarks>
+        public bool IsBlocked { get; set; }
+
+        /// <summary>
         /// Current website wallet balance in toman when available.
         /// </summary>
         public long WalletToman { get; set; }
@@ -1656,7 +1665,7 @@ namespace Adminbot.Domain
         /// <param name="message">Reason returned to the caller.</param>
         /// <returns>Eligibility result for bot-side or site-side ban.</returns>
         public static GozargahSiteWalletEligibility Blocked(string message)
-            => new() { Message = message };
+            => new() { Message = message, IsBlocked = true };
 
         /// <summary>
         /// Creates an unavailable eligibility result.

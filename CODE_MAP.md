@@ -78,6 +78,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Owned-bot profile/status messages should display Gozargah `get_user` 404/not-found as `متصل نشده`, not as the raw HTTP/API error.
 - A successful non-banned `get_user` lookup means the owned-bot buyer should be promoted to `CredUser.IsColleague=true` before tariffs, purchases, or renewals are priced.
 - Optional Gozargah `get_user` lookups for owned-bot pricing and wallet-button visibility are fail-soft with a short timeout; a slow website API must not block tariff or purchase menus.
+- Owned-bot renewal with a selected Gozargah website wallet falls back to a local bot-wallet debit if website
+  eligibility or post-XUI debit fails; the local balance may become negative and a dedicated ledger provider records
+  the compensation. Explicit bot/site bans still block service and never use this fallback.
 
 ## Current Gotchas
 

@@ -1119,6 +1119,32 @@ public class XuiV3BotFlowService
         }
     }
 
+    /// <summary>
+    /// Applies an owned-bot account renewal on XUI and settles the exact selected wallet after panel success.
+    /// </summary>
+    /// <param name="botClient">Telegram client of the active owned bot used for progress and result messages.</param>
+    /// <param name="message">Customer confirmation message containing the Telegram user and chat identifiers.</param>
+    /// <param name="credUser">
+    /// Shared credentials profile of the customer or colleague. Its bot-wallet balance is debited when selected
+    /// directly or when a selected Gozargah website-wallet debit cannot be completed.
+    /// </param>
+    /// <param name="user">
+    /// Bot-scoped renewal state containing the target account, service, plan, and selected payment method.
+    /// </param>
+    /// <param name="mainReplyMarkup">Owned-bot main keyboard restored after the renewal flow finishes.</param>
+    /// <param name="cancellationToken">
+    /// Token that cancels Telegram, XUI, website, ledger, and state operations. If it is already cancelled after a
+    /// successful XUI update and failed website debit, the compensating local debit and ledger use a non-cancelled token
+    /// so cancellation cannot leave the renewal unpaid.
+    /// </param>
+    /// <returns>A task that completes after renewal, financial settlement, audit logging, and customer notification.</returns>
+    /// <remarks>
+    /// XUI is updated before a website-wallet debit because the website must not be charged for a failed renewal.
+    /// To prevent a successful XUI renewal from becoming free, any unavailable, insufficient, failed, or exceptional
+    /// website debit falls back to the bot wallet and may make it negative. Explicit bot/site bans do not use fallback.
+    /// The bot-wallet mutation and users.db ledger append are separate database operations; the ledger records the
+    /// actual before/after balance and provider so administrators can audit the compensation path.
+    /// </remarks>
     private async Task CompleteRenewAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1163,18 +1189,19 @@ public class XuiV3BotFlowService
             return;
         }
 
+        GozargahSiteWalletEligibility siteWalletEligibility = null;
         if (useSiteWallet)
         {
-            var eligibility = await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
+            siteWalletEligibility = await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
                 credUser.TelegramUserId,
                 resolved.PriceToman,
                 cancellationToken);
-            if (!eligibility.CanUse)
+            if (!siteWalletEligibility.CanUse && siteWalletEligibility.IsBlocked)
             {
                 await _userDbContext.ClearUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
-                    text: $"پرداخت تمدید با کیف پول سایت گذرگاه ممکن نیست.\n{eligibility.Message}",
+                    text: $"پرداخت تمدید با کیف پول سایت گذرگاه ممکن نیست.\n{siteWalletEligibility.Message}",
                     replyMarkup: mainReplyMarkup,
                     cancellationToken: cancellationToken);
                 return;
@@ -1236,20 +1263,59 @@ public class XuiV3BotFlowService
         }
 
         var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
-        var beforeBalance = credUser.AccountBalance;
+        var beforeBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
         var afterBalance = beforeBalance;
         GozargahSiteWalletDebitResult siteWalletDebitResult = null;
+        var siteWalletFallbackToBot = false;
+        string siteWalletFallbackReason = null;
         if (useSiteWallet)
         {
-            var debitResult = await _gozargahSiteSyncService.DeductSiteWalletAfterPanelSuccessAsync(
-                credUser.TelegramUserId,
-                resolved.PriceToman,
-                "xui-v3-client",
-                client.Email,
-                $"XuiV3 renewal via Gozargah site wallet: {client.Email}",
-                cancellationToken);
+            GozargahSiteWalletDebitResult debitResult;
+            if (siteWalletEligibility?.CanUse == true)
+            {
+                try
+                {
+                    debitResult = await _gozargahSiteSyncService.DeductSiteWalletAfterPanelSuccessAsync(
+                        credUser.TelegramUserId,
+                        resolved.PriceToman,
+                        "xui-v3-client",
+                        client.Email,
+                        $"XuiV3 renewal via Gozargah site wallet: {client.Email}",
+                        cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Gozargah site wallet debit threw after XUI renewal; bot-wallet fallback will be applied. telegramUserId={TelegramUserId}, email={Email}, amountToman={AmountToman}",
+                        credUser.TelegramUserId,
+                        client.Email,
+                        resolved.PriceToman);
+                    debitResult = GozargahSiteWalletDebitResult.Failed("ارتباط با کیف پول سایت هنگام کسر مبلغ قطع شد.");
+                }
+            }
+            else
+            {
+                debitResult = GozargahSiteWalletDebitResult.Failed(
+                    siteWalletEligibility?.Message ?? "کیف پول سایت در دسترس نبود.");
+            }
+
+            siteWalletDebitResult = debitResult;
             if (!debitResult.Success)
             {
+                // The panel renewal already succeeded. Apply a compensating local debit even when the bot-wallet
+                // balance is insufficient so this external failure cannot turn the renewal into a free operation.
+                siteWalletFallbackToBot = true;
+                siteWalletFallbackReason = debitResult.ErrorMessage;
+                afterBalance = await DebitBotWalletForRenewalAsync(
+                    credUser,
+                    resolved.PriceToman,
+                    beforeBalance,
+                    client.Email,
+                    provider: "gozargah_site_wallet_fallback_bot_wallet",
+                    description: $"XuiV3 renewal bot-wallet fallback after Gozargah site debit failure: {client.Email}",
+                    cancellationToken: CancellationToken.None);
+
                 await _activityLog.LogWarningAsync(
                     "gozargah_site_wallet_debit_failed_after_renew",
                     credUser,
@@ -1258,32 +1324,22 @@ public class XuiV3BotFlowService
                     {
                         ["accountEmail"] = client.Email,
                         ["priceToman"] = resolved.PriceToman,
-                        ["error"] = debitResult.ErrorMessage ?? string.Empty
+                        ["error"] = debitResult.ErrorMessage ?? string.Empty,
+                        ["fallbackWallet"] = "bot_wallet",
+                        ["botBalanceBeforeToman"] = beforeBalance,
+                        ["botBalanceAfterToman"] = afterBalance
                     },
-                    cancellationToken);
-            }
-            else
-            {
-                siteWalletDebitResult = debitResult;
+                    CancellationToken.None);
             }
         }
         else
         {
-            await _credentialsDbContext.Pay(credUser, resolved.PriceToman);
-            afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
-            // Wallet debits are written after the shared credentials balance changes so the
-            // ledger mirrors the persisted before/after balance that admins and users can audit.
-            await _walletLedgerService.RecordAsync(
-                credUser.TelegramUserId,
-                WalletLedgerDirections.Debit,
+            afterBalance = await DebitBotWalletForRenewalAsync(
+                credUser,
                 resolved.PriceToman,
                 beforeBalance,
-                afterBalance,
-                WalletLedgerReasons.AccountRenew,
+                client.Email,
                 provider: "wallet",
-                referenceType: "xui-v3-client",
-                referenceId: client.Email,
-                orderId: null,
                 description: $"XuiV3 renewal {client.Email}",
                 cancellationToken: cancellationToken);
         }
@@ -1305,7 +1361,13 @@ public class XuiV3BotFlowService
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
             text: "✅ تمدید با موفقیت انجام شد.\n\n" +
-                  BuildSelectedWalletBalanceText(useSiteWallet, beforeBalance, resolved.PriceToman, afterBalance, siteWalletDebitResult) +
+                  BuildSelectedWalletBalanceText(
+                      useSiteWallet,
+                      beforeBalance,
+                      resolved.PriceToman,
+                      afterBalance,
+                      siteWalletDebitResult,
+                      siteWalletFallbackToBot) +
                   "\n\n" +
                   BuildV3ClientInfo(client, serverInfo, credUser.IsColleague),
             parseMode: ParseMode.Html,
@@ -1326,6 +1388,7 @@ public class XuiV3BotFlowService
                         : $"حجم اضافه `{renewal.RenewedTrafficGb} GB` - حجم کل پس از تمدید `{XuiV3PurchaseService.FormatTrafficSize(renewal.TotalBytesAfterRenew)}`"
                     : $"حجم اضافه `{resolved.TrafficGb} GB`",
                 $"زمان اضافه `{(resolved.DurationDays <= 0 ? "نامحدود" : $"{resolved.DurationDays} روز")}`",
+                $"روش کسر `{(siteWalletDebitResult?.Success == true ? "کیف پول سایت گذرگاه" : siteWalletFallbackToBot ? "کیف پول ربات - جایگزین خطای سایت" : "کیف پول ربات")}`",
                 $"ریست مصرف `{(renewal.ShouldResetTraffic ? (trafficResetApplied ? "انجام شد" : "ناموفق") : "نیاز نبود")}`",
                 $"سابلینک `{ApiServicev3.BuildSubscriptionLink(serverInfo, client.SubId ?? client.Email)}`",
                 $"کامنت `{client.Comment}`"
@@ -1345,8 +1408,18 @@ public class XuiV3BotFlowService
                 ["finalDurationDays"] = renewal.FinalDurationDays,
                 ["trafficResetApplied"] = trafficResetApplied,
                 ["priceToman"] = resolved.PriceToman,
-                ["balanceBeforeToman"] = beforeBalance,
-                ["balanceAfterToman"] = afterBalance,
+                ["balanceBeforeToman"] = siteWalletDebitResult?.Success == true
+                    ? siteWalletDebitResult.BeforeWallet
+                    : beforeBalance,
+                ["balanceAfterToman"] = siteWalletDebitResult?.Success == true
+                    ? siteWalletDebitResult.AfterWallet
+                    : afterBalance,
+                ["paymentSource"] = siteWalletDebitResult?.Success == true
+                    ? "gozargah_site_wallet"
+                    : siteWalletFallbackToBot
+                        ? "gozargah_site_wallet_fallback_bot_wallet"
+                        : "bot_wallet",
+                ["siteWalletFallbackReason"] = siteWalletFallbackReason ?? string.Empty,
                 ["totalGbAfterRenew"] = client.TotalGB.ConvertBytesToGB(),
                 ["usedGb"] = GetUsedBytes(client).ConvertBytesToGB(),
                 ["expiryShamsi"] = FormatExpiry(client.ExpiryTime),
@@ -1364,6 +1437,59 @@ public class XuiV3BotFlowService
             $"renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
             ResolveGozargahTenantBotId(),
             cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Debits an owned-bot user's local wallet for a completed XUI renewal and appends its audit ledger row.
+    /// </summary>
+    /// <param name="credUser">
+    /// Credentials profile whose shared bot wallet is debited. The balance may become negative; this is required for
+    /// compensation after a selected website-wallet payment fails after XUI renewal.
+    /// </param>
+    /// <param name="amountToman">Positive renewal amount to debit in Iranian toman.</param>
+    /// <param name="beforeBalance">Persisted bot-wallet balance in toman immediately before this debit attempt.</param>
+    /// <param name="clientEmail">XUI client email used as the immutable ledger reference for this renewal.</param>
+    /// <param name="provider">
+    /// Audit provider key. Use <c>wallet</c> for a normal local payment or
+    /// <c>gozargah_site_wallet_fallback_bot_wallet</c> for compensation after website debit failure.
+    /// </param>
+    /// <param name="description">Human-readable administrative ledger description without secrets.</param>
+    /// <param name="cancellationToken">Token used only for the users.db ledger append after the wallet mutation.</param>
+    /// <returns>The persisted local bot-wallet balance in toman after the debit, including a possible negative value.</returns>
+    /// <remarks>
+    /// <see cref="CredentialsDbContext.Pay"/> deliberately applies the debit even when funds are insufficient and
+    /// returns false in that case. This helper therefore does not treat a false value as failure. The credentials.db
+    /// mutation and users.db ledger insert are not one cross-database transaction; callers must invoke this helper only
+    /// once after confirmed XUI success to avoid duplicate charges.
+    /// </remarks>
+    private async Task<long> DebitBotWalletForRenewalAsync(
+        CredUser credUser,
+        long amountToman,
+        long beforeBalance,
+        string clientEmail,
+        string provider,
+        string description,
+        CancellationToken cancellationToken)
+    {
+        await _credentialsDbContext.Pay(credUser, amountToman);
+        var afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
+
+        // Record after the credentials mutation so the append-only users.db ledger mirrors the real persisted balance.
+        await _walletLedgerService.RecordAsync(
+            credUser.TelegramUserId,
+            WalletLedgerDirections.Debit,
+            amountToman,
+            beforeBalance,
+            afterBalance,
+            WalletLedgerReasons.AccountRenew,
+            provider: provider,
+            referenceType: "xui-v3-client",
+            referenceId: clientEmail,
+            orderId: null,
+            description: description,
+            cancellationToken: cancellationToken);
+
+        return afterBalance;
     }
 
     private async Task<bool> ResetRenewedTrafficIfNeededAsync(
@@ -4486,6 +4612,10 @@ public class XuiV3BotFlowService
     /// <param name="siteWalletDebitResult">
     /// Website wallet debit result. Required for site-wallet messages because it contains the website before/after balance.
     /// </param>
+    /// <param name="siteWalletFallbackToBot">
+    /// <c>true</c> when the customer selected the website wallet but the debit failed after renewal and the amount was
+    /// instead debited from the bot wallet, possibly making it negative.
+    /// </param>
     /// <returns>
     /// HTML-safe balance text that names the selected wallet, preventing site-wallet purchases from looking like bot-wallet
     /// debits.
@@ -4493,19 +4623,28 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// The bot wallet and website wallet have different sources of truth. User-facing messages must not show
     /// <c>credentials.db</c> balances after a website-wallet payment, because that incorrectly suggests a double charge.
+    /// When website debit fails and the caller explicitly applied local fallback, the bot-wallet balances are the real
+    /// source of truth and the warning explains why the selected wallet differs from the wallet actually charged.
     /// </remarks>
     private static string BuildSelectedWalletBalanceText(
         bool useSiteWallet,
         long botBeforeBalance,
         long deductedAmount,
         long botAfterBalance,
-        GozargahSiteWalletDebitResult siteWalletDebitResult)
+        GozargahSiteWalletDebitResult siteWalletDebitResult,
+        bool siteWalletFallbackToBot = false)
     {
         if (useSiteWallet && siteWalletDebitResult?.Success == true)
         {
             return $"💳 موجودی کیف پول سایت قبل: <code>{Html(siteWalletDebitResult.BeforeWallet.FormatCurrency())}</code>\n" +
                    $"💸 مبلغ کسر شده از سایت: <code>{Html(deductedAmount.FormatCurrency())}</code>\n" +
                    $"💰 موجودی کیف پول سایت بعد: <code>{Html(siteWalletDebitResult.AfterWallet.FormatCurrency())}</code>";
+        }
+
+        if (useSiteWallet && siteWalletFallbackToBot)
+        {
+            return "⚠️ کسر مبلغ از کیف پول سایت گذرگاه انجام نشد؛ مبلغ از کیف پول ربات کسر شد.\n" +
+                   BuildHtmlBalanceDeductionText(botBeforeBalance, deductedAmount, botAfterBalance);
         }
 
         return BuildHtmlBalanceDeductionText(botBeforeBalance, deductedAmount, botAfterBalance);
