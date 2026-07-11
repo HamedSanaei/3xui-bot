@@ -91,6 +91,10 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - XUI v3 request timeout is controlled by `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`; slow panels can otherwise time out during `/panel/api/clients/add`.
 - XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `429/502/503/504`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
 - XUI v3 account creation treats generated email as the idempotency key. If `addClient` or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
+- XUI v3 link changes are fail-closed before mutation: the shared owned/tenant flow must capture live client fields,
+  actual panel inbound ids, and traffic counters before changing email/subId/UUID. After the update it restores any
+  dropped inbounds or reduced traffic and verifies the complete state by read-back. Website sync and normal success
+  logging run only after verification; an incomplete repair keeps the new identity and emits a critical audit event.
 - XUI v3 creation-result expiry display resolves top-level `ExpiryTime`, nested `Traffic.ExpiryTime`, and client `Extra`
   before falling back to the submitted payload. This protects normal fixed-date accounts from being displayed as
   unlimited when newer 3x-ui responses return a zero top-level expiry field.
@@ -100,8 +104,12 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Owned bot `💻 ارتباط با ادمین` reads only the active bot's `SupportAccount`; it must not leak the default brand's
   support account when the active owned bot has no configured support contact.
 - Operational payment/account logs are delivered through the default owned bot to the central logger channel; include origin bot metadata in the message for non-default owned bots and tenant storefronts.
-- Telegram callbacks can be stale; callback answers must be best-effort and must not crash receivers.
-- Telegram blocked-user, deactivated-user, chat-not-found, and Telegram send-timeout errors are per-user/transient delivery failures; update and polling error handlers must log and swallow them without stack traces so one customer or one slow Telegram reply cannot stop or pollute logs for owned, tenant, or assistant bot receivers.
+- Tenant owner mutation buttons use target-state callbacks plus row revision and an issue timestamp. Legacy invert-state
+  `TBM:TOGGLE*` callbacks are read-only; delayed or repeated buttons must never reverse a newer bot/gateway/join state.
+- Telegram callbacks can be stale; acknowledge long owner operations before external calls and reject expired mutation
+  callbacks without changing state. Owner-panel no-op edits should be detected before calling Telegram.
+- Telegram blocked-user, deactivated-user, chat-not-found, and forbidden errors are definitive per-user delivery
+  failures. `Request timed out` is a transient transport failure and must never be described as an unreachable chat.
 - Telegram `409 getUpdates` conflict means another process/receiver is polling the same token. `MultiBotHostedService` stops only the affected receiver and logs a critical message; operators still need to remove the duplicate deployment, old service, screen/tmux process, or webhook/polling conflict that owns the token.
 - XUI/HTTP `TaskCanceledException`, `TimeoutException`, and `HttpClient.Timeout` during update handling are treated as external operation timeouts. The active bot logs `handle_update_external_timeout` and sends a best-effort retry notice instead of turning the panel delay into a Telegram polling failure.
 - `Domain/Logging/TelegramLogger.cs` truncates plain-text application logs before sending them to Telegram so large exception stacks do not trigger `message is too long` and create secondary logger noise.
@@ -110,7 +118,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   authorization, cookie, API-key, and secret representations and is fail-soft if disk logging is unavailable.
 - In owned customer routing, XUI v3 free-trial messages must be handled before purchase text flow. The trial start clears any half-built purchase session so metered purchases cannot reach summary without `TrafficGb`.
 - Bot token duplication between owned and tenant bots must be rejected or disabled at runtime.
-- `MultiBotHostedService` does a bounded background recovery pass after startup for enabled bots that missed their first Telegram receiver start because of transient `GetMe`/command setup failures. Disabled, duplicate-token, and invalid-token bots are non-retryable; do not replace this with an all-or-nothing startup.
+- `MultiBotHostedService` serializes start/stop/cleanup per `BotId`; never register a receiver outside that lifecycle
+  gate or overwrite its CTS. A transient bounded `GetMe` probe starts one optimistic receiver and completes identity/
+  command setup in the background with `initializing/degraded` status. Invalid and duplicate tokens remain fail-closed.
+- `telegramBotStartupProbeTimeoutSeconds` controls the short Telegram startup/panel probe (default 12 seconds).
+  `SetMyCommands` is background initialization and must not stop an already registered receiver.
 - Super-admins can use `🤖 وضعیت ربات‌ها` to see process-local receiver health for every owned, assistant, and tenant bot. The report comes from `BotRuntimeStatusStore`; it never exposes tokens and does not call Telegram.
 - Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel.
 - `Domain/Logging/TelegramLogger.cs` also applies message-level channel suppression for known noncritical noise: stale Sales Assistant callbacks, unchanged Telegram edits, receipt-photo relay warnings that have a text fallback, repeated tenant forced-join probes, and Telegram polling 5xx/429/timeouts. Payment/audit logs and real token/XUI/settlement failures should still reach the private channel.

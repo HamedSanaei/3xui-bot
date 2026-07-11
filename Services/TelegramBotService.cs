@@ -3789,7 +3789,7 @@ public class TelegramBotService : IHostedService
 
         builder.AppendLine("🤖 وضعیت ربات‌های در حال اجرای سرویس");
         builder.AppendLine($"زمان UTC: {now:yyyy-MM-dd HH:mm:ss}");
-        builder.AppendLine($"خلاصه: {running}/{total} listening, enabled={enabled}");
+        builder.AppendLine($"خلاصه: {running}/{total} receiver running, enabled={enabled}");
         builder.AppendLine();
 
         foreach (var bot in snapshots ?? Array.Empty<BotRuntimeStatusSnapshot>())
@@ -3814,7 +3814,10 @@ public class TelegramBotService : IHostedService
     /// Selects a visual status marker for one runtime bot snapshot.
     /// </summary>
     /// <param name="snapshot">Bot status snapshot shown in the super-admin report.</param>
-    /// <returns>Emoji marker that summarizes the most important state.</returns>
+    /// <returns>
+    /// Emoji marker that distinguishes disabled/missing/failed bots, fully listening receivers, and optimistic
+    /// receivers whose Telegram initialization is still <c>initializing</c> or <c>degraded</c>.
+    /// </returns>
     private static string GetRuntimeBotStatusIcon(BotRuntimeStatusSnapshot snapshot)
     {
         if (snapshot == null)
@@ -3823,6 +3826,12 @@ public class TelegramBotService : IHostedService
             return "⚪";
         if (!snapshot.HasToken)
             return "🟡";
+        if (snapshot.IsReceiverRunning &&
+            (string.Equals(snapshot.Status, "initializing", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(snapshot.Status, "degraded", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "⚠️";
+        }
         if (snapshot.IsReceiverRunning)
             return "✅";
         if (string.Equals(snapshot.Status, "startup_failed", StringComparison.OrdinalIgnoreCase) ||
@@ -6135,27 +6144,20 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
-    /// Detects Telegram polling errors caused by one unreachable user chat or one transient Telegram send timeout.
+    /// Detects Telegram delivery failures that definitively identify an unreachable user chat.
     /// </summary>
     /// <param name="exception">Exception raised by Telegram polling or update handling.</param>
     /// <returns>
-    /// <c>true</c> when the error is a non-fatal blocked-user, deactivated-user, forbidden, chat-not-found, or
-    /// Telegram request-timeout response; otherwise <c>false</c>.
+    /// <c>true</c> when the error is a blocked-user, deactivated-user, forbidden, or chat-not-found response;
+    /// otherwise <c>false</c>. Transport timeouts are intentionally excluded.
     /// </returns>
     /// <remarks>
-    /// These errors are expected when users block an owned bot, a tenant bot, or the sales assistant, and when
-    /// Telegram times out while the bot is sending a non-critical reply. They should be visible in logs but must not
-    /// be treated like infrastructure failures.
+    /// These responses prove that Telegram cannot deliver to that chat. A request timeout proves only a temporary
+    /// transport failure and is instead handled by <see cref="IsExternalOperationTimeout" />, without changing or
+    /// mislabeling user reachability.
     /// </remarks>
     private static bool IsUserDeliveryPollingError(Exception exception)
     {
-        if (exception is RequestException requestException)
-        {
-            var requestMessage = requestException.Message ?? string.Empty;
-            return requestMessage.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
-                   requestMessage.Contains("timed out", StringComparison.OrdinalIgnoreCase);
-        }
-
         if (exception is not ApiRequestException apiException)
             return false;
 

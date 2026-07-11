@@ -3480,6 +3480,27 @@ public class XuiV3BotFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// Changes an owned- or tenant-customer XUI account identity while preserving every non-identity account field,
+    /// attached inbound, and consumed traffic counter.
+    /// </summary>
+    /// <param name="botClient">Telegram client of the owned or tenant bot that received the callback.</param>
+    /// <param name="chatId">Telegram chat id that receives progress, success, or partial-failure messages.</param>
+    /// <param name="messageId">Editable Telegram message id, or zero when a new message must be sent.</param>
+    /// <param name="credUser">
+    /// Shared credentials profile of the customer. Its numeric Telegram id is used as the ownership guard and audit actor.
+    /// </param>
+    /// <param name="clientId">Numeric XUI v3 client id selected from the account list or search results.</param>
+    /// <param name="page">Zero-based account-list/search page restored in result keyboards.</param>
+    /// <param name="fromSearch">Whether the callback originated from account search rather than the account list.</param>
+    /// <param name="cancellationToken">Token that cancels Telegram, XUI, website-sync, and activity-log operations.</param>
+    /// <returns>A task that completes after the identity change is rejected, verified, or reported as partially repaired.</returns>
+    /// <remarks>
+    /// This method is shared by owned and tenant storefront bots and therefore relies on the active bot context for
+    /// tenant isolation. It fails closed before mutation when live inbound or traffic data cannot be captured. After
+    /// XUI accepts the new email, subId, and UUID, the new identity is retained even if reconciliation fails; such a
+    /// partial result is logged as critical and is never reported or synced as a normal success.
+    /// </remarks>
     private async Task HandleAccountChangeLinkCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -3529,38 +3550,21 @@ public class XuiV3BotFlowService
                 return;
             }
 
-            var oldEmail = client.Email ?? string.Empty;
-            var oldUuid = client.Uuid ?? string.Empty;
-            var oldSubId = string.IsNullOrWhiteSpace(client.SubId) ? oldEmail : client.SubId;
-            var oldSubLink = ApiServicev3.BuildSubscriptionLink(serverInfo, oldSubId);
-            var newEmail = GenerateReplacementAccountEmail(allClients, oldEmail);
-            var newUuid = await GenerateReplacementUuidAsync(serverInfo, cancellationToken);
-            var newSubId = newEmail;
-            var newSubLink = ApiServicev3.BuildSubscriptionLink(serverInfo, newSubId);
-            var payload = BuildChangeLinkPayload(client, newEmail, newUuid, credUser.TelegramUserId);
-
-            Console.WriteLine(
-                $"[XUIv3] change link user={credUser.TelegramUserId}, clientId={client.Id}, oldEmail={oldEmail}, newEmail={newEmail}, panel={serverInfo.Url}, rootPath={serverInfo.RootPath}");
-
-            var updateResponse = await ApiServicev3.UpdateClientAsync(
+            var snapshotResult = await CaptureChangeLinkSnapshotAsync(
                 serverInfo,
-                _configuration,
-                oldEmail,
-                payload,
+                client,
                 cancellationToken);
-
-            if (!updateResponse.Success)
+            if (snapshotResult.Snapshot == null)
             {
                 await _activityLog.LogWarningAsync(
-                    "xui_v3_change_link_failed",
+                    "xui_v3_change_link_snapshot_failed",
                     credUser,
                     false,
                     new Dictionary<string, object>
                     {
                         ["clientId"] = client.Id,
-                        ["oldEmail"] = oldEmail,
-                        ["attemptedNewEmail"] = newEmail,
-                        ["message"] = updateResponse.Msg ?? string.Empty,
+                        ["accountEmail"] = client.Email ?? string.Empty,
+                        ["message"] = snapshotResult.ErrorMessage ?? string.Empty,
                         ["panelUrl"] = serverInfo.Url,
                         ["rootPath"] = serverInfo.RootPath
                     },
@@ -3570,18 +3574,166 @@ public class XuiV3BotFlowService
                     botClient,
                     chatId,
                     messageId,
-                    $"تغییر لینک ناموفق بود.\n{updateResponse.Msg}",
+                    "برای جلوگیری از حذف اطلاعات اکانت، تغییر لینک انجام نشد؛ اطلاعات کامل inboundها یا مصرف از پنل دریافت نشد. لطفاً چند دقیقه دیگر دوباره تلاش کنید.",
                     replyMarkup: BuildChangeLinkResultKeyboard(client.Id, page, fromSearch),
                     cancellationToken: cancellationToken);
                 return;
             }
 
-            client.Email = newEmail;
-            client.Uuid = newUuid;
-            client.SubId = newSubId;
-            client.TotalGB = payload.TotalGB;
-            client.ExpiryTime = payload.ExpiryTime;
-            client.Comment = payload.Comment;
+            var snapshot = snapshotResult.Snapshot;
+            client = snapshot.Client;
+
+            var oldEmail = client.Email ?? string.Empty;
+            var oldUuid = client.Uuid ?? string.Empty;
+            var oldSubId = string.IsNullOrWhiteSpace(client.SubId) ? oldEmail : client.SubId;
+            var oldSubLink = ApiServicev3.BuildSubscriptionLink(serverInfo, oldSubId);
+            var newEmail = GenerateReplacementAccountEmail(allClients, oldEmail);
+            var newUuid = await GenerateReplacementUuidAsync(serverInfo, cancellationToken);
+            var newSubId = newEmail;
+            var newSubLink = ApiServicev3.BuildSubscriptionLink(serverInfo, newSubId);
+            var payload = BuildChangeLinkPayload(snapshot, newEmail, newUuid, credUser.TelegramUserId);
+
+            Console.WriteLine(
+                $"[XUIv3] change link user={credUser.TelegramUserId}, clientId={client.Id}, oldEmail={oldEmail}, newEmail={newEmail}, panel={serverInfo.Url}, rootPath={serverInfo.RootPath}");
+
+            XuiV3ApiResponse<Newtonsoft.Json.Linq.JToken> updateResponse = null;
+            Exception updateException = null;
+            try
+            {
+                updateResponse = await ApiServicev3.UpdateClientAsync(
+                    serverInfo,
+                    _configuration,
+                    oldEmail,
+                    payload,
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                updateException = ex;
+            }
+
+            var identityChanged = updateResponse?.Success == true;
+            if (!identityChanged)
+            {
+                // A timeout can happen after XUI commits the update. Probe the new identity before deciding that no
+                // mutation occurred, otherwise the renamed account would skip inbound and traffic reconciliation.
+                identityChanged = await IsChangedLinkIdentityPresentAsync(
+                    serverInfo,
+                    newEmail,
+                    snapshot.ClientId,
+                    cancellationToken);
+            }
+
+            if (!identityChanged)
+            {
+                var updateError = updateResponse?.Msg ?? updateException?.Message ?? "XUI did not confirm the identity update.";
+                await _activityLog.LogWarningAsync(
+                    "xui_v3_change_link_failed",
+                    credUser,
+                    false,
+                    new Dictionary<string, object>
+                    {
+                        ["clientId"] = client.Id,
+                        ["oldEmail"] = oldEmail,
+                        ["attemptedNewEmail"] = newEmail,
+                        ["message"] = updateError,
+                        ["panelUrl"] = serverInfo.Url,
+                        ["rootPath"] = serverInfo.RootPath
+                    },
+                    cancellationToken);
+
+                await SendOrEditTextAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    $"تغییر لینک ناموفق بود.\n{updateError}",
+                    replyMarkup: BuildChangeLinkResultKeyboard(client.Id, page, fromSearch),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (updateException != null || updateResponse?.Success != true)
+            {
+                _logger.LogWarning(
+                    updateException,
+                    "XUI link-change update response was ambiguous, but the new identity was found. clientId={ClientId}, oldEmail={OldEmail}, newEmail={NewEmail}",
+                    snapshot.ClientId,
+                    oldEmail,
+                    newEmail);
+            }
+
+            XuiV3LinkChangePreservationResult preservation;
+            try
+            {
+                preservation = await ReconcileChangedLinkStateAsync(
+                    serverInfo,
+                    snapshot,
+                    payload,
+                    newEmail,
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                preservation = XuiV3LinkChangePreservationResult.Failed(
+                    "reconcile-exception",
+                    ex.Message);
+            }
+            if (!preservation.Success)
+            {
+                var expectedInboundIds = string.Join(",", snapshot.InboundIds);
+                var actualInboundIds = string.Join(",", preservation.ActualInboundIds ?? new List<int>());
+                var failure = new InvalidOperationException(
+                    $"XUI link identity changed but account preservation failed at stage '{preservation.Stage}': {preservation.Message}");
+
+                _logger.LogCritical(
+                    failure,
+                    "XUI link-change preservation failed. botId={BotId}, clientId={ClientId}, oldEmail={OldEmail}, newEmail={NewEmail}, stage={Stage}, expectedInboundIds={ExpectedInboundIds}, actualInboundIds={ActualInboundIds}, expectedUp={ExpectedUp}, expectedDown={ExpectedDown}, actualUp={ActualUp}, actualDown={ActualDown}",
+                    BotContextAccessor.CurrentBotId,
+                    snapshot.ClientId,
+                    oldEmail,
+                    newEmail,
+                    preservation.Stage,
+                    expectedInboundIds,
+                    actualInboundIds,
+                    snapshot.Up,
+                    snapshot.Down,
+                    preservation.Traffic?.Up,
+                    preservation.Traffic?.Down);
+
+                await _activityLog.LogErrorAsync(
+                    "xui_v3_change_link_preservation_failed",
+                    failure,
+                    credUser,
+                    false,
+                    new Dictionary<string, object>
+                    {
+                        ["clientId"] = snapshot.ClientId,
+                        ["oldEmail"] = oldEmail,
+                        ["newEmail"] = newEmail,
+                        ["stage"] = preservation.Stage ?? string.Empty,
+                        ["expectedInboundIds"] = expectedInboundIds,
+                        ["actualInboundIds"] = actualInboundIds,
+                        ["expectedUp"] = snapshot.Up,
+                        ["expectedDown"] = snapshot.Down,
+                        ["actualUp"] = preservation.Traffic?.Up ?? -1,
+                        ["actualDown"] = preservation.Traffic?.Down ?? -1,
+                        ["panelUrl"] = serverInfo.Url,
+                        ["rootPath"] = serverInfo.RootPath
+                    },
+                    cancellationToken);
+
+                await SendOrEditTextAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    BuildChangeLinkPartialFailureText(newEmail, newSubLink),
+                    ParseMode.Html,
+                    BuildChangeLinkRecoveryKeyboard(page, fromSearch),
+                    cancellationToken);
+                return;
+            }
+
+            client = preservation.Client;
             await _gozargahSiteSyncService.QueueRenameAsync(
                 ResolveGozargahSiteOwnerTelegramUserId(credUser),
                 credUser.TelegramUserId,
@@ -3606,6 +3758,10 @@ public class XuiV3BotFlowService
                     ["newUuid"] = newUuid,
                     ["oldSubId"] = oldSubId,
                     ["newSubId"] = newSubId,
+                    ["inboundIdsBefore"] = string.Join(",", snapshot.InboundIds),
+                    ["inboundIdsAfter"] = string.Join(",", preservation.ActualInboundIds),
+                    ["usedBytesBefore"] = snapshot.Up + snapshot.Down,
+                    ["usedBytesAfter"] = (preservation.Traffic?.Up ?? 0) + (preservation.Traffic?.Down ?? 0),
                     ["usedGb"] = GetUsedBytes(client).ConvertBytesToGB(),
                     ["totalGb"] = GetTotalBytes(client).ConvertBytesToGB(),
                     ["expiryShamsi"] = FormatExpiry(GetExpiryTime(client)),
@@ -5872,18 +6028,471 @@ public class XuiV3BotFlowService
         return Guid.NewGuid().ToString();
     }
 
+    /// <summary>
+    /// Captures an immutable, live panel snapshot required before an account identity can be changed safely.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel that owns the selected client.</param>
+    /// <param name="listClient">
+    /// Client selected from the live <c>clients/list</c> response after ownership validation. Metadata-only inbound
+    /// information is intentionally ignored.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels direct client and traffic reads from XUI.</param>
+    /// <returns>
+    /// A capture result containing the immutable snapshot, or an error message with a null snapshot when live inbound
+    /// ids or traffic counters cannot be established. Callers must not mutate the account when the snapshot is null.
+    /// </returns>
+    /// <remarks>
+    /// The list and direct-client responses are merged because 3x-ui versions can omit different fields from either
+    /// endpoint. At least one live inbound id and a real traffic object are mandatory; comment metadata is never used
+    /// as a fallback for those safety-critical values.
+    /// </remarks>
+    private async Task<XuiV3LinkChangeSnapshotCaptureResult> CaptureChangeLinkSnapshotAsync(
+        ServerInfo serverInfo,
+        XuiV3Client listClient,
+        CancellationToken cancellationToken)
+    {
+        XuiV3LinkChangeLiveStateResult liveState;
+        try
+        {
+            liveState = await ReadLiveChangeLinkStateAsync(
+                serverInfo,
+                listClient?.Email,
+                listClient,
+                requireInboundIds: true,
+                requireTraffic: true,
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "XUI link-change snapshot read failed before mutation. clientId={ClientId}, email={Email}",
+                listClient?.Id,
+                listClient?.Email);
+            return XuiV3LinkChangeSnapshotCaptureResult.Failed(ex.Message);
+        }
+        if (liveState.State == null)
+            return XuiV3LinkChangeSnapshotCaptureResult.Failed(liveState.ErrorMessage);
+
+        return XuiV3LinkChangeSnapshotCaptureResult.Captured(new XuiV3LinkChangeSnapshot
+        {
+            ClientId = liveState.State.Client.Id,
+            Client = CloneChangeLinkClient(liveState.State.Client),
+            InboundIds = liveState.State.InboundIds.ToList(),
+            Up = liveState.State.Traffic.Up,
+            Down = liveState.State.Traffic.Down
+        });
+    }
+
+    /// <summary>
+    /// Determines whether an ambiguous XUI update already committed the requested account identity.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel on which the update was attempted.</param>
+    /// <param name="newEmail">New email used as the identity lookup key after the uncertain update response.</param>
+    /// <param name="expectedClientId">Original numeric XUI client id that must still identify the renamed account.</param>
+    /// <param name="cancellationToken">Token that cancels the recovery read without changing panel state.</param>
+    /// <returns>
+    /// <c>true</c> when the new email resolves to the same numeric client id; otherwise <c>false</c>, including when
+    /// the recovery read itself cannot establish the result.
+    /// </returns>
+    /// <remarks>
+    /// XUI can commit an update before a TLS or timeout failure reaches the bot. This read-only probe prevents such
+    /// an account from bypassing the mandatory inbound and traffic reconciliation. It never retries the identity
+    /// mutation and therefore cannot create a duplicate rename.
+    /// </remarks>
+    private async Task<bool> IsChangedLinkIdentityPresentAsync(
+        ServerInfo serverInfo,
+        string newEmail,
+        int expectedClientId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var liveResult = await ReadLiveChangeLinkStateAsync(
+                serverInfo,
+                newEmail,
+                knownListClient: null,
+                requireInboundIds: false,
+                requireTraffic: false,
+                cancellationToken);
+            return liveResult.State?.Client?.Id == expectedClientId;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "XUI link-change ambiguous update probe failed. clientId={ClientId}, newEmail={NewEmail}",
+                expectedClientId,
+                newEmail);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Reads and merges current client, inbound, and traffic state from live XUI endpoints.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel descriptor.</param>
+    /// <param name="email">Current XUI client email used by direct client and traffic endpoints.</param>
+    /// <param name="knownListClient">
+    /// Optional client already obtained from the same operation's live list response. Pass null after identity update
+    /// so this method refreshes the list by the new email.
+    /// </param>
+    /// <param name="requireInboundIds">Whether an empty live inbound set must make the read fail.</param>
+    /// <param name="requireTraffic">Whether absence of a live traffic object must make the read fail.</param>
+    /// <param name="cancellationToken">Token that cancels XUI list, direct-client, and traffic requests.</param>
+    /// <returns>
+    /// A live-state result. Its client is a detached canonical merge and may have an empty inbound list or null traffic
+    /// only when the corresponding requirement parameter is false.
+    /// </returns>
+    /// <remarks>
+    /// This method never reads inbound ids from the JSON comment. It is used both for the pre-change fail-closed
+    /// snapshot and post-change repair reads where an empty set is precisely the condition that must be repaired.
+    /// </remarks>
+    private async Task<XuiV3LinkChangeLiveStateResult> ReadLiveChangeLinkStateAsync(
+        ServerInfo serverInfo,
+        string email,
+        XuiV3Client knownListClient,
+        bool requireInboundIds,
+        bool requireTraffic,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+            return XuiV3LinkChangeLiveStateResult.Failed("Client email is missing.");
+
+        XuiV3Client listClient = knownListClient;
+        if (listClient == null || !string.Equals(listClient.Email, email, StringComparison.OrdinalIgnoreCase))
+        {
+            var listResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+            if (listResponse.Success)
+            {
+                listClient = listResponse.Obj?.FirstOrDefault(item =>
+                    string.Equals(item.Email?.Trim(), email.Trim(), StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        XuiV3Client directClient = null;
+        var directResponse = await ApiServicev3.GetClientAsync(serverInfo, _configuration, email, cancellationToken);
+        if (directResponse.Success)
+            directClient = directResponse.Obj;
+
+        if (listClient == null && directClient == null)
+            return XuiV3LinkChangeLiveStateResult.Failed("Client could not be read from list or direct XUI endpoints.");
+
+        var inboundIds = (listClient?.InboundIds ?? Enumerable.Empty<int>())
+            .Concat(directClient?.InboundIds ?? Enumerable.Empty<int>())
+            .Where(id => id > 0)
+            .Distinct()
+            .OrderBy(id => id)
+            .ToList();
+        if (requireInboundIds && inboundIds.Count == 0)
+            return XuiV3LinkChangeLiveStateResult.Failed("Live XUI endpoints returned no attached inbound ids.");
+
+        XuiV3ClientTraffic traffic = null;
+        var trafficResponse = await ApiServicev3.GetClientTrafficAsync(serverInfo, _configuration, email, cancellationToken);
+        if (trafficResponse.Success && trafficResponse.Obj != null)
+            traffic = CloneClientTraffic(trafficResponse.Obj);
+        else if (listClient?.Traffic != null)
+            traffic = CloneClientTraffic(listClient.Traffic);
+        else if (directClient?.Traffic != null)
+            traffic = CloneClientTraffic(directClient.Traffic);
+
+        if (requireTraffic && traffic == null)
+            return XuiV3LinkChangeLiveStateResult.Failed("Live XUI endpoints returned no traffic counters.");
+
+        var canonicalClient = BuildCanonicalChangeLinkClient(listClient, directClient, inboundIds, traffic);
+        return XuiV3LinkChangeLiveStateResult.Loaded(new XuiV3LinkChangeLiveState
+        {
+            Client = canonicalClient,
+            InboundIds = inboundIds,
+            Traffic = traffic
+        });
+    }
+
+    /// <summary>
+    /// Reconciles every preserved field after XUI accepts a new email, subId, and UUID, then performs a final read-back.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel that contains the renamed client.</param>
+    /// <param name="snapshot">Immutable pre-change snapshot containing expected fields, inbounds, and traffic.</param>
+    /// <param name="expectedPayload">Replacement payload with the new identity and all preserved snapshot fields.</param>
+    /// <param name="newEmail">New XUI email used for all post-change endpoints.</param>
+    /// <param name="cancellationToken">Token that cancels repair and verification API calls.</param>
+    /// <returns>
+    /// Success with the final verified client, inbound ids, and traffic; otherwise a stage-specific failure that keeps
+    /// the new identity in place and gives the caller enough non-secret context for critical logging.
+    /// </returns>
+    /// <remarks>
+    /// One corrective client update is allowed before inbound repair. Missing inbounds are attached and unexpected
+    /// inbounds are detached. Traffic is restored only when a counter decreased, using the greater of current and
+    /// snapshot values so legitimate traffic accrued during the operation is never reduced.
+    /// </remarks>
+    private async Task<XuiV3LinkChangePreservationResult> ReconcileChangedLinkStateAsync(
+        ServerInfo serverInfo,
+        XuiV3LinkChangeSnapshot snapshot,
+        XuiV3ClientPayload expectedPayload,
+        string newEmail,
+        CancellationToken cancellationToken)
+    {
+        var stateResult = await ReadLiveChangeLinkStateAsync(
+            serverInfo,
+            newEmail,
+            knownListClient: null,
+            requireInboundIds: false,
+            requireTraffic: false,
+            cancellationToken);
+        if (stateResult.State == null)
+            return XuiV3LinkChangePreservationResult.Failed("post-update-read", stateResult.ErrorMessage);
+
+        var state = stateResult.State;
+        if (!HasPreservedChangeLinkFields(state.Client, snapshot.ClientId, expectedPayload))
+        {
+            var correctiveResponse = await ApiServicev3.UpdateClientAsync(
+                serverInfo,
+                _configuration,
+                newEmail,
+                expectedPayload,
+                cancellationToken);
+            if (!correctiveResponse.Success)
+            {
+                return XuiV3LinkChangePreservationResult.Failed(
+                    "corrective-update",
+                    correctiveResponse.Msg,
+                    state);
+            }
+
+            stateResult = await ReadLiveChangeLinkStateAsync(
+                serverInfo,
+                newEmail,
+                knownListClient: null,
+                requireInboundIds: false,
+                requireTraffic: false,
+                cancellationToken);
+            if (stateResult.State == null)
+                return XuiV3LinkChangePreservationResult.Failed("corrective-read", stateResult.ErrorMessage);
+            state = stateResult.State;
+        }
+
+        var expectedInboundIds = snapshot.InboundIds.OrderBy(id => id).ToList();
+        var missingInboundIds = expectedInboundIds.Except(state.InboundIds).ToList();
+        if (missingInboundIds.Count > 0)
+        {
+            var attachResponse = await ApiServicev3.AttachClientAsync(
+                serverInfo,
+                _configuration,
+                newEmail,
+                missingInboundIds,
+                cancellationToken);
+            if (!attachResponse.Success)
+                return XuiV3LinkChangePreservationResult.Failed("attach-inbounds", attachResponse.Msg, state);
+        }
+
+        var unexpectedInboundIds = state.InboundIds.Except(expectedInboundIds).ToList();
+        if (unexpectedInboundIds.Count > 0)
+        {
+            var detachResponse = await ApiServicev3.DetachClientAsync(
+                serverInfo,
+                _configuration,
+                newEmail,
+                unexpectedInboundIds,
+                cancellationToken);
+            if (!detachResponse.Success)
+                return XuiV3LinkChangePreservationResult.Failed("detach-inbounds", detachResponse.Msg, state);
+        }
+
+        stateResult = await ReadLiveChangeLinkStateAsync(
+            serverInfo,
+            newEmail,
+            knownListClient: null,
+            requireInboundIds: true,
+            requireTraffic: true,
+            cancellationToken);
+        if (stateResult.State == null)
+            return XuiV3LinkChangePreservationResult.Failed("post-inbound-read", stateResult.ErrorMessage);
+        state = stateResult.State;
+
+        if (state.Traffic.Up < snapshot.Up || state.Traffic.Down < snapshot.Down)
+        {
+            var preservedUp = Math.Max(state.Traffic.Up, snapshot.Up);
+            var preservedDown = Math.Max(state.Traffic.Down, snapshot.Down);
+            var trafficResponse = await ApiServicev3.UpdateClientTrafficAsync(
+                serverInfo,
+                _configuration,
+                newEmail,
+                preservedUp,
+                preservedDown,
+                cancellationToken);
+            if (!trafficResponse.Success)
+                return XuiV3LinkChangePreservationResult.Failed("restore-traffic", trafficResponse.Msg, state);
+        }
+
+        var finalResult = await ReadLiveChangeLinkStateAsync(
+            serverInfo,
+            newEmail,
+            knownListClient: null,
+            requireInboundIds: true,
+            requireTraffic: true,
+            cancellationToken);
+        if (finalResult.State == null)
+            return XuiV3LinkChangePreservationResult.Failed("final-read", finalResult.ErrorMessage, state);
+
+        var finalState = finalResult.State;
+        if (!HasPreservedChangeLinkFields(finalState.Client, snapshot.ClientId, expectedPayload))
+            return XuiV3LinkChangePreservationResult.Failed("final-fields", "One or more preserved client fields differ after correction.", finalState);
+        if (!finalState.InboundIds.SequenceEqual(expectedInboundIds))
+            return XuiV3LinkChangePreservationResult.Failed("final-inbounds", "Attached inbound ids differ from the pre-change snapshot.", finalState);
+        if (finalState.Traffic.Up < snapshot.Up || finalState.Traffic.Down < snapshot.Down)
+            return XuiV3LinkChangePreservationResult.Failed("final-traffic", "Traffic counters are lower than the pre-change snapshot.", finalState);
+
+        return XuiV3LinkChangePreservationResult.Verified(finalState);
+    }
+
+    /// <summary>
+    /// Builds a canonical detached client from list and direct XUI responses without using comment metadata for live state.
+    /// </summary>
+    /// <param name="listClient">Client returned by the live list endpoint, or null.</param>
+    /// <param name="directClient">Client returned by the direct email endpoint, or null.</param>
+    /// <param name="inboundIds">Union of positive inbound ids returned by live XUI endpoints.</param>
+    /// <param name="traffic">Traffic counters returned by the traffic/list/direct endpoint, or null during repair reads.</param>
+    /// <returns>A detached client containing the richest available panel fields and cloned mutable JSON values.</returns>
+    private static XuiV3Client BuildCanonicalChangeLinkClient(
+        XuiV3Client listClient,
+        XuiV3Client directClient,
+        IReadOnlyCollection<int> inboundIds,
+        XuiV3ClientTraffic traffic)
+    {
+        var primary = listClient ?? directClient;
+        var secondary = ReferenceEquals(primary, listClient) ? directClient : listClient;
+        var primaryTotal = GetTotalBytes(primary);
+        var secondaryTotal = GetTotalBytes(secondary);
+        var primaryExpiry = GetExpiryTime(primary);
+        var secondaryExpiry = GetExpiryTime(secondary);
+        var ownerTelegramUserId = GetClientOwnerTelegramId(primary);
+        if (ownerTelegramUserId <= 0)
+            ownerTelegramUserId = GetClientOwnerTelegramId(secondary);
+
+        return new XuiV3Client
+        {
+            Id = primary?.Id > 0 ? primary.Id : secondary?.Id ?? 0,
+            Email = FirstChangeLinkValue(primary?.Email, secondary?.Email),
+            Uuid = FirstChangeLinkValue(primary?.Uuid, secondary?.Uuid),
+            Password = FirstChangeLinkValue(primary?.Password, secondary?.Password),
+            TotalGB = primaryTotal != 0 ? primaryTotal : secondaryTotal,
+            ExpiryTime = primaryExpiry != 0 ? primaryExpiry : secondaryExpiry,
+            TgId = ownerTelegramUserId,
+            LimitIp = primary?.LimitIp ?? secondary?.LimitIp ?? 0,
+            Enable = primary?.Enable ?? secondary?.Enable ?? true,
+            SubId = FirstChangeLinkValue(primary?.SubId, secondary?.SubId, primary?.Email, secondary?.Email),
+            Flow = FirstChangeLinkValue(primary?.Flow, secondary?.Flow),
+            Comment = FirstChangeLinkValue(primary?.Comment, secondary?.Comment),
+            Group = FirstChangeLinkValue(primary?.Group, secondary?.Group),
+            Reverse = (primary?.Reverse ?? secondary?.Reverse)?.DeepClone(),
+            Extra = MergeChangeLinkExtra(secondary?.Extra, primary?.Extra),
+            InboundIds = inboundIds?.Where(id => id > 0).Distinct().OrderBy(id => id).ToList() ?? new List<int>(),
+            Traffic = CloneClientTraffic(traffic)
+        };
+    }
+
+    /// <summary>
+    /// Determines whether the post-change client still matches every preserved identity-independent field.
+    /// </summary>
+    /// <param name="actualClient">Live post-change client read from XUI.</param>
+    /// <param name="expectedClientId">Numeric XUI client id captured before the identity change.</param>
+    /// <param name="expectedPayload">Payload containing the new identity and preserved snapshot values.</param>
+    /// <returns><c>true</c> when all stable fields and expected extension-data values are preserved.</returns>
+    private static bool HasPreservedChangeLinkFields(
+        XuiV3Client actualClient,
+        int expectedClientId,
+        XuiV3ClientPayload expectedPayload)
+    {
+        if (actualClient == null || expectedPayload == null)
+            return false;
+
+        return actualClient.Id == expectedClientId &&
+               ChangeLinkTextEquals(actualClient.Email, expectedPayload.Email) &&
+               ChangeLinkTextEquals(actualClient.Uuid, expectedPayload.Uuid) &&
+               ChangeLinkTextEquals(actualClient.Password, expectedPayload.Password) &&
+               GetTotalBytes(actualClient) == expectedPayload.TotalGB &&
+               GetExpiryTime(actualClient) == expectedPayload.ExpiryTime &&
+               GetClientOwnerTelegramId(actualClient) == expectedPayload.TgId &&
+               actualClient.LimitIp == expectedPayload.LimitIp &&
+               actualClient.Enable == expectedPayload.Enable &&
+               ChangeLinkTextEquals(actualClient.SubId, expectedPayload.SubId) &&
+               ChangeLinkTextEquals(actualClient.Flow, expectedPayload.Flow) &&
+               ChangeLinkTextEquals(actualClient.Comment, expectedPayload.Comment) &&
+               ChangeLinkTextEquals(actualClient.Group, expectedPayload.Group) &&
+               Newtonsoft.Json.Linq.JToken.DeepEquals(actualClient.Reverse, expectedPayload.Reverse) &&
+               IsChangeLinkExtraPreserved(expectedPayload.Extra, actualClient.Extra);
+    }
+
+    /// <summary>
+    /// Checks expected panel extension-data keys while tolerating panel-added fields and equivalent allowed-IP shapes.
+    /// </summary>
+    /// <param name="expected">Extension data captured before the identity change.</param>
+    /// <param name="actual">Extension data returned after the identity change.</param>
+    /// <returns><c>true</c> when every stable expected key remains semantically equivalent.</returns>
+    /// <remarks>
+    /// Dynamic traffic keys are verified through the dedicated traffic endpoint and are excluded here. The
+    /// <c>allowedIPs</c> field may be normalized by the shared API boundary from a string to an array.
+    /// </remarks>
+    private static bool IsChangeLinkExtraPreserved(
+        IDictionary<string, Newtonsoft.Json.Linq.JToken> expected,
+        IDictionary<string, Newtonsoft.Json.Linq.JToken> actual)
+    {
+        if (expected == null || expected.Count == 0)
+            return true;
+        if (actual == null)
+            return false;
+
+        foreach (var pair in expected)
+        {
+            if (IsDynamicChangeLinkExtraKey(pair.Key))
+                continue;
+
+            var actualPair = actual.FirstOrDefault(item =>
+                string.Equals(item.Key, pair.Key, StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(actualPair.Key))
+                return false;
+
+            if (string.Equals(pair.Key, "allowedIPs", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!NormalizeAllowedIpToken(pair.Value).SequenceEqual(NormalizeAllowedIpToken(actualPair.Value)))
+                    return false;
+                continue;
+            }
+
+            if (!Newtonsoft.Json.Linq.JToken.DeepEquals(pair.Value, actualPair.Value))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Creates the replacement payload that changes only email, subId, UUID, and audit metadata.
+    /// </summary>
+    /// <param name="snapshot">Immutable live snapshot captured before mutation.</param>
+    /// <param name="newEmail">New unique XUI email and subscription id.</param>
+    /// <param name="newUuid">New XUI protocol UUID generated by the panel or secure local fallback.</param>
+    /// <param name="actorTelegramUserId">Numeric Telegram id of the customer requesting the link change.</param>
+    /// <returns>A complete replacement payload preserving all non-identity fields from the snapshot.</returns>
+    /// <remarks>
+    /// Parsed metadata receives only link-change audit updates and the live inbound snapshot. User comments, tenant
+    /// ownership, plan fields, historical renewals, limits, and all other metadata remain unchanged.
+    /// </remarks>
     private static XuiV3ClientPayload BuildChangeLinkPayload(
-        XuiV3Client client,
+        XuiV3LinkChangeSnapshot snapshot,
         string newEmail,
         string newUuid,
         long actorTelegramUserId)
     {
+        var client = snapshot.Client;
         var metadata = TryReadMetadata(client.Comment);
         var comment = client.Comment;
         if (metadata != null)
         {
             metadata.LastUpdatedByTelegramUserId = actorTelegramUserId;
+            metadata.LastUpdatedByBotId = BotContextAccessor.CurrentBotId;
             metadata.LastAction = "change-link";
+            metadata.InboundIds = snapshot.InboundIds.ToList();
             comment = JsonConvert.SerializeObject(metadata, Formatting.None);
         }
 
@@ -5911,9 +6520,343 @@ public class XuiV3BotFlowService
             Flow = client.Flow,
             Comment = comment,
             Group = client.Group,
-            Reverse = client.Reverse,
-            Extra = client.Extra
+            Reverse = client.Reverse?.DeepClone(),
+            Extra = CloneChangeLinkExtra(client.Extra)
         };
+    }
+
+    /// <summary>
+    /// Builds the warning shown when XUI changed the identity but final preservation could not be verified.
+    /// </summary>
+    /// <param name="newEmail">New XUI email retained by the panel.</param>
+    /// <param name="newSubLink">New subscription link derived from the retained subId.</param>
+    /// <returns>HTML-safe Persian warning that avoids claiming normal success.</returns>
+    private static string BuildChangeLinkPartialFailureText(string newEmail, string newSubLink)
+    {
+        return "⚠️ <b>تغییر لینک کامل تأیید نشد.</b>\n\n" +
+               "شناسه‌های جدید روی پنل ثبت شده‌اند، اما حفظ کامل inboundها یا مصرف اکانت تأیید نشد. " +
+               "تا زمان بررسی پشتیبانی از لینک جدید استفاده نکنید.\n\n" +
+               $"اکانت جدید: <code>{Html(newEmail)}</code>\n" +
+               $"سابلینک جدید: <code>{Html(newSubLink)}</code>";
+    }
+
+    /// <summary>
+    /// Builds navigation for a partially completed link change without offering stale client-id actions.
+    /// </summary>
+    /// <param name="page">Zero-based list/search page to restore.</param>
+    /// <param name="fromSearch">Whether navigation should return to search results.</param>
+    /// <returns>Inline keyboard containing list/search navigation and the main-menu action.</returns>
+    private static InlineKeyboardMarkup BuildChangeLinkRecoveryKeyboard(int page, bool fromSearch)
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    fromSearch ? "بازگشت به نتایج جستجو" : "بازگشت به لیست",
+                    fromSearch
+                        ? XuiV3PurchaseCallbacks.AccountSearchList(page)
+                        : XuiV3PurchaseCallbacks.AccountList(page))
+            },
+            new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) }
+        });
+    }
+
+    /// <summary>
+    /// Returns the first non-empty string from panel response candidates.
+    /// </summary>
+    /// <param name="values">Ordered candidate values from list and direct XUI responses.</param>
+    /// <returns>The first non-whitespace value, or null when all candidates are empty.</returns>
+    private static string FirstChangeLinkValue(params string[] values)
+        => values?.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+
+    /// <summary>
+    /// Compares nullable panel strings while treating null and empty values as equivalent.
+    /// </summary>
+    /// <param name="left">First panel value.</param>
+    /// <param name="right">Second panel value.</param>
+    /// <returns><c>true</c> when trimmed values are ordinally equal.</returns>
+    private static bool ChangeLinkTextEquals(string left, string right)
+        => string.Equals((left ?? string.Empty).Trim(), (right ?? string.Empty).Trim(), StringComparison.Ordinal);
+
+    /// <summary>
+    /// Clones and merges extension data without exposing or mutating the source panel objects.
+    /// </summary>
+    /// <param name="fallback">Lower-priority extension data, usually from the direct endpoint.</param>
+    /// <param name="preferred">Higher-priority extension data, usually from the list endpoint.</param>
+    /// <returns>A detached ordinal-key dictionary, or null when both inputs are empty.</returns>
+    private static IDictionary<string, Newtonsoft.Json.Linq.JToken> MergeChangeLinkExtra(
+        IDictionary<string, Newtonsoft.Json.Linq.JToken> fallback,
+        IDictionary<string, Newtonsoft.Json.Linq.JToken> preferred)
+    {
+        if ((fallback == null || fallback.Count == 0) && (preferred == null || preferred.Count == 0))
+            return null;
+
+        var result = new Dictionary<string, Newtonsoft.Json.Linq.JToken>(StringComparer.Ordinal);
+        foreach (var pair in fallback ?? new Dictionary<string, Newtonsoft.Json.Linq.JToken>())
+            result[pair.Key] = pair.Value?.DeepClone();
+        foreach (var pair in preferred ?? new Dictionary<string, Newtonsoft.Json.Linq.JToken>())
+            result[pair.Key] = pair.Value?.DeepClone();
+        return result;
+    }
+
+    /// <summary>
+    /// Clones one extension-data dictionary for an immutable snapshot or outgoing replacement payload.
+    /// </summary>
+    /// <param name="source">Panel extension data that may contain protocol-specific values.</param>
+    /// <returns>A detached clone, or null when the source is null.</returns>
+    private static IDictionary<string, Newtonsoft.Json.Linq.JToken> CloneChangeLinkExtra(
+        IDictionary<string, Newtonsoft.Json.Linq.JToken> source)
+        => source?.ToDictionary(pair => pair.Key, pair => pair.Value?.DeepClone(), StringComparer.Ordinal);
+
+    /// <summary>
+    /// Deep-clones a canonical client so later update responses cannot mutate the pre-change snapshot.
+    /// </summary>
+    /// <param name="client">Canonical live client captured before mutation.</param>
+    /// <returns>A detached client preserving scalar, JSON, inbound, and traffic values.</returns>
+    private static XuiV3Client CloneChangeLinkClient(XuiV3Client client)
+    {
+        if (client == null)
+            return null;
+
+        return new XuiV3Client
+        {
+            Id = client.Id,
+            Email = client.Email,
+            Uuid = client.Uuid,
+            Password = client.Password,
+            TotalGB = client.TotalGB,
+            ExpiryTime = client.ExpiryTime,
+            TgId = client.TgId,
+            LimitIp = client.LimitIp,
+            Enable = client.Enable,
+            SubId = client.SubId,
+            Flow = client.Flow,
+            Comment = client.Comment,
+            Group = client.Group,
+            Reverse = client.Reverse?.DeepClone(),
+            Extra = CloneChangeLinkExtra(client.Extra),
+            InboundIds = client.InboundIds?.ToList() ?? new List<int>(),
+            Traffic = CloneClientTraffic(client.Traffic)
+        };
+    }
+
+    /// <summary>
+    /// Clones nullable traffic counters used by snapshot and verification results.
+    /// </summary>
+    /// <param name="traffic">Live XUI traffic object, or null during an incomplete repair read.</param>
+    /// <returns>A detached traffic object, or null when <paramref name="traffic"/> is null.</returns>
+    private static XuiV3ClientTraffic CloneClientTraffic(XuiV3ClientTraffic traffic)
+    {
+        if (traffic == null)
+            return null;
+
+        return new XuiV3ClientTraffic
+        {
+            Email = traffic.Email,
+            Up = traffic.Up,
+            Down = traffic.Down,
+            Total = traffic.Total,
+            TotalGB = traffic.TotalGB,
+            ExpiryTime = traffic.ExpiryTime,
+            Enable = traffic.Enable
+        };
+    }
+
+    /// <summary>
+    /// Identifies extension-data keys whose values are verified through dedicated XUI traffic fields instead.
+    /// </summary>
+    /// <param name="key">Extension-data key returned by the panel.</param>
+    /// <returns><c>true</c> for dynamic usage fields that should not participate in static-field equality.</returns>
+    private static bool IsDynamicChangeLinkExtraKey(string key)
+        => string.Equals(key, "up", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(key, "down", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(key, "total", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Converts allowed-IP extension values into a stable ordered sequence for semantic comparison.
+    /// </summary>
+    /// <param name="token">String, JSON-array string, array, or null value returned by XUI.</param>
+    /// <returns>Distinct non-empty entries sorted ordinally.</returns>
+    private static IReadOnlyList<string> NormalizeAllowedIpToken(Newtonsoft.Json.Linq.JToken token)
+    {
+        if (token == null || token.Type == Newtonsoft.Json.Linq.JTokenType.Null)
+            return Array.Empty<string>();
+
+        IEnumerable<string> values;
+        if (token is Newtonsoft.Json.Linq.JArray array)
+        {
+            values = array.Select(item => item?.ToString());
+        }
+        else
+        {
+            var raw = token.ToString().Trim();
+            if (raw.StartsWith("[", StringComparison.Ordinal))
+            {
+                try
+                {
+                    values = Newtonsoft.Json.Linq.JArray.Parse(raw).Select(item => item?.ToString());
+                }
+                catch (JsonReaderException)
+                {
+                    values = raw.Split(new[] { ',', ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                }
+            }
+            else
+            {
+                values = raw.Split(new[] { ',', ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            }
+        }
+
+        return values
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(value => value, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Immutable pre-change state used to preserve one XUI client across an identity replacement.
+    /// </summary>
+    private sealed class XuiV3LinkChangeSnapshot
+    {
+        /// <summary>Numeric XUI client id that must remain stable after the identity change.</summary>
+        public int ClientId { get; set; }
+
+        /// <summary>Detached canonical client containing every non-identity field captured from live panel responses.</summary>
+        public XuiV3Client Client { get; set; }
+
+        /// <summary>Sorted, distinct inbound ids attached to the client before mutation.</summary>
+        public List<int> InboundIds { get; set; } = new List<int>();
+
+        /// <summary>Uploaded bytes captured before mutation.</summary>
+        public long Up { get; set; }
+
+        /// <summary>Downloaded bytes captured before mutation.</summary>
+        public long Down { get; set; }
+    }
+
+    /// <summary>
+    /// Result of the fail-closed snapshot operation that runs before any XUI identity mutation.
+    /// </summary>
+    private sealed class XuiV3LinkChangeSnapshotCaptureResult
+    {
+        /// <summary>Captured immutable snapshot, or null when live state was incomplete.</summary>
+        public XuiV3LinkChangeSnapshot Snapshot { get; private set; }
+
+        /// <summary>Non-secret diagnostic reason when <see cref="Snapshot"/> is null.</summary>
+        public string ErrorMessage { get; private set; }
+
+        /// <summary>Creates a successful snapshot result.</summary>
+        /// <param name="snapshot">Complete snapshot with live inbound and traffic data.</param>
+        /// <returns>A result whose <see cref="Snapshot"/> is non-null.</returns>
+        public static XuiV3LinkChangeSnapshotCaptureResult Captured(XuiV3LinkChangeSnapshot snapshot)
+            => new() { Snapshot = snapshot };
+
+        /// <summary>Creates a failed snapshot result that forbids identity mutation.</summary>
+        /// <param name="errorMessage">Non-secret reason live state could not be established.</param>
+        /// <returns>A result whose <see cref="Snapshot"/> is null.</returns>
+        public static XuiV3LinkChangeSnapshotCaptureResult Failed(string errorMessage)
+            => new() { ErrorMessage = errorMessage };
+    }
+
+    /// <summary>
+    /// Canonical live state returned by XUI reads during snapshot capture and post-change verification.
+    /// </summary>
+    private sealed class XuiV3LinkChangeLiveState
+    {
+        /// <summary>Detached canonical client assembled from list and direct-client responses.</summary>
+        public XuiV3Client Client { get; set; }
+
+        /// <summary>Sorted, distinct inbound ids returned by live panel endpoints.</summary>
+        public List<int> InboundIds { get; set; } = new List<int>();
+
+        /// <summary>Current traffic counters, or null only during repair reads that allow missing traffic.</summary>
+        public XuiV3ClientTraffic Traffic { get; set; }
+    }
+
+    /// <summary>
+    /// Result wrapper for a live XUI state read.
+    /// </summary>
+    private sealed class XuiV3LinkChangeLiveStateResult
+    {
+        /// <summary>Canonical live state, or null when required panel data could not be read.</summary>
+        public XuiV3LinkChangeLiveState State { get; private set; }
+
+        /// <summary>Non-secret diagnostic reason when <see cref="State"/> is null.</summary>
+        public string ErrorMessage { get; private set; }
+
+        /// <summary>Creates a successful live-state result.</summary>
+        /// <param name="state">Canonical state loaded from current panel responses.</param>
+        /// <returns>A result whose <see cref="State"/> is non-null.</returns>
+        public static XuiV3LinkChangeLiveStateResult Loaded(XuiV3LinkChangeLiveState state)
+            => new() { State = state };
+
+        /// <summary>Creates a failed live-state result.</summary>
+        /// <param name="errorMessage">Non-secret panel read or validation failure.</param>
+        /// <returns>A result whose <see cref="State"/> is null.</returns>
+        public static XuiV3LinkChangeLiveStateResult Failed(string errorMessage)
+            => new() { ErrorMessage = errorMessage };
+    }
+
+    /// <summary>
+    /// Final result of post-change correction, inbound reconciliation, traffic restoration, and verification.
+    /// </summary>
+    private sealed class XuiV3LinkChangePreservationResult
+    {
+        /// <summary>Whether every required field, inbound, and traffic invariant passed final verification.</summary>
+        public bool Success { get; private set; }
+
+        /// <summary>Repair or verification stage that failed, or <c>verified</c> after success.</summary>
+        public string Stage { get; private set; }
+
+        /// <summary>Non-secret panel or invariant message associated with a failed stage.</summary>
+        public string Message { get; private set; }
+
+        /// <summary>Latest canonical client available when the result was created.</summary>
+        public XuiV3Client Client { get; private set; }
+
+        /// <summary>Latest live inbound ids available for critical audit logging.</summary>
+        public List<int> ActualInboundIds { get; private set; } = new List<int>();
+
+        /// <summary>Latest traffic counters available for critical audit logging.</summary>
+        public XuiV3ClientTraffic Traffic { get; private set; }
+
+        /// <summary>Creates a fully verified preservation result.</summary>
+        /// <param name="state">Final state whose identity, fields, inbounds, and traffic passed verification.</param>
+        /// <returns>A successful result safe for normal notification, logging, and website sync.</returns>
+        public static XuiV3LinkChangePreservationResult Verified(XuiV3LinkChangeLiveState state)
+        {
+            return new XuiV3LinkChangePreservationResult
+            {
+                Success = true,
+                Stage = "verified",
+                Client = state.Client,
+                ActualInboundIds = state.InboundIds.ToList(),
+                Traffic = CloneClientTraffic(state.Traffic)
+            };
+        }
+
+        /// <summary>Creates a failed preservation result without rolling the identity back.</summary>
+        /// <param name="stage">Stable stage key identifying the failed repair or verification operation.</param>
+        /// <param name="message">Non-secret failure message returned by XUI or local invariant validation.</param>
+        /// <param name="state">Latest live state, or null when no post-change read succeeded.</param>
+        /// <returns>A failed result containing the latest non-sensitive state for audit.</returns>
+        public static XuiV3LinkChangePreservationResult Failed(
+            string stage,
+            string message,
+            XuiV3LinkChangeLiveState state = null)
+        {
+            return new XuiV3LinkChangePreservationResult
+            {
+                Stage = stage,
+                Message = message,
+                Client = state?.Client,
+                ActualInboundIds = state?.InboundIds?.ToList() ?? new List<int>(),
+                Traffic = CloneClientTraffic(state?.Traffic)
+            };
+        }
     }
 
     private static XuiV3ClientPayload BuildUpdateCommentPayload(

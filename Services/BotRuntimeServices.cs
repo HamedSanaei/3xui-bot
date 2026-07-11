@@ -422,6 +422,34 @@ public sealed class BotRuntimeStatusStore
     }
 
     /// <summary>
+    /// Marks a receiver as registered while Telegram identity and command initialization continues in the background.
+    /// </summary>
+    /// <param name="bot">Runtime bot configuration whose receiver has been registered by this process.</param>
+    /// <param name="reason">Non-secret transient reason that prevented the startup probe from completing immediately.</param>
+    /// <remarks>
+    /// The receiver is already active in this state. This status must not be interpreted as a failed startup or used
+    /// to launch another receiver for the same bot id.
+    /// </remarks>
+    public void MarkInitializing(BotInstanceConfig bot, string reason)
+    {
+        Upsert(bot, isReceiverRunning: true, status: "initializing", lastError: reason);
+    }
+
+    /// <summary>
+    /// Marks a registered receiver as operational but temporarily unable to finish Telegram metadata initialization.
+    /// </summary>
+    /// <param name="bot">Runtime bot configuration whose receiver remains registered and running.</param>
+    /// <param name="reason">Non-secret transient Telegram or network error from the latest background attempt.</param>
+    /// <remarks>
+    /// A degraded bot is not stopped. Later background retries can promote it to <c>listening</c> without creating a
+    /// second receiver.
+    /// </remarks>
+    public void MarkDegraded(BotInstanceConfig bot, string reason)
+    {
+        Upsert(bot, isReceiverRunning: true, status: "degraded", lastError: reason);
+    }
+
+    /// <summary>
     /// Marks a bot startup as failed without changing its configured enabled flag.
     /// </summary>
     /// <param name="bot">Runtime bot configuration from <see cref="BotRegistry" />.</param>
@@ -587,8 +615,10 @@ public class MultiBotHostedService : IHostedService
     private readonly BotContextAccessor _botContextAccessor;
     private readonly BotRuntimeStatusStore _runtimeStatusStore;
     private readonly ILogger<MultiBotHostedService> _logger;
+    private readonly TimeSpan _startupProbeTimeout;
     private CancellationTokenSource _receivingCts;
     private readonly Dictionary<string, CancellationTokenSource> _botReceivers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, SemaphoreSlim> _lifecycleGates = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _syncRoot = new();
 
     /// <summary>
@@ -616,6 +646,10 @@ public class MultiBotHostedService : IHostedService
     /// <param name="runtimeStatusStore">
     /// Process-local status store used by the super-admin runtime status screen.
     /// </param>
+    /// <param name="configuration">
+    /// Application configuration containing the bounded Telegram startup probe timeout. Bot tokens are resolved
+    /// through <paramref name="registry" /> and are never read or logged by this constructor.
+    /// </param>
     /// <param name="logger">Logger for receiver lifecycle events.</param>
     public MultiBotHostedService(
         BotRegistry registry,
@@ -624,6 +658,7 @@ public class MultiBotHostedService : IHostedService
         IServiceScopeFactory scopeFactory,
         BotContextAccessor botContextAccessor,
         BotRuntimeStatusStore runtimeStatusStore,
+        IConfiguration configuration,
         ILogger<MultiBotHostedService> logger)
     {
         _registry = registry;
@@ -632,6 +667,8 @@ public class MultiBotHostedService : IHostedService
         _scopeFactory = scopeFactory;
         _botContextAccessor = botContextAccessor;
         _runtimeStatusStore = runtimeStatusStore;
+        var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
+        _startupProbeTimeout = TimeSpan.FromSeconds(Math.Clamp(appConfig.TelegramBotStartupProbeTimeoutSeconds, 5, 60));
         _logger = logger;
     }
 
@@ -641,11 +678,10 @@ public class MultiBotHostedService : IHostedService
     /// <param name="cancellationToken">Host shutdown token.</param>
     /// <returns>A task that completes after the first startup pass has been requested.</returns>
     /// <remarks>
-    /// Startup is deliberately not all-or-nothing. Telegram can briefly reject <c>GetMe</c> or command setup for
-    /// one configured bot while the default bot succeeds, especially after a Linux service restart. The first pass
-    /// records duplicate or invalid-token decisions as non-retryable and then a bounded background recovery loop
-    /// retries only enabled bots that still do not have a receiver. This prevents operators from needing several
-    /// systemd restarts just to bring all owned bots online.
+    /// Startup is deliberately not all-or-nothing. A bounded <c>GetMe</c> timeout starts one optimistic receiver and
+    /// command setup continues in the background. The recovery loop handles only enabled bots that still have no
+    /// registered receiver; duplicate and invalid-token decisions remain non-retryable. Per-bot lifecycle gates
+    /// prevent startup recovery and owner actions from creating overlapping polling loops.
     /// </remarks>
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -654,7 +690,7 @@ public class MultiBotHostedService : IHostedService
 
         foreach (var bot in _registry.Bots)
         {
-            var result = await StartBotCoreAsync(bot.Id, cancellationToken);
+            var result = await StartBotAttemptSerializedAsync(bot.Id, cancellationToken);
             if (IsNonRetryableStartupResult(result))
                 nonRetryableBotIds.Add(bot.Id);
         }
@@ -671,7 +707,7 @@ public class MultiBotHostedService : IHostedService
     /// Internal runtime bot id from the registry. For tenant storefronts this is the local <c>tenant-{ownerId}</c>
     /// value, not the numeric Telegram bot id.
     /// </param>
-    /// <param name="cancellationToken">Cancellation token for Telegram startup checks and command setup.</param>
+    /// <param name="cancellationToken">Token that cancels waiting for the per-bot lifecycle gate and startup work.</param>
     /// <returns>
     /// <c>true</c> when the receiver is already running or successfully started; <c>false</c> when the bot is
     /// disabled, missing a token, duplicated, or rejected by Telegram.
@@ -679,32 +715,67 @@ public class MultiBotHostedService : IHostedService
     /// <remarks>
     /// This method is intentionally fail-soft. A revoked tenant token disables only that tenant row in users.db
     /// and never stops other owned or tenant bots from starting. Owned bot tokens come from configuration and are
-    /// never modified automatically. Transient Telegram startup failures are retried a few times before the method
-    /// returns <c>false</c>, so owner toggle flows are not defeated by a single <c>Request timed out</c>.
+    /// never modified automatically. A transient <c>getMe</c> timeout starts one optimistic receiver and returns
+    /// <c>true</c>; only failures that prevent receiver registration use the bounded synchronous retry loop.
     /// </remarks>
     public async Task<bool> StartBotAsync(string botId, CancellationToken cancellationToken = default)
     {
         const int maxAttempts = 3;
+        var lifecycleGate = GetLifecycleGate(botId);
+        await lifecycleGate.WaitAsync(cancellationToken);
 
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        try
         {
-            var result = await StartBotCoreAsync(botId, cancellationToken);
-            if (result == BotStartupResult.Started || result == BotStartupResult.AlreadyRunning)
-                return true;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                var result = await StartBotCoreAsync(botId, cancellationToken);
+                if (result == BotStartupResult.Started || result == BotStartupResult.AlreadyRunning)
+                    return true;
 
-            if (result != BotStartupResult.TransientFailure || attempt == maxAttempts)
-                return false;
+                if (result != BotStartupResult.TransientFailure || attempt == maxAttempts)
+                    return false;
 
-            _logger.LogInformation(
-                "Retrying Telegram bot receiver after transient startup failure. botId={BotId}, attempt={Attempt}/{MaxAttempts}",
-                botId,
-                attempt + 1,
-                maxAttempts);
+                _logger.LogInformation(
+                    "Retrying Telegram bot receiver after transient startup failure. botId={BotId}, attempt={Attempt}/{MaxAttempts}",
+                    botId,
+                    attempt + 1,
+                    maxAttempts);
 
-            await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
+                await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
+            }
+
+            return false;
         }
+        finally
+        {
+            lifecycleGate.Release();
+        }
+    }
 
-        return false;
+    /// <summary>
+    /// Runs one receiver startup attempt under the per-bot lifecycle gate.
+    /// </summary>
+    /// <param name="botId">Internal registry bot id whose startup must be serialized.</param>
+    /// <param name="cancellationToken">Token that cancels waiting for the gate and the startup attempt.</param>
+    /// <returns>The exact startup classification returned by the serialized core attempt.</returns>
+    /// <remarks>
+    /// Application startup and background recovery use this helper. Owner-triggered startup uses
+    /// <see cref="StartBotAsync" /> so its bounded retry sequence remains inside one uninterrupted lifecycle lease.
+    /// </remarks>
+    private async Task<BotStartupResult> StartBotAttemptSerializedAsync(
+        string botId,
+        CancellationToken cancellationToken)
+    {
+        var lifecycleGate = GetLifecycleGate(botId);
+        await lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await StartBotCoreAsync(botId, cancellationToken);
+        }
+        finally
+        {
+            lifecycleGate.Release();
+        }
     }
 
     /// <summary>
@@ -722,9 +793,10 @@ public class MultiBotHostedService : IHostedService
     /// be skipped permanently, or failed in a way that can be retried by the bounded startup recovery loop.
     /// </returns>
     /// <remarks>
-    /// This method is the single startup path for owned, tenant, and assistant bots. It mutates tenant rows only
-    /// when Telegram proves the tenant token is invalid or when duplicate-token protection decides that another
-    /// bot owns the token. Configured owned bots are never changed in the database or configuration file.
+    /// This method is the single startup path for owned, tenant, and assistant bots and must be called while holding
+    /// the corresponding lifecycle gate. It mutates tenant rows only when Telegram proves the token is invalid or
+    /// duplicate-token protection chooses another bot. A transient preflight failure still registers one receiver;
+    /// command setup and identity refresh continue in the background.
     /// </remarks>
     private async Task<BotStartupResult> StartBotCoreAsync(string botId, CancellationToken cancellationToken = default)
     {
@@ -754,7 +826,8 @@ public class MultiBotHostedService : IHostedService
                     bot,
                     $"duplicate token conflict with {duplicate.ConflictBotId}",
                     notifyOwner: true,
-                    cancellationToken);
+                    cancellationToken,
+                    lifecycleGateHeld: true);
             }
             else
             {
@@ -778,8 +851,21 @@ public class MultiBotHostedService : IHostedService
             var parentToken = _receivingCts?.Token ?? cancellationToken;
             botCts = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
             var client = _clientProvider.GetClient(bot.Id);
-            var me = await client.GetMeAsync(cancellationToken);
-            await ConfigureBotCommandsAsync(client, bot, cancellationToken);
+            Telegram.Bot.Types.User me = null;
+            Exception transientProbeError = null;
+
+            try
+            {
+                using var probeCts = CreateStartupProbeCancellation(cancellationToken);
+                me = await client.GetMeAsync(probeCts.Token);
+            }
+            catch (Exception ex) when (IsTelegramTransientStartupError(ex))
+            {
+                // A transient getMe failure does not prove the token is invalid. Register the receiver exactly once
+                // and let polling plus background initialization establish connectivity without taking the bot offline.
+                transientProbeError = ex;
+            }
+
             var context = new BotRuntimeContext
             {
                 Config = bot,
@@ -798,15 +884,53 @@ public class MultiBotHostedService : IHostedService
             lock (_syncRoot)
                 _botReceivers[bot.Id] = botCts;
 
-            _runtimeStatusStore.MarkStarted(bot, me.Username);
-            _logger.LogInformation("Started Telegram bot receiver. botId={BotId}, username=@{Username}", bot.Id, me.Username);
+            if (transientProbeError == null)
+            {
+                _runtimeStatusStore.MarkStarted(bot, me?.Username ?? bot.Username);
+            }
+            else
+            {
+                _runtimeStatusStore.MarkInitializing(bot, transientProbeError.Message);
+                _logger.LogInformation(
+                    "Telegram bot receiver started optimistically after a transient startup probe failure. botId={BotId}, error={Error}",
+                    bot.Id,
+                    transientProbeError.Message);
+            }
+
+            _logger.LogInformation(
+                "Started Telegram bot receiver. botId={BotId}, username=@{Username}",
+                bot.Id,
+                me?.Username ?? bot.Username);
             if (IsTenant(bot))
-                LogTenantRuntimeEvent(bot, me.Username, "روشن شد", null);
+                LogTenantRuntimeEvent(
+                    bot,
+                    me?.Username ?? bot.Username,
+                    transientProbeError == null ? "روشن شد" : "روشن شد؛ در حال تکمیل اتصال",
+                    null);
+
+            _ = Task.Run(
+                () => CompleteBotInitializationAsync(
+                    bot.Id,
+                    TelegramBotTokenIdentity.ExtractBotId(bot.Token),
+                    parentToken),
+                CancellationToken.None);
 
             return BotStartupResult.Started;
         }
         catch (Exception ex)
         {
+            // If a post-registration log/status action throws, remove only this exact CTS. A newer receiver
+            // generation must never be removed by cleanup from an older failed start attempt.
+            lock (_syncRoot)
+            {
+                if (botCts != null &&
+                    _botReceivers.TryGetValue(bot.Id, out var registeredCts) &&
+                    ReferenceEquals(registeredCts, botCts))
+                {
+                    _botReceivers.Remove(bot.Id);
+                }
+            }
+
             botCts?.Cancel();
             botCts?.Dispose();
             _clientProvider.Invalidate(bot.Id);
@@ -817,7 +941,12 @@ public class MultiBotHostedService : IHostedService
             if (IsTenant(bot) && IsTelegramTokenInvalidError(ex))
             {
                 _runtimeStatusStore.MarkFailed(bot, "invalid_token", ex.Message);
-                await DisableTenantTokenAsync(bot, ex.Message, notifyOwner: true, cancellationToken);
+                await DisableTenantTokenAsync(
+                    bot,
+                    ex.Message,
+                    notifyOwner: true,
+                    cancellationToken,
+                    lifecycleGateHeld: true);
                 return BotStartupResult.InvalidToken;
             }
 
@@ -851,6 +980,121 @@ public class MultiBotHostedService : IHostedService
 
             return BotStartupResult.TransientFailure;
         }
+    }
+
+    /// <summary>
+    /// Completes Telegram identity validation and command-menu setup after the receiver has already been registered.
+    /// </summary>
+    /// <param name="botId">Internal registry bot id whose active receiver is being initialized.</param>
+    /// <param name="expectedTelegramBotId">
+    /// Numeric bot id extracted from the token used to create the receiver. A changed token cancels this background
+    /// worker so it cannot validate or disable a newer receiver generation.
+    /// </param>
+    /// <param name="cancellationToken">Host/receiver lifetime token that cancels background retries during shutdown.</param>
+    /// <returns>A task that completes after success, a definitive token rejection, receiver stop, or retry exhaustion.</returns>
+    /// <remarks>
+    /// This operation never creates a receiver. Transient failures preserve the existing receiver and mark it
+    /// degraded; a definitive invalid tenant token is routed through the serialized cleanup path. No token or API
+    /// secret is written to logs.
+    /// </remarks>
+    private async Task CompleteBotInitializationAsync(
+        string botId,
+        long? expectedTelegramBotId,
+        CancellationToken cancellationToken)
+    {
+        const int maxAttempts = 5;
+
+        for (var attempt = 1; attempt <= maxAttempts && !cancellationToken.IsCancellationRequested; attempt++)
+        {
+            if (!IsReceiverRunning(botId))
+                return;
+
+            var bot = _registry.GetById(botId);
+            if (bot == null ||
+                !bot.Enabled ||
+                string.IsNullOrWhiteSpace(bot.Token) ||
+                TelegramBotTokenIdentity.ExtractBotId(bot.Token) != expectedTelegramBotId)
+            {
+                return;
+            }
+
+            try
+            {
+                var client = _clientProvider.GetClient(bot.Id);
+                using var probeCts = CreateStartupProbeCancellation(cancellationToken);
+                var me = await client.GetMeAsync(probeCts.Token);
+                await ConfigureBotCommandsAsync(client, bot, probeCts.Token);
+
+                if (!IsReceiverRunning(botId))
+                    return;
+
+                _runtimeStatusStore.MarkStarted(bot, me.Username);
+                _logger.LogInformation(
+                    "Telegram bot background initialization completed. botId={BotId}, username=@{Username}, attempt={Attempt}",
+                    bot.Id,
+                    me.Username,
+                    attempt);
+                return;
+            }
+            catch (Exception ex) when (IsTelegramTransientStartupError(ex))
+            {
+                _runtimeStatusStore.MarkDegraded(bot, ex.Message);
+                _logger.LogInformation(
+                    "Telegram bot background initialization remains degraded. botId={BotId}, attempt={Attempt}/{MaxAttempts}, error={Error}",
+                    bot.Id,
+                    attempt,
+                    maxAttempts,
+                    ex.Message);
+
+                if (attempt < maxAttempts)
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, attempt * 5)), cancellationToken);
+            }
+            catch (Exception ex) when (IsTelegramTokenInvalidError(ex))
+            {
+                _runtimeStatusStore.MarkFailed(bot, "invalid_token", ex.Message);
+                if (IsTenant(bot))
+                {
+                    await DisableTenantTokenAsync(bot, ex.Message, notifyOwner: true, cancellationToken);
+                }
+                else
+                {
+                    await StopBotAsync(bot.Id);
+                    _logger.LogCritical(
+                        ex,
+                        "Configured Telegram bot receiver stopped after background validation rejected its token. botId={BotId}",
+                        bot.Id);
+                }
+                return;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _runtimeStatusStore.MarkDegraded(bot, ex.Message);
+                _logger.LogError(
+                    ex,
+                    "Telegram bot background initialization failed without stopping the receiver. botId={BotId}",
+                    bot.Id);
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Creates a linked cancellation scope for one bounded Telegram startup or initialization probe.
+    /// </summary>
+    /// <param name="outerCancellationToken">Host, owner-update, or receiver token that must also cancel the probe.</param>
+    /// <returns>
+    /// A disposable cancellation source that expires after the configured startup probe timeout, clamped to five
+    /// through sixty seconds.
+    /// </returns>
+    private CancellationTokenSource CreateStartupProbeCancellation(CancellationToken outerCancellationToken)
+    {
+        var source = CancellationTokenSource.CreateLinkedTokenSource(outerCancellationToken);
+        source.CancelAfter(_startupProbeTimeout);
+        return source;
     }
 
     /// <summary>
@@ -892,7 +1136,7 @@ public class MultiBotHostedService : IHostedService
                         attempt,
                         StartupRecoveryMaxAttempts);
 
-                    var result = await StartBotCoreAsync(bot.Id, cancellationToken);
+                    var result = await StartBotAttemptSerializedAsync(bot.Id, cancellationToken);
                     if (IsNonRetryableStartupResult(result))
                         nonRetryableBotIds.Add(bot.Id);
                 }
@@ -1024,9 +1268,9 @@ public class MultiBotHostedService : IHostedService
     /// <remarks>
     /// Telegram can report revoked tokens after a receiver has already been started. This handler disables only
     /// the affected tenant bot and then delegates normal error logging to the shared dispatcher.
-    /// User-block, chat-not-found, and Telegram request-timeout errors are treated as delivery failures for a
-    /// single update and are swallowed at debug level so one blocked customer or slow Telegram reply cannot stop an
-    /// owned or tenant receiver or spam the private log channel. A Telegram 409 getUpdates conflict means another
+    /// User-block and chat-not-found errors are treated as definitive per-user delivery failures. Request timeouts
+    /// and Telegram 5xx responses are treated as transient polling transport failures and do not change chat state
+    /// or stop the receiver. A Telegram 409 getUpdates conflict means another
     /// process or receiver is already polling the same token; this receiver is stopped to prevent noisy conflict
     /// loops. Telegram 5xx gateway bursts are ignored here because the polling loop retries them and they otherwise
     /// spam the private log channel.
@@ -1126,26 +1370,19 @@ public class MultiBotHostedService : IHostedService
     }
 
     /// <summary>
-    /// Detects Telegram delivery errors that mean one user blocked the bot, the chat is unreachable, or Telegram timed out.
+    /// Detects definitive Telegram delivery errors that mean one user blocked the bot or the chat is unreachable.
     /// </summary>
     /// <param name="exception">Exception raised by the Telegram polling loop or update handler.</param>
     /// <returns>
-    /// <c>true</c> when the error is a non-fatal per-user or transient Telegram delivery failure; otherwise <c>false</c>.
+    /// <c>true</c> when the error is a non-fatal per-user delivery failure; otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
     /// The polling library forwards unhandled update-handler exceptions into the polling error callback. A
-    /// customer blocking any owned or tenant bot, or a single Telegram send timeout, must not disable that receiver
-    /// or terminate the process.
+    /// customer blocking any owned or tenant bot must not disable that receiver or terminate the process. Transport
+    /// timeouts are classified separately because they do not prove the chat is unreachable.
     /// </remarks>
     private static bool IsTelegramUserDeliveryError(Exception exception)
     {
-        if (exception is RequestException requestException)
-        {
-            var requestMessage = requestException.Message ?? string.Empty;
-            return requestMessage.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
-                   requestMessage.Contains("timed out", StringComparison.OrdinalIgnoreCase);
-        }
-
         if (exception is not ApiRequestException apiException)
             return false;
 
@@ -1158,20 +1395,27 @@ public class MultiBotHostedService : IHostedService
     }
 
     /// <summary>
-    /// Detects temporary Telegram gateway failures returned by long polling.
+    /// Detects temporary Telegram transport and gateway failures returned by long polling.
     /// </summary>
     /// <param name="exception">Exception raised by the Telegram polling loop.</param>
     /// <returns>
-    /// <c>true</c> for Telegram 5xx gateway/server responses that should be swallowed and retried by polling;
+    /// <c>true</c> for Telegram request timeouts and 5xx gateway/server responses that should be retried by polling;
     /// otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
-    /// Telegram occasionally returns bursts of 502 Bad Gateway from <c>getUpdates</c>. Those bursts do not mean a
-    /// bot token or receiver is broken, so forwarding every event to the operational Telegram logger creates noise
-    /// without actionable value.
+    /// Telegram occasionally returns request timeouts or bursts of 502 Bad Gateway from <c>getUpdates</c>. Those
+    /// failures do not mean a user chat, bot token, or receiver is broken.
     /// </remarks>
     private static bool IsTelegramTransientGatewayPollingError(Exception exception)
     {
+        if (exception is RequestException requestException)
+        {
+            var requestMessage = requestException.Message ?? string.Empty;
+            return requestMessage.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
+                   requestMessage.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
+                   requestMessage.Contains("timeout", StringComparison.OrdinalIgnoreCase);
+        }
+
         if (exception is not ApiRequestException apiException)
             return false;
 
@@ -1285,7 +1529,14 @@ public class MultiBotHostedService : IHostedService
     /// but must never contain the full bot token.
     /// </param>
     /// <param name="notifyOwner">Whether to notify the tenant owner through the default owned bot.</param>
-    /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
+    /// <param name="cancellationToken">
+    /// Caller token used when no hosted-service lifetime token exists. Polling receiver cancellation is not reused
+    /// after stop because it would abort the required users.db cleanup.
+    /// </param>
+    /// <param name="lifecycleGateHeld">
+    /// Whether the caller already owns this bot's lifecycle gate. Startup validation passes <c>true</c> to avoid
+    /// reacquiring the same non-reentrant semaphore; polling and duplicate cleanup callers leave it <c>false</c>.
+    /// </param>
     /// <returns>A task that completes after best-effort cleanup and owner notification.</returns>
     /// <remarks>
     /// The tenant username and settings are preserved for the owner panel, but <c>Token</c> is cleared and
@@ -1295,20 +1546,28 @@ public class MultiBotHostedService : IHostedService
         BotInstanceConfig bot,
         string reason,
         bool notifyOwner,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool lifecycleGateHeld = false)
     {
-        await StopBotAsync(bot.Id);
+        // Polling supplies the receiver token, which becomes cancelled as soon as this bot is stopped. Database
+        // cleanup must instead follow the host lifetime so token invalidation cannot leave an enabled stale row.
+        var cleanupToken = _receivingCts?.Token ?? cancellationToken;
+
+        if (lifecycleGateHeld)
+            StopBotCore(bot.Id, "tenant token cleanup");
+        else
+            await StopBotAsync(bot.Id);
 
         await using var scope = _scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-        var tenant = await db.BotInstances.FirstOrDefaultAsync(x => x.Id == bot.Id, cancellationToken);
+        var tenant = await db.BotInstances.FirstOrDefaultAsync(x => x.Id == bot.Id, cleanupToken);
         if (tenant == null)
             return;
 
         tenant.Enabled = false;
         tenant.Token = null;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await db.SaveChangesAsync(cancellationToken);
+        await db.SaveChangesAsync(cleanupToken);
 
         _registry.Upsert(tenant);
         _clientProvider.Invalidate(tenant.Id);
@@ -1331,7 +1590,7 @@ public class MultiBotHostedService : IHostedService
             reason);
 
         if (notifyOwner && tenant.OwnerTelegramUserId.HasValue)
-            await NotifyTenantOwnerTokenClearedAsync(tenant.OwnerTelegramUserId.Value, tenant.Username, cancellationToken);
+            await NotifyTenantOwnerTokenClearedAsync(tenant.OwnerTelegramUserId.Value, tenant.Username, cleanupToken);
     }
 
     /// <summary>
@@ -1616,15 +1875,69 @@ public class MultiBotHostedService : IHostedService
     }
 
     /// <summary>
-    /// Stops one bot receiver without stopping the whole application.
+    /// Gets the process-local asynchronous lifecycle gate for one internal bot id.
     /// </summary>
-    /// <param name="botId">Internal BotId to stop.</param>
-    /// <returns>A completed task after the receiver cancellation token has been cancelled.</returns>
-    public Task StopBotAsync(string botId)
+    /// <param name="botId">Internal owned, tenant, or assistant bot id; it must not be null or whitespace.</param>
+    /// <returns>A stable semaphore shared by every start, stop, recovery, and cleanup operation for that bot.</returns>
+    /// <remarks>
+    /// Gate objects live for the hosted-service lifetime. Keeping one stable instance per bot prevents a concurrent
+    /// start from overwriting the registered receiver CTS and prevents stop from leaving an orphan polling loop.
+    /// </remarks>
+    private SemaphoreSlim GetLifecycleGate(string botId)
     {
         if (string.IsNullOrWhiteSpace(botId))
-            return Task.CompletedTask;
+            throw new ArgumentException("A bot id is required for lifecycle serialization.", nameof(botId));
 
+        lock (_syncRoot)
+        {
+            if (!_lifecycleGates.TryGetValue(botId, out var gate))
+            {
+                gate = new SemaphoreSlim(1, 1);
+                _lifecycleGates[botId] = gate;
+            }
+
+            return gate;
+        }
+    }
+
+    /// <summary>
+    /// Stops one bot receiver under its lifecycle gate without stopping the whole application.
+    /// </summary>
+    /// <param name="botId">Internal runtime bot id whose receiver must be cancelled.</param>
+    /// <returns>A task that completes after any concurrent startup finishes and the registered receiver is cancelled.</returns>
+    /// <remarks>
+    /// Waiting on the same per-bot gate used by startup makes the final state deterministic. The method is idempotent:
+    /// stopping an already stopped bot does not create or cancel another receiver.
+    /// </remarks>
+    public async Task StopBotAsync(string botId)
+    {
+        if (string.IsNullOrWhiteSpace(botId))
+            return;
+
+        var lifecycleGate = GetLifecycleGate(botId);
+        await lifecycleGate.WaitAsync();
+        try
+        {
+            StopBotCore(botId, "receiver stopped");
+        }
+        finally
+        {
+            lifecycleGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Removes and cancels the receiver currently registered for a bot while the caller owns its lifecycle gate.
+    /// </summary>
+    /// <param name="botId">Internal runtime bot id whose registered receiver should be removed.</param>
+    /// <param name="reason">Non-secret stop reason recorded in process-local runtime status.</param>
+    /// <returns><c>true</c> when a receiver existed and was cancelled; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// Callers must hold the bot lifecycle gate, except host shutdown after the shared parent token has already been
+    /// cancelled. This helper never touches another bot's CTS.
+    /// </remarks>
+    private bool StopBotCore(string botId, string reason)
+    {
         CancellationTokenSource cts = null;
         lock (_syncRoot)
         {
@@ -1632,11 +1945,14 @@ public class MultiBotHostedService : IHostedService
                 _botReceivers.Remove(botId);
         }
 
-        cts?.Cancel();
-        cts?.Dispose();
-        _runtimeStatusStore.MarkStopped(botId, "receiver stopped");
-        _logger.LogInformation("Stopped Telegram bot receiver. botId={BotId}", botId);
-        return Task.CompletedTask;
+        if (cts == null)
+            return false;
+
+        cts.Cancel();
+        cts.Dispose();
+        _runtimeStatusStore.MarkStopped(botId, reason);
+        _logger.LogInformation("Stopped Telegram bot receiver. botId={BotId}, reason={Reason}", botId, reason);
+        return true;
     }
 
     /// <summary>

@@ -49,6 +49,16 @@ namespace Adminbot.Domain
         public int BroadcastDelayMs { get; set; } = 250;
         public int BroadcastMaxRetryCount { get; set; } = 3;
         public int BroadcastQueueCapacity { get; set; } = 10000;
+        /// <summary>
+        /// Maximum duration, in seconds, allowed for one Telegram bot startup probe such as <c>getMe</c> or
+        /// command-menu configuration.
+        /// </summary>
+        /// <remarks>
+        /// A transient probe timeout does not stop receiver creation. The runtime starts the receiver optimistically
+        /// and repeats identity and command initialization in the background. Values below five seconds are clamped
+        /// to protect normal Telegram latency, and values above sixty seconds are capped to keep owner callbacks responsive.
+        /// </remarks>
+        public int TelegramBotStartupProbeTimeoutSeconds { get; set; } = 12;
         public bool HttpsEnabled { get; set; } = true;
         public int HttpsPort { get; set; } = 443;
         public int HttpPort { get; set; } = 80;

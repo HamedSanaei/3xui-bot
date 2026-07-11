@@ -65,6 +65,8 @@ public class TenantBotService
     private readonly BroadcastManager _broadcastManager;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TenantBotService> _logger;
+    private readonly Dictionary<string, TenantJoinCapabilityCacheEntry> _tenantJoinCapabilityCache = new(StringComparer.Ordinal);
+    private readonly object _tenantJoinCapabilitySync = new();
 
     /// <summary>
     /// creates the tenant Bot service with all dependencies needed for owner setup, customer storefronts, payments, and xui account creation.
@@ -325,8 +327,14 @@ public class TenantBotService
 
         if (action == "panel")
         {
-            await SHOWOWNERPANELASYNC(botClient, ChatId, CredUser, MessageId, CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(
+                botClient,
+                ChatId,
+                CredUser,
+                MessageId,
+                CancellationToken,
+                CallbackQuery.Message);
             return true;
         }
 
@@ -342,15 +350,73 @@ public class TenantBotService
             return true;
         }
 
-        if (action == "TOGGLE")
+        if (action.StartsWith("set-enabled:", StringComparison.Ordinal))
         {
-            await TOGGLETENANTBOTASYNC(botClient, CallbackQuery, CredUser, CancellationToken);
+            var parts = action.Split(':');
+            if (parts.Length == 4 && TryParseTenantBoolean(parts[1], out var enabled))
+            {
+                await SETTENANTBOTENABLEDASYNC(
+                    botClient,
+                    CallbackQuery,
+                    CredUser,
+                    enabled,
+                    parts[2],
+                    parts[3],
+                    CancellationToken);
+                return true;
+            }
+
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "دکمه معتبر نیست؛ پنل را به‌روزرسانی کنید.",
+                showAlert: true,
+                cancellationToken: CancellationToken);
             return true;
         }
 
-        if (action.StartsWith("TOGGLE:", StringComparison.Ordinal))
+        if (action.StartsWith("set-setting:", StringComparison.Ordinal))
         {
-            await TOGGLETENANTSETTINGASYNC(botClient, CallbackQuery, CredUser, action["TOGGLE:".Length..], CancellationToken);
+            var parts = action.Split(':');
+            if (parts.Length == 5 && TryParseTenantBoolean(parts[2], out var enabled))
+            {
+                await SETTENANTSETTINGASYNC(
+                    botClient,
+                    CallbackQuery,
+                    CredUser,
+                    parts[1],
+                    enabled,
+                    parts[3],
+                    parts[4],
+                    CancellationToken);
+                return true;
+            }
+
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "دکمه معتبر نیست؛ پنل را به‌روزرسانی کنید.",
+                showAlert: true,
+                cancellationToken: CancellationToken);
+            return true;
+        }
+
+        if (action == "TOGGLE" || action.StartsWith("TOGGLE:", StringComparison.Ordinal))
+        {
+            // Old panels used invert-state callbacks. They are intentionally read-only after deployment because a
+            // delayed duplicate could otherwise undo a successful enable/disable operation.
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "این دکمه قدیمی است؛ پنل جدید نمایش داده شد.",
+                cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(
+                botClient,
+                ChatId,
+                CredUser,
+                MessageId,
+                CancellationToken,
+                CallbackQuery.Message);
             return true;
         }
 
@@ -561,6 +627,10 @@ public class TenantBotService
     /// <param name="owner">colleague owner profile.</param>
     /// <param name="MessageId">Message Id to edit; null sends A new Message.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <param name="CurrentMessage">
+    /// Optional callback message currently visible in Telegram. When its rendered text and inline keyboard already
+    /// equal the new panel, the edit request is skipped to avoid Telegram's <c>message is not modified</c> response.
+    /// </param>
     /// <remarks>
     /// Opening or refreshing the panel probes an existing tenant bot token with Telegram <c>getMe</c>. If Telegram
     /// proves the token is revoked or unauthorized, the method clears only the token identity fields and disables
@@ -572,7 +642,8 @@ public class TenantBotService
         ChatId ChatId,
         CredUser owner,
         int? MessageId,
-        CancellationToken CancellationToken)
+        CancellationToken CancellationToken,
+        Message CurrentMessage = null)
     {
         var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, CancellationToken);
         var tokenNotice = await VALIDATETENANTTOKENFORPANELASYNC(tenant, CancellationToken);
@@ -581,6 +652,9 @@ public class TenantBotService
 
         if (MessageId.HasValue)
         {
+            if (IsSameTenantPanel(CurrentMessage, Text, keyboard))
+                return;
+
             await SafeEditMessageTextAsync(
                 botClient,
                 chatId: ChatId,
@@ -654,6 +728,9 @@ public class TenantBotService
         var NOWPAYMENTSENABLED = tenant?.TenantNowPaymentsEnabled == true;
         var CARDENABLED = tenant?.TenantCardPaymentEnabled == true;
         var JOINENABLED = tenant?.TenantMandatoryJoinEnabled == true;
+        var revision = BuildTenantPanelRevision(tenant);
+        var currentUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var issuedAt = (currentUnixSeconds - currentUnixSeconds % 300).ToString("X", CultureInfo.InvariantCulture);
 
         return new InlineKeyboardMarkup(new[]
         {
@@ -674,13 +751,13 @@ public class TenantBotService
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData(CARDENABLED ? "✅ کارت‌به‌کارت" : "❌ کارت‌به‌کارت", OWNERCALLBACKPREFIX + "TOGGLE:card"),
-                InlineKeyboardButton.WithCallbackData(HOOSHPAYENABLED ? "✅ هوش‌پی" : "❌ هوش‌پی", OWNERCALLBACKPREFIX + "TOGGLE:HooshPay")
+                InlineKeyboardButton.WithCallbackData(CARDENABLED ? "✅ کارت‌به‌کارت" : "❌ کارت‌به‌کارت", BuildTenantSettingCallback("card", !CARDENABLED, revision, issuedAt)),
+                InlineKeyboardButton.WithCallbackData(HOOSHPAYENABLED ? "✅ هوش‌پی" : "❌ هوش‌پی", BuildTenantSettingCallback("HooshPay", !HOOSHPAYENABLED, revision, issuedAt))
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData(NOWPAYMENTSENABLED ? "✅ ارز دیجیتال" : "❌ ارز دیجیتال", OWNERCALLBACKPREFIX + "TOGGLE:NowPayments"),
-                InlineKeyboardButton.WithCallbackData(JOINENABLED ? "✅ جوین اجباری" : "❌ جوین اجباری", OWNERCALLBACKPREFIX + "TOGGLE:join")
+                InlineKeyboardButton.WithCallbackData(NOWPAYMENTSENABLED ? "✅ ارز دیجیتال" : "❌ ارز دیجیتال", BuildTenantSettingCallback("NowPayments", !NOWPAYMENTSENABLED, revision, issuedAt)),
+                InlineKeyboardButton.WithCallbackData(JOINENABLED ? "✅ جوین اجباری" : "❌ جوین اجباری", BuildTenantSettingCallback("join", !JOINENABLED, revision, issuedAt))
             },
             new[]
             {
@@ -717,9 +794,110 @@ public class TenantBotService
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData(IsEnabled ? "⛔ خاموش کردن فروشگاه" : "✅ روشن کردن فروشگاه", OWNERCALLBACKPREFIX + "TOGGLE")
+                InlineKeyboardButton.WithCallbackData(
+                    IsEnabled ? "⛔ خاموش کردن فروشگاه" : "✅ روشن کردن فروشگاه",
+                    $"{OWNERCALLBACKPREFIX}set-enabled:{(IsEnabled ? 0 : 1)}:{revision}:{issuedAt}")
             }
         });
+    }
+
+    /// <summary>
+    /// Builds the optimistic-concurrency revision embedded in tenant owner mutation callbacks.
+    /// </summary>
+    /// <param name="tenant">Persisted tenant row whose current settings are represented by the keyboard.</param>
+    /// <returns>
+    /// Uppercase hexadecimal UTC tick value derived from the row's latest update, or <c>0</c> for a not-yet-created row.
+    /// </returns>
+    /// <remarks>
+    /// The revision is non-secret and remains well below Telegram's callback-data limit. Mutating callbacks must
+    /// compare it with a freshly loaded row before writing, preventing delayed buttons from an older panel from
+    /// undoing newer owner settings.
+    /// </remarks>
+    private static string BuildTenantPanelRevision(BotInstance tenant)
+    {
+        if (tenant == null)
+            return "0";
+
+        return (tenant.UpdatedAtUtc ?? tenant.CreatedAtUtc).Ticks.ToString("X", CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Builds an idempotent target-state callback for one tenant storefront setting.
+    /// </summary>
+    /// <param name="setting">Stable setting key: card, HooshPay, NowPayments, or join.</param>
+    /// <param name="enabled">Desired final state rather than an instruction to invert the current value.</param>
+    /// <param name="revision">Panel revision returned by <see cref="BuildTenantPanelRevision" />.</param>
+    /// <param name="issuedAt">Hexadecimal Unix timestamp rounded to the keyboard's five-minute render bucket.</param>
+    /// <returns>Tenant owner callback data containing the setting, target state, revision, and issue timestamp.</returns>
+    private static string BuildTenantSettingCallback(string setting, bool enabled, string revision, string issuedAt)
+        => $"{OWNERCALLBACKPREFIX}set-setting:{setting}:{(enabled ? 1 : 0)}:{revision}:{issuedAt}";
+
+    /// <summary>
+    /// Parses a compact target-state value from Telegram callback data.
+    /// </summary>
+    /// <param name="value">Callback token; only <c>1</c> and <c>0</c> are accepted.</param>
+    /// <param name="enabled">Receives the desired boolean state when parsing succeeds.</param>
+    /// <returns><c>true</c> for an exact supported value; otherwise <c>false</c>.</returns>
+    private static bool TryParseTenantBoolean(string value, out bool enabled)
+    {
+        enabled = string.Equals(value, "1", StringComparison.Ordinal);
+        return enabled || string.Equals(value, "0", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Checks whether a tenant mutation callback was rendered recently enough to change persisted settings.
+    /// </summary>
+    /// <param name="issuedAt">Hexadecimal Unix timestamp embedded in the callback data.</param>
+    /// <returns>
+    /// <c>true</c> when the timestamp is valid, is not materially in the future, and is at most ten minutes old;
+    /// otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Telegram may deliver callbacks queued while a bot was offline after their answer TTL has expired. This
+    /// timestamp prevents those delayed buttons from changing financial, gateway, join, or runtime settings.
+    /// </remarks>
+    private static bool IsTenantMutationCallbackFresh(string issuedAt)
+    {
+        if (!long.TryParse(issuedAt, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var unixSeconds))
+            return false;
+
+        var age = DateTimeOffset.UtcNow - DateTimeOffset.FromUnixTimeSeconds(unixSeconds);
+        return age >= TimeSpan.FromMinutes(-1) && age <= TimeSpan.FromMinutes(10);
+    }
+
+    /// <summary>
+    /// Determines whether an owner panel callback message already contains the requested text and inline keyboard.
+    /// </summary>
+    /// <param name="currentMessage">Current Telegram callback message, or null for send-only flows.</param>
+    /// <param name="htmlText">New HTML panel text before Telegram entity rendering.</param>
+    /// <param name="keyboard">New inline keyboard that would be attached to the panel.</param>
+    /// <returns>
+    /// <c>true</c> when rendered plain text and serialized reply markup are equal, allowing the edit API call to be skipped.
+    /// </returns>
+    /// <remarks>
+    /// Telegram returns HTTP 400 for no-op edits. Comparing the callback message before calling Telegram removes the
+    /// avoidable request; the existing safe exception guard remains for edits whose remote state changed concurrently.
+    /// </remarks>
+    private static bool IsSameTenantPanel(
+        Message currentMessage,
+        string htmlText,
+        InlineKeyboardMarkup keyboard)
+    {
+        if (currentMessage == null)
+            return false;
+
+        var renderedText = System.Text.RegularExpressions.Regex.Replace(
+            htmlText ?? string.Empty,
+            "<[^>]+>",
+            string.Empty,
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        renderedText = WebUtility.HtmlDecode(renderedText);
+
+        return string.Equals(currentMessage.Text ?? string.Empty, renderedText, StringComparison.Ordinal) &&
+               string.Equals(
+                   JsonConvert.SerializeObject(currentMessage.ReplyMarkup),
+                   JsonConvert.SerializeObject(keyboard),
+                   StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -862,7 +1040,8 @@ public class TenantBotService
         try
         {
             var client = new TelegramBotClient(tenant.Token);
-            var me = await client.GetMeAsync(CancellationToken);
+            using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
+            var me = await client.GetMeAsync(probeCts.Token);
             var username = me.Username?.Trim().TrimStart('@');
             var changed = false;
 
@@ -1175,7 +1354,8 @@ public class TenantBotService
         try
         {
             var TENANTCLIENT = new TelegramBotClient(Token);
-            me = await TENANTCLIENT.GetMeAsync(CancellationToken);
+            using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
+            me = await TENANTCLIENT.GetMeAsync(probeCts.Token);
         }
         catch (Exception ex)
         {
@@ -1501,21 +1681,29 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Enables or disables the tenant Bot and starts/Stops its Telegram receiver at runtime.
+    /// Applies an idempotent enabled target state to a tenant bot and starts or stops its serialized runtime receiver.
     /// </summary>
     /// <param name="botClient">Main brand Bot client.</param>
-    /// <param name="CallbackQuery">TOGGLE callback from the owner panel.</param>
+    /// <param name="CallbackQuery">Owner callback carrying the panel message and callback id.</param>
     /// <param name="owner">colleague owner profile.</param>
+    /// <param name="desiredEnabled">Desired persisted and runtime state; repeated calls with the same value are no-ops.</param>
+    /// <param name="expectedRevision">
+    /// Revision embedded in the keyboard that produced the callback. It must match the freshly loaded tenant row.
+    /// </param>
+    /// <param name="issuedAt">Hexadecimal Unix timestamp used to reject mutation buttons older than ten minutes.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
     /// <remarks>
-    /// Enabling a tenant bot is only persisted as active when <see cref="MultiBotHostedService.StartBotAsync" />
-    /// actually creates a receiver. If Telegram times out after its bounded retries, this method rolls the tenant
-    /// row back to disabled and shows the owner an alert instead of leaving the panel in a stale "روشن" state.
+    /// The callback is acknowledged before channel validation or Telegram startup. This prevents callback expiry
+    /// during network delays. Enabling is persisted only when <see cref="MultiBotHostedService.StartBotAsync" />
+    /// registers a receiver; duplicate enable callbacks never invert the state or create a second receiver.
     /// </remarks>
-    private async Task TOGGLETENANTBOTASYNC(
+    private async Task SETTENANTBOTENABLEDASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
         CredUser owner,
+        bool desiredEnabled,
+        string expectedRevision,
+        string issuedAt,
         CancellationToken CancellationToken)
     {
         var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, CancellationToken);
@@ -1529,8 +1717,81 @@ public class TenantBotService
             return;
         }
 
-        var NEXTENABLED = !tenant.Enabled;
-        if (NEXTENABLED && tenant.TenantMandatoryJoinEnabled)
+        if (!IsTenantMutationCallbackFresh(issuedAt))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "این دکمه منقضی شده است؛ پنل جدید نمایش داده شد.",
+                cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(
+                botClient,
+                CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                owner,
+                CallbackQuery.Message?.MessageId,
+                CancellationToken,
+                CallbackQuery.Message);
+            return;
+        }
+
+        if (!string.Equals(BuildTenantPanelRevision(tenant), expectedRevision, StringComparison.Ordinal))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "این پنل قدیمی شده است؛ وضعیت جدید نمایش داده شد.",
+                cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(
+                botClient,
+                CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                owner,
+                CallbackQuery.Message?.MessageId,
+                CancellationToken,
+                CallbackQuery.Message);
+            return;
+        }
+
+        if (tenant.Enabled == desiredEnabled)
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                desiredEnabled ? "فروشگاه از قبل روشن است." : "فروشگاه از قبل خاموش است.",
+                cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(
+                botClient,
+                CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                owner,
+                CallbackQuery.Message?.MessageId,
+                CancellationToken,
+                CallbackQuery.Message);
+            return;
+        }
+
+        await SafeAnswerCallbackQueryAsync(
+            botClient,
+            CallbackQuery.Id,
+            desiredEnabled ? "در حال روشن‌کردن فروشگاه..." : "در حال خاموش‌کردن فروشگاه...",
+            cancellationToken: CancellationToken);
+
+        if (CallbackQuery.Message != null)
+        {
+            await SafeEditMessageTextAsync(
+                botClient,
+                CallbackQuery.Message.Chat.Id,
+                CallbackQuery.Message.MessageId,
+                desiredEnabled
+                    ? "⏳ <b>در حال روشن‌کردن ربات فروشگاهی...</b>\n\nاتصال تلگرام و تنظیمات فروشگاه در حال بررسی است."
+                    : "⏳ <b>در حال خاموش‌کردن ربات فروشگاهی...</b>",
+                ParseMode.Html,
+                new InlineKeyboardMarkup(new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("🔄 بروزرسانی", OWNERCALLBACKPREFIX + "panel")
+                }),
+                CancellationToken);
+        }
+
+        if (desiredEnabled && tenant.TenantMandatoryJoinEnabled)
         {
             var validation = await VALIDATETENANTMANDATORYJOINASYNC(tenant, CancellationToken);
             if (!validation.ISVALID)
@@ -1540,17 +1801,21 @@ public class TenantBotService
                 await _userDbcontext.SaveChangesAsync(CancellationToken);
                 _botRegistry.Upsert(tenant);
 
-                await SafeAnswerCallbackQueryAsync(botClient, 
-                    CallbackQuery.Id,
-                    validation.ErrorMessage,
-                    showAlert: true,
+                await botClient.SendTextMessageAsync(
+                    CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                    $"⚠️ {validation.ErrorMessage}",
                     cancellationToken: CancellationToken);
-                await SHOWOWNERPANELASYNC(botClient, CallbackQuery.Message.Chat.Id, owner, CallbackQuery.Message.MessageId, CancellationToken);
+                await SHOWOWNERPANELASYNC(
+                    botClient,
+                    CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                    owner,
+                    CallbackQuery.Message?.MessageId,
+                    CancellationToken);
                 return;
             }
         }
 
-        tenant.Enabled = NEXTENABLED;
+        tenant.Enabled = desiredEnabled;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _userDbcontext.SaveChangesAsync(CancellationToken);
         _botRegistry.Upsert(tenant);
@@ -1570,13 +1835,16 @@ public class TenantBotService
                     _botRegistry.Upsert(tenant);
                     _botClientProvider.Invalidate(tenant.Id);
 
-                    await SafeAnswerCallbackQueryAsync(
-                        botClient,
-                        CallbackQuery.Id,
-                        "تلگرام یا شبکه هنگام روشن‌کردن ربات فروشگاهی پاسخ نداد. چند لحظه بعد دوباره روشن کنید.",
-                        showAlert: true,
+                    await botClient.SendTextMessageAsync(
+                        CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                        "⚠️ راه‌اندازی ربات فروشگاهی کامل نشد. چند لحظه بعد پنل را به‌روزرسانی و دوباره تلاش کنید.",
                         cancellationToken: CancellationToken);
-                    await SHOWOWNERPANELASYNC(botClient, CallbackQuery.Message.Chat.Id, owner, CallbackQuery.Message.MessageId, CancellationToken);
+                    await SHOWOWNERPANELASYNC(
+                        botClient,
+                        CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                        owner,
+                        CallbackQuery.Message?.MessageId,
+                        CancellationToken);
                     return;
                 }
             }
@@ -1586,77 +1854,158 @@ public class TenantBotService
             }
         }
 
-        await SafeAnswerCallbackQueryAsync(botClient, 
-            CallbackQuery.Id,
-            tenant.Enabled ? "فروشگاه روشن شد." : "فروشگاه خاموش شد.",
-            cancellationToken: CancellationToken);
-        await SHOWOWNERPANELASYNC(botClient, CallbackQuery.Message.Chat.Id, owner, CallbackQuery.Message.MessageId, CancellationToken);
+        await SHOWOWNERPANELASYNC(
+            botClient,
+            CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+            owner,
+            CallbackQuery.Message?.MessageId,
+            CancellationToken);
     }
 
     /// <summary>
-    /// Toggles A CONFIGURABLE tenant storefront FEATURE such as GATEWAYS, card payment, or forced join.
+    /// Applies an idempotent target state to a configurable tenant storefront feature.
     /// </summary>
     /// <param name="botClient">Main owned Bot client used to answer the owner callback.</param>
-    /// <param name="CallbackQuery">callback that requested A FEATURE TOGGLE from the tenant owner panel.</param>
+    /// <param name="CallbackQuery">Callback carrying the owner panel revision and Telegram callback id.</param>
     /// <param name="owner">colleague User who owns the tenant storefront.</param>
     /// <param name="setting">short setting key from callback Data: card, HooshPay, NowPayments, or join.</param>
+    /// <param name="desiredEnabled">Desired final value. Repeating the same callback does not invert the setting.</param>
+    /// <param name="expectedRevision">Revision embedded in the panel keyboard that must match the current tenant row.</param>
+    /// <param name="issuedAt">Hexadecimal Unix timestamp used to reject mutation buttons older than ten minutes.</param>
     /// <param name="CancellationToken">Cancellation Token for users.db Writes, Telegram calls, and optional join validation.</param>
     /// <remarks>
-    /// forced join is VALIDATED immediately before it is enabled. if Telegram reports that the tenant Bot cannot
-    /// read the channel member List, the setting stays Disabled and the owner Receives an ACTIONABLE ALERT.
+    /// Forced join is validated immediately before it is enabled. The callback is acknowledged before any Telegram
+    /// network probe, and validation failures are delivered as normal owner messages because callback answers can
+    /// only be sent once.
     /// </remarks>
-    private async Task TOGGLETENANTSETTINGASYNC(
+    private async Task SETTENANTSETTINGASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
         CredUser owner,
         string setting,
+        bool desiredEnabled,
+        string expectedRevision,
+        string issuedAt,
         CancellationToken CancellationToken)
     {
         var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        if (!IsTenantMutationCallbackFresh(issuedAt))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "این دکمه منقضی شده است؛ پنل جدید نمایش داده شد.",
+                cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(
+                botClient,
+                CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                owner,
+                CallbackQuery.Message?.MessageId,
+                CancellationToken,
+                CallbackQuery.Message);
+            return;
+        }
+
+        if (!string.Equals(BuildTenantPanelRevision(tenant), expectedRevision, StringComparison.Ordinal))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "این پنل قدیمی شده است؛ وضعیت جدید نمایش داده شد.",
+                cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(
+                botClient,
+                CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                owner,
+                CallbackQuery.Message?.MessageId,
+                CancellationToken,
+                CallbackQuery.Message);
+            return;
+        }
+
+        bool currentEnabled;
         switch (setting)
         {
             case "card":
-                if (!tenant.TenantCardPaymentEnabled &&
+                currentEnabled = tenant.TenantCardPaymentEnabled;
+                if (desiredEnabled &&
                     (string.IsNullOrWhiteSpace(tenant.TenantCardNumber) || string.IsNullOrWhiteSpace(tenant.TenantCardHolderName)))
                 {
                     await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "اول شماره کارت و نام صاحب کارت را ثبت کنید.", showAlert: true, cancellationToken: CancellationToken);
                     return;
                 }
-
-                tenant.TenantCardPaymentEnabled = !tenant.TenantCardPaymentEnabled;
                 break;
             case "HooshPay":
-                tenant.TenantHooshPayEnabled = !tenant.TenantHooshPayEnabled;
+                currentEnabled = tenant.TenantHooshPayEnabled;
                 break;
             case "NowPayments":
-                tenant.TenantNowPaymentsEnabled = !tenant.TenantNowPaymentsEnabled;
+                currentEnabled = tenant.TenantNowPaymentsEnabled;
                 break;
             case "join":
-                if (!tenant.TenantMandatoryJoinEnabled)
-                {
-                    var validation = await VALIDATETENANTMANDATORYJOINASYNC(tenant, CancellationToken);
-                    if (!validation.ISVALID)
-                    {
-                        tenant.TenantMandatoryJoinEnabled = false;
-                        await _userDbcontext.SaveChangesAsync(CancellationToken);
-                        await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, validation.ErrorMessage, showAlert: true, cancellationToken: CancellationToken);
-                        return;
-                    }
-                }
-
-                tenant.TenantMandatoryJoinEnabled = !tenant.TenantMandatoryJoinEnabled;
+                currentEnabled = tenant.TenantMandatoryJoinEnabled;
                 break;
             default:
                 await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
                 return;
         }
 
+        if (currentEnabled == desiredEnabled)
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "این تنظیم از قبل در همین وضعیت است.",
+                cancellationToken: CancellationToken);
+            return;
+        }
+
+        await SafeAnswerCallbackQueryAsync(
+            botClient,
+            CallbackQuery.Id,
+            "در حال به‌روزرسانی تنظیمات...",
+            cancellationToken: CancellationToken);
+
+        if (setting == "join" && desiredEnabled)
+        {
+            var validation = await VALIDATETENANTMANDATORYJOINASYNC(tenant, CancellationToken);
+            if (!validation.ISVALID)
+            {
+                tenant.TenantMandatoryJoinEnabled = false;
+                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await botClient.SendTextMessageAsync(
+                    CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                    $"⚠️ {validation.ErrorMessage}",
+                    cancellationToken: CancellationToken);
+                return;
+            }
+        }
+
+        switch (setting)
+        {
+            case "card":
+                tenant.TenantCardPaymentEnabled = desiredEnabled;
+                break;
+            case "HooshPay":
+                tenant.TenantHooshPayEnabled = desiredEnabled;
+                break;
+            case "NowPayments":
+                tenant.TenantNowPaymentsEnabled = desiredEnabled;
+                break;
+            case "join":
+                tenant.TenantMandatoryJoinEnabled = desiredEnabled;
+                break;
+        }
+
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _userDbcontext.SaveChangesAsync(CancellationToken);
         _botRegistry.Upsert(tenant);
 
-        await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "تنظیمات فروشگاه به‌روزرسانی شد.", cancellationToken: CancellationToken);
-        await SHOWOWNERPANELASYNC(botClient, CallbackQuery.Message.Chat.Id, owner, CallbackQuery.Message.MessageId, CancellationToken);
+        await SHOWOWNERPANELASYNC(
+            botClient,
+            CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+            owner,
+            CallbackQuery.Message?.MessageId,
+            CancellationToken);
     }
 
     /// <summary>
@@ -1809,12 +2158,23 @@ public class TenantBotService
     /// <param name="callbackQuery">Owner callback requesting tutorial management.</param>
     /// <param name="owner">Colleague owner whose tenant tutorials are displayed.</param>
     /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
+    /// <param name="answerCallback">
+    /// Whether this method owns the one allowed Telegram callback answer. Pass <c>false</c> when the caller already
+    /// acknowledged the callback before a database mutation, such as tutorial deletion.
+    /// </param>
+    /// <remarks>
+    /// Callback acknowledgement occurs before database and edit operations so a slow users.db or Telegram edit
+    /// cannot turn the callback answer into <c>query is too old</c>.
+    /// </remarks>
     private async Task SHOWTENANTTUTORIALMANAGERASYNC(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
         CredUser owner,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool answerCallback = true)
     {
+        if (answerCallback)
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
         var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, cancellationToken);
         var tutorials = ReadTenantTutorials(tenant).ToList();
         var text = new System.Text.StringBuilder();
@@ -1844,7 +2204,6 @@ public class TenantBotService
             parseMode: ParseMode.Html,
             replyMarkup: new InlineKeyboardMarkup(rows),
             cancellationToken: cancellationToken);
-        await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -1858,6 +2217,7 @@ public class TenantBotService
         CallbackQuery callbackQuery,
         CancellationToken cancellationToken)
     {
+        await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
         await _userDbcontext.SaveUserStatus(new User
         {
             Id = callbackQuery.From.Id,
@@ -1868,7 +2228,6 @@ public class TenantBotService
             callbackQuery.Message.Chat.Id,
             "عنوان آموزش را ارسال کنید؛ مثلا: آموزش نصب روی اندروید",
             cancellationToken: cancellationToken);
-        await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -1945,11 +2304,17 @@ public class TenantBotService
             return;
         }
 
+        await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
         tutorials.RemoveAt(index);
         tenant.TenantTutorialsJson = JsonConvert.SerializeObject(tutorials);
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _userDbcontext.SaveChangesAsync(cancellationToken);
-        await SHOWTENANTTUTORIALMANAGERASYNC(botClient, callbackQuery, owner, cancellationToken);
+        await SHOWTENANTTUTORIALMANAGERASYNC(
+            botClient,
+            callbackQuery,
+            owner,
+            cancellationToken,
+            answerCallback: false);
     }
 
     /// <summary>
@@ -6959,20 +7324,156 @@ public class TenantBotService
         if (string.IsNullOrWhiteSpace(tenant.Token))
             return (false, "اول توکن ربات فروشگاهی را ثبت کنید.");
 
+        var cacheKey = BuildTenantJoinCapabilityCacheKey(tenant, Channels);
+        if (TryGetTenantJoinCapabilityCache(cacheKey, out var cachedResult))
+            return cachedResult;
+
         try
         {
             var client = _botClientProvider.GetClient(tenant.Id);
-            var me = await client.GetMeAsync(CancellationToken);
+            using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
+            var me = await client.GetMeAsync(probeCts.Token);
             foreach (var channel in Channels)
-                await client.GetChatMemberAsync(channel, me.Id, CancellationToken);
+            {
+                await client.GetChatAsync(channel, probeCts.Token);
+                var administrators = await client.GetChatAdministratorsAsync(channel, probeCts.Token);
+                if (!administrators.Any(member => member.User.Id == me.Id))
+                {
+                    var notAdmin = (false, $"ربات فروشگاهی در کانال {channel} ادمین نیست. ابتدا ربات را به کانال اضافه و admin کنید.");
+                    SetTenantJoinCapabilityCache(cacheKey, notAdmin, TimeSpan.FromSeconds(15));
+                    return notAdmin;
+                }
 
-            return (true, null);
+                // A successful lookup for the owner proves the bot has the exact member-list capability used later
+                // by customer forced-join checks; the returned membership status itself is irrelevant here.
+                await client.GetChatMemberAsync(
+                    channel,
+                    tenant.OwnerTelegramUserId ?? me.Id,
+                    probeCts.Token);
+            }
+
+            var valid = (true, (string)null);
+            SetTenantJoinCapabilityCache(cacheKey, valid, TimeSpan.FromMinutes(1));
+            return valid;
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode is 400 or 403)
+        {
+            var permissionFailure = (
+                false,
+                "ربات فروشگاهی امکان خواندن اعضای کانال را ندارد. ربات را در کانال admin کنید و دوباره تلاش کنید.");
+            SetTenantJoinCapabilityCache(cacheKey, permissionFailure, TimeSpan.FromSeconds(15));
+            _logger.LogInformation(
+                "Tenant forced-join capability validation rejected the current channel access. tenantBotId={TenantBotId}, telegramError={TelegramError}",
+                tenant.Id,
+                ex.Message);
+            return permissionFailure;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "tenant forced-join validation failed. TenantBotId={TenantBotId}", tenant.Id);
             return (false, "ربات فروشگاهی به member List کانال دسترسی ندارد. ربات را به کانال اضافه و admin کنید.");
         }
+    }
+
+    /// <summary>
+    /// Builds a non-secret cache key for one tenant token identity and forced-join channel set.
+    /// </summary>
+    /// <param name="tenant">Tenant bot row containing the internal id and BotFather token identity.</param>
+    /// <param name="channels">Normalized channel usernames or ids currently configured for forced join.</param>
+    /// <returns>A stable key that changes automatically when the bot token identity or channel list changes.</returns>
+    /// <remarks>
+    /// Only the numeric bot-id prefix is used; the token secret is never retained in the cache key or logs.
+    /// </remarks>
+    private static string BuildTenantJoinCapabilityCacheKey(BotInstance tenant, IEnumerable<string> channels)
+    {
+        var telegramBotId = TelegramBotTokenIdentity.ExtractBotId(tenant?.Token)?.ToString(CultureInfo.InvariantCulture) ?? "unknown";
+        var channelKey = string.Join(",", (channels ?? Enumerable.Empty<string>())
+            .Select(channel => channel?.Trim().ToLowerInvariant())
+            .Where(channel => !string.IsNullOrWhiteSpace(channel))
+            .OrderBy(channel => channel, StringComparer.Ordinal));
+        return $"{tenant?.Id}|{telegramBotId}|{channelKey}";
+    }
+
+    /// <summary>
+    /// Reads a non-expired forced-join capability result from the process-local cache.
+    /// </summary>
+    /// <param name="cacheKey">Key produced by <see cref="BuildTenantJoinCapabilityCacheKey" />.</param>
+    /// <param name="result">Receives the cached validation tuple when available.</param>
+    /// <returns><c>true</c> when a non-expired entry was found; otherwise <c>false</c>.</returns>
+    private bool TryGetTenantJoinCapabilityCache(
+        string cacheKey,
+        out (bool ISVALID, string ErrorMessage) result)
+    {
+        lock (_tenantJoinCapabilitySync)
+        {
+            if (_tenantJoinCapabilityCache.TryGetValue(cacheKey, out var entry) && entry.ExpiresAtUtc > DateTime.UtcNow)
+            {
+                result = (entry.IsValid, entry.ErrorMessage);
+                return true;
+            }
+
+            _tenantJoinCapabilityCache.Remove(cacheKey);
+        }
+
+        result = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Stores a forced-join capability result for a bounded process-local duration.
+    /// </summary>
+    /// <param name="cacheKey">Non-secret tenant/token/channel key.</param>
+    /// <param name="result">Validation result returned to the owner enable flow.</param>
+    /// <param name="lifetime">Positive cache lifetime; failures use a short duration and successes use a longer one.</param>
+    private void SetTenantJoinCapabilityCache(
+        string cacheKey,
+        (bool ISVALID, string ErrorMessage) result,
+        TimeSpan lifetime)
+    {
+        lock (_tenantJoinCapabilitySync)
+        {
+            _tenantJoinCapabilityCache[cacheKey] = new TenantJoinCapabilityCacheEntry
+            {
+                IsValid = result.ISVALID,
+                ErrorMessage = result.ErrorMessage,
+                ExpiresAtUtc = DateTime.UtcNow.Add(lifetime)
+            };
+        }
+    }
+
+    /// <summary>
+    /// Process-local forced-join capability cache value scoped by tenant, Telegram bot identity, and channel set.
+    /// </summary>
+    private sealed class TenantJoinCapabilityCacheEntry
+    {
+        /// <summary>Whether Telegram proved the tenant bot can read members for every configured channel.</summary>
+        public bool IsValid { get; set; }
+
+        /// <summary>Owner-facing validation message when <see cref="IsValid" /> is false.</summary>
+        public string ErrorMessage { get; set; }
+
+        /// <summary>UTC expiry after which Telegram capability is probed again.</summary>
+        public DateTime ExpiresAtUtc { get; set; }
+    }
+
+    /// <summary>
+    /// Creates a bounded cancellation scope for owner-panel Telegram validation calls.
+    /// </summary>
+    /// <param name="outerCancellationToken">Update-handler token that must also cancel the validation probe.</param>
+    /// <returns>
+    /// Disposable linked source that expires after the configured Telegram bot startup probe timeout, clamped to
+    /// five through sixty seconds.
+    /// </returns>
+    /// <remarks>
+    /// Panel refresh, token validation, and forced-join capability checks share this bound so none can hold a
+    /// Telegram callback open for the library's default one-hundred-second HTTP timeout.
+    /// </remarks>
+    private CancellationTokenSource CreateTenantTelegramProbeCancellation(CancellationToken outerCancellationToken)
+    {
+        var seconds = Math.Clamp(_appConfig.TelegramBotStartupProbeTimeoutSeconds, 5, 60);
+        var source = CancellationTokenSource.CreateLinkedTokenSource(outerCancellationToken);
+        source.CancelAfter(TimeSpan.FromSeconds(seconds));
+        return source;
     }
 
     /// <summary>
