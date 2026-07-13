@@ -33,6 +33,36 @@ public class TelegramBotService : IHostedService
     private const string BroadcastAudienceColleagues = "colleagues";
     private const int MaxAccountInfoMessagesPerRequest = 5;
 
+    /// <summary>
+    /// Reply-keyboard action that starts the super-admin manual phone verification flow for an owned-bot user.
+    /// </summary>
+    private const string AdminVerifyPhoneAction = "📱 تایید دستی شماره تلفن";
+
+    /// <summary>
+    /// Conversation-state step that waits for the target user's numeric Telegram id.
+    /// </summary>
+    private const string AdminPhoneUserIdStep = "admin-phone-user-id";
+
+    /// <summary>
+    /// Conversation-state step prefix that waits for an international or local phone number.
+    /// </summary>
+    private const string AdminPhoneNumberStep = "admin-phone-number";
+
+    /// <summary>
+    /// Conversation-state step prefix that waits for the super-admin's final confirmation.
+    /// </summary>
+    private const string AdminPhoneConfirmationStep = "admin-phone-confirm";
+
+    /// <summary>
+    /// Positive confirmation label used only by the manual phone verification flow.
+    /// </summary>
+    private const string ConfirmAdminPhoneButton = "✅ تایید شماره تلفن";
+
+    /// <summary>
+    /// Cancellation label used only by the manual phone verification flow.
+    /// </summary>
+    private const string CancelAdminPhoneButton = "❌ انصراف";
+
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
@@ -478,6 +508,15 @@ public class TelegramBotService : IHostedService
             message,
             currentUser,
             GetMainMenuKeyboard(),
+            cancellationToken))
+        {
+            return;
+        }
+
+        if (await TryHandleManualPhoneVerificationAsync(
+            botClient,
+            message,
+            currentUser,
             cancellationToken))
         {
             return;
@@ -3889,6 +3928,410 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
+    /// Handles the super-admin flow that manually verifies any owned-bot user's phone number.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram client of the currently active owned bot. The client is used only for the private admin conversation;
+    /// the verified user is notified separately through every owned bot they have previously started.
+    /// </param>
+    /// <param name="message">
+    /// Text message sent by a configured super-admin. The flow expects the action button, a numeric Telegram user id,
+    /// a phone number, and finally one of the confirmation buttons.
+    /// </param>
+    /// <param name="currentUser">
+    /// Bot-scoped conversation state for the super-admin. This state belongs to the active owned bot and cannot affect
+    /// the same administrator's state in another owned or tenant bot.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for database operations and Telegram notifications.</param>
+    /// <returns>
+    /// <c>true</c> when the message belongs to the manual phone flow and has been fully handled; otherwise
+    /// <c>false</c> so the normal super-admin router can process it.
+    /// </returns>
+    /// <remarks>
+    /// Manual verification deliberately bypasses the normal Iranian-number and shared-contact ownership checks. This
+    /// allows a super-admin to approve virtual numbers and numbers from any country. The target must already exist in
+    /// <c>credentials.db</c>, and the flow requires a separate final confirmation before mutating the shared profile.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// 📱 تایید دستی شماره تلفن
+    /// 123456789
+    /// +491701234567
+    /// ✅ تایید شماره تلفن
+    /// </code>
+    /// </example>
+    private async Task<bool> TryHandleManualPhoneVerificationAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        User currentUser,
+        CancellationToken cancellationToken)
+    {
+        var text = message.Text?.Trim() ?? string.Empty;
+        if (string.Equals(text, "/start", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(text, "📑 Menu", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (string.Equals(text, AdminVerifyPhoneAction, StringComparison.Ordinal))
+        {
+            // Clear stale admin-flow data before starting this sensitive identity operation.
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            currentUser = new User
+            {
+                Id = message.From.Id,
+                Flow = "admin",
+                LastStep = AdminPhoneUserIdStep
+            };
+            await _userDbContext.SaveUserStatus(currentUser);
+
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "آیدی عددی تلگرام کاربر را وارد کنید.\n\nکاربر باید قبلاً حداقل یکی از ربات‌های مجموعه را اجرا کرده باشد.",
+                replyMarkup: BuildAdminPhoneInputKeyboard());
+            return true;
+        }
+
+        if (!string.Equals(currentUser.Flow, "admin", StringComparison.Ordinal))
+            return false;
+
+        if (string.Equals(currentUser.LastStep, AdminPhoneUserIdStep, StringComparison.Ordinal))
+        {
+            var normalizedUserId = text.PersianNumbersToEnglish();
+            if (!long.TryParse(normalizedUserId, NumberStyles.None, CultureInfo.InvariantCulture, out var targetUserId) ||
+                targetUserId <= 0)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "آیدی عددی معتبر نیست. فقط آیدی عددی تلگرام کاربر را وارد کنید.",
+                    replyMarkup: BuildAdminPhoneInputKeyboard());
+                return true;
+            }
+
+            var target = await _credentialsDbContext.GetUserStatusWithId(targetUserId);
+            if (target == null)
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "این کاربر در اطلاعات ربات پیدا نشد. از کاربر بخواهید ابتدا یکی از ربات‌های مجموعه را اجرا کند، سپس دوباره آیدی را بفرستید.",
+                    replyMarkup: BuildAdminPhoneInputKeyboard());
+                return true;
+            }
+
+            currentUser.LastStep = $"{AdminPhoneNumberStep}|{targetUserId.ToString(CultureInfo.InvariantCulture)}";
+            await _userDbContext.SaveUserStatus(currentUser);
+
+            var existingPhone = string.IsNullOrWhiteSpace(target.PhoneNumber)
+                ? "ثبت نشده"
+                : MaskPhoneNumber(target.PhoneNumber);
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text:
+                    $"کاربر پیدا شد: {target.ToString()}\n" +
+                    $"شماره فعلی: {existingPhone}\n\n" +
+                    "شماره جدید را همراه کد کشور وارد کنید. شماره مجازی و شماره کشورهای غیرایرانی نیز قابل تأیید است.\n" +
+                    "نمونه: +491701234567",
+                replyMarkup: BuildAdminPhoneInputKeyboard());
+            return true;
+        }
+
+        if (currentUser.LastStep?.StartsWith(AdminPhoneNumberStep + "|", StringComparison.Ordinal) == true)
+        {
+            if (!TryReadStateTargetUserId(currentUser.LastStep, AdminPhoneNumberStep, out var targetUserId))
+            {
+                await ResetBrokenAdminPhoneFlowAsync(botClient, message.Chat.Id, currentUser);
+                return true;
+            }
+
+            if (!TryNormalizeAdminPhoneNumber(text, out var normalizedPhone))
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "ساختار شماره معتبر نیست. شماره را با ۷ تا ۱۸ رقم و در صورت نیاز با علامت + و کد کشور وارد کنید.",
+                    replyMarkup: BuildAdminPhoneInputKeyboard());
+                return true;
+            }
+
+            currentUser.ConfigLink = normalizedPhone;
+            currentUser.LastStep = $"{AdminPhoneConfirmationStep}|{targetUserId.ToString(CultureInfo.InvariantCulture)}";
+            await _userDbContext.SaveUserStatus(currentUser);
+
+            var target = await _credentialsDbContext.GetUserStatusWithId(targetUserId);
+            if (target == null)
+            {
+                await ResetBrokenAdminPhoneFlowAsync(botClient, message.Chat.Id, currentUser);
+                return true;
+            }
+
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text:
+                    "تأیید نهایی شماره تلفن\n\n" +
+                    $"کاربر: {target.ToString()}\n" +
+                    $"آیدی عددی: {targetUserId}\n" +
+                    $"شماره: {normalizedPhone}\n\n" +
+                    "پس از تأیید، محدودیت ثبت شماره برای این کاربر برداشته می‌شود.",
+                replyMarkup: BuildAdminPhoneConfirmationKeyboard());
+            return true;
+        }
+
+        if (currentUser.LastStep?.StartsWith(AdminPhoneConfirmationStep + "|", StringComparison.Ordinal) == true)
+        {
+            if (string.Equals(text, CancelAdminPhoneButton, StringComparison.Ordinal))
+            {
+                await _userDbContext.ClearUserStatus(currentUser);
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "عملیات تأیید شماره تلفن لغو شد.",
+                    replyMarkup: GetAdminKeyboard());
+                return true;
+            }
+
+            if (!string.Equals(text, ConfirmAdminPhoneButton, StringComparison.Ordinal))
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "برای ثبت شماره از دکمه تأیید استفاده کنید یا عملیات را لغو کنید.",
+                    replyMarkup: BuildAdminPhoneConfirmationKeyboard());
+                return true;
+            }
+
+            if (!TryReadStateTargetUserId(currentUser.LastStep, AdminPhoneConfirmationStep, out var targetUserId) ||
+                !TryNormalizeAdminPhoneNumber(currentUser.ConfigLink, out var normalizedPhone))
+            {
+                await ResetBrokenAdminPhoneFlowAsync(botClient, message.Chat.Id, currentUser);
+                return true;
+            }
+
+            var target = await _credentialsDbContext.GetUserStatusWithId(targetUserId);
+            if (target == null)
+            {
+                await ResetBrokenAdminPhoneFlowAsync(botClient, message.Chat.Id, currentUser);
+                return true;
+            }
+
+            var previousPhone = target.PhoneNumber;
+            await _credentialsDbContext.SavePhoneNumber(targetUserId, normalizedPhone);
+            target.PhoneNumber = normalizedPhone;
+            await _userDbContext.ClearUserStatus(currentUser);
+
+            LogAdminPhoneVerification(message.From, target, previousPhone, normalizedPhone);
+
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text:
+                    "✅ <b>شماره تلفن کاربر با موفقیت تأیید شد.</b>\n\n" +
+                    $"{TelegramUserLinkFormatter.HtmlSummary(target)}\n" +
+                    $"شماره ثبت‌شده: <code>{Html(normalizedPhone)}</code>\n" +
+                    $"نوع حساب: <code>{Html(target.IsColleague ? "همکار" : "کاربر عادی")}</code>",
+                parseMode: ParseMode.Html,
+                replyMarkup: GetAdminKeyboard());
+
+            try
+            {
+                await _ownedBotNotificationService.NotifyUserAcrossOwnedBotsAsync(
+                    targetUserId,
+                    "✅ شماره تلفن حساب شما توسط مدیریت تأیید شد و اکنون می‌توانید از امکانات ربات استفاده کنید.",
+                    cancellationToken: cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // Verification is already persisted; a Telegram delivery failure must not roll it back.
+                _logger.LogWarning(
+                    ex,
+                    "Manual phone verification notification failed after persistence. userId={TelegramUserId}",
+                    targetUserId);
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Parses the target Telegram user id stored in a manual-phone conversation-state key.
+    /// </summary>
+    /// <param name="lastStep">State value in the form <c>step-prefix|telegram-user-id</c>.</param>
+    /// <param name="expectedPrefix">Exact state-step prefix expected by the current phase.</param>
+    /// <param name="telegramUserId">Receives the positive numeric Telegram user id when parsing succeeds.</param>
+    /// <returns><c>true</c> when the state contains the expected prefix and a positive user id; otherwise <c>false</c>.</returns>
+    /// <remarks>This rejects malformed or stale state instead of applying a sensitive verification to the wrong user.</remarks>
+    private static bool TryReadStateTargetUserId(string lastStep, string expectedPrefix, out long telegramUserId)
+    {
+        telegramUserId = 0;
+        var parts = lastStep?.Split('|', StringSplitOptions.TrimEntries);
+        return parts?.Length == 2 &&
+               string.Equals(parts[0], expectedPrefix, StringComparison.Ordinal) &&
+               long.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out telegramUserId) &&
+               telegramUserId > 0;
+    }
+
+    /// <summary>
+    /// Normalizes a super-admin supplied phone number without applying country, carrier, or virtual-number rules.
+    /// </summary>
+    /// <param name="input">
+    /// Raw phone number from the private admin chat. Persian/Arabic digits and common visual separators are accepted;
+    /// letters, extensions, and multiple plus signs are rejected.
+    /// </param>
+    /// <param name="normalizedPhone">
+    /// Receives 7 to 18 ASCII digits, optionally prefixed with <c>+</c>. A leading <c>00</c> is converted to <c>+</c>.
+    /// </param>
+    /// <returns><c>true</c> when the input has a safe phone-number shape; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// This is an administrative override, not proof that Telegram owns the number. It intentionally accepts Iranian,
+    /// non-Iranian, and virtual numbers while still rejecting arbitrary text from entering the credentials profile.
+    /// </remarks>
+    private static bool TryNormalizeAdminPhoneNumber(string input, out string normalizedPhone)
+    {
+        normalizedPhone = string.Empty;
+        if (string.IsNullOrWhiteSpace(input))
+            return false;
+
+        var value = input.PersianNumbersToEnglish().Trim();
+        var digits = new StringBuilder(value.Length);
+        var hasLeadingPlus = false;
+
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (character == '+' && index == 0)
+            {
+                hasLeadingPlus = true;
+                continue;
+            }
+
+            if (char.IsDigit(character))
+            {
+                digits.Append(character);
+                continue;
+            }
+
+            if (character is ' ' or '-' or '(' or ')')
+                continue;
+
+            return false;
+        }
+
+        if (digits.Length < 7 || digits.Length > 18)
+            return false;
+
+        var digitText = digits.ToString();
+        if (!hasLeadingPlus && digitText.StartsWith("00", StringComparison.Ordinal) && digitText.Length > 2)
+        {
+            hasLeadingPlus = true;
+            digitText = digitText.Substring(2);
+        }
+
+        if (digitText.All(character => character == '0'))
+            return false;
+
+        normalizedPhone = hasLeadingPlus ? "+" + digitText : digitText;
+        return true;
+    }
+
+    /// <summary>
+    /// Creates the compact input keyboard used while an admin enters a target id or phone number.
+    /// </summary>
+    /// <returns>A keyboard whose only action returns safely to the super-admin main menu.</returns>
+    private static ReplyKeyboardMarkup BuildAdminPhoneInputKeyboard()
+    {
+        return new ReplyKeyboardMarkup(new[]
+        {
+            new[] { new KeyboardButton("📑 Menu") }
+        })
+        {
+            ResizeKeyboard = true
+        };
+    }
+
+    /// <summary>
+    /// Creates the final confirmation keyboard for a manual phone verification.
+    /// </summary>
+    /// <returns>A keyboard containing explicit confirm, cancel, and final-row main-menu actions.</returns>
+    private static ReplyKeyboardMarkup BuildAdminPhoneConfirmationKeyboard()
+    {
+        return new ReplyKeyboardMarkup(new[]
+        {
+            new[] { new KeyboardButton(ConfirmAdminPhoneButton), new KeyboardButton(CancelAdminPhoneButton) },
+            new[] { new KeyboardButton("📑 Menu") }
+        })
+        {
+            ResizeKeyboard = true,
+            OneTimeKeyboard = true
+        };
+    }
+
+    /// <summary>
+    /// Clears a malformed manual-phone flow and returns the super-admin to a usable admin panel.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the active owned bot.</param>
+    /// <param name="chatId">Private super-admin Telegram chat id that should receive the recovery message.</param>
+    /// <param name="currentUser">Bot-scoped admin state that could not be parsed safely.</param>
+    /// <returns>A task that completes after state cleanup and Telegram notification.</returns>
+    /// <remarks>No credentials profile is modified by this recovery path.</remarks>
+    private async Task ResetBrokenAdminPhoneFlowAsync(
+        ITelegramBotClient botClient,
+        long chatId,
+        User currentUser)
+    {
+        await _userDbContext.ClearUserStatus(currentUser);
+        await botClient.CustomSendTextMessageAsync(
+            chatId: chatId,
+            text: "اطلاعات این مرحله ناقص یا منقضی شده بود. لطفاً تأیید شماره تلفن را از پنل ادمین دوباره شروع کنید.",
+            replyMarkup: GetAdminKeyboard());
+    }
+
+    /// <summary>
+    /// Masks a phone number for non-confirmation status and private audit messages.
+    /// </summary>
+    /// <param name="phoneNumber">Stored or normalized phone number. The value may include a leading plus sign.</param>
+    /// <returns>A partially masked phone number that keeps only a short prefix and suffix visible.</returns>
+    private static string MaskPhoneNumber(string phoneNumber)
+    {
+        if (string.IsNullOrWhiteSpace(phoneNumber))
+            return "ثبت نشده";
+
+        var value = phoneNumber.Trim();
+        if (value.Length <= 6)
+            return new string('*', value.Length);
+
+        return value.Substring(0, 3) + new string('*', value.Length - 6) + value.Substring(value.Length - 3);
+    }
+
+    /// <summary>
+    /// Writes a private-channel audit record after a super-admin manually verifies a user's phone number.
+    /// </summary>
+    /// <param name="actor">Telegram super-admin who confirmed the operation.</param>
+    /// <param name="target">Shared credentials user whose phone verification was persisted.</param>
+    /// <param name="previousPhone">Phone value before the operation; it may be empty when the user was unverified.</param>
+    /// <param name="verifiedPhone">New normalized phone value persisted in <c>credentials.db</c>.</param>
+    /// <remarks>
+    /// Phone values are masked because the central logger channel is an operational audit surface. The target and actor
+    /// remain clickable by numeric Telegram id, and no bot token or other credential is included.
+    /// </remarks>
+    private void LogAdminPhoneVerification(
+        Telegram.Bot.Types.User actor,
+        CredUser target,
+        string previousPhone,
+        string verifiedPhone)
+    {
+        var actorUser = BuildCredUserFromTelegramActor(actor);
+        var message =
+            "📱 <b>تأیید دستی شماره تلفن</b>\n\n" +
+            "📌 انجام‌دهنده\n" +
+            $"{TelegramUserLinkFormatter.HtmlSummary(actorUser)}\n\n" +
+            "📌 کاربر هدف\n" +
+            $"{TelegramUserLinkFormatter.HtmlSummary(target)}\n\n" +
+            $"وضعیت قبلی: <code>{Html(string.IsNullOrWhiteSpace(previousPhone) ? "تأیید نشده" : "تأیید شده")}</code>\n" +
+            $"شماره قبلی: <code>{Html(MaskPhoneNumber(previousPhone))}</code>\n" +
+            $"شماره جدید: <code>{Html(MaskPhoneNumber(verifiedPhone))}</code>\n" +
+            $"نوع حساب: <code>{Html(target.IsColleague ? "همکار" : "کاربر عادی")}</code>";
+
+        _logger.LogPayment(message);
+    }
+
+    /// <summary>
     /// Gets the reply-keyboard actions available to super-admin users.
     /// </summary>
     /// <returns>Ordered action labels shown in the super-admin keyboard.</returns>
@@ -3909,17 +4352,31 @@ public class TelegramBotService : IHostedService
             "🗑 Delete expired accounts",
             "Sync Gozargah Site",
             "✔️ Verify payment",
+            AdminVerifyPhoneAction,
             "🤖 وضعیت ربات‌ها",
             "📑 Menu"
         };
         return actions;
     }
 
+    /// <summary>
+    /// Builds the super-admin reply keyboard while keeping the main-menu action on its own final row.
+    /// </summary>
+    /// <returns>
+    /// A two-column reply keyboard for administrative actions, followed by a single full-width
+    /// <c>📑 Menu</c> row.
+    /// </returns>
+    /// <remarks>
+    /// The keyboard is used only in owned bots for users listed in <c>adminsUserIds</c>. Tenant owners receive their
+    /// separate storefront panel and cannot reach these platform-wide actions.
+    /// </remarks>
     private ReplyKeyboardMarkup GetAdminKeyboard()
     {
-        var actions = GetAdminActions();
+        var actions = GetAdminActions()
+            .Where(action => !string.Equals(action, "📑 Menu", StringComparison.Ordinal))
+            .ToArray();
 
-        // Creating keyboard buttons dynamically in two-column layout
+        // Keep operational actions dense, but reserve the final full row for an unambiguous escape to the main menu.
         List<KeyboardButton[]> keyboardRows = new List<KeyboardButton[]>();
         for (int i = 0; i < actions.Length; i += 2)
         {
@@ -3937,7 +4394,8 @@ public class TelegramBotService : IHostedService
             keyboardRows.Add(row);
         }
 
-        // Creating the keyboard markup
+        keyboardRows.Add(new[] { new KeyboardButton("📑 Menu") });
+
         var createAccountKeyboard = new ReplyKeyboardMarkup(keyboardRows.ToArray());
         return createAccountKeyboard;
     }
