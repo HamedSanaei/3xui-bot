@@ -4024,13 +4024,18 @@ public class TelegramBotService : IHostedService
             var existingPhone = string.IsNullOrWhiteSpace(target.PhoneNumber)
                 ? "ثبت نشده"
                 : MaskPhoneNumber(target.PhoneNumber);
+
+            // User-controlled names and usernames can contain Markdown control characters such as underscores.
+            // Build this dynamic profile block as encoded HTML so Telegram cannot reject the next flow step.
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text:
-                    $"کاربر پیدا شد: {target.ToString()}\n" +
-                    $"شماره فعلی: {existingPhone}\n\n" +
+                    "👤 <b>کاربر پیدا شد</b>\n" +
+                    $"{TelegramUserLinkFormatter.HtmlSummary(target)}\n" +
+                    $"شماره فعلی: <code>{Html(existingPhone)}</code>\n\n" +
                     "شماره جدید را همراه کد کشور وارد کنید. شماره مجازی و شماره کشورهای غیرایرانی نیز قابل تأیید است.\n" +
                     "نمونه: +491701234567",
+                parseMode: ParseMode.Html,
                 replyMarkup: BuildAdminPhoneInputKeyboard());
             return true;
         }
@@ -4066,11 +4071,12 @@ public class TelegramBotService : IHostedService
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text:
-                    "تأیید نهایی شماره تلفن\n\n" +
-                    $"کاربر: {target.ToString()}\n" +
-                    $"آیدی عددی: {targetUserId}\n" +
-                    $"شماره: {normalizedPhone}\n\n" +
+                    "📱 <b>تأیید نهایی شماره تلفن</b>\n\n" +
+                    $"{TelegramUserLinkFormatter.HtmlSummary(target)}\n" +
+                    $"آیدی عددی: <code>{targetUserId}</code>\n" +
+                    $"شماره: <code>{Html(normalizedPhone)}</code>\n\n" +
                     "پس از تأیید، محدودیت ثبت شماره برای این کاربر برداشته می‌شود.",
+                parseMode: ParseMode.Html,
                 replyMarkup: BuildAdminPhoneConfirmationKeyboard());
             return true;
         }

@@ -63,7 +63,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Admin manual wallet credits/debits and colleague role promotions/demotions must be mirrored to the private logger channel with clickable actor and target identities.
 - Owned-bot super-admins can manually verify an existing regular or colleague user's phone number by Telegram user id.
   This override accepts virtual and non-Iranian numbers, requires explicit final confirmation, writes the shared
-  `CredUser.PhoneNumber`, notifies the user's previously started owned bots, and logs only masked phone values.
+  `CredUser.PhoneNumber`, notifies the user's previously started owned bots, and logs only masked phone values. Dynamic
+  user identity fields in this flow must use encoded HTML, never the legacy default Markdown sender.
 - Payment/order fulfillment paths must be idempotent: duplicate IPNs, repeated checks, or repeated assistant confirmations must not create another account or ledger entry.
 - Tenant fulfillment must reload the order and treat an existing `TenantBotLedgerEntry` for the same `TenantBotOrderId` as already fulfilled; this protects against stale singleton EF tracking and duplicate "check status" clicks.
 - If XUI account creation times out after a tenant card-to-card receipt is approved, keep the order unfulfilled but retryable and leave Sales Assistant approval controls available. Do not mark timeout as a definitive failed payment.
