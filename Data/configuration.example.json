@@ -1,0 +1,31 @@
+{
+  "adminsUserIds": [],
+  "bots": [
+    {
+      "id": "owned-brand-bot",
+      "username": "owned_brand_bot",
+      "token": "SET_WITH_A_SECRET_CONFIGURATION_SOURCE",
+      "brandName": "Owned Brand",
+      "type": "owned",
+      "enabled": true,
+      "isDefault": true,
+      "channelIds": [],
+      "supportAccount": "@support_username"
+    }
+  ],
+  "userDatabasePath": "./Data/users.db",
+  "credentialsDatabasePath": "./Data/credentials.db",
+  "referral": {
+    "enabled": true,
+    "minimumEligiblePaymentAmountToman": 100000,
+    "firstPayment": {
+      "referrerRewardPercent": 20,
+      "referredRewardPercent": 10,
+      "referredMinimumRewardToman": 50000,
+      "referredMaximumRewardToman": 0
+    },
+    "subsequentPayments": {
+      "referrerRewardPercent": 10
+    }
+  }
+}

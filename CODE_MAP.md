@@ -14,9 +14,10 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 ## Data Stores
 
-- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, tenant orders, Gozargah sync outbox.
-- `Data/CredentialsDbContex.cs`: shared user wallet/profile data. Do not change this schema unless explicitly requested.
+- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox.
+- `Data/CredentialsDbContex.cs`: unchanged shared user wallet/profile data; referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
+- `Data/configuration.example.json`: sanitized configuration example including every referral setting.
 - `Data/xui-v3-service-plans.json`: XUI v3 service catalog, prices, inbounds, duration options, unlimited fair-usage plans, and metered `minimumTrafficGb`.
 
 ## Core Services
@@ -29,6 +30,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/BroadcastManager.cs`: queued broadcast engine with progress/status tracking and retry behavior.
 - `Services/SalesAssistantService.cs`: central assistant bot for tenant sale notifications and manual receipt approval.
 - `Services/WalletLedgerService.cs`: append-only wallet ledger for credits/debits.
+- `Services/ReferralService.cs`: global owned-bot relationship registration, reward calculation, users.db state/ledger idempotency, user stats, notifications, and startup reconciliation.
 - `Domain/GozargahSite.cs`: Gozargah site API client, sync event models, mapping, and retry helpers.
 
 ## Tenant Bot Rules
@@ -60,6 +62,18 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Tenant card-to-card base cost settlement tries the owner's bot wallet first, then the owner's Gozargah website wallet when connected and sufficient, then allows the bot wallet to go negative with an owner warning. This does not auto-disable the customer account in the current phase.
 - Tenant platform-gateway sales credit profit to the owner's bot wallet and include a live Gozargah website wallet snapshot in the private sale log; the site wallet is not mutated for gateway profit.
 - Every wallet movement should have a matching `WalletLedgerEntry`.
+- Global owned-bot referral relationships are unique by referred Telegram id; `BotId` is attribution only. The first
+  relationship is immutable, self-referral and all tenant activity are excluded, and `/start ref_<base36-code>` does
+  not interfere with payment return payloads.
+- Final real-provider owned wallet charges from NOWPayments, HooshPay, and Zibal can create referral rewards only after
+  the original credit and ledger succeed. Below-minimum, provisional, partial, manual, site-wallet, failed/refunded,
+  trial, gift, and tenant payments do not create an event and do not consume first-payment eligibility.
+- Referral persistence and idempotency live only in `users.db`: source/reward uniqueness, reward
+  `crediting`/`credited` states, and unique `WalletLedgerEntry.IdempotencyKey`. A credited reward can repair its ledger
+  without another wallet change. A process interruption left at `crediting` is failed closed for manual review rather
+  than automatically risking a duplicate credit; referral never changes the credentials.db schema.
+- Referral startup validation requires every documented `referral` JSON key explicitly, even when disabled; numeric
+  zero is never silently inferred from a missing business setting.
 - Admin manual wallet credits/debits and colleague role promotions/demotions must be mirrored to the private logger channel with clickable actor and target identities.
 - Owned-bot super-admins can manually verify an existing regular or colleague user's phone number by Telegram user id.
   This override accepts virtual and non-Iranian numbers, requires explicit final confirmation, writes the shared
@@ -93,8 +107,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Financial `LogPayment` backup sends both `credentials.db` and `users.db` to the configured backup channel; backup failures must stay fail-soft and must not break settlement.
 - XUI v3 panel responses may omit `Traffic`; helpers must use null-safe access and fallback to top-level fields or `Extra`.
 - XUI v3 request timeout is controlled by `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`; slow panels can otherwise time out during `/panel/api/clients/add`.
-- XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `429/502/503/504`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
+- XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
 - XUI v3 account creation treats generated email as the idempotency key. If `addClient` or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
+- XUI v3 failures must never expose panel URLs, root paths, endpoints, responses, tokens, or cookies in Telegram.
+  `XuiV3ApiException.Message` is redacted and `XuiV3UserSafeError` owns fixed user-facing creation errors; complete
+  endpoint diagnostics are restricted to the private daily error file.
 - XUI v3 link changes are fail-closed before mutation: the shared owned/tenant flow must capture live client fields,
   actual panel inbound ids, and traffic counters before changing email/subId/UUID. After the update it restores any
   dropped inbounds or reduced traffic and verifies the complete state by read-back. Website sync and normal success
@@ -131,3 +148,5 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel.
 - `Domain/Logging/TelegramLogger.cs` also applies message-level channel suppression for known noncritical noise: stale Sales Assistant callbacks, unchanged Telegram edits, receipt-photo relay warnings that have a text fallback, repeated tenant forced-join probes, and Telegram polling 5xx/429/timeouts. Payment/audit logs and real token/XUI/settlement failures should still reach the private channel.
 - `CredentialsDbContext` and legacy `UserDbContext` state helper methods are still singleton-backed in DI and currently use a `SemaphoreSlim` gate as a temporary concurrency guard. The long-term fix is a separate refactor to per-operation DbContext/factory usage.
+- New wallet-ledger and referral operations use `UserDbContextFactory` per operation; legacy conversation/payment
+  code still uses the singleton contexts and their compatibility gates.

@@ -81,6 +81,8 @@ public class TelegramBotService : IHostedService
     private readonly SalesAssistantService _salesAssistantService;
     private readonly UserActivityLogService _userActivityLog;
     private readonly WalletLedgerService _walletLedgerService;
+    /// <summary>Global owned-bot referral engine used by start links, dashboards, and legacy Zibal settlement.</summary>
+    private readonly ReferralService _referralService;
     private readonly OwnedBotNotificationService _ownedBotNotificationService;
     private readonly GozargahSiteApiClient _gozargahSiteApiClient;
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
@@ -160,6 +162,9 @@ public class TelegramBotService : IHostedService
     /// Process-local receiver status store used by the super-admin bot status screen.
     /// </param>
     /// <param name="botContextAccessor">Async-local current bot context accessor.</param>
+    /// <param name="referralService">
+    /// Global owned-bot referral service used by start payloads, user reporting, and final legacy Zibal settlement.
+    /// </param>
     public TelegramBotService(
         ITelegramBotClient botClient,
         UserDbContext dbContext,
@@ -183,7 +188,8 @@ public class TelegramBotService : IHostedService
         GozargahSiteSyncService gozargahSiteSyncService,
         BotRegistry botRegistry,
         BotRuntimeStatusStore botRuntimeStatusStore,
-        BotContextAccessor botContextAccessor)
+        BotContextAccessor botContextAccessor,
+        ReferralService referralService)
     {
         _botClient = botClient;
         _userDbContext = dbContext;
@@ -209,6 +215,7 @@ public class TelegramBotService : IHostedService
         _botRegistry = botRegistry;
         _botRuntimeStatusStore = botRuntimeStatusStore;
         _botContextAccessor = botContextAccessor;
+        _referralService = referralService;
     }
 
     /// <summary>
@@ -3381,34 +3388,82 @@ public class TelegramBotService : IHostedService
         return status == 3 || status == 4 || status == 5;
     }
 
+    /// <summary>
+    /// Applies one provider-verified Zibal wallet charge using its persisted payment guard, records its ledger, and processes owned referral rewards.
+    /// </summary>
+    /// <param name="zpi">Local Zibal row containing final provider status, track id, wallet amount in rial, and originating bot.</param>
+    /// <param name="appConfig">Application configuration retained for legacy call-site compatibility.</param>
+    /// <param name="credUser">Legacy caller profile; the authoritative target user is reloaded by <paramref name="zpi"/> Telegram id.</param>
+    /// <param name="chatid">Telegram chat id that receives the final wallet-credit confirmation.</param>
+    /// <param name="isAdmin">Whether provider verification was initiated from an admin flow; this does not bypass final provider status.</param>
+    /// <returns>A task that completes after wallet, ledger, referral, notification, and payment-message updates.</returns>
+    /// <remarks>
+    /// The amount is converted from rial to Iranian toman by dividing by ten. Only rows with <c>IsPaid=true</c>
+    /// reach referral settlement. Repeated calls repair missing audit/referral work but never credit the wallet twice.
+    /// </remarks>
     public async Task ZibalAddtoBalance(ZibalPaymentInfo zpi, AppConfig appConfig, CredUser credUser, long chatid, bool isAdmin)
     {
-        if (zpi.IsAddedToBallance == true) return;
+        if (zpi == null || !zpi.IsPaid)
+            return;
 
         var findedUser = await _credentialsDbContext.GetUserStatusWithId(zpi.TelegramUserId);
-        long beforeBalance = credUser.AccountBalance;
-        await _credentialsDbContext.AddFund(zpi.TelegramUserId, zpi.Amount / 10);
+        if (findedUser == null)
+            return;
+
+        var zibalProviderPaymentId = zpi.TrackId > 0
+            ? zpi.TrackId.ToString(CultureInfo.InvariantCulture)
+            : zpi.Id.ToString(CultureInfo.InvariantCulture);
+        var zibalMutationKey = $"wallet-credit:zibal:{TenantBotPaymentPurposes.WalletCharge}:{zibalProviderPaymentId}";
+        if (zpi.IsAddedToBallance)
+        {
+            await _walletLedgerService.RecordAsync(
+                zpi.TelegramUserId,
+                WalletLedgerDirections.Credit,
+                zpi.Amount / 10,
+                findedUser.AccountBalance - (zpi.Amount / 10),
+                findedUser.AccountBalance,
+                WalletLedgerReasons.WalletCharge,
+                provider: "zibal",
+                referenceType: nameof(ZibalPaymentInfo),
+                referenceId: zpi.Id.ToString(CultureInfo.InvariantCulture),
+                orderId: zibalProviderPaymentId,
+                description: "Zibal wallet charge",
+                botId: zpi.BotId,
+                botUsername: zpi.BotUsername,
+                botType: BotInstanceTypes.Owned,
+                idempotencyKey: zibalMutationKey,
+                cancellationToken: CancellationToken.None);
+            if (zpi.IsPaid)
+            {
+                await _referralService.ProcessFinalOwnedWalletPaymentAsync(
+                    new ReferralPaymentSource(
+                        "zibal",
+                        TenantBotPaymentPurposes.WalletCharge,
+                        zibalProviderPaymentId,
+                        zpi.BotId,
+                        BotInstanceTypes.Owned,
+                        zpi.TelegramUserId,
+                        zpi.Amount / 10,
+                        zpi.PaidAt == default ? zpi.CreatedAt : zpi.PaidAt,
+                        true,
+                        true,
+                        false),
+                    CancellationToken.None);
+            }
+            return;
+        }
+
+        var beforeBalance = findedUser.AccountBalance;
+        var credited = await _credentialsDbContext.AddFund(
+            zpi.TelegramUserId,
+            zpi.Amount / 10);
+        if (!credited)
+            return;
+        var afterBalance = checked(beforeBalance + (zpi.Amount / 10));
+
         zpi.IsAddedToBallance = true;
 
-
-        if (isAdmin)
-        {
-            beforeBalance = findedUser.AccountBalance;
-            //notify user
-            await ActiveBotClient.CustomSendTextMessageAsync(
-              chatId: findedUser.ChatID,
-              text: $"اعتبار کیف پول شما به میزان {(zpi.Amount / 10).FormatCurrency()} افزایش یافت. با اسفتاده از این اعتبار میتوانید اکانت مورد نیاز خودرا تهیه بفرمایید.",
-              replyMarkup: MainReplyMarkupKeyboardFa());
-        }
-
         await _userDbContext.SaveChangesAsync();
-        await _credentialsDbContext.SaveChangesAsync();
-
-        long afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
-        if (isAdmin)
-        {
-            afterBalance = await _credentialsDbContext.GetAccountBalance(findedUser.TelegramUserId);
-        }
         await _walletLedgerService.RecordAsync(
             zpi.TelegramUserId,
             WalletLedgerDirections.Credit,
@@ -3421,7 +3476,38 @@ public class TelegramBotService : IHostedService
             referenceId: zpi.Id.ToString(CultureInfo.InvariantCulture),
             orderId: zpi.TrackId.ToString(CultureInfo.InvariantCulture),
             description: isAdmin ? "Admin-confirmed Zibal wallet charge" : "Zibal wallet charge",
+            botId: zpi.BotId,
+            botUsername: zpi.BotUsername,
+            botType: BotInstanceTypes.Owned,
+            idempotencyKey: zibalMutationKey,
             cancellationToken: CancellationToken.None);
+
+        if (zpi.IsPaid)
+        {
+            await _referralService.ProcessFinalOwnedWalletPaymentAsync(
+                new ReferralPaymentSource(
+                    "zibal",
+                    TenantBotPaymentPurposes.WalletCharge,
+                    zibalProviderPaymentId,
+                    zpi.BotId,
+                    BotInstanceTypes.Owned,
+                    zpi.TelegramUserId,
+                    zpi.Amount / 10,
+                    zpi.PaidAt == default ? DateTime.UtcNow : zpi.PaidAt,
+                    true,
+                    true,
+                    false),
+                CancellationToken.None);
+        }
+
+        if (isAdmin)
+        {
+            // Provider verification can be initiated by an admin, but the user receives the same final-credit notice.
+            await ActiveBotClient.CustomSendTextMessageAsync(
+                chatId: findedUser.ChatID,
+                text: $"اعتبار کیف پول شما به میزان {(zpi.Amount / 10).FormatCurrency()} افزایش یافت. با اسفتاده از این اعتبار میتوانید اکانت مورد نیاز خودرا تهیه بفرمایید.",
+                replyMarkup: MainReplyMarkupKeyboardFa());
+        }
 
         //notify user ( admin)
         await ActiveBotClient.CustomSendTextMessageAsync(
@@ -4530,6 +4616,17 @@ public class TelegramBotService : IHostedService
 
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
         var user = await _userDbContext.GetUserStatus(message.From.Id);
+        ReferralRegistrationResult referralRegistration = null;
+        var isReferralStart = ReferralService.TryParseStartPayload(message.Text, out var referralCode);
+        if (isReferralStart)
+        {
+            referralRegistration = await _referralService.RegisterRelationshipAsync(
+                message.From.Id,
+                referralCode,
+                CurrentBot?.Id ?? BotContextAccessor.DefaultBotId,
+                CurrentBot?.Type ?? BotInstanceTypes.Owned,
+                cancellationToken);
+        }
 
         var mandatoryJoinChannels = BuildMandatoryJoinChannels(CurrentChannelIds);
         var isJoined = await isJoinedToChannel(mandatoryJoinChannels.Select(c => c.ChatId), message.From.Id);
@@ -4574,12 +4671,15 @@ public class TelegramBotService : IHostedService
 
 
 
-        if (message.Text == "/start")
+        if (message.Text == "/start" || isReferralStart)
         {
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            var registrationText = BuildReferralRegistrationMessage(referralRegistration);
             await botClient.CustomSendTextMessageAsync(
                chatId: message.Chat.Id,
-               text: "به ربات خوش آمدید!",
+               text: string.IsNullOrWhiteSpace(registrationText)
+                   ? "به ربات خوش آمدید!"
+                   : $"به ربات خوش آمدید!\n\n{registrationText}",
                replyMarkup: MainReplyMarkupKeyboardFa());
             return;
         }
@@ -4720,6 +4820,13 @@ public class TelegramBotService : IHostedService
             MainReplyMarkupKeyboardFa(),
             cancellationToken))
         {
+            return;
+        }
+
+        else if (message.Text == "🎁 دعوت از دوستان" || message.Text == "دعوت از دوستان")
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await SendReferralDashboardAsync(botClient, message, cancellationToken);
             return;
         }
 
@@ -7465,6 +7572,14 @@ public class TelegramBotService : IHostedService
         }
         return value;
     }
+    /// <summary>
+    /// Builds the Persian owned-bot main reply keyboard including global referral access.
+    /// </summary>
+    /// <returns>A resized reply keyboard whose final row is the single full-width main-menu button.</returns>
+    /// <remarks>
+    /// The referral button is available only in owned routing; tenant storefronts construct their own customer menu
+    /// and do not use this keyboard for referral registration or reporting.
+    /// </remarks>
     ReplyKeyboardMarkup MainReplyMarkupKeyboardFa()
     {
 
@@ -7474,7 +7589,7 @@ public class TelegramBotService : IHostedService
                     new KeyboardButton[] { "📋 تعرفه‌ها", "📒 تراکنش‌های من" },
                     new KeyboardButton[] { "⚙️ مدیریت اکانت" },
                     new KeyboardButton[] { "🌟اکانت رایگان", "💡راهنما نصب" },
-                    new KeyboardButton[] { "💻 ارتباط با ادمین" },
+                    new KeyboardButton[] { "🎁 دعوت از دوستان", "💻 ارتباط با ادمین" },
                     new KeyboardButton[] { "🏠منو" }})
         {
             ResizeKeyboard = true
@@ -7557,6 +7672,90 @@ public class TelegramBotService : IHostedService
         });
 
         return keyboard;
+    }
+
+    /// <summary>
+    /// Builds the user-facing outcome shown after an owned-bot referral start payload is processed.
+    /// </summary>
+    /// <param name="result">Registration result returned by the global referral service, or <c>null</c> for ordinary start.</param>
+    /// <returns>Readable Persian status text, or an empty string when no referral-specific message is needed.</returns>
+    /// <remarks>
+    /// The message deliberately does not reveal another referrer's Telegram id when the immutable relationship was
+    /// already claimed through a different link.
+    /// </remarks>
+    private static string BuildReferralRegistrationMessage(ReferralRegistrationResult result)
+    {
+        if (result == null)
+            return string.Empty;
+
+        return result.Status switch
+        {
+            ReferralRegistrationStatus.Created =>
+                "✅ دعوت شما با موفقیت ثبت شد. پاداش‌ها پس از اولین پرداخت واجدشرایط اعمال می‌شوند.",
+            ReferralRegistrationStatus.AlreadyRegistered =>
+                "ℹ️ این لینک دعوت قبلاً برای حساب شما ثبت شده است.",
+            ReferralRegistrationStatus.DifferentReferrerAlreadyRegistered =>
+                "ℹ️ حساب شما قبلاً با یک لینک دعوت دیگر ثبت شده و معرف اول قابل تغییر نیست.",
+            ReferralRegistrationStatus.SelfReferralRejected =>
+                "⛔️ امکان ثبت لینک دعوت خودتان وجود ندارد.",
+            ReferralRegistrationStatus.InvalidCode =>
+                "⚠️ لینک دعوت معتبر نیست یا صاحب آن هنوز در ربات ثبت نشده است.",
+            _ => string.Empty
+        };
+    }
+
+    /// <summary>
+    /// Shows the current user's global referral link and reward statistics in an owned bot.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the currently handling owned bot.</param>
+    /// <param name="message">Incoming message containing the numeric Telegram user and chat ids.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db statistics and Telegram delivery.</param>
+    /// <returns>A task that completes after the dashboard and main reply keyboard are sent.</returns>
+    /// <remarks>
+    /// The link uses the current owned bot username, but invited count and rewards are global across every owned bot.
+    /// Tenant bots never call this method and cannot create referral links or relationships.
+    /// </remarks>
+    private async Task SendReferralDashboardAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CancellationToken cancellationToken)
+    {
+        if (_appConfig.Referral?.Enabled != true)
+        {
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "قابلیت دعوت از دوستان در حال حاضر فعال نیست.",
+                replyMarkup: MainReplyMarkupKeyboardFa());
+            return;
+        }
+
+        var username = (CurrentBot?.Username ?? string.Empty).Trim().TrimStart('@');
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "نام کاربری این ربات برای ساخت لینک دعوت تنظیم نشده است.",
+                replyMarkup: MainReplyMarkupKeyboardFa());
+            return;
+        }
+
+        var stats = await _referralService.GetUserStatsAsync(message.From.Id, cancellationToken);
+        var code = ReferralCodeCodec.Encode(message.From.Id);
+        var link = $"https://t.me/{username}?start=ref_{code}";
+        var text =
+            "🎁 دعوت از دوستان\n\n" +
+            $"لینک اختصاصی شما:\n{link}\n\n" +
+            $"👥 تعداد دعوت‌شده‌ها: {stats.InvitedCount:N0}\n" +
+            $"✅ دعوت‌های واجدشرایط: {stats.EligibleReferralCount:N0}\n" +
+            $"💰 مجموع پاداش‌ها: {stats.TotalAppliedRewardToman:N0} تومان\n" +
+            $"⏳ پاداش‌های در انتظار: {stats.PendingRewardCount:N0}\n" +
+            $"⚠️ پاداش‌های نیازمند بررسی مجدد: {stats.FailedRewardCount:N0}\n\n" +
+            $"حداقل پرداخت واجدشرایط: {_appConfig.Referral.MinimumEligiblePaymentAmountToman:N0} تومان";
+
+        await botClient.CustomSendTextMessageAsync(
+            chatId: message.Chat.Id,
+            text: text,
+            replyMarkup: MainReplyMarkupKeyboardFa());
     }
 
     /// <summary>

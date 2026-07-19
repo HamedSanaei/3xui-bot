@@ -697,7 +697,8 @@ public class XuiV3AdminFlowService
         var bulkResult = await CreateAdminAccountsAsync(currentUser, message.From.Id, cancellationToken);
         if (bulkResult.SuccessfulCount == 0)
         {
-            var failureMessage = bulkResult.Failures.FirstOrDefault()?.Message ?? "خطای نامشخص";
+            var failureMessage = XuiV3UserSafeError.ForAccountCreation(
+                bulkResult.Failures.FirstOrDefault()?.Message);
             await FinishWithMessageAsync(
                 botClient,
                 message.Chat.Id,
@@ -2971,7 +2972,7 @@ public class XuiV3AdminFlowService
         {
             sb.AppendLine("خطاها:");
             foreach (var failure in result.Failures)
-                sb.AppendLine($"ردیف `{failure.Index}` - `{ShortenForLog(failure.Message, 120)}`");
+                sb.AppendLine($"ردیف `{failure.Index}` - `{ShortenForLog(XuiV3UserSafeError.ForAccountCreation(failure.Message), 120)}`");
         }
 
         return sb.ToString();
@@ -2988,7 +2989,7 @@ public class XuiV3AdminFlowService
         };
 
         foreach (var failure in result.Failures)
-            lines.Add($"ردیف <code>{failure.Index}</code>: <code>{Html(ShortenForLog(failure.Message, 160))}</code>");
+            lines.Add($"ردیف <code>{failure.Index}</code>: <code>{Html(ShortenForLog(XuiV3UserSafeError.ForAccountCreation(failure.Message), 160))}</code>");
 
         return string.Join("\n", lines);
     }

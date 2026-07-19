@@ -1952,7 +1952,7 @@ public class XuiV3BotFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: $"ساخت اکانت تست ناموفق بود.\n{creation.Message}",
+                text: $"ساخت اکانت تست ناموفق بود.\n{XuiV3UserSafeError.ForAccountCreation(creation.Message)}",
                 replyMarkup: mainReplyMarkup,
                 cancellationToken: cancellationToken);
             await _userDbContext.ClearUserStatus(user);
@@ -2742,7 +2742,8 @@ public class XuiV3BotFlowService
 
                 if (bulkResult.SuccessfulCount == 0)
                 {
-                    var failureMessage = bulkResult.Failures.FirstOrDefault()?.Message ?? "ساخت اکانت ناموفق بود.";
+                    var failureMessage = XuiV3UserSafeError.ForAccountCreation(
+                        bulkResult.Failures.FirstOrDefault()?.Message);
                     await _activityLog.LogWarningAsync(
                         "xui_v3_bulk_account_create_failed",
                         credUser,
@@ -4666,7 +4667,7 @@ public class XuiV3BotFlowService
         {
             builder.AppendLine();
             builder.AppendLine($"ردیف: <code>{failure.Index}</code>");
-            builder.AppendLine($"خطا: <code>{Html(failure.Message)}</code>");
+            builder.AppendLine($"خطا: <code>{Html(XuiV3UserSafeError.ForAccountCreation(failure.Message))}</code>");
         }
 
         return builder.ToString();

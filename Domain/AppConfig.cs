@@ -50,6 +50,14 @@ namespace Adminbot.Domain
         public int BroadcastMaxRetryCount { get; set; } = 3;
         public int BroadcastQueueCapacity { get; set; } = 10000;
         /// <summary>
+        /// Global owned-bot referral settings used by registration, settlement, reporting, and reconciliation.
+        /// </summary>
+        /// <remarks>
+        /// Referral relationships are global across every owned bot. Bot identifiers are retained only for
+        /// attribution and never partition relationship uniqueness or reward eligibility.
+        /// </remarks>
+        public ReferralOptions Referral { get; set; } = new();
+        /// <summary>
         /// Maximum duration, in seconds, allowed for one Telegram bot startup probe such as <c>getMe</c> or
         /// command-menu configuration.
         /// </summary>

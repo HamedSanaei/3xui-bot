@@ -1,4 +1,5 @@
 using Adminbot.Domain;
+using Adminbot.Domain.Logging;
 using Adminbot.Utils;
 using Newtonsoft.Json;
 using Microsoft.Extensions.Configuration;
@@ -440,8 +441,23 @@ public class XuiV3PurchaseService
     /// <remarks>
     /// The method preserves partial success. If account 1 is created and account 2 times out, callers must charge or
     /// deliver only the successful accounts and show the failure list for the rest. Shutdown cancellation is not
-    /// swallowed and still propagates through <see cref="OperationCanceledException"/>.
+    /// swallowed and still propagates through <see cref="OperationCanceledException"/>. Full panel exceptions are
+    /// retained only in the private daily diagnostic log; every failure returned to callers contains fixed,
+    /// Telegram-safe text and must not be replaced with <see cref="Exception.Message"/>.
     /// </remarks>
+    /// <example>
+    /// <code>
+    /// var result = await purchaseService.CreateBulkAccountsAsync(
+    ///     user,
+    ///     serverInfo,
+    ///     selection,
+    ///     selectedCountry: "default",
+    ///     cancellationToken: cancellationToken);
+    ///
+    /// if (result.SuccessfulCount == 0)
+    ///     await bot.SendTextMessageAsync(chatId, result.Failures[0].Message, cancellationToken: cancellationToken);
+    /// </code>
+    /// </example>
     public async Task<XuiV3BulkCreationResult> CreateBulkAccountsAsync(
         CredUser user,
         ServerInfo serverInfo,
@@ -508,10 +524,17 @@ public class XuiV3PurchaseService
             }
             catch (Exception ex)
             {
+                // Preserve the full exception only in internal diagnostics. Telegram receives a fixed safe message.
+                DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
+                    _configuration,
+                    LogLevel.Error,
+                    nameof(XuiV3PurchaseService),
+                    $"XUI v3 bulk account creation failed. bulkOrderId={bulkOrderId}, index={i}",
+                    ex);
                 result.Failures.Add(new XuiV3BulkCreationFailure
                 {
                     Index = i,
-                    Message = ex.Message
+                    Message = XuiV3UserSafeError.ForAccountCreation(ex)
                 });
                 break;
             }
@@ -522,7 +545,7 @@ public class XuiV3PurchaseService
                 {
                     Index = i,
                     Email = created.Email,
-                    Message = created.Message
+                    Message = XuiV3UserSafeError.ForAccountCreation(created.Message)
                 });
                 break;
             }
@@ -633,10 +656,32 @@ public class XuiV3PurchaseService
         return flowUser.AccountCounter + 1;
     }
 
+    /// <summary>
+    /// Builds the HTML-formatted Telegram delivery text for one XUI v3 account result.
+    /// </summary>
+    /// <param name="result">
+    /// Account creation result returned by <see cref="ApiServicev3.CreateUserAccountAsync"/>. A null or unsuccessful
+    /// result is accepted and produces a fixed safe failure message; raw panel responses must not be assigned to it.
+    /// </param>
+    /// <returns>
+    /// HTML-formatted account details when creation succeeded, or a Persian failure message that contains no panel
+    /// URL, root path, endpoint, response body, token, cookie, or request payload.
+    /// </returns>
+    /// <remarks>
+    /// The successful output is intended for Telegram with HTML parse mode. Failure output is passed through
+    /// <see cref="XuiV3UserSafeError"/> again as a boundary safeguard, even though creation results are expected to
+    /// have been sanitized earlier.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var text = purchaseService.BuildCreatedAccountText(createdAccount);
+    /// await bot.SendTextMessageAsync(chatId, text, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
+    /// </code>
+    /// </example>
     public string BuildCreatedAccountText(XuiV3AccountCreationResult result)
     {
         if (result == null || !result.Success)
-            return $"ساخت اکانت ناموفق بود.\n{result?.Message}";
+            return $"ساخت اکانت ناموفق بود.\n{XuiV3UserSafeError.ForAccountCreation(result?.Message)}";
 
         var trafficLabel = IsUnlimitedAccount(result.Comment) ? "حد مصرف منصفانه" : "حجم";
         var text = "✅ اکانت شما با موفقیت ساخته شد.\n\n";
@@ -833,10 +878,22 @@ public class XuiV3BulkCreationResult
     public bool Success => SuccessfulCount == RequestedCount && Failures.Count == 0;
 }
 
+/// <summary>
+/// Describes one failed item in a bulk XUI v3 creation request without exposing panel infrastructure details.
+/// </summary>
+/// <remarks>
+/// <see cref="Message"/> is a Telegram-safe fixed message. The original exception is written separately to the
+/// private daily diagnostic log and must not be copied into this DTO.
+/// </remarks>
 public class XuiV3BulkCreationFailure
 {
+    /// <summary>One-based item index inside the bulk account request.</summary>
     public int Index { get; set; }
+
+    /// <summary>Generated client email when it was known before the failure; otherwise <c>null</c>.</summary>
     public string Email { get; set; }
+
+    /// <summary>Fixed sanitized failure text that is safe to display through Telegram.</summary>
     public string Message { get; set; }
 }
 

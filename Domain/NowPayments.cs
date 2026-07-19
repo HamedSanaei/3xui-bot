@@ -671,12 +671,18 @@ namespace Adminbot.Domain
 
     public class NowPaymentsSettlementService
     {
+        /// <summary>
+        /// Serializes local NOWPayments wallet settlement while database uniqueness remains the cross-process guard.
+        /// </summary>
+        private static readonly SemaphoreSlim WalletSettlementGate = new(1, 1);
         private readonly UserDbContext _userDbContext;
         private readonly CredentialsDbContext _credentialsDbContext;
         private readonly BotClientProvider _botClientProvider;
         private readonly BotRegistry _botRegistry;
         private readonly BotContextAccessor _botContextAccessor;
         private readonly WalletLedgerService _walletLedgerService;
+        /// <summary>Applies global owned-bot rewards only after a final original NOWPayments credit.</summary>
+        private readonly ReferralService _referralService;
         private readonly NowPayments _nowPayments;
         private readonly ILogger<NowPaymentsSettlementService> _logger;
 
@@ -689,6 +695,7 @@ namespace Adminbot.Domain
         /// <param name="botRegistry">Runtime bot registry used to resolve the payment's bot context for logging.</param>
         /// <param name="botContextAccessor">Async-local context accessor used while sending payment logs.</param>
         /// <param name="walletLedgerService">Append-only ledger writer for successful wallet credits.</param>
+        /// <param name="referralService">Global owned-bot referral settlement invoked after the original final credit.</param>
         /// <param name="nowPayments">NOWPayments API client used to re-check provider status during manual admin checks.</param>
         /// <param name="logger">Application logger for diagnostics that should not mutate payment state.</param>
         /// <remarks>
@@ -703,6 +710,7 @@ namespace Adminbot.Domain
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
             WalletLedgerService walletLedgerService,
+            ReferralService referralService,
             NowPayments nowPayments,
             ILogger<NowPaymentsSettlementService> logger)
         {
@@ -712,10 +720,27 @@ namespace Adminbot.Domain
             _botRegistry = botRegistry;
             _botContextAccessor = botContextAccessor;
             _walletLedgerService = walletLedgerService;
+            _referralService = referralService;
             _nowPayments = nowPayments;
             _logger = logger;
         }
 
+        /// <summary>
+        /// Applies one final provider-paid owned-bot wallet charge under the payment-row guard and then processes referral rewards.
+        /// </summary>
+        /// <param name="payment">Tracked NOWPayments wallet-charge row with a final paid provider status.</param>
+        /// <param name="source">Non-secret settlement source such as IPN, return check, or admin provider re-check.</param>
+        /// <param name="notifyChatId">Optional Telegram chat id override used only for the success notification.</param>
+        /// <param name="cancellationToken">Cancellation token for both databases, ledger, referral, and Telegram work.</param>
+        /// <returns>
+        /// Applied with original before/after balances, AlreadyAdded for an idempotent replay, ProviderNotPaid when
+        /// the row is not a final wallet charge, or a missing-user result without mutation.
+        /// </returns>
+        /// <remarks>
+        /// The persisted payment-row flag prevents a repeated callback in the running service from changing the
+        /// wallet twice. Repeated IPNs repair a missing users.db ledger and replay pending referral work.
+        /// Tenant, partial, provisional, pending, failed, and refunded rows are not eligible for this referral path.
+        /// </remarks>
         public async Task<NowPaymentsSettlementResult> ApplyFinishedPaymentAsync(
             SwapinoPaymentInfo payment,
             string source,
@@ -725,50 +750,86 @@ namespace Adminbot.Domain
             if (payment == null)
                 return NowPaymentsSettlementResult.NotFound();
 
-            var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
-            if (credUser == null)
-                return NowPaymentsSettlementResult.UserNotFound();
-
-            if (payment.IsAddedToBalance)
-                return NowPaymentsSettlementResult.AlreadyAdded(credUser.AccountBalance);
-
-            var beforeBalance = credUser.AccountBalance;
-            var added = await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.AmountToman);
-            if (!added)
-                return NowPaymentsSettlementResult.UserNotFound();
-
-            payment.IsAddedToBalance = true;
-            payment.BalanceBefore = beforeBalance;
-            payment.BalanceAfter = await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
-            payment.SettledAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
-
-            var afterBalance = payment.BalanceAfter ?? await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
-            await _walletLedgerService.RecordAsync(
-                payment.TelegramUserId,
-                WalletLedgerDirections.Credit,
-                payment.AmountToman,
-                beforeBalance,
-                afterBalance,
-                WalletLedgerReasons.WalletCharge,
-                provider: "nowpayments",
-                referenceType: nameof(SwapinoPaymentInfo),
-                referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
-                orderId: payment.OrderId,
-                description: "NOWPayments wallet charge",
-                botId: payment.BotId,
-                botUsername: payment.BotUsername,
-                botType: BotInstanceTypes.Owned,
-                cancellationToken: cancellationToken);
-            using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+            if (!string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.WalletCharge, StringComparison.OrdinalIgnoreCase) ||
+                !NowPaymentsStatuses.IsPaid(payment.PaymentStatus))
             {
-                await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
-                LogPayment(payment, credUser, beforeBalance, afterBalance, source);
+                return NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
-            return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
+            await WalletSettlementGate.WaitAsync(cancellationToken);
+            try
+            {
+                var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
+                if (credUser == null)
+                    return NowPaymentsSettlementResult.UserNotFound();
+
+                if (payment.IsAddedToBalance)
+                {
+                    await EnsureOriginalLedgerAsync(
+                        payment,
+                        payment.BalanceBefore ?? (credUser.AccountBalance - payment.AmountToman),
+                        payment.BalanceAfter ?? credUser.AccountBalance,
+                        cancellationToken);
+                    await ProcessReferralAsync(payment, isProvisional: false, cancellationToken);
+                    return NowPaymentsSettlementResult.AlreadyAdded(credUser.AccountBalance);
+                }
+
+                var beforeBalance = credUser.AccountBalance;
+                var credited = await _credentialsDbContext.AddFund(
+                    payment.TelegramUserId,
+                    payment.AmountToman);
+                if (!credited)
+                    return NowPaymentsSettlementResult.UserNotFound();
+                var afterBalance = checked(beforeBalance + payment.AmountToman);
+
+                payment.IsAddedToBalance = true;
+                payment.BalanceBefore = beforeBalance;
+                payment.BalanceAfter = afterBalance;
+                payment.SettledAtUtc ??= DateTime.UtcNow;
+                await _userDbContext.SaveChangesAsync(cancellationToken);
+
+                await EnsureOriginalLedgerAsync(
+                    payment,
+                    beforeBalance,
+                    afterBalance,
+                    cancellationToken);
+
+                // Referral runs only after the original wallet credit and its audit ledger are available.
+                await ProcessReferralAsync(payment, isProvisional: false, cancellationToken);
+                using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
+                {
+                    await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
+                    LogPayment(
+                        payment,
+                        credUser,
+                        beforeBalance,
+                        afterBalance,
+                        source);
+                }
+
+                return NowPaymentsSettlementResult.Applied(
+                    beforeBalance,
+                    afterBalance);
+            }
+            finally
+            {
+                WalletSettlementGate.Release();
+            }
         }
 
+        /// <summary>
+        /// Credits a verified partial NOWPayments amount exactly once without creating referral eligibility.
+        /// </summary>
+        /// <param name="payment">Tracked NOWPayments wallet row approved for partial settlement.</param>
+        /// <param name="creditedAmountToman">Positive partial credit amount in Iranian toman.</param>
+        /// <param name="source">Non-secret settlement audit source.</param>
+        /// <param name="notifyChatId">Optional Telegram chat id override for the partial-credit notification.</param>
+        /// <param name="cancellationToken">Cancellation token for wallet, payment row, ledger, and notification work.</param>
+        /// <returns>Applied/AlreadyAdded/missing-user/invalid-amount settlement status.</returns>
+        /// <remarks>
+        /// Partial payments use a dedicated wallet and ledger idempotency key. They never call the referral service
+        /// and therefore cannot consume first eligible payment status.
+        /// </remarks>
         public async Task<NowPaymentsSettlementResult> ApplyPartialPaymentAsync(
             SwapinoPaymentInfo payment,
             long creditedAmountToman,
@@ -790,15 +851,20 @@ namespace Adminbot.Domain
                 return NowPaymentsSettlementResult.AlreadyAdded(credUser.AccountBalance);
 
             var originalAmountToman = payment.AmountToman;
+            var partialPaymentId = GetReferralProviderPaymentId(payment);
+            var partialMutationKey = $"wallet-credit:nowpayments-partial:{partialPaymentId}";
             var beforeBalance = credUser.AccountBalance;
-            var added = await _credentialsDbContext.AddFund(payment.TelegramUserId, creditedAmountToman);
-            if (!added)
+            var credited = await _credentialsDbContext.AddFund(
+                payment.TelegramUserId,
+                creditedAmountToman);
+            if (!credited)
                 return NowPaymentsSettlementResult.UserNotFound();
+            var afterBalance = checked(beforeBalance + creditedAmountToman);
 
             payment.AmountToman = creditedAmountToman;
             payment.IsAddedToBalance = true;
             payment.BalanceBefore = beforeBalance;
-            payment.BalanceAfter = await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
+            payment.BalanceAfter = afterBalance;
             payment.SettledAtUtc = DateTime.UtcNow;
             payment.ErrorCode = "partial_settlement";
             payment.ErrorMessage = $"Partial crypto payment credited. OriginalAmountToman={originalAmountToman}, CreditedAmountToman={creditedAmountToman}";
@@ -817,7 +883,6 @@ namespace Adminbot.Domain
 
             await _userDbContext.SaveChangesAsync(cancellationToken);
 
-            var afterBalance = payment.BalanceAfter ?? await _credentialsDbContext.GetAccountBalance(payment.TelegramUserId);
             await _walletLedgerService.RecordAsync(
                 payment.TelegramUserId,
                 WalletLedgerDirections.Credit,
@@ -833,6 +898,7 @@ namespace Adminbot.Domain
                 botId: payment.BotId,
                 botUsername: payment.BotUsername,
                 botType: BotInstanceTypes.Owned,
+                idempotencyKey: partialMutationKey,
                 cancellationToken: cancellationToken);
             using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
             {
@@ -841,6 +907,99 @@ namespace Adminbot.Domain
             }
 
             return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
+        }
+
+        /// <summary>
+        /// Presents one final NOWPayments wallet credit to the global owned-bot referral engine.
+        /// </summary>
+        /// <param name="payment">Locally settled wallet-charge row.</param>
+        /// <param name="isProvisional">Whether the source credit is provisional; NOWPayments callers pass <c>false</c>.</param>
+        /// <param name="cancellationToken">Cancellation token for referral persistence and notifications.</param>
+        /// <returns>A task that completes after referral work is applied or safely persisted for retry.</returns>
+        private Task ProcessReferralAsync(
+            SwapinoPaymentInfo payment,
+            bool isProvisional,
+            CancellationToken cancellationToken)
+        {
+            return _referralService.ProcessFinalOwnedWalletPaymentAsync(
+                new ReferralPaymentSource(
+                    "nowpayments",
+                    payment.PaymentPurpose,
+                    GetReferralProviderPaymentId(payment),
+                    payment.BotId,
+                    BotInstanceTypes.Owned,
+                    payment.TelegramUserId,
+                    payment.AmountToman,
+                    payment.SettledAtUtc ?? payment.PaidAtUtc ?? DateTime.UtcNow,
+                    payment.IsAddedToBalance,
+                    NowPaymentsStatuses.IsPaid(payment.PaymentStatus),
+                    isProvisional),
+                cancellationToken);
+        }
+
+        /// <summary>
+        /// Ensures the original final NOWPayments wallet credit has one matching idempotent ledger entry.
+        /// </summary>
+        /// <param name="payment">Final wallet-charge row whose original wallet credit already succeeded.</param>
+        /// <param name="beforeBalance">Authoritative wallet balance in Iranian toman before the original credit.</param>
+        /// <param name="afterBalance">Authoritative wallet balance in Iranian toman after the original credit.</param>
+        /// <param name="cancellationToken">Cancellation token for users.db audit persistence.</param>
+        /// <returns>A task that completes after the ledger exists.</returns>
+        /// <remarks>
+        /// Repeated IPNs call this method even when <see cref="SwapinoPaymentInfo.IsAddedToBalance"/> is already true.
+        /// This repairs a crash between payment-row persistence and ledger insertion without changing the wallet again.
+        /// </remarks>
+        private Task<WalletLedgerEntry> EnsureOriginalLedgerAsync(
+            SwapinoPaymentInfo payment,
+            long beforeBalance,
+            long afterBalance,
+            CancellationToken cancellationToken)
+        {
+            var sourcePaymentKey = ReferralService.BuildSourcePaymentKey(
+                "nowpayments",
+                TenantBotPaymentPurposes.WalletCharge,
+                GetReferralProviderPaymentId(payment));
+            return _walletLedgerService.RecordAsync(
+                payment.TelegramUserId,
+                WalletLedgerDirections.Credit,
+                payment.AmountToman,
+                beforeBalance,
+                afterBalance,
+                WalletLedgerReasons.WalletCharge,
+                provider: "nowpayments",
+                referenceType: nameof(SwapinoPaymentInfo),
+                referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
+                orderId: payment.OrderId,
+                description: "NOWPayments wallet charge",
+                botId: payment.BotId,
+                botUsername: payment.BotUsername,
+                botType: BotInstanceTypes.Owned,
+                idempotencyKey: $"wallet-credit:{sourcePaymentKey}",
+                cancellationToken: cancellationToken);
+        }
+
+        /// <summary>
+        /// Selects the strongest stable NOWPayments identifier for referral and wallet idempotency keys.
+        /// </summary>
+        /// <param name="payment">Local NOWPayments row containing provider and local identifiers.</param>
+        /// <returns>Payment id, invoice id, order id, or local row id in that precedence order.</returns>
+        private static string GetReferralProviderPaymentId(SwapinoPaymentInfo payment)
+        {
+            return FirstNonEmpty(
+                payment.PaymentId,
+                payment.InvoiceId,
+                payment.OrderId,
+                payment.Id.ToString(CultureInfo.InvariantCulture));
+        }
+
+        /// <summary>
+        /// Returns the first non-empty identifier supplied by a settlement row.
+        /// </summary>
+        /// <param name="values">Identifiers ordered from strongest provider id to local fallback.</param>
+        /// <returns>A trimmed non-empty identifier.</returns>
+        private static string FirstNonEmpty(params string[] values)
+        {
+            return values.First(x => !string.IsNullOrWhiteSpace(x)).Trim();
         }
 
         /// <summary>

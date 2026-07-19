@@ -28,6 +28,24 @@ public class UserDbContext : DbContext
     /// </remarks>
     private readonly SemaphoreSlim _dbGate = new(1, 1);
 
+    /// <summary>
+    /// Creates a users.db context that resolves its SQLite path from <see cref="ConfigureDatabasePath"/>.
+    /// </summary>
+    /// <remarks>This constructor is retained for the legacy singleton context and EF migration tooling.</remarks>
+    public UserDbContext()
+    {
+    }
+
+    /// <summary>
+    /// Creates a users.db context with externally supplied options from <see cref="UserDbContextFactory"/>.
+    /// </summary>
+    /// <param name="options">Configured EF Core options pointing at the application users.db database.</param>
+    /// <remarks>Referral and wallet-ledger operations use this constructor to own an independent change tracker.</remarks>
+    public UserDbContext(DbContextOptions<UserDbContext> options)
+        : base(options)
+    {
+    }
+
     public DbSet<User> Users { get; set; }
     public DbSet<BotInstance> BotInstances { get; set; }
     public DbSet<BotUserState> BotUserStates { get; set; }
@@ -35,6 +53,12 @@ public class UserDbContext : DbContext
     public DbSet<TenantBotOrder> TenantBotOrders { get; set; }
     public DbSet<TenantBotLedgerEntry> TenantBotLedgerEntries { get; set; }
     public DbSet<WalletLedgerEntry> WalletLedgerEntries { get; set; }
+    /// <summary>Global immutable referral relationships shared by all owned bots.</summary>
+    public DbSet<ReferralRelationship> ReferralRelationships { get; set; }
+    /// <summary>Eligible owned-bot wallet payment events processed by the referral engine.</summary>
+    public DbSet<ReferralPaymentEvent> ReferralPaymentEvents { get; set; }
+    /// <summary>Retryable referral reward rows linked to exactly-once wallet mutations and ledger entries.</summary>
+    public DbSet<ReferralReward> ReferralRewards { get; set; }
     public DbSet<TenantManualPaymentReceipt> TenantManualPaymentReceipts { get; set; }
     /// <summary>
     /// Outbox rows for synchronizing successful XUI operations from the bot to the Gozargah website.
@@ -252,11 +276,69 @@ public class UserDbContext : DbContext
             entity.Property(x => x.ReferenceType).HasMaxLength(64);
             entity.Property(x => x.ReferenceId).HasMaxLength(128);
             entity.Property(x => x.OrderId).HasMaxLength(140);
+            entity.Property(x => x.IdempotencyKey).HasMaxLength(240);
             entity.HasIndex(x => x.TelegramUserId);
             entity.HasIndex(x => x.OwnerTelegramUserId);
             entity.HasIndex(x => x.BotId);
             entity.HasIndex(x => x.OrderId);
             entity.HasIndex(x => x.CreatedAtUtc);
+            entity.HasIndex(x => x.IdempotencyKey)
+                .IsUnique()
+                .HasFilter("\"IdempotencyKey\" IS NOT NULL");
+        });
+
+        modelBuilder.Entity<ReferralRelationship>(entity =>
+        {
+            entity.ToTable("ReferralRelationships", table =>
+                table.HasCheckConstraint(
+                    "CK_ReferralRelationships_NoSelfReferral",
+                    "\"ReferrerTelegramUserId\" <> \"ReferredTelegramUserId\""));
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.AttributionBotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.ReferralCode).IsRequired().HasMaxLength(64);
+            entity.HasIndex(x => x.ReferredTelegramUserId).IsUnique();
+            entity.HasIndex(x => x.ReferrerTelegramUserId);
+            entity.HasIndex(x => x.AttributionBotId);
+        });
+
+        modelBuilder.Entity<ReferralPaymentEvent>(entity =>
+        {
+            entity.ToTable("ReferralPaymentEvents");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.SourcePaymentKey).IsRequired().HasMaxLength(240);
+            entity.Property(x => x.Provider).IsRequired().HasMaxLength(48);
+            entity.Property(x => x.PaymentType).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.ProviderPaymentId).IsRequired().HasMaxLength(160);
+            entity.Property(x => x.BotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.Status).IsRequired().HasMaxLength(24);
+            entity.Property(x => x.LastError).HasMaxLength(2000);
+            entity.HasIndex(x => x.SourcePaymentKey).IsUnique();
+            entity.HasIndex(x => new { x.ReferredTelegramUserId, x.IsFirstEligiblePayment })
+                .IsUnique()
+                .HasFilter("\"IsFirstEligiblePayment\" = 1");
+            entity.HasIndex(x => new { x.Status, x.UpdatedAtUtc });
+            entity.HasIndex(x => x.ReferralRelationshipId);
+        });
+
+        modelBuilder.Entity<ReferralReward>(entity =>
+        {
+            entity.ToTable("ReferralRewards");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.SourcePaymentKey).IsRequired().HasMaxLength(240);
+            entity.Property(x => x.BotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.RewardKind).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.Status).IsRequired().HasMaxLength(24);
+            entity.Property(x => x.WalletMutationKey).IsRequired().HasMaxLength(240);
+            entity.Property(x => x.LastError).HasMaxLength(2000);
+            entity.Property(x => x.RewardPercentSnapshot).HasPrecision(9, 4);
+            entity.HasIndex(x => new { x.SourcePaymentKey, x.BeneficiaryTelegramUserId, x.RewardKind }).IsUnique();
+            entity.HasIndex(x => x.WalletMutationKey).IsUnique();
+            entity.HasIndex(x => new { x.BeneficiaryTelegramUserId, x.Status });
+            entity.HasIndex(x => x.ReferralPaymentEventId);
+            entity.HasIndex(x => x.ReferralRelationshipId);
         });
 
         modelBuilder.Entity<TenantManualPaymentReceipt>(entity =>
@@ -514,4 +596,42 @@ public class UserDbContext : DbContext
         return BotContextAccessor.CurrentBotId;
     }
 
+}
+
+/// <summary>
+/// Creates independent users.db contexts for financial and referral operations that may run concurrently.
+/// </summary>
+/// <remarks>
+/// Legacy conversation-state helpers still use the singleton context, while new financial code uses this factory
+/// so each operation owns its EF Core change tracker and can rely on database uniqueness for concurrency control.
+/// </remarks>
+public sealed class UserDbContextFactory
+{
+    /// <summary>Immutable EF options reused to create independent contexts for the same migrated users.db file.</summary>
+    private readonly DbContextOptions<UserDbContext> _options;
+
+    /// <summary>
+    /// Creates a factory from fully configured users.db options.
+    /// </summary>
+    /// <param name="options">EF Core SQLite options for the same users.db file migrated at application startup.</param>
+    public UserDbContextFactory(DbContextOptions<UserDbContext> options)
+    {
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+    }
+
+    /// <summary>
+    /// Creates a new users.db context owned by the caller.
+    /// </summary>
+    /// <returns>A new disposable context with an independent change tracker.</returns>
+    /// <remarks>Callers must dispose the returned context after completing one logical operation.</remarks>
+    /// <example>
+    /// <code>
+    /// await using var context = factory.CreateDbContext();
+    /// var rewards = await context.ReferralRewards.ToListAsync(cancellationToken);
+    /// </code>
+    /// </example>
+    public UserDbContext CreateDbContext()
+    {
+        return new UserDbContext(_options);
+    }
 }

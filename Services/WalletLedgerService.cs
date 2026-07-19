@@ -13,15 +13,19 @@ namespace Adminbot.Domain
     public class WalletLedgerService
     {
         private const string GozargahSiteWalletProvider = "gozargah_site_wallet";
-        private readonly UserDbContext _userDbContext;
+        /// <summary>Creates independent users.db contexts so concurrent financial writers do not share EF tracking state.</summary>
+        private readonly UserDbContextFactory _userDbContextFactory;
 
         /// <summary>
         /// Creates a wallet ledger service backed by the runtime users database.
         /// </summary>
-        /// <param name="userDbContext">EF Core context for <c>users.db</c>, where ledger rows are persisted.</param>
-        public WalletLedgerService(UserDbContext userDbContext)
+        /// <param name="userDbContextFactory">
+        /// Per-operation EF Core context factory for <c>users.db</c>. A fresh context prevents concurrent Telegram
+        /// receivers from sharing one non-thread-safe change tracker.
+        /// </param>
+        public WalletLedgerService(UserDbContextFactory userDbContextFactory)
         {
-            _userDbContext = userDbContext;
+            _userDbContextFactory = userDbContextFactory;
         }
 
         /// <summary>
@@ -43,11 +47,17 @@ namespace Adminbot.Domain
         /// <param name="botId">Bot id that originated the financial event; falls back to the current bot context.</param>
         /// <param name="botUsername">Bot username that originated the financial event; falls back to the current bot context.</param>
         /// <param name="botType">Bot type that originated the financial event; falls back to the current bot context.</param>
+        /// <param name="idempotencyKey">
+        /// Optional stable financial mutation key. When supplied, repeated calls return the existing ledger row and
+        /// do not append a duplicate. The value must not contain secrets.
+        /// </param>
         /// <param name="cancellationToken">Cancellation token for the users.db insert.</param>
         /// <returns>The persisted ledger entry, or null when <paramref name="amountToman" /> is not positive.</returns>
         /// <remarks>
-        /// Idempotency is enforced by the caller, not this service. Payment settlement code must check its
-        /// payment/order flags before calling this method so duplicate IPNs do not create duplicate ledger rows.
+        /// Financial settlement code should always supply <paramref name="idempotencyKey"/>. The users.db unique
+        /// index is the final duplicate protection, while legacy call sites that omit the key retain append-only
+        /// behavior until they are migrated. When an older row has the same provider/reference identity but no key,
+        /// the service backfills the key on that row instead of appending a duplicate audit entry.
         /// </remarks>
         public async Task<WalletLedgerEntry> RecordAsync(
             long telegramUserId,
@@ -66,10 +76,44 @@ namespace Adminbot.Domain
             string botId = null,
             string botUsername = null,
             string botType = null,
+            string idempotencyKey = null,
             CancellationToken cancellationToken = default)
         {
             if (amountToman <= 0)
                 return null;
+
+            var normalizedIdempotencyKey = string.IsNullOrWhiteSpace(idempotencyKey)
+                ? null
+                : idempotencyKey.Trim();
+            if (normalizedIdempotencyKey?.Length > 240)
+                throw new ArgumentException("Wallet ledger idempotency key cannot exceed 240 characters.", nameof(idempotencyKey));
+
+            await using var context = _userDbContextFactory.CreateDbContext();
+            if (normalizedIdempotencyKey != null)
+            {
+                var existing = await context.WalletLedgerEntries
+                    .FirstOrDefaultAsync(x => x.IdempotencyKey == normalizedIdempotencyKey, cancellationToken);
+                if (existing != null)
+                    return existing;
+
+                if (!string.IsNullOrWhiteSpace(referenceType) && !string.IsNullOrWhiteSpace(referenceId))
+                {
+                    var legacyEntry = await context.WalletLedgerEntries.FirstOrDefaultAsync(
+                        x => x.TelegramUserId == telegramUserId &&
+                             x.Reason == reason &&
+                             x.Provider == provider &&
+                             x.ReferenceType == referenceType &&
+                             x.ReferenceId == referenceId,
+                        cancellationToken);
+                    if (legacyEntry != null)
+                    {
+                        // Backfill the new key on a pre-referral ledger row instead of creating a duplicate audit row.
+                        legacyEntry.IdempotencyKey ??= normalizedIdempotencyKey;
+                        await context.SaveChangesAsync(cancellationToken);
+                        return legacyEntry;
+                    }
+                }
+            }
 
             var entry = new WalletLedgerEntry
             {
@@ -89,12 +133,27 @@ namespace Adminbot.Domain
                 ReferenceId = referenceId,
                 OrderId = orderId,
                 Description = description,
+                IdempotencyKey = normalizedIdempotencyKey,
                 CreatedAtUtc = DateTime.UtcNow
             };
 
-            _userDbContext.WalletLedgerEntries.Add(entry);
-            await _userDbContext.SaveChangesAsync(cancellationToken);
-            return entry;
+            context.WalletLedgerEntries.Add(entry);
+            try
+            {
+                await context.SaveChangesAsync(cancellationToken);
+                return entry;
+            }
+            catch (DbUpdateException) when (normalizedIdempotencyKey != null)
+            {
+                // A concurrent settlement may have inserted the same unique key after our initial lookup.
+                context.ChangeTracker.Clear();
+                var concurrent = await context.WalletLedgerEntries
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x => x.IdempotencyKey == normalizedIdempotencyKey, cancellationToken);
+                if (concurrent != null)
+                    return concurrent;
+                throw;
+            }
         }
 
         /// <summary>
@@ -119,7 +178,8 @@ namespace Adminbot.Domain
         {
             page = Math.Max(0, page);
             pageSize = Math.Clamp(pageSize, 1, 20);
-            var query = _userDbContext.WalletLedgerEntries
+            await using var context = _userDbContextFactory.CreateDbContext();
+            var query = context.WalletLedgerEntries
                 .Where(x => x.TelegramUserId == telegramUserId &&
                             (x.Provider == null ||
                              x.Provider != GozargahSiteWalletProvider ||
@@ -144,9 +204,11 @@ namespace Adminbot.Domain
         /// direct website-wallet debit that should not be shown in the bot-wallet history. Tenant base-cost
         /// website-wallet rows are visible because they belong to colleague storefront settlement audit.
         /// </returns>
-        public Task<WalletLedgerEntry> GetByIdAsync(long telegramUserId, int id, CancellationToken cancellationToken = default)
+        public async Task<WalletLedgerEntry> GetByIdAsync(long telegramUserId, int id, CancellationToken cancellationToken = default)
         {
-            return _userDbContext.WalletLedgerEntries
+            await using var context = _userDbContextFactory.CreateDbContext();
+            return await context.WalletLedgerEntries
+                .AsNoTracking()
                 .FirstOrDefaultAsync(
                     x => x.Id == id &&
                          x.TelegramUserId == telegramUserId &&

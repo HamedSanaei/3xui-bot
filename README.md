@@ -63,7 +63,35 @@ https://payment.tofanservice.ir/hooshpay-ipn
 - `credentials.db`
   برای موجودی و اطلاعات اصلی کاربران
 
-تغییرات پرداخت `HooshPay` فقط در `users.db` ذخیره می‌شود و دیتابیس `credentials` برای ساختار پرداخت تغییر نمی‌کند.
+پاداش‌های دعوت، وضعیت پردازش و کلیدهای idempotency آن‌ها فقط در `users.db` ذخیره می‌شوند.
+مدل و schema دیتابیس `credentials.db` برای قابلیت دعوت تغییر نمی‌کند.
+
+## دعوت از دوستان در ربات‌های Owned
+
+سیستم referral بین تمام owned botها مشترک است. هر کاربر تلگرام فقط یک معرف دارد، معرف اول قابل تغییر نیست،
+خودمعرفی مجاز نیست و tenant botها در این سیستم شرکت نمی‌کنند. تنظیمات کامل و بدون مقدار پنهان:
+
+```json
+{
+  "referral": {
+    "enabled": true,
+    "minimumEligiblePaymentAmountToman": 100000,
+    "firstPayment": {
+      "referrerRewardPercent": 20,
+      "referredRewardPercent": 10,
+      "referredMinimumRewardToman": 50000,
+      "referredMaximumRewardToman": 0
+    },
+    "subsequentPayments": {
+      "referrerRewardPercent": 10
+    }
+  }
+}
+```
+
+پرداخت‌های کمتر از حداقل، پرداخت موقت، tenant، شارژ دستی، هدیه، کیف پول سایت و پرداخت ناموفق اولین پرداخت
+واجدشرایط را مصرف نمی‌کنند. فایل نمونه بدون secret در `Data/configuration.example.json` قرار دارد.
+تمام کلیدهای بخش `referral` حتی در حالت غیرفعال باید صریحاً در کانفیگ وجود داشته باشند؛ نبودن هر کلید در startup خطا می‌دهد.
 
 ## تنظیمات مهم
 
@@ -87,6 +115,7 @@ Data/configuration.json
 - `hooshPayApiKey`
 - `hooshPayIpnSecretKey`
 - `hooshPayIpnUrl`
+- `referral`
 
 ## پلن‌های سرویس
 

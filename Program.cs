@@ -45,6 +45,7 @@ class Program
             .AddJsonFile("./Data/configuration.json", optional: false, reloadOnChange: true)
             .Build();
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
+        ReferralConfigurationValidator.ValidateConfigurationAndThrow(configuration);
 
         ConfigureDatabasePaths(builder.Environment.ContentRootPath, appConfig);
         ConfigureWebServer(builder, appConfig);
@@ -62,6 +63,8 @@ class Program
         builder.Services.AddSingleton<XuiV3PurchaseSessionStore>();
         builder.Services.AddSingleton<UserActivityLogService>();
         builder.Services.AddSingleton<WalletLedgerService>();
+        builder.Services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();
+        builder.Services.AddSingleton<ReferralService>();
         builder.Services.AddSingleton<GozargahSiteApiClient>();
         builder.Services.AddSingleton<GozargahSiteSyncService>();
         builder.Services.AddSingleton<OwnedBotNotificationService>();
@@ -71,6 +74,7 @@ class Program
         builder.Services.AddSingleton<XuiV3AdminFlowService>();
         builder.Services.AddHostedService<XuiV3AccountExpiryReminderService>();
         builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
+        builder.Services.AddHostedService<ReferralReconciliationHostedService>();
 
         builder.Services.AddSingleton<TelegramBotService>();
         builder.Services.AddSingleton<MultiBotHostedService>();
@@ -83,6 +87,10 @@ class Program
             // Initialize and configure your Dbcontext here
             return new UserDbContext();
         });
+        var userContextOptions = new DbContextOptionsBuilder<UserDbContext>()
+            .UseSqlite(BuildSqliteConnectionString(appConfig.UserDatabasePath, readWriteCreate: true))
+            .Options;
+        builder.Services.AddSingleton(new UserDbContextFactory(userContextOptions));
 
 
         var optionsBuilder = new DbContextOptionsBuilder<CredentialsDbContext>();

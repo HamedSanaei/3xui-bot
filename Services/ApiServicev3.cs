@@ -185,7 +185,7 @@ public class ApiServicev3
                 Success = false,
                 ApiVersion = XuiPanelApiVersion.V3,
                 Email = client.Email,
-                Message = response.Msg
+                Message = XuiV3UserSafeError.ForAccountCreation(response.Msg)
             };
         }
 
@@ -517,7 +517,7 @@ public class ApiServicev3
             Success = false,
             ApiVersion = XuiPanelApiVersion.V3,
             Email = email,
-            Message = "ارتباط با پنل 3x-ui پایدار نبود. لطفاً چند دقیقه دیگر دوباره تلاش کنید."
+            Message = XuiV3UserSafeError.TemporaryAccountCreationFailureMessage
         };
     }
 
@@ -1646,6 +1646,18 @@ public class ApiServicev3
                     ex);
                 await Task.Delay(delay, cancellationToken);
             }
+            catch (Exception ex)
+            {
+                // The Telegram-facing exception message is intentionally redacted. Keep the full endpoint and
+                // provider details only in the private daily diagnostic file for operational investigation.
+                DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
+                    configuration,
+                    LogLevel.Error,
+                    nameof(ApiServicev3),
+                    $"XUI v3 request failed after retry policy. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}",
+                    ex);
+                throw;
+            }
         }
 
         throw lastException ?? new InvalidOperationException("XUI v3 request failed without an exception.");
@@ -1789,15 +1801,17 @@ public class ApiServicev3
     /// </summary>
     /// <param name="statusCode">Numeric HTTP status code returned by 3x-ui or the proxy in front of it.</param>
     /// <returns>
-    /// <c>true</c> for HTTP 429, 502, 503, and 504; otherwise <c>false</c>. Business 4xx errors are intentionally
-    /// excluded.
+    /// <c>true</c> for HTTP 408, 429, 502, 503, 504, and Cloudflare 520-527 gateway failures; otherwise
+    /// <c>false</c>. Business 4xx errors are intentionally excluded.
     /// </returns>
     private static bool IsTransientXuiStatusCode(int statusCode)
     {
-        return statusCode == 429 ||
+        return statusCode == 408 ||
+               statusCode == 429 ||
                statusCode == 502 ||
                statusCode == 503 ||
-               statusCode == 504;
+               statusCode == 504 ||
+               statusCode is >= 520 and <= 527;
     }
 
     /// <summary>
@@ -2120,16 +2134,50 @@ public class XuiV3ApiResponse<T>
     public T Obj { get; set; }
 }
 
+/// <summary>
+/// Represents a failed XUI v3 HTTP request while keeping its public exception message free of panel secrets.
+/// </summary>
+/// <remarks>
+/// <see cref="RequestUri"/>, <see cref="ResponseBody"/>, and <see cref="RequestBody"/> are internal diagnostic data
+/// and must never be sent to Telegram users. The base <see cref="Exception.Message"/> deliberately contains only
+/// the status code and method so accidental user-facing exception rendering cannot disclose the private panel host,
+/// root path, endpoint, response, token, cookie, or request payload.
+/// </remarks>
 public class XuiV3ApiException : Exception
 {
+    /// <summary>HTTP method used by the failed panel request.</summary>
     public string RequestMethod { get; }
+
+    /// <summary>
+    /// Full private panel request URI retained only for internal diagnostics. Never expose this value to Telegram.
+    /// </summary>
     public string RequestUri { get; }
+
+    /// <summary>Numeric HTTP status code, or zero when no HTTP response was received.</summary>
     public int StatusCode { get; }
+
+    /// <summary>Raw panel/proxy response retained only for internal diagnostics.</summary>
     public string ResponseBody { get; }
+
+    /// <summary>Sanitized request body snapshot retained only for internal diagnostics.</summary>
     public string RequestBody { get; }
 
+    /// <summary>
+    /// Creates a redacted XUI v3 request exception with separate internal diagnostic properties.
+    /// </summary>
+    /// <param name="requestMethod">HTTP method used for the failed request.</param>
+    /// <param name="requestUri">
+    /// Full private panel URI. It is required for internal diagnostics but must never be displayed to Telegram users.
+    /// </param>
+    /// <param name="statusCode">HTTP response status, or zero for a transport failure without a response.</param>
+    /// <param name="responseBody">Raw provider response retained internally; it may be empty.</param>
+    /// <param name="requestBody">Sanitized request snapshot retained internally; it may be empty.</param>
+    /// <remarks>
+    /// Log diagnostic properties only to trusted operational sinks. User-facing code must call
+    /// <see cref="XuiV3UserSafeError.ForAccountCreation(Exception)"/> instead of rendering this exception.
+    /// </remarks>
     public XuiV3ApiException(string requestMethod, string requestUri, int statusCode, string responseBody, string requestBody)
-        : base($"3X-UI v3 API request failed with status {statusCode} for {requestMethod} {requestUri}: {responseBody}")
+        : base($"XUI v3 request failed with HTTP status {statusCode} for {requestMethod}.")
     {
         RequestMethod = requestMethod;
         RequestUri = requestUri;
@@ -2176,7 +2224,8 @@ public class XuiV3AccountCreationResult
     public XuiPanelApiVersion ApiVersion { get; set; }
 
     /// <summary>
-    /// Human-readable result message from the bot or panel API.
+    /// Fixed user-safe result message suitable for Telegram. Raw panel responses and exception messages must never
+    /// be assigned to this property.
     /// </summary>
     public string Message { get; set; }
 
