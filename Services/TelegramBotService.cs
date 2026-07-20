@@ -76,6 +76,7 @@ public class TelegramBotService : IHostedService
     private readonly HooshPaySettlementService _hooshPaySettlementService;
     private readonly XuiV3PurchaseService _xuiV3PurchaseService;
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
+    private readonly XuiV3PurchaseSessionStore _xuiV3PurchaseSessionStore;
     private readonly XuiV3AdminFlowService _xuiV3AdminFlowService;
     private readonly TenantBotService _tenantBotService;
     private readonly SalesAssistantService _salesAssistantService;
@@ -150,6 +151,10 @@ public class TelegramBotService : IHostedService
     /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
     /// <param name="xuiV3PurchaseService">Shared XuiV3 purchase/account creation service.</param>
     /// <param name="xuiV3BotFlowService">Regular user XuiV3 purchase and account-management flow.</param>
+    /// <param name="xuiV3PurchaseSessionStore">
+    /// Bot-scoped in-memory purchase selection store. It is cleared when a main-menu command cancels an unfinished
+    /// customer flow, preventing stale plan selections from resuming after the referral dashboard is shown.
+    /// </param>
     /// <param name="xuiV3AdminFlowService">Super-admin XuiV3 management flow.</param>
     /// <param name="tenantBotService">Tenant storefront owner and customer flow service.</param>
     /// <param name="userActivityLog">File-based user activity logger.</param>
@@ -178,6 +183,7 @@ public class TelegramBotService : IHostedService
         HooshPaySettlementService hooshPaySettlementService,
         XuiV3PurchaseService xuiV3PurchaseService,
         XuiV3BotFlowService xuiV3BotFlowService,
+        XuiV3PurchaseSessionStore xuiV3PurchaseSessionStore,
         XuiV3AdminFlowService xuiV3AdminFlowService,
         TenantBotService tenantBotService,
         SalesAssistantService salesAssistantService,
@@ -204,6 +210,7 @@ public class TelegramBotService : IHostedService
         _hooshPaySettlementService = hooshPaySettlementService;
         _xuiV3PurchaseService = xuiV3PurchaseService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
+        _xuiV3PurchaseSessionStore = xuiV3PurchaseSessionStore;
         _xuiV3AdminFlowService = xuiV3AdminFlowService;
         _tenantBotService = tenantBotService;
         _salesAssistantService = salesAssistantService;
@@ -477,6 +484,18 @@ public class TelegramBotService : IHostedService
             isSuperAdmin ? GetMainMenuKeyboard() : MainReplyMarkupKeyboardFa(),
             cancellationToken))
         {
+            return;
+        }
+
+        // Super-admin messages bypass the regular customer handler. Route the owned-bot referral menu explicitly
+        // before the legacy admin command chain so an administrator can use the same customer-facing dashboard.
+        if (isSuperAdmin && IsReferralMenuCommand(message.Text))
+        {
+            await TryHandleReferralMenuCommandAsync(
+                botClient,
+                message,
+                user: null,
+                cancellationToken);
             return;
         }
 
@@ -4680,7 +4699,15 @@ public class TelegramBotService : IHostedService
                text: string.IsNullOrWhiteSpace(registrationText)
                    ? "به ربات خوش آمدید!"
                    : $"به ربات خوش آمدید!\n\n{registrationText}",
-               replyMarkup: MainReplyMarkupKeyboardFa());
+                replyMarkup: MainReplyMarkupKeyboardFa());
+            return;
+        }
+        else if (await TryHandleReferralMenuCommandAsync(
+                     botClient,
+                     message,
+                     user,
+                     cancellationToken))
+        {
             return;
         }
         else if (message.Text == "عضو شدم!")
@@ -4820,13 +4847,6 @@ public class TelegramBotService : IHostedService
             MainReplyMarkupKeyboardFa(),
             cancellationToken))
         {
-            return;
-        }
-
-        else if (message.Text == "🎁 دعوت از دوستان" || message.Text == "دعوت از دوستان")
-        {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await SendReferralDashboardAsync(botClient, message, cancellationToken);
             return;
         }
 
@@ -7702,6 +7722,142 @@ public class TelegramBotService : IHostedService
                 "⚠️ لینک دعوت معتبر نیست یا صاحب آن هنوز در ربات ثبت نشده است.",
             _ => string.Empty
         };
+    }
+
+    /// <summary>
+    /// Determines whether a Telegram text message requests the owned-bot referral dashboard.
+    /// </summary>
+    /// <param name="text">
+    /// Raw message text received from Telegram. Null and whitespace are allowed; surrounding whitespace is ignored.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> for the referral reply-keyboard label with or without the gift emoji; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// This method intentionally recognizes a main-menu command instead of a persisted customer-flow value. Callers
+    /// must route a match before arbitrary-text purchase, search, comment, trial, colleague, or renewal handlers.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// IsReferralMenuCommand("  🎁 دعوت از دوستان  "); // true
+    /// IsReferralMenuCommand("دعوت از دوستان");       // true
+    /// </code>
+    /// </example>
+    private static bool IsReferralMenuCommand(string text)
+    {
+        var normalized = text?.Trim();
+        return string.Equals(normalized, "🎁 دعوت از دوستان", StringComparison.Ordinal) ||
+               string.Equals(normalized, "دعوت از دوستان", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Cancels the current owned-bot customer conversation and displays the existing global referral dashboard.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned bot that received the main-menu command.</param>
+    /// <param name="message">
+    /// Incoming Telegram message. Its sender id selects bot-scoped conversation/session state and its chat id receives
+    /// the dashboard or a safe failure message.
+    /// </param>
+    /// <param name="user">
+    /// Current bot-scoped persisted customer state when the caller has already loaded it. Pass <c>null</c> from the
+    /// super-admin route so this handler loads the state inside its protected/logged operation. Only transient
+    /// conversation fields are cleared; credentials, wallet, referral relationships, rewards, and XUI accounts are
+    /// untouched.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels users.db access and Telegram delivery.</param>
+    /// <returns>
+    /// <c>true</c> when the text is a referral menu command and the update was consumed, including safe error handling;
+    /// <c>false</c> for unrelated text or a non-owned bot.
+    /// </returns>
+    /// <remarks>
+    /// This handler is shared by regular and super-admin owned-bot routes. It clears both the persisted <see cref="User"/>
+    /// flow and the current bot/user entry in <see cref="XuiV3PurchaseSessionStore"/> before calling
+    /// <see cref="SendReferralDashboardAsync"/>. Telegram notification failures never mutate referral or financial data.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// if (await TryHandleReferralMenuCommandAsync(botClient, message, user, cancellationToken))
+    ///     return;
+    /// </code>
+    /// </example>
+    private async Task<bool> TryHandleReferralMenuCommandAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        User user,
+        CancellationToken cancellationToken)
+    {
+        if (message?.From == null || !IsReferralMenuCommand(message.Text))
+            return false;
+
+        var botType = CurrentBot?.Type ?? BotContextAccessor.CurrentBotType;
+        if (!string.Equals(botType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var telegramUserId = message.From.Id;
+        var botId = CurrentBot?.Id ?? BotContextAccessor.CurrentBotId;
+        var botUsername = CurrentBot?.Username ?? BotContextAccessor.CurrentBotUsername;
+        var isSuperAdmin = IsSuperAdminUser(telegramUserId);
+        var previousFlow = user?.Flow ?? "(not-loaded)";
+        var previousLastStep = user?.LastStep ?? "(not-loaded)";
+
+        try
+        {
+            var currentState = user ?? await _userDbContext.GetUserStatus(telegramUserId);
+            previousFlow = currentState?.Flow ?? string.Empty;
+            previousLastStep = currentState?.LastStep ?? string.Empty;
+
+            // Both stores are bot-scoped. Clearing them prevents a stale arbitrary-text handler or purchase selection
+            // from resuming after the user deliberately returned to the referral main-menu screen.
+            await _userDbContext.ClearUserStatus(currentState ?? new User { Id = telegramUserId });
+            _xuiV3PurchaseSessionStore.Clear(telegramUserId);
+
+            await SendReferralDashboardAsync(botClient, message, cancellationToken);
+            _logger.LogInformation(
+                "Owned-bot referral menu routed. telegramUserId={TelegramUserId}, botId={BotId}, botUsername={BotUsername}, isSuperAdmin={IsSuperAdmin}, previousFlow={PreviousFlow}, previousLastStep={PreviousLastStep}, dashboardSent={DashboardSent}",
+                telegramUserId,
+                botId,
+                botUsername,
+                isSuperAdmin,
+                previousFlow,
+                previousLastStep,
+                true);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Owned-bot referral menu failed. telegramUserId={TelegramUserId}, botId={BotId}, botUsername={BotUsername}, isSuperAdmin={IsSuperAdmin}, previousFlow={PreviousFlow}, previousLastStep={PreviousLastStep}, dashboardSent={DashboardSent}",
+                telegramUserId,
+                botId,
+                botUsername,
+                isSuperAdmin,
+                previousFlow,
+                previousLastStep,
+                false);
+
+            try
+            {
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "نمایش اطلاعات دعوت از دوستان با خطا روبه‌رو شد. لطفاً چند دقیقه دیگر دوباره تلاش کنید.",
+                    replyMarkup: MainReplyMarkupKeyboardFa());
+            }
+            catch (Exception deliveryException)
+            {
+                _logger.LogError(
+                    deliveryException,
+                    "Referral dashboard failure notification could not be delivered. telegramUserId={TelegramUserId}, botId={BotId}, botUsername={BotUsername}",
+                    telegramUserId,
+                    botId,
+                    botUsername);
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
