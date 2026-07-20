@@ -1045,6 +1045,36 @@ public static class XuiV3PurchaseCallbacks
         return $"{Prefix}:asch:{clientId}:{Math.Max(0, page)}";
     }
 
+    /// <summary>
+    /// Builds callback data for the explicit final confirmation of one persisted link-change operation.
+    /// </summary>
+    /// <param name="operationKey">Random users.db operation key; it must not contain panel credentials.</param>
+    /// <returns>Compact callback data that resumes exactly the saved operation.</returns>
+    public static string AccountChangeLinkConfirm(string operationKey)
+    {
+        return $"{Prefix}:chok:{operationKey}";
+    }
+
+    /// <summary>
+    /// Builds callback data that cancels a persisted link change before any panel mutation.
+    /// </summary>
+    /// <param name="operationKey">Random users.db operation key shown in the same bot confirmation message.</param>
+    /// <returns>Compact callback data for the pre-mutation cancellation transition.</returns>
+    public static string AccountChangeLinkCancel(string operationKey)
+    {
+        return $"{Prefix}:chcancel:{operationKey}";
+    }
+
+    /// <summary>
+    /// Builds callback data that displays or requeues the same persisted link-change operation.
+    /// </summary>
+    /// <param name="operationKey">Random users.db operation key whose status should be refreshed.</param>
+    /// <returns>Compact callback data that never generates a replacement identity.</returns>
+    public static string AccountChangeLinkStatus(string operationKey)
+    {
+        return $"{Prefix}:chstatus:{operationKey}";
+    }
+
     public static string AccountComment(int clientId, int page)
     {
         return $"{Prefix}:acom:{clientId}:{Math.Max(0, page)}";
@@ -1055,6 +1085,16 @@ public static class XuiV3PurchaseCallbacks
         return $"{Prefix}:ascom:{clientId}:{Math.Max(0, page)}";
     }
 
+    /// <summary>
+    /// Parses compact XUI callback data into a typed routing object without executing any business operation.
+    /// </summary>
+    /// <param name="callbackData">Telegram callback data beginning with the XUI prefix.</param>
+    /// <param name="callback">Parsed routing values, or <c>null</c> when the prefix/shape is invalid.</param>
+    /// <returns><c>true</c> when the callback belongs to this router; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// Link-change confirmation/status actions expose only a random users.db operation key. They never carry panel
+    /// URLs, UUIDs, credentials, or a newly generated identity and therefore cannot independently replay a mutation.
+    /// </remarks>
     public static bool TryParse(string callbackData, out XuiV3PurchaseCallback callback)
     {
         callback = null;
@@ -1119,6 +1159,14 @@ public static class XuiV3PurchaseCallbacks
                 callback.Page = page;
         }
 
+        if ((callback.Action == "chok" ||
+             callback.Action == "chcancel" ||
+             callback.Action == "chstatus") &&
+            parts.Length >= 3)
+        {
+            callback.OperationKey = parts[2];
+        }
+
         if (callback.Action == "auren" && parts.Length >= 3)
         {
             if (int.TryParse(parts[2], out var clientId))
@@ -1168,18 +1216,38 @@ public static class XuiV3PurchaseCallbacks
     }
 }
 
+/// <summary>
+/// Parsed routing values for XUI purchase and account-management Telegram callbacks.
+/// </summary>
+/// <remarks>
+/// This DTO contains identifiers only. Callers must still enforce bot context, Telegram ownership, state transitions,
+/// and durable operation claims before calling XUI or changing financial state.
+/// </remarks>
 public class XuiV3PurchaseCallback
 {
+    /// <summary>Compact action name selected by the callback router.</summary>
     public string Action { get; set; }
+    /// <summary>Configured XUI service-plan key, when the action belongs to purchase or renewal.</summary>
     public string ServiceKey { get; set; }
+    /// <summary>Enable/disable account sub-action when applicable.</summary>
     public string AccountOperation { get; set; }
+    /// <summary>Stable numeric XUI client id selected by list/search actions.</summary>
     public int? ClientId { get; set; }
+    /// <summary>Zero-based UI page restored after an account action.</summary>
     public int? Page { get; set; }
+    /// <summary>Selected traffic in GB for metered purchase/renewal actions.</summary>
     public int? TrafficGb { get; set; }
+    /// <summary>Requested account count for multi-account purchases.</summary>
     public int? AccountCount { get; set; }
+    /// <summary>Configured duration option key.</summary>
     public string DurationKey { get; set; }
+    /// <summary>Configured unlimited-plan key.</summary>
     public string UnlimitedPlanKey { get; set; }
+    /// <summary>Random persisted link-change operation key carried by confirmation and recovery callbacks.</summary>
+    public string OperationKey { get; set; }
 
+    /// <summary>Creates the purchase selection represented by this callback.</summary>
+    /// <returns>A detached selection with account count normalized to one.</returns>
     public XuiV3PurchaseSelection ToSelection()
     {
         return new XuiV3PurchaseSelection

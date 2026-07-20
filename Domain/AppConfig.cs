@@ -106,6 +106,26 @@ namespace Adminbot.Domain
         /// failures.
         /// </summary>
         public int XuiV3TransientRetryMaxDelayMs { get; set; } = 12000;
+        /// <summary>
+        /// Number of minutes an explicit account link-change confirmation remains valid before it is closed safely.
+        /// </summary>
+        public int XuiV3LinkChangeConfirmationMinutes { get; set; } = 10;
+        /// <summary>
+        /// Number of seconds between scans for XUI link-change operations that require automatic recovery.
+        /// </summary>
+        public int XuiV3LinkChangeRecoveryPollSeconds { get; set; } = 30;
+        /// <summary>
+        /// Maximum number of foreground and background attempts made for the same saved link-change identity.
+        /// </summary>
+        public int XuiV3LinkChangeRecoveryMaxAttempts { get; set; } = 12;
+        /// <summary>
+        /// Maximum exponential-backoff delay, in seconds, before retrying an ambiguous XUI link change.
+        /// </summary>
+        public int XuiV3LinkChangeRecoveryMaxDelaySeconds { get; set; } = 900;
+        /// <summary>
+        /// Exclusive processing lease, in seconds, used to prevent concurrent workers from mutating one XUI client.
+        /// </summary>
+        public int XuiV3LinkChangeLeaseSeconds { get; set; } = 300;
         public bool AccountExpiryReminderEnabled { get; set; } = true;
         public int AccountExpiryReminderHourIran { get; set; } = 8;
         public int[] AccountExpiryReminderDays { get; set; } = new[] { 7, 3, 1 };

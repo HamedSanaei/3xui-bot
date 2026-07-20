@@ -27,6 +27,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/XuiV3RenewalPolicy.cs`: central renewal payload calculation for metered, national, and unlimited accounts.
 - `Services/XuiV3ClientPlanEligibility.cs`: checks whether an XUI client belongs to active service inbounds.
 - `Services/XuiV3AdminFlowService.cs`: super-admin XUI v3 management flows.
+- `Services/XuiV3LinkChangeOperationStore.cs`: per-operation users.db contexts, atomic confirmation, active-client uniqueness, leases, and bounded recovery state for link changes.
+- `Services/XuiV3LinkChangeRecoveryService.cs`: hosted worker that resumes the exact persisted email/UUID/subId after ambiguous XUI responses or process restarts.
 - `Services/BroadcastManager.cs`: queued broadcast engine with progress/status tracking and retry behavior.
 - `Services/SalesAssistantService.cs`: central assistant bot for tenant sale notifications and manual receipt approval.
 - `Services/WalletLedgerService.cs`: append-only wallet ledger for credits/debits.
@@ -112,10 +114,28 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - XUI v3 failures must never expose panel URLs, root paths, endpoints, responses, tokens, or cookies in Telegram.
   `XuiV3ApiException.Message` is redacted and `XuiV3UserSafeError` owns fixed user-facing creation errors; complete
   endpoint diagnostics are restricted to the private daily error file.
-- XUI v3 link changes are fail-closed before mutation: the shared owned/tenant flow must capture live client fields,
-  actual panel inbound ids, and traffic counters before changing email/subId/UUID. After the update it restores any
-  dropped inbounds or reduced traffic and verifies the complete state by read-back. Website sync and normal success
-  logging run only after verification; an incomplete repair keeps the new identity and emits a critical audit event.
+- XUI v3 link changes use a durable users.db saga shared by owned and tenant bots. The first `ach/asch` click only
+  creates a ten-minute confirmation; an atomic callback claim, filtered unique `PanelKey + ClientId` index, and
+  renewable lease ensure only one processor can rename a physical client. Snapshot and replacement email/UUID/subId
+  are persisted before the first POST and reused after callbacks, timeouts, and restarts.
+- Link-change identity, attach, detach, corrective-update, and traffic mutations use `NoAutomaticRetry`. Ambiguous
+  responses are resolved by read-back; timeout/TLS/520/incomplete responses are `Unknown`, never empty inbound or zero
+  traffic. Recovery remains locked until verification or manual review. Direct `GetClient` data supplies stable fields,
+  list data supplies inbound membership, semantic JSON/null comparisons prevent false `final-fields` failures, and
+  normal success logging/site sync occurs only after final verification.
+- Link-change configuration keys are optional for backward compatibility and default in `AppConfig` to confirmation
+  10m, poll 30s, 12 attempts, max delay 900s, and lease 300s; explicit out-of-range values fail startup. `PanelKey`
+  hashes the endpoint without storing its URL and preserves case-sensitive path components.
+- Durable link-change recovery treats operation columns as the immutable target identity and strips typed/response-only
+  keys from XUI extension data. This prevents stale duplicate `uuid/email/subId/client` data from causing false
+  `final-fields` failures or repeated corrective mutations after the panel already committed the rename.
+- The 3x-ui global clients API uses different UUID names on each side of the boundary: GET `ClientRecord` responses use
+  `uuid`, while POST update bodies bind `model.Client.id`. `ApiServicev3.PrepareClientUpdatePayload` performs this
+  mapping; sending `uuid` in an update silently preserves the old credential on 3x-ui 3.4.x.
+- A 3x-ui email rename can recreate the old email as a distinct detached ClientRecord while inbound synchronization is
+  in progress. Link-change recovery deletes that row only after the replacement is fully verified, the old row has a
+  different numeric id, still owns the original UUID, and has an authoritatively empty inbound set. Deletion uses
+  `keepTraffic=1` and read-back, so ambiguous responses are not replayed blindly.
 - XUI v3 creation-result expiry display resolves top-level `ExpiryTime`, nested `Traffic.ExpiryTime`, and client `Extra`
   before falling back to the submitted payload. This protects normal fixed-date accounts from being displayed as
   unlimited when newer 3x-ui responses return a zero top-level expiry field.

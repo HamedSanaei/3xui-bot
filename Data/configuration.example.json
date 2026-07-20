@@ -15,6 +15,11 @@
   ],
   "userDatabasePath": "./Data/users.db",
   "credentialsDatabasePath": "./Data/credentials.db",
+  "xuiV3LinkChangeConfirmationMinutes": 10,
+  "xuiV3LinkChangeRecoveryPollSeconds": 30,
+  "xuiV3LinkChangeRecoveryMaxAttempts": 12,
+  "xuiV3LinkChangeRecoveryMaxDelaySeconds": 900,
+  "xuiV3LinkChangeLeaseSeconds": 300,
   "referral": {
     "enabled": true,
     "minimumEligiblePaymentAmountToman": 100000,

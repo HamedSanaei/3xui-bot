@@ -9,7 +9,7 @@
       "kind": "metered",
       "isEnabled": true,
       "inboundIds": [
-        156
+        192
       ],
       "multiInbound": true,
       "inboundProfileKeys": [
@@ -60,10 +60,7 @@
       "description": "سرویس اینترنت عادی با چند اینباند",
       "kind": "metered",
       "isEnabled": true,
-      "inboundIds": [
-        166,
-        188,
-        189
+      "inboundIds": [188,189,190,193
       ],
       "multiInbound": true,
       "inboundProfileKeys": [
@@ -78,8 +75,11 @@
       },
       "minimumTrafficGb": 10,
       "trafficOptionsGb": [
-        50,
+        10,
+	30,
+	50,
         100,
+	150,
         200,
         500
       ],
@@ -113,9 +113,7 @@
       "kind": "unlimited",
       "isEnabled": true,
       "inboundIds": [
-        166,
-        188,
-        189
+       188,189,190,193
       ],
       "multiInbound": true,
       "inboundProfileKeys": [

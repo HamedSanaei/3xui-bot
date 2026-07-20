@@ -46,6 +46,7 @@ class Program
             .Build();
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         ReferralConfigurationValidator.ValidateConfigurationAndThrow(configuration);
+        ValidateXuiV3LinkChangeConfiguration(appConfig);
 
         ConfigureDatabasePaths(builder.Environment.ContentRootPath, appConfig);
         ConfigureWebServer(builder, appConfig);
@@ -70,9 +71,11 @@ class Program
         builder.Services.AddSingleton<OwnedBotNotificationService>();
         builder.Services.AddSingleton<SalesAssistantService>();
         builder.Services.AddSingleton<TenantBotService>();
+        builder.Services.AddSingleton<XuiV3LinkChangeOperationStore>();
         builder.Services.AddSingleton<XuiV3BotFlowService>();
         builder.Services.AddSingleton<XuiV3AdminFlowService>();
         builder.Services.AddHostedService<XuiV3AccountExpiryReminderService>();
+        builder.Services.AddHostedService<XuiV3LinkChangeRecoveryService>();
         builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
         builder.Services.AddHostedService<ReferralReconciliationHostedService>();
 
@@ -312,6 +315,47 @@ class Program
         }
 
         return logLevel >= LogLevel.Information;
+    }
+
+    /// <summary>
+    /// Validates the confirmation, lease, and recovery limits used by durable XUI v3 link changes.
+    /// </summary>
+    /// <param name="appConfig">
+    /// Application configuration bound from <c>Data/configuration.json</c>. Values are expressed in minutes, seconds,
+    /// or attempt counts as indicated by their property names and must be within the supported bounds.
+    /// </param>
+    /// <remarks>
+    /// Validation runs before dependency injection and database migration. Older deployments may omit the newly
+    /// introduced keys and then use the documented defaults declared on <see cref="AppConfig"/>. Explicit values
+    /// outside the supported ranges still fail startup with a precise configuration error.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">Thrown when any link-change safety value is outside its supported range.</exception>
+    private static void ValidateXuiV3LinkChangeConfiguration(AppConfig appConfig)
+    {
+        ArgumentNullException.ThrowIfNull(appConfig);
+
+        ValidateRange(nameof(appConfig.XuiV3LinkChangeConfirmationMinutes), appConfig.XuiV3LinkChangeConfirmationMinutes, 1, 60);
+        ValidateRange(nameof(appConfig.XuiV3LinkChangeRecoveryPollSeconds), appConfig.XuiV3LinkChangeRecoveryPollSeconds, 5, 3600);
+        ValidateRange(nameof(appConfig.XuiV3LinkChangeRecoveryMaxAttempts), appConfig.XuiV3LinkChangeRecoveryMaxAttempts, 1, 100);
+        ValidateRange(nameof(appConfig.XuiV3LinkChangeRecoveryMaxDelaySeconds), appConfig.XuiV3LinkChangeRecoveryMaxDelaySeconds, 30, 86400);
+        ValidateRange(nameof(appConfig.XuiV3LinkChangeLeaseSeconds), appConfig.XuiV3LinkChangeLeaseSeconds, 60, 1800);
+    }
+
+    /// <summary>
+    /// Rejects one integer configuration value outside an inclusive safety range.
+    /// </summary>
+    /// <param name="name">Configuration property name shown in the startup error.</param>
+    /// <param name="value">Configured integer value.</param>
+    /// <param name="minimum">Smallest accepted inclusive value.</param>
+    /// <param name="maximum">Largest accepted inclusive value.</param>
+    /// <exception cref="InvalidOperationException">Thrown when <paramref name="value"/> is outside the range.</exception>
+    private static void ValidateRange(string name, int value, int minimum, int maximum)
+    {
+        if (value < minimum || value > maximum)
+        {
+            throw new InvalidOperationException(
+                $"Configuration value '{name}' must be between {minimum} and {maximum}; actual value is {value}.");
+        }
     }
 
     /// <summary>

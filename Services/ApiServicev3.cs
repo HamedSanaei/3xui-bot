@@ -10,6 +10,21 @@ using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
+/// <summary>
+/// Selects retry semantics for one XUI v3 HTTP request.
+/// </summary>
+public enum XuiV3RequestRetryMode
+{
+    /// <summary>Retry transient failures because the request only reads panel state and has no side effect.</summary>
+    ReadOnly,
+
+    /// <summary>Retry only when the caller guarantees that replaying the same mutation is provider-idempotent.</summary>
+    IdempotentMutation,
+
+    /// <summary>Send exactly once because a timeout may hide a committed non-idempotent panel mutation.</summary>
+    NoAutomaticRetry
+}
+
 public class ApiServicev3
 {
     private const int DefaultXuiV3TimeoutSeconds = 60;
@@ -724,6 +739,10 @@ public class ApiServicev3
     /// <param name="cancellationToken">
     /// A token that cancels the XUI HTTP request when the Telegram update or background operation is stopped.
     /// </param>
+    /// <param name="retryMode">
+    /// Retry semantics selected by the caller. Link identity changes must pass
+    /// <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/> because a timeout can hide a committed update.
+    /// </param>
     /// <returns>
     /// The panel response after the update attempt. A failed response means the panel rejected or could not process the
     /// update; callers must not assume a renewal, link change, or account-state update was persisted.
@@ -749,7 +768,8 @@ public class ApiServicev3
         IConfiguration configuration,
         string email,
         XuiV3ClientPayload client,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.IdempotentMutation)
         => SendAsync<JToken>(
             serverInfo,
             configuration,
@@ -757,27 +777,36 @@ public class ApiServicev3
             $"/panel/api/clients/update/{EscapePath(email)}",
             PrepareClientUpdatePayload(client),
             true,
-            cancellationToken);
+            cancellationToken,
+            retryMode: retryMode);
 
     /// <summary>
-    /// Creates an isolated v3 update payload and changes a legacy <c>allowedIPs</c> extension value into the JSON
-    /// string-array shape required by current 3x-ui releases.
+    /// Creates an isolated v3 update payload using the request contract expected by 3x-ui 3.4.x and normalizes a
+    /// legacy <c>allowedIPs</c> extension value into the required JSON string-array shape.
     /// </summary>
     /// <param name="client">
     /// The source client payload built from an XUI panel response. It may contain arbitrary panel extension data;
     /// a null value is allowed only to preserve the prior API behavior of sending a null request body.
     /// </param>
     /// <returns>
-    /// A detached payload suitable for serialization. The result is null when <paramref name="client"/> is null.
-    /// The source payload and its extension-data dictionary remain unchanged.
+    /// A detached JSON object suitable for the update endpoint, or null when <paramref name="client"/> is null.
+    /// The UUID is emitted as <c>id</c>, while response-only aliases such as <c>uuid</c> are omitted. The source payload
+    /// and its extension-data dictionary remain unchanged.
     /// </returns>
     /// <remarks>
-    /// The copy is intentionally explicit because update payloads carry identity and access-control fields such as
-    /// UUID, password, Telegram id, subId, flow, group, reverse, and extension data. Omitting one of them can cause a
-    /// panel update to erase existing account settings. Only <c>allowedIPs</c> is normalized, and only when it was
-    /// actually returned as extension data by the panel.
+    /// The global clients read API returns a database record whose protocol UUID is named <c>uuid</c>, but the update
+    /// controller binds the request to 3x-ui's wire client model where that same protocol UUID is named <c>id</c>.
+    /// Sending <c>uuid</c> therefore causes 3x-ui 3.4.x to preserve the old credential. This boundary deliberately
+    /// separates those two contracts. The copy also retains password, auth/security extension fields, Telegram id,
+    /// subId, flow, group, reverse, and access-control data so updates do not erase unrelated account settings.
     /// </remarks>
-    private static XuiV3ClientPayload PrepareClientUpdatePayload(XuiV3ClientPayload client)
+    /// <example>
+    /// <code>
+    /// var requestBody = PrepareClientUpdatePayload(client);
+    /// // requestBody["id"] contains the protocol UUID; requestBody has no "uuid" property.
+    /// </code>
+    /// </example>
+    private static JObject PrepareClientUpdatePayload(XuiV3ClientPayload client)
     {
         if (client == null)
             return null;
@@ -791,10 +820,14 @@ public class ApiServicev3
 
         NormalizeAllowedIpsExtension(extra);
 
-        return new XuiV3ClientPayload
+        // `id` is the protocol UUID in model.Client request bodies. It is not the numeric ClientRecord id returned
+        // by GET /clients/get and /clients/list. Remove stale response aliases before adding the credential value.
+        RemoveExtensionKey(extra, "id");
+        RemoveExtensionKey(extra, "uuid");
+
+        var detached = new XuiV3ClientPayload
         {
             Email = client.Email,
-            Uuid = client.Uuid,
             Password = client.Password,
             TotalGB = client.TotalGB,
             ExpiryTime = client.ExpiryTime,
@@ -808,6 +841,39 @@ public class ApiServicev3
             Reverse = client.Reverse?.DeepClone(),
             Extra = extra
         };
+
+        var requestBody = JObject.FromObject(detached, JsonSerializer.Create(JsonSettings));
+        requestBody.Remove("uuid");
+        if (!string.IsNullOrWhiteSpace(client.Uuid))
+            requestBody["id"] = client.Uuid.Trim();
+        return requestBody;
+    }
+
+    /// <summary>
+    /// Removes every extension-data entry whose name matches a typed or transport-only JSON property.
+    /// </summary>
+    /// <param name="extra">
+    /// Detached extension data copied from a panel response. Null is allowed and results in no operation.
+    /// </param>
+    /// <param name="key">
+    /// Case-insensitive JSON property name to remove. The value must be a known typed or response-only field and must
+    /// never be derived from untrusted user text.
+    /// </param>
+    /// <remarks>
+    /// Json.NET extension data can otherwise emit duplicate identity properties. For client updates this is especially
+    /// dangerous because response <c>id</c> is numeric while request <c>id</c> is the protocol UUID.
+    /// </remarks>
+    private static void RemoveExtensionKey(IDictionary<string, JToken> extra, string key)
+    {
+        if (extra == null || string.IsNullOrWhiteSpace(key))
+            return;
+
+        foreach (var matchingKey in extra.Keys
+                     .Where(candidate => string.Equals(candidate, key, StringComparison.OrdinalIgnoreCase))
+                     .ToList())
+        {
+            extra.Remove(matchingKey);
+        }
     }
 
     /// <summary>
@@ -1051,17 +1117,77 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> DeleteClientAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/del/{EscapePath(email)}", null, true, cancellationToken);
 
+    /// <summary>
+    /// Deletes a detached XUI client record while preserving traffic rows that may still be needed by a renamed client.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel that owns the client record.</param>
+    /// <param name="configuration">Runtime authentication, timeout, and retry configuration.</param>
+    /// <param name="email">
+    /// Exact old XUI email of the detached orphan. The caller must first prove that this email belongs to a different
+    /// numeric client record and has no attached inbound.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the external HTTP request.</param>
+    /// <param name="retryMode">
+    /// Replay policy for the delete. Durable link-change recovery passes <c>NoAutomaticRetry</c> and verifies absence
+    /// with a read-back after any ambiguous transport result.
+    /// </param>
+    /// <returns>The panel response for the deletion attempt; callers must still verify that the old email is absent.</returns>
+    /// <remarks>
+    /// The <c>keepTraffic=1</c> query is essential during identity replacement. It removes only the stale client record
+    /// and leaves historical counters intact until the renamed client has been fully verified.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var response = await ApiServicev3.DeleteClientPreservingTrafficAsync(
+    ///     serverInfo,
+    ///     configuration,
+    ///     oldEmail,
+    ///     cancellationToken,
+    ///     XuiV3RequestRetryMode.NoAutomaticRetry);
+    /// </code>
+    /// </example>
+    public static Task<XuiV3ApiResponse<JToken>> DeleteClientPreservingTrafficAsync(
+        ServerInfo serverInfo,
+        IConfiguration configuration,
+        string email,
+        CancellationToken cancellationToken = default,
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.NoAutomaticRetry)
+        => SendAsync<JToken>(
+            serverInfo,
+            configuration,
+            HttpMethod.Post,
+            $"/panel/api/clients/del/{EscapePath(email)}",
+            null,
+            true,
+            cancellationToken,
+            query: new Dictionary<string, string> { ["keepTraffic"] = "1" },
+            retryMode: retryMode);
+
     /// <summary>POST /panel/api/clients/bulkDel. Deletes many clients by email.</summary>
     public static Task<XuiV3ApiResponse<JToken>> BulkDeleteClientsAsync(ServerInfo serverInfo, IConfiguration configuration, IEnumerable<string> emails, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/bulkDel", new { emails = emails?.ToList() ?? new List<string>() }, true, cancellationToken);
 
-    /// <summary>POST /panel/api/clients/{email}/attach. Attaches an existing client to additional inbounds.</summary>
-    public static Task<XuiV3ApiResponse<JToken>> AttachClientAsync(ServerInfo serverInfo, IConfiguration configuration, string email, IEnumerable<int> inboundIds, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/{EscapePath(email)}/attach", new { inboundIds = inboundIds?.ToList() ?? new List<int>() }, true, cancellationToken);
+    /// <summary>Attaches an existing XUI client to selected inbound ids.</summary>
+    /// <param name="serverInfo">Panel that owns the client.</param>
+    /// <param name="configuration">Runtime timeout, authentication, and retry configuration.</param>
+    /// <param name="email">Current XUI client email used as the endpoint identifier.</param>
+    /// <param name="inboundIds">Positive panel inbound ids to attach; an empty sequence performs no useful change.</param>
+    /// <param name="cancellationToken">Token that cancels the external request.</param>
+    /// <param name="retryMode">Replay policy; durable link-change recovery passes <c>NoAutomaticRetry</c>.</param>
+    /// <returns>The panel response; callers must read back membership after an ambiguous response.</returns>
+    public static Task<XuiV3ApiResponse<JToken>> AttachClientAsync(ServerInfo serverInfo, IConfiguration configuration, string email, IEnumerable<int> inboundIds, CancellationToken cancellationToken = default, XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.IdempotentMutation)
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/{EscapePath(email)}/attach", new { inboundIds = inboundIds?.ToList() ?? new List<int>() }, true, cancellationToken, retryMode: retryMode);
 
-    /// <summary>POST /panel/api/clients/{email}/detach. Detaches a client from selected inbounds without deleting it.</summary>
-    public static Task<XuiV3ApiResponse<JToken>> DetachClientAsync(ServerInfo serverInfo, IConfiguration configuration, string email, IEnumerable<int> inboundIds, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/{EscapePath(email)}/detach", new { inboundIds = inboundIds?.ToList() ?? new List<int>() }, true, cancellationToken);
+    /// <summary>Detaches an XUI client from selected inbounds without deleting the client.</summary>
+    /// <param name="serverInfo">Panel that owns the client.</param>
+    /// <param name="configuration">Runtime timeout, authentication, and retry configuration.</param>
+    /// <param name="email">Current XUI client email used as the endpoint identifier.</param>
+    /// <param name="inboundIds">Positive panel inbound ids to detach.</param>
+    /// <param name="cancellationToken">Token that cancels the external request.</param>
+    /// <param name="retryMode">Replay policy; durable link-change recovery passes <c>NoAutomaticRetry</c>.</param>
+    /// <returns>The panel response; callers must read back membership after an ambiguous response.</returns>
+    public static Task<XuiV3ApiResponse<JToken>> DetachClientAsync(ServerInfo serverInfo, IConfiguration configuration, string email, IEnumerable<int> inboundIds, CancellationToken cancellationToken = default, XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.IdempotentMutation)
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/{EscapePath(email)}/detach", new { inboundIds = inboundIds?.ToList() ?? new List<int>() }, true, cancellationToken, retryMode: retryMode);
 
     /// <summary>POST /panel/api/clients/bulkAttach. Attaches many existing clients to many inbounds.</summary>
     public static Task<XuiV3ApiResponse<JToken>> BulkAttachClientsAsync(ServerInfo serverInfo, IConfiguration configuration, object request, CancellationToken cancellationToken = default)
@@ -1087,9 +1213,17 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> ResetAllClientTrafficsAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/resetAllTraffics", null, true, cancellationToken);
 
-    /// <summary>POST /panel/api/clients/updateTraffic/{email}. Manually adjusts upload and download counters.</summary>
-    public static Task<XuiV3ApiResponse<JToken>> UpdateClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email, long up, long down, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/updateTraffic/{EscapePath(email)}", new { up, down }, true, cancellationToken);
+    /// <summary>Writes explicit upload and download counters for one XUI client.</summary>
+    /// <param name="serverInfo">Panel that owns the client and traffic row.</param>
+    /// <param name="configuration">Runtime timeout, authentication, and retry configuration.</param>
+    /// <param name="email">Current XUI client email used by the traffic endpoint.</param>
+    /// <param name="up">Uploaded bytes; must be non-negative.</param>
+    /// <param name="down">Downloaded bytes; must be non-negative.</param>
+    /// <param name="cancellationToken">Token that cancels the external request.</param>
+    /// <param name="retryMode">Replay policy; link-change repair disables blind retries and verifies by read-back.</param>
+    /// <returns>The panel response; a timeout is ambiguous and must not be interpreted as counters being reset.</returns>
+    public static Task<XuiV3ApiResponse<JToken>> UpdateClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email, long up, long down, CancellationToken cancellationToken = default, XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.IdempotentMutation)
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/updateTraffic/{EscapePath(email)}", new { up, down }, true, cancellationToken, retryMode: retryMode);
 
     /// <summary>POST /panel/api/clients/delDepleted. Deletes clients whose traffic quota is exhausted.</summary>
     public static Task<XuiV3ApiResponse<JToken>> DeleteDepletedClientsAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
@@ -1473,6 +1607,24 @@ public class ApiServicev3
         return builder.Uri;
     }
 
+    /// <summary>
+    /// Sends one JSON XUI v3 request and deserializes the standard panel response envelope.
+    /// </summary>
+    /// <typeparam name="T">Type expected in the response <c>obj</c> field.</typeparam>
+    /// <param name="serverInfo">Target panel descriptor containing endpoint and authentication metadata.</param>
+    /// <param name="configuration">Runtime timeout and retry configuration.</param>
+    /// <param name="method">HTTP method required by the panel endpoint.</param>
+    /// <param name="relativePath">Panel-relative API path; it must not contain secrets.</param>
+    /// <param name="body">Optional JSON request body.</param>
+    /// <param name="authenticate">Whether bearer or session authentication is required.</param>
+    /// <param name="cancellationToken">Token that cancels the request and any permitted retry delay.</param>
+    /// <param name="query">Optional query values encoded into the request URI.</param>
+    /// <param name="retryMode">Replay semantics; non-idempotent mutations must use <c>NoAutomaticRetry</c>.</param>
+    /// <returns>The deserialized XUI response envelope.</returns>
+    /// <remarks>
+    /// A successful HTTP status can still contain <c>success=false</c>; callers remain responsible for checking the
+    /// panel envelope. Exceptions retain endpoint detail only for private diagnostics and must not be shown to users.
+    /// </remarks>
     public static async Task<XuiV3ApiResponse<T>> SendAsync<T>(
         ServerInfo serverInfo,
         IConfiguration configuration,
@@ -1481,9 +1633,10 @@ public class ApiServicev3
         object body = null,
         bool authenticate = true,
         CancellationToken cancellationToken = default,
-        IDictionary<string, string> query = null)
+        IDictionary<string, string> query = null,
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
     {
-        var raw = await SendRawAsync(serverInfo, configuration, method, relativePath, body, authenticate, cancellationToken, query);
+        var raw = await SendRawAsync(serverInfo, configuration, method, relativePath, body, authenticate, cancellationToken, query, retryMode);
         var result = JsonConvert.DeserializeObject<XuiV3ApiResponse<T>>(raw);
         if (result == null)
             throw new XuiV3ApiException(method.ToString(), BuildPanelUri(serverInfo, relativePath, query).ToString(), 0, raw, null);
@@ -1560,6 +1713,7 @@ public class ApiServicev3
     /// <param name="cancellationToken">Cancellation token for the active Telegram update or background operation.</param>
     /// <param name="query">Optional query string values for endpoints that support filtering or paging.</param>
     /// <param name="requestBodyForLog">Sanitized request body label used only in exceptions; never include tokens here.</param>
+    /// <param name="retryMode">Replay policy that limits transient retries for ambiguous mutations.</param>
     /// <returns>The response body as UTF-8 text when the panel returns a successful status code.</returns>
     /// <remarks>
     /// HTTP 400/401/403/404/422 responses are treated as panel/business failures and are not retried. HTTP 429 and
@@ -1574,7 +1728,8 @@ public class ApiServicev3
         bool authenticate,
         CancellationToken cancellationToken,
         IDictionary<string, string> query = null,
-        string requestBodyForLog = null)
+        string requestBodyForLog = null,
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
     {
         var uri = BuildPanelUri(serverInfo, relativePath, query);
         return SendWithRetryAsync(
@@ -1594,7 +1749,8 @@ public class ApiServicev3
 
                 return responseText;
             },
-            cancellationToken);
+            cancellationToken,
+            retryMode);
     }
 
     /// <summary>
@@ -1606,6 +1762,7 @@ public class ApiServicev3
     /// <param name="uri">Fully built XUI panel request URI. It must not include bearer tokens or other secrets.</param>
     /// <param name="operation">Factory that sends exactly one HTTP attempt and returns the parsed response data.</param>
     /// <param name="cancellationToken">Cancellation token that stops retries when the Telegram update is cancelled.</param>
+    /// <param name="retryMode">Replay policy; <c>NoAutomaticRetry</c> forces exactly one HTTP attempt.</param>
     /// <returns>The value returned by the first successful HTTP attempt.</returns>
     /// <remarks>
     /// Retry attempts stay out of the private Telegram logger channel, but are written with full exception details to
@@ -1616,13 +1773,16 @@ public class ApiServicev3
         HttpMethod method,
         Uri uri,
         Func<Task<T>> operation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
     {
         var appConfig = configuration?.Get<AppConfig>() ?? new AppConfig();
         var retryCount = appConfig.XuiV3TransientRetryCount < 0
             ? DefaultXuiV3TransientRetryCount
             : appConfig.XuiV3TransientRetryCount;
-        var maxAttempts = Math.Max(1, retryCount + 1);
+        var maxAttempts = retryMode == XuiV3RequestRetryMode.NoAutomaticRetry
+            ? 1
+            : Math.Max(1, retryCount + 1);
         Exception lastException = null;
 
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
@@ -1663,6 +1823,19 @@ public class ApiServicev3
         throw lastException ?? new InvalidOperationException("XUI v3 request failed without an exception.");
     }
 
+    /// <summary>
+    /// Serializes an optional JSON body and delegates one raw XUI request to the central retry transport.
+    /// </summary>
+    /// <param name="serverInfo">Target XUI panel descriptor.</param>
+    /// <param name="configuration">Runtime timeout and retry settings.</param>
+    /// <param name="method">HTTP method for the endpoint.</param>
+    /// <param name="relativePath">Panel-relative API path.</param>
+    /// <param name="body">Optional object serialized as JSON for each attempt.</param>
+    /// <param name="authenticate">Whether authentication headers are required.</param>
+    /// <param name="cancellationToken">Token that cancels the request.</param>
+    /// <param name="query">Optional query values.</param>
+    /// <param name="retryMode">Replay policy; ambiguous link mutations use <c>NoAutomaticRetry</c>.</param>
+    /// <returns>Successful UTF-8 response body.</returns>
     private static async Task<string> SendRawAsync(
         ServerInfo serverInfo,
         IConfiguration configuration,
@@ -1671,7 +1844,8 @@ public class ApiServicev3
         object body,
         bool authenticate,
         CancellationToken cancellationToken,
-        IDictionary<string, string> query = null)
+        IDictionary<string, string> query = null,
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
     {
         return await SendRawWithRetryAsync(
             serverInfo,
@@ -1682,7 +1856,8 @@ public class ApiServicev3
             authenticate,
             cancellationToken,
             query,
-            SerializeBodyForLog(body));
+            SerializeBodyForLog(body),
+            retryMode);
     }
 
     private static async Task<string> SendSubscriptionRawAsync(
@@ -2304,6 +2479,14 @@ public class XuiV3ClientPayload
     [JsonProperty("email")]
     public string Email { get; set; }
 
+    /// <summary>
+    /// Protocol UUID read from the global clients API's <c>uuid</c> response property.
+    /// </summary>
+    /// <remarks>
+    /// This is an internal canonical property. Before an update request is sent,
+    /// <see cref="ApiServicev3.UpdateClientAsync"/> maps it to the 3x-ui wire-client property <c>id</c>; it must not be
+    /// serialized directly as <c>uuid</c> in an update body.
+    /// </remarks>
     [JsonProperty("uuid")]
     public string Uuid { get; set; }
 

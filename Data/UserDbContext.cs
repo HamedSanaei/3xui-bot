@@ -68,6 +68,8 @@ public class UserDbContext : DbContext
     /// retried by the background worker until the website API accepts them or marks them as skipped.
     /// </remarks>
     public DbSet<GozargahSiteSyncEvent> GozargahSiteSyncEvents { get; set; }
+    /// <summary>Durable idempotent XUI v3 account link-change operations scoped by panel and numeric client id.</summary>
+    public DbSet<XuiV3LinkChangeOperation> XuiV3LinkChangeOperations { get; set; }
     public DbSet<CookieData> Cookies { get; set; }
     public DbSet<SwapinoPaymentInfo> SwapinoPaymentInfos { get; set; }
     public DbSet<HooshPayPaymentInfo> HooshPayPaymentInfos { get; set; }
@@ -382,6 +384,35 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.SubId);
             entity.HasIndex(x => x.Status);
             entity.HasIndex(x => new { x.Operation, x.Email, x.PreviousEmail, x.Uuid, x.SubId });
+        });
+
+        modelBuilder.Entity<XuiV3LinkChangeOperation>(entity =>
+        {
+            entity.ToTable("XuiV3LinkChangeOperations");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.OperationKey).IsRequired().HasMaxLength(40);
+            entity.Property(x => x.PanelKey).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.BotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.BotUsername).HasMaxLength(128);
+            entity.Property(x => x.BotType).HasMaxLength(32);
+            entity.Property(x => x.Source).HasMaxLength(16);
+            entity.Property(x => x.Status).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.Stage).HasMaxLength(64);
+            entity.Property(x => x.OldEmail).HasMaxLength(160);
+            entity.Property(x => x.OldUuid).HasMaxLength(64);
+            entity.Property(x => x.OldSubId).HasMaxLength(160);
+            entity.Property(x => x.NewEmail).HasMaxLength(160);
+            entity.Property(x => x.NewUuid).HasMaxLength(64);
+            entity.Property(x => x.NewSubId).HasMaxLength(160);
+            entity.Property(x => x.LastError).HasMaxLength(2000);
+            entity.HasIndex(x => x.OperationKey).IsUnique();
+            entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc });
+            entity.HasIndex(x => new { x.TelegramUserId, x.CreatedAtUtc });
+            // SQLite enforces one active saga per physical panel client across all owned and tenant bots.
+            entity.HasIndex(x => new { x.PanelKey, x.ClientId })
+                .IsUnique()
+                .HasFilter("\"Status\" IN ('awaiting_confirmation','processing','recovery_pending','manual_review')");
         });
 
         modelBuilder.Entity<ZibalPaymentInfo>(entity =>
