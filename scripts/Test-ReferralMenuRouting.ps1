@@ -2,7 +2,9 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $servicePath = Join-Path $repositoryRoot 'Services\TelegramBotService.cs'
+$extensionsPath = Join-Path $repositoryRoot 'Utils\TelegramBotClientExtensions.cs'
 $source = [System.IO.File]::ReadAllText($servicePath, [System.Text.Encoding]::UTF8)
+$extensionsSource = [System.IO.File]::ReadAllText($extensionsPath, [System.Text.Encoding]::UTF8)
 
 function Assert-True {
     param(
@@ -43,15 +45,20 @@ function Assert-Ordered {
 $coreStart = $source.IndexOf('private async Task HandleUpdateCoreAsync(', [System.StringComparison]::Ordinal)
 $regularStart = $source.IndexOf('private async Task HandleUpdateRegularUsers(', [System.StringComparison]::Ordinal)
 $helperStart = $source.IndexOf('private async Task<bool> TryHandleReferralMenuCommandAsync(', [System.StringComparison]::Ordinal)
-$dashboardStart = $source.IndexOf('private async Task SendReferralDashboardAsync(', [System.StringComparison]::Ordinal)
+$dashboardStart = $source.IndexOf('private async Task<Message> SendReferralDashboardAsync(', [System.StringComparison]::Ordinal)
+$supportHelperStart = $source.IndexOf('private static string BuildOwnedBotSupportContactHtml(', [System.StringComparison]::Ordinal)
 
 Assert-True ($coreStart -ge 0 -and $regularStart -gt $coreStart) 'owned message routing methods are present'
-Assert-True ($helperStart -gt $regularStart -and $dashboardStart -gt $helperStart) 'central referral handler and dashboard are present'
+Assert-True ($helperStart -gt $regularStart -and $dashboardStart -gt $helperStart -and $supportHelperStart -gt $dashboardStart) 'central referral handler and dashboard are present'
 
 $core = $source.Substring($coreStart, $regularStart - $coreStart)
 $regular = $source.Substring($regularStart, $helperStart - $regularStart)
 $helper = $source.Substring($helperStart, $dashboardStart - $helperStart)
-$dashboard = $source.Substring($dashboardStart)
+$dashboard = $source.Substring($dashboardStart, $supportHelperStart - $dashboardStart)
+$strictSenderStart = $extensionsSource.IndexOf('public static async Task<Message> SendReferralTextMessageAsync(', [System.StringComparison]::Ordinal)
+$nextExtensionStart = $extensionsSource.IndexOf('public static async Task CustomForwardMessage(', [System.StringComparison]::Ordinal)
+Assert-True ($strictSenderStart -ge 0 -and $nextExtensionStart -gt $strictSenderStart) 'strict referral Telegram sender is present'
+$strictSender = $extensionsSource.Substring($strictSenderStart, $nextExtensionStart - $strictSenderStart)
 
 # Command recognition must be normalized and support both visible reply-keyboard forms.
 $plainCommand = -join @(
@@ -88,10 +95,17 @@ Assert-True ($helper.Contains('BotInstanceTypes.Owned')) 'central handler reject
 Assert-True ($helper.Contains('Owned-bot referral menu routed.')) 'successful routes emit structured context logs'
 Assert-True ($helper.Contains('Owned-bot referral menu failed.')) 'routing and statistics failures emit structured exception logs'
 Assert-True ($helper.Contains('Referral dashboard failure notification could not be delivered.')) 'routing failures attempt a safe user-facing notification'
+Assert-True ($helper.Contains('var dashboardSent = dashboardMessage != null;')) 'dashboard success is derived from the returned Telegram message'
+Assert-True ($helper.Contains('telegramApiException?.ErrorCode')) 'Telegram API error codes are included in structured failure logs'
 
 # Existing dashboard behavior must remain explicit for disabled configuration and missing bot usernames.
 Assert-True ($dashboard.Contains('_appConfig.Referral?.Enabled != true')) 'disabled referral configuration remains explicit'
 Assert-True ($dashboard.Contains('string.IsNullOrWhiteSpace(username)')) 'missing owned-bot username remains explicit'
+Assert-True ($dashboard.Contains('return await botClient.SendReferralTextMessageAsync(')) 'all referral dashboard outcomes return the accepted Telegram message'
+Assert-True (-not $dashboard.Contains('CustomSendTextMessageAsync(')) 'referral dashboard bypasses the exception-swallowing sender'
+Assert-True ($strictSender.Contains('parseMode: null')) 'referral sender disables Telegram entity parsing'
+Assert-True (-not $strictSender.Contains('catch (')) 'strict referral sender propagates Telegram failures'
+Assert-True ($strictSender.Contains('result ?? throw new InvalidOperationException(')) 'strict referral sender rejects a null Telegram message'
 Assert-True ($regular.Contains('RegisterRelationshipAsync(')) '/start ref registration remains connected to the existing referral service'
 
 Write-Host 'Referral menu routing regression checks completed successfully.'

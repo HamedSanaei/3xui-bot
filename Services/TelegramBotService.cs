@@ -7811,7 +7811,11 @@ public class TelegramBotService : IHostedService
             await _userDbContext.ClearUserStatus(currentState ?? new User { Id = telegramUserId });
             _xuiV3PurchaseSessionStore.Clear(telegramUserId);
 
-            await SendReferralDashboardAsync(botClient, message, cancellationToken);
+            var dashboardMessage = await SendReferralDashboardAsync(botClient, message, cancellationToken);
+            var dashboardSent = dashboardMessage != null;
+            if (!dashboardSent)
+                throw new InvalidOperationException("Telegram did not return a message for the referral dashboard.");
+
             _logger.LogInformation(
                 "Owned-bot referral menu routed. telegramUserId={TelegramUserId}, botId={BotId}, botUsername={BotUsername}, isSuperAdmin={IsSuperAdmin}, previousFlow={PreviousFlow}, previousLastStep={PreviousLastStep}, dashboardSent={DashboardSent}",
                 telegramUserId,
@@ -7820,7 +7824,7 @@ public class TelegramBotService : IHostedService
                 isSuperAdmin,
                 previousFlow,
                 previousLastStep,
-                true);
+                dashboardSent);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -7828,23 +7832,28 @@ public class TelegramBotService : IHostedService
         }
         catch (Exception ex)
         {
+            var telegramApiException = ex as ApiRequestException;
             _logger.LogError(
                 ex,
-                "Owned-bot referral menu failed. telegramUserId={TelegramUserId}, botId={BotId}, botUsername={BotUsername}, isSuperAdmin={IsSuperAdmin}, previousFlow={PreviousFlow}, previousLastStep={PreviousLastStep}, dashboardSent={DashboardSent}",
+                "Owned-bot referral menu failed. telegramUserId={TelegramUserId}, botId={BotId}, botUsername={BotUsername}, isSuperAdmin={IsSuperAdmin}, previousFlow={PreviousFlow}, previousLastStep={PreviousLastStep}, dashboardSent={DashboardSent}, exceptionType={ExceptionType}, telegramErrorCode={TelegramErrorCode}, errorMessage={ErrorMessage}",
                 telegramUserId,
                 botId,
                 botUsername,
                 isSuperAdmin,
                 previousFlow,
                 previousLastStep,
-                false);
+                false,
+                ex.GetType().FullName,
+                telegramApiException?.ErrorCode,
+                ex.Message);
 
             try
             {
-                await botClient.CustomSendTextMessageAsync(
+                await botClient.SendReferralTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "نمایش اطلاعات دعوت از دوستان با خطا روبه‌رو شد. لطفاً چند دقیقه دیگر دوباره تلاش کنید.",
-                    replyMarkup: MainReplyMarkupKeyboardFa());
+                    replyMarkup: MainReplyMarkupKeyboardFa(),
+                    cancellationToken: cancellationToken);
             }
             catch (Exception deliveryException)
             {
@@ -7866,33 +7875,36 @@ public class TelegramBotService : IHostedService
     /// <param name="botClient">Telegram client for the currently handling owned bot.</param>
     /// <param name="message">Incoming message containing the numeric Telegram user and chat ids.</param>
     /// <param name="cancellationToken">Cancellation token for users.db statistics and Telegram delivery.</param>
-    /// <returns>A task that completes after the dashboard and main reply keyboard are sent.</returns>
+    /// <returns>
+    /// The non-null Telegram message accepted for delivery. The caller must use this result, rather than completion of
+    /// the method alone, when recording <c>dashboardSent=true</c>.
+    /// </returns>
     /// <remarks>
     /// The link uses the current owned bot username, but invited count and rewards are global across every owned bot.
     /// Tenant bots never call this method and cannot create referral links or relationships.
     /// </remarks>
-    private async Task SendReferralDashboardAsync(
+    private async Task<Message> SendReferralDashboardAsync(
         ITelegramBotClient botClient,
         Message message,
         CancellationToken cancellationToken)
     {
         if (_appConfig.Referral?.Enabled != true)
         {
-            await botClient.CustomSendTextMessageAsync(
+            return await botClient.SendReferralTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "قابلیت دعوت از دوستان در حال حاضر فعال نیست.",
-                replyMarkup: MainReplyMarkupKeyboardFa());
-            return;
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
         }
 
         var username = (CurrentBot?.Username ?? string.Empty).Trim().TrimStart('@');
         if (string.IsNullOrWhiteSpace(username))
         {
-            await botClient.CustomSendTextMessageAsync(
+            return await botClient.SendReferralTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "نام کاربری این ربات برای ساخت لینک دعوت تنظیم نشده است.",
-                replyMarkup: MainReplyMarkupKeyboardFa());
-            return;
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
         }
 
         var stats = await _referralService.GetUserStatsAsync(message.From.Id, cancellationToken);
@@ -7908,10 +7920,11 @@ public class TelegramBotService : IHostedService
             $"⚠️ پاداش‌های نیازمند بررسی مجدد: {stats.FailedRewardCount:N0}\n\n" +
             $"حداقل پرداخت واجدشرایط: {_appConfig.Referral.MinimumEligiblePaymentAmountToman:N0} تومان";
 
-        await botClient.CustomSendTextMessageAsync(
+        return await botClient.SendReferralTextMessageAsync(
             chatId: message.Chat.Id,
             text: text,
-            replyMarkup: MainReplyMarkupKeyboardFa());
+            replyMarkup: MainReplyMarkupKeyboardFa(),
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>

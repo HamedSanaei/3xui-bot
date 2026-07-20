@@ -57,6 +57,68 @@ public static class TelegramBotClientExtensions
         return result;
     }
 
+    /// <summary>
+    /// Sends one referral dashboard message as plain Telegram text and propagates delivery failures to the caller.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram client for the owned bot handling the referral command. The client token is managed by the runtime and
+    /// must never be included in <paramref name="text"/> or application logs.
+    /// </param>
+    /// <param name="chatId">
+    /// Telegram chat identifier that requested the referral dashboard. This is normally the incoming private chat id.
+    /// </param>
+    /// <param name="text">
+    /// Complete plain-text referral message, including the <c>?start=ref_...</c> URL. The value is required and is sent
+    /// without Markdown or HTML entity parsing.
+    /// </param>
+    /// <param name="replyMarkup">
+    /// Optional Telegram keyboard displayed with the message. Pass the current owned-bot main keyboard for dashboard
+    /// responses, or <c>null</c> when no keyboard is required.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Token that cancels the Telegram request when polling shuts down or the current update is abandoned.
+    /// </param>
+    /// <returns>
+    /// The non-null Telegram <see cref="Message"/> returned after the API accepts the dashboard. Callers may treat this
+    /// result as proof of delivery acceptance and must not record success before it is returned.
+    /// </returns>
+    /// <remarks>
+    /// Unlike <see cref="CustomSendTextMessageAsync"/>, this strict sender intentionally does not catch Telegram or
+    /// transport exceptions. The referral route needs the real exception and Telegram response text for structured
+    /// logging, and the plain-text mode prevents the underscore in <c>ref_...</c> from being parsed as Markdown.
+    /// </remarks>
+    /// <exception cref="ApiRequestException">
+    /// Telegram rejected the request, for example because the chat is unavailable or the payload is invalid.
+    /// </exception>
+    /// <exception cref="HttpRequestException">The Telegram transport failed before a valid response was received.</exception>
+    /// <exception cref="InvalidOperationException">The Telegram client completed without returning a message.</exception>
+    /// <example>
+    /// <code>
+    /// var sent = await botClient.SendReferralTextMessageAsync(
+    ///     chatId: message.Chat.Id,
+    ///     text: "https://t.me/example_bot?start=ref_abc123",
+    ///     replyMarkup: mainKeyboard,
+    ///     cancellationToken: cancellationToken);
+    /// </code>
+    /// </example>
+    public static async Task<Message> SendReferralTextMessageAsync(
+        this ITelegramBotClient botClient,
+        ChatId chatId,
+        string text,
+        IReplyMarkup replyMarkup = null,
+        CancellationToken cancellationToken = default)
+    {
+        var result = await botClient.SendTextMessageAsync(
+            chatId: chatId,
+            text: text,
+            parseMode: null,
+            replyMarkup: replyMarkup,
+            cancellationToken: cancellationToken);
+
+        return result ?? throw new InvalidOperationException(
+            "Telegram accepted the referral send call without returning a message.");
+    }
+
 
 
 
