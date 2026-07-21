@@ -39,6 +39,16 @@ public class TelegramBotService : IHostedService
     private const string AdminVerifyPhoneAction = "📱 تایید دستی شماره تلفن";
 
     /// <summary>
+    /// Reply-keyboard action that shows usage for the seven most recent completed Tehran days.
+    /// </summary>
+    private const string AdminWeeklyUsageAction = "📊 آمار هفتگی";
+
+    /// <summary>
+    /// Reply-keyboard action that shows usage for the thirty most recent completed Tehran days.
+    /// </summary>
+    private const string AdminMonthlyUsageAction = "📈 آمار ماهانه";
+
+    /// <summary>
     /// Conversation-state step that waits for the target user's numeric Telegram id.
     /// </summary>
     private const string AdminPhoneUserIdStep = "admin-phone-user-id";
@@ -81,6 +91,7 @@ public class TelegramBotService : IHostedService
     private readonly TenantBotService _tenantBotService;
     private readonly SalesAssistantService _salesAssistantService;
     private readonly UserActivityLogService _userActivityLog;
+    private readonly UsageAnalyticsService _usageAnalyticsService;
     private readonly WalletLedgerService _walletLedgerService;
     /// <summary>Global owned-bot referral engine used by start links, dashboards, and legacy Zibal settlement.</summary>
     private readonly ReferralService _referralService;
@@ -157,7 +168,15 @@ public class TelegramBotService : IHostedService
     /// </param>
     /// <param name="xuiV3AdminFlowService">Super-admin XuiV3 management flow.</param>
     /// <param name="tenantBotService">Tenant storefront owner and customer flow service.</param>
+    /// <param name="salesAssistantService">Tenant receipt and colleague notification assistant flow.</param>
     /// <param name="userActivityLog">File-based user activity logger.</param>
+    /// <param name="usageAnalyticsService">
+    /// Shared completed-day usage aggregator used by super-admin and tenant-owner statistics.
+    /// </param>
+    /// <param name="walletLedgerService">Append-only users.db ledger writer for every wallet mutation.</param>
+    /// <param name="ownedBotNotificationService">
+    /// Best-effort notifier used to reach users through the owned bots they have previously started.
+    /// </param>
     /// <param name="gozargahSiteApiClient">Gozargah website API client used to show colleague site wallet status.</param>
     /// <param name="gozargahSiteSyncService">
     /// Gozargah website sync service used to auto-promote connected website users before owned-bot pricing is shown.
@@ -170,6 +189,11 @@ public class TelegramBotService : IHostedService
     /// <param name="referralService">
     /// Global owned-bot referral service used by start payloads, user reporting, and final legacy Zibal settlement.
     /// </param>
+    /// <remarks>
+    /// The service itself is singleton-backed, while usage analytics and newer financial operations create independent
+    /// users.db contexts through their factories. Runtime bot identity always comes from <see cref="BotContextAccessor"/>
+    /// so support, activity attribution, and Telegram delivery remain scoped to the active owned or tenant bot.
+    /// </remarks>
     public TelegramBotService(
         ITelegramBotClient botClient,
         UserDbContext dbContext,
@@ -188,6 +212,7 @@ public class TelegramBotService : IHostedService
         TenantBotService tenantBotService,
         SalesAssistantService salesAssistantService,
         UserActivityLogService userActivityLog,
+        UsageAnalyticsService usageAnalyticsService,
         WalletLedgerService walletLedgerService,
         OwnedBotNotificationService ownedBotNotificationService,
         GozargahSiteApiClient gozargahSiteApiClient,
@@ -215,6 +240,7 @@ public class TelegramBotService : IHostedService
         _tenantBotService = tenantBotService;
         _salesAssistantService = salesAssistantService;
         _userActivityLog = userActivityLog;
+        _usageAnalyticsService = usageAnalyticsService;
         _walletLedgerService = walletLedgerService;
         _ownedBotNotificationService = ownedBotNotificationService;
         _gozargahSiteApiClient = gozargahSiteApiClient;
@@ -473,6 +499,9 @@ public class TelegramBotService : IHostedService
             await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, messageCredUser, tenantUserState, cancellationToken);
             return;
         }
+
+        if (isSuperAdmin && await TryHandleUsageStatisticsCommandAsync(botClient, message, cancellationToken))
+            return;
 
         if (isSuperAdmin && await TryHandleUserActivityLogCommandAsync(botClient, message, messageCredUser, cancellationToken))
             return;
@@ -4443,6 +4472,120 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
+    /// Handles completed-day weekly and monthly usage commands before legacy super-admin text flows can consume them.
+    /// </summary>
+    /// <param name="botClient">Owned-bot Telegram client that received the super-admin command.</param>
+    /// <param name="message">
+    /// Incoming super-admin text message. The sender id has already been checked against global
+    /// <see cref="AppConfig.AdminsUserIds"/> by the common update router.
+    /// </param>
+    /// <param name="cancellationToken">Polling cancellation token used for state, file, database, and Telegram work.</param>
+    /// <returns>
+    /// <c>true</c> when the text is one of the usage commands, including when report generation fails after a safe
+    /// user-facing error is sent; otherwise <c>false</c> so normal admin routing may continue.
+    /// </returns>
+    /// <remarks>
+    /// The command clears only the sender's temporary bot-scoped conversation state. It reports either seven or thirty
+    /// complete Tehran days ending yesterday, globally de-duplicates users per day across owned and tenant bots, counts
+    /// incoming messages plus callbacks, and excludes all configured super-admin ids.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// if (isSuperAdmin &amp;&amp; await TryHandleUsageStatisticsCommandAsync(client, message, cancellationToken))
+    ///     return;
+    /// </code>
+    /// </example>
+    private async Task<bool> TryHandleUsageStatisticsCommandAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CancellationToken cancellationToken)
+    {
+        var text = message?.Text?.Trim();
+        var dayCount = string.Equals(text, AdminWeeklyUsageAction, StringComparison.Ordinal)
+            ? 7
+            : string.Equals(text, AdminMonthlyUsageAction, StringComparison.Ordinal)
+                ? 30
+                : 0;
+        if (dayCount == 0 || message?.From == null)
+            return false;
+
+        try
+        {
+            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            var yesterdayIran = _usageAnalyticsService.GetIranNow().Date.AddDays(-1);
+            var startIran = yesterdayIran.AddDays(-(dayCount - 1));
+            var report = await _usageAnalyticsService.GetReportAsync(
+                startIran,
+                dayCount,
+                botIdFilter: null,
+                includeSales: false,
+                cancellationToken);
+
+            var builder = new StringBuilder();
+            builder.AppendLine(dayCount == 7
+                ? "📊 <b>آمار هفتگی کل مجموعه</b>"
+                : "📈 <b>آمار ۳۰ روزه کل مجموعه</b>");
+            builder.AppendLine(
+                $"بازه کامل: <code>{UsageAnalyticsService.FormatPersianDate(startIran)}</code> تا " +
+                $"<code>{UsageAnalyticsService.FormatPersianDate(yesterdayIran)}</code>");
+            builder.AppendLine("روز جاری عمداً در محاسبات وارد نشده است.");
+            builder.AppendLine();
+
+            foreach (var day in report.Days)
+            {
+                builder.AppendLine(
+                    $"📅 <code>{UsageAnalyticsService.FormatPersianDate(day.DateIran)}</code> | " +
+                    $"👤 <code>{day.UniqueUsers:N0}</code> | 💬 <code>{day.Interactions:N0}</code>");
+            }
+
+            builder.AppendLine();
+            builder.AppendLine($"👤 مجموع کاربران یکتای روزانه: <code>{report.TotalDailyUniqueUsers:N0}</code>");
+            builder.AppendLine($"💬 مجموع تعامل‌ها: <code>{report.TotalInteractions:N0}</code>");
+            if (report.MissingActivityLogDays > 0 || report.MalformedLines > 0)
+            {
+                builder.AppendLine();
+                builder.AppendLine(
+                    $"⚠️ کیفیت داده: <code>{report.MissingActivityLogDays}</code> روز بدون فایل، " +
+                    $"<code>{report.MalformedLines}</code> خط خراب نادیده گرفته شد.");
+            }
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: builder.ToString(),
+                parseMode: ParseMode.Html,
+                replyMarkup: GetAdminKeyboard(),
+                cancellationToken: cancellationToken);
+            _logger.LogInformation(
+                "Super-admin usage report sent. userId={UserId}, botId={BotId}, dayCount={DayCount}, missingDays={MissingDays}, malformedLines={MalformedLines}",
+                message.From.Id,
+                BotContextAccessor.CurrentBotId,
+                dayCount,
+                report.MissingActivityLogDays,
+                report.MalformedLines);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Super-admin usage report failed. userId={UserId}, botId={BotId}, dayCount={DayCount}",
+                message.From.Id,
+                BotContextAccessor.CurrentBotId,
+                dayCount);
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "دریافت آمار در حال حاضر با خطا روبه‌رو شد. جزئیات برای بررسی ثبت شد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                replyMarkup: GetAdminKeyboard(),
+                cancellationToken: cancellationToken);
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// Gets the reply-keyboard actions available to super-admin users.
     /// </summary>
     /// <returns>Ordered action labels shown in the super-admin keyboard.</returns>
@@ -4464,6 +4607,8 @@ public class TelegramBotService : IHostedService
             "Sync Gozargah Site",
             "✔️ Verify payment",
             AdminVerifyPhoneAction,
+            AdminWeeklyUsageAction,
+            AdminMonthlyUsageAction,
             "🤖 وضعیت ربات‌ها",
             "📑 Menu"
         };
@@ -4609,12 +4754,13 @@ public class TelegramBotService : IHostedService
         if (message is not null && message.Type == MessageType.Contact && message.Contact != null)
         {
             await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
-            Contact userContact;
-            userContact = message.Contact;
-            bool isValidPhoneNumber = await CheckUserPhoneNumber(message.Chat.Id, message);
-            if (isValidPhoneNumber)
+            var normalizedPhoneNumber = await ValidateOwnedBotPhoneContactAsync(
+                botClient,
+                message,
+                cancellationToken);
+            if (!string.IsNullOrWhiteSpace(normalizedPhoneNumber))
             {
-                await _credentialsDbContext.SavePhoneNumber(message.From.Id, message.Contact.PhoneNumber);
+                await _credentialsDbContext.SavePhoneNumber(message.From.Id, normalizedPhoneNumber);
                 await botClient.CustomSendTextMessageAsync(
                              chatId: message.Chat.Id,
                              text: "شماره شما با موفقیت تایید شد. حالا دوباره گزینه مورد نظرتان را انتخاب کنید.",
@@ -4965,7 +5111,10 @@ public class TelegramBotService : IHostedService
             {
                 if (string.IsNullOrEmpty(credUser.PhoneNumber))
                 {
-                    string text = " لطفا اجازه دریافت شماره خود را برای دریافت اکانت رایگان یک روزه ارسال کنید و سپس مجدد روی دریافت اکانت رایگان کلیک کنید. " + "/n" + " در صورت عدم رضایت روی /start کلیک کنید";
+                    string text =
+                        "برای تأیید خودکار، فقط شماره موبایل ایران پذیرفته می‌شود و شماره ارسالی باید متعلق به همین حساب تلگرام باشد.\n\n" +
+                        "لطفاً شماره خود را با دکمه زیر ارسال کنید و سپس دوباره روی دریافت اکانت رایگان بزنید. " +
+                        "برای انصراف می‌توانید /start را ارسال کنید.";
                     await botClient.CustomSendTextMessageAsync(
                                 chatId: message.Chat.Id,
                                 text: text,
@@ -6081,6 +6230,18 @@ public class TelegramBotService : IHostedService
 
     }
 
+    /// <summary>
+    /// Finalizes a successful legacy owned-bot account renewal and records its wallet and sales audit entries.
+    /// </summary>
+    /// <param name="botClient">Current owned-bot Telegram client used for progress and account delivery.</param>
+    /// <param name="user">Bot-scoped legacy renewal state containing the selected account, period, traffic, and price.</param>
+    /// <param name="credUser">Shared credentials profile whose bot wallet is debited in Iranian toman.</param>
+    /// <param name="message">Customer confirmation message that supplies the Telegram user and chat ids.</param>
+    /// <returns>A task that completes after renewal, wallet debit, ledger write, sales event, and notification.</returns>
+    /// <remarks>
+    /// The structured <c>legacy_account_renewed</c> activity event is emitted only after the panel renewal succeeds and
+    /// both wallet debit and ledger entry are persisted. This keeps weekly gross sales free from pending or failed work.
+    /// </remarks>
     private async Task FinalizeRenewCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
     {
         if (message.Text == "انصراف")
@@ -6189,6 +6350,16 @@ public class TelegramBotService : IHostedService
                     referenceId: user.ConfigLink,
                     description: "Legacy account renewal",
                     cancellationToken: CancellationToken.None);
+                await _userActivityLog.LogBotActionAsync(
+                    "legacy_account_renewed",
+                    credUser,
+                    isSuperAdmin: false,
+                    new Dictionary<string, object>
+                    {
+                        ["accountEmail"] = client.Email ?? user.Email ?? string.Empty,
+                        ["priceToman"] = Convert.ToInt64(user._ConfigPrice)
+                    },
+                    CancellationToken.None);
 
                 var logMesseage = "تمدید \n" + $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
 
@@ -6222,6 +6393,18 @@ public class TelegramBotService : IHostedService
         await _userDbContext.ClearUserStatus(user);
 
     }
+    /// <summary>
+    /// Finalizes a successful legacy owned-bot account purchase and records its wallet and sales audit entries.
+    /// </summary>
+    /// <param name="botClient">Current owned-bot Telegram client used for progress and account delivery.</param>
+    /// <param name="user">Bot-scoped legacy purchase state containing the selected service and final price.</param>
+    /// <param name="credUser">Shared credentials profile whose bot wallet is debited in Iranian toman.</param>
+    /// <param name="message">Customer confirmation message that supplies the Telegram user and chat ids.</param>
+    /// <returns>A task that completes after creation, wallet debit, ledger write, sales event, and notification.</returns>
+    /// <remarks>
+    /// The structured <c>legacy_account_purchased</c> event is written only after the created account is read back as
+    /// enabled and the matching debit ledger entry exists. Wallet top-ups and failed creations are never sales events.
+    /// </remarks>
     private async Task FinalizeCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
     {
         if (message.Text == "انصراف")
@@ -6303,6 +6486,16 @@ public class TelegramBotService : IHostedService
                     referenceId: user.Email,
                     description: "Legacy account purchase",
                     cancellationToken: CancellationToken.None);
+                await _userActivityLog.LogBotActionAsync(
+                    "legacy_account_purchased",
+                    credUser,
+                    isSuperAdmin: false,
+                    new Dictionary<string, object>
+                    {
+                        ["accountEmail"] = user.Email ?? string.Empty,
+                        ["priceToman"] = Convert.ToInt64(user._ConfigPrice)
+                    },
+                    CancellationToken.None);
 
                 var logMesseage = $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
 
@@ -8256,41 +8449,63 @@ public class TelegramBotService : IHostedService
 
     }
 
-    async Task<bool> CheckUserPhoneNumber(long chatId, Message message)
+    /// <summary>
+    /// Validates an owned-bot Telegram contact for automatic Iranian phone verification.
+    /// </summary>
+    /// <param name="botClient">Owned-bot client that received the contact and must send validation feedback.</param>
+    /// <param name="message">
+    /// Incoming private Telegram message containing a contact. Its sender id and contact user id must match.
+    /// </param>
+    /// <param name="cancellationToken">Polling cancellation token used for Telegram feedback.</param>
+    /// <returns>
+    /// The canonical <c>+989xxxxxxxxx</c> phone number when the contact belongs to the sender and is Iranian;
+    /// otherwise <c>null</c>. A rejection message is sent before returning <c>null</c>.
+    /// </returns>
+    /// <remarks>
+    /// This automatic path is owned-bot scoped because tenant updates are routed away before reaching the regular-user
+    /// handler. Foreign or virtual numbers may still be approved through the separate super-admin manual flow. When an
+    /// own foreign contact is rejected, support comes strictly from the current owned bot configuration.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var phone = await ValidateOwnedBotPhoneContactAsync(client, message, cancellationToken);
+    /// if (phone != null)
+    ///     await credentials.SavePhoneNumber(message.From.Id, phone);
+    /// </code>
+    /// </example>
+    private async Task<string> ValidateOwnedBotPhoneContactAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CancellationToken cancellationToken)
     {
-        long? senderID = message?.From?.Id;
-        long? contactID = message?.Contact?.UserId;
-        if (senderID == contactID && senderID != null && contactID != null)
+        var senderId = message?.From?.Id;
+        var contact = message?.Contact;
+        if (senderId == null || contact?.UserId == null || senderId != contact.UserId)
         {
-
-            string phoneNumber = message.Contact.PhoneNumber;
-
-            // Check if the phone number starts with the Iranian country code
-            bool isIranianPhoneNumber = phoneNumber.StartsWith("98") || phoneNumber.StartsWith("+98") || phoneNumber.StartsWith("0098");
-
-            // Check the length to be sure (country code + 10 digits)
-            if (isIranianPhoneNumber && (phoneNumber.Length == 12 || phoneNumber.Length == 13 || phoneNumber.Length == 14))
-            {
-                return true;
-
-            }
-            else
-            {
-                await ActiveBotClient.SendTextMessageAsync(chatId: chatId,
-                                                   text: "خطا. لطفاً شماره اکانت خودتان با شماره واقعی را وارد کنید.",
-                                                   replyMarkup: MainReplyMarkupKeyboardFa());
-                return false;
-            }
-
-
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "شماره ارسالی باید متعلق به همین حساب تلگرام باشد. لطفاً دوباره از دکمه «ارسال شماره تلفن» استفاده کنید.",
+                replyMarkup: GetPhoneNumber(),
+                cancellationToken: cancellationToken);
+            return null;
         }
-        else
-        {
-            await ActiveBotClient.SendTextMessageAsync(chatId: chatId,
-                                                   text: "خطا. لطفاً شماره اکانت خودتان را وارد کنید.",
-                                                   replyMarkup: MainReplyMarkupKeyboardFa());
-        }
-        return false;
+
+        if (IranianPhoneNumberNormalizer.TryNormalize(contact.PhoneNumber, out var normalizedPhoneNumber))
+            return normalizedPhoneNumber;
+
+        var support = BuildOwnedBotSupportContactHtml(CurrentSupportAccount);
+        var supportText = string.IsNullOrWhiteSpace(support)
+            ? "پشتیبانی این ربات هنوز تنظیم نشده است."
+            : $"برای بررسی دستی به پشتیبانی همین ربات پیام بدهید: {support}";
+        await botClient.SendTextMessageAsync(
+            chatId: message.Chat.Id,
+            text:
+                "شماره‌های غیرایرانی به‌صورت خودکار تأیید نمی‌شوند. فقط شماره موبایل ایران قابل تأیید خودکار است.\n\n" +
+                supportText,
+            parseMode: ParseMode.Html,
+            replyMarkup: MainReplyMarkupKeyboardFa(),
+            cancellationToken: cancellationToken);
+        return null;
     }
 
 

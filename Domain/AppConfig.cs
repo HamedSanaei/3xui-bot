@@ -25,6 +25,14 @@ namespace Adminbot.Domain
         public string UserActivityLogFilePath { get; set; } = "./Data/Logs/user-activity-{shamsiDate}.jsonl";
         public int UserActivityLogMaxExceptionDepth { get; set; } = 1;
         /// <summary>
+        /// Enables the aggregate Saturday 00:01 Tehran usage chart sent to the central logger channel.
+        /// </summary>
+        /// <remarks>
+        /// The default is disabled so older configuration files do not unexpectedly start scheduled delivery.
+        /// Manual super-admin weekly and 30-day usage commands remain available regardless of this flag.
+        /// </remarks>
+        public bool WeeklyUsageReportEnabled { get; set; }
+        /// <summary>
         /// Enables the append-only daily diagnostic file that captures warning, error, and critical application logs.
         /// </summary>
         /// <remarks>

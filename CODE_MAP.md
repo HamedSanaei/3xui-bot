@@ -14,7 +14,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 ## Data Stores
 
-- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox.
+- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox, and weekly usage-report dispatch leases.
 - `Data/CredentialsDbContex.cs`: unchanged shared user wallet/profile data; referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
 - `Data/configuration.example.json`: sanitized configuration example including every referral setting.
@@ -33,6 +33,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/SalesAssistantService.cs`: central assistant bot for tenant sale notifications and manual receipt approval.
 - `Services/WalletLedgerService.cs`: append-only wallet ledger for credits/debits.
 - `Services/ReferralService.cs`: global owned-bot relationship registration, reward calculation, users.db state/ledger idempotency, user stats, notifications, and startup reconciliation.
+- `Services/UsageAnalyticsService.cs`: completed Tehran-day aggregation of JSONL messages/callbacks, successful owned sales, and fulfilled tenant sales; excludes global super-admin ids and supports tenant bot filtering.
+- `Services/UsageReportChartRenderer.cs`: cross-platform SkiaSharp PNG renderer for current-versus-previous weekly users, interactions, and gross sales.
+- `Services/WeeklyUsageReportHostedService.cs`: Saturday 00:01 Tehran report scheduler, catch-up behavior, users.db claim/lease idempotency, and direct central logger delivery through the default owned bot.
 - `Domain/GozargahSite.cs`: Gozargah site API client, sync event models, mapping, and retry helpers.
 
 ## Tenant Bot Rules
@@ -88,6 +91,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   This override accepts virtual and non-Iranian numbers, requires explicit final confirmation, writes the shared
   `CredUser.PhoneNumber`, notifies the user's previously started owned bots, and logs only masked phone values. Dynamic
   user identity fields in this flow must use encoded HTML, never the legacy default Markdown sender.
+- Automatic owned-bot contact verification accepts only a contact belonging to the sender and normalizes Iranian mobile
+  forms (`09`, `98`, `+98`, `0098`) to `+989...`. Own foreign contacts are rejected with the active owned bot's
+  clickable support account; the manual super-admin override remains intentionally international-capable.
 - Payment/order fulfillment paths must be idempotent: duplicate IPNs, repeated checks, or repeated assistant confirmations must not create another account or ledger entry.
 - Tenant fulfillment must reload the order and treat an existing `TenantBotLedgerEntry` for the same `TenantBotOrderId` as already fulfilled; this protects against stale singleton EF tracking and duplicate "check status" clicks.
 - If XUI account creation times out after a tenant card-to-card receipt is approved, keep the order unfulfilled but retryable and leave Sales Assistant approval controls available. Do not mark timeout as a definitive failed payment.
@@ -112,6 +118,17 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 ## Current Gotchas
 
 - Persian/RTL Telegram text and emoji are production UI; edit surgically and verify diffs for mojibake.
+- Super-admin `📊 آمار هفتگی` and `📈 آمار ماهانه` use only the latest 7/30 completed Tehran days through yesterday.
+  Daily users are globally distinct across all owned/tenant bots, interactions include messages and callbacks, and
+  configured super-admin ids are excluded. Tenant owner stats reuse the same parser with a strict tenant `BotId` filter.
+- Scheduled usage reporting is controlled by optional `weeklyUsageReportEnabled`; a missing old config key is false and
+  must not fail startup. Saturday 00:01 Tehran delivery compares the completed Sat-Fri week with its predecessor. Sales
+  include only structured successful owned account purchase/renew events and fulfilled tenant order `SalePriceToman`.
+- `UsageReportDispatches` exists only in `users.db`; unique `ReportKey`, atomic claims, and leases prevent concurrent
+  workers. Failed generation or Telegram delivery releases the same row for retry; successful delivery is terminal.
+  If Telegram returns a valid message but final sent-state persistence fails, the worker records a non-retryable
+  reconciliation state instead of deliberately sending a duplicate. The report sender bypasses payment logging, so it
+  does not trigger database backups.
 - `credentials.db` is shared wallet/profile state and is intentionally kept stable.
 - Financial `LogPayment` backup sends both `credentials.db` and `users.db` to the configured backup channel; backup failures must stay fail-soft and must not break settlement.
 - XUI v3 panel responses may omit `Traffic`; helpers must use null-safe access and fallback to top-level fields or `Extra`.
@@ -175,5 +192,5 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel.
 - `Domain/Logging/TelegramLogger.cs` also applies message-level channel suppression for known noncritical noise: stale Sales Assistant callbacks, unchanged Telegram edits, receipt-photo relay warnings that have a text fallback, repeated tenant forced-join probes, and Telegram polling 5xx/429/timeouts. Payment/audit logs and real token/XUI/settlement failures should still reach the private channel.
 - `CredentialsDbContext` and legacy `UserDbContext` state helper methods are still singleton-backed in DI and currently use a `SemaphoreSlim` gate as a temporary concurrency guard. The long-term fix is a separate refactor to per-operation DbContext/factory usage.
-- New wallet-ledger and referral operations use `UserDbContextFactory` per operation; legacy conversation/payment
-  code still uses the singleton contexts and their compatibility gates.
+- New wallet-ledger, referral, and scheduled usage-report operations use `UserDbContextFactory` per operation; legacy
+  conversation/payment code still uses the singleton contexts and their compatibility gates.

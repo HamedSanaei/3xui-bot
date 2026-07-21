@@ -63,6 +63,7 @@ public class TenantBotService
     private readonly SalesAssistantService _salesAssistantService;
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
     private readonly BroadcastManager _broadcastManager;
+    private readonly UsageAnalyticsService _usageAnalyticsService;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TenantBotService> _logger;
     private readonly Dictionary<string, TenantJoinCapabilityCacheEntry> _tenantJoinCapabilityCache = new(StringComparer.Ordinal);
@@ -98,6 +99,9 @@ public class TenantBotService
     /// Shared broadcast queue used for tenant public messages. Tenant broadcasts use the tenant bot as the
     /// sender, but keep progress/status updates in the owned bot chat that started the job.
     /// </param>
+    /// <param name="UsageAnalyticsService">
+    /// Shared completed-day activity aggregator used for tenant-scoped owner statistics.
+    /// </param>
     /// <param name="ServiceProvider">service Provider used to REACH MultiBotHostedService for runtime TOGGLE.</param>
     /// <param name="Logger">Logger used for tenant payment/audit channel logs.</param>
     public TenantBotService(
@@ -115,6 +119,7 @@ public class TenantBotService
         SalesAssistantService SalesAssistantService,
         GozargahSiteSyncService GozargahSiteSyncService,
         BroadcastManager BroadcastManager,
+        UsageAnalyticsService UsageAnalyticsService,
         IServiceProvider ServiceProvider,
         ILogger<TenantBotService> Logger)
     {
@@ -133,6 +138,7 @@ public class TenantBotService
         _salesAssistantService = SalesAssistantService;
         _gozargahSiteSyncService = GozargahSiteSyncService;
         _broadcastManager = BroadcastManager;
+        _usageAnalyticsService = UsageAnalyticsService;
         _serviceProvider = ServiceProvider;
         _logger = Logger;
     }
@@ -2519,12 +2525,17 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Shows seven-day tenant usage statistics from the JSONL user activity log.
+    /// Shows seven completed Tehran days of tenant-scoped usage from the shared activity aggregator.
     /// </summary>
     /// <param name="botClient">Owned bot client used to edit the owner-panel message.</param>
     /// <param name="callbackQuery">Owner callback that requested daily statistics.</param>
     /// <param name="owner">Colleague owner whose tenant bot stats are displayed.</param>
     /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
+    /// <returns>A task that completes after the existing owner-panel message is edited or an error is answered.</returns>
+    /// <remarks>
+    /// The report is isolated by the owner's internal tenant bot id, excludes global super-admin ids, counts messages
+    /// and callbacks, and uses only the seven completed Tehran days ending yesterday. It does not read sales values.
+    /// </remarks>
     private async Task SHOWTENANTDAILYSTATSASYNC(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -2538,13 +2549,31 @@ public class TenantBotService
             return;
         }
 
-        var stats = ReadTenantDailyStats(tenant.Id);
+        var startIran = _usageAnalyticsService.GetIranNow().Date.AddDays(-7);
+        var report = await _usageAnalyticsService.GetReportAsync(
+            startIran,
+            7,
+            botIdFilter: tenant.Id,
+            includeSales: false,
+            cancellationToken);
         var builder = new System.Text.StringBuilder();
         builder.AppendLine("📊 <b>آمار روزانه فروشگاه</b>");
-        builder.AppendLine("۷ روز اخیر بر اساس فایل لاگ فعالیت:");
+        builder.AppendLine("۷ روز کامل تا دیروز؛ شامل پیام‌ها و دکمه‌های callback:");
         builder.AppendLine();
-        foreach (var item in stats)
-            builder.AppendLine($"📅 <code>{Html(item.Date)}</code> | 👤 <code>{item.UniqueUsers}</code> کاربر | 💬 <code>{item.MessageCount}</code> پیام");
+        foreach (var item in report.Days)
+        {
+            builder.AppendLine(
+                $"📅 <code>{UsageAnalyticsService.FormatPersianDate(item.DateIran)}</code> | " +
+                $"👤 <code>{item.UniqueUsers:N0}</code> کاربر | 💬 <code>{item.Interactions:N0}</code> تعامل");
+        }
+
+        if (report.MissingActivityLogDays > 0 || report.MalformedLines > 0)
+        {
+            builder.AppendLine();
+            builder.AppendLine(
+                $"⚠️ <code>{report.MissingActivityLogDays}</code> روز بدون فایل و " +
+                $"<code>{report.MalformedLines}</code> خط خراب نادیده گرفته شد.");
+        }
 
         await SafeEditMessageTextAsync(
             botClient,
@@ -8236,68 +8265,6 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Reads seven-day tenant usage statistics from the JSONL activity log.
-    /// </summary>
-    /// <param name="tenantBotId">Internal tenant bot id whose events should be counted.</param>
-    /// <returns>Seven daily buckets ordered from oldest to newest.</returns>
-    private IReadOnlyList<TenantDailyStatsRow> ReadTenantDailyStats(string tenantBotId)
-    {
-        var today = DateTime.UtcNow.AddMinutes(210).Date;
-        var rows = Enumerable.Range(0, 7)
-            .Select(offset => today.AddDays(offset - 6))
-            .Select(date => new TenantDailyStatsRow { Date = date.ConvertToHijriShamsi() })
-            .ToList();
-        var usersByDate = rows.ToDictionary(x => x.Date, _ => new HashSet<long>());
-
-        var logPath = ResolveTenantActivityLogPath();
-        if (!System.IO.File.Exists(logPath))
-            return rows;
-
-        foreach (var line in System.IO.File.ReadLines(logPath))
-        {
-            try
-            {
-                var obj = JObject.Parse(line.TrimStart('\uFEFF'));
-                if (!string.Equals(obj.Value<string>("botId"), tenantBotId, StringComparison.OrdinalIgnoreCase))
-                    continue;
-                if (!string.Equals(obj.Value<string>("event"), "telegram_message", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var date = (obj.Value<string>("time") ?? string.Empty).Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-                if (string.IsNullOrWhiteSpace(date) || !usersByDate.TryGetValue(date, out var users))
-                    continue;
-
-                var row = rows.First(x => x.Date == date);
-                row.MessageCount++;
-                var userId = obj.Value<long?>("userId") ?? 0;
-                if (userId > 0)
-                    users.Add(userId);
-            }
-            catch
-            {
-                // A single malformed line must not break owner-facing statistics.
-            }
-        }
-
-        foreach (var row in rows)
-            row.UniqueUsers = usersByDate[row.Date].Count;
-        return rows;
-    }
-
-    /// <summary>
-    /// Resolves the current user activity log path using the same date placeholder convention as the logger.
-    /// </summary>
-    /// <returns>Filesystem path of today's JSONL activity log.</returns>
-    private string ResolveTenantActivityLogPath()
-    {
-        var path = string.IsNullOrWhiteSpace(_appConfig.UserActivityLogFilePath)
-            ? "./Data/Logs/user-activity-{shamsiDate}.jsonl"
-            : _appConfig.UserActivityLogFilePath;
-        var shamsi = DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi().Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
-        return path.Replace("{shamsiDate}", shamsi, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
     /// One tenant-owned tutorial link configured by a colleague.
     /// </summary>
     private sealed class TenantTutorialLink
@@ -8313,26 +8280,6 @@ public class TenantBotService
         public string Url { get; set; }
     }
 
-    /// <summary>
-    /// One daily tenant usage bucket derived from the JSONL activity log.
-    /// </summary>
-    private sealed class TenantDailyStatsRow
-    {
-        /// <summary>
-        /// Shamsi date label for the bucket.
-        /// </summary>
-        public string Date { get; set; }
-
-        /// <summary>
-        /// Number of distinct Telegram users who sent messages to the tenant bot that day.
-        /// </summary>
-        public int UniqueUsers { get; set; }
-
-        /// <summary>
-        /// Number of message events logged for the tenant bot that day.
-        /// </summary>
-        public int MessageCount { get; set; }
-    }
 
     /// <summary>
     /// Result object returned by the tenant token duplicate guard.

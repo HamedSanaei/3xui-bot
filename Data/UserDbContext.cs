@@ -70,6 +70,8 @@ public class UserDbContext : DbContext
     public DbSet<GozargahSiteSyncEvent> GozargahSiteSyncEvents { get; set; }
     /// <summary>Durable idempotent XUI v3 account link-change operations scoped by panel and numeric client id.</summary>
     public DbSet<XuiV3LinkChangeOperation> XuiV3LinkChangeOperations { get; set; }
+    /// <summary>Durable once-per-period delivery state for aggregate weekly usage reports.</summary>
+    public DbSet<UsageReportDispatch> UsageReportDispatches { get; set; }
     public DbSet<CookieData> Cookies { get; set; }
     public DbSet<SwapinoPaymentInfo> SwapinoPaymentInfos { get; set; }
     public DbSet<HooshPayPaymentInfo> HooshPayPaymentInfos { get; set; }
@@ -147,7 +149,7 @@ public class UserDbContext : DbContext
 
     /// <summary>
     /// Defines the <c>users.db</c> schema, indexes, and field limits for payments, bot instances,
-    /// tenant orders, ledgers, and bot-scoped conversation state.
+    /// tenant orders, ledgers, bot-scoped conversation state, and idempotent scheduled-report delivery.
     /// </summary>
     /// <param name="modelBuilder">EF Core model builder used by migrations and runtime metadata.</param>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -413,6 +415,19 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => new { x.PanelKey, x.ClientId })
                 .IsUnique()
                 .HasFilter("\"Status\" IN ('awaiting_confirmation','processing','recovery_pending','manual_review')");
+        });
+
+        modelBuilder.Entity<UsageReportDispatch>(entity =>
+        {
+            entity.ToTable("UsageReportDispatches");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.ReportKey).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.Status).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.LastError).HasMaxLength(2000);
+            entity.HasIndex(x => x.ReportKey).IsUnique();
+            entity.HasIndex(x => new { x.Status, x.LeaseUntilUtc });
+            entity.HasIndex(x => x.PeriodEndUtc);
         });
 
         modelBuilder.Entity<ZibalPaymentInfo>(entity =>

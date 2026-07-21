@@ -63,6 +63,9 @@ class Program
         builder.Services.AddSingleton<XuiV3PurchaseService>();
         builder.Services.AddSingleton<XuiV3PurchaseSessionStore>();
         builder.Services.AddSingleton<UserActivityLogService>();
+        builder.Services.AddSingleton<UsageAnalyticsService>();
+        builder.Services.AddSingleton<UsageReportChartRenderer>();
+        builder.Services.AddSingleton<UsageReportDispatchStore>();
         builder.Services.AddSingleton<WalletLedgerService>();
         builder.Services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();
         builder.Services.AddSingleton<ReferralService>();
@@ -78,6 +81,7 @@ class Program
         builder.Services.AddHostedService<XuiV3LinkChangeRecoveryService>();
         builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
         builder.Services.AddHostedService<ReferralReconciliationHostedService>();
+        builder.Services.AddHostedService<WeeklyUsageReportHostedService>();
 
         builder.Services.AddSingleton<TelegramBotService>();
         builder.Services.AddSingleton<MultiBotHostedService>();

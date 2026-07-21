@@ -6098,6 +6098,33 @@ public class XuiV3BotFlowService
         return null;
     }
 
+    /// <summary>
+    /// Ensures an owned-bot customer has a previously verified phone number before starting a purchase or renewal.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram client for the active owned bot. Tenant storefront updates do not enter this flow.
+    /// </param>
+    /// <param name="chatId">Private Telegram chat id that receives the contact-request keyboard.</param>
+    /// <param name="credUser">
+    /// Shared credentials profile for the Telegram customer. A non-empty <c>PhoneNumber</c> means verification has
+    /// already completed through automatic Iranian contact validation or the super-admin manual override.
+    /// </param>
+    /// <param name="cancellationToken">Polling cancellation token used for the Telegram request.</param>
+    /// <returns>
+    /// <c>true</c> when a verified phone is already stored; otherwise <c>false</c> after sending the Iranian-number
+    /// requirement and contact keyboard.
+    /// </returns>
+    /// <remarks>
+    /// Automatic verification accepts only the sender's own Iranian mobile contact. Foreign and virtual numbers are
+    /// rejected by the common owned-bot contact handler and redirected to the active bot's configured support account.
+    /// A super-admin may still verify those numbers through the separate audited manual flow.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// if (!await EnsurePhoneVerifiedAsync(client, message.Chat.Id, credUser, cancellationToken))
+    ///     return true;
+    /// </code>
+    /// </example>
     private async Task<bool> EnsurePhoneVerifiedAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -6109,13 +6136,24 @@ public class XuiV3BotFlowService
 
         await botClient.SendTextMessageAsync(
             chatId: chatId,
-            text: "برای خرید یا تمدید اکانت، ابتدا باید شماره تلفن خودتان را تایید کنید. لطفاً فقط از دکمه پایین پیام استفاده کنید.",
+            text:
+                "برای خرید یا تمدید اکانت، ابتدا باید شماره تلفن خودتان را تأیید کنید.\n\n" +
+                "تأیید خودکار فقط با شماره موبایل ایران انجام می‌شود و شماره ارسالی باید متعلق به همین حساب تلگرام باشد. " +
+                "لطفاً فقط از دکمه پایین پیام استفاده کنید.",
             replyMarkup: BuildPhoneNumberKeyboard(),
             cancellationToken: cancellationToken);
 
         return false;
     }
 
+    /// <summary>
+    /// Builds the one-time owned-bot keyboard that requests the sender's own Telegram contact.
+    /// </summary>
+    /// <returns>A contact-request row plus a cancellation row for returning from phone verification.</returns>
+    /// <remarks>
+    /// Telegram supplies the contact owner id with this button. The common owned-bot contact validator still checks
+    /// ownership and normalizes only Iranian mobile forms before anything is persisted.
+    /// </remarks>
     private static ReplyKeyboardMarkup BuildPhoneNumberKeyboard()
     {
         return new ReplyKeyboardMarkup(new[]
