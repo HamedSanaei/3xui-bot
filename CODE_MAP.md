@@ -77,6 +77,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Referral dashboard delivery uses a strict plain-text Telegram sender: `parse_mode` is omitted, the returned
   `Message` is required before `dashboardSent=true`, and Telegram/API exceptions propagate into structured route logs.
   Keep the legacy exception-swallowing sender out of this path because `ref_...` is unsafe under its default Markdown.
+  Routine successful dashboard opens are debug-only and must not be forwarded to the private logger channel; referral
+  database or Telegram delivery failures remain error-level operational logs.
 - Final real-provider owned wallet charges from NOWPayments, HooshPay, and Zibal can create referral rewards only after
   the original credit and ledger succeed. Below-minimum, provisional, partial, manual, site-wallet, failed/refunded,
   trial, gift, and tenant payments do not create an event and do not consume first-payment eligibility.

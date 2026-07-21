@@ -7965,7 +7965,9 @@ public class TelegramBotService : IHostedService
     /// <remarks>
     /// This handler is shared by regular and super-admin owned-bot routes. It clears both the persisted <see cref="User"/>
     /// flow and the current bot/user entry in <see cref="XuiV3PurchaseSessionStore"/> before calling
-    /// <see cref="SendReferralDashboardAsync"/>. Telegram notification failures never mutate referral or financial data.
+    /// <see cref="SendReferralDashboardAsync"/>. A routine successful dashboard delivery is logged only at debug level
+    /// so it does not flood the private Telegram logger channel; failures remain error-level diagnostics. Telegram
+    /// notification failures never mutate referral or financial data.
     /// </remarks>
     /// <example>
     /// <code>
@@ -8009,7 +8011,7 @@ public class TelegramBotService : IHostedService
             if (!dashboardSent)
                 throw new InvalidOperationException("Telegram did not return a message for the referral dashboard.");
 
-            _logger.LogInformation(
+            _logger.LogDebug(
                 "Owned-bot referral menu routed. telegramUserId={TelegramUserId}, botId={BotId}, botUsername={BotUsername}, isSuperAdmin={IsSuperAdmin}, previousFlow={PreviousFlow}, previousLastStep={PreviousLastStep}, dashboardSent={DashboardSent}",
                 telegramUserId,
                 botId,
