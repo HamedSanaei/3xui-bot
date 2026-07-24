@@ -84,6 +84,8 @@ public class TelegramBotService : IHostedService
     private readonly NowPaymentsSettlementService _nowPaymentsSettlementService;
     private readonly HooshPay _hooshPay;
     private readonly HooshPaySettlementService _hooshPaySettlementService;
+    private readonly Tetraminator _tetraminator;
+    private readonly TetraminatorSettlementService _tetraminatorSettlementService;
     private readonly XuiV3PurchaseService _xuiV3PurchaseService;
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
     private readonly XuiV3PurchaseSessionStore _xuiV3PurchaseSessionStore;
@@ -160,6 +162,8 @@ public class TelegramBotService : IHostedService
     /// <param name="nowPaymentsSettlementService">NOWPayments wallet settlement service.</param>
     /// <param name="hooshPay">HooshPay API client.</param>
     /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
+    /// <param name="tetraminator">Tetraminator API client used for rial invoice creation and authoritative inquiry.</param>
+    /// <param name="tetraminatorSettlementService">Idempotent Tetraminator owned-wallet settlement service.</param>
     /// <param name="xuiV3PurchaseService">Shared XuiV3 purchase/account creation service.</param>
     /// <param name="xuiV3BotFlowService">Regular user XuiV3 purchase and account-management flow.</param>
     /// <param name="xuiV3PurchaseSessionStore">
@@ -205,6 +209,8 @@ public class TelegramBotService : IHostedService
         NowPaymentsSettlementService nowPaymentsSettlementService,
         HooshPay hooshPay,
         HooshPaySettlementService hooshPaySettlementService,
+        Tetraminator tetraminator,
+        TetraminatorSettlementService tetraminatorSettlementService,
         XuiV3PurchaseService xuiV3PurchaseService,
         XuiV3BotFlowService xuiV3BotFlowService,
         XuiV3PurchaseSessionStore xuiV3PurchaseSessionStore,
@@ -233,6 +239,8 @@ public class TelegramBotService : IHostedService
         _nowPaymentsSettlementService = nowPaymentsSettlementService;
         _hooshPay = hooshPay;
         _hooshPaySettlementService = hooshPaySettlementService;
+        _tetraminator = tetraminator;
+        _tetraminatorSettlementService = tetraminatorSettlementService;
         _xuiV3PurchaseService = xuiV3PurchaseService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _xuiV3PurchaseSessionStore = xuiV3PurchaseSessionStore;
@@ -2040,6 +2048,12 @@ public class TelegramBotService : IHostedService
                 callbackQuery.Data.StartsWith("hpchk_"))
             {
                 await ProcessHooshPayPaymentCallback(callbackQuery, cancellationToken);
+                return;
+            }
+
+            if (callbackQuery.Data.StartsWith("tmchk_", StringComparison.Ordinal))
+            {
+                await ProcessTetraminatorPaymentCallbackAsync(callbackQuery, cancellationToken);
                 return;
             }
 
@@ -5451,6 +5465,11 @@ public class TelegramBotService : IHostedService
                     await CreateHooshPayWalletChargeAsync(message, credUser, user, cancellationToken);
                 }
 
+                else if (user.PaymentMethod == "tetraminator")
+                {
+                    await CreateTetraminatorWalletChargeAsync(message, credUser, user, cancellationToken);
+                }
+
                 else if (user.PaymentMethod == "swapino")
                 {
 
@@ -5717,6 +5736,26 @@ public class TelegramBotService : IHostedService
             {
                 user.PaymentMethod = "hooshpay";
             }
+            else if (message.Text == "درگاه ریالی تترامیناتور")
+            {
+                var amount = long.TryParse(user.ConfigLink, out var selectedAmount) ? selectedAmount : 0;
+                if (!_appConfig.TetraminatorEnabled || amount < _appConfig.TetraminatorMinimumAmountToman)
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(
+                        message.Chat.Id,
+                        amount < _appConfig.TetraminatorMinimumAmountToman
+                            ? $"حداقل مبلغ پرداخت با تترامیناتور {_appConfig.TetraminatorMinimumAmountToman.FormatCurrency()} است."
+                            : "درگاه تترامیناتور در حال حاضر غیرفعال است.",
+                    replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+                user.PaymentMethod = "tetraminator";
+            }
             else if (message.Text == "درگاه ریالی" || message.Text == "درگاه ریالی (غیرفعال)")
             {
                 user.LastStep = "payment_method_selection";
@@ -5745,6 +5784,8 @@ public class TelegramBotService : IHostedService
                 ? "درگاه ارز دیجیتال"
                 : user.PaymentMethod == "hooshpay"
                     ? "درگاه ریالی هوش‌پی"
+                : user.PaymentMethod == "tetraminator"
+                    ? "درگاه ریالی تترامیناتور"
                 : user.PaymentMethod == "zibal"
                     ? "درگاه ریالی"
                     : "درگاه پرداخت";
@@ -7353,16 +7394,27 @@ public class TelegramBotService : IHostedService
         return System.Net.WebUtility.HtmlEncode(value ?? string.Empty);
     }
 
-    private static ReplyKeyboardMarkup BuildChargePaymentMethodKeyboard()
+    /// <summary>
+    /// Builds enabled owned-wallet payment methods for an owned-bot wallet charge.
+    /// </summary>
+    /// <returns>
+    /// A one-time reply keyboard containing HooshPay, NOWPayments, and Tetraminator when its global switch is enabled.
+    /// </returns>
+    /// <remarks>
+    /// Tetraminator remains visible for manually entered amounts below its provider minimum. The subsequent selection
+    /// handler validates the stored amount and explains the configured minimum without issuing an invoice API request.
+    /// </remarks>
+    private ReplyKeyboardMarkup BuildChargePaymentMethodKeyboard()
     {
-        return new ReplyKeyboardMarkup(new[]
+        var buttons = new List<KeyboardButton>
         {
-            new[]
-            {
-                new KeyboardButton("درگاه ریالی هوش‌پی"),
-                new KeyboardButton("درگاه ارز دیجیتال")
-            }
-        })
+            new("درگاه ریالی هوش‌پی"),
+            new("درگاه ارز دیجیتال")
+        };
+        if (_appConfig.TetraminatorEnabled)
+            buttons.Add(new KeyboardButton("درگاه ریالی تترامیناتور"));
+
+        return new ReplyKeyboardMarkup(buttons.Chunk(2).Select(x => x.ToArray()).ToArray())
         {
             ResizeKeyboard = true,
             OneTimeKeyboard = true
@@ -7512,6 +7564,218 @@ public class TelegramBotService : IHostedService
                 replyMarkup: MainReplyMarkupKeyboardFa(),
                 cancellationToken: cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Creates and persists a Tetraminator invoice for an owned-bot wallet charge.
+    /// </summary>
+    /// <param name="message">Owned-bot customer message whose chat receives the invoice controls.</param>
+    /// <param name="credUser">Shared wallet owner identified by Telegram user id.</param>
+    /// <param name="user">Temporary charge flow state containing the selected amount in toman.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db, provider, and Telegram operations.</param>
+    /// <remarks>
+    /// The non-idempotent provider create call runs once. A timeout is stored as a failed/ambiguous local row and is
+    /// not retried automatically because Tetraminator does not accept a merchant idempotency key. The completed
+    /// confirmation state is cleared before the provider request so tapping the old reply-keyboard command again does
+    /// not create another invoice from the same owned-bot charge flow.
+    /// </remarks>
+    private async Task CreateTetraminatorWalletChargeAsync(
+        Message message,
+        CredUser credUser,
+        User user,
+        CancellationToken cancellationToken)
+    {
+        var amount = Convert.ToInt64(user.ConfigLink, CultureInfo.InvariantCulture);
+        if (!_appConfig.TetraminatorEnabled || amount < _appConfig.TetraminatorMinimumAmountToman)
+        {
+            await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                !_appConfig.TetraminatorEnabled
+                    ? "درگاه تترامیناتور در حال حاضر غیرفعال است."
+                    : $"حداقل مبلغ پرداخت با تترامیناتور {_appConfig.TetraminatorMinimumAmountToman.FormatCurrency()} است.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        // Consume the confirmed charge flow before the non-idempotent provider mutation. A failed or ambiguous create
+        // remains auditable by its local payment row and cannot be silently repeated through the stale keyboard.
+        await _userDbContext.ClearUserStatus(user);
+
+        var payment = TetraminatorPaymentInfo.CreateWalletCharge(
+            credUser.TelegramUserId,
+            amount,
+            _appConfig.TetraminatorCallbackUrl,
+            message.Chat.Id);
+        payment.CallbackUrl = BuildTetraminatorCallbackUrl(payment.OrderId);
+        payment.RawRequestJson = JsonConvert.SerializeObject(new
+        {
+            price = amount,
+            callback_url = payment.CallbackUrl,
+            order_id = payment.OrderId
+        });
+        _userDbContext.TetraminatorPaymentInfos.Add(payment);
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+
+        try
+        {
+            var invoice = await _tetraminator.CreateInvoiceAsync(amount, payment.CallbackUrl, cancellationToken);
+            payment.RawResponseJson = JsonConvert.SerializeObject(invoice);
+            payment.Apply(invoice);
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            var text = "✅ <b>فاکتور تترامیناتور ساخته شد</b>\n\n" +
+                       $"💰 مبلغ: <code>{Html(amount.FormatCurrency())}</code>\n" +
+                       $"🧾 شناسه پرداخت: <code>{Html(payment.PayId)}</code>\n\n" +
+                       "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از تایید رسمی درگاه انجام می‌شود.";
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithUrl("پرداخت با تترامیناتور", payment.PaymentLink) },
+                new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت", $"tmchk_{payment.Id}") }
+            });
+            var sent = await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                text,
+                parseMode: ParseMode.Html,
+                replyMarkup: keyboard,
+                cancellationToken: cancellationToken);
+            payment.TelMsgId = sent.MessageId;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                "منوی اصلی",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            payment.ErrorCode = ex is TetraminatorApiException apiException
+                ? apiException.StatusCode.ToString(CultureInfo.InvariantCulture)
+                : "create_failed";
+            payment.ErrorMessage = ex.Message;
+            payment.RawResponseJson = ex is TetraminatorApiException providerError ? providerError.ResponseBody : null;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+            _logger.LogError(
+                ex,
+                "Tetraminator invoice creation failed. botId={BotId}, userId={UserId}, paymentId={PaymentId}, amountToman={AmountToman}",
+                BotContextAccessor.CurrentBotId,
+                credUser.TelegramUserId,
+                payment.Id,
+                amount);
+            await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                "ساخت فاکتور تترامیناتور ناموفق بود. لطفاً کمی بعد دوباره تلاش کنید.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Rechecks a Tetraminator invoice selected by its owned-customer callback and applies settlement when verified.
+    /// </summary>
+    /// <param name="callbackQuery">Customer callback containing the internal users.db payment id.</param>
+    /// <param name="cancellationToken">Cancellation token for provider inquiry, wallet settlement, and Telegram replies.</param>
+    /// <remarks>
+    /// The callback user must own the payment row. The global enable switch is intentionally ignored so invoices
+    /// created before an operator disables the gateway can still be settled.
+    /// </remarks>
+    private async Task ProcessTetraminatorPaymentCallbackAsync(
+        CallbackQuery callbackQuery,
+        CancellationToken cancellationToken)
+    {
+        var value = callbackQuery.Data?["tmchk_".Length..];
+        if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var paymentId))
+            return;
+        var payment = await _userDbContext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+            x => x.Id == paymentId && x.TelegramUserId == callbackQuery.From.Id,
+            cancellationToken);
+        if (payment == null)
+        {
+            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+
+        await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "در حال استعلام از تترامیناتور...", cancellationToken: cancellationToken);
+        try
+        {
+            var verified = await RefreshTetraminatorPaymentAsync(payment, cancellationToken);
+            if (!verified)
+            {
+                await ActiveBotClient.SendTextMessageAsync(
+                    callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                    payment.ErrorCode == "provider_not_paid"
+                        ? $"پرداخت هنوز تایید نشده است.\nوضعیت: <code>{Html(payment.PaymentStatus)}</code>"
+                        : "اطلاعات پرداخت با فاکتور محلی تطبیق نداشت و هیچ مبلغی به کیف پول اضافه نشد.",
+                    parseMode: ParseMode.Html,
+                    replyMarkup: new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"tmchk_{payment.Id}") } }),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            var settlement = await _tetraminatorSettlementService.ApplyOfficialPaymentAsync(
+                payment,
+                "customer-check",
+                callbackQuery.Message?.Chat.Id,
+                cancellationToken);
+            var resultText = settlement.Status == NowPaymentsSettlementStatus.Applied
+                ? "✅ پرداخت تایید و کیف پول شما شارژ شد."
+                : settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded
+                    ? "این پرداخت قبلاً تایید و به کیف پول شما اضافه شده است."
+                    : "پرداخت تایید شد، اما اعمال موجودی کامل نشد. موضوع برای بررسی ثبت شد.";
+            await ActiveBotClient.SendTextMessageAsync(
+                callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                resultText,
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Tetraminator customer inquiry failed. paymentId={PaymentId}, userId={UserId}", payment.Id, callbackQuery.From.Id);
+            await ActiveBotClient.SendTextMessageAsync(
+                callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                "فعلاً امکان استعلام تترامیناتور وجود ندارد. کمی بعد دوباره تلاش کنید.",
+                replyMarkup: new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"tmchk_{payment.Id}") } }),
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Performs an authoritative inquiry and persists a safe paid or mismatch result on the local payment row.
+    /// </summary>
+    /// <param name="payment">Tracked users.db payment containing a non-empty provider pay id.</param>
+    /// <param name="cancellationToken">Cancellation token for provider and database work.</param>
+    /// <returns><c>true</c> only when provider status, pay id, and amount all match.</returns>
+    private async Task<bool> RefreshTetraminatorPaymentAsync(
+        TetraminatorPaymentInfo payment,
+        CancellationToken cancellationToken)
+    {
+        var inquiry = await _tetraminator.InquiryAsync(payment.PayId, cancellationToken);
+        payment.RawResponseJson = JsonConvert.SerializeObject(inquiry);
+        payment.Apply(inquiry);
+        var verified = TetraminatorPaymentVerifier.IsVerifiedPaid(payment, inquiry, out var errorCode);
+        payment.ErrorCode = errorCode;
+        payment.ErrorMessage = verified ? null : errorCode;
+        if (verified)
+        {
+            payment.PaymentStatus = TetraminatorStatuses.Paid;
+            payment.PaidAtUtc ??= DateTime.UtcNow;
+        }
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+        return verified;
+    }
+
+    /// <summary>
+    /// Appends the local order id to the configured unsigned Tetraminator callback endpoint.
+    /// </summary>
+    /// <param name="orderId">Unique local order id used only to find the saved payment before provider inquiry.</param>
+    /// <returns>An absolute callback URL whose existing query parameters are preserved.</returns>
+    private string BuildTetraminatorCallbackUrl(string orderId)
+    {
+        var builder = new UriBuilder(_appConfig.TetraminatorCallbackUrl);
+        var prefix = string.IsNullOrWhiteSpace(builder.Query) ? string.Empty : builder.Query.TrimStart('?') + "&";
+        builder.Query = prefix + "order_id=" + Uri.EscapeDataString(orderId);
+        return builder.Uri.AbsoluteUri;
     }
 
     /// <summary>

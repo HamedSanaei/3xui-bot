@@ -130,6 +130,7 @@ public class BotRegistry
             TenantCardHolderName = bot.TenantCardHolderName,
             TenantHooshPayEnabled = bot.TenantHooshPayEnabled,
             TenantNowPaymentsEnabled = bot.TenantNowPaymentsEnabled,
+            TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled,
             TenantTutorialsJson = bot.TenantTutorialsJson
         };
     }
@@ -244,6 +245,7 @@ public class BotRegistry
             TenantCardHolderName = bot.TenantCardHolderName,
             TenantHooshPayEnabled = bot.TenantHooshPayEnabled,
             TenantNowPaymentsEnabled = bot.TenantNowPaymentsEnabled,
+            TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled,
             TenantTutorialsJson = bot.TenantTutorialsJson,
             IsSalesAssistant = bot.IsSalesAssistant
         };

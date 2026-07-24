@@ -1386,6 +1386,11 @@ public class XuiV3BotFlowService
             priceToman: resolved.PriceToman,
             beforeBalance: useSiteWallet && siteWalletDebitResult?.Success == true ? siteWalletDebitResult.BeforeWallet : beforeBalance,
             afterBalance: useSiteWallet && siteWalletDebitResult?.Success == true ? siteWalletDebitResult.AfterWallet : afterBalance,
+            paymentWalletSource: siteWalletDebitResult?.Success == true
+                ? "کیف پول سایت گذرگاه"
+                : siteWalletFallbackToBot
+                    ? "کیف پول ربات (جایگزین پس از خطای کیف پول سایت)"
+                    : "کیف پول ربات",
             details: new[]
             {
                 $"نام اکانت `{client.Email}`",
@@ -2960,6 +2965,9 @@ public class XuiV3BotFlowService
                     priceToman: bulkResult.TotalSuccessfulPriceToman,
                     beforeBalance: bulkBeforeBalance,
                     afterBalance: bulkAfterBalance,
+                    paymentWalletSource: useSiteWallet && siteWalletDebitResult?.Success == true
+                        ? "کیف پول سایت گذرگاه"
+                        : "کیف پول ربات",
                     details: BuildBulkPurchaseLogDetails(bulkResult, selection.UserComment));
 
                 await _activityLog.LogBotActionAsync(
@@ -2981,6 +2989,9 @@ public class XuiV3BotFlowService
                         ["priceToman"] = bulkResult.TotalSuccessfulPriceToman,
                         ["balanceBeforeToman"] = bulkBeforeBalance,
                         ["balanceAfterToman"] = bulkAfterBalance,
+                        ["paymentSource"] = useSiteWallet && siteWalletDebitResult?.Success == true
+                            ? "gozargah_site_wallet"
+                            : "bot_wallet",
                         ["panelUrl"] = serverInfo.Url,
                         ["rootPath"] = serverInfo.RootPath,
                         ["userComment"] = selection.UserComment ?? string.Empty
@@ -5116,12 +5127,49 @@ public class XuiV3BotFlowService
             .ConvertToHijriShamsi();
     }
 
+    /// <summary>
+    /// Sends the central audit log for a successful owned-bot XUI v3 purchase or renewal.
+    /// </summary>
+    /// <param name="title">The human-readable operation title shown in the private logger channel.</param>
+    /// <param name="credUser">The owned-bot customer or colleague whose account was purchased or renewed.</param>
+    /// <param name="priceToman">The amount actually charged for the successful operation, in Iranian toman.</param>
+    /// <param name="beforeBalance">
+    /// The balance of the wallet that actually paid immediately before settlement, or <see langword="null"/> when
+    /// the operation has no auditable wallet snapshot.
+    /// </param>
+    /// <param name="afterBalance">
+    /// The balance of the wallet that actually paid immediately after settlement, or <see langword="null"/> when
+    /// the operation has no auditable wallet snapshot.
+    /// </param>
+    /// <param name="paymentWalletSource">
+    /// The user-facing name of the wallet that was actually debited, such as the bot wallet or the Gozargah site
+    /// wallet. This value must describe the completed debit result rather than the payment button selected earlier.
+    /// </param>
+    /// <param name="details">Additional purchase details such as plan, account email, and subscription link.</param>
+    /// <remarks>
+    /// This method preserves the existing purchase metadata and adds the actual wallet source to the same central
+    /// payment log. When a site-wallet debit fails after a renewal and the local bot wallet is used as compensation,
+    /// callers must report the bot wallet as the source and mention the fallback in the supplied label.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// LogV3Purchase(
+    ///     "ساخت اکانت نسخه ۳",
+    ///     user,
+    ///     100_000,
+    ///     500_000,
+    ///     400_000,
+    ///     "کیف پول ربات",
+    ///     details);
+    /// </code>
+    /// </example>
     private void LogV3Purchase(
         string title,
         CredUser credUser,
         long priceToman,
         long? beforeBalance,
         long? afterBalance,
+        string paymentWalletSource,
         IEnumerable<string> details)
     {
         var message = new StringBuilder();
@@ -5156,6 +5204,9 @@ public class XuiV3BotFlowService
 
         if (afterBalance.HasValue)
             message.AppendLine($"موجودی پس از خرید <code>{Html(afterBalance.Value.FormatCurrency())}</code>");
+
+        if (!string.IsNullOrWhiteSpace(paymentWalletSource))
+            message.AppendLine($"کیف پول پرداخت <code>{Html(paymentWalletSource)}</code>");
 
         if (metadataFromComment != null)
         {

@@ -22,6 +22,22 @@ using Telegram.Bot.Types.ReplyMarkups;
 /// </summary>
 public class TenantBotService
 {
+    /// <summary>
+    /// Serializes tenant fulfillment across provider callbacks, customer checks, and manual admin retries.
+    /// </summary>
+    /// <remarks>
+    /// The order is reloaded after this gate is acquired so a stale tracked <c>IsFulfilled=false</c> value cannot
+    /// create another XUI account or owner wallet mutation while a concurrent path completes the same order.
+    /// </remarks>
+    private static readonly SemaphoreSlim TenantFulfillmentGate = new(1, 1);
+    /// <summary>
+    /// Serializes the local claim that precedes a Tetraminator tenant invoice creation request.
+    /// </summary>
+    /// <remarks>
+    /// The gate is held only while users.db is checked and the pending payment row is inserted. It prevents two
+    /// callbacks for the same tenant order from issuing two non-idempotent provider create requests.
+    /// </remarks>
+    private static readonly SemaphoreSlim TenantTetraminatorInvoiceCreationGate = new(1, 1);
     public const string OwnerMenuButton = "🛒 فعالسازی ربات فروشگاهی";
 
     private const string OWNERCALLBACKPREFIX = "TBM:";
@@ -55,6 +71,7 @@ public class TenantBotService
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly HooshPay _hooshPay;
     private readonly NowPayments _nowPayments;
+    private readonly Tetraminator _tetraminator;
     private readonly BotRegistry _botRegistry;
     private readonly BotClientProvider _botClientProvider;
     private readonly BotContextAccessor _botContextAccessor;
@@ -78,6 +95,10 @@ public class TenantBotService
     /// <param name="purchaseService">xui v3 purchase and account creation service.</param>
     /// <param name="HooshPay">HooshPay API client used to Create and Verify invoices.</param>
     /// <param name="NowPayments">NOWPayments API client used to create and verify tenant crypto invoices.</param>
+    /// <param name="Tetraminator">
+    /// Tetraminator API client used to create rial tenant invoices and authoritatively verify their saved pay ids.
+    /// The provider key is read from global configuration and must never be logged or stored on tenant rows.
+    /// </param>
     /// <param name="BotRegistry">runtime Bot registry.</param>
     /// <param name="BotClientProvider">Telegram client Provider for owned and tenant bots.</param>
     /// <param name="BotContextAccessor">current Bot context accessor.</param>
@@ -111,6 +132,7 @@ public class TenantBotService
         XuiV3PurchaseService purchaseService,
         HooshPay HooshPay,
         NowPayments NowPayments,
+        Tetraminator Tetraminator,
         BotRegistry BotRegistry,
         BotClientProvider BotClientProvider,
         BotContextAccessor BotContextAccessor,
@@ -130,6 +152,7 @@ public class TenantBotService
         _purchaseService = purchaseService;
         _hooshPay = HooshPay;
         _nowPayments = NowPayments;
+        _tetraminator = Tetraminator;
         _botRegistry = BotRegistry;
         _botClientProvider = BotClientProvider;
         _botContextAccessor = BotContextAccessor;
@@ -715,6 +738,7 @@ public class TenantBotService
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.SupportAccount))} پشتیبانی فروشگاه: <code>{Html(support)}</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.TenantWelcomeText))} متن خوشامد: <code>{Html(WELCOME)}</code>\n" +
                $"{STATUSICON(tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(tenant?.TenantHooshPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(_appConfig.TetraminatorEnabled && tenant?.TenantTetraminatorEnabled == true)} درگاه تترامیناتور: <b>{Html(!_appConfig.TetraminatorEnabled ? "سراسری خاموش" : tenant?.TenantTetraminatorEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(tenant?.TenantNowPaymentsEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(tenant?.TenantCardPaymentEnabled == true)} کارت به کارت همکار: <code>{Html(card)}</code>\n" +
                $"{STATUSICON(tenant?.TenantMandatoryJoinEnabled == true)} جوین اجباری فروشگاه: <code>{Html(TENANTJOIN)}</code>\n" +
@@ -731,6 +755,7 @@ public class TenantBotService
     {
         var IsEnabled = tenant?.Enabled == true;
         var HOOSHPAYENABLED = tenant?.TenantHooshPayEnabled == true;
+        var TETRAMINATORENABLED = tenant?.TenantTetraminatorEnabled == true;
         var NOWPAYMENTSENABLED = tenant?.TenantNowPaymentsEnabled == true;
         var CARDENABLED = tenant?.TenantCardPaymentEnabled == true;
         var JOINENABLED = tenant?.TenantMandatoryJoinEnabled == true;
@@ -762,7 +787,11 @@ public class TenantBotService
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData(NOWPAYMENTSENABLED ? "✅ ارز دیجیتال" : "❌ ارز دیجیتال", BuildTenantSettingCallback("NowPayments", !NOWPAYMENTSENABLED, revision, issuedAt)),
+                InlineKeyboardButton.WithCallbackData(TETRAMINATORENABLED ? "✅ تترامیناتور" : "❌ تترامیناتور", BuildTenantSettingCallback("Tetraminator", !TETRAMINATORENABLED, revision, issuedAt)),
+                InlineKeyboardButton.WithCallbackData(NOWPAYMENTSENABLED ? "✅ ارز دیجیتال" : "❌ ارز دیجیتال", BuildTenantSettingCallback("NowPayments", !NOWPAYMENTSENABLED, revision, issuedAt))
+            },
+            new[]
+            {
                 InlineKeyboardButton.WithCallbackData(JOINENABLED ? "✅ جوین اجباری" : "❌ جوین اجباری", BuildTenantSettingCallback("join", !JOINENABLED, revision, issuedAt))
             },
             new[]
@@ -830,7 +859,7 @@ public class TenantBotService
     /// <summary>
     /// Builds an idempotent target-state callback for one tenant storefront setting.
     /// </summary>
-    /// <param name="setting">Stable setting key: card, HooshPay, NowPayments, or join.</param>
+    /// <param name="setting">Stable setting key: card, HooshPay, Tetraminator, NowPayments, or join.</param>
     /// <param name="enabled">Desired final state rather than an instruction to invert the current value.</param>
     /// <param name="revision">Panel revision returned by <see cref="BuildTenantPanelRevision" />.</param>
     /// <param name="issuedAt">Hexadecimal Unix timestamp rounded to the keyboard's five-minute render bucket.</param>
@@ -1180,6 +1209,7 @@ public class TenantBotService
         tenant.TenantCardNumber = null;
         tenant.TenantCardHolderName = null;
         tenant.TenantHooshPayEnabled = true;
+        tenant.TenantTetraminatorEnabled = true;
         tenant.TenantNowPaymentsEnabled = true;
         tenant.TenantTutorialsJson = JsonConvert.SerializeObject(Array.Empty<TenantTutorialLink>());
     }
@@ -1944,6 +1974,19 @@ public class TenantBotService
             case "HooshPay":
                 currentEnabled = tenant.TenantHooshPayEnabled;
                 break;
+            case "Tetraminator":
+                currentEnabled = tenant.TenantTetraminatorEnabled;
+                if (desiredEnabled && !_appConfig.TetraminatorEnabled)
+                {
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient,
+                        CallbackQuery.Id,
+                        "درگاه تترامیناتور در تنظیمات سراسری غیرفعال است.",
+                        showAlert: true,
+                        cancellationToken: CancellationToken);
+                    return;
+                }
+                break;
             case "NowPayments":
                 currentEnabled = tenant.TenantNowPaymentsEnabled;
                 break;
@@ -1993,6 +2036,9 @@ public class TenantBotService
                 break;
             case "HooshPay":
                 tenant.TenantHooshPayEnabled = desiredEnabled;
+                break;
+            case "Tetraminator":
+                tenant.TenantTetraminatorEnabled = desiredEnabled;
                 break;
             case "NowPayments":
                 tenant.TenantNowPaymentsEnabled = desiredEnabled;
@@ -3827,6 +3873,7 @@ public class TenantBotService
         }
 
         if (action.StartsWith("PAYHP:", StringComparison.Ordinal) ||
+            action.StartsWith("PAYTM:", StringComparison.Ordinal) ||
             action.StartsWith("PAYNP:", StringComparison.Ordinal) ||
             action.StartsWith("PAYCARD:", StringComparison.Ordinal))
         {
@@ -3844,6 +3891,11 @@ public class TenantBotService
                 await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantOrderINVOICEASYNC(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             }
+            else if (Provider == "PAYTM")
+            {
+                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await CreateTenantTetraminatorInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
+            }
             else if (Provider == "PAYNP")
             {
                 await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
@@ -3858,6 +3910,7 @@ public class TenantBotService
         }
 
         if (action.StartsWith("RNHP:", StringComparison.Ordinal) ||
+            action.StartsWith("RNTM:", StringComparison.Ordinal) ||
             action.StartsWith("RNNP:", StringComparison.Ordinal) ||
             action.StartsWith("RNCARD:", StringComparison.Ordinal))
         {
@@ -3871,6 +3924,8 @@ public class TenantBotService
 
             if (provider == "RNHP")
                 await CreateTenantHooshPayInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
+            else if (provider == "RNTM")
+                await CreateTenantTetraminatorInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
             else if (provider == "RNNP")
                 await CreateTenantNowPaymentsInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
             else
@@ -4232,6 +4287,8 @@ public class TenantBotService
         var PAYMENTROWS = new List<InlineKeyboardButton[]>();
         if (tenant.TenantHooshPayEnabled)
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("پرداخت ریالی هوش‌پی", CUSTOMERCALLBACKPREFIX + "PAYHP:" + BUILDPAYACTION(selection)) });
+        if (IsTenantTetraminatorAvailable(tenant, Price.SalePriceToman))
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("پرداخت ریالی تترامیناتور", CUSTOMERCALLBACKPREFIX + "PAYTM:" + BUILDPAYACTION(selection)) });
         if (tenant.TenantNowPaymentsEnabled)
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("پرداخت ارز دیجیتال", CUSTOMERCALLBACKPREFIX + "PAYNP:" + BUILDPAYACTION(selection)) });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
@@ -4452,6 +4509,47 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Creates a Tetraminator invoice for a new tenant storefront purchase.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client that receives the customer callback and sends payment controls.</param>
+    /// <param name="callbackQuery">Customer callback containing the selected service payload.</param>
+    /// <param name="tenant">Tenant storefront whose local gateway preference and global availability are enforced.</param>
+    /// <param name="customer">Credentials profile of the tenant customer who will own the delivered account.</param>
+    /// <param name="selection">Validated XUI service selection used to calculate the tenant sale price.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db, provider, and Telegram operations.</param>
+    /// <remarks>
+    /// Invoice creation is not retried because Tetraminator does not provide a merchant idempotency key. The local
+    /// order and payment row are persisted first so a later unsigned callback can only locate data and must still
+    /// pass authoritative pay-id, paid-status, and amount verification.
+    /// </remarks>
+    private async Task CreateTenantTetraminatorInvoiceAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        BotInstance tenant,
+        CredUser customer,
+        XuiV3PurchaseSelection selection,
+        CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var price = CalculateTenantPrice(tenant, selection);
+        if (!IsTenantTetraminatorAvailable(tenant, price.SalePriceToman))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                BuildTenantTetraminatorUnavailableMessage(price.SalePriceToman),
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "Tetraminator");
+        _userDbcontext.TenantBotOrders.Add(order);
+        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await CreateTenantTetraminatorInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
+    }
+
+    /// <summary>
     /// creates A tenant card-to-card order and asks the customer to Send A payment receipt photo.
     /// </summary>
     /// <param name="botClient">tenant storefront Bot client used to Send card INSTRUCTIONS.</param>
@@ -4669,6 +4767,201 @@ public class TenantBotService
             payment.UpdatedAtUtc = DateTime.UtcNow;
             await _userDbcontext.SaveChangesAsync(cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "ساخت فاکتور ناموفق بود.", showAlert: true, cancellationToken: cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Creates a Tetraminator invoice for an existing, unfulfilled tenant renewal order.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client used to send the renewal invoice.</param>
+    /// <param name="callbackQuery">Customer callback selecting Tetraminator for the renewal.</param>
+    /// <param name="tenant">Tenant storefront that owns the pending renewal order.</param>
+    /// <param name="customer">Customer who owns the target XUI account and order.</param>
+    /// <param name="orderDbId">Internal users.db id of the pending renewal order.</param>
+    /// <param name="cancellationToken">Cancellation token for database, provider, and Telegram calls.</param>
+    /// <remarks>
+    /// The existing renewal order is reused. A second invoice is not created after the order has been fulfilled.
+    /// </remarks>
+    private async Task CreateTenantTetraminatorInvoiceForExistingOrderAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        BotInstance tenant,
+        CredUser customer,
+        int orderDbId,
+        CancellationToken cancellationToken)
+    {
+        var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
+        if (order == null)
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+        if (!IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                BuildTenantTetraminatorUnavailableMessage(order.SalePriceToman),
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        order.PaymentProvider = "Tetraminator";
+        order.UpdatedAtUtc = DateTime.UtcNow;
+        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await CreateTenantTetraminatorInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
+    }
+
+    /// <summary>
+    /// Persists and creates the provider invoice shared by tenant purchases and renewals.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client used for customer-facing invoice messages.</param>
+    /// <param name="callbackQuery">Customer callback acknowledged after invoice creation or failure.</param>
+    /// <param name="tenant">Tenant storefront recorded for bot and owner attribution.</param>
+    /// <param name="customer">Tenant customer recorded on the payment row.</param>
+    /// <param name="order">Tracked tenant purchase or renewal order; its sale amount is the settlement source of truth.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db, Tetraminator, and Telegram work.</param>
+    /// <remarks>
+    /// The API key is never persisted. Callback data is untrusted and settlement later re-inquires the saved
+    /// <c>PayId</c>. A provider-create timeout is deliberately not retried to avoid duplicate invoices. Repeated
+    /// callbacks reuse the persisted invoice when its link is known; an ambiguous prior create remains blocked for
+    /// manual review instead of sending another provider mutation.
+    /// </remarks>
+    private async Task CreateTenantTetraminatorInvoiceCoreAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        BotInstance tenant,
+        CredUser customer,
+        TenantBotOrder order,
+        CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        TetraminatorPaymentInfo payment;
+        string existingPaymentLink = null;
+        var hasAmbiguousExistingPayment = false;
+
+        await TenantTetraminatorInvoiceCreationGate.WaitAsync(cancellationToken);
+        try
+        {
+            payment = await _userDbcontext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+                x => x.OrderId == order.OrderId || x.TenantBotOrderId == order.Id,
+                cancellationToken);
+            if (payment != null)
+            {
+                if (!string.IsNullOrWhiteSpace(payment.PayId) && !string.IsNullOrWhiteSpace(payment.PaymentLink))
+                {
+                    order.TetraminatorPaymentInfoId = payment.Id;
+                    order.PaymentUrl = payment.PaymentLink;
+                    order.UpdatedAtUtc = DateTime.UtcNow;
+                    await _userDbcontext.SaveChangesAsync(cancellationToken);
+                    existingPaymentLink = payment.PaymentLink;
+                }
+                else
+                {
+                    // A create timeout may still have produced an invoice at the provider. Retrying the POST here
+                    // could charge the customer against two unrelated pay ids, so the order remains blocked.
+                    hasAmbiguousExistingPayment = true;
+                }
+            }
+            else
+            {
+                payment = new TetraminatorPaymentInfo
+                {
+                    OrderId = order.OrderId,
+                    AmountToman = order.SalePriceToman,
+                    CallbackUrl = BuildTenantTetraminatorCallbackUrl(order.OrderId),
+                    TelegramUserId = customer.TelegramUserId,
+                    ChatId = chatId,
+                    BotId = tenant.Id,
+                    BotUsername = tenant.Username,
+                    PaymentPurpose = TenantBotPaymentPurposes.TenantOrder,
+                    TenantBotOrderId = order.Id,
+                    TenantOwnerTelegramUserId = tenant.OwnerTelegramUserId,
+                    PaymentStatus = TetraminatorStatuses.Pending,
+                    CreatedAtUtc = DateTime.UtcNow
+                };
+                payment.RawRequestJson = JsonConvert.SerializeObject(new
+                {
+                    price = payment.AmountToman,
+                    callback_url = payment.CallbackUrl,
+                    order_id = payment.OrderId
+                });
+                _userDbcontext.TetraminatorPaymentInfos.Add(payment);
+                await _userDbcontext.SaveChangesAsync(cancellationToken);
+            }
+        }
+        finally
+        {
+            TenantTetraminatorInvoiceCreationGate.Release();
+        }
+
+        if (!string.IsNullOrWhiteSpace(existingPaymentLink))
+        {
+            await botClient.SendTextMessageAsync(
+                chatId,
+                BUILDTENANTGATEWAYPAYMENTTEXT(order, "تترامیناتور"),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantPaymentKeyboard(order, existingPaymentLink),
+                cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "فاکتور قبلی تترامیناتور دوباره نمایش داده شد.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+        if (hasAmbiguousExistingPayment)
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "وضعیت ساخت فاکتور قبلی نامشخص است. برای جلوگیری از ساخت فاکتور تکراری با پشتیبانی تماس بگیرید.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        try
+        {
+            var invoice = await _tetraminator.CreateInvoiceAsync(payment.AmountToman, payment.CallbackUrl, cancellationToken);
+            payment.RawResponseJson = JsonConvert.SerializeObject(invoice);
+            payment.Apply(invoice);
+            order.TetraminatorPaymentInfoId = payment.Id;
+            order.PaymentUrl = payment.PaymentLink;
+            order.PaymentStatus = TenantBotOrderStatuses.Pending;
+            order.ErrorMessage = null;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+
+            await botClient.SendTextMessageAsync(
+                chatId,
+                BUILDTENANTGATEWAYPAYMENTTEXT(order, "تترامیناتور"),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantPaymentKeyboard(order, payment.PaymentLink),
+                cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور تترامیناتور ساخته شد.", cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Failed;
+            order.ErrorMessage = "Tetraminator invoice creation failed.";
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            payment.ErrorCode = ex is TetraminatorApiException apiException
+                ? apiException.StatusCode.ToString(CultureInfo.InvariantCulture)
+                : "create_failed";
+            payment.ErrorMessage = ex.Message;
+            payment.RawResponseJson = ex is TetraminatorApiException providerError ? providerError.ResponseBody : null;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            _logger.LogError(
+                ex,
+                "Tenant Tetraminator invoice creation failed. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, amountToman={AmountToman}",
+                tenant.Id,
+                order.OrderId,
+                payment.Id,
+                payment.AmountToman);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "ساخت فاکتور تترامیناتور ناموفق بود. کمی بعد دوباره تلاش کنید.", showAlert: true, cancellationToken: cancellationToken);
         }
     }
 
@@ -4916,6 +5209,59 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Fulfills a Tetraminator tenant order exactly once after a verified provider inquiry.
+    /// </summary>
+    /// <param name="payment">
+    /// Tracked users.db payment whose purpose is <see cref="TenantBotPaymentPurposes.TenantOrder" /> and whose
+    /// pay id, amount, and exact <c>paid</c> status were verified against Tetraminator.
+    /// </param>
+    /// <param name="Source">Audit source such as callback, customer check, or super-admin check.</param>
+    /// <param name="CancellationToken">Cancellation token for users.db, XUI, wallet ledger, and Telegram operations.</param>
+    /// <returns>
+    /// Settlement result from the shared tenant fulfillment path. Repeated callbacks return an already-applied
+    /// result and never create another account, owner-profit credit, or ledger entry.
+    /// </returns>
+    /// <remarks>
+    /// This method never accepts provisional approval. It only consumes an already provider-verified payment row;
+    /// callers handling unsigned callbacks must perform <see cref="TetraminatorPaymentVerifier.IsVerifiedPaid" />
+    /// immediately before invoking it.
+    /// </remarks>
+    public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
+        TetraminatorPaymentInfo payment,
+        string Source,
+        CancellationToken CancellationToken = default)
+    {
+        if (payment == null ||
+            !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) ||
+            !TetraminatorStatuses.IsPaid(payment.PaymentStatus) ||
+            string.IsNullOrWhiteSpace(payment.PayId) ||
+            !payment.PaidAtUtc.HasValue ||
+            !string.IsNullOrWhiteSpace(payment.ErrorCode))
+        {
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+
+        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+            x => x.Id == payment.TenantBotOrderId || x.OrderId == payment.OrderId,
+            CancellationToken);
+        if (order == null)
+            return NowPaymentsSettlementResult.NotFound();
+
+        var settlement = await FULFILLPAIDTENANTORDERASYNC(order, Source, null, null, false, CancellationToken);
+        if (settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded)
+        {
+            payment.IsAddedToBalance = true;
+            payment.SettledAtUtc ??= order.FulfilledAtUtc ?? DateTime.UtcNow;
+            payment.ErrorCode = null;
+            payment.ErrorMessage = null;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+        }
+
+        return settlement;
+    }
+
+    /// <summary>
     /// fulfills A NowPayments tenant order exactly once after the crypto gateway reports A paid invoice.
     /// </summary>
     /// <param name="payment">NowPayments payment row marked as A tenant order.</param>
@@ -5011,7 +5357,7 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// PERFORMS the Shared one-time fulfillment for paid tenant orders from HooshPay, NowPayments, or manual card Approval.
+    /// PERFORMS the Shared one-time fulfillment for paid tenant orders from HooshPay, NowPayments, Tetraminator, or manual card Approval.
     /// </summary>
     /// <param name="order">local tenant order that links the customer, owner, payment Provider, and selected plan.</param>
     /// <param name="Source">audit Source that caused fulfillment, for example ipn, manual-check, or assistant-final.</param>
@@ -5025,8 +5371,9 @@ public class TenantBotService
     /// <returns>settlement result with before/after owner wallet balances when fulfillment succeeds.</returns>
     /// <remarks>
     /// Idempotency:
-    /// if <see cref="TenantBotOrder.IsFulfilled" /> is already true, this method returns without creating
-    /// another xui account or another wallet ledger entry. this PROTECTS REPEATED IPNs and REPEATED assistant callbacks.
+    /// callback, customer check, and manual paths share a process-wide gate and reload the order before checking
+    /// <see cref="TenantBotOrder.IsFulfilled" />. A completed order returns without creating another XUI account,
+    /// owner wallet mutation, or ledger entry.
     /// </remarks>
     private async Task<NowPaymentsSettlementResult> FULFILLPAIDTENANTORDERASYNC(
         TenantBotOrder order,
@@ -5036,8 +5383,16 @@ public class TenantBotService
         bool DEBITOWNERBASECOST,
         CancellationToken CancellationToken)
     {
-        if (order.IsFulfilled)
-            return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+        await TenantFulfillmentGate.WaitAsync(CancellationToken);
+        try
+        {
+            // Reload under the process-wide gate so callback, manual check, and IPN cannot all act on stale
+            // IsFulfilled values captured before another path completed the same tenant order.
+            order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(x => x.Id == order.Id, CancellationToken);
+            if (order == null)
+                return NowPaymentsSettlementResult.NotFound();
+            if (order.IsFulfilled)
+                return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
 
         order.PaymentStatus = TenantBotOrderStatuses.Paid;
         order.PaidAtUtc ??= DateTime.UtcNow;
@@ -5177,6 +5532,11 @@ public class TenantBotService
                 LOGTENANTORDER(order, owner, customer, Source, "Exception");
                 return NowPaymentsSettlementResult.InvalidAmount();
             }
+        }
+    }
+        finally
+        {
+            TenantFulfillmentGate.Release();
         }
     }
 
@@ -5761,6 +6121,73 @@ public class TenantBotService
                 "پرداخت شما توسط مدیر تایید شده است، اما ساخت اکانت هنوز کامل نشده یا نیاز به تلاش مجدد دارد. لطفاً کمی صبر کنید یا با پشتیبانی فروشگاه تماس بگیرید.",
                 cancellationToken: CancellationToken);
             return;
+        }
+
+        if (order.TetraminatorPaymentInfoId.HasValue ||
+            string.Equals(order.PaymentProvider, "Tetraminator", StringComparison.OrdinalIgnoreCase))
+        {
+            var tetraminatorPayment = await _userDbcontext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+                x => x.Id == order.TetraminatorPaymentInfoId || x.TenantBotOrderId == order.Id,
+                CancellationToken);
+            if (tetraminatorPayment == null || string.IsNullOrWhiteSpace(tetraminatorPayment.PayId))
+            {
+                await botClient.SendTextMessageAsync(ChatId, "فاکتور تترامیناتور این سفارش پیدا نشد.", cancellationToken: CancellationToken);
+                return;
+            }
+
+            try
+            {
+                var inquiry = await _tetraminator.InquiryAsync(tetraminatorPayment.PayId, CancellationToken);
+                tetraminatorPayment.RawResponseJson = JsonConvert.SerializeObject(inquiry);
+                tetraminatorPayment.Apply(inquiry);
+                var verified = TetraminatorPaymentVerifier.IsVerifiedPaid(tetraminatorPayment, inquiry, out var errorCode);
+                tetraminatorPayment.ErrorCode = errorCode;
+                tetraminatorPayment.ErrorMessage = verified ? null : errorCode;
+                if (verified)
+                {
+                    tetraminatorPayment.PaymentStatus = TetraminatorStatuses.Paid;
+                    tetraminatorPayment.PaidAtUtc ??= DateTime.UtcNow;
+                    order.PaymentStatus = TenantBotOrderStatuses.Paid;
+                    order.UpdatedAtUtc = DateTime.UtcNow;
+                }
+                await _userDbcontext.SaveChangesAsync(CancellationToken);
+
+                if (verified)
+                {
+                    var settlement = await ApplyPaidTenantOrderAsync(tetraminatorPayment, "manual-check", CancellationToken);
+                    await SENDTENANTSETTLEMENTCHECKRESULTASYNC(botClient, ChatId, order, settlement, CancellationToken);
+                    return;
+                }
+
+                await botClient.SendTextMessageAsync(
+                    ChatId,
+                    errorCode == "provider_not_paid"
+                        ? $"پرداخت هنوز تایید نشده است.\nوضعیت فعلی: <code>{Html(tetraminatorPayment.PaymentStatus)}</code>"
+                        : "اطلاعات پرداخت تترامیناتور با سفارش تطبیق نداشت و سفارش تحویل نشد.",
+                    parseMode: ParseMode.Html,
+                    replyMarkup: BuildTenantPaymentKeyboard(order, tetraminatorPayment.PaymentLink),
+                    cancellationToken: CancellationToken);
+                return;
+            }
+            catch (Exception ex)
+            {
+                tetraminatorPayment.ErrorCode = "provider_inquiry_failed";
+                tetraminatorPayment.ErrorMessage = ex.Message;
+                tetraminatorPayment.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                _logger.LogWarning(
+                    ex,
+                    "Tenant Tetraminator customer inquiry failed. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}",
+                    order.TenantBotId,
+                    order.OrderId,
+                    tetraminatorPayment.Id);
+                await botClient.SendTextMessageAsync(
+                    ChatId,
+                    "فعلاً امکان استعلام تترامیناتور وجود ندارد. کمی بعد دوباره دکمه بررسی وضعیت را بزنید.",
+                    replyMarkup: BuildTenantPaymentKeyboard(order, tetraminatorPayment.PaymentLink),
+                    cancellationToken: CancellationToken);
+                return;
+            }
         }
 
         var payment = await _userDbcontext.HooshPayPaymentInfos.FirstOrDefaultAsync(
@@ -6845,16 +7272,62 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Determines whether a tenant can create a new Tetraminator invoice for the requested sale amount.
+    /// </summary>
+    /// <param name="tenant">Tenant storefront whose independent preference is combined with global configuration.</param>
+    /// <param name="amountToman">Gross customer payment amount in Iranian toman.</param>
+    /// <returns>
+    /// <c>true</c> only when the global gateway, tenant preference, and configured minimum amount all allow invoice creation.
+    /// </returns>
+    /// <remarks>
+    /// This guard applies only to new invoices. Existing invoice inquiry and settlement deliberately ignore later
+    /// global or tenant disablement so a customer payment cannot become stranded.
+    /// </remarks>
+    private bool IsTenantTetraminatorAvailable(BotInstance tenant, long amountToman)
+        => _appConfig.TetraminatorEnabled &&
+           tenant?.TenantTetraminatorEnabled == true &&
+           amountToman >= _appConfig.TetraminatorMinimumAmountToman;
+
+    /// <summary>
+    /// Builds the customer-facing reason why a new tenant Tetraminator invoice cannot be created.
+    /// </summary>
+    /// <param name="amountToman">Requested tenant sale amount in Iranian toman.</param>
+    /// <returns>A safe Persian message that exposes no provider credentials or endpoint data.</returns>
+    private string BuildTenantTetraminatorUnavailableMessage(long amountToman)
+        => amountToman < _appConfig.TetraminatorMinimumAmountToman
+            ? $"حداقل مبلغ پرداخت با تترامیناتور {_appConfig.TetraminatorMinimumAmountToman.FormatCurrency()} است."
+            : "درگاه تترامیناتور برای این فروشگاه در حال حاضر غیرفعال است.";
+
+    /// <summary>
+    /// Appends a tenant order id to the configured unsigned Tetraminator callback URL.
+    /// </summary>
+    /// <param name="orderId">Unique local tenant order id used only to locate the persisted payment row.</param>
+    /// <returns>An absolute callback URL that preserves any existing query parameters.</returns>
+    /// <remarks>
+    /// The order id is a lookup hint, not proof of payment. The callback endpoint must still inquire the saved
+    /// provider pay id and compare the exact toman amount before fulfillment.
+    /// </remarks>
+    private string BuildTenantTetraminatorCallbackUrl(string orderId)
+    {
+        var builder = new UriBuilder(_appConfig.TetraminatorCallbackUrl);
+        var prefix = string.IsNullOrWhiteSpace(builder.Query) ? string.Empty : builder.Query.TrimStart('?') + "&";
+        builder.Query = prefix + "order_id=" + Uri.EscapeDataString(orderId);
+        return builder.Uri.AbsoluteUri;
+    }
+
+    /// <summary>
     /// Builds payment provider callbacks for an already-created tenant renewal order.
     /// </summary>
     /// <param name="order">Tenant renewal order whose database id is embedded in callbacks.</param>
     /// <param name="tenant">Tenant bot whose enabled gateway settings decide which buttons are visible.</param>
     /// <returns>Inline keyboard containing enabled payment providers and status check.</returns>
-    private static InlineKeyboardMarkup BuildTenantRenewPaymentProviderKeyboard(TenantBotOrder order, BotInstance tenant)
+    private InlineKeyboardMarkup BuildTenantRenewPaymentProviderKeyboard(TenantBotOrder order, BotInstance tenant)
     {
         var rows = new List<InlineKeyboardButton[]>();
         if (tenant.TenantHooshPayEnabled)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("درگاه ریالی هوش‌پی", CUSTOMERCALLBACKPREFIX + $"RNHP:{order.Id}") });
+        if (IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("درگاه ریالی تترامیناتور", CUSTOMERCALLBACKPREFIX + $"RNTM:{order.Id}") });
         if (tenant.TenantNowPaymentsEnabled)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("پرداخت ارز دیجیتال", CUSTOMERCALLBACKPREFIX + $"RNNP:{order.Id}") });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))

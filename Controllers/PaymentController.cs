@@ -9,6 +9,7 @@ using Newtonsoft.Json;
 /// </summary>
 /// <remarks>
 /// NOWPayments is used for crypto wallet charges. HooshPay is used for rial wallet charges and tenant storefront orders.
+/// Tetraminator callbacks are unsigned triggers and are always verified through the provider inquiry API before settlement.
 /// Tenant HooshPay rows are detected by <see cref="HooshPayPaymentInfo.PaymentPurpose"/> and are fulfilled by
 /// <see cref="TenantBotService.ApplyPaidTenantOrderAsync"/> instead of the wallet settlement path.
 /// </remarks>
@@ -18,11 +19,14 @@ public class PaymentController : ControllerBase
 {
     private static readonly SemaphoreSlim IpnLock = new SemaphoreSlim(1, 1);
     private static readonly SemaphoreSlim HooshPayIpnLock = new SemaphoreSlim(1, 1);
+    private static readonly SemaphoreSlim TetraminatorCallbackLock = new(1, 1);
 
     private readonly UserDbContext _userDbcontext;
     private readonly AppConfig _appConfig;
     private readonly NowPaymentsSettlementService _settlementService;
     private readonly HooshPaySettlementService _hooshPaySettlementService;
+    private readonly Tetraminator _tetraminator;
+    private readonly TetraminatorSettlementService _tetraminatorSettlementService;
     private readonly TenantBotService _tenantBotService;
     private readonly ILogger<PaymentController> _logger;
 
@@ -33,6 +37,8 @@ public class PaymentController : ControllerBase
     /// <param name="config">Application configuration containing gateway secrets.</param>
     /// <param name="settlementService">NOWPayments wallet settlement service.</param>
     /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
+    /// <param name="tetraminator">Tetraminator API client used to verify unsigned callbacks.</param>
+    /// <param name="tetraminatorSettlementService">Tetraminator owned-wallet settlement service.</param>
     /// <param name="tenantBotService">Tenant storefront fulfillment service for direct HooshPay orders.</param>
     /// <param name="logger">Controller logger.</param>
     public PaymentController(
@@ -40,6 +46,8 @@ public class PaymentController : ControllerBase
         IConfiguration config,
         NowPaymentsSettlementService settlementService,
         HooshPaySettlementService hooshPaySettlementService,
+        Tetraminator tetraminator,
+        TetraminatorSettlementService tetraminatorSettlementService,
         TenantBotService tenantBotService,
         ILogger<PaymentController> logger)
     {
@@ -47,8 +55,90 @@ public class PaymentController : ControllerBase
         _appConfig = config.Get<AppConfig>();
         _settlementService = settlementService;
         _hooshPaySettlementService = hooshPaySettlementService;
+        _tetraminator = tetraminator;
+        _tetraminatorSettlementService = tetraminatorSettlementService;
         _tenantBotService = tenantBotService;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Receives Tetraminator's unsigned GET callback and settles only after an authoritative provider inquiry.
+    /// </summary>
+    /// <param name="orderId">Unique local order id embedded in the invoice-specific callback URL.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db, provider inquiry, and settlement.</param>
+    /// <returns>
+    /// HTTP 200 for verified or already-settled payments, 202 while the provider is not paid, 404 for an unknown local
+    /// order, 409 for identity/amount mismatch, or 503 for a transient provider failure.
+    /// </returns>
+    /// <remarks>
+    /// The callback itself contains no trusted payment data. Global gateway disablement does not block this endpoint,
+    /// because invoices created before disablement must remain settleable.
+    /// </remarks>
+    [HttpGet("/tetraminator-callback")]
+    public async Task<IActionResult> ReceiveTetraminator(
+        [FromQuery(Name = "order_id")] string orderId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(orderId))
+            return BadRequest(new { status = false, message = "order_id is required" });
+
+        await TetraminatorCallbackLock.WaitAsync(cancellationToken);
+        try
+        {
+            var payment = await _userDbcontext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+                x => x.OrderId == orderId,
+                cancellationToken);
+            if (payment == null)
+                return NotFound(new { status = false, message = "payment not found" });
+
+            payment.CallbackReceived = true;
+            payment.CallbackReceivedAtUtc ??= DateTime.UtcNow;
+            try
+            {
+                var inquiry = await _tetraminator.InquiryAsync(payment.PayId, cancellationToken);
+                payment.RawResponseJson = JsonConvert.SerializeObject(inquiry);
+                payment.Apply(inquiry);
+                var verified = TetraminatorPaymentVerifier.IsVerifiedPaid(payment, inquiry, out var errorCode);
+                payment.ErrorCode = errorCode;
+                payment.ErrorMessage = verified ? null : errorCode;
+                if (!verified)
+                {
+                    await _userDbcontext.SaveChangesAsync(cancellationToken);
+                    if (string.Equals(errorCode, "provider_not_paid", StringComparison.Ordinal))
+                        return Accepted(new { status = true, settled = false, providerStatus = payment.PaymentStatus });
+
+                    _logger.LogCritical(
+                        "Tetraminator callback verification mismatch. paymentId={PaymentId}, orderId={OrderId}, errorCode={ErrorCode}, expectedAmount={ExpectedAmount}, actualAmount={ActualAmount}",
+                        payment.Id,
+                        payment.OrderId,
+                        errorCode,
+                        payment.AmountToman,
+                        inquiry?.Amount);
+                    return Conflict(new { status = false, settled = false, error = errorCode });
+                }
+
+                payment.PaymentStatus = TetraminatorStatuses.Paid;
+                payment.PaidAtUtc ??= DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                var settlement = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
+                    ? await _tenantBotService.ApplyPaidTenantOrderAsync(payment, "tetraminator-callback", cancellationToken)
+                    : await _tetraminatorSettlementService.ApplyOfficialPaymentAsync(payment, "callback", cancellationToken: cancellationToken);
+                return Ok(new { status = true, settled = true, result = settlement.Status.ToString() });
+            }
+            catch (Exception ex) when (ex is TetraminatorApiException or HttpRequestException or OperationCanceledException)
+            {
+                payment.ErrorCode = "provider_inquiry_failed";
+                payment.ErrorMessage = ex.Message;
+                payment.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(CancellationToken.None);
+                _logger.LogWarning(ex, "Tetraminator callback inquiry failed. paymentId={PaymentId}, orderId={OrderId}", payment.Id, payment.OrderId);
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new { status = false, message = "provider inquiry unavailable" });
+            }
+        }
+        finally
+        {
+            TetraminatorCallbackLock.Release();
+        }
     }
 
     /// <summary>

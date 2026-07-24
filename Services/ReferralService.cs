@@ -332,6 +332,7 @@ public sealed class ReferralService
     {
         "nowpayments",
         "hooshpay",
+        "tetraminator",
         "zibal"
     };
     /// <summary>

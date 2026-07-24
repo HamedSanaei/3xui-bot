@@ -75,6 +75,8 @@ public class UserDbContext : DbContext
     public DbSet<CookieData> Cookies { get; set; }
     public DbSet<SwapinoPaymentInfo> SwapinoPaymentInfos { get; set; }
     public DbSet<HooshPayPaymentInfo> HooshPayPaymentInfos { get; set; }
+    /// <summary>Persisted Tetraminator invoices for owned wallet charges and tenant orders.</summary>
+    public DbSet<TetraminatorPaymentInfo> TetraminatorPaymentInfos { get; set; }
 
     public DbSet<ZibalPaymentInfo> ZibalPaymentInfos { get; set; }
 
@@ -205,6 +207,27 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TrackingCode).HasMaxLength(120);
         });
 
+        modelBuilder.Entity<TetraminatorPaymentInfo>(entity =>
+        {
+            entity.ToTable("TetraminatorPaymentInfos");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.OrderId).IsRequired().HasMaxLength(160);
+            entity.Property(x => x.PayId).HasMaxLength(160);
+            entity.Property(x => x.PaymentStatus).HasMaxLength(64);
+            entity.Property(x => x.BotId).HasMaxLength(64);
+            entity.Property(x => x.BotUsername).HasMaxLength(128);
+            entity.Property(x => x.PaymentPurpose).HasMaxLength(64);
+            entity.Property(x => x.ErrorCode).HasMaxLength(128);
+            entity.HasIndex(x => x.OrderId).IsUnique();
+            entity.HasIndex(x => x.PayId).IsUnique().HasFilter("\"PayId\" IS NOT NULL");
+            entity.HasIndex(x => x.TelegramUserId);
+            entity.HasIndex(x => x.BotId);
+            entity.HasIndex(x => x.PaymentPurpose);
+            entity.HasIndex(x => x.TenantBotOrderId);
+            entity.HasIndex(x => x.TenantOwnerTelegramUserId);
+        });
+
         modelBuilder.Entity<BotInstance>(entity =>
         {
             entity.ToTable("BotInstances");
@@ -220,6 +243,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantCardNumber).HasMaxLength(64);
             entity.Property(x => x.TenantCardHolderName).HasMaxLength(128);
             entity.Property(x => x.TenantTutorialsJson);
+            entity.Property(x => x.TenantTetraminatorEnabled).HasDefaultValue(true);
             entity.HasIndex(x => x.Username);
             entity.HasIndex(x => x.OwnerTelegramUserId);
         });
@@ -250,6 +274,7 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.OwnerTelegramUserId);
             entity.HasIndex(x => x.CustomerTelegramUserId);
             entity.HasIndex(x => x.HooshPayPaymentInfoId);
+            entity.HasIndex(x => x.TetraminatorPaymentInfoId);
         });
 
         modelBuilder.Entity<TenantBotLedgerEntry>(entity =>

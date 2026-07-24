@@ -47,6 +47,7 @@ class Program
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         ReferralConfigurationValidator.ValidateConfigurationAndThrow(configuration);
         ValidateXuiV3LinkChangeConfiguration(appConfig);
+        ValidateTetraminatorConfiguration(appConfig);
 
         ConfigureDatabasePaths(builder.Environment.ContentRootPath, appConfig);
         ConfigureWebServer(builder, appConfig);
@@ -56,6 +57,8 @@ class Program
         builder.Services.AddSingleton<NowPaymentsSettlementService>();
         builder.Services.AddSingleton<HooshPay>();
         builder.Services.AddSingleton<HooshPaySettlementService>();
+        builder.Services.AddSingleton<Tetraminator>();
+        builder.Services.AddSingleton<TetraminatorSettlementService>();
         builder.Services.AddSingleton<BotContextAccessor>();
         builder.Services.AddSingleton<BotRegistry>();
         builder.Services.AddSingleton<BotClientProvider>();
@@ -292,6 +295,7 @@ class Program
             existing.TenantCardHolderName = bot.TenantCardHolderName;
             existing.TenantHooshPayEnabled = bot.TenantHooshPayEnabled;
             existing.TenantNowPaymentsEnabled = bot.TenantNowPaymentsEnabled;
+            existing.TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled;
             existing.UpdatedAtUtc = DateTime.UtcNow;
         }
 
@@ -344,6 +348,45 @@ class Program
         ValidateRange(nameof(appConfig.XuiV3LinkChangeRecoveryMaxDelaySeconds), appConfig.XuiV3LinkChangeRecoveryMaxDelaySeconds, 30, 86400);
         ValidateRange(nameof(appConfig.XuiV3LinkChangeLeaseSeconds), appConfig.XuiV3LinkChangeLeaseSeconds, 60, 1800);
     }
+
+    /// <summary>
+    /// Validates Tetraminator settings before any bot can expose the live rial gateway.
+    /// </summary>
+    /// <param name="appConfig">
+    /// Application configuration bound from <c>Data/configuration.json</c>. Disabled gateways may omit credentials;
+    /// enabled gateways require a secret API key and absolute HTTP callback/API URLs.
+    /// </param>
+    /// <remarks>
+    /// Existing invoices remain settleable after the switch is disabled, so runtime settlement code does not use
+    /// <see cref="AppConfig.TetraminatorEnabled"/> as a paid-invoice guard.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">Thrown when enabled gateway settings are missing or unsafe.</exception>
+    private static void ValidateTetraminatorConfiguration(AppConfig appConfig)
+    {
+        ArgumentNullException.ThrowIfNull(appConfig);
+        ValidateRange(nameof(appConfig.TetraminatorRequestTimeoutSeconds), appConfig.TetraminatorRequestTimeoutSeconds, 5, 120);
+        ValidateRange(nameof(appConfig.TetraminatorInquiryRetryCount), appConfig.TetraminatorInquiryRetryCount, 0, 5);
+        if (appConfig.TetraminatorMinimumAmountToman < 50000)
+            throw new InvalidOperationException("Configuration value 'TetraminatorMinimumAmountToman' cannot be below the provider minimum of 50000 toman.");
+
+        if (!appConfig.TetraminatorEnabled)
+            return;
+        if (string.IsNullOrWhiteSpace(appConfig.TetraminatorApiKey))
+            throw new InvalidOperationException("Tetraminator is enabled but 'tetraminatorApiKey' is missing.");
+        if (!IsAbsoluteHttpUrl(appConfig.TetraminatorApiBaseUrl))
+            throw new InvalidOperationException("Tetraminator is enabled but 'tetraminatorApiBaseUrl' is not an absolute HTTP/HTTPS URL.");
+        if (!IsAbsoluteHttpUrl(appConfig.TetraminatorCallbackUrl))
+            throw new InvalidOperationException("Tetraminator is enabled but 'tetraminatorCallbackUrl' is not an absolute HTTP/HTTPS URL.");
+    }
+
+    /// <summary>
+    /// Checks whether a configured provider endpoint is an absolute HTTP or HTTPS URL.
+    /// </summary>
+    /// <param name="value">Raw configuration URL; null and relative values are invalid.</param>
+    /// <returns><c>true</c> for absolute HTTP/HTTPS URLs; otherwise <c>false</c>.</returns>
+    private static bool IsAbsoluteHttpUrl(string value)
+        => Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+           (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp);
 
     /// <summary>
     /// Rejects one integer configuration value outside an inclusive safety range.

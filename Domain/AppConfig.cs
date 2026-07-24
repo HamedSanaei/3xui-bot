@@ -146,6 +146,40 @@ namespace Adminbot.Domain
         public string HooshPayIpnUrl { get; set; }
         public string HooshPayReturnUrl { get; set; }
         /// <summary>
+        /// Enables creation of new Tetraminator rial invoices across owned and tenant bots.
+        /// </summary>
+        /// <remarks>
+        /// Disabling this switch only hides and blocks new invoices. Existing payment rows remain verifiable and
+        /// settleable so a customer who paid before the switch changed is not stranded.
+        /// </remarks>
+        public bool TetraminatorEnabled { get; set; }
+        /// <summary>
+        /// Base API URL used for Tetraminator invoice creation and payment inquiry requests.
+        /// </summary>
+        public string TetraminatorApiBaseUrl { get; set; } = "https://api.tetraminator.com/v1";
+        /// <summary>
+        /// Secret Tetraminator API key sent through the <c>X-API-KEY</c> header.
+        /// </summary>
+        /// <remarks>This value must never be included in Telegram messages, logs, or persisted raw request JSON.</remarks>
+        public string TetraminatorApiKey { get; set; }
+        /// <summary>
+        /// Public callback endpoint called by Tetraminator after a successful payment.
+        /// </summary>
+        public string TetraminatorCallbackUrl { get; set; }
+        /// <summary>
+        /// Maximum duration in seconds for one Tetraminator HTTP request.
+        /// </summary>
+        public int TetraminatorRequestTimeoutSeconds { get; set; } = 30;
+        /// <summary>
+        /// Number of additional retries for read-only Tetraminator payment inquiries.
+        /// </summary>
+        /// <remarks>Invoice creation is never retried because that provider operation has no idempotency key.</remarks>
+        public int TetraminatorInquiryRetryCount { get; set; } = 3;
+        /// <summary>
+        /// Minimum invoice amount in Iranian toman offered through Tetraminator.
+        /// </summary>
+        public long TetraminatorMinimumAmountToman { get; set; } = 50000;
+        /// <summary>
         /// Enables synchronization of XUI v3 account lifecycle events with the Gozargah website API.
         /// </summary>
         public bool GozargahSiteSyncEnabled { get; set; }

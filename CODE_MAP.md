@@ -53,6 +53,27 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 ## Payment and Ledger Rules
 
 - NOWPayments and HooshPay payment records live in `users.db` and can be linked to tenant orders.
+- Tetraminator is the second rial gateway for owned wallet charges and direct tenant purchase/renew orders. Its
+  `TetraminatorPaymentInfos` rows live only in `users.db`; `OrderId` and non-null `PayId` are unique. The public GET
+  callback is unsigned and therefore only triggers an authoritative `GET /payment/inquiry/{pay_id}`. Settlement
+  requires provider `status=true`, exact `payment_status=paid`, exact saved `PayId`, and exact toman amount.
+- New Tetraminator invoices require both the global `tetraminatorEnabled` switch and, for tenant storefronts, the
+  per-tenant `TenantTetraminatorEnabled` preference. Disabling either switch stops only new tenant invoices; saved
+  invoices remain inquiry/settlement eligible so paid customers are not stranded. Invoice creation is never retried
+  automatically because the provider API has no merchant idempotency key. Owned charge state is consumed before the
+  create call, while tenant orders claim one local payment row and either reuse its known link or block an ambiguous
+  prior create. Read-only inquiry retries transient 429/5xx and transport failures within configured bounds.
+- The owned-wallet Tetraminator button stays visible for manually entered amounts whenever the gateway is globally
+  enabled. Amounts below `tetraminatorMinimumAmountToman` are rejected after selection with a clear message and never
+  reach `POST /invoice/create`.
+- Official owned-wallet Tetraminator settlement writes provider=`tetraminator` ledger entries and participates in the
+  existing global owned-bot referral engine. Super-admin provisional approval is two-stage and limited to non-terminal
+  owned wallet charges; it uses provider=`tetraminator_provisional_admin`, never rewards referrals, and later official
+  confirmation records audit only. The financial service revalidates provisional eligibility and repairs a missing
+  unique provisional ledger row on retry without crediting the wallet again. Tenant orders never permit provisional approval.
+- Tenant fulfillment across all gateways is serialized and reloads the order under the gate before checking
+  `IsFulfilled`; concurrent callback, customer check, IPN, and admin retry paths cannot create another XUI account,
+  owner-wallet mutation, or tenant ledger row for an already fulfilled order.
 - HooshPay wallet charges may receive a two-stage, super-admin-only provisional credit while the provider remains
   pending. The row keeps its provider status, writes one `hooshpay_provisional_admin` ledger credit, and stores the
   approving admin/time. A later official `paid` IPN/manual check writes one reconciliation audit timestamp/log only;
@@ -116,6 +137,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Owned-bot renewal with a selected Gozargah website wallet falls back to a local bot-wallet debit if website
   eligibility or post-XUI debit fails; the local balance may become negative and a dedicated ledger provider records
   the compensation. Explicit bot/site bans still block service and never use this fallback.
+- Central owned-bot purchase and renewal logs include the wallet that was actually debited (`کیف پول ربات`,
+  `کیف پول سایت گذرگاه`, or the bot-wallet fallback after a site-wallet failure). This audit value comes from the
+  completed settlement result, not merely the payment button selected by the colleague.
 
 ## Current Gotchas
 

@@ -46,6 +46,9 @@ public class XuiV3AdminFlowService
     private const string HooshPayProvisionalStartCallbackPrefix = "x3admin:hp:provisional:";
     private const string HooshPayProvisionalConfirmCallbackPrefix = "x3admin:hp:provisional-confirm:";
     private const string HooshPayProvisionalCancelCallbackPrefix = "x3admin:hp:provisional-cancel:";
+    private const string TetraminatorProvisionalStartCallbackPrefix = "x3admin:tm:provisional:";
+    private const string TetraminatorProvisionalConfirmCallbackPrefix = "x3admin:tm:provisional-confirm:";
+    private const string TetraminatorProvisionalCancelCallbackPrefix = "x3admin:tm:provisional-cancel:";
     private const int MaxDetailedAccountInfoMessages = 5;
     private const int MaxTelegramTextLength = 3900;
     private const string SkipCommentText = "ادامه بدون کامنت";
@@ -58,6 +61,8 @@ public class XuiV3AdminFlowService
     private readonly NowPaymentsSettlementService _settlementService;
     private readonly HooshPay _hooshPay;
     private readonly HooshPaySettlementService _hooshPaySettlementService;
+    private readonly Tetraminator _tetraminator;
+    private readonly TetraminatorSettlementService _tetraminatorSettlementService;
     private readonly TenantBotService _tenantBotService;
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
@@ -74,6 +79,10 @@ public class XuiV3AdminFlowService
     /// <param name="settlementService">NOWPayments wallet settlement service.</param>
     /// <param name="hooshPay">HooshPay API client for manual rial payment checks.</param>
     /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
+    /// <param name="tetraminator">Tetraminator API client used for authoritative pay-id inquiries.</param>
+    /// <param name="tetraminatorSettlementService">
+    /// Idempotent official and super-admin provisional settlement service for owned-wallet Tetraminator charges.
+    /// </param>
     /// <param name="tenantBotService">Tenant storefront settlement service for direct tenant orders.</param>
     /// <param name="purchaseService">Shared XuiV3 purchase and renewal service.</param>
     /// <param name="gozargahSiteSyncService">
@@ -90,6 +99,8 @@ public class XuiV3AdminFlowService
         NowPaymentsSettlementService settlementService,
         HooshPay hooshPay,
         HooshPaySettlementService hooshPaySettlementService,
+        Tetraminator tetraminator,
+        TetraminatorSettlementService tetraminatorSettlementService,
         TenantBotService tenantBotService,
         XuiV3PurchaseService purchaseService,
         GozargahSiteSyncService gozargahSiteSyncService,
@@ -104,6 +115,8 @@ public class XuiV3AdminFlowService
         _settlementService = settlementService;
         _hooshPay = hooshPay;
         _hooshPaySettlementService = hooshPaySettlementService;
+        _tetraminator = tetraminator;
+        _tetraminatorSettlementService = tetraminatorSettlementService;
         _tenantBotService = tenantBotService;
         _purchaseService = purchaseService;
         _gozargahSiteSyncService = gozargahSiteSyncService;
@@ -343,7 +356,7 @@ public class XuiV3AdminFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
+                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای تترامیناتور می‌توانید `Order ID`، `Pay ID` یا شناسه داخلی رکورد را بفرستید.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
                 parseMode: ParseMode.Markdown,
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
@@ -1070,6 +1083,17 @@ public class XuiV3AdminFlowService
         CancellationToken cancellationToken)
     {
         var data = callbackQuery?.Data ?? string.Empty;
+        if (data.StartsWith(TetraminatorProvisionalStartCallbackPrefix, StringComparison.Ordinal) ||
+            data.StartsWith(TetraminatorProvisionalConfirmCallbackPrefix, StringComparison.Ordinal) ||
+            data.StartsWith(TetraminatorProvisionalCancelCallbackPrefix, StringComparison.Ordinal))
+        {
+            return await TryHandleTetraminatorProvisionalCallbackAsync(
+                botClient,
+                callbackQuery,
+                mainMenu,
+                cancellationToken);
+        }
+
         if (!data.StartsWith(HooshPayProvisionalStartCallbackPrefix, StringComparison.Ordinal) &&
             !data.StartsWith(HooshPayProvisionalConfirmCallbackPrefix, StringComparison.Ordinal) &&
             !data.StartsWith(HooshPayProvisionalCancelCallbackPrefix, StringComparison.Ordinal))
@@ -1237,12 +1261,14 @@ public class XuiV3AdminFlowService
 
         if (payment == null)
         {
+            if (await TryHandleTetraminatorStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
+                return;
             if (await TryHandleHooshPayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
                 return;
             if (await TryHandleTenantOrderManualConfirmationAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
                 return;
 
-            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments، HooshPay یا سفارش tenant با این شناسه پیدا نشد.", cancellationToken);
+            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments، HooshPay، تترامیناتور یا سفارش tenant با این شناسه پیدا نشد.", cancellationToken);
             return;
         }
 
@@ -1323,6 +1349,141 @@ public class XuiV3AdminFlowService
             BuildPaymentInfo(payment, data, settlement),
             cancellationToken,
             ParseMode.Html);
+    }
+
+    /// <summary>
+    /// Handles a super-admin Tetraminator lookup by local id, order id, or provider pay id.
+    /// </summary>
+    /// <param name="botClient">Owned-bot Telegram client serving the authenticated super-admin.</param>
+    /// <param name="message">Admin message containing a Tetraminator identifier.</param>
+    /// <param name="currentUser">Bot-scoped admin flow state cleared after the result is shown.</param>
+    /// <param name="mainMenu">Super-admin keyboard restored after the lookup.</param>
+    /// <param name="input">Internal users.db id, local order id, or provider pay id.</param>
+    /// <param name="cancellationToken">Cancellation token for inquiry, settlement, users.db, and Telegram operations.</param>
+    /// <returns><c>true</c> when a Tetraminator row was found and handled; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// The saved pay id is always re-inquired. Tenant orders can only use official paid settlement. Pending owned
+    /// wallet charges may expose the first stage of the separate two-step provisional approval flow.
+    /// </remarks>
+    private async Task<bool> TryHandleTetraminatorStatusAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        User currentUser,
+        IReplyMarkup mainMenu,
+        string input,
+        CancellationToken cancellationToken)
+    {
+        TetraminatorPaymentInfo payment = null;
+        if (int.TryParse(input, out var paymentId))
+            payment = await _userDbContext.TetraminatorPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+        payment ??= await _userDbContext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+            p => p.OrderId == input || p.PayId == input,
+            cancellationToken);
+        if (payment == null)
+            return false;
+
+        if (string.IsNullOrWhiteSpace(payment.PayId))
+        {
+            await FinishWithMessageAsync(
+                botClient,
+                message.Chat.Id,
+                currentUser,
+                mainMenu,
+                "شناسه Pay ID تترامیناتور برای این پرداخت ثبت نشده است. ساخت فاکتور کامل نشده و هیچ تسویه‌ای انجام نشد.\n\n" + BuildTetraminatorPaymentInfo(payment, null),
+                cancellationToken,
+                ParseMode.Html);
+            return true;
+        }
+
+        NowPaymentsSettlementResult settlement = null;
+        string verificationError;
+        try
+        {
+            var inquiry = await _tetraminator.InquiryAsync(payment.PayId, cancellationToken);
+            payment.RawResponseJson = JsonConvert.SerializeObject(inquiry);
+            payment.Apply(inquiry);
+            var verified = TetraminatorPaymentVerifier.IsVerifiedPaid(payment, inquiry, out verificationError);
+            payment.ErrorCode = verificationError;
+            payment.ErrorMessage = verified ? null : verificationError;
+            if (verified)
+            {
+                payment.PaymentStatus = TetraminatorStatuses.Paid;
+                payment.PaidAtUtc ??= DateTime.UtcNow;
+            }
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            if (verified)
+            {
+                var isTenantOrder = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase);
+                settlement = isTenantOrder
+                    ? await _tenantBotService.ApplyPaidTenantOrderAsync(payment, "admin-check", cancellationToken)
+                    : await _tetraminatorSettlementService.ApplyOfficialPaymentAsync(
+                        payment,
+                        "admin-check",
+                        payment.ChatId == 0 ? null : payment.ChatId,
+                        cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            payment.ErrorCode = "provider_inquiry_failed";
+            payment.ErrorMessage = ex.Message;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+            _logger.LogError(ex, "Tetraminator super-admin inquiry failed. paymentId={PaymentId}, orderId={OrderId}", payment.Id, payment.OrderId);
+            await FinishWithMessageAsync(
+                botClient,
+                message.Chat.Id,
+                currentUser,
+                mainMenu,
+                "استعلام تترامیناتور ناموفق بود و هیچ تسویه‌ای انجام نشد.\n\n" + BuildTetraminatorPaymentInfo(payment, settlement),
+                cancellationToken,
+                ParseMode.Html);
+            return true;
+        }
+
+        var actor = await GetActivityActorAsync(message.From.Id);
+        await _activityLog.LogBotActionAsync(
+            "tetraminator_status_checked",
+            actor,
+            true,
+            new Dictionary<string, object>
+            {
+                ["orderId"] = payment.OrderId ?? string.Empty,
+                ["payId"] = payment.PayId ?? string.Empty,
+                ["paymentStatus"] = payment.PaymentStatus ?? string.Empty,
+                ["verificationError"] = payment.ErrorCode ?? string.Empty,
+                ["settlementStatus"] = settlement?.Status.ToString() ?? "not-applied",
+                ["amountToman"] = payment.AmountToman,
+                ["isTenantOrder"] = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
+            },
+            cancellationToken);
+
+        if (settlement == null &&
+            string.Equals(payment.ErrorCode, "provider_not_paid", StringComparison.Ordinal) &&
+            CanProvisionallyApproveTetraminator(payment))
+        {
+            await _userDbContext.ClearUserStatus(currentUser);
+            await botClient.SendTextMessageAsync(
+                message.Chat.Id,
+                BuildTetraminatorPaymentInfo(payment, settlement) +
+                "\n\nاین پرداخت هنوز از سمت تترامیناتور تایید نشده است. فقط در صورت اطمینان از دریافت وجه می‌توانید شارژ موقت owned wallet را آغاز کنید.",
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildProvisionalTetraminatorStartKeyboard(payment.Id),
+                cancellationToken: cancellationToken);
+            await botClient.SendTextMessageAsync(message.Chat.Id, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
+            return true;
+        }
+
+        await FinishWithMessageAsync(
+            botClient,
+            message.Chat.Id,
+            currentUser,
+            mainMenu,
+            BuildTetraminatorPaymentInfo(payment, settlement),
+            cancellationToken,
+            ParseMode.Html);
+        return true;
     }
 
     /// <summary>
@@ -1480,6 +1641,294 @@ public class XuiV3AdminFlowService
             cancellationToken,
             ParseMode.Html);
         return true;
+    }
+
+    /// <summary>
+    /// Handles both stages and cancellation of a super-admin Tetraminator provisional wallet approval.
+    /// </summary>
+    /// <param name="botClient">Owned-bot Telegram client serving the super-admin callback.</param>
+    /// <param name="callbackQuery">Callback containing only the local users.db payment id.</param>
+    /// <param name="mainMenu">Super-admin keyboard restored after a final decision.</param>
+    /// <param name="cancellationToken">Cancellation token for inquiry, settlement, database, and Telegram work.</param>
+    /// <returns><c>true</c> because the caller invokes this method only for Tetraminator callback prefixes.</returns>
+    /// <remarks>
+    /// The confirm stage re-inquires the provider. A newly paid response uses official settlement. Only a still-pending
+    /// owned wallet charge may be provisionally credited; tenant payments are rejected regardless of callback data.
+    /// </remarks>
+    private async Task<bool> TryHandleTetraminatorProvisionalCallbackAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        IReplyMarkup mainMenu,
+        CancellationToken cancellationToken)
+    {
+        if (!IsConfiguredSuperAdmin(callbackQuery.From?.Id ?? 0))
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "اجازه انجام این عملیات را ندارید.", true, cancellationToken);
+            return true;
+        }
+
+        var data = callbackQuery.Data ?? string.Empty;
+        var prefix = data.StartsWith(TetraminatorProvisionalConfirmCallbackPrefix, StringComparison.Ordinal)
+            ? TetraminatorProvisionalConfirmCallbackPrefix
+            : data.StartsWith(TetraminatorProvisionalCancelCallbackPrefix, StringComparison.Ordinal)
+                ? TetraminatorProvisionalCancelCallbackPrefix
+                : TetraminatorProvisionalStartCallbackPrefix;
+        if (!int.TryParse(data[prefix.Length..], out var paymentId) || paymentId <= 0)
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "شناسه پرداخت معتبر نیست.", true, cancellationToken);
+            return true;
+        }
+
+        var payment = await _userDbContext.TetraminatorPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+        if (payment == null)
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت تترامیناتور پیدا نشد.", true, cancellationToken);
+            return true;
+        }
+
+        if (prefix == TetraminatorProvisionalCancelCallbackPrefix)
+        {
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "تایید موقت تترامیناتور لغو شد. هیچ تغییری در کیف پول انجام نشد.",
+                null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "لغو شد.", false, cancellationToken);
+            return true;
+        }
+
+        if (prefix == TetraminatorProvisionalStartCallbackPrefix)
+        {
+            if (!CanProvisionallyApproveTetraminator(payment))
+            {
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    BuildTetraminatorPaymentInfo(payment, null) + "\n\nاین پرداخت برای تایید موقت مجاز نیست.",
+                    null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "این پرداخت قابل تایید موقت نیست.", true, cancellationToken);
+                return true;
+            }
+
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("✅ تایید نهایی موقت", TetraminatorProvisionalConfirmCallbackPrefix + payment.Id),
+                    InlineKeyboardButton.WithCallbackData("انصراف", TetraminatorProvisionalCancelCallbackPrefix + payment.Id)
+                }
+            });
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "⚠️ <b>تایید موقت شارژ تترامیناتور</b>\n\n" +
+                BuildTetraminatorPaymentInfo(payment, null) +
+                "\n\nدر مرحله نهایی provider دوباره استعلام می‌شود. اگر هنوز paid نباشد، کیف پول owned بدون تایید رسمی شارژ خواهد شد؛ تایید رسمی بعدی فقط audit ثبت می‌کند.\n\nآیا ادامه می‌دهید؟",
+                keyboard,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "برای تایید نهایی، دکمه سبز را بزنید.", false, cancellationToken);
+            return true;
+        }
+
+        await ConfirmProvisionalTetraminatorAsync(botClient, callbackQuery, payment, mainMenu, cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Re-inquires Tetraminator and applies either official or provisional owned-wallet settlement.
+    /// </summary>
+    /// <param name="botClient">Telegram client used to edit the admin decision message.</param>
+    /// <param name="callbackQuery">Final confirmation callback from a configured super-admin.</param>
+    /// <param name="payment">Tracked Tetraminator owned-wallet payment selected by internal id.</param>
+    /// <param name="mainMenu">Super-admin keyboard restored after processing.</param>
+    /// <param name="cancellationToken">Cancellation token for provider, wallet, ledger, users.db, and Telegram work.</param>
+    /// <returns>A task completing after a safe official, provisional, or rejected outcome.</returns>
+    private async Task ConfirmProvisionalTetraminatorAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        TetraminatorPaymentInfo payment,
+        IReplyMarkup mainMenu,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!CanProvisionallyApproveTetraminator(payment))
+                throw new InvalidOperationException("این پرداخت در وضعیت قابل تایید موقت نیست.");
+
+            var inquiry = await _tetraminator.InquiryAsync(payment.PayId, cancellationToken);
+            payment.RawResponseJson = JsonConvert.SerializeObject(inquiry);
+            payment.Apply(inquiry);
+            var verified = TetraminatorPaymentVerifier.IsVerifiedPaid(payment, inquiry, out var errorCode);
+            payment.ErrorCode = errorCode;
+            payment.ErrorMessage = verified ? null : errorCode;
+            if (verified)
+            {
+                payment.PaymentStatus = TetraminatorStatuses.Paid;
+                payment.PaidAtUtc ??= DateTime.UtcNow;
+            }
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            if (verified)
+            {
+                var official = await _tetraminatorSettlementService.ApplyOfficialPaymentAsync(
+                    payment,
+                    "admin-provisional-confirm-refresh",
+                    payment.ChatId == 0 ? null : payment.ChatId,
+                    cancellationToken);
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    "تترامیناتور در بررسی نهایی پرداخت را تایید کرد؛ تسویه رسمی انجام شد.\n\n" + BuildTetraminatorPaymentInfo(payment, official),
+                    null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت رسمی تایید و تسویه شد.", false, cancellationToken);
+                return;
+            }
+
+            if (!string.Equals(errorCode, "provider_not_paid", StringComparison.Ordinal) || !CanProvisionallyApproveTetraminator(payment))
+            {
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    BuildTetraminatorPaymentInfo(payment, null) + "\n\nتایید موقت انجام نشد؛ پاسخ جدید provider اجازه این عملیات را نمی‌دهد.",
+                    null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "تایید موقت مجاز نیست.", true, cancellationToken);
+                return;
+            }
+
+            var provisional = await _tetraminatorSettlementService.ApplyProvisionalPaymentAsync(
+                payment,
+                callbackQuery.From.Id,
+                payment.ChatId == 0 ? null : payment.ChatId,
+                cancellationToken);
+            var actor = await GetActivityActorAsync(callbackQuery.From.Id);
+            await _activityLog.LogBotActionAsync(
+                "tetraminator_provisional_wallet_approved",
+                actor,
+                true,
+                new Dictionary<string, object>
+                {
+                    ["orderId"] = payment.OrderId ?? string.Empty,
+                    ["payId"] = payment.PayId ?? string.Empty,
+                    ["paymentStatus"] = payment.PaymentStatus ?? string.Empty,
+                    ["settlementStatus"] = provisional.Status.ToString(),
+                    ["amountToman"] = payment.AmountToman,
+                    ["approvedByTelegramUserId"] = callbackQuery.From.Id
+                },
+                cancellationToken);
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                provisional.Status == NowPaymentsSettlementStatus.Applied
+                    ? "✅ شارژ موقت تترامیناتور ثبت شد.\n\n" + BuildTetraminatorPaymentInfo(payment, provisional)
+                    : "شارژ موقت اعمال نشد.\n\n" + BuildTetraminatorPaymentInfo(payment, provisional),
+                null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(
+                botClient,
+                callbackQuery,
+                provisional.Status == NowPaymentsSettlementStatus.Applied ? "شارژ موقت ثبت شد." : "شارژ موقت اعمال نشد.",
+                provisional.Status != NowPaymentsSettlementStatus.Applied,
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Tetraminator provisional wallet confirmation failed. paymentId={PaymentId}, orderId={OrderId}, approvedBy={ApprovedBy}",
+                payment.Id,
+                payment.OrderId,
+                callbackQuery.From?.Id);
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "تایید موقت تترامیناتور انجام نشد. پاسخ provider قابل تایید نبود.",
+                null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "تایید موقت انجام نشد.", true, cancellationToken);
+        }
+        finally
+        {
+            if (callbackQuery.Message?.Chat.Id is long chatId && chatId != 0)
+            {
+                try
+                {
+                    await botClient.SendTextMessageAsync(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
+                }
+                catch (ApiRequestException ex) when (ex.ErrorCode is 400 or 403)
+                {
+                    _logger.LogWarning(ex, "Could not restore the super-admin menu after Tetraminator provisional decision. chatId={ChatId}", chatId);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Determines whether a Tetraminator row can receive a super-admin provisional owned-wallet credit.
+    /// </summary>
+    /// <param name="payment">Payment row whose latest provider observation is stored locally.</param>
+    /// <returns>
+    /// <c>true</c> only for an unsettled, non-terminal owned wallet charge with a saved provider pay id.
+    /// </returns>
+    private static bool CanProvisionallyApproveTetraminator(TetraminatorPaymentInfo payment)
+        => payment != null &&
+           !payment.IsAddedToBalance &&
+           !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) &&
+           !TetraminatorStatuses.IsPaid(payment.PaymentStatus) &&
+           !IsTetraminatorFinalFailure(payment.PaymentStatus) &&
+           !string.IsNullOrWhiteSpace(payment.PayId);
+
+    /// <summary>
+    /// Recognizes provider statuses that must never be overridden by provisional approval.
+    /// </summary>
+    /// <param name="status">Latest normalized or raw Tetraminator payment status.</param>
+    /// <returns><c>true</c> for known failed, cancelled, expired, rejected, or refunded states.</returns>
+    private static bool IsTetraminatorFinalFailure(string status)
+    {
+        var value = status?.Trim();
+        return string.Equals(value, "failed", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "cancelled", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "canceled", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "expired", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "rejected", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "refunded", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Builds the first-stage super-admin control for a pending owned-wallet Tetraminator charge.
+    /// </summary>
+    /// <param name="paymentId">Positive internal users.db id of the payment row.</param>
+    /// <returns>Inline keyboard containing only the provisional-review action.</returns>
+    private static InlineKeyboardMarkup BuildProvisionalTetraminatorStartKeyboard(int paymentId)
+        => new(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData("⚠️ تایید موقت شارژ", TetraminatorProvisionalStartCallbackPrefix + paymentId) }
+        });
+
+    /// <summary>
+    /// Builds an HTML-safe Tetraminator payment report for super-admin verification screens.
+    /// </summary>
+    /// <param name="payment">Local payment containing identifiers, provider status, amount, and audit flags.</param>
+    /// <param name="settlement">Optional settlement result produced during this check.</param>
+    /// <returns>HTML text containing no API key, callback secret, or raw provider response.</returns>
+    private static string BuildTetraminatorPaymentInfo(
+        TetraminatorPaymentInfo payment,
+        NowPaymentsSettlementResult settlement)
+    {
+        return "💳 <b>وضعیت پرداخت تترامیناتور</b>\n\n" +
+               $"شناسه داخلی: <code>{payment.Id}</code>\n" +
+               $"Order ID: <code>{Html(payment.OrderId)}</code>\n" +
+               $"Pay ID: <code>{Html(payment.PayId)}</code>\n" +
+               $"کاربر: <code>{payment.TelegramUserId}</code>\n" +
+               $"هدف: <code>{Html(payment.PaymentPurpose)}</code>\n" +
+               $"مبلغ مورد انتظار: <code>{Html(payment.AmountToman.FormatCurrency())}</code>\n" +
+               $"وضعیت provider: <code>{Html(payment.PaymentStatus)}</code>\n" +
+               $"وضعیت اعمال: <code>{Html(settlement?.Status.ToString() ?? (payment.IsAddedToBalance ? "AlreadyAdded" : "not-applied"))}</code>\n" +
+               $"تایید موقت: <code>{(payment.IsProvisionallyApproved ? "بله" : "خیر")}</code>\n" +
+               $"خطای تطبیق: <code>{Html(payment.ErrorCode ?? "-")}</code>";
     }
 
     /// <summary>
