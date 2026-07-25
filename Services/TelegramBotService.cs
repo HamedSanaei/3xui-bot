@@ -94,6 +94,7 @@ public class TelegramBotService : IHostedService
     private readonly SalesAssistantService _salesAssistantService;
     private readonly UserActivityLogService _userActivityLog;
     private readonly UsageAnalyticsService _usageAnalyticsService;
+    private readonly UsageReportChartRenderer _usageReportChartRenderer;
     private readonly WalletLedgerService _walletLedgerService;
     /// <summary>Global owned-bot referral engine used by start links, dashboards, and legacy Zibal settlement.</summary>
     private readonly ReferralService _referralService;
@@ -177,6 +178,9 @@ public class TelegramBotService : IHostedService
     /// <param name="usageAnalyticsService">
     /// Shared completed-day usage aggregator used by super-admin and tenant-owner statistics.
     /// </param>
+    /// <param name="usageReportChartRenderer">
+    /// High-resolution line-chart renderer used to send weekly and monthly super-admin usage reports as PNG photos.
+    /// </param>
     /// <param name="walletLedgerService">Append-only users.db ledger writer for every wallet mutation.</param>
     /// <param name="ownedBotNotificationService">
     /// Best-effort notifier used to reach users through the owned bots they have previously started.
@@ -219,6 +223,7 @@ public class TelegramBotService : IHostedService
         SalesAssistantService salesAssistantService,
         UserActivityLogService userActivityLog,
         UsageAnalyticsService usageAnalyticsService,
+        UsageReportChartRenderer usageReportChartRenderer,
         WalletLedgerService walletLedgerService,
         OwnedBotNotificationService ownedBotNotificationService,
         GozargahSiteApiClient gozargahSiteApiClient,
@@ -249,6 +254,7 @@ public class TelegramBotService : IHostedService
         _salesAssistantService = salesAssistantService;
         _userActivityLog = userActivityLog;
         _usageAnalyticsService = usageAnalyticsService;
+        _usageReportChartRenderer = usageReportChartRenderer;
         _walletLedgerService = walletLedgerService;
         _ownedBotNotificationService = ownedBotNotificationService;
         _gozargahSiteApiClient = gozargahSiteApiClient;
@@ -4486,7 +4492,7 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
-    /// Handles completed-day weekly and monthly usage commands before legacy super-admin text flows can consume them.
+    /// Handles completed-day weekly and monthly usage commands and sends a high-resolution line-chart PNG.
     /// </summary>
     /// <param name="botClient">Owned-bot Telegram client that received the super-admin command.</param>
     /// <param name="message">
@@ -4501,7 +4507,8 @@ public class TelegramBotService : IHostedService
     /// <remarks>
     /// The command clears only the sender's temporary bot-scoped conversation state. It reports either seven or thirty
     /// complete Tehran days ending yesterday, globally de-duplicates users per day across owned and tenant bots, counts
-    /// incoming messages plus callbacks, and excludes all configured super-admin ids.
+    /// incoming messages plus callbacks, excludes all configured super-admin ids, and sends the daily series as a
+    /// readable Telegram photo instead of a text-only list.
     /// </remarks>
     /// <example>
     /// <code>
@@ -4534,46 +4541,27 @@ public class TelegramBotService : IHostedService
                 botIdFilter: null,
                 includeSales: false,
                 cancellationToken);
-
-            var builder = new StringBuilder();
-            builder.AppendLine(dayCount == 7
-                ? "📊 <b>آمار هفتگی کل مجموعه</b>"
-                : "📈 <b>آمار ۳۰ روزه کل مجموعه</b>");
-            builder.AppendLine(
-                $"بازه کامل: <code>{UsageAnalyticsService.FormatPersianDate(startIran)}</code> تا " +
-                $"<code>{UsageAnalyticsService.FormatPersianDate(yesterdayIran)}</code>");
-            builder.AppendLine("روز جاری عمداً در محاسبات وارد نشده است.");
-            builder.AppendLine();
-
-            foreach (var day in report.Days)
-            {
-                builder.AppendLine(
-                    $"📅 <code>{UsageAnalyticsService.FormatPersianDate(day.DateIran)}</code> | " +
-                    $"👤 <code>{day.UniqueUsers:N0}</code> | 💬 <code>{day.Interactions:N0}</code>");
-            }
-
-            builder.AppendLine();
-            builder.AppendLine($"👤 مجموع کاربران یکتای روزانه: <code>{report.TotalDailyUniqueUsers:N0}</code>");
-            builder.AppendLine($"💬 مجموع تعامل‌ها: <code>{report.TotalInteractions:N0}</code>");
-            if (report.MissingActivityLogDays > 0 || report.MalformedLines > 0)
-            {
-                builder.AppendLine();
-                builder.AppendLine(
-                    $"⚠️ کیفیت داده: <code>{report.MissingActivityLogDays}</code> روز بدون فایل، " +
-                    $"<code>{report.MalformedLines}</code> خط خراب نادیده گرفته شد.");
-            }
-
-            await botClient.SendTextMessageAsync(
+            var png = _usageReportChartRenderer.RenderCompletedPeriod(report, includeSales: false);
+            await using var imageStream = new MemoryStream(png, writable: false);
+            var sentMessage = await botClient.SendPhotoAsync(
                 chatId: message.Chat.Id,
-                text: builder.ToString(),
+                photo: InputFile.FromStream(
+                    imageStream,
+                    dayCount == 7 ? "weekly-usage.png" : "monthly-usage.png"),
+                caption: BuildAdminUsageReportCaption(report, dayCount),
                 parseMode: ParseMode.Html,
                 replyMarkup: GetAdminKeyboard(),
                 cancellationToken: cancellationToken);
+            if (sentMessage == null || sentMessage.MessageId <= 0)
+                throw new InvalidOperationException("Telegram returned no valid photo message for the super-admin usage report.");
+
             _logger.LogInformation(
-                "Super-admin usage report sent. userId={UserId}, botId={BotId}, dayCount={DayCount}, missingDays={MissingDays}, malformedLines={MalformedLines}",
+                "Super-admin usage report photo sent. userId={UserId}, botId={BotId}, dayCount={DayCount}, messageId={MessageId}, imageBytes={ImageBytes}, missingDays={MissingDays}, malformedLines={MalformedLines}",
                 message.From.Id,
                 BotContextAccessor.CurrentBotId,
                 dayCount,
+                sentMessage.MessageId,
+                png.Length,
                 report.MissingActivityLogDays,
                 report.MalformedLines);
         }
@@ -4597,6 +4585,44 @@ public class TelegramBotService : IHostedService
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Builds the concise HTML caption attached to a super-admin weekly or monthly usage chart.
+    /// </summary>
+    /// <param name="report">
+    /// Completed-day report shown by the image. Its daily buckets exclude the current incomplete Tehran day.
+    /// </param>
+    /// <param name="dayCount">Requested report length in completed days; currently either 7 or 30.</param>
+    /// <returns>
+    /// Telegram HTML caption containing the date range, aggregate users/interactions, and any data-quality warning.
+    /// </returns>
+    /// <remarks>
+    /// Per-day values remain in the chart to avoid an oversized caption. Missing activity files and malformed JSONL
+    /// lines remain visible so a visually empty day is not mistaken for confirmed zero usage.
+    /// </remarks>
+    private static string BuildAdminUsageReportCaption(UsageAnalyticsReport report, int dayCount)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine(dayCount == 7
+            ? "📊 <b>نمودار آمار هفتگی کل مجموعه</b>"
+            : "📈 <b>نمودار آمار ۳۰ روزه کل مجموعه</b>");
+        builder.AppendLine(
+            $"بازه کامل: <code>{UsageAnalyticsService.FormatPersianDate(report.StartDateIran)}</code> تا " +
+            $"<code>{UsageAnalyticsService.FormatPersianDate(report.EndDateIran.AddDays(-1))}</code>");
+        builder.AppendLine("روز جاری در محاسبات وارد نشده است.");
+        builder.AppendLine();
+        builder.AppendLine($"👤 مجموع کاربران یکتای روزانه: <code>{report.TotalDailyUniqueUsers:N0}</code>");
+        builder.AppendLine($"💬 مجموع تعامل‌ها: <code>{report.TotalInteractions:N0}</code>");
+        if (report.MissingActivityLogDays > 0 || report.MalformedLines > 0)
+        {
+            builder.AppendLine();
+            builder.AppendLine(
+                $"⚠️ کیفیت داده: <code>{report.MissingActivityLogDays}</code> روز بدون فایل، " +
+                $"<code>{report.MalformedLines}</code> خط خراب نادیده گرفته شد.");
+        }
+
+        return builder.ToString();
     }
 
     /// <summary>

@@ -34,7 +34,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/WalletLedgerService.cs`: append-only wallet ledger for credits/debits.
 - `Services/ReferralService.cs`: global owned-bot relationship registration, reward calculation, users.db state/ledger idempotency, user stats, notifications, and startup reconciliation.
 - `Services/UsageAnalyticsService.cs`: completed Tehran-day aggregation of JSONL messages/callbacks, successful owned sales, and fulfilled tenant sales; excludes global super-admin ids and supports tenant bot filtering.
-- `Services/UsageReportChartRenderer.cs`: cross-platform SkiaSharp PNG renderer for current-versus-previous weekly users, interactions, and gross sales.
+- `Services/UsageReportChartRenderer.cs`: cross-platform SkiaSharp high-resolution line-chart PNG renderer with
+  explicit Y scales, adaptive date/value labels, point markers, and current-versus-previous weekly comparison.
 - `Services/WeeklyUsageReportHostedService.cs`: Saturday 00:01 Tehran report scheduler, catch-up behavior, users.db claim/lease idempotency, and direct central logger delivery through the default owned bot.
 - `Domain/GozargahSite.cs`: Gozargah site API client, sync event models, mapping, and retry helpers.
 
@@ -146,7 +147,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Persian/RTL Telegram text and emoji are production UI; edit surgically and verify diffs for mojibake.
 - Super-admin `📊 آمار هفتگی` and `📈 آمار ماهانه` use only the latest 7/30 completed Tehran days through yesterday.
   Daily users are globally distinct across all owned/tenant bots, interactions include messages and callbacks, and
-  configured super-admin ids are excluded. Tenant owner stats reuse the same parser with a strict tenant `BotId` filter.
+  configured super-admin ids are excluded. Both commands send a readable PNG line chart plus a concise caption rather
+  than a text-only daily list. Tenant owner stats reuse the same parser with a strict tenant `BotId` filter.
 - Scheduled usage reporting is controlled by optional `weeklyUsageReportEnabled`; a missing old config key is false and
   must not fail startup. Saturday 00:01 Tehran delivery compares the completed Sat-Fri week with its predecessor. Sales
   include only structured successful owned account purchase/renew events and fulfilled tenant order `SalePriceToman`.
