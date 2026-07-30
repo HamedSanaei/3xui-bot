@@ -26,6 +26,13 @@ public sealed class UsageReportChartRenderer
     private static readonly SKColor HeadingColor = new(25, 39, 72);
 
     /// <summary>
+    /// Process-wide typeface loaded from the embedded Noto Sans asset so Linux rendering never depends on system fonts.
+    /// </summary>
+    private static readonly Lazy<SKTypeface> ChartTypeface = new(
+        LoadChartTypeface,
+        LazyThreadSafetyMode.ExecutionAndPublication);
+
+    /// <summary>
     /// Renders three weekly line charts comparing unique users, interactions, and gross sales with the prior week.
     /// </summary>
     /// <param name="currentWeek">Seven completed Tehran-local days, ordered Saturday through Friday.</param>
@@ -189,8 +196,8 @@ public sealed class UsageReportChartRenderer
     {
         using var titlePaint = CreatePaint(HeadingColor);
         using var subtitlePaint = CreatePaint(AxisTextColor);
-        using var titleFont = new SKFont(SKTypeface.Default, 46);
-        using var subtitleFont = new SKFont(SKTypeface.Default, 25);
+        using var titleFont = CreateFont(46);
+        using var subtitleFont = CreateFont(25);
         canvas.DrawText(title, 70, 66, SKTextAlign.Left, titleFont, titlePaint);
         canvas.DrawText(
             $"Range: {FormatDateRange(currentReport)}",
@@ -247,7 +254,7 @@ public sealed class UsageReportChartRenderer
         using var textPaint = CreatePaint(AxisTextColor);
         using var currentPaint = CreateLinePaint(CurrentColor, 6);
         using var previousPaint = CreateLinePaint(PreviousColor, 5, dashed: true);
-        using var font = new SKFont(SKTypeface.Default, 24);
+        using var font = CreateFont(24);
 
         canvas.DrawLine(x, y - 8, x + 70, y - 8, currentPaint);
         canvas.DrawCircle(x + 35, y - 8, 8, currentPaint);
@@ -292,8 +299,8 @@ public sealed class UsageReportChartRenderer
 
         using var headingPaint = CreatePaint(HeadingColor);
         using var summaryPaint = CreatePaint(AxisTextColor);
-        using var headingFont = new SKFont(SKTypeface.Default, 32);
-        using var summaryFont = new SKFont(SKTypeface.Default, 24);
+        using var headingFont = CreateFont(32);
+        using var summaryFont = CreateFont(24);
         canvas.DrawText(title, panel.Left + 34, panel.Top + 47, SKTextAlign.Left, headingFont, headingPaint);
         canvas.DrawText(
             BuildMetricSummary(currentValues),
@@ -369,7 +376,7 @@ public sealed class UsageReportChartRenderer
         using var gridPaint = CreateLinePaint(GridColor, 2);
         using var axisPaint = CreateLinePaint(new SKColor(155, 166, 187), 3);
         using var labelPaint = CreatePaint(AxisTextColor);
-        using var labelFont = new SKFont(SKTypeface.Default, 23);
+        using var labelFont = CreateFont(23);
 
         for (var value = 0L; value <= axisMaximum; value += axisStep)
         {
@@ -452,7 +459,7 @@ public sealed class UsageReportChartRenderer
         SKColor color)
     {
         var baseline = Math.Max(plot.Top + 27, point.Y - 16);
-        using var font = new SKFont(SKTypeface.Default, 23);
+        using var font = CreateFont(23);
         using var outlinePaint = CreatePaint(SKColors.White, SKPaintStyle.Stroke, 7);
         using var textPaint = CreatePaint(color);
         var text = FormatCompactNumber(value);
@@ -461,7 +468,7 @@ public sealed class UsageReportChartRenderer
     }
 
     /// <summary>
-    /// Draws adaptive Persian-calendar date labels below the X axis.
+    /// Draws a Persian-calendar date label for every weekly or monthly point below the X axis.
     /// </summary>
     /// <param name="canvas">Target Skia canvas.</param>
     /// <param name="plot">Plot rectangle defining daily X positions.</param>
@@ -473,7 +480,7 @@ public sealed class UsageReportChartRenderer
     {
         using var datePaint = CreatePaint(AxisTextColor);
         using var tickPaint = CreateLinePaint(new SKColor(155, 166, 187), 2);
-        using var dateFont = new SKFont(SKTypeface.Default, days.Count <= 10 ? 22 : 20);
+        using var dateFont = CreateFont(days.Count <= 10 ? 22 : 18);
         for (var index = 0; index < days.Count; index++)
         {
             if (!ShouldDrawDateLabel(index, days.Count))
@@ -481,13 +488,30 @@ public sealed class UsageReportChartRenderer
 
             var point = GetPoint(plot, index, days.Count, 0, 1);
             canvas.DrawLine(point.X, plot.Bottom, point.X, plot.Bottom + 10, tickPaint);
+            var label = FormatDateLabel(days[index].DateIran);
+            if (days.Count <= 10)
+            {
+                canvas.DrawText(
+                    label,
+                    point.X,
+                    plot.Bottom + 39,
+                    SKTextAlign.Center,
+                    dateFont,
+                    datePaint);
+                continue;
+            }
+
+            // Rotate dense monthly labels so every completed day remains identifiable without horizontal overlap.
+            canvas.Save();
+            canvas.RotateDegrees(-55, point.X, plot.Bottom + 56);
             canvas.DrawText(
-                FormatDateLabel(days[index].DateIran),
+                label,
                 point.X,
-                plot.Bottom + 39,
-                SKTextAlign.Center,
+                plot.Bottom + 56,
+                SKTextAlign.Right,
                 dateFont,
                 datePaint);
+            canvas.Restore();
         }
     }
 
@@ -562,17 +586,19 @@ public sealed class UsageReportChartRenderer
     }
 
     /// <summary>
-    /// Selects X-axis date labels based on report length.
+    /// Selects X-axis date labels while guaranteeing labels for every supported weekly or monthly day.
     /// </summary>
     /// <param name="index">Zero-based day index.</param>
     /// <param name="count">Total daily buckets.</param>
-    /// <returns><c>true</c> when the date should be drawn.</returns>
+    /// <returns>
+    /// <c>true</c> for every report point up to 31 days; for longer future reports, the first, last, and periodic dates.
+    /// </returns>
     private static bool ShouldDrawDateLabel(int index, int count)
     {
-        if (count <= 10)
+        if (count <= 31)
             return true;
 
-        var interval = count <= 16 ? 2 : 5;
+        var interval = count <= 62 ? 5 : 7;
         return index == 0 || index == count - 1 || index % interval == 0;
     }
 
@@ -629,6 +655,41 @@ public sealed class UsageReportChartRenderer
             IsAntialias = true,
             PathEffect = dashed ? SKPathEffect.CreateDash(new[] { 18f, 12f }, 0) : null
         };
+    }
+
+    /// <summary>
+    /// Creates a disposable chart font backed by the process-wide embedded Noto Sans typeface.
+    /// </summary>
+    /// <param name="size">Font size in output pixels; must be positive.</param>
+    /// <returns>A Skia font that callers must dispose after drawing.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="size"/> is not positive.</exception>
+    private static SKFont CreateFont(float size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Chart font size must be positive.");
+
+        return new SKFont(ChartTypeface.Value, size);
+    }
+
+    /// <summary>
+    /// Loads the bundled Noto Sans font from the application assembly for deterministic Windows and Linux rendering.
+    /// </summary>
+    /// <returns>A valid process-lifetime Skia typeface containing the Latin letters and digits used by chart labels.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the font resource is absent from the publish output or SkiaSharp cannot decode it.
+    /// </exception>
+    /// <remarks>
+    /// Failing explicitly is safer than silently producing the blank labels seen when a minimal Linux host has no
+    /// discoverable default font. The scheduled worker and admin command already log rendering failures safely.
+    /// </remarks>
+    private static SKTypeface LoadChartTypeface()
+    {
+        const string resourceName = "Adminbot.Assets.Fonts.NotoSans-Regular.ttf";
+        using var stream = typeof(UsageReportChartRenderer).Assembly.GetManifestResourceStream(resourceName)
+                           ?? throw new InvalidOperationException(
+                               $"Embedded usage-chart font resource '{resourceName}' was not found.");
+        return SKTypeface.FromStream(stream)
+               ?? throw new InvalidOperationException("SkiaSharp could not decode the embedded usage-chart font.");
     }
 
     /// <summary>

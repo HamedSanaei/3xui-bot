@@ -25,4 +25,12 @@
     <PackageReference Include="Telegram.Bot" Version="19.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\Fonts\NotoSans-Regular.ttf"
+                      LogicalName="Adminbot.Assets.Fonts.NotoSans-Regular.ttf" />
+    <None Include="Assets\Fonts\OFL.txt"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

@@ -35,7 +35,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/ReferralService.cs`: global owned-bot relationship registration, reward calculation, users.db state/ledger idempotency, user stats, notifications, and startup reconciliation.
 - `Services/UsageAnalyticsService.cs`: completed Tehran-day aggregation of JSONL messages/callbacks, successful owned sales, and fulfilled tenant sales; excludes global super-admin ids and supports tenant bot filtering.
 - `Services/UsageReportChartRenderer.cs`: cross-platform SkiaSharp high-resolution line-chart PNG renderer with
-  explicit Y scales, adaptive date/value labels, point markers, and current-versus-previous weekly comparison.
+  explicit Y scales, every weekly/monthly date, adaptive value labels, point markers, and current-versus-previous weekly comparison. It uses
+  the embedded OFL-licensed `Assets/Fonts/NotoSans-Regular.ttf`; never fall back to `SKTypeface.Default`, because
+  minimal Linux hosts can silently render every chart label blank.
 - `Services/WeeklyUsageReportHostedService.cs`: Saturday 00:01 Tehran report scheduler, catch-up behavior, users.db claim/lease idempotency, and direct central logger delivery through the default owned bot.
 - `Domain/GozargahSite.cs`: Gozargah site API client, sync event models, mapping, and retry helpers.
 
@@ -54,6 +56,10 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 ## Payment and Ledger Rules
 
 - NOWPayments and HooshPay payment records live in `users.db` and can be linked to tenant orders.
+- New HooshPay invoices require the restart-loaded global `hooshPayEnabled` switch and, for tenant storefronts, the
+  per-tenant `TenantHooshPayEnabled` preference. Disabling either switch hides and blocks only new invoices, including
+  stale Telegram callbacks; existing rows remain eligible for status checks, IPN processing, and settlement. A missing
+  global key is disabled, while the tracked operational configuration explicitly keeps the gateway enabled.
 - Tetraminator is the second rial gateway for owned wallet charges and direct tenant purchase/renew orders. Its
   `TetraminatorPaymentInfos` rows live only in `users.db`; `OrderId` and non-null `PayId` are unique. The public GET
   callback is unsigned and therefore only triggers an authoritative `GET /payment/inquiry/{pay_id}`. Settlement
@@ -152,6 +158,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Scheduled usage reporting is controlled by optional `weeklyUsageReportEnabled`; a missing old config key is false and
   must not fail startup. Saturday 00:01 Tehran delivery compares the completed Sat-Fri week with its predecessor. Sales
   include only structured successful owned account purchase/renew events and fulfilled tenant order `SalePriceToman`.
+- Owned wallet-charge and tenant online-payment buttons show their instant-settlement label and customer-facing fee
+  policy: NOWPayments 0%, Tetraminator 12%, and HooshPay 15%. Owned amount entry explicitly supports either a suggested
+  amount button or a manually typed toman amount; legacy gateway button labels remain routable after deployment.
 - `UsageReportDispatches` exists only in `users.db`; unique `ReportKey`, atomic claims, and leases prevent concurrent
   workers. Failed generation or Telegram delivery releases the same row for retry; successful delivery is terminal.
   If Telegram returns a valid message but final sent-state persistence fails, the worker records a non-retryable

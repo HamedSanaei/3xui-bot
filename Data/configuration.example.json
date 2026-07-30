@@ -19,6 +19,7 @@
   "userActivityLogLevel": "Information",
   "userActivityLogFilePath": "./Data/Logs/user-activity-{shamsiDate}.jsonl",
   "weeklyUsageReportEnabled": true,
+  "hooshPayEnabled": false,
   "tetraminatorEnabled": false,
   "tetraminatorApiBaseUrl": "https://api.tetraminator.com/v1",
   "tetraminatorApiKey": "",

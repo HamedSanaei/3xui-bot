@@ -73,6 +73,15 @@ public class TelegramBotService : IHostedService
     /// </summary>
     private const string CancelAdminPhoneButton = "❌ انصراف";
 
+    /// <summary>Owned-wallet HooshPay action label with its displayed customer fee.</summary>
+    private const string HooshPayGatewayAction = "⚡ هوش‌پی آنی | کارمزد ۱۵٪";
+
+    /// <summary>Owned-wallet Tetraminator action label with its displayed customer fee.</summary>
+    private const string TetraminatorGatewayAction = "⚡ تترامیناتور آنی | کارمزد ۱۲٪";
+
+    /// <summary>Owned-wallet NOWPayments action label with its displayed zero-fee policy.</summary>
+    private const string CryptoGatewayAction = "⚡ ارز دیجیتال آنی | کارمزد ۰٪";
+
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
@@ -5414,6 +5423,21 @@ public class TelegramBotService : IHostedService
                     return;
                 }
 
+                if (user.PaymentMethod == "hooshpay" && !_appConfig.HooshPayEnabled)
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "درگاه هوش‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
                 await botClient.CustomSendTextMessageAsync(
                                                                             chatId: message.Chat.Id,
                                                                             text: "لطفاً چند ثانیه صبر کنید.",
@@ -5758,11 +5782,25 @@ public class TelegramBotService : IHostedService
                     cancellationToken: cancellationToken);
                 return;
             }
-            else if (message.Text == "درگاه ریالی هوش‌پی")
+            else if (IsGatewayAction(message.Text, HooshPayGatewayAction, "درگاه ریالی هوش‌پی"))
             {
+                if (!_appConfig.HooshPayEnabled)
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "درگاه هوش‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
                 user.PaymentMethod = "hooshpay";
             }
-            else if (message.Text == "درگاه ریالی تترامیناتور")
+            else if (IsGatewayAction(message.Text, TetraminatorGatewayAction, "درگاه ریالی تترامیناتور"))
             {
                 var amount = long.TryParse(user.ConfigLink, out var selectedAmount) ? selectedAmount : 0;
                 if (!_appConfig.TetraminatorEnabled || amount < _appConfig.TetraminatorMinimumAmountToman)
@@ -5796,7 +5834,7 @@ public class TelegramBotService : IHostedService
                     cancellationToken: cancellationToken);
                 return;
             }
-            else if (message.Text == "درگاه ارز دیجیتال")
+            else if (IsGatewayAction(message.Text, CryptoGatewayAction, "درگاه ارز دیجیتال"))
             {
                 user.PaymentMethod = "crypto";
             }
@@ -5807,11 +5845,11 @@ public class TelegramBotService : IHostedService
 
 
             var gatewayName = user.PaymentMethod == "crypto"
-                ? "درگاه ارز دیجیتال"
+                ? "درگاه ارز دیجیتال آنی با کارمزد ۰٪"
                 : user.PaymentMethod == "hooshpay"
-                    ? "درگاه ریالی هوش‌پی"
+                    ? "درگاه ریالی هوش‌پی آنی با کارمزد ۱۵٪"
                 : user.PaymentMethod == "tetraminator"
-                    ? "درگاه ریالی تترامیناتور"
+                    ? "درگاه ریالی تترامیناتور آنی با کارمزد ۱۲٪"
                 : user.PaymentMethod == "zibal"
                     ? "درگاه ریالی"
                     : "درگاه پرداخت";
@@ -5862,7 +5900,11 @@ public class TelegramBotService : IHostedService
 
             await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
             var msg = "💰 <b>شارژ کیف پول</b>\n\n" +
-                      "👇 از مبلغ‌های پیشنهادی پایین استفاده کنید یا مبلغ دلخواه را به تومان و با عدد وارد کنید.";
+                      "🔘 یکی از مبلغ‌های پیشنهادی پایین را انتخاب کنید.\n" +
+                      "✍️ یا مبلغ دلخواه خود را <b>به تومان و فقط به‌صورت عدد</b> ارسال کنید.\n" +
+                      "مثال: <code>250000</code>\n\n" +
+                      "⚡ درگاه‌های فعال پس از پرداخت موفق، نتیجه را به‌صورت خودکار و فوری بررسی می‌کنند.\n" +
+                      BuildActiveChargeGatewaySummary();
             //msg = "برای شارژ حساب کاربری به آیدی زیر پیام دهید: \n @vpnetiran_admin";
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -5891,7 +5933,11 @@ public class TelegramBotService : IHostedService
 
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
-                    text: $"✅ شما مقدار {longValue.FormatCurrency()}  را برای شارژ حساب خود وارد کرده اید. \n" + "لطفاً درگاه مورد نظر خود را برای پرداخت آنلاین انتخاب نمائید.",
+                    text: $"✅ مبلغ <b>{longValue.FormatCurrency()}</b> برای شارژ کیف پول ثبت شد.\n\n" +
+                          "⚡ درگاه‌های فعال پرداخت موفق را به‌صورت خودکار و فوری تایید می‌کنند.\n" +
+                          BuildActiveChargeGatewaySummary() + "\n\n" +
+                          "👇 درگاه موردنظر را انتخاب کنید.",
+                    parseMode: ParseMode.Html,
                     replyMarkup: paymentmethod);
                 return;
 
@@ -7424,35 +7470,104 @@ public class TelegramBotService : IHostedService
     /// Builds enabled owned-wallet payment methods for an owned-bot wallet charge.
     /// </summary>
     /// <returns>
-    /// A one-time reply keyboard containing HooshPay, NOWPayments, and Tetraminator when its global switch is enabled.
+    /// A one-time reply keyboard containing one readable row per enabled instant gateway, including its fee percentage.
     /// </returns>
     /// <remarks>
-    /// Tetraminator remains visible for manually entered amounts below its provider minimum. The subsequent selection
-    /// handler validates the stored amount and explains the configured minimum without issuing an invoice API request.
+    /// HooshPay is omitted whenever its global switch is disabled. Tetraminator remains visible for manually entered
+    /// amounts below its provider minimum whenever its own global switch is enabled. The subsequent selection handler
+    /// validates the stored amount and explains the configured minimum without issuing an invoice API request.
     /// </remarks>
     private ReplyKeyboardMarkup BuildChargePaymentMethodKeyboard()
     {
-        var buttons = new List<KeyboardButton>
-        {
-            new("درگاه ریالی هوش‌پی"),
-            new("درگاه ارز دیجیتال")
-        };
+        var rows = new List<KeyboardButton[]>();
+        if (_appConfig.HooshPayEnabled)
+            rows.Add(new[] { new KeyboardButton(HooshPayGatewayAction) });
         if (_appConfig.TetraminatorEnabled)
-            buttons.Add(new KeyboardButton("درگاه ریالی تترامیناتور"));
+            rows.Add(new[] { new KeyboardButton(TetraminatorGatewayAction) });
+        rows.Add(new[] { new KeyboardButton(CryptoGatewayAction) });
 
-        return new ReplyKeyboardMarkup(buttons.Chunk(2).Select(x => x.ToArray()).ToArray())
+        return new ReplyKeyboardMarkup(rows)
         {
             ResizeKeyboard = true,
             OneTimeKeyboard = true
         };
     }
 
+    /// <summary>
+    /// Builds the customer-facing list of currently enabled owned-wallet gateways and their fee policies.
+    /// </summary>
+    /// <returns>
+    /// HTML-formatted lines for every enabled gateway. NOWPayments is always included; HooshPay and Tetraminator are
+    /// included only when their global configuration switches allow new invoices.
+    /// </returns>
+    /// <remarks>
+    /// This text is informational only. Invoice creation methods independently recheck their gateway switches so
+    /// stale Telegram keyboards or persisted conversation state cannot bypass an operator disablement.
+    /// </remarks>
+    private string BuildActiveChargeGatewaySummary()
+    {
+        var lines = new List<string>();
+        if (_appConfig.HooshPayEnabled)
+            lines.Add("💳 هوش‌پی: <b>کارمزد ۱۵٪</b>");
+        if (_appConfig.TetraminatorEnabled)
+            lines.Add("💳 تترامیناتور: <b>کارمزد ۱۲٪</b>");
+        lines.Add("🪙 ارز دیجیتال: <b>کارمزد ۰٪</b>");
+        return string.Join("\n", lines);
+    }
+
+    /// <summary>
+    /// Matches a current fee-bearing gateway button while preserving compatibility with already-issued legacy keyboards.
+    /// </summary>
+    /// <param name="input">Incoming owned-bot reply-keyboard text; it may be empty for non-text updates.</param>
+    /// <param name="currentLabel">Current instant-gateway label containing the displayed fee percentage.</param>
+    /// <param name="legacyLabel">Previous label accepted only so stale keyboards remain functional after deployment.</param>
+    /// <returns><c>true</c> when the trimmed input equals either current or legacy label; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// The selected label controls routing only. Actual payment amount and provider settlement continue to come from
+    /// the persisted wallet-charge state and provider response, never from Telegram button text.
+    /// </remarks>
+    private static bool IsGatewayAction(string input, string currentLabel, string legacyLabel)
+    {
+        var normalized = input?.Trim();
+        return string.Equals(normalized, currentLabel, StringComparison.Ordinal) ||
+               string.Equals(normalized, legacyLabel, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Creates and persists a HooshPay invoice for an owned-bot wallet charge when the gateway is globally enabled.
+    /// </summary>
+    /// <param name="message">
+    /// Owned-bot customer message whose Telegram chat receives the invoice or the unavailable-gateway notice.
+    /// </param>
+    /// <param name="credUser">
+    /// Shared credentials-database wallet owner identified by the Telegram user id on the incoming update.
+    /// </param>
+    /// <param name="user">
+    /// Persisted owned-bot charge state containing the customer-entered amount in Iranian toman.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancellation token propagated to users.db, HooshPay HTTP, and Telegram operations.
+    /// </param>
+    /// <remarks>
+    /// The global switch is checked before creating a local payment row or calling HooshPay. Disabling new invoices
+    /// does not affect status checks, IPN processing, or settlement of rows created while the gateway was enabled.
+    /// </remarks>
     private async Task CreateHooshPayWalletChargeAsync(
         Message message,
         CredUser credUser,
         User user,
         CancellationToken cancellationToken)
     {
+        if (!_appConfig.HooshPayEnabled)
+        {
+            await ActiveBotClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "درگاه هوش‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+            return;
+        }
+
         long amount = Convert.ToInt64(user.ConfigLink);
         var payment = HooshPayPaymentInfo.CreateWalletCharge(
             credUser.TelegramUserId,

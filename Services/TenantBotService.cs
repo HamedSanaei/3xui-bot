@@ -710,6 +710,10 @@ public class TenantBotService
     /// <param name="owner">colleague owner profile.</param>
     /// <param name="tokenNotice">Optional HTML-safe status line produced by token validation before panel rendering.</param>
     /// <returns>Html-formatted panel Text.</returns>
+    /// <remarks>
+    /// Gateway status combines tenant preferences with global application switches. When HooshPay or Tetraminator is
+    /// disabled globally, the panel reports <c>سراسری خاموش</c> without changing the tenant's persisted preference.
+    /// </remarks>
     private string BUILDOWNERPANELTEXT(BotInstance tenant, CredUser owner, string tokenNotice = null)
     {
         var hasToken = !string.IsNullOrWhiteSpace(tenant?.Token);
@@ -737,7 +741,7 @@ public class TenantBotService
                $"{STATUSICON(true)} درصد سود روی قیمت همکار: <code>{markup}%</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.SupportAccount))} پشتیبانی فروشگاه: <code>{Html(support)}</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.TenantWelcomeText))} متن خوشامد: <code>{Html(WELCOME)}</code>\n" +
-               $"{STATUSICON(tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(tenant?.TenantHooshPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(_appConfig.HooshPayEnabled && tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(!_appConfig.HooshPayEnabled ? "سراسری خاموش" : tenant?.TenantHooshPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(_appConfig.TetraminatorEnabled && tenant?.TenantTetraminatorEnabled == true)} درگاه تترامیناتور: <b>{Html(!_appConfig.TetraminatorEnabled ? "سراسری خاموش" : tenant?.TenantTetraminatorEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(tenant?.TenantNowPaymentsEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(tenant?.TenantCardPaymentEnabled == true)} کارت به کارت همکار: <code>{Html(card)}</code>\n" +
@@ -1904,7 +1908,7 @@ public class TenantBotService
     /// <param name="botClient">Main owned Bot client used to answer the owner callback.</param>
     /// <param name="CallbackQuery">Callback carrying the owner panel revision and Telegram callback id.</param>
     /// <param name="owner">colleague User who owns the tenant storefront.</param>
-    /// <param name="setting">short setting key from callback Data: card, HooshPay, NowPayments, or join.</param>
+    /// <param name="setting">Short setting key from callback data: card, HooshPay, Tetraminator, NowPayments, or join.</param>
     /// <param name="desiredEnabled">Desired final value. Repeating the same callback does not invert the setting.</param>
     /// <param name="expectedRevision">Revision embedded in the panel keyboard that must match the current tenant row.</param>
     /// <param name="issuedAt">Hexadecimal Unix timestamp used to reject mutation buttons older than ten minutes.</param>
@@ -1912,7 +1916,8 @@ public class TenantBotService
     /// <remarks>
     /// Forced join is validated immediately before it is enabled. The callback is acknowledged before any Telegram
     /// network probe, and validation failures are delivered as normal owner messages because callback answers can
-    /// only be sent once.
+    /// only be sent once. HooshPay and Tetraminator tenant preferences cannot be enabled while their corresponding
+    /// global application switches are disabled.
     /// </remarks>
     private async Task SETTENANTSETTINGASYNC(
         ITelegramBotClient botClient,
@@ -1973,6 +1978,16 @@ public class TenantBotService
                 break;
             case "HooshPay":
                 currentEnabled = tenant.TenantHooshPayEnabled;
+                if (desiredEnabled && !_appConfig.HooshPayEnabled)
+                {
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient,
+                        CallbackQuery.Id,
+                        "درگاه هوش‌پی در تنظیمات سراسری غیرفعال است.",
+                        showAlert: true,
+                        cancellationToken: CancellationToken);
+                    return;
+                }
                 break;
             case "Tetraminator":
                 currentEnabled = tenant.TenantTetraminatorEnabled;
@@ -4271,6 +4286,11 @@ public class TenantBotService
     /// <param name="tenant">current tenant Bot row.</param>
     /// <param name="selection">selected xui purchase OPTION.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <remarks>
+    /// Every enabled online gateway is displayed as instant and includes its customer-facing fee percentage:
+    /// NOWPayments 0%, Tetraminator 12%, and HooshPay 15%. Callback data remains unchanged, so previously issued
+    /// invoices and idempotent settlement behavior are unaffected by these display labels.
+    /// </remarks>
     private async Task SHOWCUSTOMERCONFIRMASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, XuiV3PurchaseSelection selection, CancellationToken CancellationToken)
     {
         var Price = CalculateTenantPrice(tenant, selection);
@@ -4285,12 +4305,12 @@ public class TenantBotService
                    "پس از پرداخت موفق، اکانت به صورت خودکار ساخته و ارسال می‌شود.";
 
         var PAYMENTROWS = new List<InlineKeyboardButton[]>();
-        if (tenant.TenantHooshPayEnabled)
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("پرداخت ریالی هوش‌پی", CUSTOMERCALLBACKPREFIX + "PAYHP:" + BUILDPAYACTION(selection)) });
+        if (IsTenantHooshPayAvailable(tenant))
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ هوش‌پی آنی | کارمزد ۱۵٪", CUSTOMERCALLBACKPREFIX + "PAYHP:" + BUILDPAYACTION(selection)) });
         if (IsTenantTetraminatorAvailable(tenant, Price.SalePriceToman))
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("پرداخت ریالی تترامیناتور", CUSTOMERCALLBACKPREFIX + "PAYTM:" + BUILDPAYACTION(selection)) });
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + "PAYTM:" + BUILDPAYACTION(selection)) });
         if (tenant.TenantNowPaymentsEnabled)
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("پرداخت ارز دیجیتال", CUSTOMERCALLBACKPREFIX + "PAYNP:" + BUILDPAYACTION(selection)) });
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی | کارمزد ۰٪", CUSTOMERCALLBACKPREFIX + "PAYNP:" + BUILDPAYACTION(selection)) });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("کارت‌به‌کارت به فروشگاه", CUSTOMERCALLBACKPREFIX + "PAYCARD:" + BUILDPAYACTION(selection)) });
         PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") });
@@ -4315,6 +4335,11 @@ public class TenantBotService
     /// <param name="customer">Credential User record for the customer BUYING from the tenant storefront.</param>
     /// <param name="selection">resolved XuiV3 service, Traffic, Duration, or Unlimited-plan selection.</param>
     /// <param name="CancellationToken">Cancellation Token PROPAGATED from the Telegram update handler.</param>
+    /// <remarks>
+    /// The global and tenant-specific HooshPay switches are checked before creating either the tenant order or its
+    /// linked payment row. Existing HooshPay orders remain eligible for inquiry and settlement after either switch is
+    /// disabled, but stale purchase callbacks cannot create a new invoice.
+    /// </remarks>
     private async Task CreateTenantOrderINVOICEASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -4324,6 +4349,17 @@ public class TenantBotService
         CancellationToken CancellationToken)
     {
         var ChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
+        if (!IsTenantHooshPayAvailable(tenant))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                BuildTenantHooshPayUnavailableMessage(),
+                showAlert: true,
+                cancellationToken: CancellationToken);
+            return;
+        }
+
         var Price = CalculateTenantPrice(tenant, selection);
         var OrderId = CreateTenantOrderId(tenant, customer.TelegramUserId);
 
@@ -4602,6 +4638,10 @@ public class TenantBotService
     /// <param name="customer">Customer who owns the order.</param>
     /// <param name="orderDbId">Internal users.db id of the pending renewal order.</param>
     /// <param name="cancellationToken">Cancellation token for users.db, HooshPay, and Telegram operations.</param>
+    /// <remarks>
+    /// The global and tenant-specific HooshPay switches are rechecked before loading or mutating the pending renewal
+    /// order. Previously created invoices remain checkable and settleable through their existing status/IPN paths.
+    /// </remarks>
     private async Task CreateTenantHooshPayInvoiceForExistingOrderAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -4610,6 +4650,17 @@ public class TenantBotService
         int orderDbId,
         CancellationToken cancellationToken)
     {
+        if (!IsTenantHooshPayAvailable(tenant))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                BuildTenantHooshPayUnavailableMessage(),
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
         var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
         if (order == null)
         {
@@ -7272,6 +7323,30 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Determines whether a tenant can create a new HooshPay invoice.
+    /// </summary>
+    /// <param name="tenant">
+    /// Tenant storefront whose database preference is combined with the application-level HooshPay switch.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> only when HooshPay is enabled globally and for the specified tenant; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// This guard applies only to new invoice creation. Existing HooshPay rows continue through inquiry, IPN, and
+    /// settlement so disabling the gateway cannot strand a customer who already paid.
+    /// </remarks>
+    private bool IsTenantHooshPayAvailable(BotInstance tenant)
+        => _appConfig.HooshPayEnabled &&
+           tenant?.TenantHooshPayEnabled == true;
+
+    /// <summary>
+    /// Builds the safe customer-facing explanation used when a tenant HooshPay callback is no longer available.
+    /// </summary>
+    /// <returns>A Persian alert that does not expose gateway credentials, URLs, or tenant configuration details.</returns>
+    private static string BuildTenantHooshPayUnavailableMessage()
+        => "درگاه هوش‌پی برای این فروشگاه در حال حاضر غیرفعال است.";
+
+    /// <summary>
     /// Determines whether a tenant can create a new Tetraminator invoice for the requested sale amount.
     /// </summary>
     /// <param name="tenant">Tenant storefront whose independent preference is combined with global configuration.</param>
@@ -7324,7 +7399,7 @@ public class TenantBotService
     private InlineKeyboardMarkup BuildTenantRenewPaymentProviderKeyboard(TenantBotOrder order, BotInstance tenant)
     {
         var rows = new List<InlineKeyboardButton[]>();
-        if (tenant.TenantHooshPayEnabled)
+        if (IsTenantHooshPayAvailable(tenant))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("درگاه ریالی هوش‌پی", CUSTOMERCALLBACKPREFIX + $"RNHP:{order.Id}") });
         if (IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("درگاه ریالی تترامیناتور", CUSTOMERCALLBACKPREFIX + $"RNTM:{order.Id}") });

@@ -140,6 +140,15 @@ namespace Adminbot.Domain
         public string NowpaymentSuccessUrl { get; set; }
         public string NowpaymentCancelUrl { get; set; }
         public string NowpaymentIpnUrl { get; set; }
+        /// <summary>
+        /// Enables creation of new HooshPay rial invoices across owned and tenant bots.
+        /// </summary>
+        /// <remarks>
+        /// Disabling this switch hides HooshPay payment buttons and blocks new invoice creation after the application
+        /// restarts. Existing payment rows remain verifiable and settleable so customers who paid before the switch
+        /// changed are not stranded. A missing configuration key leaves this value disabled.
+        /// </remarks>
+        public bool HooshPayEnabled { get; set; }
         public string HooshPayApiKey { get; set; }
         public string HooshPayIpnSecretKey { get; set; }
         public string HooshPayBaseUrl { get; set; } = "https://pay.hooshnet.com";
