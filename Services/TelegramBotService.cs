@@ -49,6 +49,11 @@ public class TelegramBotService : IHostedService
     private const string AdminMonthlyUsageAction = "📈 آمار ماهانه";
 
     /// <summary>
+    /// Reply-keyboard action that opens the super-admin live payment-gateway switch panel.
+    /// </summary>
+    private const string AdminPaymentGatewayAction = "⚙️ مدیریت درگاه‌ها";
+
+    /// <summary>
     /// Conversation-state step that waits for the target user's numeric Telegram id.
     /// </summary>
     private const string AdminPhoneUserIdStep = "admin-phone-user-id";
@@ -79,6 +84,9 @@ public class TelegramBotService : IHostedService
     /// <summary>Owned-wallet Tetraminator action label with its displayed customer fee.</summary>
     private const string TetraminatorGatewayAction = "⚡ تترامیناتور آنی | کارمزد ۱۲٪";
 
+    /// <summary>Owned-wallet UniquePay action label with its displayed buyer fee.</summary>
+    private const string UniquePayGatewayAction = "⚡ یونیک‌پی آنی | کارمزد ۱۲٪";
+
     /// <summary>Owned-wallet NOWPayments action label with its displayed zero-fee policy.</summary>
     private const string CryptoGatewayAction = "⚡ ارز دیجیتال آنی | کارمزد ۰٪";
 
@@ -95,6 +103,9 @@ public class TelegramBotService : IHostedService
     private readonly HooshPaySettlementService _hooshPaySettlementService;
     private readonly Tetraminator _tetraminator;
     private readonly TetraminatorSettlementService _tetraminatorSettlementService;
+    private readonly UniquePay _uniquePay;
+    private readonly UniquePayReconciliationHostedService _uniquePayReconciliation;
+    private readonly IPaymentGatewayAvailability _gatewayAvailability;
     private readonly XuiV3PurchaseService _xuiV3PurchaseService;
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
     private readonly XuiV3PurchaseSessionStore _xuiV3PurchaseSessionStore;
@@ -174,6 +185,13 @@ public class TelegramBotService : IHostedService
     /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
     /// <param name="tetraminator">Tetraminator API client used for rial invoice creation and authoritative inquiry.</param>
     /// <param name="tetraminatorSettlementService">Idempotent Tetraminator owned-wallet settlement service.</param>
+    /// <param name="uniquePay">UniquePay client used only for non-retried invoice creation.</param>
+    /// <param name="uniquePayReconciliation">
+    /// Shared authoritative UniquePay inquiry coordinator reused by customer check buttons.
+    /// </param>
+    /// <param name="gatewayAvailability">
+    /// Live global gateway switches used by every button and hard invoice-creation guard.
+    /// </param>
     /// <param name="xuiV3PurchaseService">Shared XuiV3 purchase/account creation service.</param>
     /// <param name="xuiV3BotFlowService">Regular user XuiV3 purchase and account-management flow.</param>
     /// <param name="xuiV3PurchaseSessionStore">
@@ -224,6 +242,9 @@ public class TelegramBotService : IHostedService
         HooshPaySettlementService hooshPaySettlementService,
         Tetraminator tetraminator,
         TetraminatorSettlementService tetraminatorSettlementService,
+        UniquePay uniquePay,
+        UniquePayReconciliationHostedService uniquePayReconciliation,
+        IPaymentGatewayAvailability gatewayAvailability,
         XuiV3PurchaseService xuiV3PurchaseService,
         XuiV3BotFlowService xuiV3BotFlowService,
         XuiV3PurchaseSessionStore xuiV3PurchaseSessionStore,
@@ -255,6 +276,9 @@ public class TelegramBotService : IHostedService
         _hooshPaySettlementService = hooshPaySettlementService;
         _tetraminator = tetraminator;
         _tetraminatorSettlementService = tetraminatorSettlementService;
+        _uniquePay = uniquePay;
+        _uniquePayReconciliation = uniquePayReconciliation;
+        _gatewayAvailability = gatewayAvailability;
         _xuiV3PurchaseService = xuiV3PurchaseService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _xuiV3PurchaseSessionStore = xuiV3PurchaseSessionStore;
@@ -578,6 +602,12 @@ public class TelegramBotService : IHostedService
         if (message.Text == "🤖 وضعیت ربات‌ها")
         {
             await SendRuntimeBotStatusAsync(botClient, message.Chat.Id, cancellationToken);
+            return;
+        }
+
+        if (message.Text == AdminPaymentGatewayAction)
+        {
+            await SendPaymentGatewayPanelAsync(botClient, message.Chat.Id, cancellationToken);
             return;
         }
 
@@ -2035,6 +2065,12 @@ public class TelegramBotService : IHostedService
             if (callbackQuery.Data.Contains("Paid!"))
                 return;
 
+            if (callbackQuery.Data.StartsWith("gw:", StringComparison.Ordinal))
+            {
+                await ProcessPaymentGatewayCallbackAsync(callbackQuery, cancellationToken);
+                return;
+            }
+
             if (callbackQuery.Data.StartsWith("broadcast_status_", StringComparison.Ordinal))
             {
                 await ProcessBroadcastStatusCallback(callbackQuery, cancellationToken);
@@ -2069,6 +2105,12 @@ public class TelegramBotService : IHostedService
             if (callbackQuery.Data.StartsWith("tmchk_", StringComparison.Ordinal))
             {
                 await ProcessTetraminatorPaymentCallbackAsync(callbackQuery, cancellationToken);
+                return;
+            }
+
+            if (callbackQuery.Data.StartsWith("upchk_", StringComparison.Ordinal))
+            {
+                await ProcessUniquePayPaymentCallbackAsync(callbackQuery, cancellationToken);
                 return;
             }
 
@@ -3973,6 +4015,227 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
+    /// Sends the live four-gateway status panel to an authenticated super-admin.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the current owned bot.</param>
+    /// <param name="chatId">Super-admin Telegram chat id.</param>
+    /// <param name="cancellationToken">Cancellation token for the Telegram send operation.</param>
+    /// <returns>A task that completes after the panel message is sent.</returns>
+    /// <remarks>
+    /// The panel exposes only enabled state, exact configuration key names, and credential readiness. Secret values
+    /// and partial masks are deliberately absent. Each callback carries a revision and expires after ten minutes.
+    /// </remarks>
+    private async Task SendPaymentGatewayPanelAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        CancellationToken cancellationToken)
+    {
+        await botClient.SendTextMessageAsync(
+            chatId,
+            BuildPaymentGatewayPanelText(),
+            parseMode: ParseMode.Html,
+            replyMarkup: BuildPaymentGatewayPanelMarkup(),
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Builds the safe HTML status text for the global payment-gateway panel.
+    /// </summary>
+    /// <returns>Text containing four live states, configuration key names, and readiness labels without secrets.</returns>
+    private string BuildPaymentGatewayPanelText()
+    {
+        var snapshot = _gatewayAvailability.Snapshot;
+        var builder = new StringBuilder("⚙️ <b>مدیریت زنده درگاه‌ها</b>\n\n");
+        AppendGatewayPanelLine(builder, PaymentGateway.HooshPay, "هوش‌پی", "hooshPayEnabled", snapshot);
+        AppendGatewayPanelLine(builder, PaymentGateway.Tetraminator, "تترامیناتور", "tetraminatorEnabled", snapshot);
+        AppendGatewayPanelLine(builder, PaymentGateway.UniquePay, "یونیک‌پی", "uniquePayEnabled", snapshot);
+        AppendGatewayPanelLine(builder, PaymentGateway.NowPayments, "NOWPayments", "nowPaymentsEnabled", snapshot);
+        builder.AppendLine();
+        builder.Append("تغییر فقط روی ساخت پرداخت‌های جدید اثر دارد؛ بررسی و تسویه پرداخت‌های قبلی ادامه خواهد داشت.");
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Appends one gateway's safe state and readiness line to the panel text.
+    /// </summary>
+    /// <param name="builder">Panel text builder.</param>
+    /// <param name="gateway">Gateway represented by the line.</param>
+    /// <param name="displayName">Persian or stable provider name shown to administrators.</param>
+    /// <param name="configurationKey">Exact root JSON enabled property name.</param>
+    /// <param name="snapshot">Live switch snapshot used for a consistent panel render.</param>
+    private void AppendGatewayPanelLine(
+        StringBuilder builder,
+        PaymentGateway gateway,
+        string displayName,
+        string configurationKey,
+        PaymentGatewayAvailabilitySnapshot snapshot)
+    {
+        var state = snapshot.IsEnabled(gateway) ? "روشن" : "خاموش";
+        var readiness = _gatewayAvailability.IsConfigured(gateway) ? "کلید ثبت شده" : "کانفیگ ناقص";
+        builder.AppendLine(
+            $"{(snapshot.IsEnabled(gateway) ? "✅" : "⛔️")} <b>{Html(displayName)}</b> — {Html(state)}\n" +
+            $"<code>{Html(configurationKey)}</code> — {Html(readiness)}");
+    }
+
+    /// <summary>
+    /// Builds target-state, revisioned callback buttons for the four global gateway switches.
+    /// </summary>
+    /// <returns>Inline keyboard with one toggle button per gateway and a refresh button.</returns>
+    private InlineKeyboardMarkup BuildPaymentGatewayPanelMarkup()
+    {
+        var snapshot = _gatewayAvailability.Snapshot;
+        var issuedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var rows = new List<InlineKeyboardButton[]>();
+        foreach (var gateway in Enum.GetValues<PaymentGateway>())
+        {
+            var key = GetGatewayCallbackKey(gateway);
+            var desired = !snapshot.IsEnabled(gateway);
+            var label = $"{(desired ? "✅ روشن‌کردن" : "⛔️ خاموش‌کردن")} {GetGatewayDisplayName(gateway)}";
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    label,
+                    $"gw:{snapshot.Revision}:{issuedAt}:{key}:{(desired ? 1 : 0)}")
+            });
+        }
+
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData("🔄 تازه‌سازی", $"gw:{snapshot.Revision}:{issuedAt}:refresh:0")
+        });
+        return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>
+    /// Processes one super-admin gateway panel callback after expiry and revision checks.
+    /// </summary>
+    /// <param name="callbackQuery">Callback carrying revision, timestamp, provider key, and target state.</param>
+    /// <param name="cancellationToken">Cancellation token for persistence and Telegram edits.</param>
+    /// <returns>A task that completes after the panel is refreshed or the callback is rejected.</returns>
+    /// <remarks>
+    /// Authorization is checked independently of the UI route. A stale callback cannot overwrite a newer state, and
+    /// enabling a provider with missing credential/URL configuration is rejected by the central service.
+    /// </remarks>
+    private async Task ProcessPaymentGatewayCallbackAsync(
+        CallbackQuery callbackQuery,
+        CancellationToken cancellationToken)
+    {
+        if (!IsSuperAdminUser(callbackQuery.From.Id))
+        {
+            await ActiveBotClient.AnswerCallbackQueryAsync(
+                callbackQuery.Id,
+                "این بخش فقط برای سوپرادمین‌هاست.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var parts = (callbackQuery.Data ?? string.Empty).Split(':');
+        if (parts.Length != 5 ||
+            !long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var revision) ||
+            !long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var issuedAt) ||
+            !int.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out var target))
+        {
+            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "دکمه نامعتبر است.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (Math.Abs(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - issuedAt) > 600)
+        {
+            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "این دکمه منقضی شده است؛ پنل را تازه کنید.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (string.Equals(parts[3], "refresh", StringComparison.Ordinal))
+        {
+            await RefreshPaymentGatewayPanelAsync(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (!TryParseGatewayCallbackKey(parts[3], out var gateway) || target is < 0 or > 1)
+        {
+            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "درگاه نامعتبر است.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var result = await _gatewayAvailability.SetEnabledAsync(
+            gateway,
+            target == 1,
+            revision,
+            cancellationToken);
+        await RefreshPaymentGatewayPanelAsync(callbackQuery, cancellationToken);
+        await ActiveBotClient.AnswerCallbackQueryAsync(
+            callbackQuery.Id,
+            result.Message,
+            showAlert: !result.Applied,
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Re-renders the current gateway panel after a toggle or refresh request.
+    /// </summary>
+    /// <param name="callbackQuery">Callback whose message is being edited.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram edit.</param>
+    /// <returns>A task that completes after the edit attempt.</returns>
+    private async Task RefreshPaymentGatewayPanelAsync(
+        CallbackQuery callbackQuery,
+        CancellationToken cancellationToken)
+    {
+        if (callbackQuery.Message == null)
+            return;
+        await ActiveBotClient.EditMessageTextAsync(
+            callbackQuery.Message.Chat.Id,
+            callbackQuery.Message.MessageId,
+            BuildPaymentGatewayPanelText(),
+            parseMode: ParseMode.Html,
+            replyMarkup: BuildPaymentGatewayPanelMarkup(),
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>Maps a gateway enum to a short callback-safe key.</summary>
+    /// <param name="gateway">Gateway enum value.</param>
+    /// <returns>Short ASCII key used in Telegram callback data.</returns>
+    private static string GetGatewayCallbackKey(PaymentGateway gateway)
+        => gateway switch
+        {
+            PaymentGateway.HooshPay => "hp",
+            PaymentGateway.Tetraminator => "tm",
+            PaymentGateway.UniquePay => "up",
+            PaymentGateway.NowPayments => "np",
+            _ => "unknown"
+        };
+
+    /// <summary>Maps a callback-safe gateway key back to its enum.</summary>
+    /// <param name="key">Short ASCII callback key.</param>
+    /// <param name="gateway">Parsed gateway when the key is recognized.</param>
+    /// <returns><c>true</c> for hp, tm, up, or np; otherwise <c>false</c>.</returns>
+    private static bool TryParseGatewayCallbackKey(string key, out PaymentGateway gateway)
+    {
+        gateway = key switch
+        {
+            "hp" => PaymentGateway.HooshPay,
+            "tm" => PaymentGateway.Tetraminator,
+            "up" => PaymentGateway.UniquePay,
+            "np" => PaymentGateway.NowPayments,
+            _ => (PaymentGateway)(-1)
+        };
+        return Enum.IsDefined(gateway);
+    }
+
+    /// <summary>Gets a stable human-readable gateway name for the panel button.</summary>
+    /// <param name="gateway">Gateway enum value.</param>
+    /// <returns>Persian or provider name without secret data.</returns>
+    private static string GetGatewayDisplayName(PaymentGateway gateway)
+        => gateway switch
+        {
+            PaymentGateway.HooshPay => "هوش‌پی",
+            PaymentGateway.Tetraminator => "تترامیناتور",
+            PaymentGateway.UniquePay => "یونیک‌پی",
+            PaymentGateway.NowPayments => "NOWPayments",
+            _ => gateway.ToString()
+        };
+
+    /// <summary>
     /// Builds a plain-text super-admin report from runtime bot status snapshots.
     /// </summary>
     /// <param name="snapshots">Status snapshots returned by <see cref="BotRuntimeStatusStore.GetSnapshots" />.</param>
@@ -4658,6 +4921,7 @@ public class TelegramBotService : IHostedService
             AdminVerifyPhoneAction,
             AdminWeeklyUsageAction,
             AdminMonthlyUsageAction,
+            AdminPaymentGatewayAction,
             "🤖 وضعیت ربات‌ها",
             "📑 Menu"
         };
@@ -5423,7 +5687,8 @@ public class TelegramBotService : IHostedService
                     return;
                 }
 
-                if (user.PaymentMethod == "hooshpay" && !_appConfig.HooshPayEnabled)
+                if (user.PaymentMethod == "hooshpay" &&
+                    !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay))
                 {
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
@@ -5433,6 +5698,51 @@ public class TelegramBotService : IHostedService
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "درگاه هوش‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                if (user.PaymentMethod == "tetraminator" &&
+                    !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator))
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "درگاه تترامیناتور در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                if (user.PaymentMethod == "uniquepay" &&
+                    !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay))
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "درگاه یونیک‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                if (user.PaymentMethod == "crypto" &&
+                    !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments))
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "درگاه ارز دیجیتال در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
                         replyMarkup: BuildChargePaymentMethodKeyboard(),
                         cancellationToken: cancellationToken);
                     return;
@@ -5520,6 +5830,11 @@ public class TelegramBotService : IHostedService
                     await CreateTetraminatorWalletChargeAsync(message, credUser, user, cancellationToken);
                 }
 
+                else if (user.PaymentMethod == "uniquepay")
+                {
+                    await CreateUniquePayWalletChargeAsync(message, credUser, user, cancellationToken);
+                }
+
                 else if (user.PaymentMethod == "swapino")
                 {
 
@@ -5581,6 +5896,16 @@ public class TelegramBotService : IHostedService
 
                 else if (user.PaymentMethod == "crypto")
                 {
+                    if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments))
+                    {
+                        await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: "درگاه ارز دیجیتال در حال حاضر غیرفعال است.",
+                            replyMarkup: BuildChargePaymentMethodKeyboard(),
+                            cancellationToken: cancellationToken);
+                        return;
+                    }
+
                     long amount = Convert.ToInt64(user.ConfigLink);
                     var payment = SwapinoPaymentInfo.CreateCryptoCharge(
                         credUser.TelegramUserId,
@@ -5784,7 +6109,7 @@ public class TelegramBotService : IHostedService
             }
             else if (IsGatewayAction(message.Text, HooshPayGatewayAction, "درگاه ریالی هوش‌پی"))
             {
-                if (!_appConfig.HooshPayEnabled)
+                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay))
                 {
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
@@ -5803,7 +6128,8 @@ public class TelegramBotService : IHostedService
             else if (IsGatewayAction(message.Text, TetraminatorGatewayAction, "درگاه ریالی تترامیناتور"))
             {
                 var amount = long.TryParse(user.ConfigLink, out var selectedAmount) ? selectedAmount : 0;
-                if (!_appConfig.TetraminatorEnabled || amount < _appConfig.TetraminatorMinimumAmountToman)
+                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) ||
+                    amount < _appConfig.TetraminatorMinimumAmountToman)
                 {
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
@@ -5819,6 +6145,24 @@ public class TelegramBotService : IHostedService
                     return;
                 }
                 user.PaymentMethod = "tetraminator";
+            }
+            else if (IsGatewayAction(message.Text, UniquePayGatewayAction, "درگاه ریالی یونیک‌پی"))
+            {
+                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay))
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "درگاه یونیک‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                user.PaymentMethod = "uniquepay";
             }
             else if (message.Text == "درگاه ریالی" || message.Text == "درگاه ریالی (غیرفعال)")
             {
@@ -5836,6 +6180,19 @@ public class TelegramBotService : IHostedService
             }
             else if (IsGatewayAction(message.Text, CryptoGatewayAction, "درگاه ارز دیجیتال"))
             {
+                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments))
+                {
+                    user.LastStep = "payment_method_selection";
+                    user.Flow = "charge";
+                    user.PaymentMethod = string.Empty;
+                    await _userDbContext.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "درگاه ارز دیجیتال در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
                 user.PaymentMethod = "crypto";
             }
 
@@ -5850,6 +6207,8 @@ public class TelegramBotService : IHostedService
                     ? "درگاه ریالی هوش‌پی آنی با کارمزد ۱۵٪"
                 : user.PaymentMethod == "tetraminator"
                     ? "درگاه ریالی تترامیناتور آنی با کارمزد ۱۲٪"
+                : user.PaymentMethod == "uniquepay"
+                    ? "درگاه ریالی یونیک‌پی آنی با کارمزد ۱۲٪"
                 : user.PaymentMethod == "zibal"
                     ? "درگاه ریالی"
                     : "درگاه پرداخت";
@@ -7473,18 +7832,21 @@ public class TelegramBotService : IHostedService
     /// A one-time reply keyboard containing one readable row per enabled instant gateway, including its fee percentage.
     /// </returns>
     /// <remarks>
-    /// HooshPay is omitted whenever its global switch is disabled. Tetraminator remains visible for manually entered
-    /// amounts below its provider minimum whenever its own global switch is enabled. The subsequent selection handler
-    /// validates the stored amount and explains the configured minimum without issuing an invoice API request.
+    /// Every provider is read from the live global snapshot. Tetraminator remains visible for manually entered amounts
+    /// below its provider minimum whenever enabled; the selection handler explains the minimum without calling its API.
     /// </remarks>
     private ReplyKeyboardMarkup BuildChargePaymentMethodKeyboard()
     {
         var rows = new List<KeyboardButton[]>();
-        if (_appConfig.HooshPayEnabled)
+        var snapshot = _gatewayAvailability.Snapshot;
+        if (snapshot.IsEnabled(PaymentGateway.HooshPay))
             rows.Add(new[] { new KeyboardButton(HooshPayGatewayAction) });
-        if (_appConfig.TetraminatorEnabled)
+        if (snapshot.IsEnabled(PaymentGateway.Tetraminator))
             rows.Add(new[] { new KeyboardButton(TetraminatorGatewayAction) });
-        rows.Add(new[] { new KeyboardButton(CryptoGatewayAction) });
+        if (snapshot.IsEnabled(PaymentGateway.UniquePay))
+            rows.Add(new[] { new KeyboardButton(UniquePayGatewayAction) });
+        if (snapshot.IsEnabled(PaymentGateway.NowPayments))
+            rows.Add(new[] { new KeyboardButton(CryptoGatewayAction) });
 
         return new ReplyKeyboardMarkup(rows)
         {
@@ -7497,8 +7859,8 @@ public class TelegramBotService : IHostedService
     /// Builds the customer-facing list of currently enabled owned-wallet gateways and their fee policies.
     /// </summary>
     /// <returns>
-    /// HTML-formatted lines for every enabled gateway. NOWPayments is always included; HooshPay and Tetraminator are
-    /// included only when their global configuration switches allow new invoices.
+    /// HTML-formatted lines for every gateway enabled in the live global snapshot. The list may be empty when an
+    /// operator disables all platform gateways.
     /// </returns>
     /// <remarks>
     /// This text is informational only. Invoice creation methods independently recheck their gateway switches so
@@ -7507,11 +7869,17 @@ public class TelegramBotService : IHostedService
     private string BuildActiveChargeGatewaySummary()
     {
         var lines = new List<string>();
-        if (_appConfig.HooshPayEnabled)
+        var snapshot = _gatewayAvailability.Snapshot;
+        if (snapshot.IsEnabled(PaymentGateway.HooshPay))
             lines.Add("💳 هوش‌پی: <b>کارمزد ۱۵٪</b>");
-        if (_appConfig.TetraminatorEnabled)
+        if (snapshot.IsEnabled(PaymentGateway.Tetraminator))
             lines.Add("💳 تترامیناتور: <b>کارمزد ۱۲٪</b>");
-        lines.Add("🪙 ارز دیجیتال: <b>کارمزد ۰٪</b>");
+        if (snapshot.IsEnabled(PaymentGateway.UniquePay))
+            lines.Add("💳 یونیک‌پی: <b>کارمزد ۱۲٪</b>");
+        if (snapshot.IsEnabled(PaymentGateway.NowPayments))
+            lines.Add("🪙 ارز دیجیتال: <b>کارمزد ۰٪</b>");
+        if (lines.Count == 0)
+            lines.Add("⛔️ در حال حاضر هیچ درگاه آنلاینی فعال نیست.");
         return string.Join("\n", lines);
     }
 
@@ -7558,7 +7926,7 @@ public class TelegramBotService : IHostedService
         User user,
         CancellationToken cancellationToken)
     {
-        if (!_appConfig.HooshPayEnabled)
+        if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay))
         {
             await ActiveBotClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -7708,6 +8076,221 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
+    /// Creates and persists one UniquePay invoice for an owned-bot wallet charge.
+    /// </summary>
+    /// <param name="message">Owned-bot customer message whose chat receives the hosted invoice and check button.</param>
+    /// <param name="credUser">Shared credentials profile whose wallet will be credited after authoritative verification.</param>
+    /// <param name="user">Persisted charge state containing the requested base amount in Iranian toman.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db, the single create request, and Telegram delivery.</param>
+    /// <remarks>
+    /// The live global switch is rechecked before any row or provider request is created. The local merchant hash is
+    /// persisted first, creation is attempted once, and an ambiguous failure remains auditable for manual/provider
+    /// inquiry. The displayed 12% fee is paid by the buyer and is never credited to the local wallet.
+    /// </remarks>
+    private async Task CreateUniquePayWalletChargeAsync(
+        Message message,
+        CredUser credUser,
+        User user,
+        CancellationToken cancellationToken)
+    {
+        if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay))
+        {
+            await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                "درگاه یونیک‌پی در حال حاضر غیرفعال است.",
+                replyMarkup: BuildChargePaymentMethodKeyboard(),
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var amount = Convert.ToInt64(user.ConfigLink, CultureInfo.InvariantCulture);
+        await _userDbContext.ClearUserStatus(user);
+        var payment = UniquePayPaymentInfo.CreateWalletCharge(
+            credUser.TelegramUserId,
+            message.Chat.Id,
+            amount,
+            _appConfig.UniquePayFeePercent);
+        var returnUrl = BuildUniquePayReturnUrl(payment.HashId);
+        payment.RawRequestJson = JsonConvert.SerializeObject(new
+        {
+            hashId = payment.HashId,
+            amount,
+            redirectUrl = returnUrl
+        });
+        _userDbContext.UniquePayPaymentInfos.Add(payment);
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+
+        try
+        {
+            var invoice = await _uniquePay.CreateInvoiceAsync(
+                payment.HashId,
+                payment.BaseAmountToman,
+                returnUrl,
+                cancellationToken);
+            payment.Apply(invoice);
+            payment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(Math.Clamp(
+                _appConfig.UniquePayReconciliationIntervalSeconds,
+                10,
+                3600));
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            var fee = decimal.ToInt64(decimal.Round(
+                payment.BaseAmountToman * payment.FeePercent / 100m,
+                0,
+                MidpointRounding.AwayFromZero));
+            var payable = checked(payment.BaseAmountToman + fee);
+            var text = "✅ <b>فاکتور یونیک‌پی ساخته شد</b>\n\n" +
+                       $"💰 مبلغ شارژ کیف پول: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+                       $"💸 کارمزد خریدار (۱۲٪): <code>{Html(fee.FormatCurrency())}</code>\n" +
+                       $"💳 مبلغ تقریبی پرداخت: <code>{Html(payable.FormatCurrency())}</code>\n" +
+                       $"🧾 شناسه فاکتور: <code>{Html(payment.RefId)}</code>\n\n" +
+                       "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از استعلام رسمی یونیک‌پی انجام می‌شود.";
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithUrl("پرداخت با یونیک‌پی", payment.PaymentLink) },
+                new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت", $"upchk_{payment.Id}") }
+            });
+            var sent = await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                text,
+                parseMode: ParseMode.Html,
+                replyMarkup: keyboard,
+                cancellationToken: cancellationToken);
+            payment.TelMsgId = sent.MessageId;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                "منوی اصلی",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            var definitiveFailure = UniquePay.IsDefinitiveCreateFailure(ex);
+            payment.ErrorCode = ex is UniquePayApiException apiException
+                ? apiException.StatusCode.ToString(CultureInfo.InvariantCulture)
+                : "create_failed";
+            payment.ErrorMessage = ex.Message;
+            payment.RawResponseJson = ex is UniquePayApiException providerError
+                ? providerError.ResponseBody
+                : payment.RawResponseJson;
+            payment.PaymentStatus = definitiveFailure ? UniquePayStatuses.Failed : UniquePayStatuses.Pending;
+            payment.NextInquiryAtUtc = definitiveFailure
+                ? null
+                : DateTime.UtcNow.AddSeconds(Math.Clamp(
+                    _appConfig.UniquePayReconciliationIntervalSeconds,
+                    10,
+                    3600));
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            // Token and request headers are absent from both the local row and this structured logger event.
+            _logger.LogError(
+                ex,
+                "UniquePay invoice creation failed. botId={BotId}, userId={UserId}, paymentId={PaymentId}, hashId={HashId}, amountToman={AmountToman}, providerCode={ProviderCode}",
+                BotContextAccessor.CurrentBotId,
+                credUser.TelegramUserId,
+                payment.Id,
+                payment.HashId,
+                amount,
+                payment.ErrorCode);
+            await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                "ساخت فاکتور یونیک‌پی ناموفق بود. مشکل برای مدیر سیستم ثبت شد؛ لطفاً از درگاه دیگری استفاده کنید.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Rechecks an owned UniquePay invoice selected by its customer and applies wallet settlement when verified.
+    /// </summary>
+    /// <param name="callbackQuery">Customer callback containing the internal users.db payment id.</param>
+    /// <param name="cancellationToken">Cancellation token for inquiry, settlement, and Telegram replies.</param>
+    /// <returns>A task that completes after the official inquiry result and safe retry controls are sent.</returns>
+    /// <remarks>
+    /// The callback payer must own the local row. The global creation switch is deliberately ignored so payments
+    /// issued before an operator disablement remain settleable.
+    /// </remarks>
+    private async Task ProcessUniquePayPaymentCallbackAsync(
+        CallbackQuery callbackQuery,
+        CancellationToken cancellationToken)
+    {
+        var value = callbackQuery.Data?["upchk_".Length..];
+        if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var paymentId))
+            return;
+        var payment = await _userDbContext.UniquePayPaymentInfos
+            .AsNoTracking()
+            .FirstOrDefaultAsync(
+                x => x.Id == paymentId &&
+                     x.TelegramUserId == callbackQuery.From.Id &&
+                     x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge,
+                cancellationToken);
+        if (payment == null)
+        {
+            await ActiveBotClient.AnswerCallbackQueryAsync(
+                callbackQuery.Id,
+                "فاکتور یونیک‌پی پیدا نشد.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        await ActiveBotClient.AnswerCallbackQueryAsync(
+            callbackQuery.Id,
+            "در حال استعلام رسمی از یونیک‌پی...",
+            cancellationToken: cancellationToken);
+        var settlement = await _uniquePayReconciliation.ReconcilePaymentAsync(
+            payment.Id,
+            "customer-check",
+            cancellationToken);
+        var latest = await _userDbContext.UniquePayPaymentInfos
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == payment.Id, cancellationToken);
+        var text = settlement.Status == NowPaymentsSettlementStatus.Applied
+            ? "✅ پرداخت یونیک‌پی تایید و کیف پول شما شارژ شد."
+            : settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded
+                ? "این پرداخت قبلاً تایید و به کیف پول شما اضافه شده است."
+                : string.Equals(latest?.PaymentStatus, UniquePayStatuses.Expired, StringComparison.Ordinal)
+                    ? "مهلت این فاکتور یونیک‌پی منقضی شده و هیچ مبلغی به کیف پول اضافه نشد."
+                    : string.Equals(latest?.PaymentStatus, UniquePayStatuses.Cancelled, StringComparison.Ordinal)
+                        ? "این فاکتور یونیک‌پی لغو شده و هیچ مبلغی به کیف پول اضافه نشد."
+                        : string.Equals(latest?.PaymentStatus, UniquePayStatuses.Failed, StringComparison.Ordinal)
+                            ? "اطلاعات این پرداخت با پاسخ معتبر یونیک‌پی منطبق نبود؛ برای امنیت، شارژ انجام نشد."
+                            : string.Equals(latest?.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal)
+                                ? "پرداخت تایید شده اما تسویه محلی برای بررسی امن مدیر متوقف شده است؛ شارژ تکراری انجام نمی‌شود."
+                                : "پرداخت هنوز به‌صورت معتبر تایید نشده است. کمی بعد دوباره بررسی کنید.";
+        var canRetry = settlement.Status == NowPaymentsSettlementStatus.ProviderNotPaid &&
+                       !UniquePayStatuses.IsTerminal(latest?.PaymentStatus) &&
+                       !string.Equals(latest?.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal);
+        await ActiveBotClient.SendTextMessageAsync(
+            callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+            text,
+            replyMarkup: canRetry
+                ? new InlineKeyboardMarkup(new[]
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"upchk_{payment.Id}") }
+                })
+                : MainReplyMarkupKeyboardFa(),
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Adds the saved UniquePay merchant hash to the configured platform return endpoint.
+    /// </summary>
+    /// <param name="hashId">Persisted merchant hash used only to locate the local row before provider inquiry.</param>
+    /// <returns>An absolute return URL preserving existing query parameters.</returns>
+    private string BuildUniquePayReturnUrl(string hashId)
+    {
+        var builder = new UriBuilder(_appConfig.UniquePayReturnUrl);
+        var prefix = string.IsNullOrWhiteSpace(builder.Query)
+            ? string.Empty
+            : builder.Query.TrimStart('?') + "&";
+        builder.Query = prefix + "hashId=" + Uri.EscapeDataString(hashId);
+        return builder.Uri.AbsoluteUri;
+    }
+
+    /// <summary>
     /// Creates and persists a Tetraminator invoice for an owned-bot wallet charge.
     /// </summary>
     /// <param name="message">Owned-bot customer message whose chat receives the invoice controls.</param>
@@ -7727,11 +8310,12 @@ public class TelegramBotService : IHostedService
         CancellationToken cancellationToken)
     {
         var amount = Convert.ToInt64(user.ConfigLink, CultureInfo.InvariantCulture);
-        if (!_appConfig.TetraminatorEnabled || amount < _appConfig.TetraminatorMinimumAmountToman)
+        if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) ||
+            amount < _appConfig.TetraminatorMinimumAmountToman)
         {
             await ActiveBotClient.SendTextMessageAsync(
                 message.Chat.Id,
-                !_appConfig.TetraminatorEnabled
+                !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator)
                     ? "درگاه تترامیناتور در حال حاضر غیرفعال است."
                     : $"حداقل مبلغ پرداخت با تترامیناتور {_appConfig.TetraminatorMinimumAmountToman.FormatCurrency()} است.",
                 replyMarkup: MainReplyMarkupKeyboardFa(),

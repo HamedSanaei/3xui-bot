@@ -12,12 +12,19 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/TenantBotService.cs`: tenant owner panel and tenant customer storefront flows.
 - `Controllers/PaymentController.cs`: payment IPN endpoints and gateway callbacks.
 
+## Build and Publish
+
+- Restore/build: `dotnet restore`, then `dotnet build Adminbot.sln --configuration Release --no-restore`.
+- Server publish: `dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained false` from the repository root.
+- The solution intentionally contains only the production `Adminbot` project. Do not add a separate test project or test-framework dependency unless the user explicitly requests that repository structure in the current task.
+- `Adminbot.csproj` excludes `Adminbot.Tests/**` from default SDK items so stale untracked `bin/obj` files in an existing server checkout cannot be compiled after the removed test project is deployed.
+
 ## Data Stores
 
 - `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox, and weekly usage-report dispatch leases.
 - `Data/CredentialsDbContex.cs`: unchanged shared user wallet/profile data; referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
-- `Data/configuration.example.json`: sanitized configuration example including every referral setting.
+- `Data/configuration.example.json`: sanitized configuration example including referral and four-gateway enable/readiness settings; all gateway switches and secret placeholders default to off/empty.
 - `Data/xui-v3-service-plans.json`: XUI v3 service catalog, prices, inbounds, duration options, unlimited fair-usage plans, and metered `minimumTrafficGb`.
 
 ## Core Services
@@ -33,6 +40,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/SalesAssistantService.cs`: central assistant bot for tenant sale notifications and manual receipt approval.
 - `Services/WalletLedgerService.cs`: append-only wallet ledger for credits/debits.
 - `Services/ReferralService.cs`: global owned-bot relationship registration, reward calculation, users.db state/ledger idempotency, user stats, notifications, and startup reconciliation.
+- `Domain/PaymentGatewayAvailability.cs`: process-wide live snapshot for HooshPay, Tetraminator, UniquePay, and NOWPayments. Super-admin target-state callbacks use this service; only root `enabled` booleans are persisted through the byte-preserving atomic JSON editor. API credentials remain restart-loaded and are never displayed or logged.
+- `Domain/UniquePay.cs`: UniquePay Bearer/form-urlencoded client, owned-wallet settlement, fail-closed amount/IRT/buyer-fee verification, durable settlement claims, and the polling reconciliation hosted service. New invoice creation is single-attempt; inquiry is bounded and read-only.
 - `Services/UsageAnalyticsService.cs`: completed Tehran-day aggregation of JSONL messages/callbacks, successful owned sales, and fulfilled tenant sales; excludes global super-admin ids and supports tenant bot filtering.
 - `Services/UsageReportChartRenderer.cs`: cross-platform SkiaSharp high-resolution line-chart PNG renderer with
   explicit Y scales, every weekly/monthly date, adaptive value labels, point markers, and current-versus-previous weekly comparison. It uses
@@ -56,10 +65,18 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 ## Payment and Ledger Rules
 
 - NOWPayments and HooshPay payment records live in `users.db` and can be linked to tenant orders.
-- New HooshPay invoices require the restart-loaded global `hooshPayEnabled` switch and, for tenant storefronts, the
+- UniquePay payment records live in `users.db` (`UniquePayPaymentInfos`) and link owned wallet charges or tenant orders through `HashId`, optional provider `RefId`, and `TenantBotOrder.UniquePayPaymentInfoId`. Migration `20260731000000_AddUniquePayPayments` also adds `BotInstance.TenantUniquePayEnabled` (default `true`) and reconciliation indexes; `credentials.db` is unchanged.
+- UniquePay amounts are Iranian toman/`IRT`. The configured default fee is 12% and is paid by the buyer. Settlement is fail-closed: authoritative `check-invoice` must return `status=true`, `code=200`, `isPaid=true`, matching hash/ref (when present), `currency=IRT`, `feePayer=buyer`, and `invoice.amount - invoice.fee` equal to the local base amount; fee must match 12% within one toman. `isVerified` is informational and not a settlement requirement.
+- UniquePay return URLs and the customer “check status” button only trigger official inquiry. A background worker polls pending rows in batches using `NextInquiryAtUtc`; disabling the global switch hides/blocks new invoices but never stops inquiry or settlement of existing rows. Explicit provider lifecycle hints map to `expired`, `cancelled`, or `failed`; absent/unknown hints remain `pending`, and network errors remain retryable. Creation failures log safe bot/tenant/order/payment identifiers and provider status codes only.
+- UniquePay settlement uses an atomic users.db claim (`pending -> processing -> settled`) before wallet/XUI side effects. Because wallet/tenant fulfillment crosses users.db, credentials.db, and XUI, a process crash after the claim is ambiguous; claims stale for 30 minutes move to `manual_review` and are never automatically replayed, preventing duplicate wallet credit, owner profit, or account delivery.
+- Tenant UniquePay availability is `global UniquePay enabled && TenantUniquePayEnabled`; the tenant owner panel shows `سراسری خاموش` when the global switch is off and refuses local enabling until global configuration is ready.
+- Super-admin `⚙️ مدیریت درگاه‌ها` displays all four live gateway states, root key names, and configuration readiness without exposing secrets. Enabling a gateway with missing token/URL is rejected. Target-state callbacks carry a revision and short expiry, and are restricted to configured super-admin ids.
+- New HooshPay invoices require the live global `hooshPayEnabled` switch and, for tenant storefronts, the
   per-tenant `TenantHooshPayEnabled` preference. Disabling either switch hides and blocks only new invoices, including
   stale Telegram callbacks; existing rows remain eligible for status checks, IPN processing, and settlement. A missing
   global key is disabled, while the tracked operational configuration explicitly keeps the gateway enabled.
+- NOWPayments creation uses the same live global snapshot and, for tenant storefronts, `TenantNowPaymentsEnabled`;
+  IPN validation and settlement of existing crypto invoices continue when new creation is disabled.
 - Tetraminator is the second rial gateway for owned wallet charges and direct tenant purchase/renew orders. Its
   `TetraminatorPaymentInfos` rows live only in `users.db`; `OrderId` and non-null `PayId` are unique. The public GET
   callback is unsigned and therefore only triggers an authoritative `GET /payment/inquiry/{pay_id}`. Settlement

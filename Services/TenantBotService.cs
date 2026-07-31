@@ -38,6 +38,10 @@ public class TenantBotService
     /// callbacks for the same tenant order from issuing two non-idempotent provider create requests.
     /// </remarks>
     private static readonly SemaphoreSlim TenantTetraminatorInvoiceCreationGate = new(1, 1);
+    /// <summary>
+    /// Serializes the local claim before UniquePay's non-retried invoice creation request.
+    /// </summary>
+    private static readonly SemaphoreSlim TenantUniquePayInvoiceCreationGate = new(1, 1);
     public const string OwnerMenuButton = "🛒 فعالسازی ربات فروشگاهی";
 
     private const string OWNERCALLBACKPREFIX = "TBM:";
@@ -72,6 +76,8 @@ public class TenantBotService
     private readonly HooshPay _hooshPay;
     private readonly NowPayments _nowPayments;
     private readonly Tetraminator _tetraminator;
+    private readonly UniquePay _uniquePay;
+    private readonly IPaymentGatewayAvailability _gatewayAvailability;
     private readonly BotRegistry _botRegistry;
     private readonly BotClientProvider _botClientProvider;
     private readonly BotContextAccessor _botContextAccessor;
@@ -98,6 +104,12 @@ public class TenantBotService
     /// <param name="Tetraminator">
     /// Tetraminator API client used to create rial tenant invoices and authoritatively verify their saved pay ids.
     /// The provider key is read from global configuration and must never be logged or stored on tenant rows.
+    /// </param>
+    /// <param name="UniquePay">
+    /// UniquePay API client used to create tenant purchase and renewal invoices with the saved merchant hash.
+    /// </param>
+    /// <param name="GatewayAvailability">
+    /// Live global gateway switches combined with each tenant's local preference.
     /// </param>
     /// <param name="BotRegistry">runtime Bot registry.</param>
     /// <param name="BotClientProvider">Telegram client Provider for owned and tenant bots.</param>
@@ -133,6 +145,8 @@ public class TenantBotService
         HooshPay HooshPay,
         NowPayments NowPayments,
         Tetraminator Tetraminator,
+        UniquePay UniquePay,
+        IPaymentGatewayAvailability GatewayAvailability,
         BotRegistry BotRegistry,
         BotClientProvider BotClientProvider,
         BotContextAccessor BotContextAccessor,
@@ -153,6 +167,8 @@ public class TenantBotService
         _hooshPay = HooshPay;
         _nowPayments = NowPayments;
         _tetraminator = Tetraminator;
+        _uniquePay = UniquePay;
+        _gatewayAvailability = GatewayAvailability;
         _botRegistry = BotRegistry;
         _botClientProvider = BotClientProvider;
         _botContextAccessor = BotContextAccessor;
@@ -711,8 +727,8 @@ public class TenantBotService
     /// <param name="tokenNotice">Optional HTML-safe status line produced by token validation before panel rendering.</param>
     /// <returns>Html-formatted panel Text.</returns>
     /// <remarks>
-    /// Gateway status combines tenant preferences with global application switches. When HooshPay or Tetraminator is
-    /// disabled globally, the panel reports <c>سراسری خاموش</c> without changing the tenant's persisted preference.
+    /// Gateway status combines tenant preferences with live global switches. When a gateway is disabled globally, the
+    /// panel reports <c>سراسری خاموش</c> without changing the tenant's persisted preference.
     /// </remarks>
     private string BUILDOWNERPANELTEXT(BotInstance tenant, CredUser owner, string tokenNotice = null)
     {
@@ -741,9 +757,10 @@ public class TenantBotService
                $"{STATUSICON(true)} درصد سود روی قیمت همکار: <code>{markup}%</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.SupportAccount))} پشتیبانی فروشگاه: <code>{Html(support)}</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.TenantWelcomeText))} متن خوشامد: <code>{Html(WELCOME)}</code>\n" +
-               $"{STATUSICON(_appConfig.HooshPayEnabled && tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(!_appConfig.HooshPayEnabled ? "سراسری خاموش" : tenant?.TenantHooshPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
-               $"{STATUSICON(_appConfig.TetraminatorEnabled && tenant?.TenantTetraminatorEnabled == true)} درگاه تترامیناتور: <b>{Html(!_appConfig.TetraminatorEnabled ? "سراسری خاموش" : tenant?.TenantTetraminatorEnabled == true ? "روشن" : "خاموش")}</b>\n" +
-               $"{STATUSICON(tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(tenant?.TenantNowPaymentsEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) && tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) ? "سراسری خاموش" : tenant?.TenantHooshPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) && tenant?.TenantTetraminatorEnabled == true)} درگاه تترامیناتور: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) ? "سراسری خاموش" : tenant?.TenantTetraminatorEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) && tenant?.TenantUniquePayEnabled == true)} درگاه یونیک‌پی (۱۲٪): <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) ? "سراسری خاموش" : tenant?.TenantUniquePayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ? "سراسری خاموش" : tenant?.TenantNowPaymentsEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(tenant?.TenantCardPaymentEnabled == true)} کارت به کارت همکار: <code>{Html(card)}</code>\n" +
                $"{STATUSICON(tenant?.TenantMandatoryJoinEnabled == true)} جوین اجباری فروشگاه: <code>{Html(TENANTJOIN)}</code>\n" +
                $"{STATUSICON(IsEnabled)} وضعیت: <b>{Html(IsEnabled ? "روشن" : "خاموش")}</b>\n\n" +
@@ -761,6 +778,7 @@ public class TenantBotService
         var HOOSHPAYENABLED = tenant?.TenantHooshPayEnabled == true;
         var TETRAMINATORENABLED = tenant?.TenantTetraminatorEnabled == true;
         var NOWPAYMENTSENABLED = tenant?.TenantNowPaymentsEnabled == true;
+        var UNIQUEPAYENABLED = tenant?.TenantUniquePayEnabled == true;
         var CARDENABLED = tenant?.TenantCardPaymentEnabled == true;
         var JOINENABLED = tenant?.TenantMandatoryJoinEnabled == true;
         var revision = BuildTenantPanelRevision(tenant);
@@ -793,6 +811,10 @@ public class TenantBotService
             {
                 InlineKeyboardButton.WithCallbackData(TETRAMINATORENABLED ? "✅ تترامیناتور" : "❌ تترامیناتور", BuildTenantSettingCallback("Tetraminator", !TETRAMINATORENABLED, revision, issuedAt)),
                 InlineKeyboardButton.WithCallbackData(NOWPAYMENTSENABLED ? "✅ ارز دیجیتال" : "❌ ارز دیجیتال", BuildTenantSettingCallback("NowPayments", !NOWPAYMENTSENABLED, revision, issuedAt))
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(UNIQUEPAYENABLED ? "✅ یونیک‌پی ۱۲٪" : "❌ یونیک‌پی ۱۲٪", BuildTenantSettingCallback("UniquePay", !UNIQUEPAYENABLED, revision, issuedAt))
             },
             new[]
             {
@@ -1908,7 +1930,7 @@ public class TenantBotService
     /// <param name="botClient">Main owned Bot client used to answer the owner callback.</param>
     /// <param name="CallbackQuery">Callback carrying the owner panel revision and Telegram callback id.</param>
     /// <param name="owner">colleague User who owns the tenant storefront.</param>
-    /// <param name="setting">Short setting key from callback data: card, HooshPay, Tetraminator, NowPayments, or join.</param>
+    /// <param name="setting">Short setting key from callback data: card, HooshPay, Tetraminator, UniquePay, NowPayments, or join.</param>
     /// <param name="desiredEnabled">Desired final value. Repeating the same callback does not invert the setting.</param>
     /// <param name="expectedRevision">Revision embedded in the panel keyboard that must match the current tenant row.</param>
     /// <param name="issuedAt">Hexadecimal Unix timestamp used to reject mutation buttons older than ten minutes.</param>
@@ -1916,8 +1938,8 @@ public class TenantBotService
     /// <remarks>
     /// Forced join is validated immediately before it is enabled. The callback is acknowledged before any Telegram
     /// network probe, and validation failures are delivered as normal owner messages because callback answers can
-    /// only be sent once. HooshPay and Tetraminator tenant preferences cannot be enabled while their corresponding
-    /// global application switches are disabled.
+    /// only be sent once. HooshPay, Tetraminator, UniquePay, and NOWPayments tenant preferences cannot be enabled
+    /// while their corresponding live global application switches are disabled.
     /// </remarks>
     private async Task SETTENANTSETTINGASYNC(
         ITelegramBotClient botClient,
@@ -1978,7 +2000,7 @@ public class TenantBotService
                 break;
             case "HooshPay":
                 currentEnabled = tenant.TenantHooshPayEnabled;
-                if (desiredEnabled && !_appConfig.HooshPayEnabled)
+                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay))
                 {
                     await SafeAnswerCallbackQueryAsync(
                         botClient,
@@ -1991,7 +2013,7 @@ public class TenantBotService
                 break;
             case "Tetraminator":
                 currentEnabled = tenant.TenantTetraminatorEnabled;
-                if (desiredEnabled && !_appConfig.TetraminatorEnabled)
+                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator))
                 {
                     await SafeAnswerCallbackQueryAsync(
                         botClient,
@@ -2002,8 +2024,31 @@ public class TenantBotService
                     return;
                 }
                 break;
+            case "UniquePay":
+                currentEnabled = tenant.TenantUniquePayEnabled;
+                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay))
+                {
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient,
+                        CallbackQuery.Id,
+                        "درگاه یونیک‌پی در تنظیمات سراسری خاموش است.",
+                        showAlert: true,
+                        cancellationToken: CancellationToken);
+                    return;
+                }
+                break;
             case "NowPayments":
                 currentEnabled = tenant.TenantNowPaymentsEnabled;
+                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments))
+                {
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient,
+                        CallbackQuery.Id,
+                        "درگاه ارز دیجیتال در تنظیمات سراسری خاموش است.",
+                        showAlert: true,
+                        cancellationToken: CancellationToken);
+                    return;
+                }
                 break;
             case "join":
                 currentEnabled = tenant.TenantMandatoryJoinEnabled;
@@ -2054,6 +2099,9 @@ public class TenantBotService
                 break;
             case "Tetraminator":
                 tenant.TenantTetraminatorEnabled = desiredEnabled;
+                break;
+            case "UniquePay":
+                tenant.TenantUniquePayEnabled = desiredEnabled;
                 break;
             case "NowPayments":
                 tenant.TenantNowPaymentsEnabled = desiredEnabled;
@@ -3889,6 +3937,7 @@ public class TenantBotService
 
         if (action.StartsWith("PAYHP:", StringComparison.Ordinal) ||
             action.StartsWith("PAYTM:", StringComparison.Ordinal) ||
+            action.StartsWith("PAYUP:", StringComparison.Ordinal) ||
             action.StartsWith("PAYNP:", StringComparison.Ordinal) ||
             action.StartsWith("PAYCARD:", StringComparison.Ordinal))
         {
@@ -3911,6 +3960,11 @@ public class TenantBotService
                 await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantTetraminatorInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             }
+            else if (Provider == "PAYUP")
+            {
+                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await CreateTenantUniquePayInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
+            }
             else if (Provider == "PAYNP")
             {
                 await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
@@ -3926,6 +3980,7 @@ public class TenantBotService
 
         if (action.StartsWith("RNHP:", StringComparison.Ordinal) ||
             action.StartsWith("RNTM:", StringComparison.Ordinal) ||
+            action.StartsWith("RNUP:", StringComparison.Ordinal) ||
             action.StartsWith("RNNP:", StringComparison.Ordinal) ||
             action.StartsWith("RNCARD:", StringComparison.Ordinal))
         {
@@ -3941,6 +3996,8 @@ public class TenantBotService
                 await CreateTenantHooshPayInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
             else if (provider == "RNTM")
                 await CreateTenantTetraminatorInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
+            else if (provider == "RNUP")
+                await CreateTenantUniquePayInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
             else if (provider == "RNNP")
                 await CreateTenantNowPaymentsInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
             else
@@ -4288,8 +4345,8 @@ public class TenantBotService
     /// <param name="CancellationToken">Cancellation Token.</param>
     /// <remarks>
     /// Every enabled online gateway is displayed as instant and includes its customer-facing fee percentage:
-    /// NOWPayments 0%, Tetraminator 12%, and HooshPay 15%. Callback data remains unchanged, so previously issued
-    /// invoices and idempotent settlement behavior are unaffected by these display labels.
+    /// NOWPayments 0%, Tetraminator 12%, UniquePay 12%, and HooshPay 15%. Callback data remains unchanged, so
+    /// previously issued invoices and idempotent settlement behavior are unaffected by these display labels.
     /// </remarks>
     private async Task SHOWCUSTOMERCONFIRMASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, XuiV3PurchaseSelection selection, CancellationToken CancellationToken)
     {
@@ -4309,7 +4366,9 @@ public class TenantBotService
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ هوش‌پی آنی | کارمزد ۱۵٪", CUSTOMERCALLBACKPREFIX + "PAYHP:" + BUILDPAYACTION(selection)) });
         if (IsTenantTetraminatorAvailable(tenant, Price.SalePriceToman))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + "PAYTM:" + BUILDPAYACTION(selection)) });
-        if (tenant.TenantNowPaymentsEnabled)
+        if (IsTenantUniquePayAvailable(tenant))
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + "PAYUP:" + BUILDPAYACTION(selection)) });
+        if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی | کارمزد ۰٪", CUSTOMERCALLBACKPREFIX + "PAYNP:" + BUILDPAYACTION(selection)) });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("کارت‌به‌کارت به فروشگاه", CUSTOMERCALLBACKPREFIX + "PAYCARD:" + BUILDPAYACTION(selection)) });
@@ -4483,6 +4542,18 @@ public class TenantBotService
         XuiV3PurchaseSelection selection,
         CancellationToken CancellationToken)
     {
+        if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ||
+            tenant?.TenantNowPaymentsEnabled != true)
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "درگاه ارز دیجیتال برای این فروشگاه در حال حاضر غیرفعال است.",
+                showAlert: true,
+                cancellationToken: CancellationToken);
+            return;
+        }
+
         var ChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
         var Price = CalculateTenantPrice(tenant, selection);
         var order = CreateTenantOrder(tenant, customer, ChatId, selection, Price, "NowPayments");
@@ -4757,6 +4828,18 @@ public class TenantBotService
         int orderDbId,
         CancellationToken cancellationToken)
     {
+        if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ||
+            tenant?.TenantNowPaymentsEnabled != true)
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "درگاه ارز دیجیتال برای این فروشگاه در حال حاضر غیرفعال است.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
         var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
         if (order == null)
         {
@@ -4819,6 +4902,285 @@ public class TenantBotService
             await _userDbcontext.SaveChangesAsync(cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "ساخت فاکتور ناموفق بود.", showAlert: true, cancellationToken: cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Creates a UniquePay invoice for a new tenant storefront purchase.
+    /// </summary>
+    /// <param name="botClient">Tenant storefront client used for customer-facing invoice delivery.</param>
+    /// <param name="callbackQuery">Customer callback that selected UniquePay for a prepared plan.</param>
+    /// <param name="tenant">Tenant bot owning pricing, local gateway preference, and owner profit.</param>
+    /// <param name="customer">Shared credentials profile of the tenant customer.</param>
+    /// <param name="selection">Selected XUI service, traffic, duration, or unlimited plan.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db, provider, and Telegram operations.</param>
+    /// <remarks>
+    /// The global/live and tenant switches are checked before order creation. The local order and UniquePay row are
+    /// persisted before the one non-retried create call so an ambiguous response is auditable and cannot be duplicated
+    /// by a stale callback.
+    /// </remarks>
+    private async Task CreateTenantUniquePayInvoiceAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        BotInstance tenant,
+        CredUser customer,
+        XuiV3PurchaseSelection selection,
+        CancellationToken cancellationToken)
+    {
+        var price = CalculateTenantPrice(tenant, selection);
+        if (!IsTenantUniquePayAvailable(tenant))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                BuildTenantUniquePayUnavailableMessage(),
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "UniquePay");
+        _userDbcontext.TenantBotOrders.Add(order);
+        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await CreateTenantUniquePayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
+    }
+
+    /// <summary>
+    /// Reuses an existing pending tenant renewal order while creating its UniquePay invoice.
+    /// </summary>
+    /// <param name="botClient">Tenant storefront client used for invoice delivery.</param>
+    /// <param name="callbackQuery">Customer callback that selected UniquePay for renewal.</param>
+    /// <param name="tenant">Tenant storefront owning the order.</param>
+    /// <param name="customer">Customer whose XUI account is being renewed.</param>
+    /// <param name="orderDbId">Internal users.db id of the pending renewal order.</param>
+    /// <param name="cancellationToken">Cancellation token for database, provider, and Telegram work.</param>
+    /// <remarks>
+    /// The existing order is reloaded and the global/local availability guard is evaluated before any payment row or
+    /// provider call. A fulfilled order or stale callback cannot create a new invoice.
+    /// </remarks>
+    private async Task CreateTenantUniquePayInvoiceForExistingOrderAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        BotInstance tenant,
+        CredUser customer,
+        int orderDbId,
+        CancellationToken cancellationToken)
+    {
+        var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
+        if (order == null)
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (!IsTenantUniquePayAvailable(tenant))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                BuildTenantUniquePayUnavailableMessage(),
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        order.PaymentProvider = "UniquePay";
+        order.UpdatedAtUtc = DateTime.UtcNow;
+        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await CreateTenantUniquePayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
+    }
+
+    /// <summary>
+    /// Persists and creates the UniquePay invoice shared by tenant purchases and renewals.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client used for customer-facing payment text and buttons.</param>
+    /// <param name="callbackQuery">Callback acknowledged after invoice creation or safe failure.</param>
+    /// <param name="tenant">Tenant bot attribution and local gateway preference.</param>
+    /// <param name="customer">Tenant customer receiving the payment link.</param>
+    /// <param name="order">Tracked purchase/renewal order whose sale amount is the financial source of truth.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db, UniquePay, and Telegram work.</param>
+    /// <remarks>
+    /// Creation is not retried. A known prior link is reused; an ambiguous prior attempt is blocked for review rather
+    /// than issuing a second provider invoice. The buyer fee is displayed as 12% and is verified later by polling.
+    /// </remarks>
+    private async Task CreateTenantUniquePayInvoiceCoreAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        BotInstance tenant,
+        CredUser customer,
+        TenantBotOrder order,
+        CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        UniquePayPaymentInfo payment;
+        string existingPaymentLink = null;
+        var ambiguous = false;
+
+        await TenantUniquePayInvoiceCreationGate.WaitAsync(cancellationToken);
+        try
+        {
+            payment = await _userDbcontext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+                x => x.TenantBotOrderId == order.Id || x.HashId == order.OrderId,
+                cancellationToken);
+            if (payment != null)
+            {
+                if (!string.IsNullOrWhiteSpace(payment.PaymentLink))
+                {
+                    order.UniquePayPaymentInfoId = payment.Id;
+                    order.PaymentUrl = payment.PaymentLink;
+                    order.UpdatedAtUtc = DateTime.UtcNow;
+                    await _userDbcontext.SaveChangesAsync(cancellationToken);
+                    existingPaymentLink = payment.PaymentLink;
+                }
+                else
+                {
+                    ambiguous = true;
+                }
+            }
+            else
+            {
+                payment = new UniquePayPaymentInfo
+                {
+                    HashId = UniquePayPaymentInfo.CreateHashId(customer.TelegramUserId),
+                    BaseAmountToman = order.SalePriceToman,
+                    FeePercent = _appConfig.UniquePayFeePercent,
+                    TelegramUserId = customer.TelegramUserId,
+                    ChatId = chatId,
+                    BotId = tenant.Id,
+                    BotUsername = tenant.Username,
+                    PaymentPurpose = TenantBotPaymentPurposes.TenantOrder,
+                    TenantBotOrderId = order.Id,
+                    TenantOwnerTelegramUserId = tenant.OwnerTelegramUserId,
+                    PaymentStatus = UniquePayStatuses.Pending,
+                    NextInquiryAtUtc = DateTime.UtcNow,
+                    CreatedAtUtc = DateTime.UtcNow
+                };
+                payment.RawRequestJson = JsonConvert.SerializeObject(new
+                {
+                    hashId = payment.HashId,
+                    amount = payment.BaseAmountToman,
+                    redirectUrl = BuildUniquePayReturnUrl(payment.HashId)
+                });
+                _userDbcontext.UniquePayPaymentInfos.Add(payment);
+                await _userDbcontext.SaveChangesAsync(cancellationToken);
+            }
+        }
+        finally
+        {
+            TenantUniquePayInvoiceCreationGate.Release();
+        }
+
+        if (!string.IsNullOrWhiteSpace(existingPaymentLink))
+        {
+            await botClient.SendTextMessageAsync(
+                chatId,
+                BUILDTENANTGATEWAYPAYMENTTEXT(order, "یونیک‌پی | کارمزد ۱۲٪"),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantPaymentKeyboard(order, existingPaymentLink),
+                cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "فاکتور قبلی یونیک‌پی دوباره نمایش داده شد.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (ambiguous)
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "ساخت فاکتور قبلی نامشخص است؛ از ایجاد پرداخت تکراری جلوگیری شد.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        try
+        {
+            var invoice = await _uniquePay.CreateInvoiceAsync(
+                payment.HashId,
+                payment.BaseAmountToman,
+                BuildUniquePayReturnUrl(payment.HashId),
+                cancellationToken);
+            payment.Apply(invoice);
+            payment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(Math.Clamp(
+                _appConfig.UniquePayReconciliationIntervalSeconds,
+                10,
+                3600));
+            order.UniquePayPaymentInfoId = payment.Id;
+            order.PaymentUrl = payment.PaymentLink;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+
+            await botClient.SendTextMessageAsync(
+                chatId,
+                BUILDTENANTGATEWAYPAYMENTTEXT(order, "یونیک‌پی | کارمزد ۱۲٪"),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantPaymentKeyboard(order, payment.PaymentLink),
+                cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور یونیک‌پی ساخته شد.", cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            var definitiveFailure = UniquePay.IsDefinitiveCreateFailure(ex);
+            order.PaymentStatus = definitiveFailure
+                ? TenantBotOrderStatuses.Failed
+                : TenantBotOrderStatuses.Pending;
+            order.ErrorMessage = ex.Message;
+            payment.ErrorCode = ex is UniquePayApiException apiException
+                ? apiException.StatusCode.ToString(CultureInfo.InvariantCulture)
+                : "create_failed";
+            payment.ErrorMessage = ex.Message;
+            payment.RawResponseJson = ex is UniquePayApiException providerError
+                ? providerError.ResponseBody
+                : payment.RawResponseJson;
+            payment.PaymentStatus = definitiveFailure ? UniquePayStatuses.Failed : UniquePayStatuses.Pending;
+            payment.NextInquiryAtUtc = definitiveFailure
+                ? null
+                : DateTime.UtcNow.AddSeconds(Math.Clamp(
+                    _appConfig.UniquePayReconciliationIntervalSeconds,
+                    10,
+                    3600));
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            _logger.LogError(
+                ex,
+                "UniquePay tenant invoice creation failed. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, amountToman={AmountToman}, providerCode={ProviderCode}",
+                tenant.Id,
+                order.OrderId,
+                payment.Id,
+                order.SalePriceToman,
+                payment.ErrorCode);
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "ساخت فاکتور یونیک‌پی ناموفق بود.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Builds the UniquePay return trigger URL while preserving configured query parameters.
+    /// </summary>
+    /// <param name="hashId">Merchant hash used only to locate the saved row before official inquiry.</param>
+    /// <returns>Absolute configured return endpoint with the escaped hash query.</returns>
+    private string BuildUniquePayReturnUrl(string hashId)
+    {
+        var builder = new UriBuilder(_appConfig.UniquePayReturnUrl);
+        var prefix = string.IsNullOrWhiteSpace(builder.Query)
+            ? string.Empty
+            : builder.Query.TrimStart('?') + "&";
+        builder.Query = prefix + "hashId=" + Uri.EscapeDataString(hashId);
+        return builder.Uri.AbsoluteUri;
     }
 
     /// <summary>
@@ -5257,6 +5619,199 @@ public class TenantBotService
                 return NowPaymentsSettlementResult.InvalidAmount();
             }
         }
+    }
+
+    /// <summary>
+    /// Fulfills a UniquePay tenant order exactly once after a verified provider inquiry.
+    /// </summary>
+    /// <param name="payment">
+    /// Tracked users.db payment whose purpose is <see cref="TenantBotPaymentPurposes.TenantOrder" /> and whose
+    /// hash, IRT amount, buyer fee, reference, and exact <c>paid</c> status were verified against UniquePay.
+    /// </param>
+    /// <param name="Source">Audit source such as callback, customer check, or super-admin check.</param>
+    /// <param name="CancellationToken">Cancellation token for users.db, XUI, wallet ledger, and Telegram operations.</param>
+    /// <returns>
+    /// Settlement result from the shared tenant fulfillment path. Repeated callbacks return an already-applied
+    /// result and never create another account, owner-profit credit, or ledger entry.
+    /// </returns>
+    /// <remarks>
+    /// This method never accepts provisional approval. It only consumes an already provider-verified payment row;
+    /// callers handling return, customer-check, or worker triggers must perform
+    /// <see cref="UniquePayPaymentVerifier.IsVerifiedPaid" /> immediately before invoking it.
+    /// </remarks>
+    public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
+        UniquePayPaymentInfo payment,
+        string Source,
+        CancellationToken CancellationToken = default)
+    {
+        if (payment == null ||
+            !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) ||
+            !UniquePayStatuses.IsPaid(payment.PaymentStatus) ||
+            string.IsNullOrWhiteSpace(payment.HashId) ||
+            !payment.PaidAtUtc.HasValue)
+        {
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+
+        payment = await _userDbcontext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+            x => x.Id == payment.Id,
+            CancellationToken);
+        if (payment == null)
+            return NowPaymentsSettlementResult.NotFound();
+        if (payment.IsAddedToBalance ||
+            string.Equals(payment.SettlementState, UniquePaySettlementStates.Settled, StringComparison.Ordinal))
+        {
+            return NowPaymentsSettlementResult.AlreadyAdded(payment.BalanceAfter ?? 0);
+        }
+        if (await RejectActiveOrAmbiguousUniquePayTenantClaimAsync(payment, CancellationToken))
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+
+        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+            x => x.Id == payment.TenantBotOrderId || x.OrderId == payment.HashId,
+            CancellationToken);
+        if (order == null)
+        {
+            payment.SettlementState = UniquePaySettlementStates.ManualReview;
+            payment.ErrorCode = "tenant_order_not_found";
+            payment.ErrorMessage = "The paid UniquePay row is not linked to a tenant order.";
+            payment.NextInquiryAtUtc = null;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            _logger.LogError(
+                "Paid UniquePay tenant row has no order and requires manual review. paymentId={PaymentId}, hashId={HashId}, tenantOrderId={TenantOrderId}",
+                payment.Id,
+                payment.HashId,
+                payment.TenantBotOrderId);
+            return NowPaymentsSettlementResult.NotFound();
+        }
+
+        var attemptId = Guid.NewGuid().ToString("N");
+        var claimedAtUtc = DateTime.UtcNow;
+        var claimed = await _userDbcontext.UniquePayPaymentInfos
+            .Where(x => x.Id == payment.Id &&
+                        !x.IsAddedToBalance &&
+                        (x.SettlementState == null || x.SettlementState == UniquePaySettlementStates.Pending))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.SettlementState, UniquePaySettlementStates.Processing)
+                    .SetProperty(x => x.SettlementAttemptId, attemptId)
+                    .SetProperty(x => x.SettlementStartedAtUtc, claimedAtUtc)
+                    .SetProperty(x => x.UpdatedAtUtc, claimedAtUtc),
+                CancellationToken);
+        if (claimed != 1)
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+
+        await _userDbcontext.Entry(payment).ReloadAsync(CancellationToken);
+        NowPaymentsSettlementResult settlement;
+        try
+        {
+            settlement = await FULFILLPAIDTENANTORDERASYNC(order, Source, null, null, false, CancellationToken);
+        }
+        catch (Exception ex)
+        {
+            payment.SettlementState = UniquePaySettlementStates.ManualReview;
+            payment.ErrorCode = "tenant_fulfillment_ambiguous";
+            payment.ErrorMessage = ex.Message;
+            payment.NextInquiryAtUtc = null;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            _logger.LogError(
+                ex,
+                "UniquePay tenant fulfillment became ambiguous and stopped for manual review. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, attemptId={AttemptId}",
+                order.TenantBotId,
+                order.OrderId,
+                payment.Id,
+                payment.SettlementAttemptId);
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+
+        if (settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded)
+        {
+            payment.IsAddedToBalance = true;
+            payment.SettlementState = UniquePaySettlementStates.Settled;
+            payment.SettlementAttemptId = null;
+            payment.SettlementStartedAtUtc = null;
+            payment.SettledAtUtc ??= order.FulfilledAtUtc ?? DateTime.UtcNow;
+            payment.BalanceBefore = settlement.BeforeBalance;
+            payment.BalanceAfter = settlement.AfterBalance;
+            payment.ErrorCode = null;
+            payment.ErrorMessage = null;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+        }
+        else if (settlement.Status is NowPaymentsSettlementStatus.UserNotFound or NowPaymentsSettlementStatus.PaymentNotFound)
+        {
+            // No XUI or wallet mutation occurs before these precondition failures, so a later retry is safe.
+            payment.SettlementState = UniquePaySettlementStates.Pending;
+            payment.SettlementAttemptId = null;
+            payment.SettlementStartedAtUtc = null;
+            payment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(Math.Clamp(
+                _appConfig.UniquePayReconciliationIntervalSeconds,
+                10,
+                3600));
+            payment.ErrorCode = "tenant_fulfillment_prerequisite_failed";
+            payment.ErrorMessage = order.ErrorMessage;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+        }
+        else
+        {
+            // InvalidAmount can be returned after an ambiguous XUI or cross-database owner-wallet operation.
+            // Automatic replay would risk duplicate account delivery or profit credit, so require operator review.
+            payment.SettlementState = UniquePaySettlementStates.ManualReview;
+            payment.ErrorCode = "tenant_fulfillment_ambiguous";
+            payment.ErrorMessage = order.ErrorMessage;
+            payment.NextInquiryAtUtc = null;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            _logger.LogError(
+                "UniquePay tenant fulfillment stopped for manual review. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, attemptId={AttemptId}, settlementStatus={SettlementStatus}",
+                order.TenantBotId,
+                order.OrderId,
+                payment.Id,
+                payment.SettlementAttemptId,
+                settlement.Status);
+        }
+
+        return settlement;
+    }
+
+    /// <summary>
+    /// Rejects a concurrent UniquePay tenant fulfillment claim and terminally quarantines a stale claim.
+    /// </summary>
+    /// <param name="payment">Tracked, officially paid tenant UniquePay row.</param>
+    /// <param name="cancellationToken">Cancellation token for the users.db transition.</param>
+    /// <returns><c>true</c> when automatic fulfillment must stop; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// A stale processing claim may have crossed the XUI or credentials.db side-effect boundary. It is therefore
+    /// placed in manual review rather than replayed, preserving fail-closed financial and delivery semantics.
+    /// </remarks>
+    private async Task<bool> RejectActiveOrAmbiguousUniquePayTenantClaimAsync(
+        UniquePayPaymentInfo payment,
+        CancellationToken cancellationToken)
+    {
+        if (string.Equals(payment.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal))
+            return true;
+        if (!string.Equals(payment.SettlementState, UniquePaySettlementStates.Processing, StringComparison.Ordinal))
+            return false;
+        if (payment.SettlementStartedAtUtc.HasValue &&
+            DateTime.UtcNow - payment.SettlementStartedAtUtc.Value < TimeSpan.FromMinutes(30))
+        {
+            return true;
+        }
+
+        payment.SettlementState = UniquePaySettlementStates.ManualReview;
+        payment.ErrorCode = "tenant_fulfillment_claim_ambiguous";
+        payment.ErrorMessage = "A previous UniquePay tenant fulfillment claim became stale and requires manual review.";
+        payment.NextInquiryAtUtc = null;
+        payment.UpdatedAtUtc = DateTime.UtcNow;
+        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        _logger.LogError(
+            "UniquePay stale tenant fulfillment claim stopped for manual review. tenantOrderId={TenantOrderId}, paymentId={PaymentId}, attemptId={AttemptId}",
+            payment.TenantBotOrderId,
+            payment.Id,
+            payment.SettlementAttemptId);
+        return true;
     }
 
     /// <summary>
@@ -5974,12 +6529,55 @@ public class TenantBotService
             }
             else
             {
+                var uniquePay = await _userDbcontext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+                    x => x.TenantBotOrderId == order.Id || x.HashId == order.OrderId,
+                    CancellationToken);
+                if (uniquePay != null)
+                {
+                    var inquiry = await _uniquePay.CheckInvoiceAsync(uniquePay.HashId, CancellationToken);
+                    uniquePay.Apply(
+                        inquiry,
+                        DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.UniquePayReconciliationIntervalSeconds, 10, 3600)));
+                    var providerTerminalStatus = UniquePayStatuses.GetProviderTerminalStatus(inquiry.Invoice);
+                    if (providerTerminalStatus != null)
+                    {
+                        uniquePay.PaymentStatus = providerTerminalStatus;
+                        uniquePay.ErrorCode = $"provider_{providerTerminalStatus}";
+                        uniquePay.ErrorMessage = "UniquePay reported a terminal unpaid invoice state.";
+                        uniquePay.NextInquiryAtUtc = null;
+                    }
+                    else if (UniquePayPaymentVerifier.IsVerifiedPaid(uniquePay, inquiry, out var errorCode))
+                    {
+                        uniquePay.ErrorCode = null;
+                        uniquePay.ErrorMessage = null;
+                        uniquePay.PaymentStatus = UniquePayStatuses.Paid;
+                        uniquePay.PaidAtUtc ??= DateTime.UtcNow;
+                        uniquePay.NextInquiryAtUtc = null;
+                    }
+                    else
+                    {
+                        uniquePay.ErrorCode = errorCode;
+                        uniquePay.ErrorMessage = errorCode == "provider_not_paid"
+                            ? null
+                            : "UniquePay verification failed.";
+                        if (errorCode != "provider_not_paid")
+                        {
+                            uniquePay.PaymentStatus = UniquePayStatuses.Failed;
+                            uniquePay.NextInquiryAtUtc = null;
+                        }
+                    }
+                    await _userDbcontext.SaveChangesAsync(CancellationToken);
+                    settlement = await ApplyPaidTenantOrderAsync(uniquePay, "super-admin-orderid-manual", CancellationToken);
+                }
+                else
+                {
                 var nowPayments = await _userDbcontext.SwapinoPaymentInfos.FirstOrDefaultAsync(
                     x => x.TenantBotOrderId == order.Id || x.OrderId == order.OrderId,
                     CancellationToken);
                 settlement = nowPayments != null
                     ? await ApplyPaidTenantOrderAsync(nowPayments, "super-admin-orderid-manual", CancellationToken)
                     : await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, false, CancellationToken);
+                }
             }
         }
 
@@ -6132,6 +6730,7 @@ public class TenantBotService
     /// this user and to the current tenant bot context.
     /// </param>
     /// <param name="CancellationToken">Cancellation token for provider API calls, users.db writes, and Telegram replies.</param>
+    /// <returns>A task that completes after a provider-specific status or fulfillment result is sent.</returns>
     /// <remarks>
     /// This method is used by tenant payment keyboards and payment return checks. It is idempotent: fulfilled
     /// orders are never built or charged again; their stored account details are resent to the buyer instead.
@@ -6172,6 +6771,105 @@ public class TenantBotService
                 "پرداخت شما توسط مدیر تایید شده است، اما ساخت اکانت هنوز کامل نشده یا نیاز به تلاش مجدد دارد. لطفاً کمی صبر کنید یا با پشتیبانی فروشگاه تماس بگیرید.",
                 cancellationToken: CancellationToken);
             return;
+        }
+
+        if (order.UniquePayPaymentInfoId.HasValue ||
+            string.Equals(order.PaymentProvider, "UniquePay", StringComparison.OrdinalIgnoreCase))
+        {
+            var uniquePayment = await _userDbcontext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+                x => x.Id == order.UniquePayPaymentInfoId || x.TenantBotOrderId == order.Id,
+                CancellationToken);
+            if (uniquePayment == null)
+            {
+                await botClient.SendTextMessageAsync(ChatId, "فاکتور یونیک‌پی این سفارش پیدا نشد.", cancellationToken: CancellationToken);
+                return;
+            }
+
+            try
+            {
+                var inquiry = await _uniquePay.CheckInvoiceAsync(uniquePayment.HashId, CancellationToken);
+                uniquePayment.Apply(
+                    inquiry,
+                    DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.UniquePayReconciliationIntervalSeconds, 10, 3600)));
+                var providerTerminalStatus = UniquePayStatuses.GetProviderTerminalStatus(inquiry.Invoice);
+                if (providerTerminalStatus != null)
+                {
+                    uniquePayment.PaymentStatus = providerTerminalStatus;
+                    uniquePayment.ErrorCode = $"provider_{providerTerminalStatus}";
+                    uniquePayment.ErrorMessage = "UniquePay reported a terminal unpaid invoice state.";
+                    uniquePayment.NextInquiryAtUtc = null;
+                    uniquePayment.UpdatedAtUtc = DateTime.UtcNow;
+                    await _userDbcontext.SaveChangesAsync(CancellationToken);
+                    await botClient.SendTextMessageAsync(
+                        ChatId,
+                        string.Equals(providerTerminalStatus, UniquePayStatuses.Expired, StringComparison.Ordinal)
+                            ? "مهلت فاکتور یونیک‌پی این سفارش منقضی شده و سفارش تحویل نشد."
+                            : string.Equals(providerTerminalStatus, UniquePayStatuses.Cancelled, StringComparison.Ordinal)
+                                ? "فاکتور یونیک‌پی این سفارش لغو شده و سفارش تحویل نشد."
+                                : "فاکتور یونیک‌پی ناموفق اعلام شد و سفارش تحویل نشد.",
+                        cancellationToken: CancellationToken);
+                    return;
+                }
+
+                var verified = UniquePayPaymentVerifier.IsVerifiedPaid(uniquePayment, inquiry, out var errorCode);
+                uniquePayment.ErrorCode = verified || errorCode == "provider_not_paid" ? null : errorCode;
+                uniquePayment.ErrorMessage = verified || errorCode == "provider_not_paid" ? null : "UniquePay verification failed.";
+                if (verified)
+                {
+                    uniquePayment.PaymentStatus = UniquePayStatuses.Paid;
+                    uniquePayment.PaidAtUtc ??= DateTime.UtcNow;
+                    uniquePayment.NextInquiryAtUtc = null;
+                    order.PaymentStatus = TenantBotOrderStatuses.Paid;
+                    order.UpdatedAtUtc = DateTime.UtcNow;
+                }
+                else if (errorCode != "provider_not_paid")
+                {
+                    uniquePayment.PaymentStatus = UniquePayStatuses.Failed;
+                    uniquePayment.NextInquiryAtUtc = null;
+                }
+                await _userDbcontext.SaveChangesAsync(CancellationToken);
+
+                if (verified)
+                {
+                    var settlement = await ApplyPaidTenantOrderAsync(uniquePayment, "manual-check", CancellationToken);
+                    await SENDTENANTSETTLEMENTCHECKRESULTASYNC(botClient, ChatId, order, settlement, CancellationToken);
+                    return;
+                }
+
+                await botClient.SendTextMessageAsync(
+                    ChatId,
+                    errorCode == "provider_not_paid"
+                        ? "پرداخت یونیک‌پی هنوز تایید نشده است."
+                        : "اطلاعات پرداخت یونیک‌پی با سفارش تطبیق نداشت و سفارش تحویل نشد.",
+                    replyMarkup: errorCode == "provider_not_paid"
+                        ? BuildTenantPaymentKeyboard(order, uniquePayment.PaymentLink)
+                        : null,
+                    cancellationToken: CancellationToken);
+                return;
+            }
+            catch (Exception ex)
+            {
+                uniquePayment.ErrorCode = "provider_inquiry_failed";
+                uniquePayment.ErrorMessage = ex.Message;
+                uniquePayment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(Math.Clamp(
+                    _appConfig.UniquePayReconciliationIntervalSeconds,
+                    10,
+                    3600));
+                uniquePayment.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                _logger.LogWarning(
+                    ex,
+                    "Tenant UniquePay customer inquiry failed. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}",
+                    order.TenantBotId,
+                    order.OrderId,
+                    uniquePayment.Id);
+                await botClient.SendTextMessageAsync(
+                    ChatId,
+                    "فعلاً امکان استعلام یونیک‌پی وجود ندارد. کمی بعد دوباره دکمه بررسی وضعیت را بزنید.",
+                    replyMarkup: BuildTenantPaymentKeyboard(order, uniquePayment.PaymentLink),
+                    cancellationToken: CancellationToken);
+                return;
+            }
         }
 
         if (order.TetraminatorPaymentInfoId.HasValue ||
@@ -7336,7 +8034,7 @@ public class TenantBotService
     /// settlement so disabling the gateway cannot strand a customer who already paid.
     /// </remarks>
     private bool IsTenantHooshPayAvailable(BotInstance tenant)
-        => _appConfig.HooshPayEnabled &&
+        => _gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) &&
            tenant?.TenantHooshPayEnabled == true;
 
     /// <summary>
@@ -7359,9 +8057,28 @@ public class TenantBotService
     /// global or tenant disablement so a customer payment cannot become stranded.
     /// </remarks>
     private bool IsTenantTetraminatorAvailable(BotInstance tenant, long amountToman)
-        => _appConfig.TetraminatorEnabled &&
+        => _gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) &&
            tenant?.TenantTetraminatorEnabled == true &&
            amountToman >= _appConfig.TetraminatorMinimumAmountToman;
+
+    /// <summary>
+    /// Determines whether a tenant can create a new UniquePay invoice for a purchase or renewal.
+    /// </summary>
+    /// <param name="tenant">Tenant storefront whose local preference is combined with the live global switch.</param>
+    /// <returns>
+    /// <c>true</c> only when UniquePay is globally enabled and this tenant's persisted preference is enabled.
+    /// Existing UniquePay rows remain inquiry/settlement eligible after disablement.
+    /// </returns>
+    private bool IsTenantUniquePayAvailable(BotInstance tenant)
+        => _gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) &&
+           tenant?.TenantUniquePayEnabled == true;
+
+    /// <summary>
+    /// Builds the safe customer-facing explanation for a disabled tenant UniquePay callback.
+    /// </summary>
+    /// <returns>Persian message that exposes no API token or endpoint.</returns>
+    private static string BuildTenantUniquePayUnavailableMessage()
+        => "درگاه یونیک‌پی برای این فروشگاه در حال حاضر غیرفعال است.";
 
     /// <summary>
     /// Builds the customer-facing reason why a new tenant Tetraminator invoice cannot be created.
@@ -7403,7 +8120,9 @@ public class TenantBotService
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("درگاه ریالی هوش‌پی", CUSTOMERCALLBACKPREFIX + $"RNHP:{order.Id}") });
         if (IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("درگاه ریالی تترامیناتور", CUSTOMERCALLBACKPREFIX + $"RNTM:{order.Id}") });
-        if (tenant.TenantNowPaymentsEnabled)
+        if (IsTenantUniquePayAvailable(tenant))
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("درگاه ریالی یونیک‌پی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + $"RNUP:{order.Id}") });
+        if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("پرداخت ارز دیجیتال", CUSTOMERCALLBACKPREFIX + $"RNNP:{order.Id}") });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("کارت‌به‌کارت به فروشگاه", CUSTOMERCALLBACKPREFIX + $"RNCARD:{order.Id}") });

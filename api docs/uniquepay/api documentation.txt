@@ -1,0 +1,253 @@
+مستندات API پرداخت یار UniquePay
+ایجاد اینوویس کارت‌به‌کارت و بررسی وضعیت آن برای بیزینس‌ها
+Production Gateway
+Secure · HTTPS
+فلو کلی درگاه اینوویس
+این API مخصوص بیزینس‌هایی است که می‌خواهند برای تراکنش‌های خود، اینوویس بسازند و از طریق لینک پرداخت (کارت‌به‌کارت) به کاربر نهایی نمایش دهند.
+شما با استفاده از Business Token در هدر، اینوویس ایجاد کرده و سپس با استفاده از Check Invoice وضعیت پرداخت را چک می‌کنید.
+ Base URL
+https://uniquepay.top
+مراحل پرداخت
+#intro (https://uniquepay.top/api-docs#intro)
+فلو کلی به شکل زیر است:
+۱. بیزینس از طریق API /api/create-invoice برای هر سفارش یک اینوویس با hashId و amount ثبت می‌کند.
+۲. در پاسخ، یک paymentLink دریافت می‌شود که باید کاربر نهایی به آن هدایت شود.
+۳. پس از پرداخت، سیستم شما می‌تواند به صورت دوره‌ای از طریق /api/check-invoice وضعیت اینوویس را بر اساس همان hashId بررسی کند.
+۴. در صورت موفق بودن پرداخت، فیلد isPaid و redirectUrl (در صورت تعریف) در پاسخ کمک می‌کند کاربر را به صفحه‌ی موردنظر هدایت کنید.
+ℹ️
+این مستندات بر اساس کلاس InvoiceController شما در Symfony نوشته شده؛ هر تغییری در کد را می‌توانید به راحتی در همین صفحه هم به‌روزرسانی کنید.
+احراز هویت با Business Token
+#auth (https://uniquepay.top/api-docs#auth)
+تمام درخواست‌های API باید در هدر از نوع Authorization با مقدار Bearer {BUSINESS_TOKEN} ارسال شوند. این توکن در فیلد businessToken موجودیت Business ذخیره شده است.
+نمونه هدر احراز هویت
+HTTP Headers
+Authorization: Bearer YOUR_BUSINESS_TOKEN
+Content-Type: application/x-www-form-urlencoded
+نکات
+توکن فقط در سمت سرور نگه‌داری شود.
+در صورت عدم ارسال هدر، پاسخ با code = 403 و پیام Token is required برگردانده می‌شود.
+اگر توکن معتبر نباشد، code = 404 و پیام Business Not Found برمی‌گردد.
+اگر بیزینس غیرفعال یا تایید نشده باشد، code = 402 و پیام Business Is Not Active برگردانده می‌شود.
+ایجاد اینوویس جدید
+#create-invoice (https://uniquepay.top/api-docs#create-invoice)
+با استفاده از این اندپوینت، برای هر سفارش یک اینوویس جدید در سیستم ایجاد می‌شود. در پاسخ، شناسه داخلی اینوویس (refId) و لینک پرداخت (paymentLink) به شما داده می‌شود.
+✅
+اگر مقدار status در پاسخ true و code = 200 باشد، اینوویس با موفقیت ایجاد شده است و می‌توانید کاربر را به paymentLink هدایت کنید.
+مشخصات درخواست
+POST   /api/create-invoice
+هدرها:
+Authorization: Bearer YOUR_BUSINESS_TOKEN
+Content-Type: application/x-www-form-urlencoded
+پارامترهای بدنه (Form Data):
+نام فیلد
+اجباری
+توضیح
+hashId
+بله
+شناسه یکتای اینوویس در سیستم شما (مثلاً شناسه سفارش).
+amount
+بله
+مبلغ تراکنش (مثلاً به ریال). این مقدار «مبلغ پایه» است و ممکن است کارمزد روی آن اضافه شود.
+redirectUrl
+خیر
+آدرسی که پس از پرداخت موفق، کاربر به آن هدایت می‌شود. باید با دامنه سایت بیزینس یا ربات تلگرام تعریف‌شده مطابقت داشته باشد.
+callbackUrl
+خیر
+برای استفاده‌های آتی رزرو شده است. فعلاً همان قوانین اعتبارسنجی دامنه را دارد.
+⚠️
+اگر hashId تکراری و مربوط به همان بیزینس باشد، پاسخ با code = 103 و پیام Duplicated HashId On This Business برگردانده می‌شود.
+نمونه درخواست با cURL
+curl
+curl -X POST "https://uniquepay.top/api/create-invoice" \
+  -H "Authorization: Bearer YOUR_BUSINESS_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "hashId=order-12345" \
+  -d "amount=250000" \
+  -d "redirectUrl=https://merchant-site.com/payment/return"
+نمونه پاسخ موفق
+JSON Response
+{
+  "status": true,
+  "hashId": "order-12345",
+  "refId": 9876,
+  "code": 200,
+  "message": "Invoice Created Successfully",
+  "paymentLink": "https://uniquepay.top/pay-card/9876"
+}
+نکات مربوط به مبلغ و کارمزد
+مقدار ارسال‌شده در amount، مبلغ پایه است.
+براساس تنظیمات بیزینس (gatewayFee و feePayer)، ممکن است کارمزد روی مبلغ نهایی اینوویس اضافه شود.
+مبلغ نهایی که کاربر می‌پردازد در فیلد amount اینوویس (در پاسخ Check Invoice) مشخص است و ممکن است بزرگتر از مبلغ پایه باشد.
+کارمزد محاسبه‌شده در فیلد fee (در پاسخ Check Invoice) قابل مشاهده است.
+بررسی وضعیت اینوویس
+#check-invoice (https://uniquepay.top/api-docs#check-invoice)
+بعد از آن‌که کاربر به لینک پرداخت هدایت شد، می‌توانید با استفاده از این اندپوینت وضعیت اینوویس را بر اساس همان hashId بررسی کنید. این متد برای این است که سرور شما متوجه شود پرداخت انجام شده یا خیر.
+مشخصات درخواست
+POST   /api/check-invoice
+هدرها:
+Authorization: Bearer YOUR_BUSINESS_TOKEN
+Content-Type: application/x-www-form-urlencoded
+پارامترهای بدنه (Form Data):
+نام فیلد
+اجباری
+توضیح
+hashId
+بله
+همان شناسه‌ای که در زمان ایجاد اینوویس ارسال کرده‌اید.
+⚠️
+اگر اینوویسی با این hashId برای آن بیزینس پیدا نشود، پاسخ با code = 404 و پیام Invoice Not Found On This Business برگردانده می‌شود.
+نمونه درخواست با cURL
+curl
+curl -X POST "https://uniquepay.top/api/check-invoice" \
+  -H "Authorization: Bearer YOUR_BUSINESS_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "hashId=order-12345"
+نمونه پاسخ موفق
+JSON Response
+{
+  "status": true,
+  "code": 200,
+  "message": "",
+  "invoice": {
+    "id": 9876,
+    "amount": 275000,
+    "currency": "IRT",
+    "fee": 25000,
+    "feePayer": "buyer",
+    "isPaid": true,
+    "isVerified": false,
+    "redirectUrl": "https://merchant-site.com/payment/return"
+  }
+}
+توضیح فیلدهای پاسخ
+فیلد
+توضیح
+status
+اگر true باشد یعنی درخواست بدون خطا انجام شده است.
+invoice.id
+شناسه داخلی اینوویس در دیتابیس درگاه.
+invoice.amount
+مبلغ نهایی اینوویس (به همراه کارمزد در صورت انتقال به خریدار).
+invoice.currency
+واحد نگه‌داری/تسویه (از autoHoldAs بیزینس).
+invoice.fee
+مقدار کارمزد محاسبه‌شده برای این اینوویس.
+invoice.feePayer
+مشخص می‌کند کارمزد بر عهده چه کسی است (مثلاً owner یا خریدار).
+invoice.isPaid
+وضعیت پرداخت‌شدن اینوویس (true/false).
+invoice.isVerified
+در صورت پیاده‌سازی سیستم وریفای، می‌تواند نشان‌دهنده تایید نهایی باشد.
+invoice.redirectUrl
+آدرسی که بعد از پرداخت موفق باید کاربر به آن هدایت شود. اگر در زمان ایجاد اینوویس ارسال نشده باشد، مقدار پیش‌فرض درگاه استفاده می‌شود.
+وب‌سرویس سازگار با DDBot و Mirza
+#bot-gateway (https://uniquepay.top/api-docs#bot-gateway)
+این مسیرها دقیقاً از همان منطق ساخت و بررسی فاکتور فعلی استفاده می‌کنند. احراز هویت، پارامترها، پاسخ، انتخاب کارت، کارمزد و مبلغ یکتا هیچ تفاوتی با /api/create-invoice و /api/check-invoice ندارند. وب‌سرویس‌های قبلی نیز بدون تغییر باقی مانده‌اند.
+برای استفاده فقط همان Business Token فعلی را در هدر Authorization ارسال کنید؛ نیازی به Business ID، slug، Integration، secret یا دستور کنسول نیست.
+ساخت فاکتور برای DDBot و Mirza
+#bot-create (https://uniquepay.top/api-docs#bot-create)
+POST/api/ddbot/create-invoice
+POST/api/mirza/create-invoice
+نمونه درخواست
+curl -X POST "https://YOUR-DOMAIN/api/ddbot/create-invoice" \
+  -H "Authorization: Bearer BUSINESS_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "hashId=ORDER-1001" \
+  --data-urlencode "amount=50000" \
+  --data-urlencode "orderId=ORDER-1001" \
+  --data-urlencode "callbackUrl=https://bot.example.com/payment/callback" \
+  --data-urlencode "redirectUrl=https://bot.example.com/payment/result"
+پاسخ موفق
+{
+  "status": true,
+  "hashId": "ORDER-1001",
+  "refId": "INVOICE_UUID",
+  "code": 200,
+  "message": "Invoice Created Successfully",
+  "paymentLink": "https://YOUR-DOMAIN/gateway/card-to-card/pay/INVOICE_UUID",
+  "callbackUrl": "https://bot.example.com/payment/callback"
+}
+فیلد
+نوع
+الزامی
+توضیح
+hashId
+string
+بله
+شناسه یکتای فاکتور در همان بیزینس.
+amount
+integer
+بله
+مبلغ فاکتور، دقیقاً مطابق API اصلی.
+orderId
+string
+خیر
+شناسه سفارش در DDBot یا Mirza.
+callbackUrl
+URL
+خیر
+آدرس اعلام نتیجه پرداخت به ربات.
+redirectUrl
+URL
+خیر
+آدرس بازگشت کاربر پس از پرداخت.
+بررسی وضعیت فاکتور
+#bot-check (https://uniquepay.top/api-docs#bot-check)
+POST/api/ddbot/check-invoice
+POST/api/mirza/check-invoice
+نمونه درخواست
+curl -X POST "https://YOUR-DOMAIN/api/ddbot/check-invoice" \
+  -H "Authorization: Bearer BUSINESS_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "hashId=ORDER-1001"
+
+
+
+ساختار پاسخ و خطاها دقیقاً همان پاسخ مسیر اصلی /api/check-invoice است.
+کدهای وضعیت و خطا
+#errors (https://uniquepay.top/api-docs#errors)
+جدول زیر کدهایی را که در کلاس InvoiceController شما استفاده شده، نشان می‌دهد. این کدها هم در /api/create-invoice و هم در /api/check-invoice ممکن است برگردانده شوند.
+کد
+وضعیت
+پیام (message)
+توضیح
+200
+موفق
+"Invoice Created Successfully" / ""
+عملیات با موفقیت انجام شده است.
+403
+خطای احراز هویت
+"Token is required"
+هدر Authorization ارسال نشده است.
+404
+یافت نشد
+"Business Not Found"
+توکن ارسال‌شده به هیچ Businessای تعلق ندارد.
+402
+بیزینس غیرفعال
+"Business Is Not Active"
+بیزینس یا تایید نشده یا غیرفعال است (فقط در create-invoice).
+101
+پارامتر نامعتبر
+"HashId is required"
+پارامتر hashId در بدنه درخواست ارسال نشده است.
+102
+پارامتر نامعتبر
+"Amount is required"
+پارامتر amount برای ایجاد اینوویس ارسال نشده است.
+103
+تکراری
+"Duplicated HashId On This Business"
+برای این بیزینس قبلاً اینوویسی با همین hashId ثبت شده است.
+104
+اعتبارسنجی دامنه
+"Redirect Url MisMatched On This Business"
+redirectUrl ارسال‌شده با دامنه سایت بیزینس یا ربات تلگرام تعریف‌شده هم‌خوانی ندارد.
+105
+اعتبارسنجی دامنه
+"CallBack Url MisMatched On This Business"
+callbackUrl ارسال‌شده با دامنه‌های مجاز بیزینس مطابقت ندارد.
+404
+اینوویس یافت نشد
+"Invoice Not Found On This Business"
+در اندپوینت check-invoice، اینوویسی با آن hashId برای این بیزینس پیدا نشده است.

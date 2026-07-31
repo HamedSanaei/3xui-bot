@@ -1,0 +1,1377 @@
+<!DOCTYPE html>
+<!-- saved from url=(0054)https://uniquepay.top/api-docs#create-invoice-response -->
+<html lang="fa" dir="rtl"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    
+    <title>مستندات API پرداخت یار یونیک پی</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <style>
+        :root {
+            --bg-body: #020617;
+            --bg-sidebar: #020617;
+            --bg-content: #020617;
+            --bg-section: #020617;
+            --bg-card: #020617;
+            --border-subtle: #1e293b;
+            --accent: #38bdf8;
+            --accent-soft: rgba(56, 189, 248, 0.1);
+            --accent-strong: #0ea5e9;
+            --text-main: #e5e7eb;
+            --text-soft: #9ca3af;
+            --text-muted: #6b7280;
+            --danger: #f97373;
+            --danger-soft: rgba(248, 113, 113, 0.12);
+            --success: #4ade80;
+            --success-soft: rgba(74, 222, 128, 0.12);
+            --code-bg: #020617;
+            --code-border: #1f2937;
+            --badge-bg: rgba(55, 65, 81, 0.8);
+            --badge-text: #e5e7eb;
+            --shadow-soft: 0 18px 45px rgba(15, 23, 42, 0.8);
+            --radius-lg: 14px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: radial-gradient(circle at top, #0f172a 0, #020617 45%, #000 100%);
+            color: var(--text-main);
+        }
+
+        body {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        .layout {
+            display: flex;
+            width: 100%;
+            min-height: 100vh;
+            position: relative;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            max-width: 80vw;
+            background: linear-gradient(180deg, #020617 0%, #020617 100%);
+            border-left: 1px solid rgba(148, 163, 184, 0.18);
+            padding: 18px 18px 24px 18px;
+            display: flex;
+            flex-direction: column;
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            overflow-y: auto;
+            box-shadow: -18px 0 40px rgba(15, 23, 42, 0.9);
+            z-index: 20;
+        }
+
+        .sidebar-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 18px;
+        }
+
+        .logo-circle {
+            width: 32px;
+            height: 32px;
+            border-radius: 999px;
+            background: radial-gradient(circle at 30% 0%, #38bdf8 0, #0ea5e9 35%, #0f172a 80%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-weight: 700;
+            font-size: 16px;
+            color: #f9fafb;
+            box-shadow: 0 0 18px rgba(56, 189, 248, 0.7);
+        }
+
+        .brand-title {
+            font-size: 15px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }
+
+        .brand-subtitle {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .sidebar-divider {
+            border: none;
+            border-top: 1px solid rgba(148, 163, 184, 0.28);
+            margin: 10px 0 14px;
+        }
+
+        .sidebar-section-title {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .nav-list {
+            padding: 0;
+            margin: 0 0 14px 0;
+            list-style: none;
+        }
+
+        .nav-item {
+            margin-bottom: 4px;
+        }
+
+        .nav-link {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            text-decoration: none;
+            color: var(--text-soft);
+            font-size: 13px;
+            padding: 7px 9px;
+            border-radius: 8px;
+            transition: background 0.2s ease, color 0.2s ease, transform 0.1s ease;
+            border: 1px solid transparent;
+        }
+
+        .nav-link span.title {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .nav-link span.dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 999px;
+            background: rgba(148, 163, 184, 0.6);
+        }
+
+        .nav-link span.badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 999px;
+            background: var(--badge-bg);
+            color: var(--badge-text);
+        }
+
+        .nav-link:hover {
+            background: rgba(15, 23, 42, 0.85);
+            color: #f9fafb;
+            border-color: rgba(148, 163, 184, 0.35);
+            transform: translateX(-1px);
+        }
+
+        .nav-link.active {
+            background: var(--accent-soft);
+            color: #f9fafb;
+            border-color: rgba(56, 189, 248, 0.7);
+        }
+
+        .nav-link.active span.dot {
+            background: var(--accent);
+        }
+
+        .nav-sub-list {
+            list-style: none;
+            padding: 0 2px 2px 0;
+            margin: 0 0 6px 0;
+        }
+
+        .nav-sub-link {
+            display: block;
+            text-decoration: none;
+            color: var(--text-muted);
+            font-size: 12px;
+            padding: 4px 8px 4px 6px;
+            border-radius: 6px;
+            margin-bottom: 2px;
+            transition: background 0.2s ease, color 0.2s ease;
+        }
+
+        .nav-sub-link:hover {
+            background: rgba(15, 23, 42, 0.85);
+            color: #e5e7eb;
+        }
+
+        .nav-sub-link.active {
+            color: var(--accent-strong);
+            background: rgba(15, 23, 42, 0.9);
+        }
+
+        .sidebar-footer {
+            margin-top: auto;
+            font-size: 11px;
+            color: var(--text-muted);
+            border-top: 1px solid rgba(148, 163, 184, 0.24);
+            padding-top: 10px;
+        }
+
+        .sidebar-footer a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        .sidebar-footer a:hover {
+            text-decoration: underline;
+        }
+
+        .sidebar-chip {
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid rgba(148, 163, 184, 0.4);
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            margin-top: 8px;
+        }
+
+        .sidebar-chip-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 999px;
+            background: var(--success);
+        }
+
+        /* Content */
+        .content {
+            flex: 1;
+            min-width: 0;
+            padding: 18px 22px 28px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            position: relative;
+        }
+
+        .top-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 6px;
+        }
+
+        .top-title-group {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .top-title {
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }
+
+        .top-subtitle {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .top-badges {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .badge-soft {
+            font-size: 11px;
+            padding: 4px 9px;
+            border-radius: 999px;
+            background: rgba(15, 23, 42, 0.95);
+            border: 1px solid rgba(148, 163, 184, 0.45);
+            color: var(--text-soft);
+        }
+
+        .badge-soft.badge-green {
+            border-color: rgba(74, 222, 128, 0.6);
+            color: var(--success);
+        }
+
+        .badge-soft.badge-blue {
+            border-color: rgba(56, 189, 248, 0.6);
+            color: var(--accent);
+        }
+
+        .search-box {
+            position: relative;
+            max-width: 260px;
+            flex: 1;
+            margin-left: auto;
+        }
+
+        .search-input {
+            width: 100%;
+            border-radius: 999px;
+            border: 1px solid rgba(148, 163, 184, 0.4);
+            padding: 7px 32px 7px 12px;
+            background: rgba(15, 23, 42, 0.9);
+            color: var(--text-main);
+            font-size: 12px;
+            outline: none;
+            transition: border 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+        }
+
+        .search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .search-input:focus {
+            border-color: rgba(56, 189, 248, 0.9);
+            box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.5);
+            background: #020617;
+        }
+
+        .search-icon {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .main-card {
+            background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.06), rgba(15, 23, 42, 0.95));
+            border-radius: var(--radius-lg);
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            padding: 14px 16px 14px;
+            box-shadow: var(--shadow-soft);
+        }
+
+        .main-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+
+        .main-card-title {
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        .main-card-subtitle {
+            font-size: 12px;
+            color: var(--text-soft);
+            margin-top: 3px;
+        }
+
+        .main-card-meta {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 3px;
+        }
+
+        .pill-group {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+        }
+
+        .pill {
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid rgba(148, 163, 184, 0.4);
+            color: var(--text-soft);
+        }
+
+        .pill.pill-primary {
+            border-color: rgba(56, 189, 248, 0.7);
+            color: var(--accent);
+        }
+
+        .pill-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 999px;
+            background: var(--accent);
+            display: inline-block;
+        }
+
+        .section {
+            margin-top: 14px;
+            padding-top: 8px;
+        }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .section-title {
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .section-anchor {
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        .section-anchor a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        .section-anchor a:hover {
+            text-decoration: underline;
+        }
+
+        .section-description {
+            font-size: 12px;
+            color: var(--text-soft);
+            margin-bottom: 8px;
+        }
+
+        .alert {
+            border-radius: 10px;
+            padding: 8px 10px;
+            font-size: 12px;
+            margin-bottom: 10px;
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
+            border: 1px solid transparent;
+        }
+
+        .alert-icon {
+            margin-top: 2px;
+            font-size: 14px;
+        }
+
+        .alert-info {
+            background: var(--accent-soft);
+            border-color: rgba(56, 189, 248, 0.7);
+            color: var(--accent-strong);
+        }
+
+        .alert-danger {
+            background: var(--danger-soft);
+            border-color: rgba(248, 113, 113, 0.8);
+            color: var(--danger);
+        }
+
+        .alert-success {
+            background: var(--success-soft);
+            border-color: rgba(74, 222, 128, 0.8);
+            color: var(--success);
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.2fr);
+            gap: 12px;
+        }
+
+        .card {
+            background: rgba(15, 23, 42, 0.96);
+            border-radius: var(--radius-lg);
+            border: 1px solid rgba(148, 163, 184, 0.32);
+            padding: 10px 11px 10px;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            margin-bottom: 6px;
+        }
+
+        .card-title {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .card-meta {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .label {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-bottom: 3px;
+        }
+
+        .field-row {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .field {
+            flex: 1 1 120px;
+            min-width: 0;
+        }
+
+        .field span {
+            display: block;
+            font-size: 12px;
+            color: var(--text-main);
+            background: rgba(15, 23, 42, 0.9);
+            border-radius: 8px;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            padding: 6px 7px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .badge-method {
+            font-size: 11px;
+            padding: 3px 7px;
+            border-radius: 999px;
+            background: rgba(56, 189, 248, 0.12);
+            color: var(--accent);
+            border: 1px solid rgba(56, 189, 248, 0.7);
+        }
+
+        .badge-method.badge-post {
+            background: rgba(56, 189, 248, 0.12);
+        }
+
+        .badge-method.badge-get {
+            background: rgba(74, 222, 128, 0.12);
+            border-color: rgba(74, 222, 128, 0.7);
+            color: var(--success);
+        }
+
+        pre {
+            margin: 0;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 12px;
+            border-radius: 10px;
+            background: var(--code-bg);
+            border: 1px solid var(--code-border);
+            padding: 9px 10px;
+            overflow-x: auto;
+            color: #e5e7eb;
+        }
+
+        code {
+            font-family: inherit;
+        }
+
+        .code-lang-label {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+
+        .table th,
+        .table td {
+            border-bottom: 1px solid rgba(31, 41, 55, 0.8);
+            padding: 5px 6px;
+            text-align: right;
+        }
+
+        .table th {
+            font-weight: 500;
+            color: var(--text-soft);
+            background: rgba(15, 23, 42, 0.95);
+        }
+
+        .table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .table td.name {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 11px;
+        }
+
+        .table td.required {
+            color: var(--danger);
+            font-size: 11px;
+        }
+
+        .footer-note {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 12px;
+        }
+
+        .footer-note strong {
+            color: var(--accent);
+        }
+
+        /* Mobile */
+        .sidebar-toggle {
+            display: none;
+            border-radius: 999px;
+            border: 1px solid rgba(148, 163, 184, 0.5);
+            background: rgba(15, 23, 42, 0.96);
+            color: var(--text-soft);
+            font-size: 11px;
+            padding: 5px 9px;
+            cursor: pointer;
+        }
+
+        .sidebar-toggle span {
+            font-size: 14px;
+        }
+
+        @media (max-width: 920px) {
+            .sidebar {
+                position: fixed;
+                top: 0;
+                right: 0;
+                height: 100vh;
+                transform: translateX(100%);
+                transition: transform 0.2s ease-out;
+                box-shadow: -10px 0 40px rgba(15, 23, 42, 0.9);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .content {
+                padding: 14px 14px 22px;
+            }
+
+            .search-box {
+                display: none;
+            }
+
+            .sidebar-toggle {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+            }
+
+            .grid {
+                grid-template-columns: minmax(0, 1fr);
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="logo-circle">M</div>
+            <div>
+                <div class="brand-title">UniquePay API</div>
+                <div class="brand-subtitle">مستندات درگاه کارت‌به‌کارت یونیک پی </div>
+            </div>
+        </div>
+
+        <hr class="sidebar-divider">
+
+        <div>
+            <div class="sidebar-section-title">راهنمای شروع</div>
+            <ul class="nav-list">
+                <li class="nav-item">
+                    <a href="https://uniquepay.top/api-docs#intro" class="nav-link active">
+                        <span class="title">
+                            <span class="dot"></span>
+                            <span>معرفی و فلو</span>
+                        </span>
+                        <span class="badge">OVERVIEW</span>
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="https://uniquepay.top/api-docs#auth" class="nav-link">
+                        <span class="title">
+                            <span class="dot"></span>
+                            <span>احراز هویت (Business Token)</span>
+                        </span>
+                    </a>
+                </li>
+            </ul>
+        </div>
+
+        <div>
+            <div class="sidebar-section-title">اینوویس و پرداخت</div>
+            <ul class="nav-list">
+                <li class="nav-item">
+                    <a href="https://uniquepay.top/api-docs#create-invoice" class="nav-link">
+                        <span class="title">
+                            <span class="dot"></span>
+                            <span>ایجاد اینوویس</span>
+                        </span>
+                        <span class="badge">POST</span>
+                    </a>
+                    <ul class="nav-sub-list">
+                        <li><a href="https://uniquepay.top/api-docs#create-invoice-request" class="nav-sub-link">پارامترهای درخواست</a></li>
+                        <li><a href="https://uniquepay.top/api-docs#create-invoice-response" class="nav-sub-link">پاسخ موفق</a></li>
+                    </ul>
+                </li>
+                <li class="nav-item">
+                    <a href="https://uniquepay.top/api-docs#check-invoice" class="nav-link">
+                        <span class="title">
+                            <span class="dot"></span>
+                            <span>بررسی وضعیت اینوویس</span>
+                        </span>
+                        <span class="badge">POST</span>
+                    </a>
+                    <ul class="nav-sub-list">
+                        <li><a href="https://uniquepay.top/api-docs#check-invoice-request" class="nav-sub-link">درخواست</a></li>
+                        <li><a href="https://uniquepay.top/api-docs#check-invoice-response" class="nav-sub-link">پاسخ</a></li>
+                    </ul>
+                </li>
+            </ul>
+        </div>
+
+
+        <div>
+            <div class="sidebar-section-title">سازگاری با ربات‌ها</div>
+            <ul class="nav-list">
+                <li class="nav-item">
+                    <a href="https://uniquepay.top/api-docs#bot-gateway" class="nav-link">
+                        <span class="title"><span class="dot"></span><span>DDBot و Mirza</span></span>
+                        <span class="badge">POST</span>
+                    </a>
+                    <ul class="nav-sub-list">
+                        <li><a href="https://uniquepay.top/api-docs#bot-create" class="nav-sub-link">ساخت فاکتور</a></li>
+                        <li><a href="https://uniquepay.top/api-docs#bot-check" class="nav-sub-link">بررسی فاکتور</a></li>
+                    </ul>
+                </li>
+            </ul>
+        </div>
+
+        <div>
+            <div class="sidebar-section-title">خطاها و کدها</div>
+            <ul class="nav-list">
+                <li class="nav-item">
+                    <a href="https://uniquepay.top/api-docs#errors" class="nav-link">
+                        <span class="title">
+                            <span class="dot"></span>
+                            <span>کدهای وضعیت</span>
+                        </span>
+                    </a>
+                </li>
+            </ul>
+        </div>
+
+    </aside>
+
+    <!-- Content -->
+    <main class="content">
+        <div class="top-bar">
+            <div class="top-title-group">
+                <div class="top-title">مستندات API پرداخت یار UniquePay</div>
+                <div class="top-subtitle">ایجاد اینوویس کارت‌به‌کارت و بررسی وضعیت آن برای بیزینس‌ها</div>
+            </div>
+            <div class="top-badges">
+                <button class="sidebar-toggle" id="sidebarToggle">
+                    <span>☰</span>
+                    منوی مستندات
+                </button>
+                <div class="badge-soft badge-blue">Production Gateway</div>
+                <div class="badge-soft badge-green">Secure · HTTPS</div>
+            </div>
+        </div>
+
+        <!-- INTRO -->
+        <section class="main-card" id="intro">
+            <div class="main-card-header">
+                <div>
+                    <div class="main-card-title">فلو کلی درگاه اینوویس</div>
+                    <div class="main-card-subtitle">
+                        این API مخصوص بیزینس‌هایی است که می‌خواهند برای تراکنش‌های خود، اینوویس بسازند و از طریق لینک پرداخت (کارت‌به‌کارت) به کاربر نهایی نمایش دهند.
+                    </div>
+                    <div class="main-card-meta">
+                        شما با استفاده از <strong>Business Token</strong> در هدر، اینوویس ایجاد کرده و سپس با استفاده از <strong>Check Invoice</strong> وضعیت پرداخت را چک می‌کنید.
+                    </div>
+                </div>
+                <div class="pill-group">
+                    <div class="pill pill-primary">
+                        <span class="pill-dot"></span>
+                        Base URL
+                    </div>
+                    <div class="pill">https://uniquepay.top</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-header">
+                    <div class="section-title">مراحل پرداخت</div>
+                    <div class="section-anchor">
+                        <a href="https://uniquepay.top/api-docs#intro">#intro</a>
+                    </div>
+                </div>
+                <p class="section-description">
+                    فلو کلی به شکل زیر است:
+                </p>
+
+                <ul style="margin: 0; padding-right: 18px; font-size: 12px; color: var(--text-soft); line-height: 1.7;">
+                    <li>۱. بیزینس از طریق API <strong>/api/create-invoice</strong> برای هر سفارش یک اینوویس با <code>hashId</code> و <code>amount</code> ثبت می‌کند.</li>
+                    <li>۲. در پاسخ، یک <strong>paymentLink</strong> دریافت می‌شود که باید کاربر نهایی به آن هدایت شود.</li>
+                    <li>۳. پس از پرداخت، سیستم شما می‌تواند به صورت دوره‌ای از طریق <strong>/api/check-invoice</strong> وضعیت اینوویس را بر اساس همان <code>hashId</code> بررسی کند.</li>
+                    <li>۴. در صورت موفق بودن پرداخت، فیلد <code>isPaid</code> و <code>redirectUrl</code> (در صورت تعریف) در پاسخ کمک می‌کند کاربر را به صفحه‌ی موردنظر هدایت کنید.</li>
+                </ul>
+
+                <div class="alert alert-info" style="margin-top: 10px;">
+                    <div class="alert-icon">ℹ️</div>
+                    <div>
+                        این مستندات بر اساس کلاس <strong>InvoiceController</strong> شما در Symfony نوشته شده؛ هر تغییری در کد را می‌توانید به راحتی در همین صفحه هم به‌روزرسانی کنید.
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- AUTH -->
+        <section class="section" id="auth">
+            <div class="section-header">
+                <div class="section-title">احراز هویت با Business Token</div>
+                <div class="section-anchor"><a href="https://uniquepay.top/api-docs#auth">#auth</a></div>
+            </div>
+            <p class="section-description">
+                تمام درخواست‌های API باید در هدر از نوع <code>Authorization</code> با مقدار <code>Bearer {BUSINESS_TOKEN}</code> ارسال شوند.
+                این توکن در فیلد <code>businessToken</code> موجودیت <code>Business</code> ذخیره شده است.
+            </p>
+
+            <div class="grid">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">نمونه هدر احراز هویت</div>
+                        <div class="code-lang-label">HTTP Headers</div>
+                    </div>
+                    <pre><code>Authorization: Bearer YOUR_BUSINESS_TOKEN
+Content-Type: application/x-www-form-urlencoded</code></pre>
+                </div>
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">نکات</div>
+                    </div>
+                    <ul style="margin: 0; padding-right: 16px; font-size: 12px; color: var(--text-soft); line-height: 1.7;">
+                        <li>توکن فقط در سمت سرور نگه‌داری شود.</li>
+                        <li>در صورت عدم ارسال هدر، پاسخ با <strong>code = 403</strong> و پیام <code>Token is required</code> برگردانده می‌شود.</li>
+                        <li>اگر توکن معتبر نباشد، <strong>code = 404</strong> و پیام <code>Business Not Found</code> برمی‌گردد.</li>
+                        <li>اگر بیزینس غیرفعال یا تایید نشده باشد، <strong>code = 402</strong> و پیام <code>Business Is Not Active</code> برگردانده می‌شود.</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- CREATE INVOICE -->
+        <section class="section" id="create-invoice">
+            <div class="section-header">
+                <div class="section-title">ایجاد اینوویس جدید</div>
+                <div class="section-anchor"><a href="https://uniquepay.top/api-docs#create-invoice">#create-invoice</a></div>
+            </div>
+            <p class="section-description">
+                با استفاده از این اندپوینت، برای هر سفارش یک اینوویس جدید در سیستم ایجاد می‌شود. در پاسخ، شناسه داخلی اینوویس
+                (<code>refId</code>) و لینک پرداخت (<code>paymentLink</code>) به شما داده می‌شود.
+            </p>
+
+            <div class="alert alert-success">
+                <div class="alert-icon">✅</div>
+                <div>
+                    اگر مقدار <code>status</code> در پاسخ <strong>true</strong> و <code>code = 200</code> باشد، اینوویس با موفقیت ایجاد شده است و می‌توانید کاربر را به <code>paymentLink</code> هدایت کنید.
+                </div>
+            </div>
+
+            <div class="grid" id="create-invoice-request">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">مشخصات درخواست</div>
+                        <div class="card-meta">
+                            <span class="badge-method badge-post">POST</span>
+                            &nbsp; /api/create-invoice
+                        </div>
+                    </div>
+
+                    <div class="label">هدرها:</div>
+                    <pre><code>Authorization: Bearer YOUR_BUSINESS_TOKEN
+Content-Type: application/x-www-form-urlencoded</code></pre>
+
+                    <div class="label" style="margin-top: 8px;">پارامترهای بدنه (Form Data):</div>
+                    <table class="table">
+                        <thead>
+                        <tr>
+                            <th>نام فیلد</th>
+                            <th>اجباری</th>
+                            <th>توضیح</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <tr>
+                            <td class="name">hashId</td>
+                            <td class="required">بله</td>
+                            <td>شناسه یکتای اینوویس در سیستم شما (مثلاً شناسه سفارش).</td>
+                        </tr>
+                        <tr>
+                            <td class="name">amount</td>
+                            <td class="required">بله</td>
+                            <td>مبلغ تراکنش (مثلاً به ریال). این مقدار «مبلغ پایه» است و ممکن است کارمزد روی آن اضافه شود.</td>
+                        </tr>
+                        <tr>
+                            <td class="name">redirectUrl</td>
+                            <td>خیر</td>
+                            <td>آدرسی که پس از پرداخت موفق، کاربر به آن هدایت می‌شود. باید با دامنه سایت بیزینس یا ربات تلگرام تعریف‌شده مطابقت داشته باشد.</td>
+                        </tr>
+                        <tr>
+                            <td class="name">callbackUrl</td>
+                            <td>خیر</td>
+                            <td>برای استفاده‌های آتی رزرو شده است. فعلاً همان قوانین اعتبارسنجی دامنه را دارد.</td>
+                        </tr>
+                        </tbody>
+                    </table>
+
+                    <div class="alert alert-danger" style="margin-top: 8px;">
+                        <div class="alert-icon">⚠️</div>
+                        <div>
+                            اگر <code>hashId</code> تکراری و مربوط به همان بیزینس باشد، پاسخ با
+                            <strong>code = 103</strong> و پیام <code>Duplicated HashId On This Business</code>
+                            برگردانده می‌شود.
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card" id="create-invoice-response">
+                    <div class="card-header">
+                        <div class="card-title">نمونه درخواست با cURL</div>
+                        <div class="code-lang-label">curl</div>
+                    </div>
+                    <pre><code>curl -X POST "https://uniquepay.top/api/create-invoice" \
+  -H "Authorization: Bearer YOUR_BUSINESS_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "hashId=order-12345" \
+  -d "amount=250000" \
+  -d "redirectUrl=https://merchant-site.com/payment/return"</code></pre>
+                </div>
+            </div>
+
+            <div class="grid" style="margin-top: 10px;">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">نمونه پاسخ موفق</div>
+                        <div class="code-lang-label">JSON Response</div>
+                    </div>
+                    <pre><code>{
+  "status": true,
+  "hashId": "order-12345",
+  "refId": 9876,
+  "code": 200,
+  "message": "Invoice Created Successfully",
+  "paymentLink": "https://uniquepay.top/pay-card/9876"
+}</code></pre>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">نکات مربوط به مبلغ و کارمزد</div>
+                    </div>
+                    <ul style="margin: 0; padding-right: 16px; font-size: 12px; color: var(--text-soft); line-height: 1.7;">
+                        <li>مقدار ارسال‌شده در <code>amount</code>، مبلغ پایه است.</li>
+                        <li>براساس تنظیمات بیزینس (<code>gatewayFee</code> و <code>feePayer</code>)، ممکن است کارمزد روی مبلغ نهایی اینوویس اضافه شود.</li>
+                        <li>مبلغ نهایی که کاربر می‌پردازد در فیلد <code>amount</code> اینوویس (در پاسخ Check Invoice) مشخص است و ممکن است بزرگتر از مبلغ پایه باشد.</li>
+                        <li>کارمزد محاسبه‌شده در فیلد <code>fee</code> (در پاسخ Check Invoice) قابل مشاهده است.</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- CHECK INVOICE -->
+        <section class="section" id="check-invoice">
+            <div class="section-header">
+                <div class="section-title">بررسی وضعیت اینوویس</div>
+                <div class="section-anchor"><a href="https://uniquepay.top/api-docs#check-invoice">#check-invoice</a></div>
+            </div>
+            <p class="section-description">
+                بعد از آن‌که کاربر به لینک پرداخت هدایت شد، می‌توانید با استفاده از این اندپوینت وضعیت اینوویس را بر اساس همان
+                <code>hashId</code> بررسی کنید. این متد برای این است که سرور شما متوجه شود پرداخت انجام شده یا خیر.
+            </p>
+
+            <div class="grid" id="check-invoice-request">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">مشخصات درخواست</div>
+                        <div class="card-meta">
+                            <span class="badge-method badge-post">POST</span>
+                            &nbsp; /api/check-invoice
+                        </div>
+                    </div>
+
+                    <div class="label">هدرها:</div>
+                    <pre><code>Authorization: Bearer YOUR_BUSINESS_TOKEN
+Content-Type: application/x-www-form-urlencoded</code></pre>
+
+                    <div class="label" style="margin-top: 8px;">پارامترهای بدنه (Form Data):</div>
+                    <table class="table">
+                        <thead>
+                        <tr>
+                            <th>نام فیلد</th>
+                            <th>اجباری</th>
+                            <th>توضیح</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <tr>
+                            <td class="name">hashId</td>
+                            <td class="required">بله</td>
+                            <td>همان شناسه‌ای که در زمان ایجاد اینوویس ارسال کرده‌اید.</td>
+                        </tr>
+                        </tbody>
+                    </table>
+
+                    <div class="alert alert-danger" style="margin-top: 8px;">
+                        <div class="alert-icon">⚠️</div>
+                        <div>
+                            اگر اینوویسی با این <code>hashId</code> برای آن بیزینس پیدا نشود، پاسخ با
+                            <strong>code = 404</strong> و پیام <code>Invoice Not Found On This Business</code> برگردانده می‌شود.
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card" id="check-invoice-response">
+                    <div class="card-header">
+                        <div class="card-title">نمونه درخواست با cURL</div>
+                        <div class="code-lang-label">curl</div>
+                    </div>
+                    <pre><code>curl -X POST "https://uniquepay.top/api/check-invoice" \
+  -H "Authorization: Bearer YOUR_BUSINESS_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "hashId=order-12345"</code></pre>
+                </div>
+            </div>
+
+            <div class="grid" style="margin-top: 10px;">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">نمونه پاسخ موفق</div>
+                        <div class="code-lang-label">JSON Response</div>
+                    </div>
+                    <pre><code>{
+  "status": true,
+  "code": 200,
+  "message": "",
+  "invoice": {
+    "id": 9876,
+    "amount": 275000,
+    "currency": "IRT",
+    "fee": 25000,
+    "feePayer": "buyer",
+    "isPaid": true,
+    "isVerified": false,
+    "redirectUrl": "https://merchant-site.com/payment/return"
+  }
+}</code></pre>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">توضیح فیلدهای پاسخ</div>
+                    </div>
+                    <table class="table">
+                        <thead>
+                        <tr>
+                            <th>فیلد</th>
+                            <th>توضیح</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <tr>
+                            <td class="name">status</td>
+                            <td>اگر <code>true</code> باشد یعنی درخواست بدون خطا انجام شده است.</td>
+                        </tr>
+                        <tr>
+                            <td class="name">invoice.id</td>
+                            <td>شناسه داخلی اینوویس در دیتابیس درگاه.</td>
+                        </tr>
+                        <tr>
+                            <td class="name">invoice.amount</td>
+                            <td>مبلغ نهایی اینوویس (به همراه کارمزد در صورت انتقال به خریدار).</td>
+                        </tr>
+                        <tr>
+                            <td class="name">invoice.currency</td>
+                            <td>واحد نگه‌داری/تسویه (از <code>autoHoldAs</code> بیزینس).</td>
+                        </tr>
+                        <tr>
+                            <td class="name">invoice.fee</td>
+                            <td>مقدار کارمزد محاسبه‌شده برای این اینوویس.</td>
+                        </tr>
+                        <tr>
+                            <td class="name">invoice.feePayer</td>
+                            <td>مشخص می‌کند کارمزد بر عهده چه کسی است (مثلاً <code>owner</code> یا خریدار).</td>
+                        </tr>
+                        <tr>
+                            <td class="name">invoice.isPaid</td>
+                            <td>وضعیت پرداخت‌شدن اینوویس (true/false).</td>
+                        </tr>
+                        <tr>
+                            <td class="name">invoice.isVerified</td>
+                            <td>در صورت پیاده‌سازی سیستم وریفای، می‌تواند نشان‌دهنده تایید نهایی باشد.</td>
+                        </tr>
+                        <tr>
+                            <td class="name">invoice.redirectUrl</td>
+                            <td>آدرسی که بعد از پرداخت موفق باید کاربر به آن هدایت شود. اگر در زمان ایجاد اینوویس ارسال نشده باشد، مقدار پیش‌فرض درگاه استفاده می‌شود.</td>
+                        </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+
+        <!-- BOT GATEWAY -->
+        <section class="section" id="bot-gateway">
+            <div class="section-header">
+                <div class="section-title">وب‌سرویس سازگار با DDBot و Mirza</div>
+                <div class="section-anchor"><a href="https://uniquepay.top/api-docs#bot-gateway">#bot-gateway</a></div>
+            </div>
+            <p class="section-description">
+                این مسیرها دقیقاً از همان منطق ساخت و بررسی فاکتور فعلی استفاده می‌کنند.
+                احراز هویت، پارامترها، پاسخ، انتخاب کارت، کارمزد و مبلغ یکتا هیچ تفاوتی با
+                <code>/api/create-invoice</code> و <code>/api/check-invoice</code> ندارند.
+                وب‌سرویس‌های قبلی نیز بدون تغییر باقی مانده‌اند.
+            </p>
+            <div class="notice success">
+                برای استفاده فقط همان <code>Business Token</code> فعلی را در هدر Authorization ارسال کنید؛
+                نیازی به Business ID، slug، Integration، secret یا دستور کنسول نیست.
+            </div>
+        </section>
+
+        <section class="section" id="bot-create">
+            <div class="section-header">
+                <div class="section-title">ساخت فاکتور برای DDBot و Mirza</div>
+                <div class="section-anchor"><a href="https://uniquepay.top/api-docs#bot-create">#bot-create</a></div>
+            </div>
+            <div class="endpoint-row"><span class="method post">POST</span><code>/api/ddbot/create-invoice</code></div>
+            <div class="endpoint-row"><span class="method post">POST</span><code>/api/mirza/create-invoice</code></div>
+
+            <div class="card">
+                <div class="card-header"><div class="card-title">نمونه درخواست</div></div>
+<pre><code>curl -X POST "https://YOUR-DOMAIN/api/ddbot/create-invoice" \
+  -H "Authorization: Bearer BUSINESS_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "hashId=ORDER-1001" \
+  --data-urlencode "amount=50000" \
+  --data-urlencode "orderId=ORDER-1001" \
+  --data-urlencode "callbackUrl=https://bot.example.com/payment/callback" \
+  --data-urlencode "redirectUrl=https://bot.example.com/payment/result"</code></pre>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><div class="card-title">پاسخ موفق</div></div>
+<pre><code>{
+  "status": true,
+  "hashId": "ORDER-1001",
+  "refId": "INVOICE_UUID",
+  "code": 200,
+  "message": "Invoice Created Successfully",
+  "paymentLink": "https://YOUR-DOMAIN/gateway/card-to-card/pay/INVOICE_UUID",
+  "callbackUrl": "https://bot.example.com/payment/callback"
+}</code></pre>
+            </div>
+
+            <div class="card">
+                <table class="table">
+                    <thead><tr><th>فیلد</th><th>نوع</th><th>الزامی</th><th>توضیح</th></tr></thead>
+                    <tbody>
+                    <tr><td class="name">hashId</td><td>string</td><td>بله</td><td>شناسه یکتای فاکتور در همان بیزینس.</td></tr>
+                    <tr><td class="name">amount</td><td>integer</td><td>بله</td><td>مبلغ فاکتور، دقیقاً مطابق API اصلی.</td></tr>
+                    <tr><td class="name">orderId</td><td>string</td><td>خیر</td><td>شناسه سفارش در DDBot یا Mirza.</td></tr>
+                    <tr><td class="name">callbackUrl</td><td>URL</td><td>خیر</td><td>آدرس اعلام نتیجه پرداخت به ربات.</td></tr>
+                    <tr><td class="name">redirectUrl</td><td>URL</td><td>خیر</td><td>آدرس بازگشت کاربر پس از پرداخت.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="section" id="bot-check">
+            <div class="section-header">
+                <div class="section-title">بررسی وضعیت فاکتور</div>
+                <div class="section-anchor"><a href="https://uniquepay.top/api-docs#bot-check">#bot-check</a></div>
+            </div>
+            <div class="endpoint-row"><span class="method post">POST</span><code>/api/ddbot/check-invoice</code></div>
+            <div class="endpoint-row"><span class="method post">POST</span><code>/api/mirza/check-invoice</code></div>
+            <div class="card">
+                <div class="card-header"><div class="card-title">نمونه درخواست</div></div>
+<pre><code>curl -X POST "https://YOUR-DOMAIN/api/ddbot/check-invoice" \
+  -H "Authorization: Bearer BUSINESS_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "hashId=ORDER-1001"</code></pre>
+            </div>
+            <p class="section-description">
+                ساختار پاسخ و خطاها دقیقاً همان پاسخ مسیر اصلی <code>/api/check-invoice</code> است.
+            </p>
+        </section>
+
+        <!-- ERRORS -->
+        <section class="section" id="errors">
+            <div class="section-header">
+                <div class="section-title">کدهای وضعیت و خطا</div>
+                <div class="section-anchor"><a href="https://uniquepay.top/api-docs#errors">#errors</a></div>
+            </div>
+            <p class="section-description">
+                جدول زیر کدهایی را که در کلاس <code>InvoiceController</code> شما استفاده شده، نشان می‌دهد. این کدها هم در
+                <code>/api/create-invoice</code> و هم در <code>/api/check-invoice</code> ممکن است برگردانده شوند.
+            </p>
+
+            <div class="card">
+                <table class="table">
+                    <thead>
+                    <tr>
+                        <th>کد</th>
+                        <th>وضعیت</th>
+                        <th>پیام (message)</th>
+                        <th>توضیح</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <tr>
+                        <td>200</td>
+                        <td>موفق</td>
+                        <td>"Invoice Created Successfully" / ""</td>
+                        <td>عملیات با موفقیت انجام شده است.</td>
+                    </tr>
+                    <tr>
+                        <td>403</td>
+                        <td>خطای احراز هویت</td>
+                        <td>"Token is required"</td>
+                        <td>هدر <code>Authorization</code> ارسال نشده است.</td>
+                    </tr>
+                    <tr>
+                        <td>404</td>
+                        <td>یافت نشد</td>
+                        <td>"Business Not Found"</td>
+                        <td>توکن ارسال‌شده به هیچ <code>Business</code>ای تعلق ندارد.</td>
+                    </tr>
+                    <tr>
+                        <td>402</td>
+                        <td>بیزینس غیرفعال</td>
+                        <td>"Business Is Not Active"</td>
+                        <td>بیزینس یا تایید نشده یا غیرفعال است (فقط در create-invoice).</td>
+                    </tr>
+                    <tr>
+                        <td>101</td>
+                        <td>پارامتر نامعتبر</td>
+                        <td>"HashId is required"</td>
+                        <td>پارامتر <code>hashId</code> در بدنه درخواست ارسال نشده است.</td>
+                    </tr>
+                    <tr>
+                        <td>102</td>
+                        <td>پارامتر نامعتبر</td>
+                        <td>"Amount is required"</td>
+                        <td>پارامتر <code>amount</code> برای ایجاد اینوویس ارسال نشده است.</td>
+                    </tr>
+                    <tr>
+                        <td>103</td>
+                        <td>تکراری</td>
+                        <td>"Duplicated HashId On This Business"</td>
+                        <td>برای این بیزینس قبلاً اینوویسی با همین <code>hashId</code> ثبت شده است.</td>
+                    </tr>
+                    <tr>
+                        <td>104</td>
+                        <td>اعتبارسنجی دامنه</td>
+                        <td>"Redirect Url MisMatched On This Business"</td>
+                        <td><code>redirectUrl</code> ارسال‌شده با دامنه سایت بیزینس یا ربات تلگرام تعریف‌شده هم‌خوانی ندارد.</td>
+                    </tr>
+                    <tr>
+                        <td>105</td>
+                        <td>اعتبارسنجی دامنه</td>
+                        <td>"CallBack Url MisMatched On This Business"</td>
+                        <td><code>callbackUrl</code> ارسال‌شده با دامنه‌های مجاز بیزینس مطابقت ندارد.</td>
+                    </tr>
+                    <tr>
+                        <td>404</td>
+                        <td>اینوویس یافت نشد</td>
+                        <td>"Invoice Not Found On This Business"</td>
+                        <td>در اندپوینت <code>check-invoice</code>، اینوویسی با آن <code>hashId</code> برای این بیزینس پیدا نشده است.</td>
+                    </tr>
+                    </tbody>
+                </table>
+            </div>
+
+        </section>
+    </main>
+</div>
+
+<script>
+    // Toggle sidebar on mobile
+    (function () {
+        const sidebar = document.getElementById('sidebar');
+        const toggle = document.getElementById('sidebarToggle');
+
+        if (toggle) {
+            toggle.addEventListener('click', function () {
+                sidebar.classList.toggle('open');
+            });
+        }
+
+        // Close sidebar on click outside (mobile only)
+        document.addEventListener('click', function (e) {
+            if (window.innerWidth > 920) return;
+            if (!sidebar.classList.contains('open')) return;
+            const withinSidebar = sidebar.contains(e.target);
+            const withinToggle = toggle.contains(e.target);
+            if (!withinSidebar && !withinToggle) {
+                sidebar.classList.remove('open');
+            }
+        });
+
+        // Scroll spy – highlight nav item based on scroll
+        const sections = document.querySelectorAll('section[id]');
+        const navLinks = document.querySelectorAll('.nav-link');
+        const navSubLinks = document.querySelectorAll('.nav-sub-link');
+
+        function onScroll() {
+            let currentId = null;
+            const scrollPos = window.scrollY + 120;
+
+            sections.forEach(section => {
+                if (scrollPos >= section.offsetTop) {
+                    currentId = section.getAttribute('id');
+                }
+            });
+
+            navLinks.forEach(link => {
+                const href = link.getAttribute('href').replace('#', '');
+                if (href === currentId) {
+                    link.classList.add('active');
+                } else if (!link.closest('.nav-item').querySelector('.nav-sub-link.active')) {
+                    link.classList.remove('active');
+                }
+            });
+
+            navSubLinks.forEach(link => {
+                const href = link.getAttribute('href').replace('#', '');
+                if (href === currentId) {
+                    link.classList.add('active');
+                    const parentNav = link.closest('.nav-item').querySelector('.nav-link');
+                    if (parentNav) parentNav.classList.add('active');
+                } else {
+                    link.classList.remove('active');
+                }
+            });
+        }
+
+        window.addEventListener('scroll', onScroll);
+        onScroll();
+    })();
+</script>
+
+
+
+</body></html>

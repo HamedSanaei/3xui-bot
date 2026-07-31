@@ -8,8 +8,8 @@ using Newtonsoft.Json;
 /// Receives payment gateway callbacks and routes paid invoices to the correct settlement service.
 /// </summary>
 /// <remarks>
-/// NOWPayments is used for crypto wallet charges. HooshPay is used for rial wallet charges and tenant storefront orders.
-/// Tetraminator callbacks are unsigned triggers and are always verified through the provider inquiry API before settlement.
+/// NOWPayments is used for crypto wallet charges. HooshPay and UniquePay are used for rial wallet charges and tenant
+/// storefront orders. Tetraminator callbacks are unsigned triggers and are always verified through provider inquiry.
 /// Tenant HooshPay rows are detected by <see cref="HooshPayPaymentInfo.PaymentPurpose"/> and are fulfilled by
 /// <see cref="TenantBotService.ApplyPaidTenantOrderAsync"/> instead of the wallet settlement path.
 /// </remarks>
@@ -20,6 +20,7 @@ public class PaymentController : ControllerBase
     private static readonly SemaphoreSlim IpnLock = new SemaphoreSlim(1, 1);
     private static readonly SemaphoreSlim HooshPayIpnLock = new SemaphoreSlim(1, 1);
     private static readonly SemaphoreSlim TetraminatorCallbackLock = new(1, 1);
+    private static readonly SemaphoreSlim UniquePayReturnLock = new(1, 1);
 
     private readonly UserDbContext _userDbcontext;
     private readonly AppConfig _appConfig;
@@ -27,6 +28,7 @@ public class PaymentController : ControllerBase
     private readonly HooshPaySettlementService _hooshPaySettlementService;
     private readonly Tetraminator _tetraminator;
     private readonly TetraminatorSettlementService _tetraminatorSettlementService;
+    private readonly UniquePayReconciliationHostedService _uniquePayReconciliation;
     private readonly TenantBotService _tenantBotService;
     private readonly ILogger<PaymentController> _logger;
 
@@ -39,6 +41,9 @@ public class PaymentController : ControllerBase
     /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
     /// <param name="tetraminator">Tetraminator API client used to verify unsigned callbacks.</param>
     /// <param name="tetraminatorSettlementService">Tetraminator owned-wallet settlement service.</param>
+    /// <param name="uniquePayReconciliation">
+    /// Shared polling coordinator that always performs authoritative UniquePay inquiry before settlement.
+    /// </param>
     /// <param name="tenantBotService">Tenant storefront fulfillment service for direct HooshPay orders.</param>
     /// <param name="logger">Controller logger.</param>
     public PaymentController(
@@ -48,6 +53,7 @@ public class PaymentController : ControllerBase
         HooshPaySettlementService hooshPaySettlementService,
         Tetraminator tetraminator,
         TetraminatorSettlementService tetraminatorSettlementService,
+        UniquePayReconciliationHostedService uniquePayReconciliation,
         TenantBotService tenantBotService,
         ILogger<PaymentController> logger)
     {
@@ -57,6 +63,7 @@ public class PaymentController : ControllerBase
         _hooshPaySettlementService = hooshPaySettlementService;
         _tetraminator = tetraminator;
         _tetraminatorSettlementService = tetraminatorSettlementService;
+        _uniquePayReconciliation = uniquePayReconciliation;
         _tenantBotService = tenantBotService;
         _logger = logger;
     }
@@ -138,6 +145,61 @@ public class PaymentController : ControllerBase
         finally
         {
             TetraminatorCallbackLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Uses UniquePay's browser return as a safe inquiry trigger and never settles from query-string data.
+    /// </summary>
+    /// <param name="hashId">Merchant hash returned in the configured redirect URL.</param>
+    /// <param name="cancellationToken">Cancellation token for local lookup, provider inquiry, and settlement.</param>
+    /// <returns>
+    /// HTTP 200 for paid/already-settled or pending invoices, 404 for an unknown hash, and 503 for a transient
+    /// provider or local inquiry failure. Existing invoices remain processable even when global creation is disabled.
+    /// </returns>
+    /// <remarks>
+    /// UniquePay documents callbacks as reserved for a future release, so this endpoint is only a user-experience
+    /// trigger. The reconciliation coordinator calls <c>/api/check-invoice</c> and applies all financial guards.
+    /// </remarks>
+    [HttpGet("/uniquepay-return")]
+    public async Task<IActionResult> ReceiveUniquePayReturn(
+        [FromQuery(Name = "hashId")] string hashId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(hashId))
+            return BadRequest(new { status = false, message = "hashId is required" });
+
+        await UniquePayReturnLock.WaitAsync(cancellationToken);
+        try
+        {
+            var payment = await _userDbcontext.UniquePayPaymentInfos
+                .AsNoTracking()
+                .FirstOrDefaultAsync(x => x.HashId == hashId, cancellationToken);
+            if (payment == null)
+                return NotFound(new { status = false, message = "payment not found" });
+
+            var settlement = await _uniquePayReconciliation.ReconcilePaymentAsync(
+                payment.Id,
+                "return-trigger",
+                cancellationToken);
+            return Ok(new
+            {
+                status = true,
+                hashId = payment.HashId,
+                settled = settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded,
+                result = settlement.Status.ToString()
+            });
+        }
+        catch (Exception ex) when (ex is UniquePayApiException or HttpRequestException or InvalidOperationException)
+        {
+            _logger.LogWarning(ex, "UniquePay return inquiry failed. hashId={HashId}", hashId);
+            return StatusCode(
+                StatusCodes.Status503ServiceUnavailable,
+                new { status = false, message = "provider inquiry unavailable" });
+        }
+        finally
+        {
+            UniquePayReturnLock.Release();
         }
     }
 

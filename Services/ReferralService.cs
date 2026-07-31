@@ -333,6 +333,7 @@ public sealed class ReferralService
         "nowpayments",
         "hooshpay",
         "tetraminator",
+        "uniquepay",
         "zibal"
     };
     /// <summary>
@@ -1312,6 +1313,11 @@ public sealed class ReferralReconciliationHostedService : BackgroundService
                             !x.IsProvisionallyApproved &&
                             x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge)
                 .ToListAsync(cancellationToken);
+            var uniquePay = await context.UniquePayPaymentInfos
+                .AsNoTracking()
+                .Where(x => x.IsAddedToBalance &&
+                            x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge)
+                .ToListAsync(cancellationToken);
             var zibal = await context.ZibalPaymentInfos
                 .AsNoTracking()
                 .Where(x => x.IsAddedToBallance && x.IsPaid)
@@ -1341,6 +1347,20 @@ public sealed class ReferralReconciliationHostedService : BackgroundService
                         BotInstanceTypes.Owned,
                         x.TelegramUserId,
                         x.AmountToman,
+                        x.SettledAtUtc ?? x.PaidAtUtc ?? x.CreatedAtUtc,
+                        true,
+                        true,
+                        false)))
+                .Concat(uniquePay
+                    .Where(x => UniquePayStatuses.IsPaid(x.PaymentStatus) && IsOwnedBotId(x.BotId, ownedBotIds))
+                    .Select(x => new ReferralPaymentSource(
+                        "uniquepay",
+                        TenantBotPaymentPurposes.WalletCharge,
+                        FirstNonEmpty(x.RefId, x.HashId, x.Id.ToString(CultureInfo.InvariantCulture)),
+                        NormalizeOwnedBotId(x.BotId),
+                        BotInstanceTypes.Owned,
+                        x.TelegramUserId,
+                        x.BaseAmountToman,
                         x.SettledAtUtc ?? x.PaidAtUtc ?? x.CreatedAtUtc,
                         true,
                         true,

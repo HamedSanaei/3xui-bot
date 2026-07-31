@@ -26,6 +26,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Ignore stale deployment artifacts from the removed test project so an
+         existing server checkout cannot compile its nested bin/obj sources. -->
+    <Compile Remove="Adminbot.Tests\**" />
+    <None Remove="Adminbot.Tests\**" />
+    <Content Remove="Adminbot.Tests\**" />
     <EmbeddedResource Include="Assets\Fonts\NotoSans-Regular.ttf"
                       LogicalName="Adminbot.Assets.Fonts.NotoSans-Regular.ttf" />
     <None Include="Assets\Fonts\OFL.txt"

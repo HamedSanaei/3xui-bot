@@ -17,6 +17,16 @@ Treat missing XML documentation on any new or materially changed C# member as an
 
 ---
 
+## Repository policy: do not add test projects by default
+
+This repository is deployed as the single production `Adminbot` application project. Keep the solution and server publish path free of auxiliary test projects unless the user explicitly requests a persistent test project in the current task.
+
+- Do NOT create or add `Adminbot.Tests`, `*.Tests.csproj`, test-framework or test-adapter package references, project references, solution entries, or server-side test artifacts unless the user directly asks for a test project.
+- A general request to add tests, regression coverage, verification, or validation does not authorize creating a new test project. Use existing checks, build/publish verification, or temporary tooling outside the repository and remove temporary artifacts before finalizing.
+- Before finalizing any repository change, verify that `dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained false` does not depend on a missing or unnecessary auxiliary project.
+
+---
+
 ## Required agent onboarding and code-map workflow
 
 Every AI agent working in this repository MUST treat this `AGENTS.md` file as the first project entry point.

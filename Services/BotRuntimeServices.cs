@@ -131,6 +131,7 @@ public class BotRegistry
             TenantHooshPayEnabled = bot.TenantHooshPayEnabled,
             TenantNowPaymentsEnabled = bot.TenantNowPaymentsEnabled,
             TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled,
+            TenantUniquePayEnabled = bot.TenantUniquePayEnabled,
             TenantTutorialsJson = bot.TenantTutorialsJson
         };
     }
@@ -246,6 +247,7 @@ public class BotRegistry
             TenantHooshPayEnabled = bot.TenantHooshPayEnabled,
             TenantNowPaymentsEnabled = bot.TenantNowPaymentsEnabled,
             TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled,
+            TenantUniquePayEnabled = bot.TenantUniquePayEnabled,
             TenantTutorialsJson = bot.TenantTutorialsJson,
             IsSalesAssistant = bot.IsSalesAssistant
         };

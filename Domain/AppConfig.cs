@@ -141,12 +141,20 @@ namespace Adminbot.Domain
         public string NowpaymentCancelUrl { get; set; }
         public string NowpaymentIpnUrl { get; set; }
         /// <summary>
+        /// Enables creation of new NOWPayments cryptocurrency invoices across owned and tenant bots.
+        /// </summary>
+        /// <remarks>
+        /// This startup-bound value initializes the live gateway snapshot. Super-admin changes update that snapshot
+        /// and this JSON key without rebinding the options object. Disabling never stops IPN or existing settlement.
+        /// </remarks>
+        public bool NowPaymentsEnabled { get; set; }
+        /// <summary>
         /// Enables creation of new HooshPay rial invoices across owned and tenant bots.
         /// </summary>
         /// <remarks>
-        /// Disabling this switch hides HooshPay payment buttons and blocks new invoice creation after the application
-        /// restarts. Existing payment rows remain verifiable and settleable so customers who paid before the switch
-        /// changed are not stranded. A missing configuration key leaves this value disabled.
+        /// This startup-bound value initializes the live gateway snapshot. Super-admin changes update that snapshot
+        /// and this JSON key immediately. Existing payment rows remain verifiable and settleable after disablement;
+        /// a missing configuration key initializes the gateway as disabled.
         /// </remarks>
         public bool HooshPayEnabled { get; set; }
         public string HooshPayApiKey { get; set; }
@@ -158,8 +166,8 @@ namespace Adminbot.Domain
         /// Enables creation of new Tetraminator rial invoices across owned and tenant bots.
         /// </summary>
         /// <remarks>
-        /// Disabling this switch only hides and blocks new invoices. Existing payment rows remain verifiable and
-        /// settleable so a customer who paid before the switch changed is not stranded.
+        /// This startup-bound value initializes the live gateway snapshot. Super-admin changes update that snapshot
+        /// and this JSON key immediately. Existing payment rows remain verifiable and settleable after disablement.
         /// </remarks>
         public bool TetraminatorEnabled { get; set; }
         /// <summary>
@@ -188,6 +196,53 @@ namespace Adminbot.Domain
         /// Minimum invoice amount in Iranian toman offered through Tetraminator.
         /// </summary>
         public long TetraminatorMinimumAmountToman { get; set; } = 50000;
+        /// <summary>
+        /// Enables creation of new UniquePay rial invoices across owned and tenant bots.
+        /// </summary>
+        /// <remarks>
+        /// This startup-bound value initializes the live gateway snapshot. Super-admin changes update that snapshot
+        /// and this JSON key immediately. Existing invoices remain eligible for polling and settlement while disabled;
+        /// a missing key initializes the gateway as disabled.
+        /// </remarks>
+        public bool UniquePayEnabled { get; set; }
+        /// <summary>
+        /// Official UniquePay API host used for generic invoice creation and inquiry endpoints.
+        /// </summary>
+        public string UniquePayBaseUrl { get; set; } = "https://uniquepay.top";
+        /// <summary>
+        /// Secret UniquePay business bearer token.
+        /// </summary>
+        /// <remarks>This value must never be displayed, partially masked, stored on payment rows, or written to logs.</remarks>
+        public string UniquePayBusinessToken { get; set; }
+        /// <summary>
+        /// Public platform return endpoint given to UniquePay for redirecting a customer after payment.
+        /// </summary>
+        /// <remarks>
+        /// UniquePay does not currently document a settlement callback. This URL is only a trigger; the application
+        /// always calls <c>/api/check-invoice</c> before applying a financial change.
+        /// </remarks>
+        public string UniquePayReturnUrl { get; set; }
+        /// <summary>
+        /// Buyer-paid UniquePay fee percentage displayed to customers and verified against provider inquiry data.
+        /// </summary>
+        public decimal UniquePayFeePercent { get; set; } = 12m;
+        /// <summary>
+        /// Maximum duration, in seconds, for one UniquePay HTTP attempt.
+        /// </summary>
+        public int UniquePayRequestTimeoutSeconds { get; set; } = 30;
+        /// <summary>
+        /// Number of additional attempts allowed for transient, read-only UniquePay invoice inquiries.
+        /// </summary>
+        /// <remarks>UniquePay invoice creation is never retried automatically.</remarks>
+        public int UniquePayInquiryRetryCount { get; set; } = 3;
+        /// <summary>
+        /// Number of seconds between background scans for due pending UniquePay invoices.
+        /// </summary>
+        public int UniquePayReconciliationIntervalSeconds { get; set; } = 30;
+        /// <summary>
+        /// Maximum number of due UniquePay rows processed during one reconciliation scan.
+        /// </summary>
+        public int UniquePayReconciliationBatchSize { get; set; } = 50;
         /// <summary>
         /// Enables synchronization of XUI v3 account lifecycle events with the Gozargah website API.
         /// </summary>

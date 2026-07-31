@@ -90,6 +90,11 @@ namespace Adminbot.Migrations
                         .HasColumnType("INTEGER")
                         .HasDefaultValue(true);
 
+                    b.Property<bool>("TenantUniquePayEnabled")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(true);
+
                     b.Property<string>("TenantTutorialsJson")
                         .HasColumnType("TEXT");
 
@@ -1045,6 +1050,9 @@ namespace Adminbot.Migrations
                     b.Property<int?>("TetraminatorPaymentInfoId")
                         .HasColumnType("INTEGER");
 
+                    b.Property<int?>("UniquePayPaymentInfoId")
+                        .HasColumnType("INTEGER");
+
                     b.Property<int?>("TrafficGb")
                         .HasColumnType("INTEGER");
 
@@ -1078,6 +1086,8 @@ namespace Adminbot.Migrations
                     b.HasIndex("TenantBotId");
 
                     b.HasIndex("TetraminatorPaymentInfoId");
+
+                    b.HasIndex("UniquePayPaymentInfoId");
 
                     b.ToTable("TenantBotOrders", (string)null);
                 });
@@ -1292,6 +1302,165 @@ namespace Adminbot.Migrations
                     b.HasIndex("TenantOwnerTelegramUserId");
 
                     b.ToTable("TetraminatorPaymentInfos", (string)null);
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.UniquePayPaymentInfo", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("BalanceAfter")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("BalanceBefore")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("BaseAmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("BotId")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BotUsername")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("ChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Currency")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ErrorCode")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ErrorMessage")
+                        .HasColumnType("TEXT");
+
+                    b.Property<decimal>("FeePercent")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("FeePayer")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("HashId")
+                        .IsRequired()
+                        .HasMaxLength(180)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("InquiryAttemptCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsAddedToBalance")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsProviderVerified")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("LastErrorLoggedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("LastInquiryAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("NextInquiryAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("PaidAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PaymentLink")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PaymentPurpose")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PaymentStatus")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("ProviderAmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("ProviderFeeToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("RawRequestJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RawResponseJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RefId")
+                        .HasMaxLength(180)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SettlementAttemptId")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("SettlementStartedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SettlementState")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("pending");
+
+                    b.Property<DateTime?>("SettledAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("SuccessLoggedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("TelMsgId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("TenantBotOrderId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("TenantOwnerTelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("BotId");
+
+                    b.HasIndex("HashId")
+                        .IsUnique();
+
+                    b.HasIndex("IsAddedToBalance", "SettlementState", "NextInquiryAtUtc");
+
+                    b.HasIndex("PaymentPurpose");
+
+                    b.HasIndex("RefId")
+                        .IsUnique()
+                        .HasFilter("\"RefId\" IS NOT NULL");
+
+                    b.HasIndex("TelegramUserId");
+
+                    b.HasIndex("TenantBotOrderId");
+
+                    b.HasIndex("TenantOwnerTelegramUserId");
+
+                    b.ToTable("UniquePayPaymentInfos", (string)null);
                 });
 
             modelBuilder.Entity("Adminbot.Domain.UsageReportDispatch", b =>

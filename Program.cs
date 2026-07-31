@@ -53,12 +53,20 @@ class Program
         ConfigureWebServer(builder, appConfig);
 
         builder.Services.AddSingleton<IConfiguration>(configuration);
+        builder.Services.AddSingleton(appConfig);
+        builder.Services.AddSingleton<IPaymentGatewayAvailability>(sp =>
+            new PaymentGatewayAvailabilityService(
+                appConfig,
+                Path.Combine(builder.Environment.ContentRootPath, "Data", "configuration.json"),
+                sp.GetRequiredService<ILogger<PaymentGatewayAvailabilityService>>()));
         builder.Services.AddSingleton<NowPayments>();
         builder.Services.AddSingleton<NowPaymentsSettlementService>();
         builder.Services.AddSingleton<HooshPay>();
         builder.Services.AddSingleton<HooshPaySettlementService>();
         builder.Services.AddSingleton<Tetraminator>();
         builder.Services.AddSingleton<TetraminatorSettlementService>();
+        builder.Services.AddSingleton<UniquePay>();
+        builder.Services.AddSingleton<UniquePaySettlementService>();
         builder.Services.AddSingleton<BotContextAccessor>();
         builder.Services.AddSingleton<BotRegistry>();
         builder.Services.AddSingleton<BotClientProvider>();
@@ -85,6 +93,8 @@ class Program
         builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
         builder.Services.AddHostedService<ReferralReconciliationHostedService>();
         builder.Services.AddHostedService<WeeklyUsageReportHostedService>();
+        builder.Services.AddSingleton<UniquePayReconciliationHostedService>();
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
 
         builder.Services.AddSingleton<TelegramBotService>();
         builder.Services.AddSingleton<MultiBotHostedService>();
@@ -296,6 +306,7 @@ class Program
             existing.TenantHooshPayEnabled = bot.TenantHooshPayEnabled;
             existing.TenantNowPaymentsEnabled = bot.TenantNowPaymentsEnabled;
             existing.TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled;
+            existing.TenantUniquePayEnabled = bot.TenantUniquePayEnabled;
             existing.UpdatedAtUtc = DateTime.UtcNow;
         }
 

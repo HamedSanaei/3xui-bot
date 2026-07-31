@@ -39,6 +39,10 @@ namespace Adminbot.Domain
         /// </summary>
         public bool TenantTetraminatorEnabled { get; set; } = true;
         /// <summary>
+        /// Allows this tenant storefront to offer UniquePay while the global gateway switch is enabled.
+        /// </summary>
+        public bool TenantUniquePayEnabled { get; set; } = true;
+        /// <summary>
         /// JSON array of tenant-owned tutorial links shown to storefront customers.
         /// Each item contains a user-facing title and a Telegram or web URL owned by the tenant.
         /// </summary>
@@ -91,6 +95,10 @@ namespace Adminbot.Domain
         /// Tenant-scoped preference for the Tetraminator gateway; the global configuration remains the final gate.
         /// </summary>
         public bool TenantTetraminatorEnabled { get; set; } = true;
+        /// <summary>
+        /// Tenant-scoped preference for UniquePay; the live global switch remains the final invoice-creation gate.
+        /// </summary>
+        public bool TenantUniquePayEnabled { get; set; } = true;
         /// <summary>
         /// Stores tenant-owned tutorial links as JSON in users.db.
         /// The value is scoped to this bot instance and is never shared with owned bots or other tenants.
@@ -184,6 +192,10 @@ namespace Adminbot.Domain
         /// Optional users.db identifier of the Tetraminator payment that funds this tenant order.
         /// </summary>
         public int? TetraminatorPaymentInfoId { get; set; }
+        /// <summary>
+        /// Optional users.db identifier of the UniquePay payment that funds this tenant purchase or renewal.
+        /// </summary>
+        public int? UniquePayPaymentInfoId { get; set; }
         public int? ManualReceiptId { get; set; }
         public string HooshPayInvoiceUid { get; set; }
         public string PaymentUrl { get; set; }
