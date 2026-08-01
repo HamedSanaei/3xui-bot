@@ -15,9 +15,9 @@ using Telegram.Bot.Exceptions;
 /// deleting expired users, private messaging, and manually checking payment status.
 /// </summary>
 /// <remarks>
-/// The multi-tenant addition affects this service in the manual HooshPay check path.
-/// When a paid HooshPay row belongs to a tenant storefront, settlement is delegated to
-/// <see cref="TenantBotService.ApplyPaidTenantOrderAsync"/> instead of charging a user's wallet.
+/// Manual payment checks route verified tenant rows to <see cref="TenantBotService"/> and owned-wallet rows to their
+/// provider settlement service. Provisional HooshPay, Tetraminator, and UniquePay actions are restricted to configured
+/// super-admins and never bypass a provider mismatch or create a provisional tenant fulfillment.
 /// </remarks>
 public class XuiV3AdminFlowService
 {
@@ -49,6 +49,12 @@ public class XuiV3AdminFlowService
     private const string TetraminatorProvisionalStartCallbackPrefix = "x3admin:tm:provisional:";
     private const string TetraminatorProvisionalConfirmCallbackPrefix = "x3admin:tm:provisional-confirm:";
     private const string TetraminatorProvisionalCancelCallbackPrefix = "x3admin:tm:provisional-cancel:";
+    /// <summary>First-stage super-admin callback prefix for an eligible pending OWNED UniquePay wallet row.</summary>
+    private const string UniquePayProvisionalStartCallbackPrefix = "x3admin:up:provisional:";
+    /// <summary>Final-stage callback prefix that forces a fresh official inquiry before any provisional credit.</summary>
+    private const string UniquePayProvisionalConfirmCallbackPrefix = "x3admin:up:provisional-confirm:";
+    /// <summary>Cancellation callback prefix that removes UniquePay approval controls without financial effects.</summary>
+    private const string UniquePayProvisionalCancelCallbackPrefix = "x3admin:up:provisional-cancel:";
     private const int MaxDetailedAccountInfoMessages = 5;
     private const int MaxTelegramTextLength = 3900;
     private const string SkipCommentText = "ادامه بدون کامنت";
@@ -63,6 +69,8 @@ public class XuiV3AdminFlowService
     private readonly HooshPaySettlementService _hooshPaySettlementService;
     private readonly Tetraminator _tetraminator;
     private readonly TetraminatorSettlementService _tetraminatorSettlementService;
+    /// <summary>Serialized authoritative UniquePay inquiry and provisional-decision coordinator.</summary>
+    private readonly UniquePayReconciliationHostedService _uniquePayReconciliation;
     private readonly TenantBotService _tenantBotService;
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
@@ -83,6 +91,9 @@ public class XuiV3AdminFlowService
     /// <param name="tetraminatorSettlementService">
     /// Idempotent official and super-admin provisional settlement service for owned-wallet Tetraminator charges.
     /// </param>
+    /// <param name="uniquePayReconciliation">
+    /// Official UniquePay inquiry coordinator used by status checks and both provisional-approval stages.
+    /// </param>
     /// <param name="tenantBotService">Tenant storefront settlement service for direct tenant orders.</param>
     /// <param name="purchaseService">Shared XuiV3 purchase and renewal service.</param>
     /// <param name="gozargahSiteSyncService">
@@ -101,6 +112,7 @@ public class XuiV3AdminFlowService
         HooshPaySettlementService hooshPaySettlementService,
         Tetraminator tetraminator,
         TetraminatorSettlementService tetraminatorSettlementService,
+        UniquePayReconciliationHostedService uniquePayReconciliation,
         TenantBotService tenantBotService,
         XuiV3PurchaseService purchaseService,
         GozargahSiteSyncService gozargahSiteSyncService,
@@ -117,6 +129,7 @@ public class XuiV3AdminFlowService
         _hooshPaySettlementService = hooshPaySettlementService;
         _tetraminator = tetraminator;
         _tetraminatorSettlementService = tetraminatorSettlementService;
+        _uniquePayReconciliation = uniquePayReconciliation;
         _tenantBotService = tenantBotService;
         _purchaseService = purchaseService;
         _gozargahSiteSyncService = gozargahSiteSyncService;
@@ -356,7 +369,7 @@ public class XuiV3AdminFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای تترامیناتور می‌توانید `Order ID`، `Pay ID` یا شناسه داخلی رکورد را بفرستید.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
+                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای تترامیناتور می‌توانید `Order ID`، `Pay ID` یا شناسه داخلی رکورد را بفرستید.\nبرای UniquePay می‌توانید `UP:8`، `Hash ID` یا `Ref ID` بفرستید.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
                 parseMode: ParseMode.Markdown,
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
@@ -1061,20 +1074,20 @@ public class XuiV3AdminFlowService
     }
 
     /// <summary>
-    /// Handles the two-stage super-admin callback flow for provisionally crediting a pending HooshPay wallet charge.
+    /// Routes two-stage super-admin provisional callbacks for HooshPay, Tetraminator, and UniquePay wallet charges.
     /// </summary>
     /// <param name="botClient">Telegram client for the owned bot through which the super-admin is working.</param>
-    /// <param name="callbackQuery">Callback issued from the admin-only HooshPay provisional approval message.</param>
+    /// <param name="callbackQuery">Callback issued from an admin-only provider provisional approval message.</param>
     /// <param name="mainMenu">Super-admin reply keyboard used after a financial decision completes.</param>
-    /// <param name="cancellationToken">Cancellation token for HooshPay verification, users.db, wallet, ledger, and Telegram work.</param>
+    /// <param name="cancellationToken">Cancellation token for provider verification, users.db, wallet, ledger, and Telegram work.</param>
     /// <returns>
-    /// <c>true</c> when the callback belonged to the provisional HooshPay flow and was consumed; otherwise <c>false</c>
+    /// <c>true</c> when the callback belonged to a supported provisional flow and was consumed; otherwise <c>false</c>
     /// so other callback handlers may process it.
     /// </returns>
     /// <remarks>
-    /// Only configured super-admin Telegram ids may reach this method. The callback carries only the internal payment
-    /// row id; it never contains an invoice secret, provider key, or raw order payload. The confirm stage refreshes
-    /// HooshPay once more before it makes a provisional financial exception.
+    /// Every provider-specific handler rechecks the configured super-admin id. Callback data carries only an internal
+    /// payment row id and never an invoice secret, provider key, or raw order payload. Every confirm stage refreshes
+    /// the corresponding provider before it can make a provisional financial exception.
     /// </remarks>
     public async Task<bool> TryHandleCallbackAsync(
         ITelegramBotClient botClient,
@@ -1088,6 +1101,17 @@ public class XuiV3AdminFlowService
             data.StartsWith(TetraminatorProvisionalCancelCallbackPrefix, StringComparison.Ordinal))
         {
             return await TryHandleTetraminatorProvisionalCallbackAsync(
+                botClient,
+                callbackQuery,
+                mainMenu,
+                cancellationToken);
+        }
+
+        if (data.StartsWith(UniquePayProvisionalStartCallbackPrefix, StringComparison.Ordinal) ||
+            data.StartsWith(UniquePayProvisionalConfirmCallbackPrefix, StringComparison.Ordinal) ||
+            data.StartsWith(UniquePayProvisionalCancelCallbackPrefix, StringComparison.Ordinal))
+        {
+            return await TryHandleUniquePayProvisionalCallbackAsync(
                 botClient,
                 callbackQuery,
                 mainMenu,
@@ -1248,6 +1272,20 @@ public class XuiV3AdminFlowService
         await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "منوی اصلی", cancellationToken);
     }
 
+    /// <summary>
+    /// Resolves a super-admin payment identifier across NOWPayments, HooshPay, Tetraminator, UniquePay, and tenant orders.
+    /// </summary>
+    /// <param name="botClient">Owned-bot Telegram client serving the configured super-admin.</param>
+    /// <param name="message">Admin message containing a provider/order identifier; UniquePay numeric ids require <c>UP:</c>.</param>
+    /// <param name="currentUser">Bot-scoped admin state cleared when lookup handling finishes.</param>
+    /// <param name="mainMenu">Reply keyboard restored after the result.</param>
+    /// <param name="cancellationToken">Cancellation token for provider, database, settlement, and Telegram operations.</param>
+    /// <returns>A task that completes after one provider-specific lookup result is sent.</returns>
+    /// <remarks>
+    /// UniquePay is checked by explicit <c>UP:&lt;id&gt;</c>, Hash ID, or Ref ID. A lookup is never payment proof: the
+    /// service obtains a fresh official response and permits provisional OWNED credit only through the separate
+    /// two-stage callback flow.
+    /// </remarks>
     private async Task HandleNowPaymentStatusAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1256,6 +1294,21 @@ public class XuiV3AdminFlowService
         CancellationToken cancellationToken)
     {
         var input = message.Text.Trim();
+        if (input.StartsWith("UP:", StringComparison.OrdinalIgnoreCase))
+        {
+            if (await TryHandleUniquePayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
+                return;
+
+            await FinishWithMessageAsync(
+                botClient,
+                message.Chat.Id,
+                currentUser,
+                mainMenu,
+                "پرداخت UniquePay با این شناسه داخلی پیدا نشد.",
+                cancellationToken);
+            return;
+        }
+
         var payment = await _userDbContext.SwapinoPaymentInfos
             .FirstOrDefaultAsync(p => p.OrderId == input || p.PaymentId == input || p.InvoiceId == input, cancellationToken);
 
@@ -1265,10 +1318,12 @@ public class XuiV3AdminFlowService
                 return;
             if (await TryHandleHooshPayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
                 return;
+            if (await TryHandleUniquePayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
+                return;
             if (await TryHandleTenantOrderManualConfirmationAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
                 return;
 
-            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments، HooshPay، تترامیناتور یا سفارش tenant با این شناسه پیدا نشد.", cancellationToken);
+            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments، HooshPay، تترامیناتور، UniquePay یا سفارش tenant با این شناسه پیدا نشد.", cancellationToken);
             return;
         }
 
@@ -1644,6 +1699,355 @@ public class XuiV3AdminFlowService
     }
 
     /// <summary>
+    /// Handles a super-admin UniquePay lookup and performs a fresh official inquiry before offering any manual action.
+    /// </summary>
+    /// <param name="botClient">Owned-bot Telegram client serving the configured super-admin.</param>
+    /// <param name="message">Admin message containing <c>UP:id</c>, merchant Hash ID, or provider Ref ID.</param>
+    /// <param name="currentUser">Bot-scoped admin flow state cleared after the lookup result is presented.</param>
+    /// <param name="mainMenu">Super-admin reply keyboard restored after the status result.</param>
+    /// <param name="input">Provider-qualified local id or stable UniquePay identifier; never a payment proof.</param>
+    /// <param name="cancellationToken">Cancellation token for inquiry, settlement, activity logging, and Telegram work.</param>
+    /// <returns><c>true</c> when a UniquePay row was found and handled; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// Official paid responses use the normal owned or tenant settlement path. Only a freshly rechecked pending
+    /// owned-wallet row may expose the first stage of provisional approval. Terminal, mismatch, transport-failed,
+    /// tenant, and already-settled rows never receive that button.
+    /// </remarks>
+    private async Task<bool> TryHandleUniquePayStatusAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        User currentUser,
+        IReplyMarkup mainMenu,
+        string input,
+        CancellationToken cancellationToken)
+    {
+        UniquePayPaymentInfo payment = null;
+        if (TryParseUniquePayInternalId(input, out var paymentId))
+        {
+            payment = await _userDbContext.UniquePayPaymentInfos
+                .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
+        }
+        else
+        {
+            payment = await _userDbContext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+                x => x.HashId == input || x.RefId == input,
+                cancellationToken);
+        }
+
+        if (payment == null)
+            return false;
+
+        var settlement = await _uniquePayReconciliation.ReconcilePaymentAsync(
+            payment.Id,
+            "admin-check",
+            allowTerminalRecheck: true,
+            cancellationToken);
+        await _userDbContext.Entry(payment).ReloadAsync(cancellationToken);
+
+        var actor = await GetActivityActorAsync(message.From.Id);
+        await _activityLog.LogBotActionAsync(
+            "uniquepay_status_checked",
+            actor,
+            true,
+            new Dictionary<string, object>
+            {
+                ["paymentId"] = payment.Id,
+                ["hashId"] = payment.HashId ?? string.Empty,
+                ["refId"] = payment.RefId ?? string.Empty,
+                ["paymentPurpose"] = payment.PaymentPurpose ?? string.Empty,
+                ["paymentStatus"] = payment.PaymentStatus ?? string.Empty,
+                ["settlementStatus"] = settlement.Status.ToString(),
+                ["amountToman"] = payment.BaseAmountToman,
+                ["errorCode"] = payment.ErrorCode ?? string.Empty
+            },
+            cancellationToken);
+
+        if (UniquePaySettlementService.CanApplyProvisionalCredit(payment))
+        {
+            await _userDbContext.ClearUserStatus(currentUser);
+            await botClient.SendTextMessageAsync(
+                message.Chat.Id,
+                BuildUniquePayPaymentInfo(payment, settlement) +
+                "\n\nاین پرداخت در استعلام تازه هنوز paid نیست. فقط در صورت اطمینان از دریافت وجه می‌توانید شارژ موقت کیف پول OWNED را آغاز کنید.",
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildProvisionalUniquePayStartKeyboard(payment.Id),
+                cancellationToken: cancellationToken);
+            await botClient.SendTextMessageAsync(
+                message.Chat.Id,
+                "منوی اصلی",
+                replyMarkup: mainMenu,
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        await FinishWithMessageAsync(
+            botClient,
+            message.Chat.Id,
+            currentUser,
+            mainMenu,
+            BuildUniquePayPaymentInfo(payment, settlement),
+            cancellationToken,
+            ParseMode.Html);
+        return true;
+    }
+
+    /// <summary>Parses a provider-qualified UniquePay internal payment id.</summary>
+    /// <param name="input">Admin input in exact case-insensitive <c>UP:&lt;positive integer&gt;</c> form.</param>
+    /// <param name="paymentId">Parsed positive users.db primary key, or zero when parsing fails.</param>
+    /// <returns><c>true</c> when the provider prefix and positive numeric id are both valid.</returns>
+    /// <remarks>Bare numeric ids are intentionally not accepted because payment tables can contain colliding keys.</remarks>
+    private static bool TryParseUniquePayInternalId(string input, out int paymentId)
+    {
+        paymentId = 0;
+        if (string.IsNullOrWhiteSpace(input) || !input.StartsWith("UP:", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return int.TryParse(input[3..].Trim(), out paymentId) && paymentId > 0;
+    }
+
+    /// <summary>Handles start, confirmation, and cancellation callbacks for UniquePay provisional wallet credit.</summary>
+    /// <param name="botClient">Owned-bot Telegram client serving the callback.</param>
+    /// <param name="callbackQuery">Admin callback containing only a local UniquePay row id.</param>
+    /// <param name="mainMenu">Super-admin reply keyboard restored after the final decision.</param>
+    /// <param name="cancellationToken">Cancellation token for provider, wallet, ledger, users.db, and Telegram work.</param>
+    /// <returns><c>true</c> because the caller invokes this method only for UniquePay provisional prefixes.</returns>
+    /// <remarks>
+    /// Every stage rechecks configured-super-admin authorization. The final stage waits for a fresh official inquiry;
+    /// only a still-pending owned-wallet row may be credited provisionally. Tenant orders and financial mismatches are
+    /// rejected even if callback data is replayed or manually forged.
+    /// </remarks>
+    private async Task<bool> TryHandleUniquePayProvisionalCallbackAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        IReplyMarkup mainMenu,
+        CancellationToken cancellationToken)
+    {
+        if (!IsConfiguredSuperAdmin(callbackQuery.From?.Id ?? 0))
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "اجازه انجام این عملیات را ندارید.", true, cancellationToken);
+            return true;
+        }
+
+        var data = callbackQuery.Data ?? string.Empty;
+        var prefix = data.StartsWith(UniquePayProvisionalConfirmCallbackPrefix, StringComparison.Ordinal)
+            ? UniquePayProvisionalConfirmCallbackPrefix
+            : data.StartsWith(UniquePayProvisionalCancelCallbackPrefix, StringComparison.Ordinal)
+                ? UniquePayProvisionalCancelCallbackPrefix
+                : UniquePayProvisionalStartCallbackPrefix;
+        if (!int.TryParse(data[prefix.Length..], out var paymentId) || paymentId <= 0)
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "شناسه پرداخت UniquePay معتبر نیست.", true, cancellationToken);
+            return true;
+        }
+
+        var payment = await _userDbContext.UniquePayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+        if (payment == null)
+        {
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت UniquePay پیدا نشد.", true, cancellationToken);
+            return true;
+        }
+
+        if (prefix == UniquePayProvisionalCancelCallbackPrefix)
+        {
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "تایید موقت UniquePay لغو شد. هیچ تغییری در کیف پول انجام نشد.",
+                null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "لغو شد.", false, cancellationToken);
+            return true;
+        }
+
+        if (prefix == UniquePayProvisionalStartCallbackPrefix)
+        {
+            if (!UniquePaySettlementService.CanApplyProvisionalCredit(payment))
+            {
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    BuildUniquePayPaymentInfo(payment, null) + "\n\nاین پرداخت برای تایید موقت مجاز نیست.",
+                    null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "این پرداخت قابل تایید موقت نیست.", true, cancellationToken);
+                return true;
+            }
+
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("✅ تایید نهایی موقت", UniquePayProvisionalConfirmCallbackPrefix + payment.Id),
+                    InlineKeyboardButton.WithCallbackData("انصراف", UniquePayProvisionalCancelCallbackPrefix + payment.Id)
+                }
+            });
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "⚠️ <b>تایید موقت شارژ UniquePay</b>\n\n" +
+                BuildUniquePayPaymentInfo(payment, null) +
+                "\n\nدر مرحله نهایی UniquePay دوباره استعلام می‌شود. اگر همچنان paid نباشد، فقط مبلغ پایه ذخیره‌شده به کیف پول OWNED اضافه می‌شود. تایید رسمی بعدی اعتبار یا ledger را دوباره افزایش نمی‌دهد.\n\nآیا ادامه می‌دهید؟",
+                keyboard,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "برای تایید نهایی، دکمه سبز را بزنید.", false, cancellationToken);
+            return true;
+        }
+
+        await ConfirmProvisionalUniquePayAsync(botClient, callbackQuery, payment, mainMenu, cancellationToken);
+        return true;
+    }
+
+    /// <summary>Performs the fresh provider check and final UniquePay provisional-credit decision.</summary>
+    /// <param name="botClient">Owned-bot Telegram client used to edit the protected admin message.</param>
+    /// <param name="callbackQuery">Final callback from a configured super-admin.</param>
+    /// <param name="payment">Tracked UniquePay row selected by internal users.db id.</param>
+    /// <param name="mainMenu">Super-admin reply keyboard restored after processing.</param>
+    /// <param name="cancellationToken">Cancellation token for inquiry, settlement, audit, and Telegram operations.</param>
+    /// <returns>A task completing after official settlement, provisional credit, duplicate detection, or safe rejection.</returns>
+    private async Task ConfirmProvisionalUniquePayAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        UniquePayPaymentInfo payment,
+        IReplyMarkup mainMenu,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var settlement = await _uniquePayReconciliation.ReconcileAndApplyProvisionalAsync(
+                payment.Id,
+                callbackQuery.From.Id,
+                payment.ChatId == 0 ? null : payment.ChatId,
+                "admin-provisional-confirm-refresh",
+                cancellationToken);
+            await _userDbContext.Entry(payment).ReloadAsync(cancellationToken);
+
+            if (UniquePayStatuses.IsPaid(payment.PaymentStatus))
+            {
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    "UniquePay در بررسی نهایی پرداخت را تایید کرد؛ مسیر رسمی اجرا شد.\n\n" +
+                    BuildUniquePayPaymentInfo(payment, settlement),
+                    null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت رسمی بررسی و تسویه شد.", false, cancellationToken);
+                return;
+            }
+
+            if (settlement.Status == NowPaymentsSettlementStatus.Applied && payment.IsProvisionallyApproved)
+            {
+                try
+                {
+                    // The financial audit is already durable in users.db and the wallet ledger. A secondary activity
+                    // file failure must not misreport the successfully applied credit as a failed financial action.
+                    var actor = await GetActivityActorAsync(callbackQuery.From.Id);
+                    await _activityLog.LogBotActionAsync(
+                        "uniquepay_provisional_wallet_approved",
+                        actor,
+                        true,
+                        new Dictionary<string, object>
+                        {
+                            ["paymentId"] = payment.Id,
+                            ["hashId"] = payment.HashId ?? string.Empty,
+                            ["refId"] = payment.RefId ?? string.Empty,
+                            ["paymentStatus"] = payment.PaymentStatus ?? string.Empty,
+                            ["settlementStatus"] = settlement.Status.ToString(),
+                            ["amountToman"] = payment.BaseAmountToman,
+                            ["approvedByTelegramUserId"] = callbackQuery.From.Id
+                        },
+                        cancellationToken);
+                }
+                catch (Exception activityException)
+                {
+                    _logger.LogWarning(
+                        activityException,
+                        "UniquePay provisional activity-file audit failed after durable credit. paymentId={PaymentId}, approvedBy={ApprovedBy}",
+                        payment.Id,
+                        callbackQuery.From.Id);
+                }
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    "✅ شارژ موقت UniquePay ثبت شد.\n\n" + BuildUniquePayPaymentInfo(payment, settlement),
+                    null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "شارژ موقت ثبت شد.", false, cancellationToken);
+                return;
+            }
+
+            if (payment.IsAddedToBalance)
+            {
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    (payment.IsProvisionallyApproved
+                        ? "شارژ موقت UniquePay ثبت شده و دوباره اعمال نشد.\n\n"
+                        : "این پرداخت قبلاً به کیف پول اضافه شده و دوباره اعمال نشد.\n\n") +
+                    BuildUniquePayPaymentInfo(payment, settlement),
+                    null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "قبلاً اعمال شده است.", false, cancellationToken);
+                return;
+            }
+
+            if (!UniquePaySettlementService.CanApplyProvisionalCredit(payment))
+            {
+                await EditProvisionalMessageAsync(
+                    botClient,
+                    callbackQuery,
+                    BuildUniquePayPaymentInfo(payment, settlement) +
+                    "\n\nتایید موقت انجام نشد؛ پاسخ تازه provider یا وضعیت محلی اجازه این عملیات را نمی‌دهد.",
+                    null,
+                    cancellationToken);
+                await AnswerCallbackSafelyAsync(botClient, callbackQuery, "تایید موقت مجاز نیست.", true, cancellationToken);
+                return;
+            }
+
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "شارژ موقت UniquePay اعمال نشد.\n\n" + BuildUniquePayPaymentInfo(payment, settlement),
+                null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(
+                botClient,
+                callbackQuery,
+                "شارژ موقت اعمال نشد.",
+                true,
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "UniquePay provisional wallet confirmation failed. paymentId={PaymentId}, hashId={HashId}, approvedBy={ApprovedBy}",
+                payment.Id,
+                payment.HashId,
+                callbackQuery.From?.Id);
+            await EditProvisionalMessageAsync(
+                botClient,
+                callbackQuery,
+                "تایید موقت UniquePay انجام نشد. استعلام نهایی یا عملیات مالی ناموفق بود.",
+                null,
+                cancellationToken);
+            await AnswerCallbackSafelyAsync(botClient, callbackQuery, "تایید موقت انجام نشد.", true, cancellationToken);
+        }
+        finally
+        {
+            if (callbackQuery.Message?.Chat.Id is long chatId && chatId != 0)
+            {
+                try
+                {
+                    await botClient.SendTextMessageAsync(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
+                }
+                catch (ApiRequestException ex) when (ex.ErrorCode == 403 || ex.ErrorCode == 400)
+                {
+                    _logger.LogWarning(ex, "Could not restore the super-admin menu after UniquePay provisional decision. chatId={ChatId}", chatId);
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Handles both stages and cancellation of a super-admin Tetraminator provisional wallet approval.
     /// </summary>
     /// <param name="botClient">Owned-bot Telegram client serving the super-admin callback.</param>
@@ -1907,6 +2311,48 @@ public class XuiV3AdminFlowService
         {
             new[] { InlineKeyboardButton.WithCallbackData("⚠️ تایید موقت شارژ", TetraminatorProvisionalStartCallbackPrefix + paymentId) }
         });
+
+    /// <summary>Builds the first-stage control for a pending owned-wallet UniquePay invoice.</summary>
+    /// <param name="paymentId">Positive internal users.db UniquePay payment id.</param>
+    /// <returns>An inline keyboard containing only the provisional-review action.</returns>
+    /// <remarks>The callback carries no amount, user id, Hash ID, Ref ID, or provider credential.</remarks>
+    private static InlineKeyboardMarkup BuildProvisionalUniquePayStartKeyboard(int paymentId)
+        => new(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData("⚠️ تایید موقت شارژ", UniquePayProvisionalStartCallbackPrefix + paymentId) }
+        });
+
+    /// <summary>Builds the HTML-safe UniquePay payment report used by super-admin status and approval screens.</summary>
+    /// <param name="payment">Local UniquePay row containing provider observations and provisional audit state.</param>
+    /// <param name="settlement">Optional result from the immediately preceding official or provisional settlement attempt.</param>
+    /// <returns>HTML text containing identifiers, amounts, status, fee contract, and audit flags without secrets.</returns>
+    private static string BuildUniquePayPaymentInfo(
+        UniquePayPaymentInfo payment,
+        NowPaymentsSettlementResult settlement)
+    {
+        return "⚡ <b>وضعیت پرداخت UniquePay</b>\n\n" +
+               $"شناسه داخلی: <code>UP:{payment.Id}</code>\n" +
+               $"Hash ID: <code>{Html(payment.HashId)}</code>\n" +
+               $"Ref ID: <code>{Html(payment.RefId)}</code>\n" +
+               $"کاربر: <code>{payment.TelegramUserId}</code>\n" +
+               $"هدف: <code>{Html(payment.PaymentPurpose)}</code>\n" +
+               $"سفارش tenant: <code>{payment.TenantBotOrderId}</code>\n" +
+               $"مبلغ پایه: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+               $"مبلغ provider: <code>{Html(payment.ProviderAmountToman?.FormatCurrency())}</code>\n" +
+               $"کارمزد درگاه: <code>{Html(payment.ProviderFeeToman?.FormatCurrency())}</code>\n" +
+               $"درصد کارمزد: <code>{payment.FeePercent}</code>\n" +
+               $"پرداخت‌کننده کارمزد: <code>{Html(payment.FeePayer)}</code>\n" +
+               $"واحد: <code>{Html(payment.Currency)}</code>\n" +
+               $"وضعیت provider: <code>{Html(payment.PaymentStatus)}</code>\n" +
+               $"خطای تطبیق: <code>{Html(payment.ErrorCode ?? "-")}</code>\n" +
+               $"وضعیت اعمال: <code>{Html(settlement?.Status.ToString() ?? (payment.IsAddedToBalance ? "AlreadyAdded" : "not-applied"))}</code>\n" +
+               $"تایید موقت: <code>{(payment.IsProvisionallyApproved ? "بله" : "خیر")}</code>\n" +
+               $"تاییدکننده موقت: <code>{payment.ProvisionalApprovedByTelegramUserId}</code>\n" +
+               $"زمان تایید موقت: <code>{Html(payment.ProvisionalApprovedAtUtc?.AddMinutes(210).ConvertToHijriShamsi())}</code>\n" +
+               $"تایید رسمی بعدی: <code>{Html(payment.ProviderConfirmedAfterProvisionalAtUtc?.AddMinutes(210).ConvertToHijriShamsi())}</code>\n" +
+               $"موجودی قبل: <code>{Html(payment.BalanceBefore?.FormatCurrency())}</code>\n" +
+               $"موجودی بعد: <code>{Html(payment.BalanceAfter?.FormatCurrency())}</code>";
+    }
 
     /// <summary>
     /// Builds an HTML-safe Tetraminator payment report for super-admin verification screens.

@@ -19,8 +19,8 @@ namespace Adminbot.Domain;
 /// </summary>
 /// <remarks>
 /// <see cref="HashId"/> is the merchant idempotency and lookup identity sent to UniquePay. The bearer token is never
-/// persisted. Settlement requires a fresh authoritative inquiry whose identity, IRT amount, buyer fee, and paid flag
-/// pass <see cref="UniquePayPaymentVerifier"/>.
+/// persisted. Settlement requires a fresh authoritative inquiry whose identity, toman amount, configured fee-payer
+/// contract, and paid flag pass <see cref="UniquePayPaymentVerifier"/>.
 /// </remarks>
 public sealed class UniquePayPaymentInfo
 {
@@ -37,22 +37,24 @@ public sealed class UniquePayPaymentInfo
     /// <summary>UniquePay-hosted payment URL delivered only to the intended customer.</summary>
     public string PaymentLink { get; set; }
 
-    /// <summary>Local source-of-truth amount in Iranian toman, excluding the buyer-paid UniquePay fee.</summary>
+    /// <summary>Local source-of-truth wallet credit or tenant order amount in Iranian toman, excluding gateway fees.</summary>
     public long BaseAmountToman { get; set; }
 
-    /// <summary>Final IRT amount most recently reported by UniquePay, including the buyer fee.</summary>
+    /// <summary>Invoice amount most recently reported by UniquePay in Iranian toman.</summary>
     public long? ProviderAmountToman { get; set; }
 
-    /// <summary>Buyer fee in Iranian toman most recently reported by UniquePay.</summary>
+    /// <summary>Gateway fee in Iranian toman most recently reported by UniquePay.</summary>
     public long? ProviderFeeToman { get; set; }
 
     /// <summary>Fee percentage snapshotted when the invoice was created; expected to be 12 for current business rules.</summary>
     public decimal FeePercent { get; set; } = 12m;
 
-    /// <summary>Provider fee payer; only <c>buyer</c> is accepted for settlement.</summary>
+    /// <summary>
+    /// Provider fee payer; verified responses may report buyer aliases <c>user</c>/<c>buyer</c> or <c>owner</c>.
+    /// </summary>
     public string FeePayer { get; set; }
 
-    /// <summary>Provider invoice currency; only <c>IRT</c> is accepted for settlement.</summary>
+    /// <summary>Provider invoice currency; verified responses may use <c>IRT</c> or <c>toman</c>.</summary>
     public string Currency { get; set; }
 
     /// <summary>Latest local provider state: pending, paid, or failed verification.</summary>
@@ -116,6 +118,24 @@ public sealed class UniquePayPaymentInfo
     public bool IsAddedToBalance { get; set; }
 
     /// <summary>
+    /// Whether a configured super-admin credited this owned wallet before UniquePay officially confirmed payment.
+    /// Tenant orders can never set this flag.
+    /// </summary>
+    public bool IsProvisionallyApproved { get; set; }
+
+    /// <summary>UTC time when the owned-wallet provisional credit was durably recorded.</summary>
+    public DateTime? ProvisionalApprovedAtUtc { get; set; }
+
+    /// <summary>Telegram user id of the configured super-admin who approved the provisional wallet credit.</summary>
+    public long? ProvisionalApprovedByTelegramUserId { get; set; }
+
+    /// <summary>
+    /// UTC time when an authoritative inquiry later confirmed a provisionally credited payment without applying a
+    /// second wallet or ledger mutation.
+    /// </summary>
+    public DateTime? ProviderConfirmedAfterProvisionalAtUtc { get; set; }
+
+    /// <summary>
     /// Durable settlement claim state used to prevent concurrent worker, return, and customer-check processors from
     /// repeating wallet credit or tenant fulfillment.
     /// </summary>
@@ -150,7 +170,7 @@ public sealed class UniquePayPaymentInfo
     /// </summary>
     /// <param name="telegramUserId">Numeric Telegram id of the shared wallet owner.</param>
     /// <param name="chatId">Telegram chat id to receive the payment link and settlement message.</param>
-    /// <param name="baseAmountToman">Wallet credit amount in Iranian toman, excluding the 12% buyer fee; must be positive.</param>
+    /// <param name="baseAmountToman">Wallet credit amount in Iranian toman, excluding the 12% gateway fee; must be positive.</param>
     /// <param name="feePercent">Fee percentage snapshotted from global configuration, normally 12.</param>
     /// <returns>An unsaved row with a unique merchant hash and no provider credential.</returns>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when amount or fee is outside its valid financial range.</exception>
@@ -239,7 +259,7 @@ public static class UniquePayStatuses
     /// <summary>Invoice exists locally but has not passed an authoritative paid inquiry.</summary>
     public const string Pending = "pending";
 
-    /// <summary>Authoritative inquiry passed all identity, IRT amount, buyer fee, and payment checks.</summary>
+    /// <summary>Authoritative inquiry passed all identity, toman amount, fee-payer, fee, and payment checks.</summary>
     public const string Paid = "paid";
 
     /// <summary>Invoice creation or authoritative verification failed and no financial side effect is permitted.</summary>
@@ -326,7 +346,7 @@ public static class UniquePaySettlementStates
 }
 
 /// <summary>
-/// Verifies UniquePay inquiry identity, IRT currency, buyer fee, base amount, and paid state before settlement.
+/// Verifies UniquePay inquiry identity, toman currency, configured fee-payer amount model, fee, and paid state.
 /// </summary>
 public static class UniquePayPaymentVerifier
 {
@@ -341,6 +361,12 @@ public static class UniquePayPaymentVerifier
     /// <returns><c>true</c> only when the invoice is paid and every financial/identity invariant matches.</returns>
     /// <remarks>
     /// <c>isVerified</c> is intentionally informational because UniquePay documentation marks it as a future feature.
+    /// The root <c>hashId</c> echo is compared whenever present, while production responses that omit it remain bound
+    /// to the locally persisted create-time reference through <c>invoice.id</c>.
+    /// UniquePay production responses use both <c>IRT</c>/<c>toman</c> and buyer aliases <c>buyer</c>/<c>user</c>.
+    /// Current responses keep <c>amount</c> equal to the base and expose the charged total through
+    /// <c>payableAmount = base + buyer fee + uniqueAmount</c>. Legacy <c>buyer</c> responses without payable fields
+    /// remain valid only when <c>amount - fee</c> equals the base. Owner-paid invoices never add the fee to payable.
     /// The allowed one-toman fee difference accounts only for provider rounding; no other mismatch is tolerated.
     /// </remarks>
     public static bool IsVerifiedPaid(
@@ -354,13 +380,17 @@ public static class UniquePayPaymentVerifier
             return false;
         }
 
-        if (!string.IsNullOrWhiteSpace(response.HashId) &&
-            !string.Equals(payment.HashId?.Trim(), response.HashId.Trim(), StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(payment.HashId) ||
+            (!string.IsNullOrWhiteSpace(response.HashId) &&
+             !string.Equals(payment.HashId.Trim(), response.HashId.Trim(), StringComparison.Ordinal)))
         {
             errorCode = "provider_hash_id_mismatch";
             return false;
         }
 
+        // Production check-invoice responses can omit the root hashId even though the inquiry was made with the
+        // persisted merchant hash. Reject a conflicting returned hash, and bind the result to the create-time RefId
+        // through invoice.id so an omitted optional echo cannot either block or weaken financial verification.
         var providerInvoiceIdentity = !string.IsNullOrWhiteSpace(response.RefId)
             ? response.RefId.Trim()
             : response.Invoice.InvoiceId;
@@ -376,27 +406,22 @@ public static class UniquePayPaymentVerifier
             return false;
         }
 
-        if (!response.Invoice.IsPaid)
-        {
-            errorCode = "provider_not_paid";
-            return false;
-        }
-
-        if (!string.Equals(response.Invoice.Currency?.Trim(), "IRT", StringComparison.OrdinalIgnoreCase))
+        var currency = response.Invoice.Currency?.Trim();
+        if (!string.Equals(currency, "IRT", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(currency, "toman", StringComparison.OrdinalIgnoreCase))
         {
             errorCode = "provider_currency_mismatch";
             return false;
         }
 
-        if (!string.Equals(response.Invoice.FeePayer?.Trim(), "buyer", StringComparison.OrdinalIgnoreCase))
+        var feePayer = response.Invoice.FeePayer?.Trim();
+        var legacyBuyerPaysFee = string.Equals(feePayer, "buyer", StringComparison.OrdinalIgnoreCase);
+        var userPaysFee = string.Equals(feePayer, "user", StringComparison.OrdinalIgnoreCase);
+        var buyerPaysFee = legacyBuyerPaysFee || userPaysFee;
+        var ownerPaysFee = string.Equals(feePayer, "owner", StringComparison.OrdinalIgnoreCase);
+        if (!buyerPaysFee && !ownerPaysFee)
         {
             errorCode = "provider_fee_payer_mismatch";
-            return false;
-        }
-
-        if (response.Invoice.Amount - response.Invoice.Fee != payment.BaseAmountToman)
-        {
-            errorCode = "provider_base_amount_mismatch";
             return false;
         }
 
@@ -407,6 +432,56 @@ public static class UniquePayPaymentVerifier
         if (Math.Abs(response.Invoice.Fee - expectedFee) > 1m)
         {
             errorCode = "provider_fee_mismatch";
+            return false;
+        }
+
+        var hasPayableAmount = response.Invoice.PayableAmount.HasValue;
+        var hasUniqueAmount = response.Invoice.UniqueAmount.HasValue;
+        if (userPaysFee || hasPayableAmount || hasUniqueAmount)
+        {
+            if (response.Invoice.Amount != payment.BaseAmountToman)
+            {
+                errorCode = "provider_base_amount_mismatch";
+                return false;
+            }
+            if (!hasPayableAmount ||
+                !hasUniqueAmount ||
+                response.Invoice.UniqueAmount.Value < 0)
+            {
+                errorCode = "provider_payable_amount_mismatch";
+                return false;
+            }
+
+            // The live API separates the immutable merchant base from the actual card-transfer total. Validate the
+            // complete equation so neither an altered buyer fee nor an altered unique amount can settle a wallet.
+            var expectedPayableAmount = (decimal)payment.BaseAmountToman +
+                                        (buyerPaysFee ? response.Invoice.Fee : 0L) +
+                                        response.Invoice.UniqueAmount.Value;
+            if (response.Invoice.PayableAmount.Value != expectedPayableAmount)
+            {
+                errorCode = "provider_payable_amount_mismatch";
+                return false;
+            }
+        }
+        else
+        {
+            // Backward compatibility for the documented legacy shape, which placed a buyer-paid fee inside amount
+            // and did not return payableAmount/uniqueAmount.
+            var providerBaseAmount = legacyBuyerPaysFee
+                ? response.Invoice.Amount - response.Invoice.Fee
+                : response.Invoice.Amount;
+            if (providerBaseAmount != payment.BaseAmountToman)
+            {
+                errorCode = "provider_base_amount_mismatch";
+                return false;
+            }
+        }
+
+        // A provisional decision may use only a structurally and financially consistent pending invoice. Validate
+        // every immutable provider field before returning provider_not_paid to the super-admin flow.
+        if (!response.Invoice.IsPaid)
+        {
+            errorCode = "provider_not_paid";
             return false;
         }
 
@@ -458,7 +533,7 @@ public sealed class UniquePay
     /// Creates one UniquePay invoice without automatic retry.
     /// </summary>
     /// <param name="hashId">Globally unique merchant hash already persisted in users.db.</param>
-    /// <param name="amountToman">Base amount in Iranian toman/IRT, excluding the buyer-paid fee; must be positive.</param>
+    /// <param name="amountToman">Base amount in Iranian toman/IRT, excluding the gateway fee; must be positive.</param>
     /// <param name="redirectUrl">
     /// Absolute platform return URL containing the merchant hash only as a lookup hint; it is not a settlement callback.
     /// </param>
@@ -473,7 +548,7 @@ public sealed class UniquePay
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(hashId);
         if (amountToman <= 0)
-            throw new ArgumentOutOfRangeException(nameof(amountToman), "UniquePay invoice amount must be positive IRT.");
+            throw new ArgumentOutOfRangeException(nameof(amountToman), "UniquePay invoice amount must be positive toman.");
 
         var fields = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -665,7 +740,9 @@ public abstract class UniquePayResponseBase
     [JsonProperty("code")]
     public int Code { get; set; }
 
-    /// <summary>Merchant hash returned by the provider.</summary>
+    /// <summary>
+    /// Optional merchant hash echo returned by the provider; production inquiry responses may omit this field.
+    /// </summary>
     [JsonProperty("hashId")]
     public string HashId { get; set; }
 
@@ -749,11 +826,26 @@ public sealed class UniquePayInvoiceData
     [JsonProperty("isCanceled")]
     public bool? IsCanceled { get; set; }
 
-    /// <summary>Final amount in IRT/toman including buyer fee.</summary>
+    /// <summary>
+    /// Provider invoice amount in IRT/toman. Current responses keep this at the merchant base amount; legacy
+    /// <c>buyer</c> responses may include the fee here when payable fields are absent.
+    /// </summary>
     [JsonProperty("amount")]
     public long Amount { get; set; }
 
-    /// <summary>Provider currency code; settlement requires <c>IRT</c>.</summary>
+    /// <summary>
+    /// Final card-transfer amount in IRT/toman after the applicable buyer fee and provider unique amount are added.
+    /// </summary>
+    [JsonProperty("payableAmount")]
+    public long? PayableAmount { get; set; }
+
+    /// <summary>
+    /// Non-negative provider-selected amount in IRT/toman added to make the card transfer uniquely identifiable.
+    /// </summary>
+    [JsonProperty("uniqueAmount")]
+    public long? UniqueAmount { get; set; }
+
+    /// <summary>Provider currency code; settlement accepts only case-insensitive <c>IRT</c> or <c>toman</c>.</summary>
     [JsonProperty("currency")]
     public string Currency { get; set; }
 
@@ -761,7 +853,10 @@ public sealed class UniquePayInvoiceData
     [JsonProperty("fee")]
     public long Fee { get; set; }
 
-    /// <summary>Party paying the fee; settlement requires <c>buyer</c>.</summary>
+    /// <summary>
+    /// Party paying the fee; settlement accepts <c>user</c>/<c>buyer</c> as buyer aliases or <c>owner</c>, each with
+    /// its matching amount equation.
+    /// </summary>
     [JsonProperty("feePayer")]
     public string FeePayer { get; set; }
 
@@ -810,15 +905,16 @@ public sealed class UniquePayApiException : Exception
 }
 
 /// <summary>
-/// Credits officially verified UniquePay owned-wallet invoices exactly once.
+/// Credits officially verified or explicitly provisionally approved UniquePay owned-wallet invoices exactly once.
 /// </summary>
 /// <remarks>
-/// Tenant payments are deliberately rejected and routed through <see cref="TenantBotService"/>. Telegram notification
-/// and central reporting occur only after wallet, payment marker, ledger, and referral work are durably applied.
+/// Tenant payments are deliberately rejected and routed through <see cref="TenantBotService"/>. Provisional approval
+/// is restricted to configured super-admin flows, uses a separate ledger identity, and never creates referral rewards.
 /// </remarks>
 public sealed class UniquePaySettlementService
 {
     private static readonly SemaphoreSlim SettlementGate = new(1, 1);
+    private readonly AppConfig _configuration;
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
     private readonly WalletLedgerService _walletLedgerService;
@@ -829,6 +925,7 @@ public sealed class UniquePaySettlementService
     /// <summary>
     /// Creates the owned-wallet UniquePay settlement boundary.
     /// </summary>
+    /// <param name="configuration">Startup configuration containing the immutable super-admin Telegram allow-list.</param>
     /// <param name="userDbContext">users.db context containing payment rows and settlement markers.</param>
     /// <param name="credentialsDbContext">credentials.db context containing the shared wallet balance.</param>
     /// <param name="walletLedgerService">Idempotent append-only wallet-ledger writer.</param>
@@ -836,6 +933,7 @@ public sealed class UniquePaySettlementService
     /// <param name="botClientProvider">Bot client provider used for best-effort customer delivery.</param>
     /// <param name="logger">Operational and payment logger; provider credentials are never included.</param>
     public UniquePaySettlementService(
+        IConfiguration configuration,
         UserDbContext userDbContext,
         CredentialsDbContext credentialsDbContext,
         WalletLedgerService walletLedgerService,
@@ -843,6 +941,7 @@ public sealed class UniquePaySettlementService
         BotClientProvider botClientProvider,
         ILogger<UniquePaySettlementService> logger)
     {
+        _configuration = configuration.Get<AppConfig>() ?? new AppConfig();
         _userDbContext = userDbContext;
         _credentialsDbContext = credentialsDbContext;
         _walletLedgerService = walletLedgerService;
@@ -909,12 +1008,24 @@ public sealed class UniquePaySettlementService
                     tracked.UpdatedAtUtc = DateTime.UtcNow;
                     await _userDbContext.SaveChangesAsync(cancellationToken);
                 }
-                await EnsureLedgerAsync(
-                    tracked,
-                    tracked.BalanceBefore ?? user.AccountBalance - tracked.BaseAmountToman,
-                    tracked.BalanceAfter ?? user.AccountBalance,
-                    cancellationToken);
-                await ProcessReferralAsync(tracked, cancellationToken);
+                if (tracked.IsProvisionallyApproved)
+                {
+                    await EnsureProvisionalLedgerAsync(
+                        tracked,
+                        tracked.BalanceBefore ?? user.AccountBalance - tracked.BaseAmountToman,
+                        tracked.BalanceAfter ?? user.AccountBalance,
+                        cancellationToken);
+                    await RecordProviderConfirmationAfterProvisionalAsync(tracked, user, source, cancellationToken);
+                }
+                else
+                {
+                    await EnsureLedgerAsync(
+                        tracked,
+                        tracked.BalanceBefore ?? user.AccountBalance - tracked.BaseAmountToman,
+                        tracked.BalanceAfter ?? user.AccountBalance,
+                        cancellationToken);
+                    await ProcessReferralAsync(tracked, cancellationToken);
+                }
                 return NowPaymentsSettlementResult.AlreadyAdded(user.AccountBalance);
             }
 
@@ -968,8 +1079,129 @@ public sealed class UniquePaySettlementService
             await _userDbContext.SaveChangesAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, before, after, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
-            await NotifyCustomerAsync(tracked, notifyChatId ?? tracked.ChatId, cancellationToken);
+            await NotifyCustomerAsync(tracked, notifyChatId ?? tracked.ChatId, provisional: false, cancellationToken);
             LogSettlementOnce(tracked, user, before, after, source);
+            return NowPaymentsSettlementResult.Applied(before, after);
+        }
+        finally
+        {
+            SettlementGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Applies a two-stage super-admin provisional credit to one recently rechecked pending UniquePay wallet invoice.
+    /// </summary>
+    /// <param name="payment">Owned-wallet payment whose latest official inquiry still reports unpaid.</param>
+    /// <param name="approvedByTelegramUserId">Configured super-admin Telegram id persisted for financial audit.</param>
+    /// <param name="notifyChatId">Optional customer chat override; null uses the chat saved on the payment row.</param>
+    /// <param name="cancellationToken">Cancellation token for claim, wallet, users.db, ledger, and Telegram operations.</param>
+    /// <returns>Applied for the first credit, AlreadyAdded for a duplicate decision, or a non-mutating failure status.</returns>
+    /// <remarks>
+    /// The amount always comes from immutable <see cref="UniquePayPaymentInfo.BaseAmountToman"/>. Tenant orders,
+    /// terminal/mismatched responses, provider-check failures, and already paid rows are rejected. A persisted claim is
+    /// acquired before credentials.db is changed so a crash becomes manual review instead of a duplicate wallet credit.
+    /// Referral processing is permanently excluded for this provisional credit; a later official confirmation writes
+    /// audit only and never retroactively creates a referral reward.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var result = await settlement.ApplyProvisionalPaymentAsync(payment, adminTelegramId, payment.ChatId, token);
+    /// </code>
+    /// </example>
+    public async Task<NowPaymentsSettlementResult> ApplyProvisionalPaymentAsync(
+        UniquePayPaymentInfo payment,
+        long approvedByTelegramUserId,
+        long? notifyChatId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (payment == null)
+            return NowPaymentsSettlementResult.NotFound();
+        if (approvedByTelegramUserId <= 0 ||
+            _configuration.AdminsUserIds?.Contains(approvedByTelegramUserId) != true ||
+            !IsOwnedWalletCharge(payment))
+        {
+            return NowPaymentsSettlementResult.InvalidAmount();
+        }
+
+        await SettlementGate.WaitAsync(cancellationToken);
+        try
+        {
+            var tracked = await _userDbContext.UniquePayPaymentInfos
+                .FirstOrDefaultAsync(x => x.Id == payment.Id, cancellationToken);
+            if (tracked == null)
+                return NowPaymentsSettlementResult.NotFound();
+
+            var user = await _credentialsDbContext.GetUserStatusWithId(tracked.TelegramUserId);
+            if (user == null)
+                return NowPaymentsSettlementResult.UserNotFound();
+
+            if (tracked.IsAddedToBalance)
+            {
+                if (tracked.IsProvisionallyApproved)
+                {
+                    await EnsureProvisionalLedgerAsync(
+                        tracked,
+                        tracked.BalanceBefore ?? user.AccountBalance - tracked.BaseAmountToman,
+                        tracked.BalanceAfter ?? user.AccountBalance,
+                        cancellationToken);
+                }
+                return NowPaymentsSettlementResult.AlreadyAdded(user.AccountBalance);
+            }
+
+            if (!CanApplyProvisionalCredit(tracked) ||
+                await RejectActiveOrAmbiguousClaimAsync(tracked, cancellationToken))
+            {
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
+
+            var attemptId = Guid.NewGuid().ToString("N");
+            var claimedAtUtc = DateTime.UtcNow;
+            var claimed = await _userDbContext.UniquePayPaymentInfos
+                .Where(x => x.Id == tracked.Id &&
+                            !x.IsAddedToBalance &&
+                            x.PaymentStatus == UniquePayStatuses.Pending &&
+                            (x.SettlementState == null || x.SettlementState == UniquePaySettlementStates.Pending))
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(x => x.SettlementState, UniquePaySettlementStates.Processing)
+                        .SetProperty(x => x.SettlementAttemptId, attemptId)
+                        .SetProperty(x => x.SettlementStartedAtUtc, claimedAtUtc)
+                        .SetProperty(x => x.UpdatedAtUtc, claimedAtUtc),
+                    cancellationToken);
+            if (claimed != 1)
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+
+            await _userDbContext.Entry(tracked).ReloadAsync(cancellationToken);
+            var before = user.AccountBalance;
+            if (!await _credentialsDbContext.AddFund(tracked.TelegramUserId, tracked.BaseAmountToman))
+            {
+                tracked.SettlementState = UniquePaySettlementStates.Pending;
+                tracked.SettlementAttemptId = null;
+                tracked.SettlementStartedAtUtc = null;
+                tracked.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbContext.SaveChangesAsync(cancellationToken);
+                return NowPaymentsSettlementResult.UserNotFound();
+            }
+            var after = checked(before + tracked.BaseAmountToman);
+
+            tracked.IsAddedToBalance = true;
+            tracked.IsProvisionallyApproved = true;
+            tracked.ProvisionalApprovedAtUtc = DateTime.UtcNow;
+            tracked.ProvisionalApprovedByTelegramUserId = approvedByTelegramUserId;
+            tracked.SettlementState = UniquePaySettlementStates.Settled;
+            tracked.SettlementAttemptId = null;
+            tracked.SettlementStartedAtUtc = null;
+            tracked.BalanceBefore = before;
+            tracked.BalanceAfter = after;
+            tracked.SettledAtUtc ??= DateTime.UtcNow;
+            tracked.NextInquiryAtUtc ??= DateTime.UtcNow.AddMinutes(1);
+            tracked.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbContext.SaveChangesAsync(cancellationToken);
+
+            await EnsureProvisionalLedgerAsync(tracked, before, after, cancellationToken);
+            await NotifyCustomerAsync(tracked, notifyChatId ?? tracked.ChatId, provisional: true, cancellationToken);
+            LogProvisionalSettlement(tracked, user, before, after);
             return NowPaymentsSettlementResult.Applied(before, after);
         }
         finally
@@ -1022,6 +1254,32 @@ public sealed class UniquePaySettlementService
     }
 
     /// <summary>
+    /// Determines whether a refreshed UniquePay row may receive a super-admin provisional owned-wallet credit.
+    /// </summary>
+    /// <param name="payment">Tracked payment after the immediately preceding official inquiry.</param>
+    /// <returns>
+    /// <c>true</c> only for an unsettled owned-wallet invoice that remains pending without verification or transport
+    /// errors and has both local and provider identities; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Paid, terminal, mismatched, network-failed, tenant, and ambiguous settlement rows are deliberately excluded.
+    /// The caller must still acquire the durable settlement claim before changing credentials.db.
+    /// </remarks>
+    public static bool CanApplyProvisionalCredit(UniquePayPaymentInfo payment)
+    {
+        return payment != null &&
+               IsOwnedWalletCharge(payment) &&
+               !payment.IsAddedToBalance &&
+               string.Equals(payment.PaymentStatus, UniquePayStatuses.Pending, StringComparison.Ordinal) &&
+               string.IsNullOrWhiteSpace(payment.ErrorCode) &&
+               !string.IsNullOrWhiteSpace(payment.HashId) &&
+               !string.IsNullOrWhiteSpace(payment.RefId) &&
+               !string.IsNullOrWhiteSpace(payment.PaymentLink) &&
+               !string.Equals(payment.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal) &&
+               !string.Equals(payment.SettlementState, UniquePaySettlementStates.Processing, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Ensures a UniquePay wallet credit has one append-only audit row.
     /// </summary>
     /// <param name="payment">Settled owned-wallet payment.</param>
@@ -1060,6 +1318,44 @@ public sealed class UniquePaySettlementService
     }
 
     /// <summary>
+    /// Ensures a super-admin provisional UniquePay credit has one append-only wallet-ledger row.
+    /// </summary>
+    /// <param name="payment">Provisionally credited owned-wallet payment containing the approving administrator.</param>
+    /// <param name="before">Authoritative shared wallet balance in toman before the provisional credit.</param>
+    /// <param name="after">Authoritative shared wallet balance in toman after the provisional credit.</param>
+    /// <param name="cancellationToken">Cancellation token for the independent users.db ledger write.</param>
+    /// <returns>The existing or newly inserted ledger entry selected by its provider-specific idempotency key.</returns>
+    /// <remarks>
+    /// Duplicate admin callbacks and later provider confirmation call this helper again only to repair a missing audit
+    /// row. The unique key prevents a second ledger entry and this method never changes credentials.db.
+    /// </remarks>
+    private Task<WalletLedgerEntry> EnsureProvisionalLedgerAsync(
+        UniquePayPaymentInfo payment,
+        long before,
+        long after,
+        CancellationToken cancellationToken)
+    {
+        var providerId = GetStableProviderId(payment);
+        return _walletLedgerService.RecordAsync(
+            payment.TelegramUserId,
+            WalletLedgerDirections.Credit,
+            payment.BaseAmountToman,
+            before,
+            after,
+            WalletLedgerReasons.WalletCharge,
+            provider: "uniquepay_provisional_admin",
+            referenceType: nameof(UniquePayPaymentInfo),
+            referenceId: payment.Id.ToString(CultureInfo.InvariantCulture),
+            orderId: payment.HashId,
+            description: $"UniquePay provisional wallet charge approved by {payment.ProvisionalApprovedByTelegramUserId}",
+            botId: payment.BotId,
+            botUsername: payment.BotUsername,
+            botType: BotInstanceTypes.Owned,
+            idempotencyKey: $"wallet-credit:uniquepay-provisional:{providerId}",
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
     /// Presents one settled official UniquePay wallet payment to the global referral engine.
     /// </summary>
     /// <param name="payment">Final owned-wallet payment with durable local credit.</param>
@@ -1086,10 +1382,12 @@ public sealed class UniquePaySettlementService
     /// </summary>
     /// <param name="payment">Settled payment containing the originating bot and credited amount.</param>
     /// <param name="chatId">Telegram chat id; zero suppresses delivery.</param>
+    /// <param name="provisional">Whether the message must identify the credit as a super-admin provisional action.</param>
     /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
     private async Task NotifyCustomerAsync(
         UniquePayPaymentInfo payment,
         long chatId,
+        bool provisional,
         CancellationToken cancellationToken)
     {
         if (chatId == 0)
@@ -1098,7 +1396,9 @@ public sealed class UniquePaySettlementService
         {
             await _botClientProvider.GetClient(payment.BotId).SendTextMessageAsync(
                 chatId,
-                $"اعتبار کیف پول شما به میزان {payment.BaseAmountToman.FormatCurrency()} افزایش یافت.",
+                provisional
+                    ? $"اعتبار کیف پول شما به میزان {payment.BaseAmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت."
+                    : $"اعتبار کیف پول شما به میزان {payment.BaseAmountToman.FormatCurrency()} افزایش یافت.",
                 cancellationToken: cancellationToken);
         }
         catch (Exception ex)
@@ -1136,12 +1436,74 @@ public sealed class UniquePaySettlementService
             "✅ پرداخت ریالی یونیک‌پی تایید شد\n\n" +
             TelegramUserLinkFormatter.HtmlSummary(user) + "\n\n" +
             $"💰 مبلغ پایه: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
-            $"💸 کارمزد خریدار: <code>{Html((payment.ProviderFeeToman ?? 0).FormatCurrency())}</code>\n" +
+            $"💸 کارمزد درگاه: <code>{Html((payment.ProviderFeeToman ?? 0).FormatCurrency())}</code>\n" +
+            $"👤 پرداخت‌کننده کارمزد: <code>{Html(payment.FeePayer)}</code>\n" +
+            $"💱 واحد: <code>{Html(payment.Currency)}</code>\n" +
             $"🧾 Hash ID: <code>{Html(payment.HashId)}</code>\n" +
             $"🧾 Ref ID: <code>{Html(payment.RefId)}</code>\n" +
             $"💳 موجودی قبل: <code>{Html(before.FormatCurrency())}</code>\n" +
             $"💳 موجودی بعد: <code>{Html(after.FormatCurrency())}</code>\n" +
             $"📡 منبع: <code>{Html(source)}</code>");
+    }
+
+    /// <summary>Sends the one-time central audit for a provisional UniquePay wallet credit.</summary>
+    /// <param name="payment">Provisionally credited owned-wallet payment and provider identifiers.</param>
+    /// <param name="user">Shared wallet owner displayed in the protected payment log.</param>
+    /// <param name="before">Wallet balance in toman before the provisional credit.</param>
+    /// <param name="after">Wallet balance in toman after the provisional credit.</param>
+    /// <remarks>The provider status remains pending; this audit never represents an official UniquePay confirmation.</remarks>
+    private void LogProvisionalSettlement(
+        UniquePayPaymentInfo payment,
+        CredUser user,
+        long before,
+        long after)
+    {
+        _logger.LogPayment(
+            "⚠️ شارژ موقت یونیک‌پی\n\n" +
+            TelegramUserLinkFormatter.HtmlSummary(user) + "\n\n" +
+            $"💰 مبلغ: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+            $"🧾 Hash ID: <code>{Html(payment.HashId)}</code>\n" +
+            $"🧾 Ref ID: <code>{Html(payment.RefId)}</code>\n" +
+            $"👨‍💼 تاییدکننده: <code>{payment.ProvisionalApprovedByTelegramUserId}</code>\n" +
+            $"💳 موجودی قبل: <code>{Html(before.FormatCurrency())}</code>\n" +
+            $"💳 موجودی بعد: <code>{Html(after.FormatCurrency())}</code>\n" +
+            "🔒 وضعیت رسمی درگاه همچنان pending است.");
+    }
+
+    /// <summary>
+    /// Records a later official UniquePay confirmation for a provisionally credited wallet without crediting again.
+    /// </summary>
+    /// <param name="payment">Tracked row already marked paid and provisionally credited.</param>
+    /// <param name="user">Shared wallet owner displayed in the protected audit.</param>
+    /// <param name="source">Non-secret inquiry source that observed the official confirmation.</param>
+    /// <param name="cancellationToken">Cancellation token for the users.db audit update.</param>
+    /// <returns>A task that completes after a new audit is saved or an existing confirmation is left unchanged.</returns>
+    /// <remarks>No wallet, referral, or ledger mutation is performed.</remarks>
+    private async Task RecordProviderConfirmationAfterProvisionalAsync(
+        UniquePayPaymentInfo payment,
+        CredUser user,
+        string source,
+        CancellationToken cancellationToken)
+    {
+        if (!payment.IsProvisionallyApproved ||
+            !payment.IsAddedToBalance ||
+            !UniquePayStatuses.IsPaid(payment.PaymentStatus) ||
+            payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue)
+        {
+            return;
+        }
+
+        payment.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
+        payment.UpdatedAtUtc = DateTime.UtcNow;
+        await _userDbContext.SaveChangesAsync(cancellationToken);
+        _logger.LogPayment(
+            "ℹ️ یونیک‌پی پرداخت موقت را بعداً تایید کرد\n\n" +
+            TelegramUserLinkFormatter.HtmlSummary(user) + "\n\n" +
+            $"🧾 Hash ID: <code>{Html(payment.HashId)}</code>\n" +
+            $"🧾 Ref ID: <code>{Html(payment.RefId)}</code>\n" +
+            $"👨‍💼 تایید موقت توسط: <code>{payment.ProvisionalApprovedByTelegramUserId}</code>\n" +
+            $"📡 منبع تایید رسمی: <code>{Html(source)}</code>\n" +
+            "🔒 کیف پول و ledger دوباره تغییر نکردند.");
     }
 
     /// <summary>
@@ -1192,7 +1554,7 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// <summary>
     /// Creates the UniquePay polling worker.
     /// </summary>
-    /// <param name="configuration">Startup configuration containing interval and batch limits.</param>
+    /// <param name="configuration">Startup configuration containing interval, batch limits, and super-admin allow-list.</param>
     /// <param name="userDbContext">users.db context containing pending UniquePay rows.</param>
     /// <param name="uniquePay">Authenticated read-only inquiry client.</param>
     /// <param name="ownedSettlement">Idempotent owned-wallet settlement service.</param>
@@ -1250,13 +1612,14 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     }
 
     /// <summary>
-    /// Reconciles one fair batch of due, unsettled UniquePay rows.
+    /// Reconciles one fair batch of due unsettled rows and provisional credits awaiting a final provider outcome.
     /// </summary>
     /// <param name="cancellationToken">Cancellation token for users.db, provider, and settlement work.</param>
     /// <returns>A task that completes after all selected rows have been inspected.</returns>
     /// <remarks>
     /// The process-wide gate prevents a return request and the periodic scan from issuing overlapping inquiries for
-    /// the same shared DbContext. Database settlement markers remain the final duplicate-prevention boundary.
+    /// the same shared DbContext. Database settlement markers remain the final duplicate-prevention boundary. A
+    /// provisional row remains inquiry-eligible until official confirmation or a terminal/mismatched result is saved.
     /// </remarks>
     public async Task ReconcileDueAsync(CancellationToken cancellationToken = default)
     {
@@ -1265,7 +1628,8 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         var batchSize = Math.Clamp(_configuration.UniquePayReconciliationBatchSize, 1, 500);
         var ids = await _userDbContext.UniquePayPaymentInfos
             .AsNoTracking()
-            .Where(x => !x.IsAddedToBalance &&
+            .Where(x => (!x.IsAddedToBalance ||
+                         (x.IsProvisionallyApproved && x.ProviderConfirmedAfterProvisionalAtUtc == null)) &&
                         x.PaymentStatus != UniquePayStatuses.Failed &&
                         x.PaymentStatus != UniquePayStatuses.Expired &&
                         x.PaymentStatus != UniquePayStatuses.Cancelled &&
@@ -1302,12 +1666,115 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         int paymentId,
         string source,
         CancellationToken cancellationToken = default)
+        => await ReconcilePaymentAsync(
+            paymentId,
+            source,
+            allowTerminalRecheck: false,
+            cancellationToken);
+
+    /// <summary>
+    /// Authoritatively checks one UniquePay row with an optional super-admin recovery override for local terminal state.
+    /// </summary>
+    /// <param name="paymentId">Internal users.db UniquePay row id; it is only a lookup key, never payment proof.</param>
+    /// <param name="source">Safe audit label for the worker, customer, return, or admin trigger.</param>
+    /// <param name="allowTerminalRecheck">
+    /// <c>true</c> only for a configured super-admin status check that must recover rows rejected by an older local
+    /// validator. Provider terminal results remain authoritative and no local force-paid status is created.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for provider, database, wallet, and tenant work.</param>
+    /// <returns>Settlement outcome after an official inquiry, or ProviderNotPaid when no safe settlement is possible.</returns>
+    /// <remarks>
+    /// This overload bypasses only the local early-return guard. It still requires the current provider response to
+    /// pass every identity, paid, currency, fee-payer, amount, and fee invariant before official settlement.
+    /// </remarks>
+    public async Task<NowPaymentsSettlementResult> ReconcilePaymentAsync(
+        int paymentId,
+        string source,
+        bool allowTerminalRecheck,
+        CancellationToken cancellationToken = default)
     {
-        if (!await ReconciliationGate.WaitAsync(0, cancellationToken))
+        if (allowTerminalRecheck)
+        {
+            // A super-admin's final decision must observe a fresh provider result, so it waits for any in-flight
+            // worker/customer inquiry instead of interpreting lock contention as an unpaid response.
+            await ReconciliationGate.WaitAsync(cancellationToken);
+        }
+        else if (!await ReconciliationGate.WaitAsync(0, cancellationToken))
+        {
             return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
         try
         {
-            return await ReconcilePaymentCoreAsync(paymentId, source, cancellationToken);
+            return await ReconcilePaymentCoreAsync(paymentId, source, allowTerminalRecheck, cancellationToken);
+        }
+        finally
+        {
+            ReconciliationGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Performs the final authoritative UniquePay inquiry and, only when it remains safely pending, applies one
+    /// super-admin provisional OWNED wallet credit before releasing the reconciliation gate.
+    /// </summary>
+    /// <param name="paymentId">Positive internal users.db UniquePay payment id selected by the admin callback.</param>
+    /// <param name="approvedByTelegramUserId">Configured super-admin Telegram id persisted with the provisional audit.</param>
+    /// <param name="notifyChatId">Optional owned-customer Telegram chat id; null uses the persisted payment chat.</param>
+    /// <param name="source">Non-secret audit label identifying the final admin confirmation trigger.</param>
+    /// <param name="cancellationToken">Cancellation token for provider, users.db, credentials.db, ledger, and Telegram work.</param>
+    /// <returns>
+    /// The official settlement result when the provider reports paid; the provisional settlement result when the
+    /// refreshed row remains eligible; otherwise a non-mutating ProviderNotPaid, NotFound, or InvalidAmount result.
+    /// </returns>
+    /// <remarks>
+    /// Holding the same reconciliation gate across inquiry and provisional claim prevents the periodic worker from
+    /// starting another inquiry on the singleton users.db context between the admin's final check and wallet claim.
+    /// Tenant orders, terminal/mismatched responses, malformed responses, and transport errors always fail closed.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var result = await reconciliation.ReconcileAndApplyProvisionalAsync(
+    ///     payment.Id, adminTelegramId, payment.ChatId, "admin-provisional-confirm", cancellationToken);
+    /// </code>
+    /// </example>
+    public async Task<NowPaymentsSettlementResult> ReconcileAndApplyProvisionalAsync(
+        int paymentId,
+        long approvedByTelegramUserId,
+        long? notifyChatId,
+        string source,
+        CancellationToken cancellationToken = default)
+    {
+        if (paymentId <= 0 ||
+            approvedByTelegramUserId <= 0 ||
+            _configuration.AdminsUserIds?.Contains(approvedByTelegramUserId) != true)
+        {
+            return NowPaymentsSettlementResult.InvalidAmount();
+        }
+
+        await ReconciliationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var official = await ReconcilePaymentCoreAsync(
+                paymentId,
+                source,
+                allowTerminalRecheck: true,
+                cancellationToken);
+            var payment = await _userDbContext.UniquePayPaymentInfos
+                .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
+            if (payment == null)
+                return NowPaymentsSettlementResult.NotFound();
+            if (UniquePayStatuses.IsPaid(payment.PaymentStatus) || payment.IsAddedToBalance)
+                return official;
+            if (!UniquePaySettlementService.CanApplyProvisionalCredit(payment))
+                return official;
+
+            // Inquiry and claim stay serialized, while the settlement service's independent durable claim remains the
+            // final exactly-once boundary against a concurrent return trigger or duplicate admin callback.
+            return await _ownedSettlement.ApplyProvisionalPaymentAsync(
+                payment,
+                approvedByTelegramUserId,
+                notifyChatId,
+                cancellationToken);
         }
         finally
         {
@@ -1320,20 +1787,28 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// </summary>
     /// <param name="paymentId">Internal users.db UniquePay payment id.</param>
     /// <param name="source">Safe settlement trigger label.</param>
+    /// <param name="allowTerminalRecheck">
+    /// Whether a configured super-admin may bypass only the local terminal-state early return and obtain fresh official
+    /// provider data. All payment invariants remain mandatory.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token for provider and settlement operations.</param>
     /// <returns>Settlement result from the authoritative inquiry and downstream fulfillment.</returns>
     private async Task<NowPaymentsSettlementResult> ReconcilePaymentCoreAsync(
         int paymentId,
         string source,
+        bool allowTerminalRecheck,
         CancellationToken cancellationToken)
     {
         var payment = await _userDbContext.UniquePayPaymentInfos
             .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
-        if (payment.IsAddedToBalance)
+        if (payment.IsAddedToBalance &&
+            (!payment.IsProvisionallyApproved || payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue))
+        {
             return NowPaymentsSettlementResult.AlreadyAdded(payment.BalanceAfter ?? 0);
-        if (UniquePayStatuses.IsTerminal(payment.PaymentStatus) ||
+        }
+        if ((!allowTerminalRecheck && UniquePayStatuses.IsTerminal(payment.PaymentStatus)) ||
             string.Equals(payment.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal))
         {
             return NowPaymentsSettlementResult.ProviderNotPaid();
@@ -1418,33 +1893,49 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     }
 
     /// <summary>
-    /// Sends a transition/hourly-throttled logger-channel error for one pending payment.
+    /// Sends a transition/hourly-throttled logger-channel error for one payment.
     /// </summary>
     /// <param name="payment">Payment whose safe identifiers and amount are logged.</param>
     /// <param name="message">Non-secret failure category.</param>
     /// <param name="exception">Optional sanitized provider/transport exception.</param>
+    /// <remarks>
+    /// Repeated network failures are limited to one report per hour. The first terminal or verification-failed result
+    /// after a provisional credit bypasses that throttle so the operator always receives the required clawback-review alert.
+    /// </remarks>
     private void LogFailureWithThrottle(
         UniquePayPaymentInfo payment,
         string message,
         Exception exception)
     {
         var now = DateTime.UtcNow;
-        if (payment.LastErrorLoggedAtUtc.HasValue &&
+        var mustReportProvisionalTerminalOutcome = payment.IsProvisionallyApproved &&
+                                                   UniquePayStatuses.IsTerminal(payment.PaymentStatus) &&
+                                                   !string.Equals(
+                                                       payment.ErrorCode,
+                                                       "provider_check_failed",
+                                                       StringComparison.Ordinal);
+        if (!mustReportProvisionalTerminalOutcome &&
+            payment.LastErrorLoggedAtUtc.HasValue &&
             now - payment.LastErrorLoggedAtUtc.Value < TimeSpan.FromHours(1))
         {
             return;
         }
 
         payment.LastErrorLoggedAtUtc = now;
+        var effectiveMessage = mustReportProvisionalTerminalOutcome
+            ? message + " Provisional wallet credit was not reversed; human financial review is required."
+            : message;
         _logger.LogError(
             exception,
-            "{Message} paymentId={PaymentId}, hashId={HashId}, tenantOrderId={TenantOrderId}, botId={BotId}, amountToman={AmountToman}, errorCode={ErrorCode}",
-            message,
+            "{Message} paymentId={PaymentId}, hashId={HashId}, tenantOrderId={TenantOrderId}, botId={BotId}, amountToman={AmountToman}, errorCode={ErrorCode}, provisional={Provisional}, approvedBy={ApprovedBy}",
+            effectiveMessage,
             payment.Id,
             payment.HashId,
             payment.TenantBotOrderId,
             payment.BotId,
             payment.BaseAmountToman,
-            payment.ErrorCode);
+            payment.ErrorCode,
+            payment.IsProvisionallyApproved,
+            payment.ProvisionalApprovedByTelegramUserId);
     }
 }

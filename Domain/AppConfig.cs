@@ -197,7 +197,7 @@ namespace Adminbot.Domain
         /// </summary>
         public long TetraminatorMinimumAmountToman { get; set; } = 50000;
         /// <summary>
-        /// Enables creation of new UniquePay rial invoices across owned and tenant bots.
+        /// Enables creation of new UniquePay toman invoices across owned and tenant bots.
         /// </summary>
         /// <remarks>
         /// This startup-bound value initializes the live gateway snapshot. Super-admin changes update that snapshot
@@ -223,8 +223,13 @@ namespace Adminbot.Domain
         /// </remarks>
         public string UniquePayReturnUrl { get; set; }
         /// <summary>
-        /// Buyer-paid UniquePay fee percentage displayed to customers and verified against provider inquiry data.
+        /// UniquePay fee percentage displayed to customers and verified against provider inquiry data.
         /// </summary>
+        /// <remarks>
+        /// The provider business setting decides whether the buyer (<c>user</c>/<c>buyer</c>) or <c>owner</c> pays
+        /// this fee. The public create-invoice API has no fee-payer field, so changing that party must be done in the
+        /// UniquePay panel.
+        /// </remarks>
         public decimal UniquePayFeePercent { get; set; } = 12m;
         /// <summary>
         /// Maximum duration, in seconds, for one UniquePay HTTP attempt.

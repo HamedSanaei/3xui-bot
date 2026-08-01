@@ -84,7 +84,7 @@ public class TelegramBotService : IHostedService
     /// <summary>Owned-wallet Tetraminator action label with its displayed customer fee.</summary>
     private const string TetraminatorGatewayAction = "⚡ تترامیناتور آنی | کارمزد ۱۲٪";
 
-    /// <summary>Owned-wallet UniquePay action label with its displayed buyer fee.</summary>
+    /// <summary>Owned-wallet UniquePay action label with its displayed gateway fee.</summary>
     private const string UniquePayGatewayAction = "⚡ یونیک‌پی آنی | کارمزد ۱۲٪";
 
     /// <summary>Owned-wallet NOWPayments action label with its displayed zero-fee policy.</summary>
@@ -8263,7 +8263,8 @@ public class TelegramBotService : IHostedService
     /// <remarks>
     /// The live global switch is rechecked before any row or provider request is created. The local merchant hash is
     /// persisted first, creation is attempted once, and an ambiguous failure remains auditable for manual/provider
-    /// inquiry. The displayed 12% fee is paid by the buyer and is never credited to the local wallet.
+    /// inquiry. The displayed 12% is the gateway fee; UniquePay decides from its business setting whether the
+    /// <c>user</c>/<c>buyer</c> or owner bears it, while only the immutable local base amount can be credited.
     /// </remarks>
     private async Task CreateUniquePayWalletChargeAsync(
         Message message,
@@ -8312,15 +8313,10 @@ public class TelegramBotService : IHostedService
                 3600));
             await _userDbContext.SaveChangesAsync(cancellationToken);
 
-            var fee = decimal.ToInt64(decimal.Round(
-                payment.BaseAmountToman * payment.FeePercent / 100m,
-                0,
-                MidpointRounding.AwayFromZero));
-            var payable = checked(payment.BaseAmountToman + fee);
             var text = "✅ <b>فاکتور یونیک‌پی ساخته شد</b>\n\n" +
                        $"💰 مبلغ شارژ کیف پول: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
-                       $"💸 کارمزد خریدار (۱۲٪): <code>{Html(fee.FormatCurrency())}</code>\n" +
-                       $"💳 مبلغ تقریبی پرداخت: <code>{Html(payable.FormatCurrency())}</code>\n" +
+                       "💸 کارمزد درگاه: <code>۱۲٪</code>\n" +
+                       "💳 مبلغ نهایی مطابق تنظیمات کارمزد، در صفحه رسمی یونیک‌پی نمایش داده می‌شود.\n" +
                        $"🧾 شناسه فاکتور: <code>{Html(payment.RefId)}</code>\n\n" +
                        "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از استعلام رسمی یونیک‌پی انجام می‌شود.";
             var keyboard = new InlineKeyboardMarkup(new[]

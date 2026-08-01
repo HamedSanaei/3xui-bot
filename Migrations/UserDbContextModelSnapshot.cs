@@ -1365,6 +1365,9 @@ namespace Adminbot.Migrations
                     b.Property<bool>("IsProviderVerified")
                         .HasColumnType("INTEGER");
 
+                    b.Property<bool>("IsProvisionallyApproved")
+                        .HasColumnType("INTEGER");
+
                     b.Property<DateTime?>("LastErrorLoggedAtUtc")
                         .HasColumnType("TEXT");
 
@@ -1376,6 +1379,12 @@ namespace Adminbot.Migrations
 
                     b.Property<DateTime?>("PaidAtUtc")
                         .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("ProvisionalApprovedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("ProvisionalApprovedByTelegramUserId")
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("PaymentLink")
                         .HasColumnType("TEXT");
@@ -1393,6 +1402,9 @@ namespace Adminbot.Migrations
 
                     b.Property<long?>("ProviderFeeToman")
                         .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("ProviderConfirmedAfterProvisionalAtUtc")
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("RawRequestJson")
                         .HasColumnType("TEXT");

@@ -5006,7 +5006,8 @@ public class TenantBotService
     /// <param name="cancellationToken">Cancellation token for users.db, UniquePay, and Telegram work.</param>
     /// <remarks>
     /// Creation is not retried. A known prior link is reused; an ambiguous prior attempt is blocked for review rather
-    /// than issuing a second provider invoice. The buyer fee is displayed as 12% and is verified later by polling.
+    /// than issuing a second provider invoice. The 12% gateway fee is displayed without claiming who bears it; polling
+    /// later verifies either the provider's <c>user</c>/<c>buyer</c>-paid or owner-paid amount contract.
     /// </remarks>
     private async Task CreateTenantUniquePayInvoiceCoreAsync(
         ITelegramBotClient botClient,
@@ -5626,7 +5627,7 @@ public class TenantBotService
     /// </summary>
     /// <param name="payment">
     /// Tracked users.db payment whose purpose is <see cref="TenantBotPaymentPurposes.TenantOrder" /> and whose
-    /// hash, IRT amount, buyer fee, reference, and exact <c>paid</c> status were verified against UniquePay.
+    /// hash, toman amount, fee-payer contract, gateway fee, reference, and exact <c>paid</c> status were verified against UniquePay.
     /// </param>
     /// <param name="Source">Audit source such as callback, customer check, or super-admin check.</param>
     /// <param name="CancellationToken">Cancellation token for users.db, XUI, wallet ledger, and Telegram operations.</param>
@@ -5638,6 +5639,8 @@ public class TenantBotService
     /// This method never accepts provisional approval. It only consumes an already provider-verified payment row;
     /// callers handling return, customer-check, or worker triggers must perform
     /// <see cref="UniquePayPaymentVerifier.IsVerifiedPaid" /> immediately before invoking it.
+    /// Successful fulfillment records the effective currency, fee payer, stored base amount, and provider-reported
+    /// fee once in the protected payment channel; repeated fulfillment checks do not emit another provider-success log.
     /// </remarks>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         UniquePayPaymentInfo payment,
@@ -5727,6 +5730,7 @@ public class TenantBotService
 
         if (settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded)
         {
+            var shouldLogProviderSuccess = !payment.SuccessLoggedAtUtc.HasValue;
             payment.IsAddedToBalance = true;
             payment.SettlementState = UniquePaySettlementStates.Settled;
             payment.SettlementAttemptId = null;
@@ -5736,8 +5740,25 @@ public class TenantBotService
             payment.BalanceAfter = settlement.AfterBalance;
             payment.ErrorCode = null;
             payment.ErrorMessage = null;
+            payment.SuccessLoggedAtUtc ??= DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
             await _userDbcontext.SaveChangesAsync(CancellationToken);
+
+            if (shouldLogProviderSuccess)
+            {
+                _logger.LogPayment(
+                    "✅ پرداخت رسمی UniquePay فروشگاه تایید شد\n\n" +
+                    $"ربات tenant: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
+                    $"Order ID: <code>{Html(order.OrderId)}</code>\n" +
+                    $"Payment ID: <code>UP:{payment.Id}</code>\n" +
+                    $"Hash ID: <code>{Html(payment.HashId)}</code>\n" +
+                    $"Ref ID: <code>{Html(payment.RefId)}</code>\n" +
+                    $"مبلغ پایه: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+                    $"کارمزد واقعی درگاه: <code>{Html((payment.ProviderFeeToman ?? 0).FormatCurrency())}</code>\n" +
+                    $"پرداخت‌کننده کارمزد: <code>{Html(payment.FeePayer)}</code>\n" +
+                    $"واحد: <code>{Html(payment.Currency)}</code>\n" +
+                    $"منبع: <code>{Html(Source)}</code>");
+            }
         }
         else if (settlement.Status is NowPaymentsSettlementStatus.UserNotFound or NowPaymentsSettlementStatus.PaymentNotFound)
         {
