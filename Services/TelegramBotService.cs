@@ -90,6 +90,14 @@ public class TelegramBotService : IHostedService
     /// <summary>Owned-wallet NOWPayments action label with its displayed zero-fee policy.</summary>
     private const string CryptoGatewayAction = "⚡ ارز دیجیتال آنی | کارمزد ۰٪";
 
+    /// <summary>
+    /// Bot-scoped callback that abandons an insufficient-balance purchase or renewal and opens the owned-wallet charge flow.
+    /// </summary>
+    internal const string WalletChargeShortcutCallback = "wallet:charge";
+
+    /// <summary>Customer-facing label shown below owned purchase and renewal insufficient-balance messages.</summary>
+    internal const string WalletChargeShortcutLabel = "💰 افزایش موجودی کیف پول";
+
     private readonly ITelegramBotClient _botClient;
     private readonly UserDbContext _userDbContext;
     private readonly CredentialsDbContext _credentialsDbContext;
@@ -449,7 +457,7 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
-    /// Routes callbacks and messages to tenant storefront flows, owner tenant configuration,
+    /// Routes callbacks and messages to tenant storefront flows, owned-wallet shortcuts, owner tenant configuration,
     /// user XuiV3 flows, super-admin flows, payment return handlers, and legacy menus.
     /// </summary>
     /// <param name="botClient">Telegram client for the current bot.</param>
@@ -486,6 +494,12 @@ public class TelegramBotService : IHostedService
             if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
             {
                 await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, callbackCredUser, callbackUserState, cancellationToken);
+                return;
+            }
+
+            if (string.Equals(callbackQuery.Data, WalletChargeShortcutCallback, StringComparison.Ordinal))
+            {
+                await ProcessWalletChargeShortcutAsync(botClient, callbackQuery, cancellationToken);
                 return;
             }
 
@@ -2054,6 +2068,156 @@ public class TelegramBotService : IHostedService
 
     }
 
+    /// <summary>
+    /// Opens the owned-wallet charge flow from an insufficient-balance inline button.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned bot that received the callback.</param>
+    /// <param name="callbackQuery">
+    /// Callback whose sender is the wallet owner. The sender id, never callback payload data, selects the bot-scoped state.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for callback acknowledgement, state reset, and Telegram delivery.</param>
+    /// <returns>A task that completes after the old message is updated and the charge-amount menu is sent.</returns>
+    /// <remarks>
+    /// Tenant storefronts are rejected before this handler because their customers pay orders directly. Clearing both
+    /// persisted state and the in-memory XUI selection prevents an old purchase confirmation from resuming after top-up.
+    /// Replaying an old callback has no financial side effect; it only reopens a fresh charge flow for its sender.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// await ProcessWalletChargeShortcutAsync(botClient, callbackQuery, cancellationToken);
+    /// </code>
+    /// </example>
+    private async Task ProcessWalletChargeShortcutAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
+        {
+            await botClient.AnswerCallbackQueryAsync(
+                callbackQuery.Id,
+                "شارژ کیف پول در این فروشگاه در دسترس نیست.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        await AnswerCallbackSafely(callbackQuery, cancellationToken);
+        await ShowWalletChargeMenuAsync(
+            botClient,
+            callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+            callbackQuery.From.Id,
+            callbackQuery.Message?.MessageId,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Resets an owned customer's previous flow and displays the canonical wallet charge-amount menu.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the active owned bot.</param>
+    /// <param name="chatId">Telegram chat id that receives the charge menu.</param>
+    /// <param name="telegramUserId">Telegram user id whose bot-scoped state and XUI selection are replaced.</param>
+    /// <param name="sourceMessageId">
+    /// Optional insufficient-balance message id to replace with the successful-routing acknowledgement; null for entry
+    /// through the main reply-keyboard button.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
+    /// <returns>A task that completes after state persistence and charge-menu delivery.</returns>
+    /// <remarks>
+    /// Suggested amounts are derived from configured owned prices exactly as in the original charge menu. Gateway text
+    /// is built from the live global gateway snapshot, so a provider disabled immediately before the click is omitted.
+    /// This method creates no invoice and performs no wallet mutation.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// await ShowWalletChargeMenuAsync(botClient, message.Chat.Id, message.From.Id, null, cancellationToken);
+    /// </code>
+    /// </example>
+    private async Task ShowWalletChargeMenuAsync(
+        ITelegramBotClient botClient,
+        long chatId,
+        long telegramUserId,
+        int? sourceMessageId,
+        CancellationToken cancellationToken)
+    {
+        await _userDbContext.ClearUserStatus(new User { Id = telegramUserId });
+        _xuiV3PurchaseSessionStore.Clear(telegramUserId);
+        await _userDbContext.SaveUserStatus(new User
+        {
+            Id = telegramUserId,
+            LastStep = "enter charge amount",
+            Flow = "charge"
+        });
+
+        if (sourceMessageId.HasValue)
+        {
+            try
+            {
+                await botClient.EditMessageTextAsync(
+                    chatId,
+                    sourceMessageId.Value,
+                    "✅ به منوی شارژ کیف پول هدایت شدید.",
+                    cancellationToken: cancellationToken);
+            }
+            catch (ApiRequestException ex)
+            {
+                // A deleted or already-edited source message must not prevent the safe, non-financial charge menu entry.
+                _logger.LogDebug(
+                    ex,
+                    "Wallet charge shortcut source message could not be edited. botId={BotId}, userId={UserId}, chatId={ChatId}, messageId={MessageId}",
+                    BotContextAccessor.CurrentBotId,
+                    telegramUserId,
+                    chatId,
+                    sourceMessageId.Value);
+            }
+        }
+
+        var keyboardButtons = new List<List<KeyboardButton>>();
+        var allPrices = _appConfig.Price
+            .Concat(_appConfig.PriceCommon)
+            .Concat(_appConfig.PriceColleagues)
+            .Select(priceConfig => Convert.ToInt64(priceConfig.Price))
+            .Where(price => price > 0)
+            .Distinct()
+            .OrderBy(price => price)
+            .ToList();
+
+        for (var index = 0; index < allPrices.Count; index += 4)
+        {
+            keyboardButtons.Add(allPrices
+                .Skip(index)
+                .Take(4)
+                .Select(price => new KeyboardButton(price.FormatCurrency()))
+                .ToList());
+        }
+
+        keyboardButtons.Add(new List<KeyboardButton> { new("بازگشت") });
+        var keyboard = new ReplyKeyboardMarkup(keyboardButtons)
+        {
+            ResizeKeyboard = true,
+            OneTimeKeyboard = true
+        };
+        var text = "💰 <b>شارژ کیف پول</b>\n\n" +
+                   "🔘 یکی از مبلغ‌های پیشنهادی پایین را انتخاب کنید.\n" +
+                   "✍️ یا مبلغ دلخواه خود را <b>به تومان و فقط به‌صورت عدد</b> ارسال کنید.\n" +
+                   "مثال: <code>250000</code>\n\n" +
+                   "⚡ درگاه‌های فعال پس از پرداخت موفق، نتیجه را به‌صورت خودکار و فوری بررسی می‌کنند.\n" +
+                   BuildActiveChargeGatewaySummary();
+
+        await botClient.CustomSendTextMessageAsync(
+            chatId,
+            text,
+            replyMarkup: keyboard,
+            parseMode: ParseMode.Html,
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Routes legacy payment and administrative callbacks that were not handled by higher-level owned-bot dispatchers.
+    /// </summary>
+    /// <param name="callbackQuery">Telegram callback to classify by its stable prefix.</param>
+    /// <param name="cancellationToken">Cancellation token for provider, database, logging, and Telegram operations.</param>
+    /// <returns>A task that completes after a matching callback is processed or the unknown callback is ignored.</returns>
     private async Task ProccessCallbacks(CallbackQuery callbackQuery, CancellationToken cancellationToken)
     {
         //Process call back query
@@ -5055,6 +5219,57 @@ public class TelegramBotService : IHostedService
         return msg;
     }
 
+    /// <summary>
+    /// Builds the owned-bot insufficient-wallet message used by legacy purchase and renewal flows.
+    /// </summary>
+    /// <param name="requiredAmountToman">Exact purchase or renewal price in Iranian toman; must be non-negative.</param>
+    /// <param name="currentBalanceToman">Customer's current shared bot-wallet balance in Iranian toman.</param>
+    /// <returns>A Persian customer message showing the current balance, required amount, and charge instruction.</returns>
+    /// <example>
+    /// <code>
+    /// var text = BuildOwnedInsufficientBalanceText(250000, 100000);
+    /// </code>
+    /// </example>
+    private static string BuildOwnedInsufficientBalanceText(long requiredAmountToman, long currentBalanceToman)
+    {
+        return "⛔️ موجودی کیف پول شما برای خرید یا تمدید مورد نظر کافی نیست.\n" +
+               $"💳 موجودی فعلی: {currentBalanceToman.FormatCurrency()}\n" +
+               $"💰 مبلغ مورد نیاز: {requiredAmountToman.FormatCurrency()}\n\n" +
+               "برای ادامه، کیف پول خود را شارژ کنید.";
+    }
+
+    /// <summary>
+    /// Builds the single inline action that routes an owned customer into wallet charging.
+    /// </summary>
+    /// <returns>An inline keyboard containing the bot-scoped wallet-charge callback.</returns>
+    /// <remarks>
+    /// The callback contains no Telegram user id or financial value. The handler derives ownership from the callback
+    /// sender and creates no invoice until the customer later selects an amount and an enabled gateway.
+    /// </remarks>
+    private static InlineKeyboardMarkup BuildWalletChargeShortcutKeyboard()
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    WalletChargeShortcutLabel,
+                    WalletChargeShortcutCallback)
+            }
+        });
+    }
+
+    /// <summary>
+    /// Handles customer messages for owned bots, including legacy purchase, renewal, wallet-charge, and account menus.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned bot that received the message.</param>
+    /// <param name="update">Telegram update containing the customer message and sender identity.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram, database, payment, and XUI operations.</param>
+    /// <returns>A task that completes after the matching owned-customer state transition is handled.</returns>
+    /// <remarks>
+    /// Tenant storefront updates are removed by the outer dispatcher before this method runs. Legacy insufficient-wallet
+    /// branches show an inline shortcut into the same canonical charge flow used by the main reply-keyboard action.
+    /// </remarks>
     private async Task HandleUpdateRegularUsers(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
 
@@ -6228,49 +6443,12 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "💰شارژ حساب کاربری")
         {
-            var keyboardButtons = new List<List<KeyboardButton>>();
-            var allPrices = _appConfig.Price
-                .Concat(_appConfig.PriceCommon)
-                .Concat(_appConfig.PriceColleagues)
-                .Select(priceConfig => Convert.ToInt64(priceConfig.Price))
-                .Where(price => price > 0)
-                .Distinct()
-                .OrderBy(price => price)
-                .ToList();
-
-            for (var index = 0; index < allPrices.Count; index += 4)
-            {
-                keyboardButtons.Add(allPrices
-                    .Skip(index)
-                    .Take(4)
-                    .Select(price => new KeyboardButton(price.FormatCurrency()))
-                    .ToList());
-            }
-
-            // Add a "Back" button at the end
-            keyboardButtons.Add(new List<KeyboardButton> { new KeyboardButton("بازگشت") });
-
-            var keyboard = new ReplyKeyboardMarkup(keyboardButtons)
-            {
-                ResizeKeyboard = true,
-                OneTimeKeyboard = true
-            };
-
-
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
-            var msg = "💰 <b>شارژ کیف پول</b>\n\n" +
-                      "🔘 یکی از مبلغ‌های پیشنهادی پایین را انتخاب کنید.\n" +
-                      "✍️ یا مبلغ دلخواه خود را <b>به تومان و فقط به‌صورت عدد</b> ارسال کنید.\n" +
-                      "مثال: <code>250000</code>\n\n" +
-                      "⚡ درگاه‌های فعال پس از پرداخت موفق، نتیجه را به‌صورت خودکار و فوری بررسی می‌کنند.\n" +
-                      BuildActiveChargeGatewaySummary();
-            //msg = "برای شارژ حساب کاربری به آیدی زیر پیام دهید: \n @vpnetiran_admin";
-            await botClient.CustomSendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: msg,
-                replyMarkup: keyboard, parseMode: ParseMode.Html);
-
-
+            await ShowWalletChargeMenuAsync(
+                botClient,
+                message.Chat.Id,
+                message.From.Id,
+                sourceMessageId: null,
+                cancellationToken);
         }
 
         else if (user.LastStep == "enter charge amount" && user.Flow == "charge")
@@ -6425,9 +6603,9 @@ public class TelegramBotService : IHostedService
             else
             {
                 await botClient.CustomSendTextMessageAsync(
-                                   chatId: message.Chat.Id,
-                                   text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
-                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                    chatId: message.Chat.Id,
+                    text: BuildOwnedInsufficientBalanceText(price, credUser.AccountBalance),
+                    replyMarkup: BuildWalletChargeShortcutKeyboard());
                 await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
                 return;
@@ -6508,9 +6686,9 @@ public class TelegramBotService : IHostedService
             else
             {
                 await botClient.CustomSendTextMessageAsync(
-                                   chatId: message.Chat.Id,
-                                   text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
-                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                    chatId: message.Chat.Id,
+                    text: BuildOwnedInsufficientBalanceText(price, credUser.AccountBalance),
+                    replyMarkup: BuildWalletChargeShortcutKeyboard());
                 await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
                 return;
@@ -6616,9 +6794,9 @@ public class TelegramBotService : IHostedService
             else
             {
                 await botClient.CustomSendTextMessageAsync(
-                                   chatId: message.Chat.Id,
-                                   text: $"⛔️ شما اعتبار لازم برای ساخت اکانت مورد نظر را ندارید. \n" + " ❗️ برای شارژ حساب از منوی مربوطه اقدام کنید.\n",
-                                   replyMarkup: MainReplyMarkupKeyboardFa());
+                    chatId: message.Chat.Id,
+                    text: BuildOwnedInsufficientBalanceText(price, credUser.AccountBalance),
+                    replyMarkup: BuildWalletChargeShortcutKeyboard());
                 return;
             }
 

@@ -1150,7 +1150,8 @@ public class XuiV3BotFlowService
     /// To prevent a successful XUI renewal from becoming free, any unavailable, insufficient, failed, or exceptional
     /// website debit falls back to the bot wallet and may make it negative. Explicit bot/site bans do not use fallback.
     /// The bot-wallet mutation and users.db ledger append are separate database operations; the ledger records the
-    /// actual before/after balance and provider so administrators can audit the compensation path.
+    /// actual before/after balance and provider so administrators can audit the compensation path. When the selected
+    /// bot wallet is insufficient, the customer receives an inline shortcut to the owned-wallet charge flow.
     /// </remarks>
     private async Task CompleteRenewAsync(
         ITelegramBotClient botClient,
@@ -1190,8 +1191,11 @@ public class XuiV3BotFlowService
             await _userDbContext.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: $"موجودی شما کافی نیست.\nقیمت: {resolved.PriceToman.FormatCurrency()}",
-                replyMarkup: mainReplyMarkup,
+                text: "⛔️ موجودی کیف پول شما برای تمدید کافی نیست.\n" +
+                      $"💳 موجودی فعلی: {credUser.AccountBalance.FormatCurrency()}\n" +
+                      $"💰 مبلغ مورد نیاز: {resolved.PriceToman.FormatCurrency()}\n\n" +
+                      "برای ادامه، کیف پول خود را شارژ کنید.",
+                replyMarkup: BuildOwnedWalletChargeShortcutKeyboard(),
                 cancellationToken: cancellationToken);
             return;
         }
@@ -2110,7 +2114,11 @@ public class XuiV3BotFlowService
     /// <returns><c>true</c> when the callback belongs to the XUI flow; otherwise <c>false</c>.</returns>
     /// <remarks>
     /// Link-change callbacks carry only a durable operation key. Duplicate confirmations can display persisted state
-    /// but cannot replay a panel mutation because users.db owns the atomic confirmation transition.
+    /// but cannot replay a panel mutation because users.db owns the atomic confirmation transition. Owned purchase
+    /// confirmations with insufficient bot-wallet balance expose a separate callback handled by TelegramBotService;
+    /// it is deliberately not parsed here because it abandons the XUI selection and starts wallet charging. Purchase
+    /// confirmation payload fallback is accepted only while the persisted bot-scoped state is still at the active
+    /// confirmation step, so an old callback cannot recreate an abandoned selection or debit the wallet.
     /// </remarks>
     public async Task<bool> TryHandleCallbackAsync(
         ITelegramBotClient botClient,
@@ -2687,6 +2695,26 @@ public class XuiV3BotFlowService
 
         if (callback.Action == "ok" || callback.Action == "sitepay")
         {
+            if (!string.Equals(user.Flow, PurchaseFlowName, StringComparison.Ordinal) ||
+                !string.Equals(user.LastStep, PurchaseStepConfirm, StringComparison.Ordinal))
+            {
+                // Confirmation data contains enough plan detail to recover from a process restart. The persisted
+                // confirmation state is therefore the authority that distinguishes a recoverable callback from one
+                // abandoned through wallet charging, cancellation, or another bot-scoped flow.
+                _sessionStore.Clear(credUser.TelegramUserId);
+                if (messageId != 0)
+                {
+                    await SafeEditMessageTextAsync(
+                        botClient,
+                        chatId: chatId,
+                        messageId: messageId,
+                        text: "این درخواست خرید منقضی شده است. لطفاً خرید را از ابتدا آغاز کنید.",
+                        cancellationToken: cancellationToken);
+                }
+
+                return true;
+            }
+
             var hasSession = _sessionStore.TryGet(credUser.TelegramUserId, out var selection);
             if (!hasSession || selection == null || string.IsNullOrWhiteSpace(selection.ServiceKey))
             {
@@ -2737,12 +2765,11 @@ public class XuiV3BotFlowService
                             botClient,
                             chatId: chatId,
                             messageId: messageId,
-                            text: $"موجودی شما کافی نیست.\nقیمت کل: {totalPrice.FormatCurrency()}",
-                            replyMarkup: new InlineKeyboardMarkup(new[]
-                            {
-                                new[] { InlineKeyboardButton.WithCallbackData("بازگشت", XuiV3PurchaseCallbacks.BackToServices()) },
-                                new[] { InlineKeyboardButton.WithCallbackData("انصراف", XuiV3PurchaseCallbacks.Cancel()) }
-                            }),
+                            text: "⛔️ موجودی کیف پول شما برای خرید کافی نیست.\n" +
+                                  $"💳 موجودی فعلی: {credUser.AccountBalance.FormatCurrency()}\n" +
+                                  $"💰 مبلغ مورد نیاز: {totalPrice.FormatCurrency()}\n\n" +
+                                  "برای ادامه، کیف پول خود را شارژ کنید.",
+                            replyMarkup: BuildPurchaseInsufficientBalanceKeyboard(),
                             cancellationToken: cancellationToken);
                     }
                     return true;
@@ -5867,6 +5894,55 @@ public class XuiV3BotFlowService
             rows.Insert(0, new[] { InlineKeyboardButton.WithCallbackData("پرداخت با کیف پول سایت گذرگاه", XuiV3PurchaseCallbacks.SiteWalletConfirm(selection)) });
 
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", XuiV3PurchaseCallbacks.BackToServices()) });
+        return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>
+    /// Builds the owned renewal shortcut that abandons the current XUI state and opens wallet charging.
+    /// </summary>
+    /// <returns>An inline keyboard containing only the safe wallet-charge routing callback.</returns>
+    /// <remarks>
+    /// No user id, amount, or payment proof is encoded in the callback. TelegramBotService resolves the sender from the
+    /// callback envelope, clears bot-scoped state, and displays the live charge menu without creating an invoice.
+    /// </remarks>
+    private static InlineKeyboardMarkup BuildOwnedWalletChargeShortcutKeyboard()
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    TelegramBotService.WalletChargeShortcutLabel,
+                    TelegramBotService.WalletChargeShortcutCallback)
+            }
+        });
+    }
+
+    /// <summary>
+    /// Builds the insufficient-balance keyboard for a final XUI v3 purchase confirmation.
+    /// </summary>
+    /// <returns>
+    /// Charge, back, and cancel actions for owned bots; back and cancel only for any non-owned context.
+    /// </returns>
+    /// <remarks>
+    /// Tenant storefront customers never use the platform wallet. The explicit runtime-type check prevents an owned
+    /// charge shortcut from appearing if a stale shared XUI callback is delivered through a tenant bot.
+    /// </remarks>
+    private InlineKeyboardMarkup BuildPurchaseInsufficientBalanceKeyboard()
+    {
+        var rows = new List<InlineKeyboardButton[]>();
+        if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
+        {
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    TelegramBotService.WalletChargeShortcutLabel,
+                    TelegramBotService.WalletChargeShortcutCallback)
+            });
+        }
+
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", XuiV3PurchaseCallbacks.BackToServices()) });
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("انصراف", XuiV3PurchaseCallbacks.Cancel()) });
         return new InlineKeyboardMarkup(rows);
     }
 
