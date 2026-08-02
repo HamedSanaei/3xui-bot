@@ -87,7 +87,10 @@ public sealed class UniquePayPaymentInfo
     /// <summary>Nullable Telegram id of the tenant owner whose profit is credited after fulfillment.</summary>
     public long? TenantOwnerTelegramUserId { get; set; }
 
-    /// <summary>Sanitized form payload retained for audit; it never contains the bearer token.</summary>
+    /// <summary>
+    /// Sanitized bot-gateway form payload retained for audit, including merchant hash, amount, return, and callback
+    /// URLs; it never contains the bearer token.
+    /// </summary>
     public string RawRequestJson { get; set; }
 
     /// <summary>Latest provider JSON response retained for protected diagnostics.</summary>
@@ -96,10 +99,16 @@ public sealed class UniquePayPaymentInfo
     /// <summary>UTC time of the latest authoritative <c>check-invoice</c> attempt.</summary>
     public DateTime? LastInquiryAtUtc { get; set; }
 
-    /// <summary>UTC time when the reconciliation worker should next inspect this pending row.</summary>
+    /// <summary>
+    /// UTC time when bounded recovery polling should next inspect this pending row; null means automatic polling has
+    /// stopped while explicit callback, return, customer, and admin checks remain allowed.
+    /// </summary>
     public DateTime? NextInquiryAtUtc { get; set; }
 
-    /// <summary>Total number of read-only provider inquiry attempts recorded for the invoice.</summary>
+    /// <summary>
+    /// Total number of read-only provider inquiries recorded for the invoice across worker and explicit triggers; the
+    /// configured recovery cap uses this value only to stop future automatic scans.
+    /// </summary>
     public int InquiryAttemptCount { get; set; }
 
     /// <summary>UTC time when the local payment row was first persisted.</summary>
@@ -227,8 +236,20 @@ public sealed class UniquePayPaymentInfo
     /// Records one authoritative inquiry observation and schedules the next pending scan.
     /// </summary>
     /// <param name="response">UniquePay check response, which may represent pending or paid state.</param>
-    /// <param name="nextInquiryAtUtc">UTC time for the next worker attempt when settlement has not completed.</param>
-    public void Apply(UniquePayCheckInvoiceResponse response, DateTime nextInquiryAtUtc)
+    /// <param name="nextInquiryAtUtc">
+    /// Optional UTC time for the next bounded recovery inquiry. Pass <c>null</c> after the configured automatic-attempt
+    /// limit; callback, browser-return, and explicit customer/admin checks can still inspect the invoice.
+    /// </param>
+    /// <remarks>
+    /// This method records provider observations only. It never credits a wallet or fulfills a tenant order; callers
+    /// must run <see cref="UniquePayPaymentVerifier"/> and the appropriate idempotent settlement service afterward.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// payment.Apply(checkResponse, nextInquiryAtUtc: null);
+    /// </code>
+    /// </example>
+    public void Apply(UniquePayCheckInvoiceResponse response, DateTime? nextInquiryAtUtc)
     {
         InquiryAttemptCount++;
         LastInquiryAtUtc = DateTime.UtcNow;
@@ -535,15 +556,35 @@ public sealed class UniquePay
     /// <param name="hashId">Globally unique merchant hash already persisted in users.db.</param>
     /// <param name="amountToman">Base amount in Iranian toman/IRT, excluding the gateway fee; must be positive.</param>
     /// <param name="redirectUrl">
-    /// Absolute platform return URL containing the merchant hash only as a lookup hint; it is not a settlement callback.
+    /// Absolute platform return URL containing the merchant hash only as a lookup hint; it is not payment proof.
+    /// </param>
+    /// <param name="callbackUrl">
+    /// Absolute platform callback URL containing the merchant hash. UniquePay's unsigned notification only triggers
+    /// an authoritative inquiry and must never be interpreted as proof of payment.
     /// </param>
     /// <param name="cancellationToken">Cancellation token for the single create request.</param>
     /// <returns>A validated response containing matching hash id, provider reference, and payment link.</returns>
     /// <exception cref="UniquePayApiException">Thrown for provider rejection or malformed/incomplete response.</exception>
+    /// <remarks>
+    /// Uses UniquePay's documented bot-compatible <c>/api/ddbot/create-invoice</c> route because the generic route
+    /// reserves callback delivery for future use. Creation is never retried, preventing duplicate invoices after an
+    /// ambiguous transport failure. The callback remains unsigned and cannot settle without <c>check-invoice</c>.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var invoice = await uniquePay.CreateInvoiceAsync(
+    ///     payment.HashId,
+    ///     amountToman: 50000,
+    ///     redirectUrl: "https://merchant.example/uniquepay-return?hashId=example",
+    ///     callbackUrl: "https://merchant.example/uniquepay-callback?hashId=example",
+    ///     cancellationToken);
+    /// </code>
+    /// </example>
     public async Task<UniquePayCreateInvoiceResponse> CreateInvoiceAsync(
         string hashId,
         long amountToman,
         string redirectUrl,
+        string callbackUrl,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(hashId);
@@ -557,9 +598,12 @@ public sealed class UniquePay
         };
         if (!string.IsNullOrWhiteSpace(redirectUrl))
             fields["redirectUrl"] = redirectUrl;
+        if (!string.IsNullOrWhiteSpace(callbackUrl))
+            fields["callbackUrl"] = callbackUrl;
+        fields["orderId"] = hashId;
 
         var response = await SendFormAsync<UniquePayCreateInvoiceResponse>(
-            "api/create-invoice",
+            "api/ddbot/create-invoice",
             fields,
             retryInquiry: false,
             cancellationToken);
@@ -1534,42 +1578,47 @@ public sealed class UniquePaySettlementService
 }
 
 /// <summary>
-/// Periodically inquires pending UniquePay invoices and routes verified payments to idempotent owned or tenant settlement.
+/// Reconciles UniquePay callbacks and performs bounded recovery polling for missed provider notifications.
 /// </summary>
 /// <remarks>
 /// The worker intentionally ignores the global creation switch: disabling UniquePay must not strand invoices that
-/// customers received earlier. Repeated provider outages are throttled before they reach the Telegram logger channel.
+/// customers received earlier. Automatic polling uses exponential backoff and a hard per-invoice attempt cap; callback,
+/// return, customer-check, and admin triggers remain available afterward. Provider outages are logger-throttled.
 /// </remarks>
 public sealed class UniquePayReconciliationHostedService : BackgroundService
 {
     private static readonly SemaphoreSlim ReconciliationGate = new(1, 1);
     private static readonly TimeSpan StaleSettlementClaimAge = TimeSpan.FromMinutes(30);
     private readonly AppConfig _configuration;
-    private readonly UserDbContext _userDbContext;
+    /// <summary>Creates one independent users.db context per scan or authoritative inquiry.</summary>
+    private readonly UserDbContextFactory _userDbContextFactory;
     private readonly UniquePay _uniquePay;
     private readonly UniquePaySettlementService _ownedSettlement;
     private readonly TenantBotService _tenantBotService;
     private readonly ILogger<UniquePayReconciliationHostedService> _logger;
 
     /// <summary>
-    /// Creates the UniquePay polling worker.
+    /// Creates the UniquePay callback coordinator and bounded recovery worker.
     /// </summary>
     /// <param name="configuration">Startup configuration containing interval, batch limits, and super-admin allow-list.</param>
-    /// <param name="userDbContext">users.db context containing pending UniquePay rows.</param>
+    /// <param name="userDbContextFactory">
+    /// Factory that creates an independent users.db context for each scan or inquiry, preventing the hosted worker
+    /// from sharing EF Core operations with concurrent Telegram update handlers.
+    /// </param>
     /// <param name="uniquePay">Authenticated read-only inquiry client.</param>
     /// <param name="ownedSettlement">Idempotent owned-wallet settlement service.</param>
     /// <param name="tenantBotService">Shared tenant purchase/renew fulfillment boundary.</param>
     /// <param name="logger">Operational logger used for throttled provider and verification failures.</param>
     public UniquePayReconciliationHostedService(
         IConfiguration configuration,
-        UserDbContext userDbContext,
+        UserDbContextFactory userDbContextFactory,
         UniquePay uniquePay,
         UniquePaySettlementService ownedSettlement,
         TenantBotService tenantBotService,
         ILogger<UniquePayReconciliationHostedService> logger)
     {
         _configuration = configuration.Get<AppConfig>() ?? new AppConfig();
-        _userDbContext = userDbContext;
+        _userDbContextFactory = userDbContextFactory ?? throw new ArgumentNullException(nameof(userDbContextFactory));
         _uniquePay = uniquePay;
         _ownedSettlement = ownedSettlement;
         _tenantBotService = tenantBotService;
@@ -1577,13 +1626,14 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     }
 
     /// <summary>
-    /// Runs bounded reconciliation scans until application shutdown.
+    /// Runs bounded recovery scans for callbacks that may have been lost until application shutdown.
     /// </summary>
     /// <param name="stoppingToken">Host shutdown token.</param>
     /// <returns>A task representing the worker lifetime.</returns>
     /// <remarks>
-    /// An unavailable token is tolerated while UniquePay has no existing rows. Once rows exist, the controlled
-    /// configuration error is logged with throttling and the rows remain pending for later recovery.
+    /// An unavailable token is tolerated while UniquePay has no scheduled rows. Once rows exist, the controlled
+    /// configuration error is logged with throttling. Each row stops automatic scheduling at the configured cap but
+    /// remains eligible for callback, return, customer-check, and admin-triggered authoritative inquiry.
     /// </remarks>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -1617,16 +1667,40 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// <param name="cancellationToken">Cancellation token for users.db, provider, and settlement work.</param>
     /// <returns>A task that completes after all selected rows have been inspected.</returns>
     /// <remarks>
-    /// The process-wide gate prevents a return request and the periodic scan from issuing overlapping inquiries for
-    /// the same shared DbContext. Database settlement markers remain the final duplicate-prevention boundary. A
-    /// provisional row remains inquiry-eligible until official confirmation or a terminal/mismatched result is saved.
+    /// The process-wide gate serializes provider inquiries, while each database operation owns an independent EF Core
+    /// context. Only rows below the configured automatic-attempt cap and with a due non-null schedule are selected.
+    /// Callback, browser-return, customer, and admin triggers remain available after automatic recovery polling stops.
     /// </remarks>
+    /// <example>
+    /// <code>
+    /// await reconciliation.ReconcileDueAsync(cancellationToken);
+    /// </code>
+    /// </example>
     public async Task ReconcileDueAsync(CancellationToken cancellationToken = default)
     {
         var now = DateTime.UtcNow;
         var staleClaimBefore = now.Subtract(StaleSettlementClaimAge);
         var batchSize = Math.Clamp(_configuration.UniquePayReconciliationBatchSize, 1, 500);
-        var ids = await _userDbContext.UniquePayPaymentInfos
+        var maxAttempts = Math.Clamp(_configuration.UniquePayReconciliationMaxAttempts, 1, 100);
+        await using var context = _userDbContextFactory.CreateDbContext();
+
+        // Persist the stopped schedule so old deployments with thousands of attempts no longer appear due in
+        // operational database inspection. Null only disables automatic scans; explicit HTTP/Telegram triggers do
+        // not consult NextInquiryAtUtc and therefore remain able to reconcile these invoices.
+        await context.UniquePayPaymentInfos
+            .Where(x => x.InquiryAttemptCount >= maxAttempts &&
+                        x.NextInquiryAtUtc != null &&
+                        x.PaymentStatus != UniquePayStatuses.Paid &&
+                        x.PaymentStatus != UniquePayStatuses.Failed &&
+                        x.PaymentStatus != UniquePayStatuses.Expired &&
+                        x.PaymentStatus != UniquePayStatuses.Cancelled)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.NextInquiryAtUtc, (DateTime?)null)
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+
+        var ids = await context.UniquePayPaymentInfos
             .AsNoTracking()
             .Where(x => (!x.IsAddedToBalance ||
                          (x.IsProvisionallyApproved && x.ProviderConfirmedAfterProvisionalAtUtc == null)) &&
@@ -1637,7 +1711,9 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
                         (x.SettlementState != UniquePaySettlementStates.Processing ||
                          x.SettlementStartedAtUtc == null ||
                          x.SettlementStartedAtUtc <= staleClaimBefore) &&
-                        (x.NextInquiryAtUtc == null || x.NextInquiryAtUtc <= now))
+                        x.InquiryAttemptCount < maxAttempts &&
+                        x.NextInquiryAtUtc != null &&
+                        x.NextInquiryAtUtc <= now)
             .OrderBy(x => x.NextInquiryAtUtc)
             .ThenBy(x => x.Id)
             .Select(x => x.Id)
@@ -1659,8 +1735,9 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// or <see cref="NowPaymentsSettlementStatus.NotFound"/> when the local row no longer exists.
     /// </returns>
     /// <remarks>
-    /// Callers may use this method for customer-check and return triggers. It never trusts query or callback fields
-    /// beyond locating the local row and always performs <c>/api/check-invoice</c>.
+    /// Interactive customer checks use this non-blocking method. Provider callback and browser-return requests use
+    /// <see cref="ReconcileProviderTriggerAsync"/> so their HTTP response waits for a real inquiry. Neither path trusts
+    /// callback data beyond locating the local row and both perform <c>/api/check-invoice</c>.
     /// </remarks>
     public async Task<NowPaymentsSettlementResult> ReconcilePaymentAsync(
         int paymentId,
@@ -1671,6 +1748,50 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
             source,
             allowTerminalRecheck: false,
             cancellationToken);
+
+    /// <summary>
+    /// Waits for any in-flight inquiry and authoritatively reconciles a UniquePay provider callback or browser return.
+    /// </summary>
+    /// <param name="paymentId">
+    /// Positive internal users.db UniquePay row id resolved from the invoice-specific merchant hash. It is never
+    /// accepted directly from provider status or amount fields.
+    /// </param>
+    /// <param name="source">Safe audit source identifying callback or browser-return processing.</param>
+    /// <param name="cancellationToken">Cancellation token for gate waiting, provider inquiry, persistence, and settlement.</param>
+    /// <returns>
+    /// The authoritative settlement outcome. ProviderNotPaid means the fresh official inquiry remained pending or
+    /// failed validation; no callback payload can directly produce an Applied result.
+    /// </returns>
+    /// <remarks>
+    /// Unlike an interactive customer check, a provider trigger waits for the reconciliation gate so the HTTP response
+    /// is based on a real inquiry rather than lock contention. Duplicate callbacks remain idempotent through durable
+    /// settlement markers and unique ledger keys.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var result = await reconciliation.ReconcileProviderTriggerAsync(
+    ///     payment.Id, "provider-callback", cancellationToken);
+    /// </code>
+    /// </example>
+    public async Task<NowPaymentsSettlementResult> ReconcileProviderTriggerAsync(
+        int paymentId,
+        string source,
+        CancellationToken cancellationToken = default)
+    {
+        await ReconciliationGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await ReconcilePaymentCoreAsync(
+                paymentId,
+                source,
+                allowTerminalRecheck: false,
+                cancellationToken);
+        }
+        finally
+        {
+            ReconciliationGate.Release();
+        }
+    }
 
     /// <summary>
     /// Authoritatively checks one UniquePay row with an optional super-admin recovery override for local terminal state.
@@ -1728,8 +1849,9 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// </returns>
     /// <remarks>
     /// Holding the same reconciliation gate across inquiry and provisional claim prevents the periodic worker from
-    /// starting another inquiry on the singleton users.db context between the admin's final check and wallet claim.
-    /// Tenant orders, terminal/mismatched responses, malformed responses, and transport errors always fail closed.
+    /// starting another inquiry between the admin's final check and wallet claim. The refreshed row is loaded through
+    /// an independent context; tenant orders, terminal/mismatched responses, malformed responses, and transport errors
+    /// always fail closed.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1759,7 +1881,9 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
                 source,
                 allowTerminalRecheck: true,
                 cancellationToken);
-            var payment = await _userDbContext.UniquePayPaymentInfos
+            await using var context = _userDbContextFactory.CreateDbContext();
+            var payment = await context.UniquePayPaymentInfos
+                .AsNoTracking()
                 .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
             if (payment == null)
                 return NowPaymentsSettlementResult.NotFound();
@@ -1799,7 +1923,8 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         bool allowTerminalRecheck,
         CancellationToken cancellationToken)
     {
-        var payment = await _userDbContext.UniquePayPaymentInfos
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var payment = await context.UniquePayPaymentInfos
             .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
@@ -1814,14 +1939,10 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
 
-        var nextDelay = TimeSpan.FromSeconds(Math.Clamp(
-            _configuration.UniquePayReconciliationIntervalSeconds,
-            10,
-            3600));
         try
         {
             var response = await _uniquePay.CheckInvoiceAsync(payment.HashId, cancellationToken);
-            payment.Apply(response, DateTime.UtcNow.Add(nextDelay));
+            payment.Apply(response, GetNextAutomaticInquiryAtUtc(payment.InquiryAttemptCount + 1));
             var providerTerminalStatus = UniquePayStatuses.GetProviderTerminalStatus(response.Invoice);
             if (providerTerminalStatus != null)
             {
@@ -1831,7 +1952,7 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
                 payment.ErrorMessage = "UniquePay reported a terminal unpaid invoice state.";
                 payment.UpdatedAtUtc = DateTime.UtcNow;
                 LogFailureWithThrottle(payment, "UniquePay reported a terminal unpaid invoice.", null);
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await context.SaveChangesAsync(cancellationToken);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
@@ -1848,7 +1969,7 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
                     payment.NextInquiryAtUtc = null;
                     LogFailureWithThrottle(payment, "UniquePay payment verification mismatch.", null);
                 }
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await context.SaveChangesAsync(cancellationToken);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
@@ -1862,7 +1983,7 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
             payment.ErrorCode = null;
             payment.ErrorMessage = null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await context.SaveChangesAsync(cancellationToken);
 
             if (string.Equals(
                     payment.PaymentPurpose,
@@ -1882,14 +2003,53 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         {
             payment.InquiryAttemptCount++;
             payment.LastInquiryAtUtc = DateTime.UtcNow;
-            payment.NextInquiryAtUtc = DateTime.UtcNow.Add(nextDelay);
+            payment.NextInquiryAtUtc = GetNextAutomaticInquiryAtUtc(payment.InquiryAttemptCount);
             payment.ErrorCode = "provider_check_failed";
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
             LogFailureWithThrottle(payment, "UniquePay invoice inquiry failed.", ex);
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await context.SaveChangesAsync(cancellationToken);
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
+    }
+
+    /// <summary>
+    /// Computes the next bounded automatic UniquePay recovery inquiry using exponential backoff.
+    /// </summary>
+    /// <param name="completedAttempts">
+    /// Total authoritative inquiries already recorded for the local invoice, including worker and explicit triggers.
+    /// Values at or above the configured maximum stop automatic scheduling.
+    /// </param>
+    /// <returns>
+    /// The next UTC inquiry time, or <c>null</c> when the automatic-attempt cap has been reached. A null schedule does
+    /// not block provider callback, browser return, customer check, or super-admin inquiry paths.
+    /// </returns>
+    /// <remarks>
+    /// The base delay is <see cref="AppConfig.UniquePayReconciliationIntervalSeconds"/> and doubles after each pending
+    /// observation up to <see cref="AppConfig.UniquePayReconciliationMaxDelaySeconds"/>. This keeps short recovery for
+    /// dropped callbacks without continuously querying abandoned invoices.
+    /// </remarks>
+    /// <example>
+    /// With a 30-second base and 900-second cap, pending attempts are scheduled after approximately 60, 120, 240,
+    /// 480, then at most 900 seconds until the attempt limit is reached.
+    /// </example>
+    private DateTime? GetNextAutomaticInquiryAtUtc(int completedAttempts)
+    {
+        var maxAttempts = Math.Clamp(_configuration.UniquePayReconciliationMaxAttempts, 1, 100);
+        if (completedAttempts >= maxAttempts)
+            return null;
+
+        var baseDelaySeconds = Math.Clamp(
+            _configuration.UniquePayReconciliationIntervalSeconds,
+            10,
+            3600);
+        var maxDelaySeconds = Math.Clamp(
+            _configuration.UniquePayReconciliationMaxDelaySeconds,
+            baseDelaySeconds,
+            86400);
+        var exponent = Math.Clamp(completedAttempts, 0, 20);
+        var delaySeconds = Math.Min(maxDelaySeconds, baseDelaySeconds * Math.Pow(2, exponent));
+        return DateTime.UtcNow.AddSeconds(delaySeconds);
     }
 
     /// <summary>

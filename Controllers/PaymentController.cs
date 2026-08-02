@@ -9,7 +9,8 @@ using Newtonsoft.Json;
 /// </summary>
 /// <remarks>
 /// NOWPayments is used for crypto wallet charges. HooshPay and UniquePay are used for rial wallet charges and tenant
-/// storefront orders. Tetraminator callbacks are unsigned triggers and are always verified through provider inquiry.
+/// storefront orders. Tetraminator and UniquePay callbacks are unsigned triggers and are always verified through
+/// provider inquiry.
 /// Tenant HooshPay rows are detected by <see cref="HooshPayPaymentInfo.PaymentPurpose"/> and are fulfilled by
 /// <see cref="TenantBotService.ApplyPaidTenantOrderAsync"/> instead of the wallet settlement path.
 /// </remarks>
@@ -20,9 +21,12 @@ public class PaymentController : ControllerBase
     private static readonly SemaphoreSlim IpnLock = new SemaphoreSlim(1, 1);
     private static readonly SemaphoreSlim HooshPayIpnLock = new SemaphoreSlim(1, 1);
     private static readonly SemaphoreSlim TetraminatorCallbackLock = new(1, 1);
-    private static readonly SemaphoreSlim UniquePayReturnLock = new(1, 1);
+    /// <summary>Serializes UniquePay callback and browser-return triggers before authoritative inquiry.</summary>
+    private static readonly SemaphoreSlim UniquePayTriggerLock = new(1, 1);
 
     private readonly UserDbContext _userDbcontext;
+    /// <summary>Creates isolated users.db contexts for concurrent UniquePay HTTP triggers.</summary>
+    private readonly UserDbContextFactory _userDbContextFactory;
     private readonly AppConfig _appConfig;
     private readonly NowPaymentsSettlementService _settlementService;
     private readonly HooshPaySettlementService _hooshPaySettlementService;
@@ -36,6 +40,9 @@ public class PaymentController : ControllerBase
     /// Creates the payment controller with all settlement services required by the IPN endpoints.
     /// </summary>
     /// <param name="userDbContext">Runtime database containing local payment records.</param>
+    /// <param name="userDbContextFactory">
+    /// Factory used by concurrent UniquePay callback and return requests so they never share an EF Core context.
+    /// </param>
     /// <param name="config">Application configuration containing gateway secrets.</param>
     /// <param name="settlementService">NOWPayments wallet settlement service.</param>
     /// <param name="hooshPaySettlementService">HooshPay wallet settlement service.</param>
@@ -48,6 +55,7 @@ public class PaymentController : ControllerBase
     /// <param name="logger">Controller logger.</param>
     public PaymentController(
         UserDbContext userDbContext,
+        UserDbContextFactory userDbContextFactory,
         IConfiguration config,
         NowPaymentsSettlementService settlementService,
         HooshPaySettlementService hooshPaySettlementService,
@@ -58,6 +66,7 @@ public class PaymentController : ControllerBase
         ILogger<PaymentController> logger)
     {
         _userDbcontext = userDbContext;
+        _userDbContextFactory = userDbContextFactory ?? throw new ArgumentNullException(nameof(userDbContextFactory));
         _appConfig = config.Get<AppConfig>();
         _settlementService = settlementService;
         _hooshPaySettlementService = hooshPaySettlementService;
@@ -158,8 +167,8 @@ public class PaymentController : ControllerBase
     /// provider or local inquiry failure. Existing invoices remain processable even when global creation is disabled.
     /// </returns>
     /// <remarks>
-    /// UniquePay documents callbacks as reserved for a future release, so this endpoint is only a user-experience
-    /// trigger. The reconciliation coordinator calls <c>/api/check-invoice</c> and applies all financial guards.
+    /// The bot-compatible provider route also sends a separate server callback. Both endpoints call the same
+    /// reconciliation coordinator, which performs <c>/api/check-invoice</c> and applies all financial guards.
     /// </remarks>
     [HttpGet("/uniquepay-return")]
     public async Task<IActionResult> ReceiveUniquePayReturn(
@@ -169,18 +178,75 @@ public class PaymentController : ControllerBase
         if (string.IsNullOrWhiteSpace(hashId))
             return BadRequest(new { status = false, message = "hashId is required" });
 
-        await UniquePayReturnLock.WaitAsync(cancellationToken);
+        return await HandleUniquePayTriggerAsync(hashId, "return-trigger", cancellationToken);
+    }
+
+    /// <summary>
+    /// Receives UniquePay's bot-gateway notification and treats it only as an authoritative-inquiry trigger.
+    /// </summary>
+    /// <param name="hashId">
+    /// Merchant hash embedded in the invoice-specific configured callback URL. It locates a local payment but does not
+    /// prove identity, paid state, amount, currency, fee, or fee payer.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for users.db lookup, provider inquiry, and settlement.</param>
+    /// <returns>
+    /// HTTP 200 after a paid/already-settled or still-pending authoritative inquiry, 404 for an unknown merchant hash,
+    /// and 503 when the official provider inquiry is temporarily unavailable.
+    /// </returns>
+    /// <remarks>
+    /// Callback form/body fields are deliberately ignored because the documentation provides no signature contract.
+    /// Duplicate or forged requests cannot credit a wallet or fulfill a tenant order: each request must pass a fresh
+    /// <c>/api/check-invoice</c> response and the durable idempotent settlement boundary.
+    /// </remarks>
+    /// <example>
+    /// UniquePay calls <c>POST /uniquepay-callback?hashId=merchant-hash</c>; the action ignores any claimed paid status
+    /// in the body and checks the saved hash through the provider API.
+    /// </example>
+    [HttpPost("/uniquepay-callback")]
+    public async Task<IActionResult> ReceiveUniquePayCallback(
+        [FromQuery(Name = "hashId")] string hashId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(hashId))
+            return BadRequest(new { status = false, message = "hashId is required" });
+
+        return await HandleUniquePayTriggerAsync(hashId, "provider-callback", cancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves one UniquePay merchant hash and serializes its official inquiry and idempotent settlement.
+    /// </summary>
+    /// <param name="hashId">Exact non-secret merchant hash from an invoice-specific return or callback URL.</param>
+    /// <param name="source">Safe audit label distinguishing provider callback from customer browser return.</param>
+    /// <param name="cancellationToken">Cancellation token for gate waiting, users.db, UniquePay, and settlement work.</param>
+    /// <returns>An HTTP result suitable for the provider callback or customer return request.</returns>
+    /// <remarks>
+    /// A fresh factory-created users.db context avoids the singleton-context race previously observed in the polling
+    /// worker. The incoming HTTP request supplies no trusted financial data and cannot bypass official verification.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// return await HandleUniquePayTriggerAsync(hashId, "provider-callback", cancellationToken);
+    /// </code>
+    /// </example>
+    private async Task<IActionResult> HandleUniquePayTriggerAsync(
+        string hashId,
+        string source,
+        CancellationToken cancellationToken)
+    {
+        await UniquePayTriggerLock.WaitAsync(cancellationToken);
         try
         {
-            var payment = await _userDbcontext.UniquePayPaymentInfos
+            await using var context = _userDbContextFactory.CreateDbContext();
+            var payment = await context.UniquePayPaymentInfos
                 .AsNoTracking()
                 .FirstOrDefaultAsync(x => x.HashId == hashId, cancellationToken);
             if (payment == null)
                 return NotFound(new { status = false, message = "payment not found" });
 
-            var settlement = await _uniquePayReconciliation.ReconcilePaymentAsync(
+            var settlement = await _uniquePayReconciliation.ReconcileProviderTriggerAsync(
                 payment.Id,
-                "return-trigger",
+                source,
                 cancellationToken);
             return Ok(new
             {
@@ -192,14 +258,14 @@ public class PaymentController : ControllerBase
         }
         catch (Exception ex) when (ex is UniquePayApiException or HttpRequestException or InvalidOperationException)
         {
-            _logger.LogWarning(ex, "UniquePay return inquiry failed. hashId={HashId}", hashId);
+            _logger.LogWarning(ex, "UniquePay HTTP trigger inquiry failed. source={Source}, hashId={HashId}", source, hashId);
             return StatusCode(
                 StatusCodes.Status503ServiceUnavailable,
                 new { status = false, message = "provider inquiry unavailable" });
         }
         finally
         {
-            UniquePayReturnLock.Release();
+            UniquePayTriggerLock.Release();
         }
     }
 

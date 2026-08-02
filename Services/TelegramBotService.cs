@@ -8262,8 +8262,9 @@ public class TelegramBotService : IHostedService
     /// <param name="cancellationToken">Cancellation token for users.db, the single create request, and Telegram delivery.</param>
     /// <remarks>
     /// The live global switch is rechecked before any row or provider request is created. The local merchant hash is
-    /// persisted first, creation is attempted once, and an ambiguous failure remains auditable for manual/provider
-    /// inquiry. The displayed 12% is the gateway fee; UniquePay decides from its business setting whether the
+    /// persisted first, creation is attempted once through the bot-compatible endpoint, and an ambiguous failure
+    /// remains auditable for manual/provider inquiry. The invoice-specific unsigned callback and browser return only
+    /// trigger authoritative inquiry. The displayed 12% is the gateway fee; UniquePay decides whether the
     /// <c>user</c>/<c>buyer</c> or owner bears it, while only the immutable local base amount can be credited.
     /// </remarks>
     private async Task CreateUniquePayWalletChargeAsync(
@@ -8290,11 +8291,14 @@ public class TelegramBotService : IHostedService
             amount,
             _appConfig.UniquePayFeePercent);
         var returnUrl = BuildUniquePayReturnUrl(payment.HashId);
+        var callbackUrl = BuildUniquePayCallbackUrl(payment.HashId);
         payment.RawRequestJson = JsonConvert.SerializeObject(new
         {
             hashId = payment.HashId,
+            orderId = payment.HashId,
             amount,
-            redirectUrl = returnUrl
+            redirectUrl = returnUrl,
+            callbackUrl
         });
         _userDbContext.UniquePayPaymentInfos.Add(payment);
         await _userDbContext.SaveChangesAsync(cancellationToken);
@@ -8305,6 +8309,7 @@ public class TelegramBotService : IHostedService
                 payment.HashId,
                 payment.BaseAmountToman,
                 returnUrl,
+                callbackUrl,
                 cancellationToken);
             payment.Apply(invoice);
             payment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(Math.Clamp(
@@ -8457,6 +8462,32 @@ public class TelegramBotService : IHostedService
     private string BuildUniquePayReturnUrl(string hashId)
     {
         var builder = new UriBuilder(_appConfig.UniquePayReturnUrl);
+        var prefix = string.IsNullOrWhiteSpace(builder.Query)
+            ? string.Empty
+            : builder.Query.TrimStart('?') + "&";
+        builder.Query = prefix + "hashId=" + Uri.EscapeDataString(hashId);
+        return builder.Uri.AbsoluteUri;
+    }
+
+    /// <summary>
+    /// Adds the saved UniquePay merchant hash to the configured provider-notification endpoint.
+    /// </summary>
+    /// <param name="hashId">
+    /// Persisted merchant hash used only to locate the owned-wallet invoice before an authoritative provider inquiry.
+    /// It is not accepted as payment proof.
+    /// </param>
+    /// <returns>An absolute callback URL preserving configured query parameters.</returns>
+    /// <remarks>
+    /// UniquePay's bot-compatible create route calls this unsigned URL. The receiving controller ignores callback
+    /// status and amount fields and settles only after <c>/api/check-invoice</c> passes every financial invariant.
+    /// </remarks>
+    /// <example>
+    /// A configured <c>https://merchant.example/uniquepay-callback</c> becomes
+    /// <c>https://merchant.example/uniquepay-callback?hashId=merchant-hash</c>.
+    /// </example>
+    private string BuildUniquePayCallbackUrl(string hashId)
+    {
+        var builder = new UriBuilder(_appConfig.UniquePayCallbackUrl);
         var prefix = string.IsNullOrWhiteSpace(builder.Query)
             ? string.Empty
             : builder.Query.TrimStart('?') + "&";

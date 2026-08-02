@@ -5005,9 +5005,10 @@ public class TenantBotService
     /// <param name="order">Tracked purchase/renewal order whose sale amount is the financial source of truth.</param>
     /// <param name="cancellationToken">Cancellation token for users.db, UniquePay, and Telegram work.</param>
     /// <remarks>
-    /// Creation is not retried. A known prior link is reused; an ambiguous prior attempt is blocked for review rather
-    /// than issuing a second provider invoice. The 12% gateway fee is displayed without claiming who bears it; polling
-    /// later verifies either the provider's <c>user</c>/<c>buyer</c>-paid or owner-paid amount contract.
+    /// Creation uses the bot-compatible endpoint and is not retried. A known prior link is reused; an ambiguous prior
+    /// attempt is blocked for review rather than issuing a second provider invoice. The invoice-specific callback is
+    /// only an authoritative-inquiry trigger. Bounded recovery polling verifies either the provider's
+    /// <c>user</c>/<c>buyer</c>-paid or owner-paid amount contract when notification delivery is lost.
     /// </remarks>
     private async Task CreateTenantUniquePayInvoiceCoreAsync(
         ITelegramBotClient botClient,
@@ -5064,8 +5065,10 @@ public class TenantBotService
                 payment.RawRequestJson = JsonConvert.SerializeObject(new
                 {
                     hashId = payment.HashId,
+                    orderId = payment.HashId,
                     amount = payment.BaseAmountToman,
-                    redirectUrl = BuildUniquePayReturnUrl(payment.HashId)
+                    redirectUrl = BuildUniquePayReturnUrl(payment.HashId),
+                    callbackUrl = BuildUniquePayCallbackUrl(payment.HashId)
                 });
                 _userDbcontext.UniquePayPaymentInfos.Add(payment);
                 await _userDbcontext.SaveChangesAsync(cancellationToken);
@@ -5109,6 +5112,7 @@ public class TenantBotService
                 payment.HashId,
                 payment.BaseAmountToman,
                 BuildUniquePayReturnUrl(payment.HashId),
+                BuildUniquePayCallbackUrl(payment.HashId),
                 cancellationToken);
             payment.Apply(invoice);
             payment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(Math.Clamp(
@@ -5177,6 +5181,33 @@ public class TenantBotService
     private string BuildUniquePayReturnUrl(string hashId)
     {
         var builder = new UriBuilder(_appConfig.UniquePayReturnUrl);
+        var prefix = string.IsNullOrWhiteSpace(builder.Query)
+            ? string.Empty
+            : builder.Query.TrimStart('?') + "&";
+        builder.Query = prefix + "hashId=" + Uri.EscapeDataString(hashId);
+        return builder.Uri.AbsoluteUri;
+    }
+
+    /// <summary>
+    /// Builds the invoice-specific UniquePay provider-notification URL for a tenant purchase or renewal.
+    /// </summary>
+    /// <param name="hashId">
+    /// Persisted merchant hash belonging to the tenant order's UniquePay row. It is a lookup hint and never payment
+    /// proof, so it is safe to include in the callback query string but must not authorize fulfillment.
+    /// </param>
+    /// <returns>Absolute configured callback endpoint with the escaped merchant hash appended.</returns>
+    /// <remarks>
+    /// All tenant bots share the platform endpoint while the hash resolves the tenant-owned order. The callback is
+    /// unsigned; fulfillment still requires an authoritative UniquePay inquiry and the existing tenant idempotency
+    /// boundary.
+    /// </remarks>
+    /// <example>
+    /// A configured <c>https://merchant.example/uniquepay-callback</c> becomes
+    /// <c>https://merchant.example/uniquepay-callback?hashId=merchant-hash</c>.
+    /// </example>
+    private string BuildUniquePayCallbackUrl(string hashId)
+    {
+        var builder = new UriBuilder(_appConfig.UniquePayCallbackUrl);
         var prefix = string.IsNullOrWhiteSpace(builder.Query)
             ? string.Empty
             : builder.Query.TrimStart('?') + "&";

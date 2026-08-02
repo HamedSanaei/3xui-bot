@@ -139,6 +139,11 @@ public sealed class PaymentGatewayAvailabilityService : IPaymentGatewayAvailabil
     /// Absolute or content-root-relative path of the JSON file whose four root boolean properties are persisted.
     /// </param>
     /// <param name="logger">Operational logger used for safe gateway-toggle audit events.</param>
+    /// <remarks>
+    /// UniquePay starts effectively disabled when its bot callback URL or another required credential/URL is missing,
+    /// even if the persisted enabled flag is true. This prevents displaying a gateway that cannot create callback-
+    /// capable invoices; the super-admin panel reports the incomplete configuration without exposing secrets.
+    /// </remarks>
     public PaymentGatewayAvailabilityService(
         AppConfig configuration,
         string configurationPath,
@@ -150,7 +155,7 @@ public sealed class PaymentGatewayAvailabilityService : IPaymentGatewayAvailabil
         _snapshot = new PaymentGatewayAvailabilitySnapshot(
             configuration.HooshPayEnabled,
             configuration.TetraminatorEnabled,
-            configuration.UniquePayEnabled,
+            configuration.UniquePayEnabled && IsConfigured(PaymentGateway.UniquePay),
             configuration.NowPaymentsEnabled,
             Revision: 1);
     }
@@ -175,6 +180,7 @@ public sealed class PaymentGatewayAvailabilityService : IPaymentGatewayAvailabil
                 HasSecret(_configuration.UniquePayBusinessToken) &&
                 IsAbsoluteHttpUrl(_configuration.UniquePayBaseUrl) &&
                 IsAbsoluteHttpUrl(_configuration.UniquePayReturnUrl) &&
+                IsAbsoluteHttpUrl(_configuration.UniquePayCallbackUrl) &&
                 _configuration.UniquePayFeePercent == 12m,
             PaymentGateway.NowPayments =>
                 HasSecret(_configuration.NowPaymentApiKey) &&

@@ -218,10 +218,19 @@ namespace Adminbot.Domain
         /// Public platform return endpoint given to UniquePay for redirecting a customer after payment.
         /// </summary>
         /// <remarks>
-        /// UniquePay does not currently document a settlement callback. This URL is only a trigger; the application
-        /// always calls <c>/api/check-invoice</c> before applying a financial change.
+        /// This browser-return URL is separate from <see cref="UniquePayCallbackUrl"/>. It is only a lookup trigger;
+        /// the application always calls <c>/api/check-invoice</c> before applying a financial change.
         /// </remarks>
         public string UniquePayReturnUrl { get; set; }
+        /// <summary>
+        /// Public HTTPS endpoint that receives UniquePay's bot-gateway payment notification.
+        /// </summary>
+        /// <remarks>
+        /// The callback is an unsigned trigger and is never accepted as payment proof. The application locates the
+        /// saved invoice by its merchant hash and performs an authoritative <c>/api/check-invoice</c> request before
+        /// any wallet credit or tenant fulfillment.
+        /// </remarks>
+        public string UniquePayCallbackUrl { get; set; }
         /// <summary>
         /// UniquePay fee percentage displayed to customers and verified against provider inquiry data.
         /// </summary>
@@ -244,6 +253,18 @@ namespace Adminbot.Domain
         /// Number of seconds between background scans for due pending UniquePay invoices.
         /// </summary>
         public int UniquePayReconciliationIntervalSeconds { get; set; } = 30;
+        /// <summary>
+        /// Maximum number of automatic background inquiries allowed for one UniquePay invoice.
+        /// </summary>
+        /// <remarks>
+        /// Callback, browser-return, customer-check, and super-admin checks remain available after this limit. The
+        /// bound prevents abandoned invoices from being queried indefinitely.
+        /// </remarks>
+        public int UniquePayReconciliationMaxAttempts { get; set; } = 12;
+        /// <summary>
+        /// Maximum exponential-backoff delay, in seconds, between automatic UniquePay inquiries.
+        /// </summary>
+        public int UniquePayReconciliationMaxDelaySeconds { get; set; } = 900;
         /// <summary>
         /// Maximum number of due UniquePay rows processed during one reconciliation scan.
         /// </summary>
