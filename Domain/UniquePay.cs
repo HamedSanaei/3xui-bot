@@ -959,7 +959,7 @@ public sealed class UniquePaySettlementService
 {
     private static readonly SemaphoreSlim SettlementGate = new(1, 1);
     private readonly AppConfig _configuration;
-    private readonly UserDbContext _userDbContext;
+    private readonly UserDbContextFactory _userDbContextFactory;
     private readonly CredentialsDbContext _credentialsDbContext;
     private readonly WalletLedgerService _walletLedgerService;
     private readonly ReferralService _referralService;
@@ -970,15 +970,23 @@ public sealed class UniquePaySettlementService
     /// Creates the owned-wallet UniquePay settlement boundary.
     /// </summary>
     /// <param name="configuration">Startup configuration containing the immutable super-admin Telegram allow-list.</param>
-    /// <param name="userDbContext">users.db context containing payment rows and settlement markers.</param>
+    /// <param name="userDbContextFactory">
+    /// Factory that creates an independent users.db context for each settlement attempt. A fresh change tracker is
+    /// required because reconciliation records provider-paid state through a separate context immediately before
+    /// this service claims the wallet credit.
+    /// </param>
     /// <param name="credentialsDbContext">credentials.db context containing the shared wallet balance.</param>
     /// <param name="walletLedgerService">Idempotent append-only wallet-ledger writer.</param>
     /// <param name="referralService">Global owned-bot referral engine for final official wallet payments.</param>
     /// <param name="botClientProvider">Bot client provider used for best-effort customer delivery.</param>
     /// <param name="logger">Operational and payment logger; provider credentials are never included.</param>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown when <paramref name="userDbContextFactory"/> is null because settlement cannot safely reuse the legacy
+    /// singleton users.db change tracker after reconciliation.
+    /// </exception>
     public UniquePaySettlementService(
         IConfiguration configuration,
-        UserDbContext userDbContext,
+        UserDbContextFactory userDbContextFactory,
         CredentialsDbContext credentialsDbContext,
         WalletLedgerService walletLedgerService,
         ReferralService referralService,
@@ -986,7 +994,7 @@ public sealed class UniquePaySettlementService
         ILogger<UniquePaySettlementService> logger)
     {
         _configuration = configuration.Get<AppConfig>() ?? new AppConfig();
-        _userDbContext = userDbContext;
+        _userDbContextFactory = userDbContextFactory ?? throw new ArgumentNullException(nameof(userDbContextFactory));
         _credentialsDbContext = credentialsDbContext;
         _walletLedgerService = walletLedgerService;
         _referralService = referralService;
@@ -1005,6 +1013,8 @@ public sealed class UniquePaySettlementService
     /// <remarks>
     /// The process-wide gate and persisted <see cref="UniquePayPaymentInfo.IsAddedToBalance"/> marker prevent duplicate
     /// wallet mutations when return, customer button, and worker race. The append-only ledger has a second unique key.
+    /// Each attempt reloads the payment through an independent users.db context so the paid state written by the
+    /// authoritative reconciliation context cannot be hidden by a stale singleton EF Core change tracker.
     /// </remarks>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(
         UniquePayPaymentInfo payment,
@@ -1024,7 +1034,10 @@ public sealed class UniquePaySettlementService
         await SettlementGate.WaitAsync(cancellationToken);
         try
         {
-            var tracked = await _userDbContext.UniquePayPaymentInfos
+            // Reconciliation writes paid state through its own context. A new tracker here is required so a legacy
+            // singleton entity cached as pending cannot suppress the durable wallet claim.
+            await using var context = _userDbContextFactory.CreateDbContext();
+            var tracked = await context.UniquePayPaymentInfos
                 .FirstOrDefaultAsync(x => x.Id == payment.Id, cancellationToken);
             if (tracked == null)
                 return NowPaymentsSettlementResult.NotFound();
@@ -1038,7 +1051,7 @@ public sealed class UniquePaySettlementService
                 tracked.ErrorMessage = "The credentials wallet user was not found.";
                 tracked.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(1);
                 tracked.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await context.SaveChangesAsync(cancellationToken);
                 return NowPaymentsSettlementResult.UserNotFound();
             }
 
@@ -1050,7 +1063,7 @@ public sealed class UniquePaySettlementService
                     tracked.SettlementAttemptId = null;
                     tracked.SettlementStartedAtUtc = null;
                     tracked.UpdatedAtUtc = DateTime.UtcNow;
-                    await _userDbContext.SaveChangesAsync(cancellationToken);
+                    await context.SaveChangesAsync(cancellationToken);
                 }
                 if (tracked.IsProvisionallyApproved)
                 {
@@ -1059,7 +1072,12 @@ public sealed class UniquePaySettlementService
                         tracked.BalanceBefore ?? user.AccountBalance - tracked.BaseAmountToman,
                         tracked.BalanceAfter ?? user.AccountBalance,
                         cancellationToken);
-                    await RecordProviderConfirmationAfterProvisionalAsync(tracked, user, source, cancellationToken);
+                    await RecordProviderConfirmationAfterProvisionalAsync(
+                        context,
+                        tracked,
+                        user,
+                        source,
+                        cancellationToken);
                 }
                 else
                 {
@@ -1073,12 +1091,12 @@ public sealed class UniquePaySettlementService
                 return NowPaymentsSettlementResult.AlreadyAdded(user.AccountBalance);
             }
 
-            if (await RejectActiveOrAmbiguousClaimAsync(tracked, cancellationToken))
+            if (await RejectActiveOrAmbiguousClaimAsync(context, tracked, cancellationToken))
                 return NowPaymentsSettlementResult.ProviderNotPaid();
 
             var attemptId = Guid.NewGuid().ToString("N");
             var claimedAtUtc = DateTime.UtcNow;
-            var claimed = await _userDbContext.UniquePayPaymentInfos
+            var claimed = await context.UniquePayPaymentInfos
                 .Where(x => x.Id == tracked.Id &&
                             !x.IsAddedToBalance &&
                             (x.SettlementState == null || x.SettlementState == UniquePaySettlementStates.Pending))
@@ -1091,13 +1109,13 @@ public sealed class UniquePaySettlementService
                     cancellationToken);
             if (claimed != 1)
             {
-                await _userDbContext.Entry(tracked).ReloadAsync(cancellationToken);
+                await context.Entry(tracked).ReloadAsync(cancellationToken);
                 return tracked.IsAddedToBalance
                     ? NowPaymentsSettlementResult.AlreadyAdded(tracked.BalanceAfter ?? user.AccountBalance)
                     : NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
-            await _userDbContext.Entry(tracked).ReloadAsync(cancellationToken);
+            await context.Entry(tracked).ReloadAsync(cancellationToken);
 
             var before = user.AccountBalance;
             if (!await _credentialsDbContext.AddFund(tracked.TelegramUserId, tracked.BaseAmountToman))
@@ -1107,7 +1125,7 @@ public sealed class UniquePaySettlementService
                 tracked.SettlementStartedAtUtc = null;
                 tracked.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(1);
                 tracked.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await context.SaveChangesAsync(cancellationToken);
                 return NowPaymentsSettlementResult.UserNotFound();
             }
             var after = checked(before + tracked.BaseAmountToman);
@@ -1120,11 +1138,11 @@ public sealed class UniquePaySettlementService
             tracked.BalanceAfter = after;
             tracked.SettledAtUtc ??= DateTime.UtcNow;
             tracked.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await context.SaveChangesAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, before, after, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
             await NotifyCustomerAsync(tracked, notifyChatId ?? tracked.ChatId, provisional: false, cancellationToken);
-            LogSettlementOnce(tracked, user, before, after, source);
+            await LogSettlementOnceAsync(context, tracked, user, before, after, source, cancellationToken);
             return NowPaymentsSettlementResult.Applied(before, after);
         }
         finally
@@ -1146,7 +1164,8 @@ public sealed class UniquePaySettlementService
     /// terminal/mismatched responses, provider-check failures, and already paid rows are rejected. A persisted claim is
     /// acquired before credentials.db is changed so a crash becomes manual review instead of a duplicate wallet credit.
     /// Referral processing is permanently excluded for this provisional credit; a later official confirmation writes
-    /// audit only and never retroactively creates a referral reward.
+    /// audit only and never retroactively creates a referral reward. The refreshed eligibility row is loaded with an
+    /// independent users.db context so an older tracked status cannot authorize or reject the administrator's action.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1171,7 +1190,10 @@ public sealed class UniquePaySettlementService
         await SettlementGate.WaitAsync(cancellationToken);
         try
         {
-            var tracked = await _userDbContext.UniquePayPaymentInfos
+            // The admin decision must use the row produced by the immediately preceding inquiry, not an entity that
+            // an earlier Telegram update left in the singleton users.db tracker.
+            await using var context = _userDbContextFactory.CreateDbContext();
+            var tracked = await context.UniquePayPaymentInfos
                 .FirstOrDefaultAsync(x => x.Id == payment.Id, cancellationToken);
             if (tracked == null)
                 return NowPaymentsSettlementResult.NotFound();
@@ -1194,14 +1216,14 @@ public sealed class UniquePaySettlementService
             }
 
             if (!CanApplyProvisionalCredit(tracked) ||
-                await RejectActiveOrAmbiguousClaimAsync(tracked, cancellationToken))
+                await RejectActiveOrAmbiguousClaimAsync(context, tracked, cancellationToken))
             {
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
             var attemptId = Guid.NewGuid().ToString("N");
             var claimedAtUtc = DateTime.UtcNow;
-            var claimed = await _userDbContext.UniquePayPaymentInfos
+            var claimed = await context.UniquePayPaymentInfos
                 .Where(x => x.Id == tracked.Id &&
                             !x.IsAddedToBalance &&
                             x.PaymentStatus == UniquePayStatuses.Pending &&
@@ -1216,7 +1238,7 @@ public sealed class UniquePaySettlementService
             if (claimed != 1)
                 return NowPaymentsSettlementResult.ProviderNotPaid();
 
-            await _userDbContext.Entry(tracked).ReloadAsync(cancellationToken);
+            await context.Entry(tracked).ReloadAsync(cancellationToken);
             var before = user.AccountBalance;
             if (!await _credentialsDbContext.AddFund(tracked.TelegramUserId, tracked.BaseAmountToman))
             {
@@ -1224,7 +1246,7 @@ public sealed class UniquePaySettlementService
                 tracked.SettlementAttemptId = null;
                 tracked.SettlementStartedAtUtc = null;
                 tracked.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await context.SaveChangesAsync(cancellationToken);
                 return NowPaymentsSettlementResult.UserNotFound();
             }
             var after = checked(before + tracked.BaseAmountToman);
@@ -1241,7 +1263,7 @@ public sealed class UniquePaySettlementService
             tracked.SettledAtUtc ??= DateTime.UtcNow;
             tracked.NextInquiryAtUtc ??= DateTime.UtcNow.AddMinutes(1);
             tracked.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await context.SaveChangesAsync(cancellationToken);
 
             await EnsureProvisionalLedgerAsync(tracked, before, after, cancellationToken);
             await NotifyCustomerAsync(tracked, notifyChatId ?? tracked.ChatId, provisional: true, cancellationToken);
@@ -1257,6 +1279,10 @@ public sealed class UniquePaySettlementService
     /// <summary>
     /// Rejects an active settlement claim and converts a stale crash-ambiguous claim to manual review.
     /// </summary>
+    /// <param name="context">
+    /// Per-operation users.db context tracking <paramref name="payment"/> and the durable settlement claim.
+    /// It must not be the legacy singleton context because its change tracker may hold pre-inquiry payment state.
+    /// </param>
     /// <param name="payment">Tracked paid UniquePay row that has not yet reached the durable settled marker.</param>
     /// <param name="cancellationToken">Cancellation token for persisting the manual-review transition.</param>
     /// <returns>
@@ -1268,6 +1294,7 @@ public sealed class UniquePaySettlementService
     /// a cross-database transaction. This transition fails closed instead of risking a duplicate wallet credit.
     /// </remarks>
     private async Task<bool> RejectActiveOrAmbiguousClaimAsync(
+        UserDbContext context,
         UniquePayPaymentInfo payment,
         CancellationToken cancellationToken)
     {
@@ -1287,7 +1314,7 @@ public sealed class UniquePaySettlementService
         payment.ErrorMessage = "A previous UniquePay wallet settlement claim became stale and requires manual review.";
         payment.NextInquiryAtUtc = null;
         payment.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        await context.SaveChangesAsync(cancellationToken);
         _logger.LogError(
             "UniquePay wallet settlement stopped for manual review. paymentId={PaymentId}, attemptId={AttemptId}, userId={UserId}, amountToman={AmountToman}",
             payment.Id,
@@ -1458,23 +1485,35 @@ public sealed class UniquePaySettlementService
     /// <summary>
     /// Sends the central one-time successful UniquePay payment report after durable financial work.
     /// </summary>
+    /// <param name="context">
+    /// Per-operation users.db context tracking <paramref name="payment"/>. It persists the one-time logging marker
+    /// without consulting the stale legacy singleton change tracker.
+    /// </param>
     /// <param name="payment">Settled payment identifiers and amounts.</param>
     /// <param name="user">Shared wallet owner shown in the private audit.</param>
     /// <param name="before">Wallet balance in toman before credit.</param>
     /// <param name="after">Wallet balance in toman after credit.</param>
     /// <param name="source">Safe settlement trigger label.</param>
-    private void LogSettlementOnce(
+    /// <param name="cancellationToken">Cancellation token for persisting the users.db log marker.</param>
+    /// <returns>A task that completes after the durable marker and central payment audit are emitted once.</returns>
+    /// <remarks>
+    /// Wallet credit, settlement state, ledger, referral processing, and customer notification are already durable
+    /// before this helper runs. A Telegram logging failure must not cause the financial mutation to be replayed.
+    /// </remarks>
+    private async Task LogSettlementOnceAsync(
+        UserDbContext context,
         UniquePayPaymentInfo payment,
         CredUser user,
         long before,
         long after,
-        string source)
+        string source,
+        CancellationToken cancellationToken)
     {
         if (payment.SuccessLoggedAtUtc.HasValue)
             return;
         payment.SuccessLoggedAtUtc = DateTime.UtcNow;
         payment.UpdatedAtUtc = DateTime.UtcNow;
-        _userDbContext.SaveChanges();
+        await context.SaveChangesAsync(cancellationToken);
 
         _logger.LogPayment(
             "✅ پرداخت ریالی یونیک‌پی تایید شد\n\n" +
@@ -1517,6 +1556,9 @@ public sealed class UniquePaySettlementService
     /// <summary>
     /// Records a later official UniquePay confirmation for a provisionally credited wallet without crediting again.
     /// </summary>
+    /// <param name="context">
+    /// Per-operation users.db context that tracks the payment and persists only the provider-confirmation audit.
+    /// </param>
     /// <param name="payment">Tracked row already marked paid and provisionally credited.</param>
     /// <param name="user">Shared wallet owner displayed in the protected audit.</param>
     /// <param name="source">Non-secret inquiry source that observed the official confirmation.</param>
@@ -1524,6 +1566,7 @@ public sealed class UniquePaySettlementService
     /// <returns>A task that completes after a new audit is saved or an existing confirmation is left unchanged.</returns>
     /// <remarks>No wallet, referral, or ledger mutation is performed.</remarks>
     private async Task RecordProviderConfirmationAfterProvisionalAsync(
+        UserDbContext context,
         UniquePayPaymentInfo payment,
         CredUser user,
         string source,
@@ -1539,7 +1582,7 @@ public sealed class UniquePaySettlementService
 
         payment.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
         payment.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        await context.SaveChangesAsync(cancellationToken);
         _logger.LogPayment(
             "ℹ️ یونیک‌پی پرداخت موقت را بعداً تایید کرد\n\n" +
             TelegramUserLinkFormatter.HtmlSummary(user) + "\n\n" +

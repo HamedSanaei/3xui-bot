@@ -1,4 +1,5 @@
 using Adminbot.Domain;
+using Adminbot.Domain.Logging;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
@@ -691,6 +692,40 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// Confirms a super-admin bulk account request, creates the panel accounts, delivers their details, and records
+    /// one HTML-formatted audit in the central Telegram logger channel.
+    /// </summary>
+    /// <param name="botClient">
+    /// Active owned-bot Telegram client handling the configured super-admin conversation. It delivers account details
+    /// to the requesting admin, while the logger provider routes the audit through the default logging bot.
+    /// </param>
+    /// <param name="message">
+    /// Telegram confirmation message from the super-admin. Only the exact confirmation command proceeds with creation.
+    /// </param>
+    /// <param name="currentUser">
+    /// Bot-scoped users.db conversation state containing the target Telegram user id, selected XUI service, duration,
+    /// fair-usage or traffic limit, requested account count, and optional user comment.
+    /// </param>
+    /// <param name="mainMenu">Reply keyboard restored after creation succeeds, partially succeeds, or is cancelled.</param>
+    /// <param name="cancellationToken">
+    /// Cancellation token for Telegram delivery, XUI panel calls, optional Gozargah sync, users.db state, and activity audit work.
+    /// </param>
+    /// <returns>A task that completes after all successful account details and the central logger audit are queued.</returns>
+    /// <remarks>
+    /// Super-admin creation never debits a customer wallet. Each successfully created account is optionally queued for
+    /// Gozargah synchronization before the conversation returns to the main menu. The audit uses Telegram HTML with
+    /// every dynamic value encoded before it enters a <c>code</c> entity, so comments or panel values cannot break the
+    /// logger message markup. Partial failures remain visible in both the admin response and the audit.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the saved target Telegram user id is missing or invalid before the XUI request is created.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// await HandleCreateConfirmAsync(botClient, message, currentUser, mainMenu, cancellationToken);
+    /// </code>
+    /// </example>
     private async Task HandleCreateConfirmAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -783,8 +818,8 @@ public class XuiV3AdminFlowService
         }
 
         await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "منوی اصلی", cancellationToken);
-        _logger.LogInformation(
-            BuildAdminBulkCreateLogMessage(currentUser, message.From.Id, bulkResult).EscapeMarkdown());
+        _logger.LogTelegramHtml(
+            BuildAdminBulkCreateLogMessage(currentUser, message.From.Id, bulkResult));
 
         var actorCredUser = await GetActivityActorAsync(message.From.Id);
         await _activityLog.LogBotActionAsync(
@@ -3834,6 +3869,36 @@ public class XuiV3AdminFlowService
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Builds the bounded Telegram HTML audit for accounts created manually by a configured super-admin.
+    /// </summary>
+    /// <param name="currentUser">
+    /// Bot-scoped admin conversation state whose <c>ConfigLink</c> contains the numeric Telegram user id that owns the
+    /// created accounts. A missing value is represented as <c>unknown</c> in the protected audit.
+    /// </param>
+    /// <param name="actorTelegramUserId">
+    /// Numeric Telegram user id of the configured super-admin who confirmed the XUI creation; it is global audit
+    /// identity rather than a tenant, chat, bot, or panel id and must be positive at the caller.
+    /// </param>
+    /// <param name="result">
+    /// Completed XUI bulk-creation result containing the local bulk order id, service and limit snapshot, successful
+    /// account identifiers, and safe per-row failures. The result must not be null.
+    /// </param>
+    /// <returns>
+    /// Non-null HTML-safe text whose dynamic values are wrapped in Telegram <c>code</c> entities. The returned text is
+    /// intended only for <see cref="LoggerExtensions.LogTelegramHtml"/> and must not be sent as Markdown.
+    /// </returns>
+    /// <remarks>
+    /// User comments and provider-derived values are shortened where appropriate and HTML-encoded before formatting.
+    /// The account count is bounded by <see cref="XuiV3PurchaseService.MaxBulkAccountCount"/>, keeping the audit below
+    /// Telegram's single-message limit. This method has no database, panel, wallet, or Telegram side effects.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var audit = BuildAdminBulkCreateLogMessage(state, 123456789, bulkResult);
+    /// logger.LogTelegramHtml(audit);
+    /// </code>
+    /// </example>
     private static string BuildAdminBulkCreateLogMessage(
         User currentUser,
         long actorTelegramUserId,
@@ -3843,31 +3908,31 @@ public class XuiV3AdminFlowService
         var metadata = TryReadMetadata(result.CreatedAccounts.FirstOrDefault()?.Comment);
         var sb = new StringBuilder();
         sb.AppendLine("ساخت انبوه اکانت نسخه ۳ توسط ادمین");
-        sb.AppendLine($"ادمین `{actorTelegramUserId}`");
-        sb.AppendLine($"مالک `{targetUserId}`");
-        sb.AppendLine($"شناسه سفارش `{result.BulkOrderId}`");
-        sb.AppendLine($"تاریخ ساخت `{FormatMetadataCreatedAt(metadata)}`");
-        sb.AppendLine($"سرویس `{result.ServiceName}`");
-        sb.AppendLine($"تعداد درخواست `{result.RequestedCount}`");
-        sb.AppendLine($"تعداد موفق `{result.SuccessfulCount}`");
-        sb.AppendLine($"{(string.Equals(metadata?.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase) ? "حد مصرف منصفانه هر اکانت" : "حجم هر اکانت")} `{XuiV3PurchaseService.FormatTrafficSize(result.TrafficBytes, result.TrafficGb)}`");
-        sb.AppendLine($"مدت `{(result.DurationDays <= 0 ? "نامحدود" : result.DurationDays + " روز")}`");
+        sb.AppendLine($"ادمین <code>{actorTelegramUserId}</code>");
+        sb.AppendLine($"مالک <code>{Html(targetUserId)}</code>");
+        sb.AppendLine($"شناسه سفارش <code>{Html(result.BulkOrderId)}</code>");
+        sb.AppendLine($"تاریخ ساخت <code>{Html(FormatMetadataCreatedAt(metadata))}</code>");
+        sb.AppendLine($"سرویس <code>{Html(result.ServiceName)}</code>");
+        sb.AppendLine($"تعداد درخواست <code>{result.RequestedCount}</code>");
+        sb.AppendLine($"تعداد موفق <code>{result.SuccessfulCount}</code>");
+        sb.AppendLine($"{(string.Equals(metadata?.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase) ? "حد مصرف منصفانه هر اکانت" : "حجم هر اکانت")} <code>{Html(XuiV3PurchaseService.FormatTrafficSize(result.TrafficBytes, result.TrafficGb))}</code>");
+        sb.AppendLine($"مدت <code>{Html(result.DurationDays <= 0 ? "نامحدود" : result.DurationDays + " روز")}</code>");
 
         if (!string.IsNullOrWhiteSpace(metadata?.UserComment))
-            sb.AppendLine($"کامنت کاربر `{ShortenForLog(metadata.UserComment, 120)}`");
+            sb.AppendLine($"کامنت کاربر <code>{Html(ShortenForLog(metadata.UserComment, 120))}</code>");
 
         if (result.CreatedAccounts.Count > 0)
         {
             sb.AppendLine("اکانت‌های ساخته‌شده:");
             foreach (var account in result.CreatedAccounts)
-                sb.AppendLine($"`{account.Email}`");
+                sb.AppendLine($"<code>{Html(account.Email)}</code>");
         }
 
         if (result.Failures.Count > 0)
         {
             sb.AppendLine("خطاها:");
             foreach (var failure in result.Failures)
-                sb.AppendLine($"ردیف `{failure.Index}` - `{ShortenForLog(XuiV3UserSafeError.ForAccountCreation(failure.Message), 120)}`");
+                sb.AppendLine($"ردیف <code>{failure.Index}</code> - <code>{Html(ShortenForLog(XuiV3UserSafeError.ForAccountCreation(failure.Message), 120))}</code>");
         }
 
         return sb.ToString();

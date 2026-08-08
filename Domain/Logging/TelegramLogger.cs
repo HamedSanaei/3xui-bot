@@ -14,7 +14,14 @@ using Adminbot.Domain;
 
 namespace Adminbot.Domain.Logging
 {
-
+    /// <summary>
+    /// Routes Microsoft.Extensions.Logging events to the central Telegram logger channel with explicit plain-text,
+    /// HTML audit, and payment/backup delivery modes.
+    /// </summary>
+    /// <remarks>
+    /// The default owned bot performs channel delivery so tenant and secondary owned bots need no direct access to the
+    /// private logger channel. Every delivery is best-effort and must never fail the originating bot operation.
+    /// </remarks>
     public class TelegramLogger : ILogger
     {
         /// <summary>
@@ -69,6 +76,22 @@ namespace Adminbot.Domain.Logging
 
         public bool IsEnabled(LogLevel logLevel) => (_filter == null || _filter(_categoryName, logLevel));
 
+        /// <summary>
+        /// Formats one Microsoft logger event and dispatches it through the event-specific Telegram delivery path.
+        /// </summary>
+        /// <typeparam name="TState">Structured logger state type supplied by Microsoft.Extensions.Logging.</typeparam>
+        /// <param name="logLevel">Severity evaluated against the configured category filter before delivery.</param>
+        /// <param name="eventId">
+        /// Event identity selecting payment HTML with backups, operational HTML without backups, or ordinary plain text.
+        /// </param>
+        /// <param name="state">Structured event state passed to <paramref name="formatter"/>; it may be null.</param>
+        /// <param name="exception">Optional exception used by channel-noise suppression and the formatter.</param>
+        /// <param name="formatter">Required formatter that produces the final channel message from state and exception.</param>
+        /// <remarks>
+        /// Event 1000/Payment uses the financial HTML and database-backup path. Event 1001/TelegramHtml uses HTML
+        /// without backup side effects. All other events stay plain text so arbitrary application logs cannot be
+        /// interpreted as Telegram markup. Dispatch is fire-and-forget and failures are contained by the send helpers.
+        /// </remarks>
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
         {
             if (!IsEnabled(logLevel))
@@ -87,6 +110,10 @@ namespace Adminbot.Domain.Logging
             if (eventId.Id == 1000 && eventId.Name == "Payment")
             {
                 _ = Task.Run(() => LogPayment(message));
+            }
+            else if (eventId.Id == 1001 && eventId.Name == "TelegramHtml")
+            {
+                _ = Task.Run(() => SendHtmlMessageToChannelAsync(message));
             }
             else
             {
@@ -301,6 +328,32 @@ namespace Adminbot.Domain.Logging
             {
                 Console.WriteLine($"Exception caught in logger: {ex.Message}");
                 // You might want to log to a local file here as a fallback
+            }
+        }
+
+        /// <summary>
+        /// Sends one pre-encoded non-financial audit to the central logger channel using Telegram HTML entities.
+        /// </summary>
+        /// <param name="message">
+        /// Bounded HTML-safe audit text produced by a trusted builder. Dynamic values must already be HTML-encoded.
+        /// </param>
+        /// <returns>A task that completes after Telegram accepts the message or the best-effort failure is contained.</returns>
+        /// <remarks>
+        /// This path deliberately does not start database backups. Plain application logs remain on
+        /// <see cref="SendMessageToChannelAsync"/> so arbitrary angle brackets are never interpreted as markup.
+        /// </remarks>
+        private async Task SendHtmlMessageToChannelAsync(string message)
+        {
+            try
+            {
+                await CurrentBotClient.SendTextMessageAsync(
+                    CurrentLoggerChannelId,
+                    message ?? string.Empty,
+                    parseMode: Telegram.Bot.Types.Enums.ParseMode.Html);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Exception caught in HTML logger: {ex.Message}");
             }
         }
 

@@ -60,7 +60,7 @@
       "description": "سرویس اینترنت عادی با چند اینباند",
       "kind": "metered",
       "isEnabled": true,
-      "inboundIds": [188,189,190,193
+      "inboundIds": [188,195,190,193
       ],
       "multiInbound": true,
       "inboundProfileKeys": [
@@ -70,8 +70,8 @@
         "tunnel"
       ],
       "pricePerGb": {
-        "user": 9000,
-        "colleague": 5000
+        "user": 5000,
+        "colleague": 3500
       },
       "minimumTrafficGb": 10,
       "trafficOptionsGb": [
@@ -113,7 +113,7 @@
       "kind": "unlimited",
       "isEnabled": true,
       "inboundIds": [
-       188,189,190,193
+       188,195,190,193
       ],
       "multiInbound": true,
       "inboundProfileKeys": [
@@ -131,7 +131,7 @@
           "maxUsers": 2,
           "price": {
             "user": 319000,
-            "colleague": 319000
+            "colleague": 255000
           },
           "isEnabled": true
         },
@@ -143,7 +143,7 @@
           "maxUsers": 2,
           "price": {
             "user": 549000,
-            "colleague": 549000
+            "colleague": 439000
           },
           "isEnabled": true
         },
@@ -155,7 +155,7 @@
           "maxUsers": 2,
           "price": {
             "user": 739000,
-            "colleague": 739000
+            "colleague": 591000
           },
           "isEnabled": true
         },
@@ -167,7 +167,7 @@
           "maxUsers": 2,
           "price": {
             "user": 1490000,
-            "colleague": 1490000
+            "colleague": 1103000
           },
           "isEnabled": true
         }
