@@ -199,6 +199,12 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   purchase/renewal; the separate fixed-price `kind=unlimited` plans do not use these metered fields. The resolver also
   returns the authoritative metered component breakdown, and owned-bot final purchase/renewal previews must format
   that stored breakdown rather than recalculate rates or subtotals in the Telegram presentation layer.
+- The normal metered service may enable `customDurationDays` with an inclusive `minimumDays`/`maximumDays` range capped
+  at 365. Typed Latin, Persian, or Arabic-Indic whole numbers are persisted in callbacks, `users.db`, and tenant orders
+  as canonical `days-N` keys. Missing policy means disabled. Custom days are independent of preset `isEnabled` flags,
+  but are revalidated against the live policy before owned/tenant confirmation, payment activation, and fulfillment;
+  `days-` is reserved and cannot prefix configured duration keys. Tenant purchase/renewal summaries show the effective
+  storefront traffic/day calculation without exposing colleague base rates. This behavior needs no database migration.
 - XUI v3 request timeout is controlled by `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`; slow panels can otherwise time out during `/panel/api/clients/add`.
 - XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
 - XUI v3 account creation treats generated email as the idempotency key. If `addClient` or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.

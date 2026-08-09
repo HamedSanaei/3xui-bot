@@ -7,7 +7,16 @@ using Telegram.Bot.Types.ReplyMarkups;
 
 public class XuiV3PurchaseService
 {
+    /// <summary>Maximum custom duration that configuration and customer input may request, in whole days.</summary>
+    public const int MaxCustomDurationDays = 365;
+
     public const int MaxBulkAccountCount = 10;
+
+    /// <summary>Stable catalog key of the only metered service that may accept typed custom durations.</summary>
+    private const string NormalServiceKey = "normal";
+
+    /// <summary>Reserved prefix used by canonical custom-duration callback and persisted-state keys.</summary>
+    private const string CustomDurationKeyPrefix = "days-";
 
     private readonly IConfiguration _configuration;
     private readonly AppConfig _appConfig;
@@ -32,7 +41,7 @@ public class XuiV3PurchaseService
     /// </remarks>
     /// <exception cref="FileNotFoundException">Thrown when the configured catalog file does not exist.</exception>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when a metered daily price, lifetime multiplier, or duration-day value is invalid.
+    /// Thrown when a metered daily price, lifetime multiplier, duration-day value, or custom-duration policy is invalid.
     /// </exception>
     /// <example>
     /// <code>
@@ -74,7 +83,8 @@ public class XuiV3PurchaseService
     /// </summary>
     /// <param name="selection">
     /// The selected service and either a metered traffic/duration pair or an unlimited plan key.
-    /// Metered traffic is expressed in GB and is validated against the service's configured minimum.
+    /// Metered traffic is expressed in GB and is validated against the service's configured minimum. Duration keys may
+    /// reference an enabled preset or a canonical custom-day value such as <c>days-3</c>.
     /// </param>
     /// <param name="isColleague">
     /// Whether colleague base pricing should be used. Tenant storefronts pass <c>false</c> for public sale
@@ -87,8 +97,9 @@ public class XuiV3PurchaseService
     /// </returns>
     /// <remarks>
     /// This method is the shared financial policy gate for owned bots and tenant bots. Metered finite durations add
-    /// role-specific daily cost to traffic cost; zero-day durations multiply only the traffic cost. Disabled durations,
-    /// stale callbacks, and typed values are rejected before wallet, tenant-order, ledger, or XUI side effects.
+    /// role-specific daily cost to traffic cost; zero-day durations multiply only the traffic cost. Custom-day keys are
+    /// revalidated against the current normal-service policy. Disabled presets, stale callbacks, and invalid typed
+    /// values are rejected before wallet, tenant-order, ledger, or XUI side effects.
     /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="selection"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
@@ -150,10 +161,7 @@ public class XuiV3PurchaseService
         if (selection.TrafficGb.Value < minimumTrafficGb)
             throw new InvalidOperationException($"Minimum traffic for service '{service.Key}' is {minimumTrafficGb} GB.");
 
-        var duration = GetEnabledDurationOptions(service).FirstOrDefault(d =>
-            string.Equals(d.Key, selection.DurationKey, StringComparison.OrdinalIgnoreCase));
-
-        if (duration == null)
+        if (!TryResolveDurationKey(service, selection.DurationKey, out var duration))
             throw new InvalidOperationException($"Duration '{selection.DurationKey}' is not configured or is disabled for service '{service.Key}'.");
 
         var priceBreakdown = CalculateMeteredPriceBreakdown(
@@ -286,6 +294,203 @@ public class XuiV3PurchaseService
         return service?.DurationOptions?
             .Where(duration => duration?.IsEnabled == true)
             .ToList() ?? new List<XuiV3DurationOption>();
+    }
+
+    /// <summary>
+    /// Determines whether the current service policy allows customers to type a custom finite duration.
+    /// </summary>
+    /// <param name="service">
+    /// Service definition loaded from the validated global catalog. Null, national, unlimited, and disabled policies
+    /// return <c>false</c>.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> only for the metered <c>normal</c> service when <c>customDurationDays.isEnabled</c> is enabled.
+    /// </returns>
+    /// <remarks>
+    /// Catalog loading validates the configured range separately. This helper only answers whether customer-facing
+    /// prompts and parsers should expose the capability; it has no financial or persistence side effects.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// if (XuiV3PurchaseService.SupportsCustomDurationDays(service))
+    ///     prompt = XuiV3PurchaseService.BuildDurationSelectionText(service, prompt);
+    /// </code>
+    /// </example>
+    public static bool SupportsCustomDurationDays(XuiV3ServiceDefinition service)
+    {
+        return service != null &&
+               string.Equals(service.Kind, XuiV3ServiceKinds.Metered, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(service.Key, NormalServiceKey, StringComparison.OrdinalIgnoreCase) &&
+               service.CustomDurationDays?.IsEnabled == true;
+    }
+
+    /// <summary>
+    /// Resolves a configured duration key or canonical <c>days-N</c> key against the current service policy.
+    /// </summary>
+    /// <param name="service">Enabled metered service loaded from the current global catalog.</param>
+    /// <param name="durationKey">
+    /// Configured duration key such as <c>m1</c>, or canonical custom key such as <c>days-3</c>. Null and empty values
+    /// are invalid.
+    /// </param>
+    /// <param name="duration">
+    /// The enabled configured duration or a detached custom duration when resolution succeeds; otherwise <c>null</c>.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the key is currently allowed for the service; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Configured keys honor their own <c>isEnabled</c> value. Custom keys are independent of preset availability and
+    /// are accepted only when their day count remains inside the current custom-duration range. This method has no
+    /// wallet, database, Telegram, tenant-order, ledger, or XUI side effects.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var valid = XuiV3PurchaseService.TryResolveDurationKey(service, "days-3", out var duration);
+    /// </code>
+    /// </example>
+    public static bool TryResolveDurationKey(
+        XuiV3ServiceDefinition service,
+        string durationKey,
+        out XuiV3DurationOption duration)
+    {
+        duration = null;
+        if (service == null || string.IsNullOrWhiteSpace(durationKey))
+            return false;
+
+        var normalizedKey = durationKey.Trim();
+        duration = GetEnabledDurationOptions(service).FirstOrDefault(option =>
+            string.Equals(option.Key, normalizedKey, StringComparison.OrdinalIgnoreCase));
+        if (duration != null)
+            return true;
+
+        if (!TryParseCanonicalCustomDurationKey(normalizedKey, out var customDays) ||
+            !SupportsCustomDurationDays(service))
+        {
+            return false;
+        }
+
+        var policy = service.CustomDurationDays;
+        if (customDays < policy.MinimumDays || customDays > policy.MaximumDays)
+            return false;
+
+        duration = new XuiV3DurationOption
+        {
+            Key = BuildCustomDurationKey(customDays),
+            DisplayName = $"{customDays} روز (دلخواه)",
+            Days = customDays,
+            IsEnabled = true
+        };
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves a Telegram duration reply as either an enabled preset or a custom whole-day number.
+    /// </summary>
+    /// <param name="service">Enabled metered service that owns the duration selection step.</param>
+    /// <param name="text">
+    /// Raw Telegram text. Preset keys, labels, bracketed keys, and digit-only Latin, Persian, or Arabic-Indic custom
+    /// day values are accepted. Negative, decimal, unit-suffixed, and free-form values are rejected.
+    /// </param>
+    /// <param name="duration">
+    /// The resolved configured or detached custom duration when valid; otherwise <c>null</c>.
+    /// </param>
+    /// <returns><c>true</c> when the input represents a currently allowed duration; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// A digit-only reply is always interpreted as an independent custom selection, even when the same day count has
+    /// a disabled preset. Final purchase resolution repeats the policy check before any financial side effect.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var valid = XuiV3PurchaseService.TryResolveDurationInput(service, "۳", out var duration);
+    /// // duration.Key == "days-3" and duration.Days == 3
+    /// </code>
+    /// </example>
+    public static bool TryResolveDurationInput(
+        XuiV3ServiceDefinition service,
+        string text,
+        out XuiV3DurationOption duration)
+    {
+        duration = null;
+        var trimmed = text?.Trim();
+        if (service == null || string.IsNullOrWhiteSpace(trimmed))
+            return false;
+
+        var normalizedDigits = NormalizeUnicodeDigits(trimmed);
+        if (normalizedDigits.All(character => character is >= '0' and <= '9') &&
+            int.TryParse(
+                normalizedDigits,
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var customDays))
+        {
+            return TryResolveDurationKey(service, BuildCustomDurationKey(customDays), out duration);
+        }
+
+        var bracketStart = trimmed.LastIndexOf('[');
+        var bracketEnd = trimmed.LastIndexOf(']');
+        if (bracketStart >= 0 && bracketEnd > bracketStart + 1)
+        {
+            var bracketedKey = trimmed.Substring(bracketStart + 1, bracketEnd - bracketStart - 1).Trim();
+            if (TryResolveDurationKey(service, bracketedKey, out duration))
+                return true;
+        }
+
+        if (TryResolveDurationKey(service, trimmed, out duration))
+            return true;
+
+        duration = GetEnabledDurationOptions(service).FirstOrDefault(option =>
+            string.Equals(option.DisplayName, trimmed, StringComparison.OrdinalIgnoreCase));
+        return duration != null;
+    }
+
+    /// <summary>
+    /// Appends custom-day instructions and the configured range to a duration-selection Telegram prompt.
+    /// </summary>
+    /// <param name="service">Current service whose validated custom-duration policy controls the guidance.</param>
+    /// <param name="heading">Existing Persian prompt or validation message shown before the guidance.</param>
+    /// <returns>
+    /// The original heading when custom input is disabled; otherwise plain Persian text that explains digit-only input,
+    /// includes the example “number 3 means 3 days,” and shows the current inclusive range.
+    /// </returns>
+    /// <remarks>The returned text contains no Telegram markup and is safe in plain-text or HTML messages.</remarks>
+    /// <example>
+    /// <code>
+    /// var text = XuiV3PurchaseService.BuildDurationSelectionText(service, "مدت را انتخاب کنید:");
+    /// </code>
+    /// </example>
+    public static string BuildDurationSelectionText(XuiV3ServiceDefinition service, string heading)
+    {
+        var prompt = heading?.TrimEnd() ?? string.Empty;
+        if (!SupportsCustomDurationDays(service))
+            return prompt;
+
+        var policy = service.CustomDurationDays;
+        return prompt +
+               "\n\nیا تعداد روز دلخواه را فقط به‌صورت عدد بفرستید." +
+               "\nمثلاً عدد 3 یعنی 3 روز." +
+               $"\nبازه مجاز: {policy.MinimumDays} تا {policy.MaximumDays} روز.";
+    }
+
+    /// <summary>
+    /// Formats a persisted duration key for user-visible order details without exposing an internal custom key.
+    /// </summary>
+    /// <param name="durationKey">Configured duration key or canonical custom key stored in state or an order.</param>
+    /// <returns>
+    /// A Persian custom-day label such as <c>3 روز (دلخواه)</c> for <c>days-3</c>; otherwise the original key. Null and
+    /// empty input returns an empty string.
+    /// </returns>
+    /// <remarks>This helper only formats persisted data and does not validate current purchase eligibility.</remarks>
+    /// <example>
+    /// <code>
+    /// var label = XuiV3PurchaseService.FormatDurationSelectionKey("days-3");
+    /// </code>
+    /// </example>
+    public static string FormatDurationSelectionKey(string durationKey)
+    {
+        if (TryParseCanonicalCustomDurationKey(durationKey, out var days))
+            return $"{days} روز (دلخواه)";
+
+        return durationKey ?? string.Empty;
     }
 
     /// <summary>
@@ -1179,6 +1384,91 @@ public class XuiV3PurchaseService
     }
 
     /// <summary>
+    /// Builds the canonical persisted key for one validated custom duration.
+    /// </summary>
+    /// <param name="days">Requested duration in whole days. Callers validate the configured range separately.</param>
+    /// <returns>A culture-invariant key in the form <c>days-N</c>.</returns>
+    /// <remarks>The key contains no colon and is safe inside existing owned and tenant callback payloads.</remarks>
+    private static string BuildCustomDurationKey(int days)
+    {
+        return CustomDurationKeyPrefix + days.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Parses a canonical custom-duration key without consulting the current service policy.
+    /// </summary>
+    /// <param name="durationKey">Persisted or callback key expected in the exact <c>days-N</c> format.</param>
+    /// <param name="days">Parsed whole-day value when successful; otherwise zero.</param>
+    /// <returns>
+    /// <c>true</c> only for canonical values from one through <see cref="MaxCustomDurationDays" />; otherwise
+    /// <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Policy enablement and service-specific minimum/maximum checks remain the responsibility of
+    /// <see cref="TryResolveDurationKey" />.
+    /// </remarks>
+    private static bool TryParseCanonicalCustomDurationKey(string durationKey, out int days)
+    {
+        days = 0;
+        var key = durationKey?.Trim();
+        if (string.IsNullOrWhiteSpace(key) ||
+            !key.StartsWith(CustomDurationKeyPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var dayText = key.Substring(CustomDurationKeyPrefix.Length);
+        if (!int.TryParse(
+                dayText,
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out days) ||
+            days < 1 ||
+            days > MaxCustomDurationDays)
+        {
+            days = 0;
+            return false;
+        }
+
+        if (!string.Equals(key, BuildCustomDurationKey(days), StringComparison.OrdinalIgnoreCase))
+        {
+            days = 0;
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Converts Latin, Persian, and Arabic-Indic decimal digits to ASCII while preserving every non-digit character.
+    /// </summary>
+    /// <param name="value">Raw Telegram text. Null and empty values return an empty string.</param>
+    /// <returns>A same-shape string whose whole decimal digits use <c>0</c> through <c>9</c>.</returns>
+    /// <remarks>
+    /// Preserving signs, decimal separators, units, and letters lets the strict caller reject them instead of silently
+    /// extracting a different positive number.
+    /// </remarks>
+    private static string NormalizeUnicodeDigits(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return string.Empty;
+
+        var builder = new System.Text.StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            var normalizedCharacter = character switch
+            {
+                >= '\u06F0' and <= '\u06F9' => (char)('0' + character - '\u06F0'),
+                >= '\u0660' and <= '\u0669' => (char)('0' + character - '\u0660'),
+                _ => character
+            };
+            builder.Append(normalizedCharacter);
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>
     /// Validates metered duration-pricing fields before any catalog consumer can display or charge them.
     /// </summary>
     /// <param name="catalog">
@@ -1190,14 +1480,31 @@ public class XuiV3PurchaseService
     /// This method has no persistence or external-service side effects.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when a metered daily role price is negative, a lifetime multiplier is not positive and finite, or a
-    /// configured duration has negative days.
+    /// Thrown when a metered daily role price is negative, a lifetime multiplier is not positive and finite, a
+    /// configured duration is invalid, or a custom-duration policy violates service or range constraints.
     /// </exception>
     private static void ValidateMeteredPricingConfiguration(XuiV3ServicePlanCatalog catalog)
     {
         foreach (var service in catalog?.Services ?? new List<XuiV3ServiceDefinition>())
         {
-            if (service == null || service.IsUnlimited)
+            if (service == null)
+                continue;
+
+            var customDuration = service.CustomDurationDays ?? new XuiV3CustomDurationDaysOptions();
+            if (customDuration.MinimumDays < 1)
+                throw new InvalidOperationException($"Service '{service.Key}' custom duration minimum must be at least one day.");
+            if (customDuration.MaximumDays < customDuration.MinimumDays)
+                throw new InvalidOperationException($"Service '{service.Key}' custom duration maximum cannot be less than its minimum.");
+            if (customDuration.MaximumDays > MaxCustomDurationDays)
+                throw new InvalidOperationException($"Service '{service.Key}' custom duration maximum cannot exceed {MaxCustomDurationDays} days.");
+            if (customDuration.IsEnabled &&
+                (!string.Equals(service.Kind, XuiV3ServiceKinds.Metered, StringComparison.OrdinalIgnoreCase) ||
+                 !string.Equals(service.Key, NormalServiceKey, StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new InvalidOperationException("Custom duration input can be enabled only for the metered 'normal' service.");
+            }
+
+            if (service.IsUnlimited)
                 continue;
 
             if ((service.PricePerDay?.User ?? 0L) < 0 || (service.PricePerDay?.Colleague ?? 0L) < 0)
@@ -1211,6 +1518,8 @@ public class XuiV3PurchaseService
                     throw new InvalidOperationException($"Service '{service.Key}' contains an empty duration entry.");
                 if (duration.Days < 0)
                     throw new InvalidOperationException($"Duration '{duration.Key}' in service '{service.Key}' cannot have negative days.");
+                if (duration.Key?.StartsWith(CustomDurationKeyPrefix, StringComparison.OrdinalIgnoreCase) == true)
+                    throw new InvalidOperationException($"Duration key '{duration.Key}' in service '{service.Key}' uses the reserved '{CustomDurationKeyPrefix}' prefix.");
             }
         }
     }
@@ -1334,6 +1643,23 @@ public static class XuiV3PurchaseCallbacks
         return $"{Prefix}:upl:{serviceKey}:{planKey}";
     }
 
+    /// <summary>
+    /// Builds the owned-bot confirmation callback for one purchase selection.
+    /// </summary>
+    /// <param name="selection">
+    /// Selected service and either an unlimited-plan key or metered traffic/duration. Metered duration may be a
+    /// configured key or a canonical custom key such as <c>days-3</c>.
+    /// </param>
+    /// <returns>Compact callback data that can be parsed by <see cref="TryParse" />.</returns>
+    /// <remarks>
+    /// The callback is only transport state. Confirmation handlers must call the central resolver again before wallet,
+    /// ledger, XUI, or website-wallet side effects because configuration can change after this callback is sent.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var callback = XuiV3PurchaseCallbacks.Confirm(selection);
+    /// </code>
+    /// </example>
     public static string Confirm(XuiV3PurchaseSelection selection)
     {
         if (!string.IsNullOrWhiteSpace(selection.UnlimitedPlanKey))
@@ -1345,7 +1671,9 @@ public static class XuiV3PurchaseCallbacks
     /// <summary>
     /// Builds callback data for confirming an XUI v3 purchase with the Gozargah website wallet.
     /// </summary>
-    /// <param name="selection">Selected service, traffic, duration, or unlimited plan.</param>
+    /// <param name="selection">
+    /// Selected service, traffic, enabled preset or <c>days-N</c> duration, or unlimited plan.
+    /// </param>
     /// <returns>
     /// Callback data that carries the same purchase selection as <see cref="Confirm"/> while marking the
     /// payment source as the Gozargah website wallet.
@@ -1492,6 +1820,8 @@ public static class XuiV3PurchaseCallbacks
     /// <remarks>
     /// Link-change confirmation/status actions expose only a random users.db operation key. They never carry panel
     /// URLs, UUIDs, credentials, or a newly generated identity and therefore cannot independently replay a mutation.
+    /// Purchase callbacks may carry a <c>days-N</c> duration key, but parsing does not establish eligibility; callers
+    /// must resolve it against the current custom-duration configuration before any financial or XUI operation.
     /// </remarks>
     public static bool TryParse(string callbackData, out XuiV3PurchaseCallback callback)
     {
@@ -1637,7 +1967,7 @@ public class XuiV3PurchaseCallback
     public int? TrafficGb { get; set; }
     /// <summary>Requested account count for multi-account purchases.</summary>
     public int? AccountCount { get; set; }
-    /// <summary>Configured duration option key.</summary>
+    /// <summary>Configured duration option key or canonical custom key such as <c>days-3</c>.</summary>
     public string DurationKey { get; set; }
     /// <summary>Configured unlimited-plan key.</summary>
     public string UnlimitedPlanKey { get; set; }

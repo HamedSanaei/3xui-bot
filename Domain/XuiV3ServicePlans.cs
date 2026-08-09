@@ -104,6 +104,14 @@ namespace Adminbot.Domain
         /// validated value to <see cref="decimal" />. A missing value defaults to <c>1</c> and preserves legacy prices.
         /// </remarks>
         public double LifetimePriceMultiplier { get; set; } = 1D;
+        /// <summary>
+        /// Gets or sets the policy that allows customers to type an exact finite duration in days.
+        /// </summary>
+        /// <remarks>
+        /// A missing JSON value keeps custom duration input disabled for backward compatibility. The shared purchase
+        /// resolver accepts this policy only for the metered <c>normal</c> service and revalidates it before charging.
+        /// </remarks>
+        public XuiV3CustomDurationDaysOptions CustomDurationDays { get; set; } = new XuiV3CustomDurationDaysOptions();
         public List<int> TrafficOptionsGb { get; set; } = new List<int>();
         /// <summary>
         /// Minimum traffic, in GB, that can be purchased or renewed for this metered service.
@@ -212,6 +220,29 @@ namespace Adminbot.Domain
         public bool IsEnabled { get; set; } = true;
     }
 
+    /// <summary>
+    /// Controls whether customers can type a finite duration instead of selecting a configured duration preset.
+    /// </summary>
+    /// <remarks>
+    /// This policy is global configuration for the <c>normal</c> metered service. It does not apply to national,
+    /// lifetime, fixed-price unlimited, or super-admin manual creation flows. Missing configuration defaults to
+    /// disabled so legacy catalogs retain their preset-only behavior.
+    /// </remarks>
+    public class XuiV3CustomDurationDaysOptions
+    {
+        /// <summary>Gets or sets whether typed custom-day selections are accepted for the owning service.</summary>
+        public bool IsEnabled { get; set; }
+
+        /// <summary>Gets or sets the minimum accepted custom duration in whole days; the default is one day.</summary>
+        public int MinimumDays { get; set; } = 1;
+
+        /// <summary>
+        /// Gets or sets the maximum accepted custom duration in whole days; the default and absolute supported cap are
+        /// 365 days.
+        /// </summary>
+        public int MaximumDays { get; set; } = 365;
+    }
+
     public class XuiV3UnlimitedPlan
     {
         public string Key { get; set; }
@@ -223,10 +254,20 @@ namespace Adminbot.Domain
         public bool IsEnabled { get; set; } = true;
     }
 
+    /// <summary>
+    /// Carries a raw XUI v3 purchase or renewal choice between Telegram, durable bot state, and payment callbacks.
+    /// </summary>
+    /// <remarks>
+    /// Metered duration keys are either configured catalog keys such as <c>m1</c> or canonical custom-day keys such as
+    /// <c>days-3</c>. Callers must pass the selection through the central resolver before any financial or XUI effect.
+    /// </remarks>
     public class XuiV3PurchaseSelection
     {
         public string ServiceKey { get; set; }
         public int? TrafficGb { get; set; }
+        /// <summary>
+        /// Gets or sets the configured duration key or the canonical <c>days-N</c> key for a typed custom duration.
+        /// </summary>
         public string DurationKey { get; set; }
         public string UnlimitedPlanKey { get; set; }
         public int AccountCount { get; set; } = 1;

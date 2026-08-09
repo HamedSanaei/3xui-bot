@@ -2242,7 +2242,10 @@ public class TenantBotService
             $"وضعیت تحویل: <code>{Html(order.IsFulfilled ? "تحویل شده" : "تحویل نشده")}</code>\n\n" +
             $"سرویس: <code>{Html(order.ServiceKey)}</code>\n" +
             $"حجم: <code>{Html(order.TrafficGb?.ToString(CultureInfo.InvariantCulture) ?? "-")} GB</code>\n" +
-            $"مدت/پلن: <code>{Html(order.DurationKey ?? order.UnlimitedPlanKey ?? "-")}</code>\n" +
+            $"مدت/پلن: <code>{Html(
+                !string.IsNullOrWhiteSpace(order.DurationKey)
+                    ? XuiV3PurchaseService.FormatDurationSelectionKey(order.DurationKey)
+                    : order.UnlimitedPlanKey ?? "-")}</code>\n" +
             $"اکانت هدف/ساخته‌شده: <code>{Html(order.TargetAccountEmail ?? order.CreatedAccountEmail ?? "-")}</code>\n" +
             $"ساب‌لینک: <code>{Html(order.CreatedSubLink ?? "-")}</code>\n\n" +
             $"مبلغ فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
@@ -2996,22 +2999,26 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Handles typed metered traffic while a tenant customer is in the purchase traffic-selection step.
+    /// Handles typed metered traffic and custom duration days in a tenant customer's purchase flow.
     /// </summary>
     /// <param name="botClient">Tenant bot client that received the customer's typed traffic value.</param>
-    /// <param name="message">Incoming customer text message, expected to contain a GB amount such as <c>12</c> or <c>12 GB</c>.</param>
+    /// <param name="message">
+    /// Incoming customer text message containing either a GB amount in the traffic step or a digit-only custom day
+    /// count in the duration step.
+    /// </param>
     /// <param name="tenant">Tenant storefront whose prices will be used after a valid traffic amount is selected.</param>
     /// <param name="user">
     /// Bot-scoped customer state. The state belongs to the active tenant bot and carries the selected metered service key.
     /// </param>
     /// <param name="cancellationToken">Cancellation token for users.db state updates and Telegram replies.</param>
     /// <returns>
-    /// <c>true</c> when the message belonged to the tenant purchase traffic state and was handled; otherwise <c>false</c>.
+    /// <c>true</c> when the message belonged to tenant purchase traffic or duration state and was handled; otherwise
+    /// <c>false</c>.
     /// </returns>
     /// <remarks>
-    /// Tenant purchase originally accepted only inline traffic buttons. This method adds typed custom traffic while
-    /// preserving the existing callback path. It validates the typed amount against the same plan-file
-    /// <c>minimumTrafficGb</c> rule used by owned bots before showing duration choices.
+    /// Tenant purchase preserves its inline preset callbacks while accepting typed traffic and <c>days-N</c> duration
+    /// selections. Both values are validated by the same global policy used by owned bots before an order, gateway
+    /// invoice, tenant balance movement, or XUI request can be created.
     /// </remarks>
     private async Task<bool> TRYHANDLETENANTPURCHASETEXTASYNC(
         ITelegramBotClient botClient,
@@ -3079,6 +3086,57 @@ public class TenantBotService
             return true;
         }
 
+        if (user.LastStep == TENANTPURCHASESTEPDURATION)
+        {
+            if (!int.TryParse(
+                    user.TotoalGB,
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out var trafficGb) ||
+                !XuiV3PurchaseService.MeetsMinimumTraffic(service, trafficGb))
+            {
+                user.LastStep = TENANTPURCHASESTEPTRAFFIC;
+                user.SelectedPeriod = null;
+                await _userDbcontext.SaveUserStatus(user);
+                await botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    BuildTenantMinimumTrafficMessage(service),
+                    replyMarkup: BuildTenantTrafficInlineKeyboard(service),
+                    cancellationToken: cancellationToken);
+                return true;
+            }
+
+            if (!XuiV3PurchaseService.TryResolveDurationInput(service, text, out var duration))
+            {
+                await SHOWDURATIONOPTIONSASYNC(
+                    botClient,
+                    message.Chat.Id,
+                    null,
+                    tenant,
+                    service.Key,
+                    trafficGb,
+                    cancellationToken,
+                    "مدت معتبر نیست. یکی از گزینه‌های فعال را انتخاب کنید.");
+                return true;
+            }
+
+            var selection = new XuiV3PurchaseSelection
+            {
+                ServiceKey = service.Key,
+                TrafficGb = trafficGb,
+                DurationKey = duration.Key
+            };
+            await _userDbcontext.ClearUserStatus(user);
+            await SHOWCUSTOMERCONFIRMASYNC(
+                botClient,
+                message.Chat.Id,
+                null,
+                tenant,
+                selection,
+                cancellationToken);
+            return true;
+        }
+
         await botClient.SendTextMessageAsync(
             message.Chat.Id,
             "برای ادامه، مدت سرویس را از دکمه‌های پیام قبلی انتخاب کنید یا انصراف دهید.",
@@ -3138,7 +3196,9 @@ public class TenantBotService
     /// <remarks>
     /// Tenant renewals intentionally do not call the owned-bot renewal completion path because that path debits
     /// the customer's wallet. This flow only collects the same plan choices, calculates the same tenant sale
-    /// price used by purchases, and creates a tenant order that is fulfilled after payment settlement.
+    /// price used by purchases, and creates a tenant order that is fulfilled after payment settlement. For the normal
+    /// metered service, digit-only Latin, Persian, and Arabic-Indic duration input is persisted as <c>days-N</c> and
+    /// revalidated before order creation and again before fulfillment.
     /// </remarks>
     private async Task<bool> TRYHANDLETENANTRENEWASYNC(
         ITelegramBotClient botClient,
@@ -3186,8 +3246,10 @@ public class TenantBotService
     /// <param name="mainReplyMarkup">Tenant reply keyboard used after completion.</param>
     /// <param name="cancellationToken">Cancellation token for async operations.</param>
     /// <remarks>
-    /// The method stores only temporary selection state in users.db. The actual renewal is not applied until
-    /// a tenant payment order is settled, which keeps duplicate callbacks idempotent.
+    /// The method stores only temporary selection state in users.db. Preset duration keys honor their current enabled
+    /// flag, while a numeric custom duration is independent of presets and must satisfy the current normal-service
+    /// custom range. The actual renewal is not applied until a tenant payment order is settled, which keeps duplicate
+    /// callbacks idempotent.
     /// </remarks>
     private async Task HANDLETENANTRENEWSTEPASYNC(
         ITelegramBotClient botClient,
@@ -3232,7 +3294,11 @@ public class TenantBotService
             user.LastStep = TENANTRENEWSTEPDURATION;
             user.TotoalGB = trafficGb.ToString(CultureInfo.InvariantCulture);
             await _userDbcontext.SaveUserStatus(user);
-            await botClient.SendTextMessageAsync(message.Chat.Id, "مدت تمدید را انتخاب کنید:", replyMarkup: BuildTenantRenewDurationKeyboard(service), cancellationToken: cancellationToken);
+            await botClient.SendTextMessageAsync(
+                message.Chat.Id,
+                XuiV3PurchaseService.BuildDurationSelectionText(service, "مدت تمدید را انتخاب کنید:"),
+                replyMarkup: BuildTenantRenewDurationKeyboard(service),
+                cancellationToken: cancellationToken);
             return;
         }
 
@@ -3241,7 +3307,13 @@ public class TenantBotService
             var duration = FindTenantDurationOption(service, text);
             if (duration == null)
             {
-                await botClient.SendTextMessageAsync(message.Chat.Id, "مدت تمدید معتبر نیست. یکی از گزینه‌های زیر را انتخاب کنید.", replyMarkup: BuildTenantRenewDurationKeyboard(service), cancellationToken: cancellationToken);
+                await botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    XuiV3PurchaseService.BuildDurationSelectionText(
+                        service,
+                        "مدت تمدید معتبر نیست. یکی از گزینه‌های زیر را انتخاب کنید."),
+                    replyMarkup: BuildTenantRenewDurationKeyboard(service),
+                    cancellationToken: cancellationToken);
                 return;
             }
 
@@ -3275,6 +3347,22 @@ public class TenantBotService
             if (!IsConfirmText(text))
             {
                 await botClient.SendTextMessageAsync(message.Chat.Id, "برای ساخت فاکتور تمدید، گزینه تایید را بزنید یا انصراف دهید.", replyMarkup: BuildTenantRenewConfirmKeyboard(), cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (!service.IsUnlimited &&
+                !XuiV3PurchaseService.TryResolveDurationKey(service, user.SelectedPeriod, out _))
+            {
+                user.LastStep = TENANTRENEWSTEPDURATION;
+                user.SelectedPeriod = null;
+                await _userDbcontext.SaveUserStatus(user);
+                await botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    XuiV3PurchaseService.BuildDurationSelectionText(
+                        service,
+                        "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید."),
+                    replyMarkup: BuildTenantRenewDurationKeyboard(service),
+                    cancellationToken: cancellationToken);
                 return;
             }
 
@@ -3359,7 +3447,8 @@ public class TenantBotService
     /// <remarks>
     /// The preview is tenant-isolated and uses tenant sale pricing, but traffic and expiry arithmetic come from the
     /// shared renewal policy. Active unlimited accounts show direct quota addition; expired unlimited accounts show
-    /// replacement quota and a first-connection duration after reset.
+    /// replacement quota and a first-connection duration after reset. Metered renewals show the effective storefront
+    /// per-GB and per-day calculation without exposing the tenant owner's colleague base rates.
     /// </remarks>
     private async Task SendTenantRenewSummaryAsync(
         ITelegramBotClient botClient,
@@ -3372,6 +3461,7 @@ public class TenantBotService
         var selection = BuildTenantRenewSelectionFromState(user);
         var resolved = _purchaseService.ResolvePurchase(selection, false);
         var price = CalculateTenantPrice(tenant, selection);
+        var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
         var serverInfo = BuildConfiguredPanelServerInfo();
         var client = await FindTenantClientAsync(serverInfo, user.ConfigLink, cancellationToken);
         var renewal = client == null ? null : XuiV3RenewalPolicy.Calculate(client, resolved, "tenant-renew-summary", customer.TelegramUserId);
@@ -3392,6 +3482,7 @@ public class TenantBotService
             trafficLine +
             $"مدت افزوده: <code>{Html(resolved.DurationDays <= 0 ? "نامحدود" : resolved.DurationDays + " روز")}</code>\n" +
             (renewal == null ? string.Empty : $"مدت نهایی بعد از تمدید: <code>{Html(renewal.FinalDurationDays <= 0 ? "نامحدود" : renewal.FinalDurationDays + " روز")}</code>\n") +
+            (string.IsNullOrWhiteSpace(priceBreakdownText) ? string.Empty : $"\n{priceBreakdownText}\n") +
             $"مبلغ قابل پرداخت: <b>{Html(price.SalePriceToman.FormatCurrency())}</b>\n\n" +
             "بعد از تایید، روش پرداخت را انتخاب می‌کنید و پس از پرداخت موفق اکانت تمدید می‌شود.";
 
@@ -3450,7 +3541,10 @@ public class TenantBotService
     /// Builds the selected renewal plan from temporary bot state.
     /// </summary>
     /// <param name="user">Bot-scoped state row created by the tenant renewal flow.</param>
-    /// <returns>The selected XUI v3 purchase selection reused for renewal pricing.</returns>
+    /// <returns>
+    /// The selected XUI v3 purchase selection reused for renewal pricing. Metered duration is preserved as either an
+    /// enabled preset key or canonical <c>days-N</c> value for central revalidation.
+    /// </returns>
     private static XuiV3PurchaseSelection BuildTenantRenewSelectionFromState(User user)
     {
         return string.IsNullOrWhiteSpace(user.Type)
@@ -3651,21 +3745,22 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Finds a duration option from a tenant reply-keyboard label.
+    /// Finds an enabled preset or allowed custom-day duration from a tenant renewal reply.
     /// </summary>
     /// <param name="service">Service containing duration options.</param>
-    /// <param name="text">Customer text containing display name or key.</param>
-    /// <returns>The matched duration option, or <c>null</c> when invalid.</returns>
+    /// <param name="text">
+    /// Customer text containing a preset display name/key or a digit-only Latin, Persian, or Arabic-Indic day count.
+    /// </param>
+    /// <returns>The matched configured or detached custom duration, or <c>null</c> when invalid.</returns>
     /// <remarks>
-    /// Only enabled options are matched. This protects tenant renewal state from reply-keyboard messages that were
-    /// sent before a duration was disabled in the global catalog.
+    /// Preset keys honor <c>isEnabled</c>. Numeric custom input remains independent of preset availability and is
+    /// checked against the normal service's current custom-duration policy before tenant renewal state is persisted.
     /// </remarks>
     private static XuiV3DurationOption FindTenantDurationOption(XuiV3ServiceDefinition service, string text)
     {
-        return XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(x =>
-            string.Equals(text, x.Key, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(text, x.DisplayName, StringComparison.OrdinalIgnoreCase) ||
-            (text?.Contains($"[{x.Key}]", StringComparison.OrdinalIgnoreCase) == true));
+        return XuiV3PurchaseService.TryResolveDurationInput(service, text, out var duration)
+            ? duration
+            : null;
     }
 
     /// <summary>
@@ -3907,9 +4002,7 @@ public class TenantBotService
                     return;
                 }
 
-                var duration = XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(option =>
-                    string.Equals(option.Key, parts[3], StringComparison.OrdinalIgnoreCase));
-                if (duration == null)
+                if (!XuiV3PurchaseService.TryResolveDurationKey(service, parts[3], out _))
                 {
                     // Tenant callback messages can remain clickable after an operator disables a duration. Refresh
                     // the current choices before order creation so no tenant balance or gateway flow can be reached.
@@ -3955,6 +4048,16 @@ public class TenantBotService
                 return;
             }
 
+            if (!await EnsureTenantPurchaseSelectionIsCurrentAsync(
+                    botClient,
+                    CallbackQuery,
+                    tenant,
+                    selection,
+                    CancellationToken))
+            {
+                return;
+            }
+
             await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
             await CreateTenantOrderINVOICEASYNC(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             return;
@@ -3972,6 +4075,16 @@ public class TenantBotService
             if (selection == null)
             {
                 await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "سفارش نامعتبر است.", showAlert: true, cancellationToken: CancellationToken);
+                return;
+            }
+
+            if (!await EnsureTenantPurchaseSelectionIsCurrentAsync(
+                    botClient,
+                    CallbackQuery,
+                    tenant,
+                    selection,
+                    CancellationToken))
+            {
                 return;
             }
 
@@ -4318,13 +4431,26 @@ public class TenantBotService
     /// <param name="CancellationToken">
     /// Cancellation token for Telegram and state-validation operations.
     /// </param>
+    /// <param name="Heading">
+    /// Optional Persian heading shown above the duration instructions. Pass a validation message after rejected typed
+    /// input, or leave <c>null</c> to use the normal duration-selection heading.
+    /// </param>
     /// <remarks>
     /// This method is shared by callback traffic buttons and manually typed traffic in tenant bots. It rechecks the
-    /// minimum traffic and includes only currently enabled durations. Every button price comes from the shared
-    /// resolver plus current tenant markup, so stale data cannot bypass global pricing or availability. The method
-    /// sends or edits Telegram text but does not create an order or mutate a wallet.
+    /// minimum traffic and includes only currently enabled preset durations. When the normal service enables typed
+    /// custom durations, the prompt also publishes its inclusive day range and explicit numeric example. Every button
+    /// price comes from the shared resolver plus current tenant markup, so stale data cannot bypass global pricing or
+    /// availability. The method sends or edits Telegram text but does not create an order or mutate a wallet.
     /// </remarks>
-    private async Task SHOWDURATIONOPTIONSASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, string ServiceKey, int TrafficGb, CancellationToken CancellationToken)
+    private async Task SHOWDURATIONOPTIONSASYNC(
+        ITelegramBotClient botClient,
+        ChatId ChatId,
+        int? MessageId,
+        BotInstance tenant,
+        string ServiceKey,
+        int TrafficGb,
+        CancellationToken CancellationToken,
+        string Heading = null)
     {
         var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => x.Key == ServiceKey);
         if (service == null)
@@ -4357,19 +4483,132 @@ public class TenantBotService
             .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + $"svc:{ServiceKey}") })
             .ToArray();
 
-        await EDITORSENDASYNC(botClient, ChatId, MessageId, "مدت سرویس را انتخاب کنید:", new InlineKeyboardMarkup(rows), CancellationToken);
+        await EDITORSENDASYNC(
+            botClient,
+            ChatId,
+            MessageId,
+            XuiV3PurchaseService.BuildDurationSelectionText(
+                service,
+                Heading ?? "مدت سرویس را انتخاب کنید:"),
+            new InlineKeyboardMarkup(rows),
+            CancellationToken);
     }
 
     /// <summary>
-    /// SHOWS the tenant customer pre-invoice summary and payment confirmation button.
+    /// Revalidates a tenant purchase callback against the current global catalog before any payment action.
     /// </summary>
-    /// <param name="botClient">tenant Bot client.</param>
-    /// <param name="ChatId">customer chat Id.</param>
-    /// <param name="MessageId">optional Message Id to edit.</param>
-    /// <param name="tenant">current tenant Bot row.</param>
-    /// <param name="selection">selected xui purchase OPTION.</param>
-    /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <param name="botClient">Tenant storefront client used to refresh an invalid selection.</param>
+    /// <param name="callbackQuery">Customer callback containing the chat, message, and Telegram user identifiers.</param>
+    /// <param name="tenant">Tenant bot whose current markup participates in authoritative sale-price validation.</param>
+    /// <param name="selection">
+    /// Parsed purchase selection from callback data. Metered duration may be a preset key or canonical <c>days-N</c>.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for users.db and Telegram operations.</param>
+    /// <returns>
+    /// <c>true</c> when the selection and current tenant price resolve successfully; <c>false</c> when no order or
+    /// payment invoice may be created and the customer has been notified.
+    /// </returns>
     /// <remarks>
+    /// A custom-duration policy or preset can change while a Telegram pre-invoice remains visible. Invalid metered
+    /// selections are restored to the tenant-scoped duration step and current options are shown. Full price validation
+    /// is also repeated so malformed configuration cannot reach order, gateway, wallet, ledger, or XUI side effects.
+    /// </remarks>
+    private async Task<bool> EnsureTenantPurchaseSelectionIsCurrentAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        BotInstance tenant,
+        XuiV3PurchaseSelection selection,
+        CancellationToken cancellationToken)
+    {
+        var service = _purchaseService.GetEnabledServices().FirstOrDefault(candidate =>
+            string.Equals(candidate.Key, selection?.ServiceKey, StringComparison.OrdinalIgnoreCase));
+        if (service == null)
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "این سرویس دیگر فعال نیست. خرید را دوباره آغاز کنید.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return false;
+        }
+
+        if (!service.IsUnlimited &&
+            (!selection.TrafficGb.HasValue ||
+             !XuiV3PurchaseService.MeetsMinimumTraffic(service, selection.TrafficGb.Value) ||
+             !XuiV3PurchaseService.TryResolveDurationKey(service, selection.DurationKey, out _)))
+        {
+            if (selection.TrafficGb.HasValue && XuiV3PurchaseService.MeetsMinimumTraffic(service, selection.TrafficGb.Value))
+            {
+                await _userDbcontext.SaveUserStatus(new User
+                {
+                    Id = callbackQuery.From.Id,
+                    Flow = TENANTPURCHASEFLOW,
+                    LastStep = TENANTPURCHASESTEPDURATION,
+                    SelectedCountry = service.Key,
+                    TotoalGB = selection.TrafficGb.Value.ToString(CultureInfo.InvariantCulture),
+                    SelectedPeriod = null
+                });
+                await SHOWDURATIONOPTIONSASYNC(
+                    botClient,
+                    callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                    callbackQuery.Message?.MessageId,
+                    tenant,
+                    service.Key,
+                    selection.TrafficGb.Value,
+                    cancellationToken,
+                    "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید.");
+            }
+
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "مدت یا حجم این سفارش دیگر معتبر نیست.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return false;
+        }
+
+        try
+        {
+            _ = CalculateTenantPrice(tenant, selection);
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Tenant purchase callback was rejected by current pricing. tenantBotId={TenantBotId}, customerTelegramUserId={CustomerTelegramUserId}, serviceKey={ServiceKey}",
+                tenant.Id,
+                callbackQuery.From.Id,
+                selection.ServiceKey);
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "تعرفه این سفارش تغییر کرده است. خرید را دوباره آغاز کنید.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Shows the tenant customer pre-invoice with the selected duration, sale-price calculation, and payment choices.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the tenant storefront that owns this customer conversation.</param>
+    /// <param name="ChatId">Telegram chat id of the tenant customer receiving or updating the pre-invoice.</param>
+    /// <param name="MessageId">Optional Telegram message id to edit; <c>null</c> sends a new message.</param>
+    /// <param name="tenant">Tenant bot whose markup and enabled payment methods control the sale.</param>
+    /// <param name="selection">
+    /// Current global plan selection. A metered duration may be an enabled preset or canonical <c>days-N</c> custom key.
+    /// </param>
+    /// <param name="CancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <remarks>
+    /// The shared resolver revalidates service, traffic, and duration before the summary is built. Metered summaries
+    /// show traffic and daily components using customer-visible effective tenant rates; markup pricing never exposes
+    /// the owner's raw colleague cost. This method sends UI only and does not create an order, invoice, wallet movement,
+    /// ledger entry, or XUI account.
+    ///
     /// Every enabled online gateway is displayed as instant and includes its customer-facing fee percentage:
     /// NOWPayments 0%, Tetraminator 12%, UniquePay 12%, and HooshPay 15%. Callback data remains unchanged, so
     /// previously issued invoices and idempotent settlement behavior are unaffected by these display labels.
@@ -4378,12 +4617,14 @@ public class TenantBotService
     {
         var Price = CalculateTenantPrice(tenant, selection);
         var resolved = _purchaseService.ResolvePurchase(selection, false);
+        var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, Price.SalePriceToman);
         var Text = "📌 <b>پیش‌فاکتور خرید</b>\n\n" +
                    $"سرویس: <b>{Html(resolved.Service.DisplayName)}</b>\n" +
                    (resolved.IsUnlimited
                        ? $"حد مصرف منصفانه: <code>{resolved.TrafficGb} GB</code>\n"
                        : $"حجم: <code>{resolved.TrafficGb} GB</code>\n") +
                    $"مدت: <code>{(resolved.DurationDays <= 0 ? "نامحدود" : resolved.DurationDays + " روز")}</code>\n" +
+                   (string.IsNullOrWhiteSpace(priceBreakdownText) ? string.Empty : $"\n{priceBreakdownText}\n") +
                    $"مبلغ قابل پرداخت: <b>{Html(Price.SalePriceToman.FormatCurrency())}</b>\n\n" +
                    "پس از پرداخت موفق، اکانت به صورت خودکار ساخته و ارسال می‌شود.";
 
@@ -5481,27 +5722,71 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Loads a pending tenant renewal order and verifies that it belongs to the current tenant customer.
+    /// Loads a pending tenant renewal order and revalidates its plan and price before payment activation.
     /// </summary>
     /// <param name="orderDbId">Internal users.db order id from callback data.</param>
     /// <param name="tenant">Current tenant bot.</param>
     /// <param name="customer">Current tenant customer.</param>
     /// <param name="cancellationToken">Cancellation token for the database lookup.</param>
-    /// <returns>The pending renewal order, or <c>null</c> when not eligible for payment activation.</returns>
-    private Task<TenantBotOrder> GetPendingTenantRenewOrderAsync(
+    /// <returns>
+    /// The tracked pending renewal order when ownership, status, current plan eligibility, and current tenant sale price
+    /// all match; otherwise <c>null</c>. A null result must not be used to create a payment record or provider invoice.
+    /// </returns>
+    /// <remarks>
+    /// This guard prevents a stored <c>days-N</c> order from becoming payable after custom durations are disabled or
+    /// narrowed, and also rejects price/markup changes between summary and provider selection. It performs read-only
+    /// validation and does not mutate the order, wallet, ledger, payment provider, or XUI account.
+    /// </remarks>
+    private async Task<TenantBotOrder> GetPendingTenantRenewOrderAsync(
         int orderDbId,
         BotInstance tenant,
         CredUser customer,
         CancellationToken cancellationToken)
     {
-        return _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == orderDbId &&
                  x.TenantBotId == tenant.Id &&
                  x.CustomerTelegramUserId == customer.TelegramUserId &&
                  x.OrderKind == TenantBotOrderKinds.Renew &&
-                 !x.IsFulfilled &&
-                 (x.PaymentStatus == TenantBotOrderStatuses.Pending || x.PaymentStatus == TenantBotOrderStatuses.Failed),
+                  !x.IsFulfilled &&
+                  (x.PaymentStatus == TenantBotOrderStatuses.Pending || x.PaymentStatus == TenantBotOrderStatuses.Failed),
             cancellationToken);
+        if (order == null)
+            return null;
+
+        try
+        {
+            var selection = new XuiV3PurchaseSelection
+            {
+                ServiceKey = order.ServiceKey,
+                TrafficGb = order.TrafficGb,
+                DurationKey = order.DurationKey,
+                UnlimitedPlanKey = order.UnlimitedPlanKey,
+                AccountCount = order.AccountCount
+            };
+            var currentPrice = CalculateTenantPrice(tenant, selection);
+            if (currentPrice.SalePriceToman != order.SalePriceToman ||
+                currentPrice.BaseCostToman != order.BaseCostToman)
+            {
+                _logger.LogWarning(
+                    "Tenant renewal payment activation rejected after price change. orderId={OrderId}, storedSalePriceToman={StoredSalePriceToman}, currentSalePriceToman={CurrentSalePriceToman}",
+                    order.OrderId,
+                    order.SalePriceToman,
+                    currentPrice.SalePriceToman);
+                return null;
+            }
+
+            return order;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Tenant renewal payment activation rejected by current plan configuration. orderId={OrderId}, durationKey={DurationKey}",
+                order.OrderId,
+                order.DurationKey);
+            return null;
+        }
     }
 
     /// <summary>
@@ -8365,6 +8650,102 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Builds a customer-visible traffic and duration calculation for one tenant metered sale.
+    /// </summary>
+    /// <param name="tenant">
+    /// Tenant storefront whose non-negative markup percentage determines the customer-visible effective rates.
+    /// </param>
+    /// <param name="resolved">
+    /// Public-role selection resolved by the central purchase service. Unlimited selections and null values produce
+    /// an empty result.
+    /// </param>
+    /// <param name="salePriceToman">
+    /// Authoritative final tenant sale price in whole Iranian toman returned by <see cref="CalculateTenantPrice" />.
+    /// It must be non-negative and already include any tenant markup and final upward rounding.
+    /// </param>
+    /// <returns>
+    /// Plain Persian calculation text suitable for an HTML Telegram message, or an empty string for fixed-price
+    /// unlimited selections. The text exposes only public or effective sale rates, never the owner's colleague cost.
+    /// </returns>
+    /// <remarks>
+    /// Without markup, the shared public-price breakdown is reused verbatim. With markup, each visible rate is derived
+    /// from the colleague rate multiplied by <c>1 + markup / 100</c>, while the final line uses the authoritative tenant
+    /// sale total so component formatting cannot change an order amount. This method has no persistence, wallet,
+    /// gateway, ledger, Telegram-send, or XUI side effects.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var details = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
+    /// </code>
+    /// </example>
+    private static string BuildTenantMeteredPriceBreakdownText(
+        BotInstance tenant,
+        XuiV3ResolvedPurchase resolved,
+        long salePriceToman)
+    {
+        var breakdown = resolved?.MeteredPriceBreakdown;
+        if (breakdown == null)
+            return string.Empty;
+
+        var markup = Math.Max(0, tenant?.TenantPriceMarkupPercent ?? 0);
+        if (markup <= 0)
+            return XuiV3PurchaseService.BuildMeteredPriceBreakdownText(resolved);
+
+        var saleFactor = 1M + markup / 100M;
+        var effectivePricePerGb = resolved.Service.GetPricePerGb(isColleague: true) * saleFactor;
+        var trafficSubtotal = breakdown.TrafficGb * effectivePricePerGb;
+        var builder = new StringBuilder();
+        builder.AppendLine("جزئیات محاسبه قیمت:");
+        builder.AppendLine(
+            $"• حجم: {breakdown.TrafficGb} GB × نرخ هر گیگ {FormatTenantPriceAmount(effectivePricePerGb)} " +
+            $"= جمع حجم {FormatTenantPriceAmount(trafficSubtotal)}");
+
+        decimal rawTotal;
+        if (breakdown.IsLifetime)
+        {
+            rawTotal = trafficSubtotal * Convert.ToDecimal(breakdown.LifetimePriceMultiplier);
+            builder.AppendLine(
+                $"• زمان نامحدود: جمع حجم × ضریب {XuiV3PurchaseService.FormatLifetimeMultiplier(breakdown.LifetimePriceMultiplier)} " +
+                $"= {salePriceToman.FormatCurrency()}");
+        }
+        else
+        {
+            var effectivePricePerDay = resolved.Service.GetPricePerDay(isColleague: true) * saleFactor;
+            var durationSubtotal = breakdown.DurationDays * effectivePricePerDay;
+            rawTotal = trafficSubtotal + durationSubtotal;
+            builder.AppendLine(
+                $"• زمان: {breakdown.DurationDays} روز × نرخ هر روز {FormatTenantPriceAmount(effectivePricePerDay)} " +
+                $"= جمع زمان {FormatTenantPriceAmount(durationSubtotal)}");
+        }
+
+        var roundingText = rawTotal == salePriceToman ? string.Empty : " (گرد شده رو به بالا)";
+        builder.Append($"• جمع قیمت: {salePriceToman.FormatCurrency()}{roundingText}");
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Formats a potentially fractional tenant sale-rate component without silently rounding its arithmetic.
+    /// </summary>
+    /// <param name="amountToman">
+    /// Non-negative rate or subtotal in Iranian toman. Up to four fractional digits are retained for display.
+    /// </param>
+    /// <returns>A culture-invariant grouped amount followed by the Persian toman unit.</returns>
+    /// <remarks>
+    /// This formatter is presentation-only. Wallets and tenant orders continue to store the final upward-rounded
+    /// whole-toman amount calculated by <see cref="CalculateTenantPrice" />.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var text = FormatTenantPriceAmount(4025.5M); // "4,025.5 تومان"
+    /// </code>
+    /// </example>
+    private static string FormatTenantPriceAmount(decimal amountToman)
+    {
+        var format = amountToman == decimal.Truncate(amountToman) ? "#,0" : "#,0.####";
+        return amountToman.ToString(format, CultureInfo.InvariantCulture) + " تومان";
+    }
+
+    /// <summary>
     /// Calculates the customer-visible effective daily rate for a tenant metered tariff.
     /// </summary>
     /// <param name="tenant">
@@ -8456,10 +8837,22 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Encodes A tenant purchase selection into A compact callback action.
+    /// Encodes a tenant purchase selection into a compact callback action.
     /// </summary>
-    /// <param name="selection">selection to Serialize into callback Data.</param>
-    /// <returns>callback suffix used after the tenant customer callback prefix.</returns>
+    /// <param name="selection">
+    /// Selected global service and either an unlimited plan or metered traffic with a configured or <c>days-N</c>
+    /// duration key.
+    /// </param>
+    /// <returns>Callback suffix used after the tenant customer callback prefix.</returns>
+    /// <remarks>
+    /// The action carries selection state only. Every payment-provider handler resolves it against the current global
+    /// catalog before creating an order or invoice, so a stale custom-duration callback cannot create a financial effect.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var action = BUILDPAYACTION(selection);
+    /// </code>
+    /// </example>
     private static string BUILDPAYACTION(XuiV3PurchaseSelection selection)
     {
         if (!string.IsNullOrWhiteSpace(selection.UnlimitedPlanKey))
@@ -8469,10 +8862,21 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Parses the compact callback action generated by <see cref="BUILDPAYACTION"/> back into A purchase selection.
+    /// Parses the compact callback action generated by <see cref="BUILDPAYACTION" /> back into a purchase selection.
     /// </summary>
-    /// <param name="action">callback action string received from Telegram.</param>
-    /// <returns>purchase selection when the callback is valid; otherwise null.</returns>
+    /// <param name="action">
+    /// Callback action received from Telegram. Metered actions may contain a canonical <c>days-N</c> duration key.
+    /// </param>
+    /// <returns>A detached purchase selection when the callback shape is valid; otherwise <c>null</c>.</returns>
+    /// <remarks>
+    /// Shape parsing does not validate current service availability, preset enablement, or the custom-day range.
+    /// Callers must pass the result to central tenant pricing before any order, invoice, wallet, ledger, or XUI effect.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var selection = PARSESELECTIONFROMPAYACTION("Pay:m:normal:100:days-3");
+    /// </code>
+    /// </example>
     private static XuiV3PurchaseSelection PARSESELECTIONFROMPAYACTION(string action)
     {
         var parts = action.Split(':');

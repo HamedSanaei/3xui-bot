@@ -554,6 +554,26 @@ public class XuiV3BotFlowService
         }
     }
 
+    /// <summary>
+    /// Routes owned-bot renewal commands and text replies through the XUI v3 renewal state machine.
+    /// </summary>
+    /// <param name="botClient">Telegram client of the active owned bot that received the renewal input.</param>
+    /// <param name="message">
+    /// Customer or colleague message containing a renewal command, account identifier, traffic, preset/custom duration,
+    /// or confirmation label depending on the current bot-scoped state.
+    /// </param>
+    /// <param name="credUser">
+    /// Shared credentials profile whose Telegram id, colleague role, and selected wallet determine ownership and price.
+    /// </param>
+    /// <param name="user">Current owned-bot users.db conversation state for the Telegram sender.</param>
+    /// <param name="mainReplyMarkup">Owned-bot main keyboard restored after cancellation, failure, or completion.</param>
+    /// <param name="cancellationToken">Cancellation token for Telegram, users.db, XUI, pricing, and wallet operations.</param>
+    /// <returns><c>true</c> when the input belonged to renewal handling; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// For the normal metered service, digit-only Latin, Persian, or Arabic-Indic duration input is saved as
+    /// <c>days-N</c>. The duration is revalidated at confirmation against the current catalog before any wallet debit or
+    /// XUI update. The normal renewal completion policy still updates XUI before its documented wallet settlement.
+    /// </remarks>
     public async Task<bool> TryHandleRenewAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -962,9 +982,10 @@ public class XuiV3BotFlowService
     /// Cancellation token for Telegram, database, pricing, and state persistence operations.
     /// </param>
     /// <remarks>
-    /// The method validates typed traffic against the service-level minimum from
-    /// <c>xui-v3-service-plans.json</c> before building the renewal summary. Invalid traffic keeps the
-    /// user inside the renewal flow and shows the filtered traffic keyboard again.
+    /// The method validates typed traffic against the service-level minimum and typed duration days against the
+    /// current normal-service custom-duration range in <c>xui-v3-service-plans.json</c>. Invalid input keeps the user
+    /// inside the same renewal step. A valid custom duration is persisted as <c>days-N</c> and revalidated by the
+    /// central resolver before wallet debit or XUI renewal.
     /// </remarks>
     private async Task HandleRenewFlowStepAsync(
         ITelegramBotClient botClient,
@@ -1029,7 +1050,7 @@ public class XuiV3BotFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "مدت تمدید را انتخاب کنید:",
+                text: XuiV3PurchaseService.BuildDurationSelectionText(service, "مدت تمدید را انتخاب کنید:"),
                 replyMarkup: BuildDurationReplyKeyboard(service),
                 cancellationToken: cancellationToken);
             return;
@@ -1042,7 +1063,9 @@ public class XuiV3BotFlowService
             {
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
-                    text: "مدت معتبر نیست. یکی از گزینه‌های لیست را انتخاب کنید.",
+                    text: XuiV3PurchaseService.BuildDurationSelectionText(
+                        service,
+                        "مدت معتبر نیست. یکی از گزینه‌های لیست را انتخاب کنید."),
                     replyMarkup: BuildDurationReplyKeyboard(service),
                     cancellationToken: cancellationToken);
                 return;
@@ -1116,6 +1139,22 @@ public class XuiV3BotFlowService
                     chatId: message.Chat.Id,
                     text: "برای تمدید، گزینه تایید تمدید را بزنید.",
                     replyMarkup: BuildConfirmReplyKeyboard(),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (!service.IsUnlimited &&
+                !XuiV3PurchaseService.TryResolveDurationKey(service, user.SelectedPeriod, out _))
+            {
+                user.LastStep = RenewStepDuration;
+                user.SelectedPeriod = null;
+                await _userDbContext.SaveUserStatus(user);
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: XuiV3PurchaseService.BuildDurationSelectionText(
+                        service,
+                        "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید."),
+                    replyMarkup: BuildDurationReplyKeyboard(service),
                     cancellationToken: cancellationToken);
                 return;
             }
@@ -1629,8 +1668,9 @@ public class XuiV3BotFlowService
     /// summary, the service key is rehydrated from the durable state when the session value is blank, preventing crashes
     /// such as "Service plan '' was not found" after a process restart or cross-instance dispatch.
     ///
-    /// Metered traffic typed by the user is validated through <see cref="XuiV3PurchaseService.ResolvePurchase" />,
-    /// so owned bots and tenant bots apply the same minimum-traffic policy from the service-plan file.
+    /// Metered traffic and custom duration days typed by the user are validated through the shared purchase policy,
+    /// so owned bots and tenant bots apply the same plan-file ranges and pricing. Durable traffic and duration fields
+    /// are rehydrated before later steps so a process restart cannot discard a <c>days-N</c> selection.
     /// </remarks>
     public async Task<bool> TryHandlePurchaseTextAsync(
         ITelegramBotClient botClient,
@@ -1671,6 +1711,58 @@ public class XuiV3BotFlowService
                 chatId: message.Chat.Id,
                 text: "ابتدا نوع سرویس را از دکمه‌ها انتخاب کنید.",
                 replyMarkup: _purchaseService.BuildServiceKeyboard(),
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        RehydratePurchaseSelectionFromState(selection, service, user);
+
+        if (user.LastStep == PurchaseStepSelectDuration)
+        {
+            if (!selection.TrafficGb.HasValue ||
+                !XuiV3PurchaseService.MeetsMinimumTraffic(service, selection.TrafficGb.Value))
+            {
+                user.LastStep = PurchaseStepSelectTraffic;
+                user.SelectedPeriod = null;
+                await _userDbContext.SaveUserStatus(user);
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: BuildMinimumTrafficMessage(service),
+                    replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
+                    cancellationToken: cancellationToken);
+                return true;
+            }
+
+            if (!XuiV3PurchaseService.TryResolveDurationInput(service, message.Text, out var duration))
+            {
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: XuiV3PurchaseService.BuildDurationSelectionText(
+                        service,
+                        "مدت معتبر نیست. یکی از گزینه‌های فعال را انتخاب کنید."),
+                    replyMarkup: _purchaseService.BuildDurationKeyboard(service.Key, selection.TrafficGb.Value),
+                    cancellationToken: cancellationToken);
+                return true;
+            }
+
+            selection.ServiceKey = service.Key;
+            selection.DurationKey = duration.Key;
+            selection.UnlimitedPlanKey = null;
+            selection.AccountCount = 1;
+            selection.UserComment = null;
+            _sessionStore.Set(credUser.TelegramUserId, selection);
+
+            user.Flow = PurchaseFlowName;
+            user.LastStep = PurchaseStepAccountCount;
+            user.SelectedCountry = service.Key;
+            user.TotoalGB = selection.TrafficGb.Value.ToString(CultureInfo.InvariantCulture);
+            user.SelectedPeriod = duration.Key;
+            await _userDbContext.SaveUserStatus(user);
+
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: $"تعداد اکانت مورد نظر را وارد کنید. حداکثر تعداد در هر سفارش {XuiV3PurchaseService.MaxBulkAccountCount} است.",
+                replyMarkup: BuildAccountCountInlineKeyboard(),
                 cancellationToken: cancellationToken);
             return true;
         }
@@ -1790,7 +1882,9 @@ public class XuiV3BotFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: $"حجم انتخاب شد: {trafficGb} GB\nحالا مدت را انتخاب کنید:",
+                text: XuiV3PurchaseService.BuildDurationSelectionText(
+                    service,
+                    $"حجم انتخاب شد: {trafficGb} GB\nحالا مدت را انتخاب کنید:"),
                 replyMarkup: _purchaseService.BuildDurationKeyboard(service.Key, trafficGb),
                 cancellationToken: cancellationToken);
             return true;
@@ -2119,8 +2213,9 @@ public class XuiV3BotFlowService
     /// it is deliberately not parsed here because it abandons the XUI selection and starts wallet charging. Purchase
     /// confirmation payload fallback is accepted only while the persisted bot-scoped state is still at the active
     /// confirmation step, so an old callback cannot recreate an abandoned selection or debit the wallet.
-    /// Metered duration callbacks are also checked against the freshly loaded enabled options before purchase state
-    /// advances; a catalog toggle therefore invalidates previously issued buttons without financial side effects.
+    /// Metered duration callbacks and canonical <c>days-N</c> selections are checked against the freshly loaded preset
+    /// flags and custom-duration range before purchase state advances and again at confirmation. A catalog toggle
+    /// therefore returns the buyer to current duration choices without a wallet, ledger, website, or XUI side effect.
     /// </remarks>
     public async Task<bool> TryHandleCallbackAsync(
         ITelegramBotClient botClient,
@@ -2612,7 +2707,9 @@ public class XuiV3BotFlowService
                     botClient,
                     chatId: chatId,
                     messageId: messageId,
-                    text: $"حجم انتخاب شد: {callback.TrafficGb} GB\nحالا مدت را انتخاب کنید:",
+                    text: XuiV3PurchaseService.BuildDurationSelectionText(
+                        service,
+                        $"حجم انتخاب شد: {callback.TrafficGb} GB\nحالا مدت را انتخاب کنید:"),
                     replyMarkup: _purchaseService.BuildDurationKeyboard(callback.ServiceKey, callback.TrafficGb ?? 0),
                     cancellationToken: cancellationToken);
             }
@@ -2650,7 +2747,9 @@ public class XuiV3BotFlowService
                         botClient,
                         chatId: chatId,
                         messageId: messageId,
-                        text: "این مدت غیرفعال شده است. لطفاً یکی از مدت‌های فعال را انتخاب کنید.",
+                        text: XuiV3PurchaseService.BuildDurationSelectionText(
+                            service,
+                            "این مدت غیرفعال شده است. لطفاً یکی از مدت‌های فعال را انتخاب کنید."),
                         replyMarkup: _purchaseService.BuildDurationKeyboard(service.Key, callback.TrafficGb.Value),
                         cancellationToken: cancellationToken);
                 }
@@ -2748,6 +2847,54 @@ public class XuiV3BotFlowService
             {
                 Console.WriteLine($"[XUIv3] confirm failed: selection is still empty for user {credUser.TelegramUserId}");
                 return true;
+            }
+
+            var confirmationService = FindService(selection.ServiceKey);
+            if (confirmationService != null && !confirmationService.IsUnlimited)
+            {
+                if (!selection.TrafficGb.HasValue ||
+                    !XuiV3PurchaseService.MeetsMinimumTraffic(confirmationService, selection.TrafficGb.Value))
+                {
+                    selection.DurationKey = null;
+                    selection.TrafficGb = null;
+                    _sessionStore.Set(credUser.TelegramUserId, selection);
+                    user.LastStep = PurchaseStepSelectTraffic;
+                    user.SelectedPeriod = null;
+                    user.TotoalGB = null;
+                    await _userDbContext.SaveUserStatus(user);
+                    await SendOrEditTextAsync(
+                        botClient,
+                        chatId,
+                        messageId,
+                        BuildMinimumTrafficMessage(confirmationService),
+                        replyMarkup: _purchaseService.BuildTrafficKeyboard(confirmationService.Key),
+                        cancellationToken: cancellationToken);
+                    return true;
+                }
+
+                if (!XuiV3PurchaseService.TryResolveDurationKey(
+                        confirmationService,
+                        selection.DurationKey,
+                        out _))
+                {
+                    selection.DurationKey = null;
+                    _sessionStore.Set(credUser.TelegramUserId, selection);
+                    user.LastStep = PurchaseStepSelectDuration;
+                    user.SelectedPeriod = null;
+                    await _userDbContext.SaveUserStatus(user);
+                    await SendOrEditTextAsync(
+                        botClient,
+                        chatId,
+                        messageId,
+                        XuiV3PurchaseService.BuildDurationSelectionText(
+                            confirmationService,
+                            "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید."),
+                        replyMarkup: _purchaseService.BuildDurationKeyboard(
+                            confirmationService.Key,
+                            selection.TrafficGb.Value),
+                        cancellationToken: cancellationToken);
+                    return true;
+                }
             }
 
             try
@@ -5836,6 +5983,52 @@ public class XuiV3BotFlowService
     }
 
     /// <summary>
+    /// Restores durable purchase fields into the in-memory owned-bot selection after a restart or instance handoff.
+    /// </summary>
+    /// <param name="selection">
+    /// Mutable bot-scoped in-memory selection for the current Telegram user. The object is updated in place and must
+    /// not be shared with another bot context or Telegram user.
+    /// </param>
+    /// <param name="service">Current enabled global service resolved from the durable service key.</param>
+    /// <param name="user">
+    /// Bot-scoped users.db state containing traffic in GB, configured or <c>days-N</c> duration, unlimited plan key,
+    /// and later-step values saved by the active owned bot.
+    /// </param>
+    /// <remarks>
+    /// This method performs no database write. The central resolver still validates every restored value before wallet,
+    /// ledger, site-wallet, tenant, or XUI effects, so durable state cannot bypass a later catalog change.
+    /// </remarks>
+    private static void RehydratePurchaseSelectionFromState(
+        XuiV3PurchaseSelection selection,
+        XuiV3ServiceDefinition service,
+        User user)
+    {
+        if (selection == null || service == null || user == null)
+            return;
+
+        selection.ServiceKey = service.Key;
+        if (service.IsUnlimited)
+        {
+            if (string.IsNullOrWhiteSpace(selection.UnlimitedPlanKey))
+                selection.UnlimitedPlanKey = user.Type;
+            selection.TrafficGb = null;
+            selection.DurationKey = null;
+            return;
+        }
+
+        if (!selection.TrafficGb.HasValue &&
+            int.TryParse(user.TotoalGB, NumberStyles.Integer, CultureInfo.InvariantCulture, out var trafficGb) &&
+            trafficGb > 0)
+        {
+            selection.TrafficGb = trafficGb;
+        }
+
+        if (string.IsNullOrWhiteSpace(selection.DurationKey))
+            selection.DurationKey = user.SelectedPeriod;
+        selection.UnlimitedPlanKey = null;
+    }
+
+    /// <summary>
     /// Builds the owned-bot renewal keyboard for enabled metered durations.
     /// </summary>
     /// <param name="service">
@@ -6433,24 +6626,23 @@ public class XuiV3BotFlowService
     }
 
     /// <summary>
-    /// Matches an owned-bot renewal reply against an enabled metered duration.
+    /// Matches an owned-bot renewal reply against an enabled preset or allowed custom-day duration.
     /// </summary>
     /// <param name="service">Current global metered service containing the allowed duration keys and labels.</param>
     /// <param name="text">
-    /// Telegram message text entered by the customer. It may contain a bracketed key, a raw key, or a display label.
+    /// Telegram message text entered by the customer. It may contain a bracketed key, raw key, display label, or a
+    /// digit-only Latin, Persian, or Arabic-Indic custom day count.
     /// </param>
     /// <returns>
-    /// The enabled detached duration definition that matches the message, or <c>null</c> when the value is unknown or
-    /// has been disabled since its keyboard was sent.
+    /// The enabled configured or detached custom duration that matches the message, or <c>null</c> when the value is
+    /// unknown, outside the custom range, or disabled by the current catalog policy.
     /// </returns>
     /// <remarks>This method has no persistence, wallet, Telegram-send, or XUI side effects.</remarks>
     private static XuiV3DurationOption TryGetDurationFromText(XuiV3ServiceDefinition service, string text)
     {
-        var key = ExtractBracketValue(text);
-        return XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(duration =>
-            string.Equals(duration.Key, key, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(duration.Key, text?.Trim(), StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(duration.DisplayName, text?.Trim(), StringComparison.OrdinalIgnoreCase));
+        return XuiV3PurchaseService.TryResolveDurationInput(service, text, out var duration)
+            ? duration
+            : null;
     }
 
     private static XuiV3UnlimitedPlan TryGetUnlimitedPlanFromText(XuiV3ServiceDefinition service, string text)
