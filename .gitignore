@@ -183,6 +183,7 @@ Logs/
 Data/Logs/
 artifacts/
 published/
+api_docs/
 
 # Local IDE/debug settings may contain tokens or private paths
 .vscode/launch.json

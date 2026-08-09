@@ -30,7 +30,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 ## Core Services
 
 - `Services/XuiV3PurchaseService.cs`: resolves service selections, validates plan rules, builds XUI v3 account metadata, and creates accounts.
-- `Services/XuiV3BotFlowService.cs`: shared customer account flows for owned and tenant bots: purchase, renewal, search, account list, link change, comment change, delete, and state callbacks.
+- `Services/XuiV3BotFlowService.cs`: shared customer account flows for owned and tenant bots: purchase, renewal,
+  search, account list, link/comment changes, delete, state callbacks, and owner-checked configuration delivery. All
+  owned account cards use one source-aware action keyboard; `x3:acfg:{clientId}` reloads ownership, reads
+  `subLinks/{subId}` with `links/{email}` fallback, deduplicates URLs ordinally, and sends short results as escaped HTML
+  or long results as an in-memory UTF-8 file. The API adapter accepts raw arrays and standard envelopes and disables
+  automatic URI-logging retries for these identifier-bearing paths. SubId, URLs, response bodies, tokens, and private
+  request URIs must never enter callbacks or logs; non-owner UUID/SubId results retain the restricted renewal-only menu.
 - `Services/TelegramNavigationCommandParser.cs`: validates bot-addressed `/start` commands and the owned-only `/refresh`
   alias, including `@BotUsername`, optional start payloads, and the legacy `/start=payload` form. The main dispatcher
   clears both the current `BotId + TelegramUserId` conversation row and bot-scoped in-memory XUI purchase selection
@@ -42,7 +48,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/XuiV3RenewalPolicy.cs`: central renewal payload calculation for metered, national, and unlimited accounts.
 - `Services/XuiV3ClientPlanEligibility.cs`: checks whether an XUI client belongs to active service inbounds.
 - `Services/XuiV3ClientUsageResolver.cs`: shared null-safe XUI list-response interpretation for consumption, quota,
-  expiry, `createdAt`, `updatedAt`, origin bot, and renewal metadata.
+  expiry, `createdAt`, `updatedAt`, origin bot, and renewal metadata. A missing nested `traffic` object falls back to
+  top-level/extension fields; the volume worker isolates recoverably malformed rows so one client cannot abort a full
+  panel scan.
 - `Services/XuiV3VolumeExpirationReminderService.cs` + `XuiV3VolumeReminderStateStore.cs`: one-list-request
   30-minute 80/90/99 traffic reminder worker and users.db cycle/claim idempotency. Notifications are bot-scoped,
   separate per account, rate-limit-aware, and require a matching `BotUserState`; migration

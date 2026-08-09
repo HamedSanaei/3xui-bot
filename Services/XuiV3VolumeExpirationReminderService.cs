@@ -125,7 +125,8 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     /// <remarks>
     /// A failed or partial list response produces no reminder-state mutation. This prevents transient panel failures
     /// from looking like deletion, counter reset, or renewal. Lower thresholds are not emitted when the same scan
-    /// first observes a higher threshold.
+    /// first observes a higher threshold. Recoverably malformed individual client rows are skipped and summarized in
+    /// one diagnostic entry so one historical panel row cannot abort reconciliation for every valid account.
     /// </remarks>
     private async Task RunScanAsync(AppConfig config, CancellationToken cancellationToken)
     {
@@ -142,33 +143,59 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
         var nowUtc = DateTime.UtcNow;
         var enabledServices = _purchaseService.GetEnabledServices();
         var observations = new List<XuiV3VolumeReminderObservation>();
+        var malformedClientCount = 0;
+        var firstMalformedClientId = 0;
+        Exception firstMalformedClientException = null;
         foreach (var client in response.Obj ?? new List<XuiV3Client>())
         {
-            if (client == null || client.Id <= 0 ||
-                !XuiV3ClientPlanEligibility.IsClientInActiveServiceInbounds(client, enabledServices))
-            {
+            if (client == null || client.Id <= 0)
                 continue;
+
+            try
+            {
+                if (!XuiV3ClientPlanEligibility.IsClientInActiveServiceInbounds(client, enabledServices))
+                    continue;
+
+                var snapshot = XuiV3ClientUsageResolver.Resolve(client);
+                if (snapshot.TotalBytes <= 0 || snapshot.OwnerTelegramUserId <= 0 || IsSuperAdmin(config, snapshot.OwnerTelegramUserId))
+                    continue;
+
+                var threshold = XuiV3ClientUsageResolver.GetHighestReachedThreshold(snapshot);
+                observations.Add(new XuiV3VolumeReminderObservation
+                {
+                    ClientId = snapshot.ClientId,
+                    ClientCreatedAt = snapshot.ClientCreatedAt,
+                    Email = snapshot.Email,
+                    BotId = snapshot.CreatedByBotId,
+                    TelegramUserId = snapshot.OwnerTelegramUserId,
+                    PanelUpdatedAt = snapshot.PanelUpdatedAt,
+                    TotalBytes = snapshot.TotalBytes,
+                    UsedBytes = snapshot.UsedBytes,
+                    LastRenewedAtUtc = snapshot.LastRenewedAtUtc,
+                    HighestReachedThreshold = threshold,
+                    CanNotify = XuiV3ClientUsageResolver.CanNotifyVolumeThreshold(snapshot, nowUtc, threshold)
+                });
             }
-
-            var snapshot = XuiV3ClientUsageResolver.Resolve(client);
-            if (snapshot.TotalBytes <= 0 || snapshot.OwnerTelegramUserId <= 0 || IsSuperAdmin(config, snapshot.OwnerTelegramUserId))
-                continue;
-
-            var threshold = XuiV3ClientUsageResolver.GetHighestReachedThreshold(snapshot);
-            observations.Add(new XuiV3VolumeReminderObservation
+            catch (Exception ex) when (IsRecoverableClientRecordException(ex))
             {
-                ClientId = snapshot.ClientId,
-                ClientCreatedAt = snapshot.ClientCreatedAt,
-                Email = snapshot.Email,
-                BotId = snapshot.CreatedByBotId,
-                TelegramUserId = snapshot.OwnerTelegramUserId,
-                PanelUpdatedAt = snapshot.PanelUpdatedAt,
-                TotalBytes = snapshot.TotalBytes,
-                UsedBytes = snapshot.UsedBytes,
-                LastRenewedAtUtc = snapshot.LastRenewedAtUtc,
-                HighestReachedThreshold = threshold,
-                CanNotify = XuiV3ClientUsageResolver.CanNotifyVolumeThreshold(snapshot, nowUtc, threshold)
-            });
+                malformedClientCount++;
+                // Retain only the first row-local failure so a panel containing many malformed historical clients
+                // produces one actionable diagnostic instead of flooding the private Telegram logger channel.
+                if (firstMalformedClientException == null)
+                {
+                    firstMalformedClientId = client.Id;
+                    firstMalformedClientException = ex;
+                }
+            }
+        }
+
+        if (malformedClientCount > 0)
+        {
+            _logger.LogWarning(
+                firstMalformedClientException,
+                "XUI v3 volume reminder skipped malformed client rows. count={Count}, firstClientId={FirstClientId}",
+                malformedClientCount,
+                firstMalformedClientId);
         }
 
         var panelKey = XuiV3ClientUsageResolver.BuildPanelKey(serverInfo);
@@ -303,6 +330,32 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             sent,
             skipped,
             failed);
+    }
+
+    /// <summary>
+    /// Identifies row-local panel-shape failures that may be skipped without invalidating the complete list response.
+    /// </summary>
+    /// <param name="exception">
+    /// Exception raised while normalizing or classifying one XUI client row. Cancellation and resource-exhaustion
+    /// exceptions must not be supplied because they apply to the worker rather than one client.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> for nullable, conversion, collection, or invalid-shape failures that are isolated to one client;
+    /// otherwise <c>false</c> so the outer worker guard can fail and retry the complete scan.
+    /// </returns>
+    /// <remarks>
+    /// The first accepted exception is logged once with the number of skipped rows and a numeric client id. Email,
+    /// panel credentials, subscription values, and client metadata are intentionally excluded from the diagnostic.
+    /// </remarks>
+    private static bool IsRecoverableClientRecordException(Exception exception)
+    {
+        return exception is NullReferenceException or
+               ArgumentException or
+               FormatException or
+               OverflowException or
+               InvalidCastException or
+               InvalidOperationException or
+               KeyNotFoundException;
     }
 
     /// <summary>

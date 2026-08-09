@@ -25,6 +25,15 @@ public enum XuiV3RequestRetryMode
     NoAutomaticRetry
 }
 
+/// <summary>
+/// Provides authenticated XUI v3 panel operations and normalized bot-facing account results.
+/// </summary>
+/// <remarks>
+/// Public API methods receive server credentials from trusted runtime configuration. Panel URLs, bearer tokens,
+/// request paths containing email/SubId, response bodies, and returned proxy configurations are sensitive. Callers
+/// that deliver configurations must opt out of identifier-bearing retry logs and must never expose these values in
+/// Telegram callbacks or customer-visible logs.
+/// </remarks>
 public class ApiServicev3
 {
     private const int DefaultXuiV3TimeoutSeconds = 60;
@@ -1257,13 +1266,227 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<XuiV3ClientTraffic>> GetClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default)
         => SendAsync<XuiV3ClientTraffic>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/clients/traffic/{EscapePath(email)}", null, true, cancellationToken);
 
-    /// <summary>GET /panel/api/clients/links/{email}. Gets all proxy URLs for a client across attached inbounds.</summary>
-    public static Task<XuiV3ApiResponse<List<string>>> GetClientLinksAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default)
-        => SendAsync<List<string>>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/clients/links/{EscapePath(email)}", null, true, cancellationToken);
+    /// <summary>
+    /// Gets every protocol configuration URL for one client email across the inbounds attached by the XUI panel.
+    /// </summary>
+    /// <param name="serverInfo">
+    /// Authenticated XUI v3 panel connection settings. The bearer token, private URL, and credentials must never be
+    /// written to Telegram or customer-visible logs.
+    /// </param>
+    /// <param name="configuration">Runtime application configuration used for HTTP timeouts and read-only retries.</param>
+    /// <param name="email">
+    /// Exact panel client email/name obtained from a previously authorized client record. It is escaped as one URL
+    /// path segment and must not be accepted directly from an unverified Telegram callback.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the authenticated panel request and bounded retries.</param>
+    /// <param name="suppressIdentifierBearingRetryLogs">
+    /// <c>true</c> to perform one attempt without the shared retry diagnostics because the path contains a private
+    /// email; <c>false</c> to preserve the existing read-only retry behavior used by account-creation recovery.
+    /// </param>
+    /// <returns>
+    /// A normalized response envelope whose object is an ordered list of raw VLESS, VMess, Trojan, Shadowsocks,
+    /// Hysteria, or other supported protocol URLs. Both a raw JSON array and the standard panel envelope are accepted.
+    /// The list may be null or empty when the client has no enabled inbound configuration. Callers must treat every
+    /// returned URL as sensitive customer data.
+    /// </returns>
+    /// <remarks>
+    /// Calls <c>GET /panel/api/clients/links/{email}</c>. This read-only endpoint is suitable as a fallback when a
+    /// client's subscription id is unavailable or the subscription-link endpoint cannot produce configurations.
+    /// Configuration-delivery callers must pass <c>suppressIdentifierBearingRetryLogs: true</c> and must not log the
+    /// request URI, response body, email-to-link mapping, or returned URLs.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var response = await ApiServicev3.GetClientLinksAsync(
+    ///     serverInfo,
+    ///     configuration,
+    ///     client.Email,
+    ///     cancellationToken,
+    ///     suppressIdentifierBearingRetryLogs: true);
+    /// </code>
+    /// </example>
+    /// <exception cref="XuiV3ApiException">Thrown when the panel returns an unsuccessful HTTP status.</exception>
+    /// <exception cref="InvalidDataException">Thrown when a successful response has an unsupported JSON shape.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is cancelled.</exception>
+    public static Task<XuiV3ApiResponse<List<string>>> GetClientLinksAsync(
+        ServerInfo serverInfo,
+        IConfiguration configuration,
+        string email,
+        CancellationToken cancellationToken = default,
+        bool suppressIdentifierBearingRetryLogs = false)
+        => SendSensitiveStringListAsync(
+            serverInfo,
+            configuration,
+            $"/panel/api/clients/links/{EscapePath(email)}",
+            cancellationToken,
+            suppressIdentifierBearingRetryLogs);
 
-    /// <summary>GET /panel/api/clients/subLinks/{subId}. Gets all protocol URLs for a subscription ID as JSON.</summary>
-    public static Task<XuiV3ApiResponse<List<string>>> GetClientSubLinksAsync(ServerInfo serverInfo, IConfiguration configuration, string subId, CancellationToken cancellationToken = default)
-        => SendAsync<List<string>>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/clients/subLinks/{EscapePath(subId)}", null, true, cancellationToken);
+    /// <summary>
+    /// Gets every protocol configuration URL represented by one XUI subscription id without base64 wrapping.
+    /// </summary>
+    /// <param name="serverInfo">
+    /// Authenticated XUI v3 panel connection settings. The bearer token, private URL, and credentials must remain in
+    /// trusted server-side memory and diagnostics only.
+    /// </param>
+    /// <param name="configuration">Runtime application configuration used for HTTP timeouts and read-only retries.</param>
+    /// <param name="subId">
+    /// Exact private subscription identifier loaded from an ownership-verified XUI client. It is escaped as one path
+    /// segment and must never be placed in Telegram callback data or operational log properties.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the authenticated panel request and bounded retries.</param>
+    /// <param name="suppressIdentifierBearingRetryLogs">
+    /// <c>true</c> to perform one attempt without the shared retry diagnostics because the path contains private SubId;
+    /// <c>false</c> to allow the normal read-only retry diagnostics.
+    /// </param>
+    /// <returns>
+    /// A normalized response envelope whose object is an ordered list of protocol URLs matching the subscription.
+    /// Both the documented raw JSON array and the standard panel envelope are accepted. The list may be null or empty
+    /// when no enabled client/inbound contributes a configuration. Returned values are sensitive and may be exposed
+    /// only to the verified account owner.
+    /// </returns>
+    /// <remarks>
+    /// Calls <c>GET /panel/api/clients/subLinks/{subId}</c>. Callers should fall back to
+    /// <see cref="GetClientLinksAsync"/> when SubId is missing, the endpoint fails, or the normalized list is empty.
+    /// Configuration-delivery callers must pass <c>suppressIdentifierBearingRetryLogs: true</c> and must not log
+    /// SubId, the request URI, panel response body, or any returned proxy URL.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var response = await ApiServicev3.GetClientSubLinksAsync(
+    ///     serverInfo,
+    ///     configuration,
+    ///     client.SubId,
+    ///     cancellationToken,
+    ///     suppressIdentifierBearingRetryLogs: true);
+    /// </code>
+    /// </example>
+    /// <exception cref="XuiV3ApiException">Thrown when the panel returns an unsuccessful HTTP status.</exception>
+    /// <exception cref="InvalidDataException">Thrown when a successful response has an unsupported JSON shape.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is cancelled.</exception>
+    public static Task<XuiV3ApiResponse<List<string>>> GetClientSubLinksAsync(
+        ServerInfo serverInfo,
+        IConfiguration configuration,
+        string subId,
+        CancellationToken cancellationToken = default,
+        bool suppressIdentifierBearingRetryLogs = false)
+        => SendSensitiveStringListAsync(
+            serverInfo,
+            configuration,
+            $"/panel/api/clients/subLinks/{EscapePath(subId)}",
+            cancellationToken,
+            suppressIdentifierBearingRetryLogs);
+
+    /// <summary>
+    /// Sends a sensitive read-only string-list request and normalizes either a raw JSON array or panel envelope.
+    /// </summary>
+    /// <param name="serverInfo">Authenticated XUI v3 panel settings used only for the outgoing request.</param>
+    /// <param name="configuration">Runtime timeout and retry configuration for the authenticated HTTP read.</param>
+    /// <param name="relativePath">
+    /// Fully escaped panel-relative path containing a private client email or SubId. It must never be logged or shown
+    /// to a Telegram user.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the authenticated HTTP read.</param>
+    /// <param name="suppressIdentifierBearingRetryLogs">
+    /// Whether to disable automatic retries whose shared diagnostics would include <paramref name="relativePath"/>.
+    /// </param>
+    /// <returns>
+    /// A normalized successful envelope for a raw JSON array, or the panel-provided envelope when the response uses
+    /// the standard <c>success/msg/obj</c> shape. The returned URLs remain sensitive customer configuration data.
+    /// </returns>
+    /// <remarks>
+    /// Configuration-delivery callers set <paramref name="suppressIdentifierBearingRetryLogs"/> to <c>true</c> because
+    /// the shared retry pipeline writes request URIs to private diagnostics, while this path contains email/SubId.
+    /// Existing account-creation callers retain read-only retries for backward compatibility.
+    /// </remarks>
+    /// <exception cref="InvalidDataException">
+    /// Thrown when a successful HTTP response is neither a JSON string array nor a valid XUI response envelope.
+    /// No response body or request path is included in the exception message.
+    /// </exception>
+    /// <exception cref="XuiV3ApiException">Thrown when the panel returns an unsuccessful HTTP status.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is cancelled.</exception>
+    /// <example>
+    /// <code>
+    /// var response = await SendSensitiveStringListAsync(
+    ///     serverInfo,
+    ///     configuration,
+    ///     escapedPrivatePath,
+    ///     cancellationToken,
+    ///     suppressIdentifierBearingRetryLogs: true);
+    /// </code>
+    /// </example>
+    private static async Task<XuiV3ApiResponse<List<string>>> SendSensitiveStringListAsync(
+        ServerInfo serverInfo,
+        IConfiguration configuration,
+        string relativePath,
+        CancellationToken cancellationToken,
+        bool suppressIdentifierBearingRetryLogs)
+    {
+        var raw = await SendRawAsync(
+            serverInfo,
+            configuration,
+            HttpMethod.Get,
+            relativePath,
+            body: null,
+            authenticate: true,
+            cancellationToken: cancellationToken,
+            query: null,
+            retryMode: suppressIdentifierBearingRetryLogs
+                ? XuiV3RequestRetryMode.NoAutomaticRetry
+                : XuiV3RequestRetryMode.ReadOnly);
+
+        return ParseSensitiveStringListResponse(raw);
+    }
+
+    /// <summary>
+    /// Parses a successful sensitive string-list response without retaining its body in an exception message.
+    /// </summary>
+    /// <param name="raw">
+    /// Raw UTF-8 JSON returned by the authenticated links or subLinks endpoint. It may be a direct string array or a
+    /// standard XUI response envelope and must never be logged.
+    /// </param>
+    /// <returns>
+    /// A normalized successful envelope for a raw array, or the deserialized provider envelope for object responses.
+    /// URL order and casing are preserved for later owner-only delivery.
+    /// </returns>
+    /// <remarks>
+    /// This parser does not trim or deduplicate URLs; presentation code owns that policy. Invalid data produces only a
+    /// fixed diagnostic message so configuration content cannot leak through exception rendering.
+    /// </remarks>
+    /// <exception cref="InvalidDataException">
+    /// Thrown when <paramref name="raw"/> is invalid JSON or uses an unsupported top-level shape.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// var response = ParseSensitiveStringListResponse("[\"vless://sample\"]");
+    /// </code>
+    /// </example>
+    private static XuiV3ApiResponse<List<string>> ParseSensitiveStringListResponse(string raw)
+    {
+        JToken token;
+        try
+        {
+            token = JToken.Parse(raw);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("XUI v3 string-list response was not valid JSON.", ex);
+        }
+
+        if (token.Type == JTokenType.Array)
+        {
+            return new XuiV3ApiResponse<List<string>>
+            {
+                Success = true,
+                Obj = token.ToObject<List<string>>() ?? new List<string>()
+            };
+        }
+
+        if (token.Type != JTokenType.Object)
+            throw new InvalidDataException("XUI v3 string-list response did not use a supported JSON shape.");
+
+        return token.ToObject<XuiV3ApiResponse<List<string>>>()
+               ?? throw new InvalidDataException("XUI v3 string-list response envelope was empty.");
+    }
 
     /// <summary>GET /panel/api/clients/groups. Lists client groups with member counts.</summary>
     public static Task<XuiV3ApiResponse<List<XuiV3ClientGroup>>> GetClientGroupsAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)

@@ -33,7 +33,9 @@ public static class XuiV3ClientUsageResolver
     /// <remarks>
     /// Upload and download counters are clamped at zero and summed without overflowing <see cref="long"/>. Quota
     /// lookup follows top-level <c>totalGB</c>, nested <c>traffic.totalGB</c>, nested <c>traffic.total</c>, and raw
-    /// extension data. A newer <c>updatedAt</c> alone is deliberately not classified as a renewal.
+    /// extension data. Missing nested <c>traffic</c> objects are valid for historical or not-yet-observed panel
+    /// clients and resolve to the available top-level or extension values. A newer <c>updatedAt</c> alone is
+    /// deliberately not classified as a renewal.
     /// </remarks>
     /// <example>
     /// <code>
@@ -212,12 +214,20 @@ public static class XuiV3ClientUsageResolver
     /// </summary>
     /// <param name="client">Panel client whose expiry fields are being normalized.</param>
     /// <returns>Positive Unix milliseconds, zero lifetime, or negative first-connection duration milliseconds.</returns>
+    /// <remarks>
+    /// The nested traffic object is optional in real <c>/panel/api/clients/list</c> responses. Its nullable expiry
+    /// value is materialized before comparison so a missing object cannot pass a lifted <c>!= 0</c> comparison and
+    /// then be dereferenced.
+    /// </remarks>
     private static long ResolveExpiryTime(XuiV3Client client)
     {
         if (client.ExpiryTime != 0)
             return client.ExpiryTime;
-        if (client.Traffic?.ExpiryTime != 0)
-            return client.Traffic.ExpiryTime;
+
+        var trafficExpiryTime = client.Traffic?.ExpiryTime ?? 0;
+        if (trafficExpiryTime != 0)
+            return trafficExpiryTime;
+
         return ReadLongExtra(client, "expiryTime");
     }
 

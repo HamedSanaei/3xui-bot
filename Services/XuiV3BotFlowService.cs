@@ -11,6 +11,14 @@ using System.Text;
 using System.Globalization;
 using Adminbot.Domain.Logging;
 
+/// <summary>
+/// Coordinates shared XUI v3 customer purchase, renewal, search, and owned-account management flows for Telegram bots.
+/// </summary>
+/// <remarks>
+/// The service is reused by owned bots and tenant storefront bots under the active bot context. Account-management
+/// callbacks are bot-routed but must still reload panel clients and enforce Telegram ownership. Read-only
+/// configuration delivery keeps private SubId and proxy URLs out of callback data and operational logs.
+/// </remarks>
 public class XuiV3BotFlowService
 {
     private const string RenewFlowName = "xui-v3-renew";
@@ -47,6 +55,8 @@ public class XuiV3BotFlowService
     private const long NormalTrialBytes = 1L * 1024L * 1024L * 1024L;
     private const long MinimumWeeklyColleagueSalesToman = 5_000_000L;
     private const int AccountListPageSize = 20;
+    /// <summary>Safe Telegram HTML limit that leaves room below the platform's 4096-character message ceiling.</summary>
+    private const int MaxAccountConfigsHtmlLength = 3900;
 
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly XuiV3PurchaseSessionStore _sessionStore;
@@ -271,6 +281,31 @@ public class XuiV3BotFlowService
         }
     }
 
+    /// <summary>
+    /// Handles a colleague's direct numeric account-counter lookup and displays the owned account's full action card.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned or tenant bot receiving the text message.</param>
+    /// <param name="message">Incoming Telegram message whose text may contain an account counter.</param>
+    /// <param name="credUser">Bot user profile; only colleague profiles may use this direct lookup route.</param>
+    /// <param name="user">
+    /// Bot-scoped conversation state. A lookup is accepted only when no other flow is active for this user and bot.
+    /// </param>
+    /// <param name="mainReplyMarkup">Main-menu keyboard used for not-found or panel-failure responses.</param>
+    /// <param name="cancellationToken">Token that cancels panel and Telegram operations.</param>
+    /// <returns>
+    /// <c>true</c> when the message was recognized as an eligible account-counter lookup, including not-found results;
+    /// otherwise <c>false</c> so later text handlers may process it.
+    /// </returns>
+    /// <remarks>
+    /// The panel result is filtered by the sender's Telegram ownership metadata before the card is shown. A successful
+    /// result uses the same complete menu as list and search cards, including read-only configuration retrieval.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var handled = await flow.TryHandleAccountCounterLookupAsync(
+    ///     botClient, message, credUser, userState, mainMenu, cancellationToken);
+    /// </code>
+    /// </example>
     public async Task<bool> TryHandleAccountCounterLookupAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -325,7 +360,7 @@ public class XuiV3BotFlowService
             chatId: message.Chat.Id,
             text: BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
             parseMode: ParseMode.Html,
-            replyMarkup: BuildAccountDetailsKeyboard(client, 0, credUser.IsColleague, IsClientRenewable(client)),
+            replyMarkup: BuildAccountDetailsKeyboard(client, 0, IsClientRenewable(client)),
             cancellationToken: cancellationToken);
 
         return true;
@@ -2231,7 +2266,12 @@ public class XuiV3BotFlowService
     /// Metered duration callbacks and canonical <c>days-N</c> selections are checked against the freshly loaded preset
     /// flags and custom-duration range before purchase state advances and again at confirmation. A catalog toggle
     /// therefore returns the buyer to current duration choices without a wallet, ledger, website, or XUI side effect.
+    /// The read-only <c>acfg</c> route carries only a numeric client id; it reloads panel data and verifies Telegram
+    /// ownership before any SubId or configuration URL is requested, then sends the result in a separate message/file.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="cancellationToken"/> is cancelled during Telegram, database, or panel work.
+    /// </exception>
     public async Task<bool> TryHandleCallbackAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -2445,6 +2485,17 @@ public class XuiV3BotFlowService
             return true;
         }
 
+        if (callback.Action == "acfg")
+        {
+            await HandleAccountConfigsCallbackAsync(
+                botClient,
+                chatId,
+                credUser,
+                callback.ClientId,
+                cancellationToken);
+            return true;
+        }
+
         if (callback.Action == "acct")
         {
             await HandleAccountStateCallbackAsync(
@@ -2453,6 +2504,7 @@ public class XuiV3BotFlowService
                 messageId,
                 credUser,
                 callback.ClientId,
+                callback.Page ?? 0,
                 string.Equals(callback.AccountOperation, "en", StringComparison.OrdinalIgnoreCase),
                 cancellationToken);
             return true;
@@ -3322,6 +3374,22 @@ public class XuiV3BotFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// Resolves and renders paged account search results, including direct UUID and subscription-id lookups.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the current owned or tenant storefront bot.</param>
+    /// <param name="chatId">Telegram chat that receives or owns the editable search result.</param>
+    /// <param name="credUser">Bot-scoped requester whose Telegram id is used for ownership filtering.</param>
+    /// <param name="query">User-supplied account text, UUID, SubId, email, comment, or supported search fragment.</param>
+    /// <param name="page">Zero-based search-result page to render.</param>
+    /// <param name="cancellationToken">Token that cancels state persistence, panel reads, and Telegram delivery.</param>
+    /// <param name="messageId">Existing Telegram message to edit, or zero to send a separate result message.</param>
+    /// <returns>A task that completes after the search state and result UI have been delivered.</returns>
+    /// <remarks>
+    /// Normal search results are restricted to accounts owned by the requester. Direct UUID/SubId matches may retain
+    /// the legacy non-owner renewal-only behavior, but only owner matches receive the complete menu and its
+    /// configuration button. The sensitive direct identifier is never placed in the configuration callback.
+    /// </remarks>
     private async Task SendAccountSearchResultsAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -3384,7 +3452,7 @@ public class XuiV3BotFlowService
             var isOwner = ClientBelongsToUser(uuidClient, credUser.TelegramUserId);
             var text = BuildDirectSearchResultText(uuidClient, serverInfo, isOwner, "UUID", uuid);
             var keyboard = isOwner
-                ? BuildAccountSearchDetailsKeyboard(uuidClient, page, IsClientRenewable(uuidClient))
+                ? BuildAccountDetailsKeyboard(uuidClient, page, IsClientRenewable(uuidClient), fromSearch: true)
                 : BuildUuidSearchResultKeyboard(uuidClient, IsClientRenewable(uuidClient));
 
             await SendOrEditTextAsync(
@@ -3406,7 +3474,7 @@ public class XuiV3BotFlowService
                 var isOwner = ClientBelongsToUser(subIdClient, credUser.TelegramUserId);
                 var text = BuildDirectSearchResultText(subIdClient, serverInfo, isOwner, "Subscription ID", subId);
                 var keyboard = isOwner
-                    ? BuildAccountSearchDetailsKeyboard(subIdClient, page, IsClientRenewable(subIdClient))
+                    ? BuildAccountDetailsKeyboard(subIdClient, page, IsClientRenewable(subIdClient), fromSearch: true)
                     : BuildUuidSearchResultKeyboard(subIdClient, IsClientRenewable(subIdClient));
 
                 await SendOrEditTextAsync(
@@ -3540,6 +3608,21 @@ public class XuiV3BotFlowService
         }
     }
 
+    /// <summary>
+    /// Reloads one list-selected account, verifies ownership, and renders its complete source-aware action card.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the bot that received the list callback.</param>
+    /// <param name="chatId">Telegram chat containing the selected account list.</param>
+    /// <param name="messageId">List message id to edit, or zero to send a new account card.</param>
+    /// <param name="credUser">Current bot user whose Telegram id must own the panel client.</param>
+    /// <param name="clientId">Numeric panel client id selected from the account list.</param>
+    /// <param name="page">Zero-based account-list page restored by later actions.</param>
+    /// <param name="cancellationToken">Token that cancels panel lookup and Telegram delivery.</param>
+    /// <returns>A task that completes after ownership rejection or account-card delivery.</returns>
+    /// <remarks>
+    /// Ownership is rechecked after the callback is received. The resulting menu is shared with search cards but uses
+    /// list-specific renewal, mutation, state, and navigation callbacks.
+    /// </remarks>
     private async Task HandleAccountViewCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -3562,7 +3645,7 @@ public class XuiV3BotFlowService
         var serverInfo = BuildConfiguredPanelServerInfo();
         var canRenew = IsClientRenewable(client);
         var text = BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, canRenew);
-        var keyboard = BuildAccountDetailsKeyboard(client, page, credUser.IsColleague, canRenew);
+        var keyboard = BuildAccountDetailsKeyboard(client, page, canRenew);
 
         if (messageId != 0)
         {
@@ -4646,6 +4729,21 @@ public class XuiV3BotFlowService
         }
     }
 
+    /// <summary>
+    /// Reloads one search-selected account, verifies ownership, and renders the complete search action card.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the current owned or tenant storefront bot.</param>
+    /// <param name="chatId">Telegram chat containing the search result.</param>
+    /// <param name="messageId">Search message id to edit, or zero to send a new card.</param>
+    /// <param name="credUser">Current bot user whose Telegram id must own the selected panel client.</param>
+    /// <param name="clientId">Numeric panel client id selected from an owned search-result row.</param>
+    /// <param name="page">Zero-based search page restored by later actions.</param>
+    /// <param name="cancellationToken">Token that cancels panel lookup and Telegram delivery.</param>
+    /// <returns>A task that completes after ownership rejection or account-card delivery.</returns>
+    /// <remarks>
+    /// The common account keyboard selects search-specific mutation and navigation callbacks while exposing the same
+    /// safe configuration action as the account-list card.
+    /// </remarks>
     private async Task HandleAccountSearchViewCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -4672,7 +4770,7 @@ public class XuiV3BotFlowService
             messageId,
             BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
             ParseMode.Html,
-            BuildAccountSearchDetailsKeyboard(client, page, IsClientRenewable(client)),
+            BuildAccountDetailsKeyboard(client, page, IsClientRenewable(client), fromSearch: true),
             cancellationToken);
     }
 
@@ -4874,6 +4972,22 @@ public class XuiV3BotFlowService
             cancellationToken);
     }
 
+    /// <summary>
+    /// Enables or disables an ownership-verified search result and rebuilds the same complete search account card.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the bot that received the search-state callback.</param>
+    /// <param name="chatId">Telegram chat containing the selected account card.</param>
+    /// <param name="messageId">Account-card message id to edit, or zero to send a new card.</param>
+    /// <param name="credUser">Current bot user whose Telegram id must own the panel client.</param>
+    /// <param name="clientId">Numeric XUI client id selected from the search result.</param>
+    /// <param name="page">Zero-based search page retained by the rebuilt action menu.</param>
+    /// <param name="enable"><c>true</c> to enable the account; <c>false</c> to disable it.</param>
+    /// <param name="cancellationToken">Token that cancels panel, audit-log, and Telegram operations.</param>
+    /// <returns>A task that completes after rejection, panel failure, or updated-card delivery.</returns>
+    /// <remarks>
+    /// Ownership is revalidated before the panel mutation. Wallets, orders, and conversation state are unchanged. On
+    /// success the shared menu preserves search navigation and restores configuration retrieval for either state.
+    /// </remarks>
     private async Task HandleAccountSearchStateCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -4909,7 +5023,7 @@ public class XuiV3BotFlowService
                 chatId,
                 messageId,
                 $"متاسفانه عملیات مورد نظر انجام نشد.\n{updateResponse.Msg}",
-                replyMarkup: BuildAccountSearchDetailsKeyboard(client, page, IsClientRenewable(client)),
+                replyMarkup: BuildAccountDetailsKeyboard(client, page, IsClientRenewable(client), fromSearch: true),
                 cancellationToken: cancellationToken);
             return;
         }
@@ -4934,7 +5048,7 @@ public class XuiV3BotFlowService
             messageId,
             BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
             ParseMode.Html,
-            BuildAccountSearchDetailsKeyboard(client, page, IsClientRenewable(client)),
+            BuildAccountDetailsKeyboard(client, page, IsClientRenewable(client), fromSearch: true),
             cancellationToken);
     }
 
@@ -4990,6 +5104,25 @@ public class XuiV3BotFlowService
             cancellationToken);
     }
 
+    /// <summary>
+    /// Updates one ownership-verified account comment and sends a refreshed card with the common action menu.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the current owned or tenant storefront bot.</param>
+    /// <param name="chatId">Telegram chat that receives the result card.</param>
+    /// <param name="messageId">Source message id retained for flow context; the success result is sent separately.</param>
+    /// <param name="credUser">Current bot user whose Telegram id must own the panel client.</param>
+    /// <param name="clientId">Numeric XUI client id saved by the comment flow.</param>
+    /// <param name="page">Zero-based list or search page restored by the refreshed menu.</param>
+    /// <param name="fromSearch"><c>true</c> for search callbacks; <c>false</c> for account-list callbacks.</param>
+    /// <param name="newComment">Validated non-empty customer comment text to merge with bot metadata.</param>
+    /// <param name="mainReplyMarkup">Fallback main-menu keyboard used when ownership or panel update fails.</param>
+    /// <param name="cancellationToken">Token that cancels panel, audit-log, and Telegram operations.</param>
+    /// <returns>A task that completes after rejection, panel failure, or refreshed-card delivery.</returns>
+    /// <remarks>
+    /// The panel client is reloaded and ownership is checked before update. Bot metadata is preserved by the payload
+    /// builder. A successful card uses the common menu, preserving the original list/search navigation and exposing
+    /// configuration retrieval without placing the account's SubId or URLs in callback data.
+    /// </remarks>
     private async Task ApplyAccountCommentAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -5046,10 +5179,283 @@ public class XuiV3BotFlowService
             text: "✅ کامنت اکانت با موفقیت تغییر کرد.\n\n" +
                   BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
             parseMode: ParseMode.Html,
-            replyMarkup: fromSearch
-                ? BuildAccountSearchDetailsKeyboard(client, page, IsClientRenewable(client))
-                : BuildAccountDetailsKeyboard(client, page, credUser.IsColleague, IsClientRenewable(client)),
+            replyMarkup: BuildAccountDetailsKeyboard(
+                client,
+                page,
+                IsClientRenewable(client),
+                fromSearch),
             cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Retrieves and delivers the protocol configuration URLs for one account owned by the current Telegram user.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned or tenant bot that received the account callback.</param>
+    /// <param name="chatId">Telegram chat that receives a separate configuration message or UTF-8 document.</param>
+    /// <param name="credUser">
+    /// Bot-scoped credential record for the requesting customer. Its numeric Telegram id is the ownership boundary.
+    /// </param>
+    /// <param name="clientId">
+    /// Numeric XUI client id carried by the callback. The value is not trusted until the panel client is reloaded and
+    /// matched to <paramref name="credUser"/>.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels panel reads and Telegram delivery.</param>
+    /// <returns>A task that completes after a safe rejection, explanatory empty result, message, or document is sent.</returns>
+    /// <remarks>
+    /// This operation is read-only: it does not change conversation state, wallet balances, orders, or panel clients.
+    /// It first uses the client's private SubId with the panel subLinks endpoint, then falls back to the email links
+    /// endpoint when SubId is absent or the first endpoint fails or returns no URLs. Neither SubId nor returned URLs,
+    /// bearer tokens, response bodies, or request URIs are written to callbacks or logs. A forged callback for another
+    /// Telegram owner is rejected before either link endpoint is called.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="cancellationToken"/> is cancelled so receiver shutdown is not reported as a
+    /// customer-visible panel failure.
+    /// </exception>
+    private async Task HandleAccountConfigsCallbackAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        CredUser credUser,
+        int? clientId,
+        CancellationToken cancellationToken)
+    {
+        XuiV3Client client;
+        try
+        {
+            client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                "XUI v3 account ownership lookup failed before configuration retrieval. clientId={ClientId}, failureType={FailureType}",
+                clientId,
+                ex.GetType().Name);
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: "دریافت اطلاعات اکانت موقتاً انجام نشد. لطفاً کمی بعد دوباره تلاش کنید.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (client == null)
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var serverInfo = BuildConfiguredPanelServerInfo();
+        var links = new List<string>();
+
+        // These identifier-bearing reads use one attempt so the shared retry diagnostic never records SubId/email URI.
+        if (!string.IsNullOrWhiteSpace(client.SubId))
+        {
+            try
+            {
+                var subLinksResponse = await ApiServicev3.GetClientSubLinksAsync(
+                    serverInfo,
+                    _configuration,
+                    client.SubId,
+                    cancellationToken,
+                    suppressIdentifierBearingRetryLogs: true);
+                if (subLinksResponse.Success)
+                {
+                    links = NormalizeAccountConfigLinks(subLinksResponse.Obj);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "XUI v3 account subLinks request was unsuccessful. clientId={ClientId}, failureType={FailureType}",
+                        client.Id,
+                        "panel_response");
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Deliberately log only the exception type and numeric client id: the request path contains SubId.
+                _logger.LogWarning(
+                    "XUI v3 account subLinks request failed. clientId={ClientId}, failureType={FailureType}",
+                    client.Id,
+                    ex.GetType().Name);
+            }
+        }
+
+        if (links.Count == 0)
+        {
+            if (string.IsNullOrWhiteSpace(client.Email))
+            {
+                _logger.LogWarning(
+                    "XUI v3 account links fallback skipped because the owned client has no email. clientId={ClientId}",
+                    client.Id);
+                await botClient.SendTextMessageAsync(
+                    chatId: chatId,
+                    text: "این اکانت شناسهٔ معتبری برای دریافت کانفیگ ندارد.",
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            try
+            {
+                var emailLinksResponse = await ApiServicev3.GetClientLinksAsync(
+                    serverInfo,
+                    _configuration,
+                    client.Email,
+                    cancellationToken,
+                    suppressIdentifierBearingRetryLogs: true);
+                if (!emailLinksResponse.Success)
+                {
+                    _logger.LogWarning(
+                        "XUI v3 account links fallback was unsuccessful. clientId={ClientId}, failureType={FailureType}",
+                        client.Id,
+                        "panel_response");
+                    await botClient.SendTextMessageAsync(
+                        chatId: chatId,
+                        text: "دریافت کانفیگ‌ها موقتاً انجام نشد. لطفاً کمی بعد دوباره تلاش کنید.",
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                links = NormalizeAccountConfigLinks(emailLinksResponse.Obj);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Do not attach the exception object: its private diagnostic properties may include the email path.
+                _logger.LogWarning(
+                    "XUI v3 account links fallback failed. clientId={ClientId}, failureType={FailureType}",
+                    client.Id,
+                    ex.GetType().Name);
+                await botClient.SendTextMessageAsync(
+                    chatId: chatId,
+                    text: "دریافت کانفیگ‌ها موقتاً انجام نشد. لطفاً کمی بعد دوباره تلاش کنید.",
+                    cancellationToken: cancellationToken);
+                return;
+            }
+        }
+
+        if (links.Count == 0)
+        {
+            var emptyText = client.Enable
+                ? "پنل برای این اکانت هیچ کانفیگ فعالی برنگرداند. ممکن است اکانت هنوز به ورودی فعالی متصل نباشد."
+                : "این اکانت غیرفعال است و پنل کانفیگ فعالی برای آن برنگرداند. ابتدا اکانت را فعال کنید و دوباره تلاش کنید.";
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: emptyText,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var html = BuildAccountConfigsHtml(client.Email, links);
+        if (html.Length <= MaxAccountConfigsHtmlLength)
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId,
+                text: html,
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var documentBytes = Encoding.UTF8.GetBytes(string.Join(Environment.NewLine, links));
+        await using var documentStream = new MemoryStream(documentBytes, writable: false);
+        await botClient.SendDocumentAsync(
+            chatId: chatId,
+            document: InputFile.FromStream(documentStream, $"configs-{client.Id}.txt"),
+            caption: "📥 <b>کانفیگ‌های اکانت</b>\n" +
+                     $"اکانت: <code>{Html(client.Email)}</code>\n" +
+                     $"تعداد: <code>{links.Count}</code>\n\n" +
+                     "به‌دلیل طول زیاد، کانفیگ‌ها در فایل UTF-8 ارسال شدند.",
+            parseMode: ParseMode.Html,
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Normalizes panel configuration URLs while preserving their original order.
+    /// </summary>
+    /// <param name="links">
+    /// Raw URL collection returned by an authenticated XUI endpoint. The collection and its items may be null or blank.
+    /// </param>
+    /// <returns>
+    /// A new list containing trimmed, non-empty, ordinally distinct URLs in first-seen panel order. The list may be
+    /// empty and must be treated as a normal panel result rather than exposing the raw provider response.
+    /// </returns>
+    /// <remarks>
+    /// Ordinal comparison is intentional because proxy URLs and their encoded fragments are case-sensitive payloads.
+    /// The returned values remain sensitive customer configurations and must not be logged.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var links = NormalizeAccountConfigLinks(new[] { " vless://one ", "vless://one", "vmess://two" });
+    /// // links contains vless://one followed by vmess://two.
+    /// </code>
+    /// </example>
+    private static List<string> NormalizeAccountConfigLinks(IEnumerable<string> links)
+    {
+        var normalized = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var link in links ?? Enumerable.Empty<string>())
+        {
+            var value = link?.Trim();
+            if (!string.IsNullOrWhiteSpace(value) && seen.Add(value))
+                normalized.Add(value);
+        }
+
+        return normalized;
+    }
+
+    /// <summary>
+    /// Formats a copy-safe Telegram HTML message containing all normalized configuration URLs for one account.
+    /// </summary>
+    /// <param name="email">Panel client email/name shown as the account label; it may contain HTML-sensitive text.</param>
+    /// <param name="links">
+    /// Ordered, normalized proxy URLs. Callers must provide at least one item and must not log the collection.
+    /// </param>
+    /// <returns>
+    /// Telegram-safe HTML with the account label and every URL escaped inside a separate <c>&lt;code&gt;</c> block.
+    /// The caller must compare its length with <see cref="MaxAccountConfigsHtmlLength"/> before sending.
+    /// </returns>
+    /// <remarks>
+    /// HTML escaping prevents account names and URL query fragments from changing Telegram markup while preserving
+    /// the decoded, copyable URL displayed to the customer.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var html = BuildAccountConfigsHtml("sample", new[] { "vless://id@example.test?x=1&amp;y=2" });
+    /// </code>
+    /// </example>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="links"/> is <c>null</c>.</exception>
+    private static string BuildAccountConfigsHtml(string email, IReadOnlyList<string> links)
+    {
+        ArgumentNullException.ThrowIfNull(links);
+
+        var builder = new StringBuilder();
+        builder.AppendLine("📥 <b>کانفیگ‌های اکانت</b>");
+        builder.AppendLine($"اکانت: <code>{Html(email)}</code>");
+        builder.AppendLine($"تعداد: <code>{links.Count}</code>");
+        builder.AppendLine();
+
+        for (var index = 0; index < links.Count; index++)
+        {
+            builder.AppendLine($"<b>{index + 1}</b>");
+            builder.AppendLine($"<code>{Html(links[index])}</code>");
+            if (index < links.Count - 1)
+                builder.AppendLine();
+        }
+
+        return builder.ToString();
     }
 
     private async Task<XuiV3Client> GetOwnedClientByIdAsync(
@@ -5206,45 +5612,118 @@ public class XuiV3BotFlowService
         return new InlineKeyboardMarkup(rows);
     }
 
-    private static InlineKeyboardMarkup BuildAccountDetailsKeyboard(XuiV3Client client, int page, bool isColleague, bool canRenew)
+    /// <summary>
+    /// Builds the complete owned-account action menu for both list and search result cards.
+    /// </summary>
+    /// <param name="client">
+    /// Panel client already verified as belonging to the Telegram user who will receive the keyboard.
+    /// </param>
+    /// <param name="page">
+    /// Zero-based source page restored by subsequent account actions. Negative values are normalized by callback
+    /// builders.
+    /// </param>
+    /// <param name="canRenew">
+    /// <c>true</c> when the client's inbound belongs to an enabled service plan and renewal may be offered.
+    /// </param>
+    /// <param name="fromSearch">
+    /// <c>true</c> when the card came from account search; <c>false</c> when it came from the paged account list.
+    /// This selects source-aware mutation and navigation callbacks without changing the available account actions.
+    /// </param>
+    /// <returns>
+    /// A Telegram inline keyboard with renewal when allowed, read-only configuration retrieval, account mutations,
+    /// state toggle, and source-appropriate navigation rows.
+    /// </returns>
+    /// <remarks>
+    /// Configuration retrieval is deliberately available for both active and inactive owned accounts. This builder
+    /// never establishes authorization by itself; every callback handler reloads the numeric client id and rechecks
+    /// Telegram ownership before reading or changing panel data. UUID/SubId results that are not owned by the current
+    /// user continue to use the restricted search keyboard and therefore never receive this action menu.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="client"/> is <c>null</c>.</exception>
+    /// <example>
+    /// <code>
+    /// var keyboard = BuildAccountDetailsKeyboard(client, page: 1, canRenew: true, fromSearch: true);
+    /// </code>
+    /// </example>
+    private static InlineKeyboardMarkup BuildAccountDetailsKeyboard(
+        XuiV3Client client,
+        int page,
+        bool canRenew,
+        bool fromSearch = false)
     {
+        ArgumentNullException.ThrowIfNull(client);
+
         var rows = new List<InlineKeyboardButton[]>();
         if (canRenew)
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", XuiV3PurchaseCallbacks.AccountRenew(client.Id, page)) });
+        {
+            var renewCallback = fromSearch
+                ? XuiV3PurchaseCallbacks.AccountSearchRenew(client.Id, page)
+                : XuiV3PurchaseCallbacks.AccountRenew(client.Id, page);
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", renewCallback) });
+        }
 
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تغییر لینک", XuiV3PurchaseCallbacks.AccountChangeLink(client.Id, page)) });
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تغییر کامنت", XuiV3PurchaseCallbacks.AccountComment(client.Id, page)) });
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("حذف همین اکانت", XuiV3PurchaseCallbacks.AccountDeleteAsk(client.Id, page)) });
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData(
+                "دریافت کانفیگ‌ها",
+                XuiV3PurchaseCallbacks.AccountConfigs(client.Id))
+        });
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData(
+                "تغییر لینک",
+                fromSearch
+                    ? XuiV3PurchaseCallbacks.AccountSearchChangeLink(client.Id, page)
+                    : XuiV3PurchaseCallbacks.AccountChangeLink(client.Id, page))
+        });
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData(
+                "تغییر کامنت",
+                fromSearch
+                    ? XuiV3PurchaseCallbacks.AccountSearchComment(client.Id, page)
+                    : XuiV3PurchaseCallbacks.AccountComment(client.Id, page))
+        });
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData(
+                "حذف همین اکانت",
+                fromSearch
+                    ? XuiV3PurchaseCallbacks.AccountSearchDeleteAsk(client.Id, page)
+                    : XuiV3PurchaseCallbacks.AccountDeleteAsk(client.Id, page))
+        });
 
         var actionText = client.Enable ? "غیرفعال کردن" : "فعال کردن";
-        var callbackData = client.Enable
-            ? XuiV3PurchaseCallbacks.AccountState(client.Id, false)
-            : XuiV3PurchaseCallbacks.AccountState(client.Id, true);
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData(actionText, callbackData) });
+        var stateCallback = fromSearch
+            ? XuiV3PurchaseCallbacks.AccountSearchState(client.Id, !client.Enable, page)
+            : XuiV3PurchaseCallbacks.AccountState(client.Id, !client.Enable, page);
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData(actionText, stateCallback) });
 
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به لیست", XuiV3PurchaseCallbacks.AccountList(page)) });
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) });
-        return new InlineKeyboardMarkup(rows);
-    }
+        if (fromSearch)
+        {
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    "بازگشت به نتایج جستجو",
+                    XuiV3PurchaseCallbacks.AccountSearchList(page))
+            });
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("بازگشت به لیست کلی", XuiV3PurchaseCallbacks.AccountList(0))
+            });
+        }
+        else
+        {
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("بازگشت به لیست", XuiV3PurchaseCallbacks.AccountList(page))
+            });
+        }
 
-    private static InlineKeyboardMarkup BuildAccountSearchDetailsKeyboard(XuiV3Client client, int page, bool canRenew)
-    {
-        var rows = new List<InlineKeyboardButton[]>();
-        if (canRenew)
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تمدید اکانت", XuiV3PurchaseCallbacks.AccountSearchRenew(client.Id, page)) });
-
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تغییر لینک", XuiV3PurchaseCallbacks.AccountSearchChangeLink(client.Id, page)) });
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("تغییر کامنت", XuiV3PurchaseCallbacks.AccountSearchComment(client.Id, page)) });
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("حذف همین اکانت", XuiV3PurchaseCallbacks.AccountSearchDeleteAsk(client.Id, page)) });
-
-        var actionText = client.Enable ? "غیرفعال کردن" : "فعال کردن";
-        var callbackData = client.Enable
-            ? XuiV3PurchaseCallbacks.AccountSearchState(client.Id, false, page)
-            : XuiV3PurchaseCallbacks.AccountSearchState(client.Id, true, page);
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData(actionText, callbackData) });
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به نتایج جستجو", XuiV3PurchaseCallbacks.AccountSearchList(page)) });
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به لیست کلی", XuiV3PurchaseCallbacks.AccountList(0)) });
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) });
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home())
+        });
         return new InlineKeyboardMarkup(rows);
     }
 
@@ -5283,6 +5762,23 @@ public class XuiV3BotFlowService
         });
     }
 
+    /// <summary>
+    /// Sends a sequence of prefiltered owned account cards using the same complete action keyboard as paged lists.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned or tenant bot receiving the account-status request.</param>
+    /// <param name="chatId">Telegram chat that receives the heading and one message per account.</param>
+    /// <param name="isColleague">Whether colleague-specific account presentation rules apply to card text.</param>
+    /// <param name="serverInfo">Configured XUI server used to build each displayed subscription link.</param>
+    /// <param name="clients">
+    /// Clients already filtered to the requesting Telegram owner. The collection may be empty but must not include
+    /// accounts belonging to another user because the full action keyboard assumes an owned card.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels Telegram delivery.</param>
+    /// <returns>A task that completes after the heading and all account cards have been sent.</returns>
+    /// <remarks>
+    /// This presentation helper performs no panel read or mutation. Callback handlers still revalidate ownership when
+    /// a button is clicked, including the read-only configuration action available to active and inactive accounts.
+    /// </remarks>
     private async Task SendV3AccountsInfoAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -5302,7 +5798,7 @@ public class XuiV3BotFlowService
                 chatId: chatId,
                 text: BuildV3ClientInfo(client, serverInfo, isColleague, IsClientRenewable(client)),
                 parseMode: ParseMode.Html,
-                replyMarkup: BuildV3AccountKeyboard(client, isColleague),
+                replyMarkup: BuildAccountDetailsKeyboard(client, 0, IsClientRenewable(client)),
                 cancellationToken: cancellationToken);
         }
     }
@@ -8990,35 +9486,34 @@ public class XuiV3BotFlowService
         return text.ToString();
     }
 
-    private static InlineKeyboardMarkup BuildV3AccountKeyboard(XuiV3Client client, bool isColleague)
-    {
-        if (client == null || client.Id <= 0)
-            return null;
-
-        var actionText = client.Enable ? "🚫 غیرفعال کردن" : "✅ فعال کردن";
-        var callbackData = client.Enable
-            ? XuiV3PurchaseCallbacks.AccountState(client.Id, false)
-            : XuiV3PurchaseCallbacks.AccountState(client.Id, true);
-
-        return new InlineKeyboardMarkup(new[]
-        {
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData(actionText, callbackData)
-            },
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home())
-            }
-        });
-    }
-
+    /// <summary>
+    /// Enables or disables an owned XUI client and rebuilds its complete account card on the originating list page.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned or tenant bot that received the callback.</param>
+    /// <param name="chatId">Telegram chat containing the account card to update.</param>
+    /// <param name="messageId">Message id of the account card, or zero when a new card must be sent.</param>
+    /// <param name="credUser">
+    /// Bot-scoped credential record for the Telegram user. Its Telegram id is used to revalidate account ownership.
+    /// </param>
+    /// <param name="clientId">Numeric panel client id from the callback; a missing or non-positive value is rejected.</param>
+    /// <param name="page">
+    /// Zero-based owned-account list page restored after the panel mutation. Legacy callbacks use page zero.
+    /// </param>
+    /// <param name="enable"><c>true</c> to enable the client; <c>false</c> to disable it.</param>
+    /// <param name="cancellationToken">Token that cancels panel, activity-log, and Telegram operations.</param>
+    /// <returns>A task that completes after rejection or after the updated account card has been delivered.</returns>
+    /// <remarks>
+    /// The method reloads the panel client list and checks Telegram ownership before mutation. A successful update
+    /// keeps the account card on its previous page and restores the same full action menu, including read-only
+    /// configuration retrieval. It does not change wallet, order, renewal, or conversation-state records.
+    /// </remarks>
     private async Task HandleAccountStateCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
         int messageId,
         CredUser credUser,
         int? clientId,
+        int page,
         bool enable,
         CancellationToken cancellationToken)
     {
@@ -9101,7 +9596,10 @@ public class XuiV3BotFlowService
 
             client.Enable = enable;
             var updatedText = BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client));
-            var updatedKeyboard = BuildV3AccountKeyboard(client, credUser.IsColleague);
+            var updatedKeyboard = BuildAccountDetailsKeyboard(
+                client,
+                page,
+                IsClientRenewable(client));
 
             if (messageId != 0)
             {

@@ -1604,6 +1604,14 @@ public class XuiV3BulkCreationFailure
     public string Message { get; set; }
 }
 
+/// <summary>
+/// Builds and parses compact Telegram callback payloads for XUI v3 purchase, renewal, and account-management actions.
+/// </summary>
+/// <remarks>
+/// Callback values are transport identifiers, never authorization. Handlers must revalidate bot context, Telegram
+/// ownership, current plan configuration, and persisted state before reading private panel data or applying a side
+/// effect. Account configuration callbacks contain only a numeric client id and never SubId or protocol URLs.
+/// </remarks>
 public static class XuiV3PurchaseCallbacks
 {
     private const string Prefix = "x3";
@@ -1691,9 +1699,52 @@ public static class XuiV3PurchaseCallbacks
         return $"{Prefix}:cnt:{Math.Max(1, Math.Min(count, XuiV3PurchaseService.MaxBulkAccountCount))}";
     }
 
-    public static string AccountState(int clientId, bool enable)
+    /// <summary>
+    /// Builds an owned-account enable or disable callback that preserves the originating list page.
+    /// </summary>
+    /// <param name="clientId">
+    /// Stable numeric XUI client identifier from the authenticated panel client list. Must be positive.
+    /// </param>
+    /// <param name="enable"><c>true</c> to enable the account; <c>false</c> to disable it.</param>
+    /// <param name="page">
+    /// Zero-based page of the owned-account list that should be restored after the panel operation.
+    /// Negative values are normalized to zero.
+    /// </param>
+    /// <returns>Compact callback data containing only the operation, numeric client id, and UI page.</returns>
+    /// <remarks>
+    /// Older Telegram messages may omit the page segment. <see cref="TryParse"/> continues to accept that shape,
+    /// and the dispatcher restores page zero. The callback does not prove ownership; handlers must reload the client
+    /// and verify its Telegram owner before changing panel state.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var callback = XuiV3PurchaseCallbacks.AccountState(client.Id, enable: false, page: 2);
+    /// </code>
+    /// </example>
+    public static string AccountState(int clientId, bool enable, int page = 0)
     {
-        return $"{Prefix}:acct:{(enable ? "en" : "dis")}:{clientId}";
+        return $"{Prefix}:acct:{(enable ? "en" : "dis")}:{clientId}:{Math.Max(0, page)}";
+    }
+
+    /// <summary>
+    /// Builds the read-only callback used to retrieve protocol configuration URLs for one owned account.
+    /// </summary>
+    /// <param name="clientId">
+    /// Stable numeric XUI client identifier from the panel client list. Must be positive.
+    /// </param>
+    /// <returns>A short callback that contains the numeric client id and never contains SubId or proxy URLs.</returns>
+    /// <remarks>
+    /// The receiving handler must reload the client and enforce Telegram ownership before requesting any links from
+    /// the panel. This callback intentionally carries no panel credential, subscription id, email, or configuration.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var callback = XuiV3PurchaseCallbacks.AccountConfigs(client.Id);
+    /// </code>
+    /// </example>
+    public static string AccountConfigs(int clientId)
+    {
+        return $"{Prefix}:acfg:{clientId}";
     }
 
     public static string AccountList(int page)
@@ -1822,6 +1873,8 @@ public static class XuiV3PurchaseCallbacks
     /// URLs, UUIDs, credentials, or a newly generated identity and therefore cannot independently replay a mutation.
     /// Purchase callbacks may carry a <c>days-N</c> duration key, but parsing does not establish eligibility; callers
     /// must resolve it against the current custom-duration configuration before any financial or XUI operation.
+    /// Account-configuration callbacks carry only the numeric client id. Parsing does not establish Telegram ownership,
+    /// and legacy <c>acct</c> state callbacks without a page segment remain valid with a null page restored as zero.
     /// </remarks>
     public static bool TryParse(string callbackData, out XuiV3PurchaseCallback callback)
     {
@@ -1844,6 +1897,14 @@ public static class XuiV3PurchaseCallbacks
         {
             callback.AccountOperation = parts[2];
             if (int.TryParse(parts[3], out var clientId))
+                callback.ClientId = clientId;
+            if (parts.Length >= 5 && int.TryParse(parts[4], out var page))
+                callback.Page = page;
+        }
+
+        if (callback.Action == "acfg" && parts.Length >= 3)
+        {
+            if (int.TryParse(parts[2], out var clientId))
                 callback.ClientId = clientId;
         }
 
@@ -1961,7 +2022,10 @@ public class XuiV3PurchaseCallback
     public string AccountOperation { get; set; }
     /// <summary>Stable numeric XUI client id selected by list/search actions.</summary>
     public int? ClientId { get; set; }
-    /// <summary>Zero-based UI page restored after an account action.</summary>
+    /// <summary>
+    /// Zero-based UI page restored after an account action, or <c>null</c> for legacy state callbacks that default to
+    /// page zero in the dispatcher.
+    /// </summary>
     public int? Page { get; set; }
     /// <summary>Selected traffic in GB for metered purchase/renewal actions.</summary>
     public int? TrafficGb { get; set; }
