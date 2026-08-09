@@ -457,12 +457,74 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
-    /// Routes callbacks and messages to tenant storefront flows, owned-wallet shortcuts, owner tenant configuration,
-    /// user XuiV3 flows, super-admin flows, payment return handlers, and legacy menus.
+    /// Clears transient conversation data for one Telegram user in the currently active bot runtime.
     /// </summary>
-    /// <param name="botClient">Telegram client for the current bot.</param>
-    /// <param name="update">Telegram update being routed.</param>
-    /// <param name="cancellationToken">Cancellation token from polling.</param>
+    /// <param name="telegramUserId">
+    /// Positive Telegram user id taken from the incoming message sender. The active <see cref="BotContextAccessor"/>
+    /// supplies the owned or tenant bot id that scopes both state stores.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Polling cancellation token checked before the users.db operation. The legacy state API does not accept a token,
+    /// so cancellation requested during its short serialized write is observed by the outer update handler afterward.
+    /// </param>
+    /// <returns>A task that completes after persisted state is cleared and the in-memory XUI selection is removed.</returns>
+    /// <remarks>
+    /// This is a conversation cancellation, not a financial cancellation. It keeps credentials, wallet balances,
+    /// ledger rows, payment records, tenant orders, referral relationships, XUI accounts, free-trial timestamps, and
+    /// long-lived counters unchanged. Both stores are bot-scoped, so resetting one storefront does not affect the same
+    /// Telegram user in another bot. The method may create an empty bot-state row when none existed, matching the
+    /// established <see cref="UserDbContext.ClearUserStatus(User)"/> behavior.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// await ResetCurrentBotConversationAsync(message.From.Id, cancellationToken);
+    /// </code>
+    /// </example>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="telegramUserId"/> is zero or negative, which indicates the caller did not use a
+    /// Telegram update sender id.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">
+    /// Thrown when <paramref name="cancellationToken"/> is already cancelled before the users.db write starts.
+    /// </exception>
+    private async Task ResetCurrentBotConversationAsync(long telegramUserId, CancellationToken cancellationToken)
+    {
+        if (telegramUserId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(telegramUserId), "A positive Telegram user id is required.");
+
+        cancellationToken.ThrowIfCancellationRequested();
+        await _userDbContext.ClearUserStatus(new User { Id = telegramUserId });
+        _xuiV3PurchaseSessionStore.Clear(telegramUserId);
+    }
+
+    /// <summary>
+    /// Routes callbacks and messages to tenant storefront flows, owned-wallet shortcuts, owner tenant configuration,
+    /// user XuiV3 flows, super-admin flows, payment return handlers, and legacy menus while giving navigation reset
+    /// commands priority over every conversation state machine.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram client belonging to the active runtime bot that received the update. It is used only for that bot's
+    /// callbacks, messages, membership checks, and menus.
+    /// </param>
+    /// <param name="update">
+    /// Raw Telegram update from polling. Message sender ids are Telegram user ids; callback sender ids are never
+    /// substituted from persisted state.
+    /// </param>
+    /// <param name="cancellationToken">Polling cancellation token for database, Telegram, payment, and XUI work.</param>
+    /// <returns>A task that completes after the update is consumed or deliberately ignored.</returns>
+    /// <remarks>
+    /// Valid <c>/start</c> commands for owned and tenant bots, plus <c>/refresh</c> for owned bots, clear the current
+    /// bot/user conversation row and in-memory XUI purchase selection immediately after activity logging. The reset
+    /// happens before blocked-user and forced-join responses, but those access policies still decide whether a home
+    /// menu can be displayed. Reset never mutates credentials, wallet balances, ledgers, payments, orders, referrals,
+    /// XUI accounts, or another bot's state. Known payment and referral start payloads continue through their existing
+    /// handlers after the transient reset.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// await HandleUpdateCoreAsync(botClient, update, cancellationToken);
+    /// </code>
+    /// </example>
     private async Task HandleUpdateCoreAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
         if (_salesAssistantService.IsAssistantBot)
@@ -547,6 +609,28 @@ public class TelegramBotService : IHostedService
 
         await _userActivityLog.LogMessageAsync(message, messageCredUser, isSuperAdmin, cancellationToken);
 
+        var currentBotType = CurrentBot?.Type ?? BotContextAccessor.CurrentBotType;
+        var isTenantBot = string.Equals(currentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase);
+        var isOwnedBot = string.Equals(currentBotType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase) ||
+                         string.IsNullOrWhiteSpace(currentBotType);
+        var currentBotUsername = CurrentBot?.Username ?? BotContextAccessor.CurrentBotUsername;
+        var hasNavigationCommand = TelegramNavigationCommandParser.TryParse(
+            message.Text,
+            currentBotUsername,
+            allowRefresh: isOwnedBot,
+            out var navigationCommand);
+        var isOwnedPaymentReturn = isOwnedBot && TryParseNowPaymentsReturnCommand(
+            message.Text,
+            currentBotUsername,
+            out _);
+
+        if (hasNavigationCommand || isOwnedPaymentReturn)
+        {
+            // Both stores derive their key from the active BotContext, so this cannot clear the same Telegram user's
+            // independent flow in another owned brand or tenant storefront.
+            await ResetCurrentBotConversationAsync(message.From.Id, cancellationToken);
+        }
+
         if (!isSuperAdmin && messageCredUser?.IsBlocked == true)
         {
             await SendBlockedUserMessageAsync(botClient, message.Chat.Id, cancellationToken);
@@ -554,18 +638,12 @@ public class TelegramBotService : IHostedService
         }
 
         // Tenant bots answer as storefronts only; they do not expose the main brand menus.
-        if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
+        if (isTenantBot)
         {
             var tenantUserState = await _userDbContext.GetUserStatus(message.From.Id);
             await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, messageCredUser, tenantUserState, cancellationToken);
             return;
         }
-
-        if (isSuperAdmin && await TryHandleUsageStatisticsCommandAsync(botClient, message, cancellationToken))
-            return;
-
-        if (isSuperAdmin && await TryHandleUserActivityLogCommandAsync(botClient, message, messageCredUser, cancellationToken))
-            return;
 
         if (await TryHandleNowPaymentsReturnStartAsync(
             botClient,
@@ -576,6 +654,21 @@ public class TelegramBotService : IHostedService
         {
             return;
         }
+
+        if (isSuperAdmin && hasNavigationCommand)
+        {
+            await botClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "Main Menu",
+                replyMarkup: GetMainMenuKeyboard());
+            return;
+        }
+
+        if (isSuperAdmin && await TryHandleUsageStatisticsCommandAsync(botClient, message, cancellationToken))
+            return;
+
+        if (isSuperAdmin && await TryHandleUserActivityLogCommandAsync(botClient, message, messageCredUser, cancellationToken))
+            return;
 
         // Super-admin messages bypass the regular customer handler. Route the owned-bot referral menu explicitly
         // before the legacy admin command chain so an administrator can use the same customer-facing dashboard.
@@ -644,25 +737,7 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-        // await ActiveBotClient.ForwardMessageAsync(
-        //             chatId: 85758085,
-        //             fromChatId: $"@kingofilter",
-        //             messageId: 54107
-        //         );
-
-        if (message.Text == "/start")
-        {
-
-            //string hamed = "✅ Account details: \n Active: *Depleted* ❗️MultiIP \n Account Name: `vniaccgF8uNAN2` \n Expiration Date: 1402 / 12 / 1 - 8:13";
-            await botClient.CustomSendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: "Main Menu",
-                replyMarkup: GetMainMenuKeyboard()
-                );
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-        }
-
-        else if (message.Text == "➕ Create New Account")
+        if (message.Text == "➕ Create New Account")
         {
             var createAccountKeyboard = GetLocationKeyboard();
 
@@ -3103,6 +3178,45 @@ public class TelegramBotService : IHostedService
                $"🧾 Order ID: <code>{orderId}</code>";
     }
 
+    /// <summary>
+    /// Handles an owned-wallet NOWPayments success or cancellation return without allowing a start payload to fall
+    /// into an unrelated customer or super-admin state machine.
+    /// </summary>
+    /// <param name="botClient">Owned bot client that received the return message and sends progress/result text.</param>
+    /// <param name="message">
+    /// Incoming Telegram message containing a validated payment return command or legacy bare return token. Its sender
+    /// id identifies the owned-wallet customer and its chat id receives the result.
+    /// </param>
+    /// <param name="credUser">
+    /// Shared credentials profile loaded for the sender. It is used only as a Telegram user-id fallback and may be
+    /// <c>null</c>; the authoritative wallet payment remains the bot-scoped users.db row.
+    /// </param>
+    /// <param name="mainReplyMarkup">Owned customer or super-admin home keyboard shown after a terminal response.</param>
+    /// <param name="cancellationToken">Token for users.db, provider inquiry, settlement, and Telegram operations.</param>
+    /// <returns>
+    /// <c>true</c> when the message is a NOWPayments return and was consumed, including when no pending row exists;
+    /// otherwise <c>false</c> so normal owned routing can continue.
+    /// </returns>
+    /// <remarks>
+    /// <see cref="HandleUpdateCoreAsync"/> clears transient bot-scoped conversation state before calling this method.
+    /// A success return is only a lookup trigger: wallet credit still requires the existing authoritative provider
+    /// verification and idempotent settlement path. A cancellation return updates only the matching pending payment
+    /// record; it does not debit or credit a wallet. Payment rows are filtered by Telegram user and active bot id so a
+    /// return link cannot settle another owned brand's invoice.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// if (await TryHandleNowPaymentsReturnStartAsync(
+    ///         botClient,
+    ///         message,
+    ///         credUser,
+    ///         mainReplyMarkup,
+    ///         cancellationToken))
+    /// {
+    ///     return;
+    /// }
+    /// </code>
+    /// </example>
     private async Task<bool> TryHandleNowPaymentsReturnStartAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -3113,10 +3227,15 @@ public class TelegramBotService : IHostedService
         if (message?.Text == null)
             return false;
 
-        var isSuccess = IsNowPaymentsSuccessStart(message.Text);
-        var isCancel = IsNowPaymentsCancelStart(message.Text);
-        if (!isSuccess && !isCancel)
+        if (!TryParseNowPaymentsReturnCommand(
+                message.Text,
+                CurrentBot?.Username ?? BotContextAccessor.CurrentBotUsername,
+                out var isSuccess))
+        {
             return false;
+        }
+
+        var isCancel = !isSuccess;
 
         var telegramUserId = message.From?.Id ?? credUser?.TelegramUserId ?? 0;
         Console.WriteLine($"[NOWPayments ReturnUrl] received start. user={telegramUserId}, chat={message.Chat.Id}, text={message.Text}, success={isSuccess}, cancel={isCancel}");
@@ -3172,28 +3291,64 @@ public class TelegramBotService : IHostedService
         return true;
     }
 
-    private static bool IsNowPaymentsSuccessStart(string text)
+    /// <summary>
+    /// Recognizes the bot-addressed NOWPayments return payloads and their retained legacy bare aliases.
+    /// </summary>
+    /// <param name="text">
+    /// Raw Telegram message text. Supported values are a start command carrying <c>payment_success</c> or
+    /// <c>payment_cancel</c>, or the legacy bare token with the same name.
+    /// </param>
+    /// <param name="currentBotUsername">
+    /// Username of the owned bot handling the message. A command with an <c>@username</c> mention must match this value.
+    /// </param>
+    /// <param name="isSuccess">
+    /// <c>true</c> for the success payload and <c>false</c> for the cancellation payload when parsing succeeds. Callers
+    /// must ignore this value when the method returns <c>false</c>.
+    /// </param>
+    /// <returns><c>true</c> for a complete supported return token; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// This method is side-effect free. It deliberately requires a token boundary so attacker-controlled values such
+    /// as <c>payment_success_fake</c> cannot trigger a provider lookup. Financial verification remains the
+    /// responsibility of <see cref="TryHandleNowPaymentsReturnStartAsync"/>.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// TryParseNowPaymentsReturnCommand("/start@ShopBot payment_success", "ShopBot", out var isSuccess);
+    /// </code>
+    /// </example>
+    private static bool TryParseNowPaymentsReturnCommand(
+        string text,
+        string currentBotUsername,
+        out bool isSuccess)
     {
-        if (string.IsNullOrWhiteSpace(text))
+        isSuccess = false;
+        var normalized = text?.Trim();
+        if (string.Equals(normalized, "payment_success", StringComparison.OrdinalIgnoreCase))
+        {
+            isSuccess = true;
+            return true;
+        }
+
+        if (string.Equals(normalized, "payment_cancel", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (!TelegramNavigationCommandParser.TryParse(
+                text,
+                currentBotUsername,
+                allowRefresh: false,
+                out var command) ||
+            command.Kind != TelegramNavigationCommandKind.Start)
+        {
             return false;
+        }
 
-        var normalized = text.Trim();
-        return normalized.Equals("/start payment_success", StringComparison.OrdinalIgnoreCase) ||
-               normalized.Equals("/start=payment_success", StringComparison.OrdinalIgnoreCase) ||
-               normalized.Equals("payment_success", StringComparison.OrdinalIgnoreCase) ||
-               normalized.StartsWith("/start payment_success", StringComparison.OrdinalIgnoreCase);
-    }
+        if (command.HasPayloadToken("payment_success"))
+        {
+            isSuccess = true;
+            return true;
+        }
 
-    private static bool IsNowPaymentsCancelStart(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-            return false;
-
-        var normalized = text.Trim();
-        return normalized.Equals("/start payment_cancel", StringComparison.OrdinalIgnoreCase) ||
-               normalized.Equals("/start=payment_cancel", StringComparison.OrdinalIgnoreCase) ||
-               normalized.Equals("payment_cancel", StringComparison.OrdinalIgnoreCase) ||
-               normalized.StartsWith("/start payment_cancel", StringComparison.OrdinalIgnoreCase);
+        return command.HasPayloadToken("payment_cancel");
     }
 
     private async Task CheckAndSettleCryptoPaymentCoreAsync(
@@ -5267,9 +5422,17 @@ public class TelegramBotService : IHostedService
     /// <param name="cancellationToken">Cancellation token for Telegram, database, payment, and XUI operations.</param>
     /// <returns>A task that completes after the matching owned-customer state transition is handled.</returns>
     /// <remarks>
-    /// Tenant storefront updates are removed by the outer dispatcher before this method runs. Legacy insufficient-wallet
-    /// branches show an inline shortcut into the same canonical charge flow used by the main reply-keyboard action.
+    /// Tenant storefront updates are removed by the outer dispatcher before this method runs. Valid <c>/start</c> and
+    /// <c>/refresh</c> commands have already cleared the current bot/user persisted state and XUI purchase session, but
+    /// this method still enforces mandatory-channel membership before displaying the owned main menu. Start referral
+    /// payloads are registered after the reset and retain their existing immutable relationship rules. Legacy
+    /// insufficient-wallet branches show an inline shortcut into the canonical main-keyboard charge flow.
     /// </remarks>
+    /// <example>
+    /// <code>
+    /// await HandleUpdateRegularUsers(botClient, update, cancellationToken);
+    /// </code>
+    /// </example>
     private async Task HandleUpdateRegularUsers(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
 
@@ -5309,8 +5472,18 @@ public class TelegramBotService : IHostedService
 
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
         var user = await _userDbContext.GetUserStatus(message.From.Id);
+        var hasNavigationCommand = TelegramNavigationCommandParser.TryParse(
+            message.Text,
+            CurrentBot?.Username ?? BotContextAccessor.CurrentBotUsername,
+            allowRefresh: true,
+            out var navigationCommand);
         ReferralRegistrationResult referralRegistration = null;
-        var isReferralStart = ReferralService.TryParseStartPayload(message.Text, out var referralCode);
+        var normalizedStartPayload = hasNavigationCommand &&
+                                     navigationCommand.Kind == TelegramNavigationCommandKind.Start &&
+                                     navigationCommand.Payload.Length > 0
+            ? $"/start {navigationCommand.Payload}"
+            : string.Empty;
+        var isReferralStart = ReferralService.TryParseStartPayload(normalizedStartPayload, out var referralCode);
         if (isReferralStart)
         {
             referralRegistration = await _referralService.RegisterRelationshipAsync(
@@ -5362,11 +5535,8 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-
-
-        if (message.Text == "/start" || isReferralStart)
+        if (hasNavigationCommand)
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
             var registrationText = BuildReferralRegistrationMessage(referralRegistration);
             await botClient.CustomSendTextMessageAsync(
                chatId: message.Chat.Id,
@@ -7909,6 +8079,22 @@ public class TelegramBotService : IHostedService
         };
     }
 
+    /// <summary>
+    /// Builds the owned-bot HTML help text describing available features and public Telegram commands.
+    /// </summary>
+    /// <param name="credUser">
+    /// Shared credentials profile of the owned-bot user requesting help. A null or non-colleague profile receives the
+    /// regular-user capability text; active colleagues receive the additional colleague section.
+    /// </param>
+    /// <returns>
+    /// Telegram-safe static HTML containing the role label, feature descriptions, command syntax, and examples. The
+    /// caller may send it to owned-bot users with <see cref="ParseMode.Html"/>; no secret or wallet value is included.
+    /// </returns>
+    /// <remarks>
+    /// The command section mirrors the owned command menu configured at runtime. Tenant storefronts use their own help
+    /// and must not expose the owned-only <c>/refresh</c> alias or colleague account commands.
+    /// </remarks>
+    /// <example><code>var helpText = BuildBotCapabilitiesMessage(credUser);</code></example>
     private static string BuildBotCapabilitiesMessage(CredUser credUser)
     {
         var roleText = credUser?.IsColleague == true ? "همکار" : "کاربر عادی";
@@ -7967,6 +8153,9 @@ public class TelegramBotService : IHostedService
         builder.AppendLine();
         builder.AppendLine("🔹 <code>/start</code>");
         builder.AppendLine("شروع مجدد ربات، پاک کردن وضعیت موقت کاربر و برگشت به منوی اصلی.");
+        builder.AppendLine();
+        builder.AppendLine("🔹 <code>/refresh</code>");
+        builder.AppendLine("تازه‌سازی ربات، پاک کردن وضعیت موقت و برگشت به منوی اصلی؛ با همان رفتار دستور /start.");
         builder.AppendLine();
         builder.AppendLine("🔹 <code>/renew_EMAIL</code>");
         builder.AppendLine("شروع تمدید اکانت با نام اکانت یا همان ایمیل.");

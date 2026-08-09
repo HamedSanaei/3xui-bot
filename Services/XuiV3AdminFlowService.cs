@@ -77,6 +77,7 @@ public class XuiV3AdminFlowService
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
     private readonly ILogger<XuiV3AdminFlowService> _logger;
     private readonly UserActivityLogService _activityLog;
+    private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
 
     /// <summary>
     /// Creates the super-admin XuiV3 flow service and injects the payment and tenant services needed by admin tools.
@@ -103,6 +104,10 @@ public class XuiV3AdminFlowService
     /// </param>
     /// <param name="logger">Service logger.</param>
     /// <param name="activityLog">File-based activity logger for admin actions.</param>
+    /// <param name="volumeReminderStateStore">
+    /// Durable users.db volume-cycle store notified after the panel accepts an admin renewal. Reminder persistence is
+    /// best-effort and never changes the account update or any financial state.
+    /// </param>
     public XuiV3AdminFlowService(
         UserDbContext userDbContext,
         CredentialsDbContext credentialsDbContext,
@@ -118,7 +123,8 @@ public class XuiV3AdminFlowService
         XuiV3PurchaseService purchaseService,
         GozargahSiteSyncService gozargahSiteSyncService,
         ILogger<XuiV3AdminFlowService> logger,
-        UserActivityLogService activityLog)
+        UserActivityLogService activityLog,
+        XuiV3VolumeReminderStateStore volumeReminderStateStore)
     {
         _userDbContext = userDbContext;
         _credentialsDbContext = credentialsDbContext;
@@ -136,6 +142,7 @@ public class XuiV3AdminFlowService
         _gozargahSiteSyncService = gozargahSiteSyncService;
         _logger = logger;
         _activityLog = activityLog;
+        _volumeReminderStateStore = volumeReminderStateStore;
     }
 
     /// <summary>
@@ -990,6 +997,23 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// Applies the super-admin's confirmed XUI v3 renewal and returns the admin to the management menu.
+    /// </summary>
+    /// <param name="botClient">Owned Telegram bot client used for progress, success, and failure messages.</param>
+    /// <param name="message">Admin confirmation message containing the actor and private chat identifiers.</param>
+    /// <param name="currentUser">
+    /// Bot-scoped admin flow state containing the target email, added traffic in GB, added duration in days, and
+    /// selected service key.
+    /// </param>
+    /// <param name="mainMenu">Super-admin reply keyboard restored when the flow finishes.</param>
+    /// <param name="cancellationToken">Token for panel, users.db, site-sync, activity-log, and Telegram operations.</param>
+    /// <returns>A task that completes after cancellation, failure, or the confirmed renewal and its audit side effects.</returns>
+    /// <remarks>
+    /// The method mutates the XUI client only after the explicit <c>Yes Renew!</c> confirmation. After the panel update
+    /// and any required counter reset succeed, it advances the volume-reminder cycle best-effort. Reminder persistence
+    /// never changes the panel outcome and has no wallet, payment, order, or ledger effect.
+    /// </remarks>
     private async Task HandleRenewConfirmAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1045,6 +1069,12 @@ public class XuiV3AdminFlowService
         }
 
         var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
+        await _volumeReminderStateStore.TryBeginNewCycleAfterRenewalAsync(
+            serverInfo,
+            client,
+            renewal,
+            trafficResetApplied,
+            cancellationToken);
         client.TotalGB = updatedClient.TotalGB;
         client.ExpiryTime = updatedClient.ExpiryTime;
         client.Comment = updatedClient.Comment;

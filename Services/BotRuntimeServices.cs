@@ -1822,7 +1822,8 @@ public class MultiBotHostedService : IHostedService
     /// </param>
     /// <param name="bot">
     /// Runtime bot configuration from the registry. Tenant storefronts receive only <c>/start</c>, while owned bots
-    /// receive the public support commands used by customers and colleagues.
+    /// receive <c>/start</c>, its <c>/refresh</c> reset alias, and the public account commands used by customers and
+    /// colleagues.
     /// </param>
     /// <param name="cancellationToken">
     /// Startup cancellation token used to abort the Telegram API call when the host is stopping.
@@ -1832,9 +1833,11 @@ public class MultiBotHostedService : IHostedService
     /// commands.
     /// </returns>
     /// <remarks>
-    /// Tenant customers already use <c>/start</c> to return to the storefront home menu. Owned bot users can also use
-    /// the command menu to return to the main menu or start account operations without relying on a persistent reply
-    /// keyboard while a purchase flow is active.
+    /// Tenant customers use only <c>/start</c> to return to the storefront home menu. Owned bot users can use either
+    /// <c>/start</c> or <c>/refresh</c> to clear bot-scoped transient state and return to their role-appropriate main
+    /// menu, or start account operations without relying on a persistent reply keyboard. Telegram receives the whole
+    /// command array atomically through <c>SetMyCommands</c> each time the bot runtime starts; this method does not
+    /// change conversation state itself.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1864,6 +1867,7 @@ public class MultiBotHostedService : IHostedService
             commands = new[]
             {
                 new BotCommand { Command = "start", Description = "شروع مجدد ربات و برگشت به منوی اصلی" },
+                new BotCommand { Command = "refresh", Description = "پاک کردن وضعیت موقت و برگشت به منوی اصلی" },
                 new BotCommand { Command = "renew_email", Description = "شروع تمدید اکانت با نام اکانت یا ایمیل" },
                 new BotCommand { Command = "enable_email", Description = "فعال کردن اکانت با نام اکانت یا ایمیل" },
                 new BotCommand { Command = "disable_email", Description = "غیرفعال کردن اکانت با نام اکانت یا ایمیل" },

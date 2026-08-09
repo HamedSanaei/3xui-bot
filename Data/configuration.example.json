@@ -55,6 +55,8 @@
   "xuiV3LinkChangeRecoveryMaxAttempts": 12,
   "xuiV3LinkChangeRecoveryMaxDelaySeconds": 900,
   "xuiV3LinkChangeLeaseSeconds": 300,
+  "volumeExpirationReminderEnabled": false,
+  "volumeExpirationReminderIntervalMinutes": 30,
   "referral": {
     "enabled": true,
     "minimumEligiblePaymentAmountToman": 100000,

@@ -47,6 +47,7 @@ class Program
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         ReferralConfigurationValidator.ValidateConfigurationAndThrow(configuration);
         ValidateXuiV3LinkChangeConfiguration(appConfig);
+        ValidateXuiV3VolumeReminderConfiguration(appConfig);
         ValidateTetraminatorConfiguration(appConfig);
 
         ConfigureDatabasePaths(builder.Environment.ContentRootPath, appConfig);
@@ -77,6 +78,7 @@ class Program
         builder.Services.AddSingleton<UsageAnalyticsService>();
         builder.Services.AddSingleton<UsageReportChartRenderer>();
         builder.Services.AddSingleton<UsageReportDispatchStore>();
+        builder.Services.AddSingleton<XuiV3VolumeReminderStateStore>();
         builder.Services.AddSingleton<WalletLedgerService>();
         builder.Services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();
         builder.Services.AddSingleton<ReferralService>();
@@ -89,6 +91,7 @@ class Program
         builder.Services.AddSingleton<XuiV3BotFlowService>();
         builder.Services.AddSingleton<XuiV3AdminFlowService>();
         builder.Services.AddHostedService<XuiV3AccountExpiryReminderService>();
+        builder.Services.AddHostedService<XuiV3VolumeExpirationReminderService>();
         builder.Services.AddHostedService<XuiV3LinkChangeRecoveryService>();
         builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
         builder.Services.AddHostedService<ReferralReconciliationHostedService>();
@@ -358,6 +361,31 @@ class Program
         ValidateRange(nameof(appConfig.XuiV3LinkChangeRecoveryMaxAttempts), appConfig.XuiV3LinkChangeRecoveryMaxAttempts, 1, 100);
         ValidateRange(nameof(appConfig.XuiV3LinkChangeRecoveryMaxDelaySeconds), appConfig.XuiV3LinkChangeRecoveryMaxDelaySeconds, 30, 86400);
         ValidateRange(nameof(appConfig.XuiV3LinkChangeLeaseSeconds), appConfig.XuiV3LinkChangeLeaseSeconds, 60, 1800);
+    }
+
+    /// <summary>
+    /// Validates the configurable complete-list scan interval for XUI v3 volume-expiration reminders.
+    /// </summary>
+    /// <param name="appConfig">
+    /// Startup configuration bound from <c>Data/configuration.json</c>. The interval is measured in whole minutes and
+    /// is validated even when the module is disabled so a later enablement cannot activate an unsafe value.
+    /// </param>
+    /// <remarks>
+    /// Values from 5 through 1440 allow responsive warnings without turning the panel clients endpoint into a
+    /// high-frequency poll. Older configurations use the documented 30-minute model default and remain disabled until
+    /// explicitly enabled.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown before database migration and hosted-service startup when the interval is outside 5 through 1440.
+    /// </exception>
+    private static void ValidateXuiV3VolumeReminderConfiguration(AppConfig appConfig)
+    {
+        ArgumentNullException.ThrowIfNull(appConfig);
+        ValidateRange(
+            nameof(appConfig.VolumeExpirationReminderIntervalMinutes),
+            appConfig.VolumeExpirationReminderIntervalMinutes,
+            5,
+            1440);
     }
 
     /// <summary>

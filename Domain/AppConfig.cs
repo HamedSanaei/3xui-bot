@@ -134,9 +134,34 @@ namespace Adminbot.Domain
         /// Exclusive processing lease, in seconds, used to prevent concurrent workers from mutating one XUI client.
         /// </summary>
         public int XuiV3LinkChangeLeaseSeconds { get; set; } = 300;
+        /// <summary>
+        /// Enables the existing once-daily time-expiry reminder for XUI v3 accounts.
+        /// </summary>
         public bool AccountExpiryReminderEnabled { get; set; } = true;
+        /// <summary>
+        /// Tehran-local whole hour, from 0 through 23, at which the time-expiry reminder runs.
+        /// </summary>
         public int AccountExpiryReminderHourIran { get; set; } = 8;
+        /// <summary>
+        /// Positive whole-day offsets before account expiry that should produce the existing time reminder.
+        /// </summary>
         public int[] AccountExpiryReminderDays { get; set; } = new[] { 7, 3, 1 };
+        /// <summary>
+        /// Enables durable 80, 90, and 99 percent XUI v3 traffic-consumption reminders.
+        /// </summary>
+        /// <remarks>
+        /// The default is disabled so older configuration files do not begin sending a new class of customer
+        /// notification until the deployment explicitly opts in.
+        /// </remarks>
+        public bool VolumeExpirationReminderEnabled { get; set; }
+        /// <summary>
+        /// Number of minutes between complete XUI v3 client-list scans for volume reminders.
+        /// </summary>
+        /// <remarks>
+        /// Valid enabled values are 5 through 1440 minutes. Each scan uses one panel list request rather than one
+        /// request per client; 30 minutes is the production default for balancing freshness and panel load.
+        /// </remarks>
+        public int VolumeExpirationReminderIntervalMinutes { get; set; } = 30;
         public string NowpaymentSuccessUrl { get; set; }
         public string NowpaymentCancelUrl { get; set; }
         public string NowpaymentIpnUrl { get; set; }

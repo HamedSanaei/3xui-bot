@@ -5,7 +5,8 @@ using System.Threading;
 /// <summary>
 /// Entity Framework context for <c>users.db</c>.
 /// It stores bot-scoped conversation state, payment metadata, tenant storefront definitions,
-/// tenant orders, tenant ledger rows, cookies, and other runtime data that must not live in <c>credentials.db</c>.
+/// tenant orders, tenant ledger rows, XUI volume-reminder cycles, cookies, and other runtime data that must not live
+/// in <c>credentials.db</c>.
 /// </summary>
 /// <remarks>
 /// Multi-instance support is implemented here by routing the legacy <see cref="User"/> state API
@@ -72,6 +73,10 @@ public class UserDbContext : DbContext
     public DbSet<XuiV3LinkChangeOperation> XuiV3LinkChangeOperations { get; set; }
     /// <summary>Durable once-per-period delivery state for aggregate weekly usage reports.</summary>
     public DbSet<UsageReportDispatch> UsageReportDispatches { get; set; }
+    /// <summary>
+    /// Durable per-panel/client cycles and Telegram delivery claims for 80/90/99 percent traffic reminders.
+    /// </summary>
+    public DbSet<XuiV3VolumeReminderState> XuiV3VolumeReminderStates { get; set; }
     public DbSet<CookieData> Cookies { get; set; }
     public DbSet<SwapinoPaymentInfo> SwapinoPaymentInfos { get; set; }
     public DbSet<HooshPayPaymentInfo> HooshPayPaymentInfos { get; set; }
@@ -153,7 +158,8 @@ public class UserDbContext : DbContext
 
     /// <summary>
     /// Defines the <c>users.db</c> schema, indexes, and field limits for payments, bot instances,
-    /// tenant orders, ledgers, bot-scoped conversation state, and idempotent scheduled-report delivery.
+    /// tenant orders, ledgers, bot-scoped conversation state, idempotent scheduled-report delivery, and durable
+    /// per-client XUI volume-reminder cycles and claims.
     /// </summary>
     /// <param name="modelBuilder">EF Core model builder used by migrations and runtime metadata.</param>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -485,6 +491,23 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.PeriodEndUtc);
         });
 
+        modelBuilder.Entity<XuiV3VolumeReminderState>(entity =>
+        {
+            entity.ToTable("XuiV3VolumeReminderStates");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.PanelKey).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.Email).IsRequired().HasMaxLength(160);
+            entity.Property(x => x.BotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.DeliveryStatus).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.LastError).HasMaxLength(2000);
+            // One durable cycle row represents one physical numeric client on one credential-free panel identity.
+            entity.HasIndex(x => new { x.PanelKey, x.ClientId }).IsUnique();
+            entity.HasIndex(x => new { x.DeliveryStatus, x.LeaseUntilUtc });
+            entity.HasIndex(x => new { x.BotId, x.TelegramUserId });
+            entity.HasIndex(x => x.LastObservedAtUtc);
+        });
+
         modelBuilder.Entity<ZibalPaymentInfo>(entity =>
         {
             entity.HasIndex(x => x.BotId);
@@ -700,11 +723,13 @@ public class UserDbContext : DbContext
 }
 
 /// <summary>
-/// Creates independent users.db contexts for financial and referral operations that may run concurrently.
+/// Creates independent users.db contexts for financial, referral, and durable background-state operations that may
+/// run concurrently.
 /// </summary>
 /// <remarks>
-/// Legacy conversation-state helpers still use the singleton context, while new financial code uses this factory
-/// so each operation owns its EF Core change tracker and can rely on database uniqueness for concurrency control.
+/// Legacy conversation-state helpers still use the singleton context, while newer financial and background workers
+/// use this factory so each operation owns its EF Core change tracker and can rely on database uniqueness for
+/// concurrency control.
 /// </remarks>
 public sealed class UserDbContextFactory
 {

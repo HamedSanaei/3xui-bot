@@ -89,6 +89,7 @@ public class TenantBotService
     private readonly UsageAnalyticsService _usageAnalyticsService;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TenantBotService> _logger;
+    private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
     private readonly Dictionary<string, TenantJoinCapabilityCacheEntry> _tenantJoinCapabilityCache = new(StringComparer.Ordinal);
     private readonly object _tenantJoinCapabilitySync = new();
 
@@ -137,6 +138,10 @@ public class TenantBotService
     /// </param>
     /// <param name="ServiceProvider">service Provider used to REACH MultiBotHostedService for runtime TOGGLE.</param>
     /// <param name="Logger">Logger used for tenant payment/audit channel logs.</param>
+    /// <param name="VolumeReminderStateStore">
+    /// Durable users.db volume-cycle store notified after a tenant renewal succeeds on the panel. Its best-effort state
+    /// update never credits or debits the tenant owner and cannot change order fulfillment.
+    /// </param>
     public TenantBotService(
         UserDbContext UserDbContext,
         CredentialsDbContext CredentialsDbContext,
@@ -157,7 +162,8 @@ public class TenantBotService
         BroadcastManager BroadcastManager,
         UsageAnalyticsService UsageAnalyticsService,
         IServiceProvider ServiceProvider,
-        ILogger<TenantBotService> Logger)
+        ILogger<TenantBotService> Logger,
+        XuiV3VolumeReminderStateStore VolumeReminderStateStore)
     {
         _userDbcontext = UserDbContext;
         _credentialsDbContext = CredentialsDbContext;
@@ -180,6 +186,7 @@ public class TenantBotService
         _usageAnalyticsService = UsageAnalyticsService;
         _serviceProvider = ServiceProvider;
         _logger = Logger;
+        _volumeReminderStateStore = VolumeReminderStateStore;
     }
 
     /// <summary>
@@ -2847,22 +2854,38 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Handles tenant customer Text messages such as /start, purchase, TARIFFS, support, and payment return payloads.
+    /// Handles tenant customer text messages such as <c>/start</c>, purchases, tariffs, support, and payment returns.
     /// </summary>
-    /// <param name="botClient">tenant Bot client.</param>
-    /// <param name="Message">Incoming customer Message.</param>
-    /// <param name="customer">Shared customer profile.</param>
+    /// <param name="botClient">
+    /// Telegram client belonging to the active tenant storefront. It must not be the default owned-bot client.
+    /// </param>
+    /// <param name="Message">
+    /// Incoming tenant-customer message. Its sender id is the Telegram user id scoped to the active tenant bot, and its
+    /// chat id receives storefront, membership, payment, or flow responses.
+    /// </param>
+    /// <param name="customer">
+    /// Shared credentials profile for the sender. Wallet/profile identity is global, while the conversation state and
+    /// tenant order routing remain scoped to the active storefront.
+    /// </param>
     /// <param name="User">
     /// Bot-scoped conversation state for this Telegram user. The state belongs to the active tenant bot and
     /// is passed through to shared XUI handlers so account search, comment changes, and renewal steps do not
     /// leak into another bot instance.
     /// </param>
-    /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <param name="CancellationToken">Token for users.db, Telegram, payment, tenant-order, and XUI operations.</param>
+    /// <returns>A task that completes after the tenant message is consumed.</returns>
     /// <remarks>
     /// This method handles tenant-only purchase and payment messages locally, but delegates account-management
-    /// commands to <see cref="XuiV3BotFlowService" />. <c>/start</c> and top-level tenant menu buttons are handled
-    /// before any state-machine step so a stale renewal/search state cannot treat commands as XUI account identifiers.
+    /// commands to <see cref="XuiV3BotFlowService" />. The outer dispatcher clears persisted conversation state and the
+    /// in-memory XUI selection before every valid tenant <c>/start</c>, then this method preserves the storefront-enabled
+    /// and mandatory-join gates before displaying home. Payment success/cancel payloads retain their existing order
+    /// behavior after that reset. Tenant bots deliberately do not accept <c>/refresh</c>.
     /// </remarks>
+    /// <example>
+    /// <code>
+    /// await HANDLECUSTOMERMESSAGEASYNC(botClient, message, customer, botScopedState, cancellationToken);
+    /// </code>
+    /// </example>
     private async Task HANDLECUSTOMERMESSAGEASYNC(
         ITelegramBotClient botClient,
         Message Message,
@@ -2889,17 +2912,23 @@ public class TenantBotService
         var Text = Message.Text?.Trim() ?? string.Empty;
         var tenantReplyKeyboard = BuildTenantReplyKeyboard();
 
-        if (Text.StartsWith("/start", StringComparison.OrdinalIgnoreCase))
+        var hasStartCommand = TelegramNavigationCommandParser.TryParse(
+                                  Text,
+                                  BotContextAccessor.CurrentBotUsername,
+                                  allowRefresh: false,
+                                  out var navigationCommand) &&
+                              navigationCommand.Kind == TelegramNavigationCommandKind.Start;
+
+        if (hasStartCommand)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
-            if (Text.Contains("payment_success", StringComparison.OrdinalIgnoreCase))
+            if (navigationCommand.HasPayloadToken("payment_success"))
             {
                 await botClient.SendTextMessageAsync(Message.Chat.Id, "پرداخت از سمت درگاه پرداخت تایید شد. در حال بررسی وضعیت سفارش...", cancellationToken: CancellationToken);
                 await CHECKLATESTCUSTOMERORDERASYNC(botClient, Message.Chat.Id, customer.TelegramUserId, CancellationToken);
                 return;
             }
 
-            if (Text.Contains("payment_cancel", StringComparison.OrdinalIgnoreCase))
+            if (navigationCommand.HasPayloadToken("payment_cancel"))
             {
                 await MARKLATESTCUSTOMERORDERCANCELLEDASYNC(botClient, Message.Chat.Id, customer.TelegramUserId, CancellationToken);
                 return;
@@ -9407,6 +9436,8 @@ public class TenantBotService
     /// <remarks>
     /// This method is called only from the tenant order fulfillment gate after duplicate-order checks.
     /// It updates XUI first; wallet and ledger changes are recorded only after the panel confirms renewal.
+    /// The volume-reminder cycle is advanced best-effort after the update/reset and before settlement persistence;
+    /// reminder-state failure cannot roll back the panel renewal or alter owner/customer balances.
     /// </remarks>
     private async Task<NowPaymentsSettlementResult> FULFILLPAIDTENANTRENEWORDERASYNC(
         TenantBotOrder order,
@@ -9449,8 +9480,18 @@ public class TenantBotService
             return NowPaymentsSettlementResult.InvalidAmount();
         }
 
-        if (renewal.ShouldResetTraffic)
-            await RESETTENANTRENEWEDTRAFFICASYNC(serverInfo, client.Email, cancellationToken);
+        var trafficResetApplied = !renewal.ShouldResetTraffic ||
+                                  await RESETTENANTRENEWEDTRAFFICASYNC(
+                                      serverInfo,
+                                      client.Email,
+                                      cancellationToken);
+
+        await _volumeReminderStateStore.TryBeginNewCycleAfterRenewalAsync(
+            serverInfo,
+            client,
+            renewal,
+            trafficResetApplied,
+            cancellationToken);
 
         client.TotalGB = renewal.Payload.TotalGB;
         client.ExpiryTime = renewal.Payload.ExpiryTime;
@@ -9529,14 +9570,31 @@ public class TenantBotService
     /// <param name="serverInfo">Configured XUI v3 panel descriptor.</param>
     /// <param name="email">XUI client email whose counters should be reset.</param>
     /// <param name="cancellationToken">Cancellation token for panel API calls.</param>
-    /// <returns>A task that completes after the reset or fallback attempt.</returns>
-    private async Task RESETTENANTRENEWEDTRAFFICASYNC(ServerInfo serverInfo, string email, CancellationToken cancellationToken)
+    /// <returns>
+    /// <c>true</c> when the primary reset endpoint or the zero-counter fallback succeeds; otherwise <c>false</c>. The
+    /// caller uses this only to record conservative post-renewal reminder usage and retains existing fulfillment rules.
+    /// </returns>
+    /// <remarks>
+    /// This method changes only panel traffic counters. It does not write tenant orders, owner wallets, ledgers, or
+    /// reminder state; those effects remain owned by their existing callers.
+    /// </remarks>
+    private async Task<bool> RESETTENANTRENEWEDTRAFFICASYNC(
+        ServerInfo serverInfo,
+        string email,
+        CancellationToken cancellationToken)
     {
         var resetResponse = await ApiServicev3.ResetClientTrafficAsync(serverInfo, _configuration, email, cancellationToken);
         if (resetResponse.Success)
-            return;
+            return true;
 
-        await ApiServicev3.UpdateClientTrafficAsync(serverInfo, _configuration, email, 0, 0, cancellationToken);
+        var fallbackResponse = await ApiServicev3.UpdateClientTrafficAsync(
+            serverInfo,
+            _configuration,
+            email,
+            0,
+            0,
+            cancellationToken);
+        return fallbackResponse.Success;
     }
 
     /// <summary>

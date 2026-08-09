@@ -21,7 +21,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 ## Data Stores
 
-- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox, and weekly usage-report dispatch leases.
+- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox, weekly usage-report dispatch leases, and durable XUI volume-reminder cycles/claims.
 - `Data/CredentialsDbContex.cs`: unchanged shared user wallet/profile data; referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
 - `Data/configuration.example.json`: sanitized configuration example including referral and four-gateway enable/readiness settings; all gateway switches and secret placeholders default to off/empty.
@@ -31,9 +31,22 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 - `Services/XuiV3PurchaseService.cs`: resolves service selections, validates plan rules, builds XUI v3 account metadata, and creates accounts.
 - `Services/XuiV3BotFlowService.cs`: shared customer account flows for owned and tenant bots: purchase, renewal, search, account list, link change, comment change, delete, and state callbacks.
+- `Services/TelegramNavigationCommandParser.cs`: validates bot-addressed `/start` commands and the owned-only `/refresh`
+  alias, including `@BotUsername`, optional start payloads, and the legacy `/start=payload` form. The main dispatcher
+  clears both the current `BotId + TelegramUserId` conversation row and bot-scoped in-memory XUI purchase selection
+  before blocked-user, forced-join, tenant, regular-user, or super-admin flows. Access gates still control menu display;
+  payment/referral payloads keep their existing side effects, and no wallet, ledger, order, payment, account, referral,
+  long-lived counter, or other bot's state is deleted. Tenant bots accept only `/start`; owned command menus publish
+  both `/start` and `/refresh` whenever their runtime starts.
 - Owned purchase/renewal insufficient-balance messages expose `wallet:charge`. The dispatcher trusts only the callback sender, clears that bot's persisted state plus its in-memory XUI selection, edits the source message, and opens the same live-gateway charge menu as `💰شارژ حساب کاربری`; tenant storefronts never receive this shortcut.
 - `Services/XuiV3RenewalPolicy.cs`: central renewal payload calculation for metered, national, and unlimited accounts.
 - `Services/XuiV3ClientPlanEligibility.cs`: checks whether an XUI client belongs to active service inbounds.
+- `Services/XuiV3ClientUsageResolver.cs`: shared null-safe XUI list-response interpretation for consumption, quota,
+  expiry, `createdAt`, `updatedAt`, origin bot, and renewal metadata.
+- `Services/XuiV3VolumeExpirationReminderService.cs` + `XuiV3VolumeReminderStateStore.cs`: one-list-request
+  30-minute 80/90/99 traffic reminder worker and users.db cycle/claim idempotency. Notifications are bot-scoped,
+  separate per account, rate-limit-aware, and require a matching `BotUserState`; migration
+  `20260809000000_AddXuiV3VolumeReminderStates` needs no backfill.
 - `Services/XuiV3AdminFlowService.cs`: super-admin XUI v3 management flows.
 - `Services/XuiV3LinkChangeOperationStore.cs`: per-operation users.db contexts, atomic confirmation, active-client uniqueness, leases, and bounded recovery state for link changes.
 - `Services/XuiV3LinkChangeRecoveryService.cs`: hosted worker that resumes the exact persisted email/UUID/subId after ambiguous XUI responses or process restarts.
@@ -191,6 +204,14 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `credentials.db` is shared wallet/profile state and is intentionally kept stable.
 - Financial `LogPayment` backup sends both `credentials.db` and `users.db` to the configured backup channel; backup failures must stay fail-soft and must not break settlement.
 - XUI v3 panel responses may omit `Traffic`; helpers must use null-safe access and fallback to top-level fields or `Extra`.
+- The daily 08:00 time-expiry reminder must exclude finite accounts whose bytes reached quota or whose traffic row is
+  disabled at/above 99%; volume consumption messaging belongs only to the independent volume worker. Its optional
+  config defaults are disabled/30 minutes, enabled interval must be 5-1440, and production config explicitly enables
+  30 minutes. The full clients list already supplies `updatedAt`, so never add per-client polling.
+- `XuiV3VolumeReminderStates` is unique by credential-free `PanelKey + ClientId`. A cycle resets for counter drop,
+  quota increase, client recreation, newer bot renewal metadata, or successful owned/admin/tenant renewal hook;
+  `updatedAt` alone never resets it. Only the highest crossed threshold is sent, stale ambiguous claims are suppressed
+  to prevent duplicates, and a successful renewal must never be rolled back when reminder-state persistence fails.
 - Metered XUI pricing is centralized in `XuiV3PurchaseService.ResolvePurchase`: finite durations charge
   `trafficGb * rolePricePerGb + days * rolePricePerDay`, while zero-day lifetime durations charge
   `trafficGb * rolePricePerGb * lifetimePriceMultiplier` and round upward to whole toman. Missing daily prices,

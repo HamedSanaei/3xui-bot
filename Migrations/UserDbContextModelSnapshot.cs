@@ -1531,6 +1531,101 @@ namespace Adminbot.Migrations
                     b.ToTable("UsageReportDispatches", (string)null);
                 });
 
+            modelBuilder.Entity("Adminbot.Domain.XuiV3VolumeReminderState", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("BotId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("ClaimedThreshold")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("ClientCreatedAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("ClientId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("CycleNumber")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("DeliveryStatus")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(160)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("HighestHandledThreshold")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(2000)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("LastDeliveredAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("LastObservedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("LastRenewedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("LeaseUntilUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PanelKey")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("PanelUpdatedAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("TelegramMessageId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TotalBytes")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("UsedBytes")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("LastObservedAtUtc");
+
+                    b.HasIndex("BotId", "TelegramUserId");
+
+                    b.HasIndex("DeliveryStatus", "LeaseUntilUtc");
+
+                    b.HasIndex("PanelKey", "ClientId")
+                        .IsUnique();
+
+                    b.ToTable("XuiV3VolumeReminderStates", (string)null);
+                });
+
             modelBuilder.Entity("Adminbot.Domain.WalletLedgerEntry", b =>
                 {
                     b.Property<int>("Id")

@@ -60,6 +60,7 @@ public class XuiV3BotFlowService
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
     private readonly BotContextAccessor _botContextAccessor;
     private readonly XuiV3LinkChangeOperationStore _linkChangeOperationStore;
+    private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
 
     /// <summary>
     /// Creates the shared XUI v3 customer-flow service used by owned bots and tenant storefront bots.
@@ -99,6 +100,10 @@ public class XuiV3BotFlowService
     /// Durable users.db store that provides confirmation expiry, per-client uniqueness, leases, and recovery state for
     /// account link changes across every owned and tenant bot.
     /// </param>
+    /// <param name="volumeReminderStateStore">
+    /// Durable users.db volume-cycle store notified after a panel-confirmed renewal. Its best-effort write never changes
+    /// the renewal price, wallet debit, account payload, or customer success outcome.
+    /// </param>
     /// <remarks>
     /// This service is intentionally shared between owned bots and tenant storefronts. Tenant callers must
     /// set the active bot context before invoking it so state reads and callback handling stay scoped to the
@@ -115,7 +120,8 @@ public class XuiV3BotFlowService
         WalletLedgerService walletLedgerService,
         GozargahSiteSyncService gozargahSiteSyncService,
         BotContextAccessor botContextAccessor,
-        XuiV3LinkChangeOperationStore linkChangeOperationStore)
+        XuiV3LinkChangeOperationStore linkChangeOperationStore,
+        XuiV3VolumeReminderStateStore volumeReminderStateStore)
     {
         _purchaseService = purchaseService;
         _sessionStore = sessionStore;
@@ -129,6 +135,7 @@ public class XuiV3BotFlowService
         _gozargahSiteSyncService = gozargahSiteSyncService;
         _botContextAccessor = botContextAccessor;
         _linkChangeOperationStore = linkChangeOperationStore;
+        _volumeReminderStateStore = volumeReminderStateStore;
     }
 
     public bool IsEnabledForPurchaseFlow()
@@ -1190,7 +1197,9 @@ public class XuiV3BotFlowService
     /// website debit falls back to the bot wallet and may make it negative. Explicit bot/site bans do not use fallback.
     /// The bot-wallet mutation and users.db ledger append are separate database operations; the ledger records the
     /// actual before/after balance and provider so administrators can audit the compensation path. When the selected
-    /// bot wallet is insufficient, the customer receives an inline shortcut to the owned-wallet charge flow.
+    /// bot wallet is insufficient, the customer receives an inline shortcut to the owned-wallet charge flow. After
+    /// the panel update and any required counter reset, the volume-reminder cycle is advanced best-effort; failure of
+    /// that auxiliary users.db write is logged and never changes the successful renewal or its financial settlement.
     /// </remarks>
     private async Task CompleteRenewAsync(
         ITelegramBotClient botClient,
@@ -1313,6 +1322,12 @@ public class XuiV3BotFlowService
         }
 
         var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
+        await _volumeReminderStateStore.TryBeginNewCycleAfterRenewalAsync(
+            serverInfo,
+            client,
+            renewal,
+            trafficResetApplied,
+            cancellationToken);
         var beforeBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
         var afterBalance = beforeBalance;
         GozargahSiteWalletDebitResult siteWalletDebitResult = null;
