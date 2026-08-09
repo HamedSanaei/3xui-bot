@@ -3535,9 +3535,23 @@ public class XuiV3AdminFlowService
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
     }
 
+    /// <summary>
+    /// Builds the super-admin account-creation keyboard for enabled metered durations.
+    /// </summary>
+    /// <param name="service">
+    /// Enabled global metered service selected by the super-admin. Its options come from the current XUI v3 catalog.
+    /// </param>
+    /// <returns>
+    /// A reply keyboard containing enabled duration labels in ascending day order plus cancellation. The result can
+    /// contain only cancellation when the service has no enabled durations.
+    /// </returns>
+    /// <remarks>
+    /// This keyboard does not authorize account creation. The typed-value parser and central purchase resolver
+    /// revalidate the option before XUI is called, which prevents old Telegram buttons from reviving disabled plans.
+    /// </remarks>
     private static ReplyKeyboardMarkup BuildDurationReplyKeyboard(XuiV3ServiceDefinition service)
     {
-        var rows = service.DurationOptions
+        var rows = XuiV3PurchaseService.GetEnabledDurationOptions(service)
             .OrderBy(duration => duration.Days)
             .Select(duration => new KeyboardButton($"{duration.DisplayName} [{duration.Key}]"))
             .Chunk(2)
@@ -3657,10 +3671,24 @@ public class XuiV3AdminFlowService
                unit.Contains("\u06af\u06cc\u06af", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Matches a super-admin reply against an enabled metered duration.
+    /// </summary>
+    /// <param name="service">Current global service whose enabled duration options are authoritative.</param>
+    /// <param name="text">
+    /// Telegram text containing a bracketed duration key, raw key, or configured display label. Null and empty values
+    /// are accepted but do not match.
+    /// </param>
+    /// <returns>
+    /// The enabled detached duration definition that matches, or <c>null</c> when the duration is unknown or disabled.
+    /// </returns>
+    /// <remarks>
+    /// Returning null keeps the admin state at duration selection and prevents any account-creation side effect.
+    /// </remarks>
     private static XuiV3DurationOption TryGetDurationFromText(XuiV3ServiceDefinition service, string text)
     {
         var key = ExtractBracketValue(text);
-        return service.DurationOptions.FirstOrDefault(duration =>
+        return XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(duration =>
             string.Equals(duration.Key, key, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(duration.Key, text?.Trim(), StringComparison.OrdinalIgnoreCase) ||
             string.Equals(duration.DisplayName, text?.Trim(), StringComparison.OrdinalIgnoreCase));

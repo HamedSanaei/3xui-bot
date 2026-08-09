@@ -186,3 +186,4 @@ published/
 
 # Local IDE/debug settings may contain tokens or private paths
 .vscode/launch.json
+.continue/agents/new-config.yaml

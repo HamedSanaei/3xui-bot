@@ -18,11 +18,50 @@ public class XuiV3PurchaseService
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
     }
 
+    /// <summary>
+    /// Loads and validates the global XUI v3 service-plan catalog used by owned and tenant bots.
+    /// </summary>
+    /// <returns>
+    /// A detached in-memory catalog loaded from the configured JSON path. The returned catalog is safe for pricing
+    /// only after this method's metered-price validation succeeds.
+    /// </returns>
+    /// <remarks>
+    /// The file is re-read on every call, so operational changes to duration availability and prices take effect
+    /// without mutating database state. Invalid financial values fail before a wallet debit, tenant order, or XUI
+    /// account creation can use them.
+    /// </remarks>
+    /// <exception cref="FileNotFoundException">Thrown when the configured catalog file does not exist.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when a metered daily price, lifetime multiplier, or duration-day value is invalid.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// var catalog = purchaseService.LoadCatalog();
+    /// var normalService = catalog.Services.First(service => service.Key == "normal");
+    /// </code>
+    /// </example>
     public XuiV3ServicePlanCatalog LoadCatalog()
     {
-        return XuiV3ServicePlanCatalog.Load(_appConfig.XuiV3ServicePlansPath);
+        var catalog = XuiV3ServicePlanCatalog.Load(_appConfig.XuiV3ServicePlansPath);
+        ValidateMeteredPricingConfiguration(catalog);
+        return catalog;
     }
 
+    /// <summary>
+    /// Gets services that are globally enabled in the current XUI v3 catalog.
+    /// </summary>
+    /// <returns>
+    /// A detached list of enabled service definitions. The list can be empty and must not be persisted directly.
+    /// </returns>
+    /// <remarks>
+    /// Duration-level availability is handled separately because a metered service can expose some durations while
+    /// hiding others. The catalog is reloaded and validated before this list is built.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var services = purchaseService.GetEnabledServices();
+    /// </code>
+    /// </example>
     public IReadOnlyList<XuiV3ServiceDefinition> GetEnabledServices()
     {
         return LoadCatalog().Services
@@ -42,18 +81,34 @@ public class XuiV3PurchaseService
     /// pricing and call the same method again with <c>true</c> when calculating owner base cost.
     /// </param>
     /// <returns>
-    /// A normalized purchase result containing the enabled service definition, traffic bytes, duration days,
-    /// limit IP, and toman price. The returned object is safe to use for account creation and invoice totals.
+    /// A normalized purchase result containing the enabled service and plan, traffic bytes, duration days, limit IP,
+    /// and whole-toman unit price. Metered results also contain the authoritative component breakdown used to explain
+    /// that same unit price. The returned object is safe to use for account creation and invoice totals.
     /// </returns>
     /// <remarks>
-    /// This method is the shared policy gate for owned bots and tenant bots. Any metered purchase or renewal
-    /// that bypasses the visible traffic keyboards still reaches this validation before price calculation or
-    /// account creation, so stale callbacks and typed values cannot buy less than the configured minimum.
+    /// This method is the shared financial policy gate for owned bots and tenant bots. Metered finite durations add
+    /// role-specific daily cost to traffic cost; zero-day durations multiply only the traffic cost. Disabled durations,
+    /// stale callbacks, and typed values are rejected before wallet, tenant-order, ledger, or XUI side effects.
     /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="selection"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when the service, unlimited plan, duration, traffic, or configured minimum is invalid.
+    /// Thrown when the service, unlimited plan, duration, traffic, configured minimum, or financial setting is invalid.
     /// </exception>
+    /// <exception cref="OverflowException">
+    /// Thrown when a valid metered formula produces an amount outside the supported signed 64-bit toman range.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// var resolved = purchaseService.ResolvePurchase(
+    ///     new XuiV3PurchaseSelection
+    ///     {
+    ///         ServiceKey = "normal",
+    ///         TrafficGb = 10,
+    ///         DurationKey = "m2"
+    ///     },
+    ///     isColleague: false);
+    /// </code>
+    /// </example>
     public XuiV3ResolvedPurchase ResolvePurchase(XuiV3PurchaseSelection selection, bool isColleague)
     {
         if (selection == null)
@@ -95,11 +150,17 @@ public class XuiV3PurchaseService
         if (selection.TrafficGb.Value < minimumTrafficGb)
             throw new InvalidOperationException($"Minimum traffic for service '{service.Key}' is {minimumTrafficGb} GB.");
 
-        var duration = service.DurationOptions.FirstOrDefault(d =>
+        var duration = GetEnabledDurationOptions(service).FirstOrDefault(d =>
             string.Equals(d.Key, selection.DurationKey, StringComparison.OrdinalIgnoreCase));
 
         if (duration == null)
-            throw new InvalidOperationException($"Duration '{selection.DurationKey}' is not configured for service '{service.Key}'.");
+            throw new InvalidOperationException($"Duration '{selection.DurationKey}' is not configured or is disabled for service '{service.Key}'.");
+
+        var priceBreakdown = CalculateMeteredPriceBreakdown(
+            service,
+            duration,
+            selection.TrafficGb.Value,
+            isColleague);
 
         return new XuiV3ResolvedPurchase
         {
@@ -109,7 +170,8 @@ public class XuiV3PurchaseService
             TrafficBytes = ApiService.ConvertGBToBytes(selection.TrafficGb.Value),
             DurationDays = duration.Days,
             LimitIp = 0,
-            PriceToman = selection.TrafficGb.Value * service.GetPricePerGb(isColleague),
+            PriceToman = priceBreakdown.TotalPriceToman,
+            MeteredPriceBreakdown = priceBreakdown,
             IsUnlimited = false
         };
     }
@@ -196,6 +258,236 @@ public class XuiV3PurchaseService
     }
 
     /// <summary>
+    /// Returns the metered duration options that can currently be displayed and selected.
+    /// </summary>
+    /// <param name="service">
+    /// Metered service definition loaded from the global XUI v3 catalog. A null service is allowed and produces an
+    /// empty collection.
+    /// </param>
+    /// <returns>
+    /// Enabled, non-null duration definitions in their configured order. The collection can be empty and is detached
+    /// configuration data that callers must not persist.
+    /// </returns>
+    /// <remarks>
+    /// Owned purchase, owned renewal, super-admin creation, and tenant purchase/renewal flows must use this helper so
+    /// a disabled option cannot remain visible in one Telegram surface. <see cref="ResolvePurchase" /> repeats the
+    /// check as the final financial policy gate for stale callbacks.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// foreach (var duration in XuiV3PurchaseService.GetEnabledDurationOptions(service))
+    /// {
+    ///     // Build one Telegram button for the enabled duration.
+    /// }
+    /// </code>
+    /// </example>
+    public static IReadOnlyList<XuiV3DurationOption> GetEnabledDurationOptions(XuiV3ServiceDefinition service)
+    {
+        return service?.DurationOptions?
+            .Where(duration => duration?.IsEnabled == true)
+            .ToList() ?? new List<XuiV3DurationOption>();
+    }
+
+    /// <summary>
+    /// Calculates every authoritative price component for one metered service account.
+    /// </summary>
+    /// <param name="service">
+    /// Enabled metered service loaded from the global catalog. Its prices are Iranian toman major units and must be
+    /// non-negative for the selected role.
+    /// </param>
+    /// <param name="duration">
+    /// Enabled duration owned by <paramref name="service" />. Zero days means lifetime; positive values are charged
+    /// per day; negative values are invalid.
+    /// </param>
+    /// <param name="trafficGb">Purchased traffic in whole GB. The value must be greater than zero.</param>
+    /// <param name="isColleague">
+    /// <c>true</c> to use colleague per-GB and per-day rates; <c>false</c> to use normal-customer rates.
+    /// </param>
+    /// <returns>
+    /// A detached breakdown containing role rates, traffic and duration subtotals, the exact pre-rounding total, and
+    /// the final whole-toman unit price. It is safe to expose in owned-bot confirmation messages but must not be
+    /// independently persisted as a ledger movement.
+    /// </returns>
+    /// <remarks>
+    /// Finite formula: <c>trafficGb * pricePerGb + durationDays * pricePerDay</c>.
+    /// Lifetime formula: <c>trafficGb * pricePerGb * lifetimePriceMultiplier</c>; no daily fee is charged.
+    /// This method has no database, wallet, Telegram, or XUI side effects.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="service" /> or <paramref name="duration" /> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown for an unlimited service, non-positive traffic, negative price, negative duration, or invalid lifetime multiplier.
+    /// </exception>
+    /// <exception cref="OverflowException">Thrown when the calculated amount cannot fit in a signed 64-bit toman value.</exception>
+    /// <example>
+    /// <code>
+    /// var breakdown = XuiV3PurchaseService.CalculateMeteredPriceBreakdown(
+    ///     service,
+    ///     duration,
+    ///     trafficGb: 10,
+    ///     isColleague: false);
+    ///
+    /// var payableUnitPrice = breakdown.TotalPriceToman;
+    /// </code>
+    /// </example>
+    public static XuiV3MeteredPriceBreakdown CalculateMeteredPriceBreakdown(
+        XuiV3ServiceDefinition service,
+        XuiV3DurationOption duration,
+        int trafficGb,
+        bool isColleague)
+    {
+        if (service == null)
+            throw new ArgumentNullException(nameof(service));
+        if (duration == null)
+            throw new ArgumentNullException(nameof(duration));
+        if (service.IsUnlimited)
+            throw new InvalidOperationException($"Service '{service.Key}' uses fixed unlimited-plan pricing.");
+        if (trafficGb <= 0)
+            throw new InvalidOperationException("Metered traffic must be greater than zero GB.");
+        if (duration.Days < 0)
+            throw new InvalidOperationException($"Duration '{duration.Key}' cannot have negative days.");
+
+        var pricePerGb = service.GetPricePerGb(isColleague);
+        if (pricePerGb < 0)
+            throw new InvalidOperationException($"Service '{service.Key}' cannot have a negative per-GB price.");
+
+        var trafficSubtotal = (decimal)trafficGb * pricePerGb;
+        if (trafficSubtotal > long.MaxValue)
+            throw new OverflowException($"Traffic subtotal for service '{service.Key}' exceeds the supported toman range.");
+
+        var isLifetime = duration.Days == 0;
+        var pricePerDay = 0L;
+        var durationSubtotal = 0M;
+        decimal rawTotal;
+        if (isLifetime)
+        {
+            if (!double.IsFinite(service.LifetimePriceMultiplier) || service.LifetimePriceMultiplier <= 0D)
+                throw new InvalidOperationException($"Service '{service.Key}' must have a positive finite lifetime multiplier.");
+
+            // Convert the validated JSON double to decimal before multiplying money so binary floating-point error
+            // never changes the whole-toman amount charged to a wallet or tenant order.
+            var multiplier = Convert.ToDecimal(service.LifetimePriceMultiplier);
+            rawTotal = trafficSubtotal * multiplier;
+        }
+        else
+        {
+            pricePerDay = service.GetPricePerDay(isColleague);
+            if (pricePerDay < 0)
+                throw new InvalidOperationException($"Service '{service.Key}' cannot have a negative daily price.");
+
+            durationSubtotal = (decimal)duration.Days * pricePerDay;
+            if (durationSubtotal > long.MaxValue)
+                throw new OverflowException($"Duration subtotal for service '{service.Key}' exceeds the supported toman range.");
+
+            rawTotal = trafficSubtotal + durationSubtotal;
+        }
+
+        var roundedPrice = Math.Ceiling(rawTotal);
+        if (roundedPrice > long.MaxValue)
+            throw new OverflowException($"Calculated price for service '{service.Key}' exceeds the supported toman range.");
+
+        return new XuiV3MeteredPriceBreakdown
+        {
+            TrafficGb = trafficGb,
+            PricePerGbToman = pricePerGb,
+            TrafficSubtotalToman = (long)trafficSubtotal,
+            DurationDays = duration.Days,
+            PricePerDayToman = pricePerDay,
+            DurationSubtotalToman = (long)durationSubtotal,
+            LifetimePriceMultiplier = isLifetime ? service.LifetimePriceMultiplier : 1D,
+            IsLifetime = isLifetime,
+            RawTotalToman = rawTotal,
+            TotalPriceToman = (long)roundedPrice
+        };
+    }
+
+    /// <summary>
+    /// Calculates the final whole-toman unit price for a metered service selection.
+    /// </summary>
+    /// <param name="service">Enabled global metered service containing role-specific rates.</param>
+    /// <param name="duration">Enabled configured duration; zero days represents lifetime.</param>
+    /// <param name="trafficGb">Purchased traffic in whole GB; must be greater than zero.</param>
+    /// <param name="isColleague"><c>true</c> for colleague rates; <c>false</c> for normal-customer rates.</param>
+    /// <returns>The final upward-rounded unit price in Iranian toman.</returns>
+    /// <remarks>
+    /// This compatibility helper delegates to <see cref="CalculateMeteredPriceBreakdown" /> so pricing and displayed
+    /// breakdowns cannot diverge. It has no database, wallet, Telegram, ledger, or XUI side effects.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="service" /> or <paramref name="duration" /> is null.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the metered selection or configured rates are invalid.</exception>
+    /// <exception cref="OverflowException">Thrown when the price exceeds the supported signed 64-bit toman range.</exception>
+    /// <example>
+    /// <code>
+    /// var unitPrice = XuiV3PurchaseService.CalculateMeteredPriceToman(
+    ///     service,
+    ///     duration,
+    ///     trafficGb: 10,
+    ///     isColleague: false);
+    /// </code>
+    /// </example>
+    public static long CalculateMeteredPriceToman(
+        XuiV3ServiceDefinition service,
+        XuiV3DurationOption duration,
+        int trafficGb,
+        bool isColleague)
+    {
+        return CalculateMeteredPriceBreakdown(service, duration, trafficGb, isColleague).TotalPriceToman;
+    }
+
+    /// <summary>
+    /// Formats an authoritative metered unit-price breakdown for a Telegram confirmation message.
+    /// </summary>
+    /// <param name="resolved">
+    /// Purchase result returned by <see cref="ResolvePurchase" />. Unlimited results and null values are allowed and
+    /// produce an empty string.
+    /// </param>
+    /// <returns>
+    /// Plain Persian text listing GB quantity, per-GB rate, traffic subtotal, and either day-rate subtotal or lifetime
+    /// multiplier, followed by the unit total. The text contains no Telegram markup and is safe to embed in both plain
+    /// messages and HTML messages.
+    /// </returns>
+    /// <remarks>
+    /// This method only formats <see cref="XuiV3ResolvedPurchase.MeteredPriceBreakdown" /> and never recalculates a
+    /// payable amount. It has no wallet, database, ledger, Telegram-send, tenant, or XUI side effects.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var resolved = purchaseService.ResolvePurchase(selection, isColleague: false);
+    /// var details = XuiV3PurchaseService.BuildMeteredPriceBreakdownText(resolved);
+    /// </code>
+    /// </example>
+    public static string BuildMeteredPriceBreakdownText(XuiV3ResolvedPurchase resolved)
+    {
+        var breakdown = resolved?.MeteredPriceBreakdown;
+        if (breakdown == null)
+            return string.Empty;
+
+        var builder = new System.Text.StringBuilder();
+        builder.AppendLine("جزئیات محاسبه قیمت هر اکانت:");
+        builder.AppendLine(
+            $"• حجم: {breakdown.TrafficGb} GB × نرخ هر گیگ {breakdown.PricePerGbToman.FormatCurrency()} " +
+            $"= جمع حجم {breakdown.TrafficSubtotalToman.FormatCurrency()}");
+
+        if (breakdown.IsLifetime)
+        {
+            var roundingText = breakdown.RawTotalToman == breakdown.TotalPriceToman
+                ? string.Empty
+                : " (گرد شده رو به بالا)";
+            builder.AppendLine(
+                $"• زمان نامحدود: جمع حجم × ضریب {FormatLifetimeMultiplier(breakdown.LifetimePriceMultiplier)} " +
+                $"= {breakdown.TotalPriceToman.FormatCurrency()}{roundingText}");
+        }
+        else
+        {
+            builder.AppendLine(
+                $"• زمان: {breakdown.DurationDays} روز × نرخ هر روز {breakdown.PricePerDayToman.FormatCurrency()} " +
+                $"= جمع زمان {breakdown.DurationSubtotalToman.FormatCurrency()}");
+        }
+
+        builder.Append($"• جمع قیمت هر اکانت: {breakdown.TotalPriceToman.FormatCurrency()}");
+        return builder.ToString();
+    }
+
+    /// <summary>
     /// Checks whether a metered traffic amount satisfies the configured service minimum.
     /// </summary>
     /// <param name="service">Metered service definition that owns the traffic policy.</param>
@@ -208,10 +500,25 @@ public class XuiV3PurchaseService
         return trafficGb >= GetMinimumTrafficGb(service);
     }
 
+    /// <summary>
+    /// Builds the owned-bot duration keyboard for a metered service and traffic selection.
+    /// </summary>
+    /// <param name="serviceKey">Global service key from <c>xui-v3-service-plans.json</c>.</param>
+    /// <param name="trafficGb">Previously selected traffic in whole GB, encoded into each callback.</param>
+    /// <returns>An inline keyboard containing only enabled durations plus a back button.</returns>
+    /// <remarks>
+    /// This method only builds Telegram callback data. The callback handler and <see cref="ResolvePurchase" /> must
+    /// still revalidate the duration because the catalog can change after the message is sent.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var keyboard = purchaseService.BuildDurationKeyboard("normal", 30);
+    /// </code>
+    /// </example>
     public InlineKeyboardMarkup BuildDurationKeyboard(string serviceKey, int trafficGb)
     {
         var service = FindService(serviceKey);
-        var rows = service.DurationOptions
+        var rows = GetEnabledDurationOptions(service)
             .Select(duration => new[]
             {
                 InlineKeyboardButton.WithCallbackData(
@@ -257,6 +564,31 @@ public class XuiV3PurchaseService
         });
     }
 
+    /// <summary>
+    /// Builds the final owned-bot purchase confirmation shown before any wallet debit or XUI account creation.
+    /// </summary>
+    /// <param name="selection">
+    /// Current owned-bot purchase selection containing the global service key, metered traffic/duration or unlimited
+    /// plan key, account count, and optional user comment.
+    /// </param>
+    /// <param name="isColleague">
+    /// <c>true</c> when the current credentials profile receives colleague rates; otherwise <c>false</c> for public rates.
+    /// </param>
+    /// <returns>
+    /// Plain Persian Telegram text containing the selected plan, authoritative per-account and order totals, and a
+    /// detailed metered price breakdown when applicable. Dynamic user comments remain plain text.
+    /// </returns>
+    /// <remarks>
+    /// The message is preview-only. It reads the current global catalog through <see cref="ResolvePurchase" /> but does
+    /// not debit a wallet, write a ledger row, create an XUI account, or send Telegram content itself.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">Thrown when the selected service, duration, or pricing configuration is invalid.</exception>
+    /// <exception cref="OverflowException">Thrown when the configured price exceeds the supported toman range.</exception>
+    /// <example>
+    /// <code>
+    /// var text = purchaseService.BuildSummaryText(selection, credUser.IsColleague);
+    /// </code>
+    /// </example>
     public string BuildSummaryText(XuiV3PurchaseSelection selection, bool isColleague)
     {
         var resolved = ResolvePurchase(selection, isColleague);
@@ -276,6 +608,10 @@ public class XuiV3PurchaseService
         if (resolved.IsUnlimited)
             text += $"تعداد کاربر مجاز: {resolved.LimitIp}\n";
 
+        var priceBreakdownText = BuildMeteredPriceBreakdownText(resolved);
+        if (!string.IsNullOrWhiteSpace(priceBreakdownText))
+            text += $"\n{priceBreakdownText}\n";
+
         text += $"قیمت هر اکانت: {resolved.PriceToman.FormatCurrency()}\n";
         text += $"قیمت کل: {totalPrice.FormatCurrency()}\n";
         if (!string.IsNullOrWhiteSpace(selection.UserComment))
@@ -293,12 +629,12 @@ public class XuiV3PurchaseService
     /// <c>false</c> when normal customer prices should be shown.
     /// </param>
     /// <returns>
-    /// HTML-formatted Persian text that is safe to send with <c>ParseMode.Html</c>. The text includes
-    /// only enabled plans and filters metered traffic options below each service's configured minimum.
+    /// HTML-formatted Persian text that is safe to send with <c>ParseMode.Html</c>. The text includes only enabled
+    /// plans, role-specific per-GB/per-day prices, applicable lifetime multipliers, and valid traffic presets.
     /// </returns>
     /// <remarks>
-    /// The tariff message is derived from <c>xui-v3-service-plans.json</c>. This method does not persist
-    /// any data and does not calculate a payable invoice; it is only a read-only presentation helper.
+    /// The tariff message is derived from <c>xui-v3-service-plans.json</c> and omits disabled durations. This method
+    /// does not persist data or calculate a payable invoice; <see cref="ResolvePurchase" /> remains authoritative.
     /// </remarks>
     /// <example>
     /// <code>
@@ -347,7 +683,16 @@ public class XuiV3PurchaseService
                 if (visibleTrafficOptions.Count > 0)
                     builder.AppendLine($"حجم‌ها: <code>{Html(string.Join(" / ", visibleTrafficOptions.Select(x => $"{x}GB")))}</code>");
 
-                var durations = service.DurationOptions?
+                var enabledDurations = GetEnabledDurationOptions(service);
+                var hasDailyPrice = (service.PricePerDay?.User ?? 0L) > 0 ||
+                                    (service.PricePerDay?.Colleague ?? 0L) > 0;
+                if (hasDailyPrice && enabledDurations.Any(duration => duration.Days > 0))
+                    builder.AppendLine($"هزینه هر روز: <code>{Html(service.GetPricePerDay(isColleague).FormatCurrency())}</code>");
+                if ((hasDailyPrice || service.LifetimePriceMultiplier != 1D) &&
+                    enabledDurations.Any(duration => duration.Days == 0))
+                    builder.AppendLine($"ضریب مدت نامحدود: <code>{Html(FormatLifetimeMultiplier(service.LifetimePriceMultiplier))}</code>");
+
+                var durations = enabledDurations
                     .OrderBy(duration => duration.Days)
                     .Select(duration => duration.Days <= 0
                         ? duration.DisplayName
@@ -815,6 +1160,59 @@ public class XuiV3PurchaseService
         };
 
         return JsonConvert.SerializeObject(metadata, Formatting.None);
+    }
+
+    /// <summary>
+    /// Formats a validated lifetime multiplier for user-visible tariff text without locale-dependent separators.
+    /// </summary>
+    /// <param name="multiplier">Positive finite multiplier loaded from the global service catalog.</param>
+    /// <returns>A culture-invariant value with up to four fractional digits, suitable for HTML encoding.</returns>
+    /// <remarks>This helper performs presentation only and must not be used for financial arithmetic.</remarks>
+    /// <example>
+    /// <code>
+    /// var label = XuiV3PurchaseService.FormatLifetimeMultiplier(1.2D);
+    /// </code>
+    /// </example>
+    public static string FormatLifetimeMultiplier(double multiplier)
+    {
+        return multiplier.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Validates metered duration-pricing fields before any catalog consumer can display or charge them.
+    /// </summary>
+    /// <param name="catalog">
+    /// Detached global XUI v3 catalog loaded from JSON. Null collections are tolerated for legacy compatibility.
+    /// </param>
+    /// <remarks>
+    /// Validation is intentionally global rather than role-specific: a negative colleague price must be rejected
+    /// even when the current caller is a normal customer, because tenant base-cost calculation may use it later.
+    /// This method has no persistence or external-service side effects.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when a metered daily role price is negative, a lifetime multiplier is not positive and finite, or a
+    /// configured duration has negative days.
+    /// </exception>
+    private static void ValidateMeteredPricingConfiguration(XuiV3ServicePlanCatalog catalog)
+    {
+        foreach (var service in catalog?.Services ?? new List<XuiV3ServiceDefinition>())
+        {
+            if (service == null || service.IsUnlimited)
+                continue;
+
+            if ((service.PricePerDay?.User ?? 0L) < 0 || (service.PricePerDay?.Colleague ?? 0L) < 0)
+                throw new InvalidOperationException($"Service '{service.Key}' cannot have a negative daily price.");
+            if (!double.IsFinite(service.LifetimePriceMultiplier) || service.LifetimePriceMultiplier <= 0D)
+                throw new InvalidOperationException($"Service '{service.Key}' must have a positive finite lifetime multiplier.");
+
+            foreach (var duration in service.DurationOptions ?? new List<XuiV3DurationOption>())
+            {
+                if (duration == null)
+                    throw new InvalidOperationException($"Service '{service.Key}' contains an empty duration entry.");
+                if (duration.Days < 0)
+                    throw new InvalidOperationException($"Duration '{duration.Key}' in service '{service.Key}' cannot have negative days.");
+            }
+        }
     }
 
     private static string FormatInboundIds(IEnumerable<int> inboundIds)

@@ -2119,6 +2119,8 @@ public class XuiV3BotFlowService
     /// it is deliberately not parsed here because it abandons the XUI selection and starts wallet charging. Purchase
     /// confirmation payload fallback is accepted only while the persisted bot-scoped state is still at the active
     /// confirmation step, so an old callback cannot recreate an abandoned selection or debit the wallet.
+    /// Metered duration callbacks are also checked against the freshly loaded enabled options before purchase state
+    /// advances; a catalog toggle therefore invalidates previously issued buttons without financial side effects.
     /// </remarks>
     public async Task<bool> TryHandleCallbackAsync(
         ITelegramBotClient botClient,
@@ -2630,6 +2632,26 @@ public class XuiV3BotFlowService
                         messageId: messageId,
                         text: BuildMinimumTrafficMessage(service),
                         replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
+                        cancellationToken: cancellationToken);
+                }
+
+                return true;
+            }
+
+            var duration = XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(option =>
+                string.Equals(option.Key, callback.DurationKey, StringComparison.OrdinalIgnoreCase));
+            if (duration == null)
+            {
+                // Telegram buttons can outlive a catalog edit. Revalidate before persisting purchase state so a
+                // disabled duration never reaches account-count selection, wallet debit, or XUI account creation.
+                if (messageId != 0)
+                {
+                    await SafeEditMessageTextAsync(
+                        botClient,
+                        chatId: chatId,
+                        messageId: messageId,
+                        text: "این مدت غیرفعال شده است. لطفاً یکی از مدت‌های فعال را انتخاب کنید.",
+                        replyMarkup: _purchaseService.BuildDurationKeyboard(service.Key, callback.TrafficGb.Value),
                         cancellationToken: cancellationToken);
                 }
 
@@ -5813,9 +5835,24 @@ public class XuiV3BotFlowService
         return $"حداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است. لطفاً حجم بیشتری وارد کنید.";
     }
 
+    /// <summary>
+    /// Builds the owned-bot renewal keyboard for enabled metered durations.
+    /// </summary>
+    /// <param name="service">
+    /// Enabled global metered service that owns the renewal options. The value must come from the current catalog,
+    /// not from persisted user state alone.
+    /// </param>
+    /// <returns>
+    /// A Telegram reply keyboard containing enabled duration labels in ascending day order plus a cancellation row.
+    /// The keyboard can contain only cancellation when no duration is enabled.
+    /// </returns>
+    /// <remarks>
+    /// Buttons are presentation hints and can remain visible in old messages after configuration changes. Text
+    /// parsing and the central resolver repeat the enabled check before any wallet or XUI side effect.
+    /// </remarks>
     private static ReplyKeyboardMarkup BuildDurationReplyKeyboard(XuiV3ServiceDefinition service)
     {
-        var rows = service.DurationOptions
+        var rows = XuiV3PurchaseService.GetEnabledDurationOptions(service)
             .OrderBy(duration => duration.Days)
             .Select(duration => new KeyboardButton($"{duration.DisplayName} [{duration.Key}]"))
             .Chunk(2)
@@ -6314,11 +6351,14 @@ public class XuiV3BotFlowService
     /// </param>
     /// <returns>
     /// HTML-safe Persian preview text showing exact traffic addition/replacement, duration addition, reset behavior,
-    /// and price. If panel lookup fails, the text falls back to the selected plan without mutating the account.
+    /// authoritative price components, and total price. If panel lookup fails, the text falls back to the selected
+    /// plan without mutating the account.
     /// </returns>
     /// <remarks>
     /// The method is read-only. Unlimited previews follow <see cref="XuiV3RenewalPolicy"/>: active accounts show the
     /// exact selected traffic added to the existing quota, while expired accounts show traffic replacement after reset.
+    /// Metered price details are formatted from the resolver's stored breakdown, so the displayed rates and subtotals
+    /// cannot drift from the amount later debited from the selected owned-bot wallet.
     /// </remarks>
     private async Task<string> BuildRenewSummaryAsync(
         User user,
@@ -6382,14 +6422,32 @@ public class XuiV3BotFlowService
         if (renewal?.ShouldResetTraffic == true)
             text.AppendLine("🔄 اکانت منقضی شده است؛ مصرف قبلی ریست می‌شود و حجم تمدید جایگزین حجم قبلی خواهد شد.");
         text.AppendLine($"⏳ زمان اضافه: <code>{Html(durationText)}</code>");
+        var priceBreakdownText = XuiV3PurchaseService.BuildMeteredPriceBreakdownText(resolved);
+        if (!string.IsNullOrWhiteSpace(priceBreakdownText))
+        {
+            text.AppendLine();
+            text.AppendLine(priceBreakdownText);
+        }
         text.AppendLine($"💰 قیمت: <code>{Html(resolved.PriceToman.FormatCurrency())}</code>");
         return text.ToString();
     }
 
+    /// <summary>
+    /// Matches an owned-bot renewal reply against an enabled metered duration.
+    /// </summary>
+    /// <param name="service">Current global metered service containing the allowed duration keys and labels.</param>
+    /// <param name="text">
+    /// Telegram message text entered by the customer. It may contain a bracketed key, a raw key, or a display label.
+    /// </param>
+    /// <returns>
+    /// The enabled detached duration definition that matches the message, or <c>null</c> when the value is unknown or
+    /// has been disabled since its keyboard was sent.
+    /// </returns>
+    /// <remarks>This method has no persistence, wallet, Telegram-send, or XUI side effects.</remarks>
     private static XuiV3DurationOption TryGetDurationFromText(XuiV3ServiceDefinition service, string text)
     {
         var key = ExtractBracketValue(text);
-        return service.DurationOptions.FirstOrDefault(duration =>
+        return XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(duration =>
             string.Equals(duration.Key, key, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(duration.Key, text?.Trim(), StringComparison.OrdinalIgnoreCase) ||
             string.Equals(duration.DisplayName, text?.Trim(), StringComparison.OrdinalIgnoreCase));

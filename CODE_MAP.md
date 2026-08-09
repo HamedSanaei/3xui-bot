@@ -25,7 +25,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Data/CredentialsDbContex.cs`: unchanged shared user wallet/profile data; referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
 - `Data/configuration.example.json`: sanitized configuration example including referral and four-gateway enable/readiness settings; all gateway switches and secret placeholders default to off/empty.
-- `Data/xui-v3-service-plans.json`: XUI v3 service catalog, prices, inbounds, duration options, unlimited fair-usage plans, and metered `minimumTrafficGb`.
+- `Data/xui-v3-service-plans.json`: XUI v3 service catalog, inbounds, metered per-GB/per-day/lifetime pricing, duration availability, unlimited fair-usage plans, and `minimumTrafficGb`.
 
 ## Core Services
 
@@ -191,6 +191,14 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `credentials.db` is shared wallet/profile state and is intentionally kept stable.
 - Financial `LogPayment` backup sends both `credentials.db` and `users.db` to the configured backup channel; backup failures must stay fail-soft and must not break settlement.
 - XUI v3 panel responses may omit `Traffic`; helpers must use null-safe access and fallback to top-level fields or `Extra`.
+- Metered XUI pricing is centralized in `XuiV3PurchaseService.ResolvePurchase`: finite durations charge
+  `trafficGb * rolePricePerGb + days * rolePricePerDay`, while zero-day lifetime durations charge
+  `trafficGb * rolePricePerGb * lifetimePriceMultiplier` and round upward to whole toman. Missing daily prices,
+  lifetime multipliers, and duration `isEnabled` values default to zero, one, and true for catalog compatibility.
+  Disabled durations must be omitted and rejected across owned purchase/renewal, super-admin creation, and tenant
+  purchase/renewal; the separate fixed-price `kind=unlimited` plans do not use these metered fields. The resolver also
+  returns the authoritative metered component breakdown, and owned-bot final purchase/renewal previews must format
+  that stored breakdown rather than recalculate rates or subtotals in the Telegram presentation layer.
 - XUI v3 request timeout is controlled by `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`; slow panels can otherwise time out during `/panel/api/clients/add`.
 - XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
 - XUI v3 account creation treats generated email as the idempotency key. If `addClient` or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.

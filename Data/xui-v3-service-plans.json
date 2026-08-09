@@ -8,29 +8,16 @@
       "description": "سرویس مخصوص ترافیک داخلی با چند اینباند",
       "kind": "metered",
       "isEnabled": true,
-      "inboundIds": [
-        192
-      ],
+      "inboundIds": [192],
       "multiInbound": true,
-      "inboundProfileKeys": [
-        "national"
-      ],
-      "fallbackInboundTypes": [
-        "tunnel"
-      ],
+      "inboundProfileKeys": ["national"],
+      "fallbackInboundTypes": ["tunnel"],
       "pricePerGb": {
         "user": 145000,
         "colleague": 96000
       },
       "minimumTrafficGb": 1,
-      "trafficOptionsGb": [
-        1,
-        2,
-        3,
-        4,
-        5,
-        10
-      ],
+      "trafficOptionsGb": [1, 2, 3, 4, 5, 10],
       "durationOptions": [
         {
           "key": "life",
@@ -60,49 +47,51 @@
       "description": "سرویس اینترنت عادی با چند اینباند",
       "kind": "metered",
       "isEnabled": true,
-      "inboundIds": [188,195,190,193
-      ],
+      "inboundIds": [188, 195, 190, 193],
       "multiInbound": true,
-      "inboundProfileKeys": [
-        "normal"
-      ],
-      "fallbackInboundTypes": [
-        "tunnel"
-      ],
+      "inboundProfileKeys": ["normal"],
+      "fallbackInboundTypes": ["tunnel"],
       "pricePerGb": {
         "user": 5000,
         "colleague": 3500
       },
+      "pricePerDay": {
+        "user": 500,
+        "colleague": 500
+      },
+      "lifetimePriceMultiplier": 1,
       "minimumTrafficGb": 10,
-      "trafficOptionsGb": [
-        10,
-	30,
-	50,
-        100,
-	150,
-        200,
-        500
-      ],
+      "trafficOptionsGb": [10, 30, 50, 100, 150, 200, 500],
       "durationOptions": [
         {
           "key": "life",
           "displayName": "نامحدود",
-          "days": 0
+          "days": 0,
+          "isEnabled": false
         },
         {
           "key": "m1",
           "displayName": "یک ماه",
-          "days": 30
+          "days": 30,
+          "isEnabled": true
         },
         {
           "key": "m2",
           "displayName": "دو ماه",
-          "days": 60
+          "days": 60,
+          "isEnabled": true
         },
         {
           "key": "m3",
           "displayName": "سه ماه",
-          "days": 90
+          "days": 90,
+          "isEnabled": true
+        },
+        {
+          "key": "m6",
+          "displayName": "شش ماه",
+          "days": 180,
+          "isEnabled": true
         }
       ]
     },
@@ -112,16 +101,10 @@
       "description": "نامحدود با مصرف منصفانه، محدودیت زمان و تعداد کاربر",
       "kind": "unlimited",
       "isEnabled": true,
-      "inboundIds": [
-       188,195,190,193
-      ],
+      "inboundIds": [188, 195, 190, 193],
       "multiInbound": true,
-      "inboundProfileKeys": [
-        "unlimited"
-      ],
-      "fallbackInboundTypes": [
-        "tunnel"
-      ],
+      "inboundProfileKeys": ["unlimited"],
+      "fallbackInboundTypes": ["tunnel"],
       "unlimitedPlans": [
         {
           "key": "u2-m1",

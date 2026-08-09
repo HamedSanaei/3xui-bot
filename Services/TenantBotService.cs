@@ -3519,10 +3519,14 @@ public class TenantBotService
     /// Builds the reply keyboard used to choose metered renewal duration.
     /// </summary>
     /// <param name="service">Metered XUI service definition.</param>
-    /// <returns>Reply keyboard containing duration options and cancel.</returns>
+    /// <returns>Reply keyboard containing enabled duration options and cancel.</returns>
+    /// <remarks>
+    /// The global catalog controls duration availability for every tenant. Text parsing and final order pricing repeat
+    /// this check because an old Telegram reply keyboard can outlive a configuration change.
+    /// </remarks>
     private static ReplyKeyboardMarkup BuildTenantRenewDurationKeyboard(XuiV3ServiceDefinition service)
     {
-        var rows = service.DurationOptions
+        var rows = XuiV3PurchaseService.GetEnabledDurationOptions(service)
             .OrderBy(x => x.Days)
             .Select(x => new[] { new KeyboardButton($"{x.DisplayName} [{x.Key}]") })
             .Append(new[] { new KeyboardButton("❌ انصراف") })
@@ -3652,9 +3656,13 @@ public class TenantBotService
     /// <param name="service">Service containing duration options.</param>
     /// <param name="text">Customer text containing display name or key.</param>
     /// <returns>The matched duration option, or <c>null</c> when invalid.</returns>
+    /// <remarks>
+    /// Only enabled options are matched. This protects tenant renewal state from reply-keyboard messages that were
+    /// sent before a duration was disabled in the global catalog.
+    /// </remarks>
     private static XuiV3DurationOption FindTenantDurationOption(XuiV3ServiceDefinition service, string text)
     {
-        return service.DurationOptions.FirstOrDefault(x =>
+        return XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(x =>
             string.Equals(text, x.Key, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(text, x.DisplayName, StringComparison.OrdinalIgnoreCase) ||
             (text?.Contains($"[{x.Key}]", StringComparison.OrdinalIgnoreCase) == true));
@@ -3774,7 +3782,8 @@ public class TenantBotService
     /// <remarks>
     /// Only callbacks with the tenant customer prefix are processed here. Shared account-management callbacks
     /// are routed to <see cref="XuiV3BotFlowService" /> by the update dispatcher so tenant storefront buttons can
-    /// reuse the existing account details, search, renewal, and comment logic.
+    /// reuse the existing account details, search, renewal, and comment logic. Duration callbacks are checked against
+    /// the freshly loaded catalog before tenant state advances or a payable order can be created.
     /// </remarks>
     private async Task HANDLECUSTOMERCALLBACKASYNC(
         ITelegramBotClient botClient,
@@ -3895,6 +3904,22 @@ public class TenantBotService
                         service == null ? null : BuildTenantTrafficInlineKeyboard(service),
                         CancellationToken);
                     await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
+                    return;
+                }
+
+                var duration = XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(option =>
+                    string.Equals(option.Key, parts[3], StringComparison.OrdinalIgnoreCase));
+                if (duration == null)
+                {
+                    // Tenant callback messages can remain clickable after an operator disables a duration. Refresh
+                    // the current choices before order creation so no tenant balance or gateway flow can be reached.
+                    await SHOWDURATIONOPTIONSASYNC(botClient, ChatId, MessageId, tenant, service.Key, GB, CancellationToken);
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient,
+                        CallbackQuery.Id,
+                        "این مدت غیرفعال شده است. یک گزینه فعال را انتخاب کنید.",
+                        showAlert: true,
+                        cancellationToken: CancellationToken);
                     return;
                 }
 
@@ -4294,9 +4319,10 @@ public class TenantBotService
     /// Cancellation token for Telegram and state-validation operations.
     /// </param>
     /// <remarks>
-    /// This method is shared by callback traffic buttons and manually typed traffic in tenant bots.
-    /// It rechecks the minimum traffic here so stale callback data or edited messages cannot bypass the
-    /// same pricing policy used by owned bots.
+    /// This method is shared by callback traffic buttons and manually typed traffic in tenant bots. It rechecks the
+    /// minimum traffic and includes only currently enabled durations. Every button price comes from the shared
+    /// resolver plus current tenant markup, so stale data cannot bypass global pricing or availability. The method
+    /// sends or edits Telegram text but does not create an order or mutate a wallet.
     /// </remarks>
     private async Task SHOWDURATIONOPTIONSASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, string ServiceKey, int TrafficGb, CancellationToken CancellationToken)
     {
@@ -4316,7 +4342,7 @@ public class TenantBotService
             return;
         }
 
-        var rows = service.DurationOptions
+        var rows = XuiV3PurchaseService.GetEnabledDurationOptions(service)
             .Select(Duration =>
             {
                 var selection = new XuiV3PurchaseSelection { ServiceKey = ServiceKey, TrafficGb = TrafficGb, DurationKey = Duration.Key };
@@ -7984,19 +8010,21 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Builds the tariff message shown inside a tenant storefront.
+    /// Builds the tenant storefront tariff message from global service rules and tenant-specific sale pricing.
     /// </summary>
     /// <param name="tenant">
-    /// Tenant bot whose sale-price markup, enabled payment options, and storefront identity should be reflected
-    /// in the message.
+    /// Tenant bot row that owns the storefront. Its non-negative markup percent can replace the public tariff with a
+    /// marked-up colleague base cost; null uses the public normal-customer tariff.
     /// </param>
     /// <returns>
-    /// HTML-formatted Persian tariff text suitable for Telegram <c>ParseMode.Html</c>. Metered traffic options
-    /// below each service's configured <c>minimumTrafficGb</c> are omitted from the visible examples.
+    /// HTML-formatted Persian tariff text safe for the tenant bot to send to its customers. Disabled durations and
+    /// unlimited plans are omitted, and sample totals are exact whole-toman sale prices.
     /// </returns>
     /// <remarks>
-    /// Tenant pricing uses the same purchase rules as owned bots, then applies the tenant owner's sale-price
-    /// policy. The method is presentation-only and does not create orders or modify tenant state.
+    /// Per-day display never reveals the owner's colleague base cost. With no markup it shows the public daily rate;
+    /// with markup it shows the effective marked-up daily rate. Final order prices are still calculated from the
+    /// complete selection by <see cref="CalculateTenantPrice" />, not by multiplying this presentation value.
+    /// This method performs no database writes, wallet changes, gateway calls, or Telegram sends.
     /// </remarks>
     private string BUILDTENANTTARIFFSTEXT(BotInstance tenant)
     {
@@ -8024,7 +8052,21 @@ public class TenantBotService
                 var visibleTrafficOptions = XuiV3PurchaseService.GetVisibleTrafficOptions(service);
                 var traffic = string.Join("، ", visibleTrafficOptions.Select(x => $"{x}GB"));
                 Builder.AppendLine($"• حجم‌ها: <code>{Html(traffic)}</code>");
-                foreach (var duration in service.DurationOptions.OrderBy(x => x.Days))
+                var enabledDurations = XuiV3PurchaseService.GetEnabledDurationOptions(service);
+                var hasDailyPrice = (service.PricePerDay?.User ?? 0L) > 0 ||
+                                    (service.PricePerDay?.Colleague ?? 0L) > 0;
+                if (hasDailyPrice && enabledDurations.Any(duration => duration.Days > 0))
+                {
+                    var effectiveDailyPrice = CalculateTenantEffectiveDailyPriceToman(tenant, service);
+                    Builder.AppendLine($"• هزینه هر روز: <code>{Html(effectiveDailyPrice.FormatCurrency())}</code>");
+                }
+                if ((hasDailyPrice || service.LifetimePriceMultiplier != 1D) &&
+                    enabledDurations.Any(duration => duration.Days == 0))
+                {
+                    Builder.AppendLine($"• ضریب مدت نامحدود: <code>{Html(XuiV3PurchaseService.FormatLifetimeMultiplier(service.LifetimePriceMultiplier))}</code>");
+                }
+
+                foreach (var duration in enabledDurations.OrderBy(x => x.Days))
                 {
                     var sampleTraffic = visibleTrafficOptions.FirstOrDefault();
                     if (sampleTraffic <= 0)
@@ -8278,11 +8320,28 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// CALCULATES customer sale Price, owner base cost, and owner profit for A tenant-storefront selection.
+    /// Calculates customer sale price, owner base cost, and owner profit for a tenant-storefront selection.
     /// </summary>
-    /// <param name="tenant">tenant Bot whose optional markup percent can override the public TARIFF.</param>
-    /// <param name="selection">service and plan selection selected by the storefront customer.</param>
-    /// <returns>Price BREAKDOWN in toman for order creation and ledger RECORDING.</returns>
+    /// <param name="tenant">
+    /// Tenant bot row that owns the storefront. Its markup is a non-negative percentage; null means no custom markup.
+    /// </param>
+    /// <param name="selection">
+    /// Global service selection made by the tenant customer, including metered traffic and duration or a fixed
+    /// unlimited-plan key. The selection must remain enabled in the current catalog.
+    /// </param>
+    /// <returns>
+    /// A whole-toman breakdown containing the customer sale amount, colleague owner base cost, and non-negative owner
+    /// profit. The result is detached and callers persist it on the tenant order before settlement.
+    /// </returns>
+    /// <remarks>
+    /// The shared resolver first applies per-GB, per-day, or lifetime-multiplier pricing for both public and colleague
+    /// roles. A positive tenant markup replaces the public sale with the colleague total multiplied by that markup;
+    /// the sale is never below owner base cost. This method does not debit or credit a wallet and does not create an
+    /// order, ledger entry, gateway invoice, or XUI account.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the selected global plan or its financial configuration is invalid or disabled.
+    /// </exception>
     private TenantPriceResult CalculateTenantPrice(BotInstance tenant, XuiV3PurchaseSelection selection)
     {
         var PUBLICRESOLVED = _purchaseService.ResolvePurchase(selection, false);
@@ -8303,6 +8362,49 @@ public class TenantBotService
             BaseCostToman = BASECOST,
             ProfitToman = Math.Max(0, sale - BASECOST)
         };
+    }
+
+    /// <summary>
+    /// Calculates the customer-visible effective daily rate for a tenant metered tariff.
+    /// </summary>
+    /// <param name="tenant">
+    /// Tenant bot whose non-negative markup percentage controls storefront sale pricing. Null uses the public tariff.
+    /// </param>
+    /// <param name="service">
+    /// Global metered service containing role-specific daily rates in Iranian toman. It must come from the validated
+    /// current catalog and must not be an unlimited fixed-price service.
+    /// </param>
+    /// <returns>
+    /// Effective daily sale rate in whole Iranian toman, rounded upward. It is safe to display to tenant customers and
+    /// does not expose the raw colleague rate when markup pricing is active.
+    /// </returns>
+    /// <remarks>
+    /// With no positive markup, the normal-customer daily tariff is returned. With markup, the colleague daily rate
+    /// is multiplied by <c>1 + markup / 100</c>. Final order totals continue to use
+    /// <see cref="CalculateTenantPrice" /> so combined rounding and traffic pricing remain authoritative.
+    /// This method has no persistence, wallet, Telegram, gateway, ledger, or XUI side effects.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="service" /> is null.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the effective daily rate is negative.</exception>
+    /// <exception cref="OverflowException">Thrown when the effective rate exceeds the supported 64-bit toman range.</exception>
+    private static long CalculateTenantEffectiveDailyPriceToman(BotInstance tenant, XuiV3ServiceDefinition service)
+    {
+        if (service == null)
+            throw new ArgumentNullException(nameof(service));
+
+        var markup = Math.Max(0, tenant?.TenantPriceMarkupPercent ?? 0);
+        var effectiveRate = markup > 0
+            ? service.GetPricePerDay(isColleague: true) * (1M + markup / 100M)
+            : service.GetPricePerDay(isColleague: false);
+
+        if (effectiveRate < 0M)
+            throw new InvalidOperationException($"Service '{service.Key}' cannot have a negative effective daily price.");
+
+        var roundedRate = Math.Ceiling(effectiveRate);
+        if (roundedRate > long.MaxValue)
+            throw new OverflowException($"Effective daily price for service '{service.Key}' exceeds the supported toman range.");
+
+        return (long)roundedRate;
     }
 
     /// <summary>
