@@ -18,6 +18,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Server publish: `dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained false` from the repository root.
 - The solution intentionally contains only the production `Adminbot` project. Do not add a separate test project or test-framework dependency unless the user explicitly requests that repository structure in the current task.
 - `Adminbot.csproj` excludes `Adminbot.Tests/**` from default SDK items so stale untracked `bin/obj` files in an existing server checkout cannot be compiled after the removed test project is deployed.
+- `Adminbot.csproj` explicitly pins `SQLitePCLRaw.bundle_e_sqlite3` to patched 2.1.12 so EF Core's native
+  SQLite library, provider, and core packages resolve as one compatible family instead of vulnerable 2.1.11.
 
 ## Data Stores
 
@@ -26,6 +28,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
 - `Data/configuration.example.json`: sanitized configuration example including referral and four-gateway enable/readiness settings; all gateway switches and secret placeholders default to off/empty.
 - `Data/xui-v3-service-plans.json`: XUI v3 service catalog, inbounds, metered per-GB/per-day/lifetime pricing, duration availability, unlimited fair-usage plans, and `minimumTrafficGb`.
+- Historical migration filenames and `[Migration("timestamp_name")]` ids are immutable database history. Their CLR
+  types use PascalCase to keep current compilers warning-free; never rename the files or attribute ids as cleanup.
 
 ## Core Services
 

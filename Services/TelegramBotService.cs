@@ -7582,11 +7582,27 @@ public class TelegramBotService : IHostedService
         return GetPrices(isColleague, isForRenew).Contains(text);
     }
 
+    /// <summary>
+    /// Sends one or more Telegram messages containing the legacy account-status representation of XUI clients.
+    /// </summary>
+    /// <param name="chatId">
+    /// The destination Telegram chat id from the active owned bot conversation.
+    /// </param>
+    /// <param name="isColleague">
+    /// Whether the recipient has colleague privileges and may see usage and enable/disable actions.
+    /// </param>
+    /// <param name="clients">
+    /// The XUI client records to display. The collection must be non-null and may be empty.
+    /// </param>
+    /// <returns>A task that completes after every non-empty message chunk has been delivered.</returns>
+    /// <remarks>
+    /// Messages are split below Telegram's 4096-character limit. This legacy formatter does not mutate clients,
+    /// account ownership, wallet balances, or conversation state.
+    /// </remarks>
     public async Task SendMessageWithClientInfo(ChatId chatId, bool isColleague, List<ClientExtend> clients)
     {
         const int MaxMessageLength = 4096; // Telegram max message length
         StringBuilder messageBuilder = new StringBuilder();
-        var sentMessages = 0;
         string clientInfo = "وضعیت اکانت های شما به شرح زیر است: \n";
         foreach (var client in clients)
         {

@@ -5,7 +5,7 @@
 namespace Adminbot.Migrations
 {
     /// <inheritdoc />
-    public partial class acountcounter : Migration
+    public partial class AccountCounter : Migration
     {
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)

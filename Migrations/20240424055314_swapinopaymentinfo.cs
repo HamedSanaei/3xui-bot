@@ -5,7 +5,7 @@
 namespace Adminbot.Migrations
 {
     /// <inheritdoc />
-    public partial class swapinopaymentinfo : Migration
+    public partial class SwapinoPaymentInfoTable : Migration
     {
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)

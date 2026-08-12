@@ -11,7 +11,7 @@ namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
     [Migration("20240424055314_swapinopaymentinfo")]
-    partial class swapinopaymentinfo
+    partial class SwapinoPaymentInfoTable
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)

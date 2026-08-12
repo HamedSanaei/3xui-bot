@@ -103,15 +103,14 @@ public class ApiService
     /// This method is intentionally fail-closed and exception-safe. Null server config, invalid URLs, missing
     /// <c>Set-Cookie</c> headers, empty cookie values, HTTP failures, database errors, and unexpected exceptions
     /// are logged and converted to <c>null</c> so Telegram update handlers do not crash.
+    /// TLS negotiation is delegated to <see cref="HttpClient" /> and the operating system so obsolete global
+    /// <see cref="ServicePointManager" /> settings cannot weaken or misrepresent the connection policy.
     /// </remarks>
     public static async Task<string> LoginAndGetSessionCookie(ServerInfo serverInfo)
 
     {
         try
         {
-            System.Net.ServicePointManager.SecurityProtocol =
-        SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
-
             if (!TryValidateLoginServer(serverInfo, out var baseUri))
                 return null;
 

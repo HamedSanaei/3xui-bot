@@ -5,7 +5,7 @@
 namespace Adminbot.Migrations
 {
     /// <inheritdoc />
-    public partial class zibaltable : Migration
+    public partial class ZibalTable : Migration
     {
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)

@@ -79,6 +79,28 @@ namespace Adminbot.Utils
             //return long.TryParse(numericString, out long result) ? result : 0;
         }
 
+        /// <summary>
+        /// Converts decimal digits from any Unicode decimal script, including Persian and Arabic-Indic digits,
+        /// to their ASCII equivalents while preserving every non-digit character.
+        /// </summary>
+        /// <param name="input">
+        /// The optional user-supplied text to normalize. A null or empty value is returned unchanged.
+        /// </param>
+        /// <returns>
+        /// A string whose Unicode decimal digits are represented by <c>0</c> through <c>9</c>; non-digit text is
+        /// unchanged. The return value is null only when <paramref name="input" /> is null.
+        /// </returns>
+        /// <remarks>
+        /// Telegram amount, duration, and identifier parsers use this helper before numeric validation. It performs
+        /// no trimming and does not discard signs, separators, or letters, so callers remain responsible for their
+        /// own input grammar.
+        /// </remarks>
+        /// <example>
+        /// <code>
+        /// var normalized = "مدت ۳ روز".PersianNumbersToEnglish();
+        /// // normalized == "مدت 3 روز"
+        /// </code>
+        /// </example>
         public static string PersianNumbersToEnglish(this string input)
         {
             if (string.IsNullOrEmpty(input))
@@ -97,26 +119,6 @@ namespace Adminbot.Utils
             }
 
             return normalized.ToString();
-
-            var builder = new StringBuilder(input.Length);
-            foreach (char c in input)
-            {
-                switch (c)
-                {
-                    case '۰': builder.Append('0'); break;
-                    case '۱': builder.Append('1'); break;
-                    case '۲': builder.Append('2'); break;
-                    case '۳': builder.Append('3'); break;
-                    case '۴': builder.Append('4'); break;
-                    case '۵': builder.Append('5'); break;
-                    case '۶': builder.Append('6'); break;
-                    case '۷': builder.Append('7'); break;
-                    case '۸': builder.Append('8'); break;
-                    case '۹': builder.Append('9'); break;
-                    default: builder.Append(c); break; // If it's not a Persian number, just append the character as is
-                }
-            }
-            return builder.ToString();
         }
     }
 }

@@ -34,10 +34,23 @@ namespace Adminbot.Services
             await Task.Run(() => ProcessRequests(), cancellationToken);
         }
 
+        /// <summary>
+        /// Loads and validates the configured PKCS#12 certificate before the legacy HTTPS listener starts.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="HttpListener" /> obtains its server certificate from the operating-system HTTPS binding. This
+        /// method preserves the existing fail-fast validation of the configured file and password and disposes the
+        /// temporary certificate immediately after validation.
+        /// </remarks>
+        /// <exception cref="System.IO.IOException">The configured certificate file cannot be read.</exception>
+        /// <exception cref="System.Security.Cryptography.CryptographicException">
+        /// The file is not a valid PKCS#12 certificate or its password is incorrect.
+        /// </exception>
         private void LoadCertificate()
         {
-            X509Certificate2 certificate = new X509Certificate2(_certificatePath, _certificatePassword);
-            //_listener.SslConfiguration.ServerCertificate = certificate;
+            using var certificate = X509CertificateLoader.LoadPkcs12FromFile(
+                _certificatePath,
+                _certificatePassword);
         }
 
         private void ProcessRequests()

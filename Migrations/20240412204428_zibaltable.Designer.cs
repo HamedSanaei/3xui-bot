@@ -11,7 +11,7 @@ namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
     [Migration("20240412204428_zibaltable")]
-    partial class zibaltable
+    partial class ZibalTable
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)

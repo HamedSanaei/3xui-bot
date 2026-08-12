@@ -6217,15 +6217,35 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// fulfills A paid tenant order exactly once: creates the XuiV3 account, credits the tenant owner
-    /// with the profit, Writes the ledger row, NOTIFIES both PARTIES, and EMITS the operational log.
+    /// Fulfills a paid HooshPay tenant order through the shared idempotent tenant settlement pipeline.
     /// </summary>
-    /// <param name="payment">HooshPay payment row whose <c>PaymentPurpose</c> is A tenant order.</param>
-    /// <param name="Source">settlement Source, for example <c>ipn</c> or <c>manual-check</c>.</param>
-    /// <param name="CancellationToken">Cancellation Token for database, Telegram, and panel operations.</param>
+    /// <param name="payment">
+    /// The HooshPay users.db payment row associated with a tenant order. The row must carry either the internal
+    /// tenant-order id or its public order id; a null value is treated as not found.
+    /// </param>
+    /// <param name="Source">
+    /// The non-secret settlement trigger recorded for auditing, such as <c>ipn</c> or <c>manual-check</c>.
+    /// </param>
+    /// <param name="CancellationToken">
+    /// A token that cancels users.db, XUI, wallet-ledger, and Telegram operations for this settlement attempt.
+    /// </param>
     /// <returns>
-    /// settlement status describing whether the order was applied, already fulfilled, or could not be completed.
+    /// A settlement result indicating that the order was applied, was already fulfilled, was not found, or could
+    /// not be completed. Callers must use the result rather than retrying fulfillment blindly.
     /// </returns>
+    /// <remarks>
+    /// The shared fulfillment routine is the only implementation used here. It protects account creation and the
+    /// tenant owner's toman profit credit from duplicate provider callbacks and records the corresponding ledger row.
+    /// A missing payment or order produces no XUI, balance, ledger, or notification side effect.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var result = await tenantBotService.ApplyPaidTenantOrderAsync(
+    ///     verifiedPayment,
+    ///     "ipn",
+    ///     cancellationToken);
+    /// </code>
+    /// </example>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         HooshPayPaymentInfo payment,
         string Source,
@@ -6241,154 +6261,6 @@ public class TenantBotService
             return NowPaymentsSettlementResult.NotFound();
 
         return await FULFILLPAIDTENANTORDERASYNC(order, Source, payment, null, false, CancellationToken);
-
-        if (await ISTENANTORDERALREADYFULFILLEDASYNC(order, CancellationToken))
-            return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
-
-        // fulfillment is idempotent: paid orders Create one account and credit the owner once.
-        order.PaymentStatus = TenantBotOrderStatuses.Paid;
-        order.PaidAtUtc = DateTime.UtcNow;
-        order.UpdatedAtUtc = DateTime.UtcNow;
-        payment.PaymentStatus = HooshPayStatuses.Paid;
-        payment.PaidAtUtc ??= DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
-
-        var TENANTCONFIG = _botRegistry.GetById(order.TenantBotId);
-        var tenant = await _userDbcontext.BotInstances.FirstOrDefaultAsync(x => x.Id == order.TenantBotId, CancellationToken);
-        var owner = await _credentialsDbContext.GetUserStatusWithId(order.OwnerTelegramUserId);
-        var customer = await _credentialsDbContext.GetUserStatusWithId(order.CustomerTelegramUserId);
-        if (owner == null || customer == null || tenant == null)
-        {
-            order.PaymentStatus = TenantBotOrderStatuses.Failed;
-            order.ErrorMessage = "tenant owner or customer was not found.";
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
-            return NowPaymentsSettlementResult.UserNotFound();
-        }
-
-        var selection = new XuiV3PurchaseSelection
-        {
-            ServiceKey = order.ServiceKey,
-            TrafficGb = order.TrafficGb,
-            DurationKey = order.DurationKey,
-            UnlimitedPlanKey = order.UnlimitedPlanKey,
-            AccountCount = 1
-        };
-
-        using (_botContextAccessor.Push(new BotRuntimeContext
-        {
-            Config = TENANTCONFIG,
-            Client = _botClientProvider.GetClient(order.TenantBotId)
-        }))
-        {
-            try
-            {
-                if (string.Equals(order.OrderKind, TenantBotOrderKinds.Renew, StringComparison.OrdinalIgnoreCase))
-                    return await FULFILLPAIDTENANTRENEWORDERASYNC(order, owner, customer, tenant, selection, Source, false, CancellationToken);
-
-                var created = await _purchaseService.CreateAccountAsync(
-                    customer,
-                    BuildConfiguredPanelServerInfo(),
-                    selection,
-                    _appConfig.XuiV3ApiBaseUrl,
-                    CancellationToken,
-                    new XuiV3AccountMetadataOptions
-                    {
-                        UserComment = $"tenant sale VIA @{tenant.Username}",
-                        PriceTomanOverride = order.SalePriceToman,
-                        CreatedByBotId = order.TenantBotId,
-                        LastUpdatedByBotId = order.TenantBotId,
-                        CreatedByTelegramUserId = order.CustomerTelegramUserId,
-                        LastUpdatedByTelegramUserId = order.OwnerTelegramUserId,
-                        LastAction = "tenant-Bot-sale",
-                        SaveUserStatus = true
-                    });
-
-                if (!created.Success)
-                {
-                    var retryable = IsTenantFulfillmentTimeout(created.Message);
-                    order.PaymentStatus = retryable
-                        ? TenantBotOrderStatuses.ReceiptApproved
-                        : TenantBotOrderStatuses.Failed;
-                    order.ErrorMessage = created.Message;
-                    order.UpdatedAtUtc = DateTime.UtcNow;
-                    await _userDbcontext.SaveChangesAsync(CancellationToken);
-                    if (retryable)
-                    {
-                        await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, created.Message, CancellationToken);
-                        LOGTENANTORDER(order, owner, customer, Source, "account-create-timeout-retryable");
-                    }
-                    else
-                    {
-                        await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, created.Message, CancellationToken);
-                        LOGTENANTORDER(order, owner, customer, Source, "account-Create-failed");
-                    }
-
-                    return NowPaymentsSettlementResult.InvalidAmount();
-                }
-
-                var beforeBalance = owner.AccountBalance;
-                if (order.ProfitToman > 0)
-                    await _credentialsDbContext.AddFund(order.OwnerTelegramUserId, order.ProfitToman);
-                var afterBalance = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
-
-                order.IsFulfilled = true;
-                order.IsOwnerCredited = order.ProfitToman > 0;
-                order.OwnerBalanceBefore = beforeBalance;
-                order.OwnerBalanceAfter = afterBalance;
-                order.PaymentStatus = TenantBotOrderStatuses.Fulfilled;
-                order.CreatedAccountEmail = created.Email;
-                order.CreatedSubLink = created.SubLink;
-                order.CreatedAccountJson = JsonConvert.SerializeObject(created);
-                order.FulfilledAtUtc = DateTime.UtcNow;
-                order.UpdatedAtUtc = DateTime.UtcNow;
-                await CLEARTENANTORDERFULFILLMENTERRORASYNC(order, CancellationToken);
-
-                _userDbcontext.TenantBotLedgerEntries.Add(new TenantBotLedgerEntry
-                {
-                    TenantBotId = order.TenantBotId,
-                    TenantBotUsername = order.TenantBotUsername,
-                    TenantBotOrderId = order.Id,
-                    OrderId = order.OrderId,
-                    OwnerTelegramUserId = order.OwnerTelegramUserId,
-                    CustomerTelegramUserId = order.CustomerTelegramUserId,
-                    SalePriceToman = order.SalePriceToman,
-                    BaseCostToman = order.BaseCostToman,
-                    ProfitToman = order.ProfitToman,
-                    OwnerBalanceBefore = beforeBalance,
-                    OwnerBalanceAfter = afterBalance,
-                    Description = $"tenant Bot sale VIA @{order.TenantBotUsername}",
-                    CreatedAtUtc = DateTime.UtcNow
-                });
-
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
-                await NOTIFYTENANTCUSTOMERSUCCESSASYNC(order, created, CancellationToken);
-                await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, CancellationToken);
-                LOGTENANTORDER(order, owner, customer, Source, "fulfilled");
-                return NowPaymentsSettlementResult.Applied(beforeBalance, afterBalance);
-            }
-            catch (Exception ex)
-            {
-                var retryable = IsTenantFulfillmentTimeout(ex);
-                order.PaymentStatus = retryable
-                    ? TenantBotOrderStatuses.ReceiptApproved
-                    : TenantBotOrderStatuses.Failed;
-                order.ErrorMessage = ex.Message;
-                order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
-                if (retryable)
-                {
-                    await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, ex.Message, CancellationToken);
-                    LOGTENANTORDER(order, owner, customer, Source, "Exception-timeout-retryable");
-                }
-                else
-                {
-                    await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, ex.Message, CancellationToken);
-                    LOGTENANTORDER(order, owner, customer, Source, "Exception");
-                }
-
-                return NowPaymentsSettlementResult.InvalidAmount();
-            }
-        }
     }
 
     /// <summary>

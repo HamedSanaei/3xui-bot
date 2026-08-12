@@ -11,7 +11,7 @@ namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
     [Migration("20240317232216_acountcounter")]
-    partial class acountcounter
+    partial class AccountCounter
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
