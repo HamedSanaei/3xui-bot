@@ -176,13 +176,13 @@ namespace Adminbot.Domain
         /// </summary>
         public string TargetAccountEmail { get; set; }
         /// <summary>
-        /// Normalized XUI client UUID that pins an externally authorized renewal order to the exact account selected.
+        /// Normalized XUI client UUID that pins a tenant renewal order to the exact account selected.
         /// </summary>
         /// <remarks>
-        /// A null value preserves the legacy owner-only renewal rule. A non-null value means the customer proved
-        /// possession of a UUID or a server-validated restricted search result; fulfillment must match both this UUID
-        /// and <see cref="TargetAccountEmail"/> before applying any panel or wallet side effect. The value is sensitive
-        /// and must not be written to Telegram callbacks, customer messages, or operational logs.
+        /// Every newly created safely lockable renewal order stores the panel-derived UUID regardless of whether the
+        /// account belongs to the payer. Fulfillment must match it with <see cref="TargetAccountEmail"/> before any
+        /// panel or wallet effect. Null is retained for old orders and owned legacy clients whose panel row has no valid
+        /// UUID; those remain owner-checked. The value must not enter callbacks, messages, or operational logs.
         /// </remarks>
         public string TargetAccountUuid { get; set; }
         public string ServiceKey { get; set; }
@@ -366,12 +366,13 @@ namespace Adminbot.Domain
         public DateTime LastFreeAcc { get; set; } = DateTime.MinValue;
         public string PaymentMethod { get; set; } = "credit";
         /// <summary>
-        /// Normalized UUID that authorizes renewal of the exact target account even when the payer is not its owner.
+        /// Normalized panel UUID that locks the exact account selected for renewal.
         /// </summary>
         /// <remarks>
-        /// This bot-scoped transient proof is independent from <see cref="PaymentMethod"/> so selecting the bot or
-        /// website wallet cannot erase authorization. Every preview and completion path must compare it with fresh
-        /// panel data. Empty values retain the normal owner-only rule.
+        /// Every safely lockable owned or tenant renewal stores this value independently from <see cref="PaymentMethod"/>,
+        /// whether or not the payer owns the account. Preview, order, and completion compare it with saved email and
+        /// fresh panel data. Empty values are accepted for old state and owned legacy clients whose panel row lacks a
+        /// valid UUID; those remain owner-checked. This lock grants no management or configuration permission.
         /// </remarks>
         public string RenewTargetUuid { get; set; }
         public int AccountCounter { get; set; }
@@ -389,7 +390,7 @@ namespace Adminbot.Domain
         /// <param name="user">Legacy User state object collected by existing call sites.</param>
         /// <returns>A new BotUserState that can be inserted into users.db.</returns>
         /// <remarks>
-        /// The conversion copies an optional renewal UUID proof into the specified bot scope. It performs no account,
+        /// The conversion copies an optional renewal UUID target lock into the specified bot scope. It performs no account,
         /// wallet, order, or panel operation and callers remain responsible for persisting the returned row.
         /// </remarks>
         public static BotUserState FromUser(string botId, User user)
@@ -425,7 +426,7 @@ namespace Adminbot.Domain
         /// </summary>
         /// <returns>A User object with the same conversation fields and Telegram user id.</returns>
         /// <remarks>
-        /// The sensitive renewal UUID proof is copied so later preview/payment handlers can revalidate it; the returned
+        /// The sensitive renewal UUID target lock is copied so later preview/payment handlers can revalidate it; the returned
         /// compatibility DTO is detached and does not authorize any action by itself.
         /// </remarks>
         public User ToUser()
@@ -460,7 +461,7 @@ namespace Adminbot.Domain
         /// <param name="user">Partial legacy state update.</param>
         /// <remarks>
         /// Null means "preserve the stored value" for all nullable legacy fields; an explicit empty string clears a
-        /// string field. This distinction preserves the renewal UUID proof across payment-method and plan updates but
+        /// string field. This distinction preserves the renewal UUID target lock across payment-method and plan updates but
         /// means callers that must also clear numeric pending state should use a full reset instead of a partial save.
         /// Callers must save the tracked state after this in-memory merge.
         /// </remarks>
@@ -491,7 +492,7 @@ namespace Adminbot.Domain
         /// Clears transient flow fields while keeping the bot/user row and long-lived counters.
         /// </summary>
         /// <remarks>
-        /// Renewal UUID proof and payment choice are cleared with the conversation so a later flow cannot inherit
+        /// Renewal UUID target lock and payment choice are cleared with the conversation so a later flow cannot inherit
         /// authorization. Wallets, tenant orders, account metadata, and state rows belonging to other bots are untouched.
         /// </remarks>
         public void Clear()

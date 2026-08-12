@@ -40,13 +40,14 @@ public class User
     public DateTime LastFreeAcc { get; set; } = DateTime.MinValue;
     public string PaymentMethod { get; set; } = "credit";
     /// <summary>
-    /// Gets or sets the normalized UUID that authorizes a renewal without requiring the payer to own the target account.
+    /// Gets or sets the normalized panel UUID that locks the exact account selected for renewal.
     /// </summary>
     /// <remarks>
     /// This compatibility DTO property is not mapped to the legacy <c>Users</c> table. The value is persisted only by
-    /// <see cref="BotUserState"/> for the current bot and Telegram user, and must be revalidated against the panel before
-    /// a wallet debit, tenant order, or XUI update. It grants renewal access only and must never authorize configuration
-    /// delivery or account-management actions.
+    /// <see cref="BotUserState"/> for the current bot and Telegram user. Every safely lockable renewal stores a
+    /// panel-derived value regardless of ownership and revalidates it with saved email before a wallet debit, tenant
+    /// order, or XUI update. An owned legacy client without a valid UUID remains owner-checked. This value grants no
+    /// configuration-delivery or management permission.
     /// </remarks>
     [NotMapped]
     public string RenewTargetUuid { get; set; }

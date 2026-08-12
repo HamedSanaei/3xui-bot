@@ -36,8 +36,8 @@ public static class XuiV3RenewalPolicy
     /// </param>
     /// <param name="allowActorAsOwnerFallback">
     /// <c>true</c> to retain legacy behavior that assigns the actor when the client has no owner metadata;
-    /// <c>false</c> for UUID-authorized third-party renewals so paying for an ownerless legacy account cannot transfer
-    /// ownership to the payer and existing panel/metadata owner fields remain independently unchanged.
+    /// <c>false</c> for every renewal protected by an exact email-plus-UUID target lock so paying for an ownerless
+    /// account cannot transfer ownership to the payer and existing panel/metadata owner fields remain unchanged.
     /// </param>
     /// <returns>
     /// A detached renewal calculation containing the complete XUI replacement payload, reset requirement,
@@ -254,8 +254,8 @@ public static class XuiV3RenewalPolicy
             ServiceName = service?.DisplayName ?? "unknown"
         };
 
-        // An external UUID payer is an audit actor, not an owner. Preserve an existing metadata owner independently
-        // from panel TgId even when old data contains different values; owner-based legacy renewals retain old repair.
+        // A payer using an exact renewal target lock is an audit actor, not an owner. Preserve an existing metadata
+        // owner independently from panel TgId; only legacy owner-based states retain the historical fallback repair.
         if (allowActorAsOwnerFallback || !hadExistingMetadata)
             metadata.TelegramUserId = ownerTelegramUserId;
         if (service != null)
@@ -412,7 +412,7 @@ public static class XuiV3RenewalPolicy
     }
 
     /// <summary>
-    /// Resolves the account owner without allowing an external UUID payer to take ownership of an ownerless client.
+    /// Resolves the account owner without allowing a target-locked renewal payer to take ownership of an ownerless client.
     /// </summary>
     /// <param name="client">Current panel client whose positive <c>TgId</c> has first priority.</param>
     /// <param name="metadata">Parsed account metadata whose owner is used when panel <c>TgId</c> is absent.</param>

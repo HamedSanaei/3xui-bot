@@ -1821,9 +1821,40 @@ public static class XuiV3PurchaseCallbacks
         return $"{Prefix}:asren:{clientId}:{Math.Max(0, page)}";
     }
 
+    /// <summary>
+    /// Builds the legacy <c>auren</c> callback for a non-owned account found by an exact saved renewal identifier.
+    /// </summary>
+    /// <param name="clientId">Positive numeric panel client id used only to route back to the saved search state.</param>
+    /// <returns>A compact callback containing no email, SubId, UUID, password, or configuration URL.</returns>
+    /// <remarks>
+    /// Despite the historical method name, email, SubId/subscription URL, UUID, and supported configuration searches
+    /// may use this callback. The handler must prove that the bot-scoped query still resolves to this client and must
+    /// show the non-owner confirmation before plan selection.
+    /// </remarks>
     public static string AccountUuidRenew(int clientId)
     {
         return $"{Prefix}:auren:{clientId}";
+    }
+
+    /// <summary>
+    /// Builds the fixed callback that confirms the warning for a non-owned renewal target stored in bot-scoped state.
+    /// </summary>
+    /// <returns>A callback containing no client id, email, UUID, SubId, password, or configuration URL.</returns>
+    /// <remarks>
+    /// The receiving owned or tenant handler must require the exact renewal flow and
+    /// <c>renew-confirm-external-target</c> step, then reload the saved email and UUID from the panel. The callback is
+    /// routing data only and is never sufficient to select or renew an account by itself.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// InlineKeyboardButton.WithCallbackData(
+    ///     "ادامه تمدید همین اکانت",
+    ///     XuiV3PurchaseCallbacks.ConfirmExternalRenewTarget());
+    /// </code>
+    /// </example>
+    public static string ConfirmExternalRenewTarget()
+    {
+        return $"{Prefix}:rgo";
     }
 
     public static string AccountDeleteAsk(int clientId, int page)
@@ -1914,6 +1945,7 @@ public static class XuiV3PurchaseCallbacks
     /// must resolve it against the current custom-duration configuration before any financial or XUI operation.
     /// Account-configuration callbacks carry only the numeric client id. Parsing does not establish Telegram ownership,
     /// and legacy <c>acct</c> state callbacks without a page segment remain valid with a null page restored as zero.
+    /// The fixed <c>rgo</c> action contains no target identity and is valid only with matching bot-scoped renewal state.
     /// </remarks>
     public static bool TryParse(string callbackData, out XuiV3PurchaseCallback callback)
     {

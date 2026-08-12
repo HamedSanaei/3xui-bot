@@ -40,7 +40,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `subLinks/{subId}` with `links/{email}` fallback, deduplicates URLs ordinally, and sends short results as escaped HTML
   or long results as an in-memory UTF-8 file. The API adapter accepts raw arrays and standard envelopes and disables
   automatic URI-logging retries for these identifier-bearing paths. SubId, URLs, response bodies, tokens, and private
-  request URIs must never enter callbacks or logs; non-owner UUID/SubId results retain the restricted renewal-only menu.
+  request URIs must never enter callbacks or logs; non-owner exact-identifier results retain a restricted renewal-only
+  menu and never receive usage details, configuration delivery, or management actions.
 - `Services/TelegramNavigationCommandParser.cs`: validates bot-addressed `/start` commands and the owned-only `/refresh`
   alias, including `@BotUsername`, optional start payloads, and the legacy `/start=payload` form. The main dispatcher
   clears both the current `BotId + TelegramUserId` conversation row and bot-scoped in-memory XUI purchase selection
@@ -50,9 +51,10 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   both `/start` and `/refresh` whenever their runtime starts.
 - Owned purchase/renewal insufficient-balance messages expose `wallet:charge`. The dispatcher trusts only the callback sender, clears that bot's persisted state plus its in-memory XUI selection, edits the source message, and opens the same live-gateway charge menu as `💰شارژ حساب کاربری`; tenant storefronts never receive this shortcut.
 - `Services/XuiV3RenewalPolicy.cs`: central renewal payload calculation for metered, national, and unlimited accounts.
-- `Services/XuiV3RenewalTargetParser.cs`: side-effect-free raw/VLESS/VMess UUID extraction shared by owned and tenant
-  renewal. UUID possession grants renewal only; the payer remains an audit actor and existing `TgId`, metadata owner,
-  UUID, SubId, protocol identity, and account ownership are preserved.
+- `Services/XuiV3RenewalTargetParser.cs` + `XuiV3RenewalTargetResolver.cs`: shared side-effect-free exact renewal lookup
+  for email, raw SubId/full subscription link, UUID, and VLESS/VMess/Trojan/Shadowsocks/Hysteria configurations. One
+  fresh `clients/list` snapshot must produce exactly one client; configuration matching trusts only embedded UUID or
+  protocol password, never host/fragment/display label. Password matching is ordinal and duplicate matches fail closed.
 - `Services/XuiV3ClientPlanEligibility.cs`: checks whether an XUI client belongs to active service inbounds.
 - `Services/XuiV3ClientUsageResolver.cs`: shared null-safe XUI list-response interpretation for consumption, quota,
   expiry, `createdAt`, `updatedAt`, origin bot, and renewal metadata. A missing nested `traffic` object falls back to
@@ -85,10 +87,12 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Tenant runtime state is scoped by `BotId + TelegramUserId` in `BotUserStates`; never key tenant customer flow only by Telegram user id.
 - Tenant customers reuse shared XUI account flows where possible, but tenant payments and fulfillment go through `TenantBotOrder`.
 - Tenant account-card renewal callbacks are intercepted before the shared owned-wallet handler and enter the tenant
-  order flow. Normal name/email renewal remains owner-only. A direct UUID or state-bound `auren` search proof may renew
-  another user's account but is revalidated before preview, order creation, and fulfillment. Migration
+  order flow. Renewal entry no longer filters ownership: email, SubId/subscription link, UUID, or supported config may
+  select another user's account. A non-owner target pauses at state `renew-confirm-external-target` and fixed callback
+  `x3:rgo`; the callback carries no identity and reloads bot-scoped email+UUID state before plan selection. Migration
   `20260812000000_AddRenewTargetUuidProofs` adds bot-scoped `RenewTargetUuid` and nullable order-level
-  `TargetAccountUuid`; null orders retain the legacy owner-based settlement rule and require no backfill.
+  `TargetAccountUuid`. Every safely lockable new renewal stores the panel UUID, while null legacy/UUID-less owned targets
+  retain owner-based settlement. Tenant pricing comes from the storefront used to renew, not the account's origin bot.
 - Tenant account metadata stored in XUI comments must preserve `CreatedByBotId`, `TenantBotId`, buyer Telegram id, service key, service kind, inbounds, and last action.
 - Normal and unlimited services may share the same public inbounds. Renewal/search must trust metadata first; if metadata is missing, negative expiry means unlimited, otherwise shared public inbounds should resolve to normal metered service.
 - Tenant support contacts should be stored as canonical `@username`; `t.me` links are normalized before display so customers never see `@https://...`.
@@ -257,8 +261,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - XUI v3 request timeout is controlled by `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`; slow panels can otherwise time out during `/panel/api/clients/add`.
 - Owned and tenant renewal entry uses explicit account-selection state and always clears that bot/user state before a
   terminal lookup/service/panel result. Entry, success selection cards, and terminal results expose `x3:home`, so reply
-  keyboard text cannot keep being consumed as an account name. UUID proof is stored separately from `PaymentMethod`,
-  never transported in callbacks/logs, and exact email+UUID matching is repeated before financial or XUI side effects.
+  keyboard text cannot keep being consumed as an account name. Non-owner targets require `x3:rgo`; after confirmation
+  the payer gains renewal only, never configuration/change/delete/state access. The panel UUID lock is stored separately
+  from `PaymentMethod`, never transported in callbacks/logs, and exact email+UUID matching is repeated before preview,
+  order creation, payment settlement, or XUI mutation. The payer is audit actor only; existing `TgId`, metadata owner,
+  UUID, password, SubId, and protocol identity are preserved.
 - XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
 - XUI v3 account creation treats generated email as the idempotency key. If `addClient` or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
 - XUI v3 failures must never expose panel URLs, root paths, endpoints, responses, tokens, or cookies in Telegram.
