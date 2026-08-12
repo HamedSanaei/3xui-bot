@@ -175,6 +175,16 @@ namespace Adminbot.Domain
         /// This field is tenant-scoped through <see cref="TenantBotId"/> and must be empty for normal purchases.
         /// </summary>
         public string TargetAccountEmail { get; set; }
+        /// <summary>
+        /// Normalized XUI client UUID that pins an externally authorized renewal order to the exact account selected.
+        /// </summary>
+        /// <remarks>
+        /// A null value preserves the legacy owner-only renewal rule. A non-null value means the customer proved
+        /// possession of a UUID or a server-validated restricted search result; fulfillment must match both this UUID
+        /// and <see cref="TargetAccountEmail"/> before applying any panel or wallet side effect. The value is sensitive
+        /// and must not be written to Telegram callbacks, customer messages, or operational logs.
+        /// </remarks>
+        public string TargetAccountUuid { get; set; }
         public string ServiceKey { get; set; }
         public int? TrafficGb { get; set; }
         public string DurationKey { get; set; }
@@ -355,6 +365,15 @@ namespace Adminbot.Domain
         public string _ConfigPrice { get; set; }
         public DateTime LastFreeAcc { get; set; } = DateTime.MinValue;
         public string PaymentMethod { get; set; } = "credit";
+        /// <summary>
+        /// Normalized UUID that authorizes renewal of the exact target account even when the payer is not its owner.
+        /// </summary>
+        /// <remarks>
+        /// This bot-scoped transient proof is independent from <see cref="PaymentMethod"/> so selecting the bot or
+        /// website wallet cannot erase authorization. Every preview and completion path must compare it with fresh
+        /// panel data. Empty values retain the normal owner-only rule.
+        /// </remarks>
+        public string RenewTargetUuid { get; set; }
         public int AccountCounter { get; set; }
         public int PendingAccountCount { get; set; }
         public string PendingUserComment { get; set; }
@@ -369,6 +388,10 @@ namespace Adminbot.Domain
         /// <param name="botId">Runtime bot id that owns this conversation state.</param>
         /// <param name="user">Legacy User state object collected by existing call sites.</param>
         /// <returns>A new BotUserState that can be inserted into users.db.</returns>
+        /// <remarks>
+        /// The conversion copies an optional renewal UUID proof into the specified bot scope. It performs no account,
+        /// wallet, order, or panel operation and callers remain responsible for persisting the returned row.
+        /// </remarks>
         public static BotUserState FromUser(string botId, User user)
         {
             return new BotUserState
@@ -387,6 +410,7 @@ namespace Adminbot.Domain
                 _ConfigPrice = user._ConfigPrice,
                 LastFreeAcc = user.LastFreeAcc,
                 PaymentMethod = user.PaymentMethod ?? "credit",
+                RenewTargetUuid = user.RenewTargetUuid,
                 AccountCounter = user.AccountCounter,
                 PendingAccountCount = user.PendingAccountCount,
                 PendingUserComment = user.PendingUserComment,
@@ -400,6 +424,10 @@ namespace Adminbot.Domain
         /// Converts this bot-scoped state back to the legacy User shape expected by existing flow code.
         /// </summary>
         /// <returns>A User object with the same conversation fields and Telegram user id.</returns>
+        /// <remarks>
+        /// The sensitive renewal UUID proof is copied so later preview/payment handlers can revalidate it; the returned
+        /// compatibility DTO is detached and does not authorize any action by itself.
+        /// </remarks>
         public User ToUser()
         {
             return new User
@@ -417,6 +445,7 @@ namespace Adminbot.Domain
                 _ConfigPrice = _ConfigPrice,
                 LastFreeAcc = LastFreeAcc,
                 PaymentMethod = PaymentMethod ?? "credit",
+                RenewTargetUuid = RenewTargetUuid,
                 AccountCounter = AccountCounter,
                 PendingAccountCount = PendingAccountCount,
                 PendingUserComment = PendingUserComment,
@@ -430,6 +459,10 @@ namespace Adminbot.Domain
         /// This preserves older flow behavior where SaveUserStatus receives partial state updates.
         /// </summary>
         /// <param name="user">Partial legacy state update.</param>
+        /// <remarks>
+        /// A null <see cref="User.RenewTargetUuid"/> preserves the current proof across payment-method and plan updates;
+        /// an explicit empty value clears it. Callers must save the tracked state after this in-memory merge.
+        /// </remarks>
         public void ApplyPartial(User user)
         {
             if (user.SelectedCountry != null) SelectedCountry = user.SelectedCountry;
@@ -444,6 +477,7 @@ namespace Adminbot.Domain
             if (user._ConfigPrice != null) _ConfigPrice = user._ConfigPrice;
             if (user.AccountCounter > AccountCounter) AccountCounter = user.AccountCounter;
             if (user.PaymentMethod != PaymentMethod) PaymentMethod = user.PaymentMethod;
+            if (user.RenewTargetUuid != null) RenewTargetUuid = user.RenewTargetUuid;
             if (user.PendingAccountCount > 0) PendingAccountCount = user.PendingAccountCount;
             if (user.PendingUserComment != null) PendingUserComment = user.PendingUserComment;
             if (user.LastFreeAcc > DateTime.MinValue) LastFreeAcc = user.LastFreeAcc;
@@ -455,6 +489,10 @@ namespace Adminbot.Domain
         /// <summary>
         /// Clears transient flow fields while keeping the bot/user row and long-lived counters.
         /// </summary>
+        /// <remarks>
+        /// Renewal UUID proof and payment choice are cleared with the conversation so a later flow cannot inherit
+        /// authorization. Wallets, tenant orders, account metadata, and state rows belonging to other bots are untouched.
+        /// </remarks>
         public void Clear()
         {
             SelectedCountry = "";
@@ -468,6 +506,7 @@ namespace Adminbot.Domain
             SubLink = "";
             _ConfigPrice = "0";
             PaymentMethod = "credit";
+            RenewTargetUuid = "";
             PendingAccountCount = 0;
             PendingUserComment = "";
             UpdatedAtUtc = DateTime.UtcNow;

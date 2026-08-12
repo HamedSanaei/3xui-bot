@@ -295,6 +295,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantBotUsername).HasMaxLength(128);
             entity.Property(x => x.OrderKind).HasMaxLength(32);
             entity.Property(x => x.TargetAccountEmail).HasMaxLength(160);
+            entity.Property(x => x.TargetAccountUuid).HasMaxLength(64);
             entity.Property(x => x.ServiceKey).HasMaxLength(64);
             entity.Property(x => x.DurationKey).HasMaxLength(64);
             entity.Property(x => x.UnlimitedPlanKey).HasMaxLength(64);
@@ -522,6 +523,7 @@ public class UserDbContext : DbContext
             entity.HasKey(x => new { x.BotId, x.TelegramUserId });
             entity.Property(x => x.BotId).HasMaxLength(64);
             entity.Property(x => x.PaymentMethod).HasMaxLength(64);
+            entity.Property(x => x.RenewTargetUuid).HasMaxLength(64);
             entity.HasIndex(x => x.TelegramUserId);
             entity.HasIndex(x => x.Flow);
         });

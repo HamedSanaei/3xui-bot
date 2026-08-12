@@ -584,6 +584,18 @@ public class TenantBotService
     /// <param name="User">Bot-scoped conversation state for the customer.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
     /// <returns>true when current Bot is A tenant Bot and update has been handled; otherwise false.</returns>
+    /// <remarks>
+    /// Account renewal callbacks are intercepted before the shared XUI dispatcher so tenant customers always create a
+    /// tenant-priced order and never enter the owned-wallet flow. State cleanup and UUID proof remain scoped to the
+    /// current tenant bot plus Telegram user; no other bot's state is read or changed.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// if (await tenantBotService.TryHandleTenantUpdateAsync(
+    ///         botClient, update, credentialUser, botScopedUser, cancellationToken))
+    ///     return;
+    /// </code>
+    /// </example>
     public async Task<bool> TryHandleTenantUpdateAsync(
         ITelegramBotClient botClient,
         Update update,
@@ -604,6 +616,20 @@ public class TenantBotService
             if (IsCustomerCallback(CallbackQuery.Data))
             {
                 await HANDLECUSTOMERCALLBACKASYNC(botClient, CallbackQuery, CredUser, User, CancellationToken);
+                return true;
+            }
+
+            if (XuiV3PurchaseCallbacks.TryParse(CallbackQuery.Data, out var xuiCallback) &&
+                IsTenantRenewCallbackAction(xuiCallback.Action))
+            {
+                await HANDLETENANTRENEWFROMCALLBACKASYNC(
+                    botClient,
+                    CallbackQuery,
+                    xuiCallback,
+                    tenant,
+                    CredUser,
+                    User,
+                    CancellationToken);
                 return true;
             }
 
@@ -629,6 +655,235 @@ public class TenantBotService
 
         await HANDLECUSTOMERMESSAGEASYNC(botClient, Message, CredUser, User, CancellationToken);
         return true;
+    }
+
+    /// <summary>
+    /// Checks whether a shared XUI callback starts an account renewal that must remain inside the tenant order flow.
+    /// </summary>
+    /// <param name="action">Compact XUI callback action parsed from Telegram callback data.</param>
+    /// <returns>
+    /// <c>true</c> for owned-list, owned-search, or externally authorized UUID renewal callbacks; otherwise
+    /// <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Tenant callbacks are intercepted before <see cref="XuiV3BotFlowService.TryHandleCallbackAsync"/> so they can
+    /// never fall into the owned-bot wallet flow. The callback action is routing data only and grants no account access.
+    /// </remarks>
+    private static bool IsTenantRenewCallbackAction(string action)
+    {
+        return string.Equals(action, "aren", StringComparison.Ordinal) ||
+               string.Equals(action, "asren", StringComparison.Ordinal) ||
+               string.Equals(action, "auren", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Starts a tenant renewal from an account card after reloading and authorizing the selected panel client.
+    /// </summary>
+    /// <param name="botClient">Telegram client of the tenant storefront that received the callback.</param>
+    /// <param name="callbackQuery">Callback containing only the numeric panel client id and source-list page.</param>
+    /// <param name="callback">Parsed XUI routing values; UUID and SubId values are never carried here.</param>
+    /// <param name="tenant">Current tenant bot row, or <c>null</c> when the bot is no longer configured.</param>
+    /// <param name="customer">Credential profile of the customer who pressed the renewal button.</param>
+    /// <param name="user">Bot-scoped state used to validate direct UUID/SubId search callbacks.</param>
+    /// <param name="cancellationToken">Token that cancels Telegram, users.db, and panel operations.</param>
+    /// <returns>A task that completes after safe rejection or delivery of the tenant renewal selection keyboard.</returns>
+    /// <remarks>
+    /// Normal list/search callbacks require customer ownership and tenant compatibility. The <c>auren</c> callback is
+    /// accepted only when the saved search query authorizes the same numeric client; its normalized UUID is then saved
+    /// separately from payment choice. This grants renewal only and never configuration, mutation, or ownership access.
+    /// </remarks>
+    private async Task HANDLETENANTRENEWFROMCALLBACKASYNC(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        XuiV3PurchaseCallback callback,
+        BotInstance tenant,
+        CredUser customer,
+        User user,
+        CancellationToken cancellationToken)
+    {
+        await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
+
+        var chatId = callbackQuery.Message?.Chat.Id ?? customer.ChatID;
+        if (tenant == null || !tenant.Enabled)
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                "فروشگاه در حال حاضر غیرفعال است.",
+                allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        var allowExternalRenew = string.Equals(callback.Action, "auren", StringComparison.Ordinal);
+        var client = await _xuiV3BotFlowService.ResolveRenewCallbackTargetAsync(
+            user,
+            customer.TelegramUserId,
+            callback.ClientId,
+            allowExternalRenew,
+            cancellationToken);
+
+        if (client == null ||
+            (!allowExternalRenew && !ClientBelongsToTenantCustomer(client, customer.TelegramUserId, tenant.Id)))
+        {
+            _logger.LogWarning(
+                "Tenant renewal callback authorization failed. tenantBotId={TenantBotId}, userId={UserId}, clientId={ClientId}, action={Action}",
+                tenant.Id,
+                customer.TelegramUserId,
+                callback.ClientId,
+                callback.Action);
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                allowExternalRenew
+                    ? "درخواست تمدید معتبر نیست. UUID یا لینک دارای UUID را دوباره از بخش جستجو ارسال کنید."
+                    : "اکانت مورد نظر برای تمدید پیدا نشد یا متعلق به حساب شما در این فروشگاه نیست.",
+                allowSearchRestart: allowExternalRenew,
+                cancellationToken);
+            return;
+        }
+
+        var service = ResolveTenantServiceForClient(client);
+        if (service == null)
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                "این اکانت مربوط به پلن‌های فعال فروشگاه نیست و از این مسیر قابل تمدید نیست.",
+                allowSearchRestart: allowExternalRenew,
+                cancellationToken);
+            return;
+        }
+
+        var targetUuid = string.Empty;
+        if (allowExternalRenew && !TryNormalizeTenantClientUuid(client.Uuid, out targetUuid))
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                "UUID اکانت در پاسخ پنل معتبر نیست و تمدید امن آن ممکن نشد.",
+                allowSearchRestart: true,
+                cancellationToken);
+            return;
+        }
+
+        await _userDbcontext.ClearUserStatus(new User { Id = customer.TelegramUserId });
+        await _userDbcontext.SaveUserStatus(new User
+        {
+            Id = customer.TelegramUserId,
+            Flow = TENANTRENEWFLOW,
+            LastStep = service.IsUnlimited ? TENANTRENEWSTEPUNLIMITEDPLAN : TENANTRENEWSTEPTRAFFIC,
+            ConfigLink = client.Email,
+            SelectedCountry = service.Key,
+            RenewTargetUuid = allowExternalRenew ? targetUuid : string.Empty,
+            PaymentMethod = "credit"
+        });
+
+        var navigationKeyboard = allowExternalRenew
+            ? new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("جستجوی جدید", XuiV3PurchaseCallbacks.AccountSearchStart()) },
+                new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) }
+            })
+            : new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(
+                        string.Equals(callback.Action, "asren", StringComparison.Ordinal)
+                            ? "بازگشت به نتایج جستجو"
+                            : "بازگشت به لیست اکانت‌ها",
+                        string.Equals(callback.Action, "asren", StringComparison.Ordinal)
+                            ? XuiV3PurchaseCallbacks.AccountSearchList(callback.Page ?? 0)
+                            : XuiV3PurchaseCallbacks.AccountList(callback.Page ?? 0))
+                },
+                new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) }
+            });
+
+        var selectedText =
+            $"اکانت انتخاب شد: <code>{Html(client.Email)}</code>\n" +
+            (service.IsUnlimited
+                ? "پلن تمدید نامحدود را انتخاب کنید."
+                : "حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.");
+
+        if (callbackQuery.Message != null)
+        {
+            await SafeEditMessageTextAsync(
+                botClient,
+                callbackQuery.Message.Chat.Id,
+                callbackQuery.Message.MessageId,
+                selectedText,
+                ParseMode.Html,
+                navigationKeyboard,
+                cancellationToken);
+        }
+        else
+        {
+            await botClient.SendTextMessageAsync(
+                chatId,
+                selectedText,
+                parseMode: ParseMode.Html,
+                replyMarkup: navigationKeyboard,
+                cancellationToken: cancellationToken);
+        }
+
+        await botClient.SendTextMessageAsync(
+            chatId,
+            service.IsUnlimited
+                ? "یکی از پلن‌های زیر را انتخاب کنید:"
+                : $"یکی از حجم‌های زیر را انتخاب کنید یا عدد دلخواه بفرستید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
+            replyMarkup: service.IsUnlimited
+                ? BuildTenantRenewUnlimitedKeyboard(service, tenant)
+                : BuildTenantRenewTrafficKeyboard(service),
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Clears tenant-scoped renewal state before sending a terminal result with safe callback navigation.
+    /// </summary>
+    /// <param name="botClient">Tenant Telegram client used to send the terminal result.</param>
+    /// <param name="chatId">Telegram chat id of the customer whose renewal ended.</param>
+    /// <param name="telegramUserId">Numeric customer Telegram id whose state belongs to the current tenant bot.</param>
+    /// <param name="text">Persian customer-facing result text; it must not contain panel secrets or raw exceptions.</param>
+    /// <param name="allowSearchRestart">Whether a direct-search restart button should be shown above Home.</param>
+    /// <param name="cancellationToken">Token that cancels users.db cleanup and Telegram delivery.</param>
+    /// <returns>A task that completes after state cleanup and message delivery.</returns>
+    /// <remarks>
+    /// Cleanup is bot-scoped through the active tenant context. It removes only temporary conversation state and does
+    /// not change wallets, orders, account ownership, or panel data.
+    /// </remarks>
+    private async Task SendTenantRenewTerminalAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        long telegramUserId,
+        string text,
+        bool allowSearchRestart,
+        CancellationToken cancellationToken)
+    {
+        await _userDbcontext.ClearUserStatus(new User { Id = telegramUserId });
+        var rows = new List<InlineKeyboardButton[]>();
+        if (allowSearchRestart)
+        {
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("جستجوی جدید", XuiV3PurchaseCallbacks.AccountSearchStart())
+            });
+        }
+
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home())
+        });
+
+        await botClient.SendTextMessageAsync(
+            chatId,
+            text,
+            replyMarkup: new InlineKeyboardMarkup(rows),
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -3227,7 +3482,8 @@ public class TenantBotService
     /// the customer's wallet. This flow only collects the same plan choices, calculates the same tenant sale
     /// price used by purchases, and creates a tenant order that is fulfilled after payment settlement. For the normal
     /// metered service, digit-only Latin, Persian, and Arabic-Indic duration input is persisted as <c>days-N</c> and
-    /// revalidated before order creation and again before fulfillment.
+    /// revalidated before order creation and again before fulfillment. Plain account names require tenant ownership;
+    /// raw/VLESS/VMess UUID input may target another owner's account but persists an exact proof and never transfers it.
     /// </remarks>
     private async Task<bool> TRYHANDLETENANTRENEWASYNC(
         ITelegramBotClient botClient,
@@ -3258,8 +3514,13 @@ public class TenantBotService
 
         await botClient.SendTextMessageAsync(
             message.Chat.Id,
-            "نام اکانت، UUID، ساب‌لینک یا لینک کانفیگ اکانتی که می‌خواهید تمدید کنید را ارسال کنید.",
+            "نام اکانت، UUID یا لینک دارای UUID اکانتی که می‌خواهید تمدید کنید را ارسال کنید.\nلینک‌های VLESS و VMess نیز پذیرفته می‌شوند.",
             replyMarkup: new ReplyKeyboardRemove(),
+            cancellationToken: cancellationToken);
+        await botClient.SendTextMessageAsync(
+            message.Chat.Id,
+            "برای خروج از فرایند تمدید، دکمه زیر را بزنید.",
+            replyMarkup: BuildTenantRenewHomeKeyboard(),
             cancellationToken: cancellationToken);
         return true;
     }
@@ -3270,7 +3531,10 @@ public class TenantBotService
     /// <param name="botClient">Tenant bot client used to answer the customer.</param>
     /// <param name="message">Customer message containing the current renewal input.</param>
     /// <param name="tenant">Tenant bot whose pricing settings apply.</param>
-    /// <param name="customer">Customer profile that must own the target account.</param>
+    /// <param name="customer">
+    /// Customer profile that pays for renewal. Ownership is required for name-selected accounts; UUID-authorized
+    /// accounts may have another owner and are protected by a separate exact proof.
+    /// </param>
     /// <param name="user">Current bot-scoped renewal state.</param>
     /// <param name="mainReplyMarkup">Tenant reply keyboard used after completion.</param>
     /// <param name="cancellationToken">Cancellation token for async operations.</param>
@@ -3280,6 +3544,7 @@ public class TenantBotService
     /// custom range. The actual renewal is not applied until a tenant payment order is settled, which keeps duplicate
     /// callbacks idempotent.
     /// </remarks>
+    /// <returns>A task that completes after the current state transition and its Telegram response.</returns>
     private async Task HANDLETENANTRENEWSTEPASYNC(
         ITelegramBotClient botClient,
         Message message,
@@ -3299,15 +3564,20 @@ public class TenantBotService
 
         if (user.LastStep == TENANTRENEWSTEPACCOUNT)
         {
-            await STARTTENANTRENEWSELECTIONASYNC(botClient, message, tenant, customer, text, mainReplyMarkup, cancellationToken);
+            await STARTTENANTRENEWSELECTIONASYNC(botClient, message, tenant, customer, text, cancellationToken);
             return;
         }
 
         var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => string.Equals(x.Key, user.SelectedCountry, StringComparison.OrdinalIgnoreCase));
         if (service == null)
         {
-            await _userDbcontext.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(message.Chat.Id, "سرویس اکانت برای تمدید پیدا نشد. دوباره از منوی تمدید اقدام کنید.", replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                message.Chat.Id,
+                message.From.Id,
+                "سرویس اکانت برای تمدید پیدا نشد. دوباره از منوی تمدید اقدام کنید.",
+                allowSearchRestart: false,
+                cancellationToken);
             return;
         }
 
@@ -3395,7 +3665,7 @@ public class TenantBotService
                 return;
             }
 
-            await CreateTenantRenewOrderFromStateAsync(botClient, message.Chat.Id, tenant, customer, user, mainReplyMarkup, cancellationToken);
+            await CreateTenantRenewOrderFromStateAsync(botClient, message.Chat.Id, tenant, customer, user, cancellationToken);
         }
     }
 
@@ -3405,50 +3675,131 @@ public class TenantBotService
     /// <param name="botClient">Tenant bot client used to send the next selection keyboard.</param>
     /// <param name="message">Customer message containing the account identifier.</param>
     /// <param name="tenant">Tenant bot that owns the storefront.</param>
-    /// <param name="customer">Customer who must own the account.</param>
-    /// <param name="input">Account email, UUID, config link, or subscription link.</param>
-    /// <param name="mainReplyMarkup">Tenant reply keyboard restored on failure.</param>
+    /// <param name="customer">
+    /// Customer requesting renewal. Plain account names require this Telegram user to own the account; exact UUID
+    /// possession permits renewal without transferring ownership.
+    /// </param>
+    /// <param name="input">Account email, raw UUID, or VLESS/VMess text containing a UUID.</param>
     /// <param name="cancellationToken">Cancellation token for panel and Telegram operations.</param>
+    /// <returns>A task that completes after terminal cleanup or delivery of the next tenant selection keyboard.</returns>
+    /// <remarks>
+    /// UUID authorization is persisted separately in <see cref="User.RenewTargetUuid"/> and is checked again before
+    /// summary, order creation, and fulfillment. Name/email input remains ownership-only. No input grants account
+    /// management access or changes XUI ownership metadata.
+    /// </remarks>
     private async Task STARTTENANTRENEWSELECTIONASYNC(
         ITelegramBotClient botClient,
         Message message,
         BotInstance tenant,
         CredUser customer,
         string input,
-        IReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var client = await FindTenantClientAsync(serverInfo, input, cancellationToken);
-        if (client == null || !ClientBelongsToTenantCustomer(client, customer.TelegramUserId, tenant.Id))
+        var hasUuidProof = XuiV3RenewalTargetParser.TryExtractUuid(input, out var requestedUuid);
+        var client = await FindTenantClientAsync(
+            serverInfo,
+            hasUuidProof ? requestedUuid : input,
+            cancellationToken);
+        if (client == null)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = message.From.Id });
-            await botClient.SendTextMessageAsync(message.Chat.Id, "اکانت پیدا نشد یا متعلق به حساب شما در این فروشگاه نیست.", replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                message.Chat.Id,
+                message.From.Id,
+                "اکانت مورد نظر پیدا نشد.",
+                allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        if (hasUuidProof)
+        {
+            if (!TryNormalizeTenantClientUuid(client.Uuid, out var actualUuid) ||
+                !string.Equals(actualUuid, requestedUuid, StringComparison.OrdinalIgnoreCase))
+            {
+                await SendTenantRenewTerminalAsync(
+                    botClient,
+                    message.Chat.Id,
+                    message.From.Id,
+                    "UUID اکانت با اطلاعات فعلی پنل تطبیق ندارد. دوباره از منوی تمدید اقدام کنید.",
+                    allowSearchRestart: false,
+                    cancellationToken);
+                return;
+            }
+
+            requestedUuid = actualUuid;
+        }
+        else if (!ClientBelongsToTenantCustomer(client, customer.TelegramUserId, tenant.Id))
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                message.Chat.Id,
+                message.From.Id,
+                "این نام اکانت متعلق به حساب شما نیست. برای تمدید اکانت شخص دیگر، UUID یا لینک دارای UUID را ارسال کنید.",
+                allowSearchRestart: false,
+                cancellationToken);
             return;
         }
 
         var service = ResolveTenantServiceForClient(client);
         if (service == null)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = message.From.Id });
-            await botClient.SendTextMessageAsync(message.Chat.Id, "این اکانت مربوط به پلن‌های فعال فروشگاه نیست و از این مسیر قابل تمدید نیست.", replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                message.Chat.Id,
+                message.From.Id,
+                "این اکانت مربوط به پلن‌های فعال فروشگاه نیست و از این مسیر قابل تمدید نیست.",
+                allowSearchRestart: false,
+                cancellationToken);
             return;
         }
 
+        await _userDbcontext.ClearUserStatus(new User { Id = message.From.Id });
         await _userDbcontext.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = TENANTRENEWFLOW,
             LastStep = service.IsUnlimited ? TENANTRENEWSTEPUNLIMITEDPLAN : TENANTRENEWSTEPTRAFFIC,
             ConfigLink = client.Email,
-            SelectedCountry = service.Key
+            SelectedCountry = service.Key,
+            RenewTargetUuid = hasUuidProof ? requestedUuid : string.Empty,
+            PaymentMethod = "credit"
         });
 
         await botClient.SendTextMessageAsync(
             message.Chat.Id,
-            service.IsUnlimited ? "پلن تمدید نامحدود را انتخاب کنید:" : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
+            $"اکانت انتخاب شد: <code>{Html(client.Email)}</code>",
+            parseMode: ParseMode.Html,
+            replyMarkup: BuildTenantRenewHomeKeyboard(),
+            cancellationToken: cancellationToken);
+
+        await botClient.SendTextMessageAsync(
+            message.Chat.Id,
+            service.IsUnlimited
+                ? "پلن تمدید نامحدود را انتخاب کنید:"
+                : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
             replyMarkup: service.IsUnlimited ? BuildTenantRenewUnlimitedKeyboard(service, tenant) : BuildTenantRenewTrafficKeyboard(service),
             cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Builds the inline callback used to abandon tenant renewal and return through the shared bot-scoped Home route.
+    /// </summary>
+    /// <returns>An inline keyboard containing only the safe <c>x3:home</c> navigation callback.</returns>
+    /// <remarks>
+    /// The Home handler clears the current tenant bot's persisted state and in-memory XUI session without touching
+    /// state for the same Telegram user in other owned or tenant bots.
+    /// </remarks>
+    private static InlineKeyboardMarkup BuildTenantRenewHomeKeyboard()
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home())
+            }
+        });
     }
 
     /// <summary>
@@ -3465,7 +3816,8 @@ public class TenantBotService
     /// </param>
     /// <param name="customer">
     /// Shared credential profile of the Telegram customer requesting renewal. Its numeric Telegram id is used for
-    /// account ownership checks and renewal metadata; this method does not debit its wallet.
+    /// owner-based targets and renewal audit history; UUID-authorized targets may belong to someone else. This method
+    /// does not debit its wallet.
     /// </param>
     /// <param name="user">
     /// Tenant-scoped conversation state containing the target email and selected renewal plan. The state must belong
@@ -3477,7 +3829,8 @@ public class TenantBotService
     /// The preview is tenant-isolated and uses tenant sale pricing, but traffic and expiry arithmetic come from the
     /// shared renewal policy. Active unlimited accounts show direct quota addition; expired unlimited accounts show
     /// replacement quota and a first-connection duration after reset. Metered renewals show the effective storefront
-    /// per-GB and per-day calculation without exposing the tenant owner's colleague base rates.
+    /// per-GB and per-day calculation without exposing the tenant owner's colleague base rates. Fresh account data is
+    /// authorized again before rendering; an email/UUID mismatch clears state and prevents confirmation.
     /// </remarks>
     private async Task SendTenantRenewSummaryAsync(
         ITelegramBotClient botClient,
@@ -3492,8 +3845,31 @@ public class TenantBotService
         var price = CalculateTenantPrice(tenant, selection);
         var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var client = await FindTenantClientAsync(serverInfo, user.ConfigLink, cancellationToken);
-        var renewal = client == null ? null : XuiV3RenewalPolicy.Calculate(client, resolved, "tenant-renew-summary", customer.TelegramUserId);
+        var client = await GetAuthorizedTenantRenewClientAsync(
+            serverInfo,
+            user,
+            customer.TelegramUserId,
+            tenant.Id,
+            cancellationToken);
+        if (client == null)
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                "اکانت هدف حذف شده یا UUID آن تغییر کرده است. بدون پرداخت دوباره از منوی تمدید اقدام کنید.",
+                allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        var externalUuidRenew = !string.IsNullOrWhiteSpace(user.RenewTargetUuid);
+        var renewal = XuiV3RenewalPolicy.Calculate(
+            client,
+            resolved,
+            "tenant-renew-summary",
+            customer.TelegramUserId,
+            allowActorAsOwnerFallback: !externalUuidRenew);
 
         var trafficLine = resolved.IsUnlimited
             ? renewal?.ShouldResetTraffic == true
@@ -3531,11 +3907,12 @@ public class TenantBotService
     /// <param name="tenant">Tenant bot that owns the renewal order.</param>
     /// <param name="customer">Customer who will pay for the renewal.</param>
     /// <param name="user">Bot-scoped state containing target account and selected plan.</param>
-    /// <param name="mainReplyMarkup">Tenant reply keyboard restored after order creation.</param>
     /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
+    /// <returns>A task that completes after safe target validation and order/payment-choice delivery.</returns>
     /// <remarks>
     /// The order is not fulfilled here. Payment callbacks and IPNs later call the shared tenant fulfillment
-    /// routine, which applies the renewal exactly once.
+    /// routine, which applies the renewal exactly once. External renewal stores a normalized UUID proof on the order;
+    /// plain email renewal leaves that field null so existing owner-based orders remain backward compatible.
     /// </remarks>
     private async Task CreateTenantRenewOrderFromStateAsync(
         ITelegramBotClient botClient,
@@ -3543,14 +3920,35 @@ public class TenantBotService
         BotInstance tenant,
         CredUser customer,
         User user,
-        IReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
+        var serverInfo = BuildConfiguredPanelServerInfo();
+        var client = await GetAuthorizedTenantRenewClientAsync(
+            serverInfo,
+            user,
+            customer.TelegramUserId,
+            tenant.Id,
+            cancellationToken);
+        if (client == null)
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                "اکانت هدف حذف شده یا UUID آن تغییر کرده است. هیچ سفارشی ساخته نشد.",
+                allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
         var selection = BuildTenantRenewSelectionFromState(user);
         var price = CalculateTenantPrice(tenant, selection);
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "pending");
         order.OrderKind = TenantBotOrderKinds.Renew;
-        order.TargetAccountEmail = user.ConfigLink;
+        order.TargetAccountEmail = client.Email;
+        order.TargetAccountUuid = TryNormalizeTenantClientUuid(user.RenewTargetUuid, out var targetUuid)
+            ? targetUuid
+            : null;
         order.PaymentStatus = TenantBotOrderStatuses.Pending;
         order.UpdatedAtUtc = DateTime.UtcNow;
 
@@ -9424,7 +9822,10 @@ public class TenantBotService
     /// </summary>
     /// <param name="order">Paid tenant order whose <see cref="TenantBotOrder.OrderKind"/> is <c>renew</c>.</param>
     /// <param name="owner">Tenant owner whose wallet receives profit or is debited for card-to-card base cost.</param>
-    /// <param name="customer">Tenant customer who owns the target account.</param>
+    /// <param name="customer">
+    /// Tenant customer who pays for the renewal. For legacy owner-based orders this is also the account owner; for
+    /// UUID-authorized orders it may be a different Telegram user and must not become the account owner.
+    /// </param>
     /// <param name="tenant">Tenant bot that owns the storefront.</param>
     /// <param name="selection">Renewal service/plan selection stored on the order.</param>
     /// <param name="source">Settlement source such as IPN, manual check, or assistant confirmation.</param>
@@ -9435,7 +9836,10 @@ public class TenantBotService
     /// </returns>
     /// <remarks>
     /// This method is called only from the tenant order fulfillment gate after duplicate-order checks.
-    /// It updates XUI first; wallet and ledger changes are recorded only after the panel confirms renewal.
+    /// It reloads the target first and requires owner authorization for legacy orders or an exact stored UUID match for
+    /// external orders. It updates XUI first; wallet and ledger changes are recorded only after the panel confirms renewal.
+    /// Rejected panel updates store and display a fixed safe status; raw response bodies and UUID proofs are never copied
+    /// into tenant order errors, Telegram messages, or central payment logs.
     /// The volume-reminder cycle is advanced best-effort after the update/reset and before settlement persistence;
     /// reminder-state failure cannot roll back the panel renewal or alter owner/customer balances.
     /// </remarks>
@@ -9454,28 +9858,45 @@ public class TenantBotService
 
         var serverInfo = BuildConfiguredPanelServerInfo();
         var client = await FindTenantClientAsync(serverInfo, order.TargetAccountEmail, cancellationToken);
-        if (client == null || !ClientBelongsToTenantCustomer(client, order.CustomerTelegramUserId, order.TenantBotId))
+        var externalUuidRenew = !string.IsNullOrWhiteSpace(order.TargetAccountUuid);
+        var targetAuthorized = externalUuidRenew
+            ? TryNormalizeTenantClientUuid(order.TargetAccountUuid, out var targetUuid) &&
+              TryNormalizeTenantClientUuid(client?.Uuid, out var clientUuid) &&
+              string.Equals(clientUuid, targetUuid, StringComparison.OrdinalIgnoreCase)
+            : client != null &&
+              ClientBelongsToTenantCustomer(client, order.CustomerTelegramUserId, order.TenantBotId);
+        if (client == null || !targetAuthorized)
         {
             order.PaymentStatus = TenantBotOrderStatuses.Failed;
-            order.ErrorMessage = "Target account was not found or does not belong to this tenant customer.";
+            order.ErrorMessage = externalUuidRenew
+                ? "Target account was not found or its UUID proof no longer matches."
+                : "Target account was not found or does not belong to this tenant customer.";
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _userDbcontext.SaveChangesAsync(cancellationToken);
-            await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, "اکانت هدف تمدید پیدا نشد.", cancellationToken);
-            LOGTENANTORDER(order, owner, customer, source, "renew-target-not-found");
+            await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, "اکانت هدف تمدید پیدا نشد یا اطلاعات هویتی آن تغییر کرده است.", cancellationToken);
+            LOGTENANTORDER(order, owner, customer, source, "renew-target-authorization-failed");
             return NowPaymentsSettlementResult.NotFound();
         }
 
         var resolved = _purchaseService.ResolvePurchase(selection, false);
         resolved.PriceToman = order.SalePriceToman;
-        var renewal = XuiV3RenewalPolicy.Calculate(client, resolved, "tenant-renew", order.CustomerTelegramUserId);
+        var renewal = XuiV3RenewalPolicy.Calculate(
+            client,
+            resolved,
+            "tenant-renew",
+            order.CustomerTelegramUserId,
+            allowActorAsOwnerFallback: !externalUuidRenew);
         var updateResponse = await ApiServicev3.UpdateClientAsync(serverInfo, _configuration, client.Email, renewal.Payload, cancellationToken);
         if (!updateResponse.Success)
         {
             order.PaymentStatus = TenantBotOrderStatuses.Failed;
-            order.ErrorMessage = updateResponse.Msg;
+            order.ErrorMessage = "Panel renewal update was rejected.";
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _userDbcontext.SaveChangesAsync(cancellationToken);
-            await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, updateResponse.Msg, cancellationToken);
+            await NOTIFYTENANTCUSTOMERFAILUREASYNC(
+                order,
+                "تمدید در پنل انجام نشد. لطفاً کمی بعد وضعیت سفارش را دوباره بررسی کنید.",
+                cancellationToken);
             LOGTENANTORDER(order, owner, customer, source, "renew-update-failed");
             return NowPaymentsSettlementResult.InvalidAmount();
         }
@@ -9648,6 +10069,50 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Reloads a tenant renewal target and verifies either storefront ownership or the persisted exact UUID proof.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel descriptor used for the fresh account lookup.</param>
+    /// <param name="user">
+    /// Current tenant-scoped renewal state containing the target account email and optional normalized UUID proof.
+    /// </param>
+    /// <param name="customerTelegramUserId">
+    /// Numeric Telegram id of the payer. It is used for ownership only when no UUID proof is present.
+    /// </param>
+    /// <param name="tenantBotId">Internal tenant bot id that scopes owner-based account metadata.</param>
+    /// <param name="cancellationToken">Token that cancels panel reads.</param>
+    /// <returns>
+    /// The fresh detached panel client when authorization still matches, or <c>null</c> when the account was deleted,
+    /// rebuilt with another UUID, moved outside the tenant, or no longer belongs to the customer.
+    /// </returns>
+    /// <remarks>
+    /// UUID possession bypasses only the owner check for renewal. The method has no wallet, order, Telegram, or panel
+    /// mutation side effects and must be called again at each financial or fulfillment boundary.
+    /// </remarks>
+    private async Task<XuiV3Client> GetAuthorizedTenantRenewClientAsync(
+        ServerInfo serverInfo,
+        User user,
+        long customerTelegramUserId,
+        string tenantBotId,
+        CancellationToken cancellationToken)
+    {
+        if (user == null || string.IsNullOrWhiteSpace(user.ConfigLink))
+            return null;
+
+        var client = await FindTenantClientAsync(serverInfo, user.ConfigLink, cancellationToken);
+        if (client == null)
+            return null;
+
+        if (string.IsNullOrWhiteSpace(user.RenewTargetUuid))
+            return ClientBelongsToTenantCustomer(client, customerTelegramUserId, tenantBotId) ? client : null;
+
+        return TryNormalizeTenantClientUuid(user.RenewTargetUuid, out var targetUuid) &&
+               TryNormalizeTenantClientUuid(client.Uuid, out var clientUuid) &&
+               string.Equals(clientUuid, targetUuid, StringComparison.OrdinalIgnoreCase)
+            ? client
+            : null;
+    }
+
+    /// <summary>
     /// Finds an XUI client for tenant renewal from email, UUID, config link, or subscription link input.
     /// </summary>
     /// <param name="serverInfo">Configured XUI v3 panel descriptor.</param>
@@ -9658,10 +10123,12 @@ public class TenantBotService
     /// rejects a direct lookup with a not-found response.
     /// </returns>
     /// <remarks>
-    /// This method only locates a candidate. Tenant ownership is checked separately by
-    /// <see cref="ClientBelongsToTenantCustomer"/> before renewal is allowed. Direct <c>GET clients/get</c>
+    /// This method only locates a candidate. Tenant ownership or exact UUID proof is checked separately before renewal
+    /// is allowed. Direct <c>GET clients/get</c>
     /// calls can return HTTP 404 for unknown emails, so those failures are treated as a miss and the method
-    /// falls back to listing clients instead of allowing an exception to stop the tenant receiver.
+    /// falls back to listing clients instead of allowing an exception to stop the tenant receiver. The identifier is
+    /// never included in logs because it may be a UUID, SubId, or configuration URL. UUID/link input skips the direct
+    /// identifier-bearing endpoint entirely so exception telemetry cannot capture a sensitive request URI.
     /// </remarks>
     private async Task<XuiV3Client> FindTenantClientAsync(ServerInfo serverInfo, string input, CancellationToken cancellationToken)
     {
@@ -9669,19 +10136,36 @@ public class TenantBotService
         if (string.IsNullOrWhiteSpace(candidate))
             return null;
 
-        try
+        var lookupKind = XuiV3RenewalTargetParser.TryExtractUuid(input, out _)
+            ? "uuid"
+            : Uri.TryCreate(input, UriKind.Absolute, out _) ? "link" : "account";
+
+        if (string.Equals(lookupKind, "account", StringComparison.Ordinal))
         {
-            var direct = await ApiServicev3.GetClientAsync(serverInfo, _configuration, candidate, cancellationToken);
-            if (direct.Success && direct.Obj != null)
-                return direct.Obj;
-        }
-        catch (XuiV3ApiException ex) when (ex.StatusCode == 404)
-        {
-            _logger.LogInformation(ex, "Tenant renewal direct XUI lookup returned not found. candidate={Candidate}", candidate);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Tenant renewal direct XUI lookup failed. candidate={Candidate}", candidate);
+            try
+            {
+                var direct = await ApiServicev3.GetClientAsync(serverInfo, _configuration, candidate, cancellationToken);
+                if (direct.Success &&
+                    direct.Obj != null &&
+                    string.Equals(direct.Obj.Email?.Trim(), candidate.Trim(), StringComparison.OrdinalIgnoreCase))
+                {
+                    return direct.Obj;
+                }
+            }
+            catch (XuiV3ApiException ex) when (ex.StatusCode == 404)
+            {
+                _logger.LogInformation(
+                    "Tenant renewal direct XUI lookup returned not found. lookupKind={LookupKind}, statusCode={StatusCode}",
+                    lookupKind,
+                    ex.StatusCode);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    "Tenant renewal direct XUI lookup failed. lookupKind={LookupKind}, errorType={ErrorType}",
+                    lookupKind,
+                    ex.GetType().Name);
+            }
         }
 
         try
@@ -9695,7 +10179,10 @@ public class TenantBotService
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Tenant renewal client list lookup failed. candidate={Candidate}", candidate);
+            _logger.LogWarning(
+                "Tenant renewal client list lookup failed. lookupKind={LookupKind}, errorType={ErrorType}",
+                lookupKind,
+                ex.GetType().Name);
             return null;
         }
     }
@@ -9732,6 +10219,26 @@ public class TenantBotService
         }
 
         return value.Trim().Trim('`');
+    }
+
+    /// <summary>
+    /// Normalizes a UUID field that must contain only one complete non-empty GUID.
+    /// </summary>
+    /// <param name="value">UUID read from panel client data or a previously canonicalized users.db/order proof.</param>
+    /// <param name="uuid">Canonical dashed UUID when valid; otherwise an empty string.</param>
+    /// <returns><c>true</c> only when the entire trimmed value is a valid non-empty GUID.</returns>
+    /// <remarks>
+    /// Customer input uses <see cref="XuiV3RenewalTargetParser"/> to extract UUIDs from VLESS/VMess text. Authorization
+    /// boundaries use this stricter helper so extra text in a panel field or persisted proof can never compare as exact.
+    /// </remarks>
+    private static bool TryNormalizeTenantClientUuid(string value, out string uuid)
+    {
+        uuid = string.Empty;
+        if (!Guid.TryParse(value?.Trim(), out var parsed) || parsed == Guid.Empty)
+            return false;
+
+        uuid = parsed.ToString();
+        return true;
     }
 
     /// <summary>

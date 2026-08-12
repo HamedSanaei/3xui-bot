@@ -168,6 +168,10 @@ namespace Adminbot.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("RenewTargetUuid")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
                     b.Property<int>("PendingAccountCount")
                         .HasColumnType("INTEGER");
 
@@ -1037,6 +1041,10 @@ namespace Adminbot.Migrations
 
                     b.Property<string>("TargetAccountEmail")
                         .HasMaxLength(160)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("TargetAccountUuid")
+                        .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("TenantBotId")

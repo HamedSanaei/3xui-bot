@@ -34,6 +34,11 @@ public static class XuiV3RenewalPolicy
     /// Numeric Telegram user id of the customer or administrator initiating the renewal. Pass zero only when the
     /// actor is unknown; the existing account owner is then used for metadata where possible.
     /// </param>
+    /// <param name="allowActorAsOwnerFallback">
+    /// <c>true</c> to retain legacy behavior that assigns the actor when the client has no owner metadata;
+    /// <c>false</c> for UUID-authorized third-party renewals so paying for an ownerless legacy account cannot transfer
+    /// ownership to the payer and existing panel/metadata owner fields remain independently unchanged.
+    /// </param>
     /// <returns>
     /// A detached renewal calculation containing the complete XUI replacement payload, reset requirement,
     /// exact traffic added, final quota, expiry, and duration. The caller must send the payload to the panel and
@@ -57,7 +62,8 @@ public static class XuiV3RenewalPolicy
         XuiV3Client client,
         XuiV3ResolvedPurchase resolved,
         string action,
-        long actorTelegramUserId = 0)
+        long actorTelegramUserId = 0,
+        bool allowActorAsOwnerFallback = true)
     {
         if (client == null)
             throw new ArgumentNullException(nameof(client));
@@ -76,7 +82,8 @@ public static class XuiV3RenewalPolicy
             resolved.IsUnlimited ? resolved.UnlimitedPlan?.Key : resolved.Duration?.Key,
             resolved.IsUnlimited ? resolved.UnlimitedPlan?.DisplayName : resolved.Duration?.DisplayName,
             action,
-            actorTelegramUserId);
+            actorTelegramUserId,
+            allowActorAsOwnerFallback);
     }
 
     /// <summary>
@@ -145,7 +152,8 @@ public static class XuiV3RenewalPolicy
             null,
             null,
             action,
-            actorTelegramUserId);
+            actorTelegramUserId,
+            allowActorAsOwnerFallback: true);
     }
 
     /// <summary>
@@ -163,6 +171,9 @@ public static class XuiV3RenewalPolicy
     /// <param name="planName">Selected plan display name, or null when no catalog plan was selected.</param>
     /// <param name="action">Audit action stored in the client's metadata.</param>
     /// <param name="actorTelegramUserId">Numeric Telegram id of the actor performing the renewal.</param>
+    /// <param name="allowActorAsOwnerFallback">
+    /// Whether an actor may become the metadata owner only when the existing client has no owner identity.
+    /// </param>
     /// <returns>
     /// The calculated payload and operational facts needed by XUI update, traffic reset, logging, website sync,
     /// and customer notification callers.
@@ -185,10 +196,16 @@ public static class XuiV3RenewalPolicy
         string planKey,
         string planName,
         string action,
-        long actorTelegramUserId)
+        long actorTelegramUserId,
+        bool allowActorAsOwnerFallback)
     {
         var metadata = TryReadMetadata(client.Comment);
-        var ownerTelegramUserId = GetOwnerTelegramUserId(client, metadata, actorTelegramUserId);
+        var hadExistingMetadata = metadata != null;
+        var ownerTelegramUserId = GetOwnerTelegramUserId(
+            client,
+            metadata,
+            actorTelegramUserId,
+            allowActorAsOwnerFallback);
         var currentTotalBytes = GetTotalBytes(client);
         var usedBytes = GetUsedBytes(client);
         var currentExpiryTime = GetExpiryTime(client);
@@ -237,7 +254,10 @@ public static class XuiV3RenewalPolicy
             ServiceName = service?.DisplayName ?? "unknown"
         };
 
-        metadata.TelegramUserId = ownerTelegramUserId;
+        // An external UUID payer is an audit actor, not an owner. Preserve an existing metadata owner independently
+        // from panel TgId even when old data contains different values; owner-based legacy renewals retain old repair.
+        if (allowActorAsOwnerFallback || !hadExistingMetadata)
+            metadata.TelegramUserId = ownerTelegramUserId;
         if (service != null)
         {
             metadata.ServiceKey = service.Key;
@@ -271,7 +291,7 @@ public static class XuiV3RenewalPolicy
         var payload = CopyClientPayload(client);
         payload.TotalGB = updatedTotalBytes;
         payload.ExpiryTime = updatedExpiryTime;
-        payload.TgId = ownerTelegramUserId;
+        payload.TgId = allowActorAsOwnerFallback ? ownerTelegramUserId : client.TgId;
         payload.LimitIp = client.LimitIp;
         payload.Enable = true;
         payload.Comment = JsonConvert.SerializeObject(metadata, Formatting.None);
@@ -391,7 +411,20 @@ public static class XuiV3RenewalPolicy
         return expiryTime > 0 && expiryTime <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     }
 
-    private static long GetOwnerTelegramUserId(XuiV3Client client, XuiV3ClientMetadata metadata, long actorTelegramUserId)
+    /// <summary>
+    /// Resolves the account owner without allowing an external UUID payer to take ownership of an ownerless client.
+    /// </summary>
+    /// <param name="client">Current panel client whose positive <c>TgId</c> has first priority.</param>
+    /// <param name="metadata">Parsed account metadata whose owner is used when panel <c>TgId</c> is absent.</param>
+    /// <param name="actorTelegramUserId">Numeric Telegram id of the renewal actor.</param>
+    /// <param name="allowActorAsOwnerFallback">Whether the actor may fill a genuinely missing owner identity.</param>
+    /// <returns>Existing owner id, allowed actor fallback, or zero when ownership must remain unknown.</returns>
+    /// <remarks>This method performs no persistence and never changes the supplied client or metadata.</remarks>
+    private static long GetOwnerTelegramUserId(
+        XuiV3Client client,
+        XuiV3ClientMetadata metadata,
+        long actorTelegramUserId,
+        bool allowActorAsOwnerFallback)
     {
         if (client?.TgId > 0)
             return client.TgId;
@@ -399,7 +432,7 @@ public static class XuiV3RenewalPolicy
         if (metadata?.TelegramUserId > 0)
             return metadata.TelegramUserId;
 
-        return actorTelegramUserId > 0 ? actorTelegramUserId : 0;
+        return allowActorAsOwnerFallback && actorTelegramUserId > 0 ? actorTelegramUserId : 0;
     }
 
     private static XuiV3ClientMetadata TryReadMetadata(string comment)
