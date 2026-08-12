@@ -240,6 +240,14 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   purchase/renewal; the separate fixed-price `kind=unlimited` plans do not use these metered fields. The resolver also
   returns the authoritative metered component breakdown, and owned-bot final purchase/renewal previews must format
   that stored breakdown rather than recalculate rates or subtotals in the Telegram presentation layer.
+- Owned XUI purchase state restored from `BotUserStates` is revalidated against the live catalog before count,
+  comment, preview, or confirmation is consumed. Removed/disabled service, low traffic, disabled/custom-out-of-range
+  duration, and disabled unlimited sub-plan lazily return only that bot/user to the earliest valid selection step;
+  valid service/traffic choices are preserved, the triggering text is not reused, and no wallet/order/XUI effect occurs.
+  Service/traffic/duration/plan/count callbacks repeat the same checks, while final resolution remains fail-closed.
+  `BotUserState.ApplyPartial` deliberately means `null = preserve`; use an explicit empty string to clear one string or
+  `UserDbContext.ResetUserStatus` to atomically clear all transient fields and install a replacement state. Recovery
+  audit events contain only bot/user identity, previous step, coarse target, and safe service key.
 - The normal metered service may enable `customDurationDays` with an inclusive `minimumDays`/`maximumDays` range capped
   at 365. Typed Latin, Persian, or Arabic-Indic whole numbers are persisted in callbacks, `users.db`, and tenant orders
   as canonical `days-N` keys. Missing policy means disabled. Custom days are independent of preset `isEnabled` flags,

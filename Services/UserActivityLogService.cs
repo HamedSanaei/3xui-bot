@@ -404,7 +404,11 @@ public class UserActivityLogService
     /// Keeps only approved detail keys and truncates long strings before writing JSONL.
     /// </summary>
     /// <param name="details">Raw detail dictionary supplied by callers.</param>
-    /// <returns>Filtered and compacted detail dictionary.</returns>
+    /// <returns>Filtered and compacted detail dictionary containing only approved operational fields.</returns>
+    /// <remarks>
+    /// Purchase recovery may record a previous state-machine step and a coarse recovery target. User-entered text,
+    /// UUIDs, links, tokens, payment payloads, and unapproved values are discarded by the allowlist.
+    /// </remarks>
     private static Dictionary<string, object> CompactDetails(IDictionary<string, object> details)
     {
         var compact = new Dictionary<string, object>();
@@ -425,6 +429,8 @@ public class UserActivityLogService
             "balanceToman",
             "expiryShamsi",
             "requestedAction",
+            "previousStep",
+            "recoveryTarget",
             "message",
             "errorType",
             "errorMessage",

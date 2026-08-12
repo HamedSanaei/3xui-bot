@@ -12,7 +12,8 @@ using System.Threading;
 /// Multi-instance support is implemented here by routing the legacy <see cref="User"/> state API
 /// through <see cref="BotUserState"/> rows keyed by <c>BotId + TelegramUserId</c>.
 /// Existing call sites can still call <see cref="SaveUserStatus"/>, <see cref="ClearUserStatus"/>,
-/// <see cref="GetUserStatus"/>, <see cref="IsUserReadyToCreate"/>, and <see cref="IsUserReadyToUpdate"/>;
+/// <see cref="ResetUserStatus"/>, <see cref="GetUserStatus"/>, <see cref="IsUserReadyToCreate"/>, and
+/// <see cref="IsUserReadyToUpdate"/>;
 /// the current bot is resolved from <see cref="BotContextAccessor"/>.
 /// </remarks>
 public class UserDbContext : DbContext
@@ -594,6 +595,59 @@ public class UserDbContext : DbContext
             await context.SaveChangesAsync();
         });
     }
+
+    /// <summary>
+    /// Atomically clears one bot-scoped conversation and replaces it with an explicit recovery state.
+    /// </summary>
+    /// <param name="user">
+    /// Complete transient state to keep after the reset. <see cref="User.Id"/> must be the Telegram user id from the
+    /// current update; the owning bot id is read from <see cref="BotContextAccessor.CurrentBotId"/>. Empty strings are
+    /// accepted as explicit cleared values, while wallet, order, payment, account, and other-bot data are never touched.
+    /// </param>
+    /// <returns>A task that completes after the clear-and-replace operation is committed to <c>users.db</c>.</returns>
+    /// <remarks>
+    /// Use this method when a state-machine recovery must remove stale partial fields such as duration, comment, or
+    /// account count. Unlike two separate calls to <see cref="ClearUserStatus"/> and <see cref="SaveUserStatus"/>, the
+    /// reset and replacement share one serialized database operation, so another update cannot observe the cleared
+    /// intermediate state. Long-lived free-account timestamps and counters are preserved by
+    /// <see cref="BotUserState.Clear"/> and <see cref="BotUserState.ApplyPartial"/>.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// await db.ResetUserStatus(new User
+    /// {
+    ///     Id = telegramUserId,
+    ///     Flow = "xui-v3",
+    ///     LastStep = "select-duration",
+    ///     SelectedCountry = "normal",
+    ///     TotoalGB = "10"
+    /// });
+    /// </code>
+    /// </example>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="user"/> is null.</exception>
+    public async Task ResetUserStatus(User user)
+    {
+        ArgumentNullException.ThrowIfNull(user);
+
+        await RunSerializedAsync(async () =>
+        {
+            var context = new UserDbContext();
+            var botId = GetCurrentBotId();
+            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(
+                state => state.BotId == botId && state.TelegramUserId == user.Id);
+
+            if (existingUser == null)
+            {
+                existingUser = BotUserState.FromUser(botId, new User { Id = user.Id });
+                context.BotUserStates.Add(existingUser);
+            }
+
+            existingUser.Clear();
+            existingUser.ApplyPartial(user);
+            await context.SaveChangesAsync();
+        });
+    }
+
     /// <summary>
     /// Checks whether the current bot has collected all legacy purchase fields needed to create an account.
     /// </summary>

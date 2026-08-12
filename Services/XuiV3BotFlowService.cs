@@ -58,6 +58,27 @@ public class XuiV3BotFlowService
     /// <summary>Safe Telegram HTML limit that leaves room below the platform's 4096-character message ceiling.</summary>
     private const int MaxAccountConfigsHtmlLength = 3900;
 
+    /// <summary>
+    /// Identifies the earliest owned-purchase step that remains valid after the live plan catalog changes.
+    /// </summary>
+    private enum PurchaseRecoveryTarget
+    {
+        /// <summary>The restored selection is valid for the requested step and needs no recovery.</summary>
+        None,
+
+        /// <summary>The saved service no longer exists, is disabled, or cannot be trusted.</summary>
+        Service,
+
+        /// <summary>The metered service remains valid but its saved traffic is missing or below the current minimum.</summary>
+        Traffic,
+
+        /// <summary>The metered service and traffic remain valid but the preset or custom duration is no longer allowed.</summary>
+        Duration,
+
+        /// <summary>The unlimited service remains valid but its saved unlimited sub-plan is missing or disabled.</summary>
+        UnlimitedPlan
+    }
+
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly XuiV3PurchaseSessionStore _sessionStore;
     private readonly UserDbContext _userDbContext;
@@ -1180,8 +1201,14 @@ public class XuiV3BotFlowService
     /// inside the same renewal step. A valid custom duration is persisted as <c>days-N</c> and revalidated by the
     /// central resolver before wallet debit or XUI renewal. Before preview, the target is freshly reloaded and must
     /// still match either owner identity or the independent UUID proof; mismatch terminates and clears the state.
+    /// When a duration is disabled between preview and confirmation, an explicit empty string clears only the stored
+    /// duration while the bot-scoped target-account UUID proof and the other renewal fields remain intact. A disabled
+    /// unlimited sub-plan similarly returns to the current plan keyboard without consuming confirmation or charging.
     /// </remarks>
     /// <returns>A task that completes after the current state transition and Telegram response.</returns>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="cancellationToken"/> is cancelled during Telegram, database, pricing, or panel work.
+    /// </exception>
     private async Task HandleRenewFlowStepAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1374,7 +1401,7 @@ public class XuiV3BotFlowService
                 !XuiV3PurchaseService.TryResolveDurationKey(service, user.SelectedPeriod, out _))
             {
                 user.LastStep = RenewStepDuration;
-                user.SelectedPeriod = null;
+                user.SelectedPeriod = string.Empty;
                 await _userDbContext.SaveUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -1382,6 +1409,22 @@ public class XuiV3BotFlowService
                         service,
                         "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید."),
                     replyMarkup: BuildDurationReplyKeyboard(service),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (service.IsUnlimited &&
+                service.UnlimitedPlans?.Any(plan =>
+                    plan.IsEnabled &&
+                    string.Equals(plan.Key, user.Type, StringComparison.OrdinalIgnoreCase)) != true)
+            {
+                user.LastStep = RenewStepUnlimitedPlan;
+                user.Type = string.Empty;
+                await _userDbContext.SaveUserStatus(user);
+                await botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "پلن نامحدود انتخاب‌شده دیگر فعال نیست. پلن جدید را انتخاب کنید.",
+                    replyMarkup: BuildUnlimitedPlanReplyKeyboard(service, credUser.IsColleague),
                     cancellationToken: cancellationToken);
                 return;
             }
@@ -1941,8 +1984,15 @@ public class XuiV3BotFlowService
     ///
     /// Metered traffic and custom duration days typed by the user are validated through the shared purchase policy,
     /// so owned bots and tenant bots apply the same plan-file ranges and pricing. Durable traffic and duration fields
-    /// are rehydrated before later steps so a process restart cannot discard a <c>days-N</c> selection.
+    /// are rehydrated before later steps so a process restart cannot discard a <c>days-N</c> selection. Every restored
+    /// service, traffic, duration, and unlimited-plan value is checked against the live catalog before count, comment,
+    /// or confirmation text is consumed. Invalid state is lazily reset in the current bot only and the triggering text
+    /// is not saved as an order value. A valid comment preview resolves pricing once and reuses that snapshot for the
+    /// summary, total amount, and site-wallet eligibility; confirmation resolves the live catalog again before effects.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="cancellationToken"/> is cancelled during Telegram, database, or payment-precheck work.
+    /// </exception>
     public async Task<bool> TryHandlePurchaseTextAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1976,34 +2026,39 @@ public class XuiV3BotFlowService
             ? user.SelectedCountry
             : selection.ServiceKey;
         var service = FindService(serviceKey);
-        if (service == null)
+        if (service != null)
+            RehydratePurchaseSelectionFromState(selection, service, user);
+
+        if (service == null &&
+            string.Equals(user.LastStep, PurchaseStepSelectService, StringComparison.Ordinal) &&
+            string.IsNullOrWhiteSpace(serviceKey))
         {
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "ابتدا نوع سرویس را از دکمه‌ها انتخاب کنید.",
+                text: "نوع سرویس را از دکمه‌های فعال انتخاب کنید.",
                 replyMarkup: _purchaseService.BuildServiceKeyboard(),
                 cancellationToken: cancellationToken);
             return true;
         }
 
-        RehydratePurchaseSelectionFromState(selection, service, user);
+        var recoveryTarget = DeterminePurchaseRecoveryTarget(service, selection, user.LastStep);
+        if (recoveryTarget != PurchaseRecoveryTarget.None)
+        {
+            await RecoverPurchaseStateAsync(
+                botClient,
+                message.Chat.Id,
+                0,
+                credUser,
+                user,
+                selection,
+                service,
+                recoveryTarget,
+                cancellationToken);
+            return true;
+        }
 
         if (user.LastStep == PurchaseStepSelectDuration)
         {
-            if (!selection.TrafficGb.HasValue ||
-                !XuiV3PurchaseService.MeetsMinimumTraffic(service, selection.TrafficGb.Value))
-            {
-                user.LastStep = PurchaseStepSelectTraffic;
-                user.SelectedPeriod = null;
-                await _userDbContext.SaveUserStatus(user);
-                await botClient.SendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: BuildMinimumTrafficMessage(service),
-                    replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
-                    cancellationToken: cancellationToken);
-                return true;
-            }
-
             if (!XuiV3PurchaseService.TryResolveDurationInput(service, message.Text, out var duration))
             {
                 await botClient.SendTextMessageAsync(
@@ -2023,12 +2078,16 @@ public class XuiV3BotFlowService
             selection.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
-            user.Flow = PurchaseFlowName;
-            user.LastStep = PurchaseStepAccountCount;
-            user.SelectedCountry = service.Key;
-            user.TotoalGB = selection.TrafficGb.Value.ToString(CultureInfo.InvariantCulture);
-            user.SelectedPeriod = duration.Key;
-            await _userDbContext.SaveUserStatus(user);
+            await _userDbContext.ResetUserStatus(new User
+            {
+                Id = message.From.Id,
+                Flow = PurchaseFlowName,
+                LastStep = PurchaseStepAccountCount,
+                SelectedCountry = service.Key,
+                TotoalGB = selection.TrafficGb.Value.ToString(CultureInfo.InvariantCulture),
+                SelectedPeriod = duration.Key,
+                PendingUserComment = string.Empty
+            });
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -2055,11 +2114,15 @@ public class XuiV3BotFlowService
             selection.AccountCount = accountCount;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
-            await _userDbContext.SaveUserStatus(new User
+            await _userDbContext.ResetUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = PurchaseFlowName,
                 LastStep = PurchaseStepUserComment,
+                SelectedCountry = service.Key,
+                TotoalGB = selection.TrafficGb?.ToString(CultureInfo.InvariantCulture),
+                SelectedPeriod = selection.DurationKey ?? string.Empty,
+                Type = selection.UnlimitedPlanKey ?? string.Empty,
                 PendingAccountCount = accountCount
             });
 
@@ -2073,14 +2136,21 @@ public class XuiV3BotFlowService
 
         if (user.LastStep == PurchaseStepUserComment)
         {
+            // Resolve once before consuming the message so the preview, payable total, and site-wallet eligibility all
+            // use the same live-catalog snapshot. Confirmation deliberately resolves again immediately before effects.
+            selection.ServiceKey = service.Key;
+            selection.AccountCount = XuiV3PurchaseService.NormalizeAccountCount(user.PendingAccountCount);
+            var resolved = _purchaseService.ResolvePurchase(selection, credUser.IsColleague);
+            var totalPrice = resolved.PriceToman * selection.AccountCount;
+            var canUseSiteWallet = await CanUseGozargahSiteWalletAsync(
+                credUser.TelegramUserId,
+                totalPrice,
+                cancellationToken);
+
             var userComment = IsSkipCommentText(message.Text)
                 ? string.Empty
                 : NormalizeUserComment(message.Text);
 
-            // A user may return to the optional-comment step after an app restart or session loss.
-            // Rehydrate the service key from the persisted bot state before building the payment summary.
-            selection.ServiceKey = service.Key;
-            selection.AccountCount = XuiV3PurchaseService.NormalizeAccountCount(user.PendingAccountCount);
             selection.UserComment = userComment;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
@@ -2094,15 +2164,9 @@ public class XuiV3BotFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: _purchaseService.BuildSummaryText(selection, credUser.IsColleague),
+                text: _purchaseService.BuildSummaryText(selection, resolved),
                 parseMode: ParseMode.Html,
-                replyMarkup: BuildPurchaseConfirmKeyboard(
-                    selection,
-                    await CanUseGozargahSiteWalletAsync(
-                        credUser.TelegramUserId,
-                        _purchaseService.ResolvePurchase(selection, credUser.IsColleague).PriceToman *
-                        XuiV3PurchaseService.NormalizeAccountCount(selection.AccountCount),
-                        cancellationToken)),
+                replyMarkup: BuildPurchaseConfirmKeyboard(selection, canUseSiteWallet),
                 cancellationToken: cancellationToken);
             return true;
         }
@@ -2117,7 +2181,7 @@ public class XuiV3BotFlowService
             return true;
         }
 
-        if (!selection.TrafficGb.HasValue)
+        if (user.LastStep == PurchaseStepSelectTraffic)
         {
             if (!TryGetTrafficGbFromText(message.Text, out var trafficGb) || trafficGb <= 0)
             {
@@ -2145,11 +2209,17 @@ public class XuiV3BotFlowService
             selection.UnlimitedPlanKey = null;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
-            user.Flow = PurchaseFlowName;
-            user.LastStep = PurchaseStepSelectDuration;
-            user.SelectedCountry = service.Key;
-            user.TotoalGB = trafficGb.ToString();
-            await _userDbContext.SaveUserStatus(user);
+            await _userDbContext.ResetUserStatus(new User
+            {
+                Id = message.From.Id,
+                Flow = PurchaseFlowName,
+                LastStep = PurchaseStepSelectDuration,
+                SelectedCountry = service.Key,
+                TotoalGB = trafficGb.ToString(CultureInfo.InvariantCulture),
+                SelectedPeriod = string.Empty,
+                Type = string.Empty,
+                PendingUserComment = string.Empty
+            });
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -2482,11 +2552,14 @@ public class XuiV3BotFlowService
     /// but cannot replay a panel mutation because users.db owns the atomic confirmation transition. Owned purchase
     /// confirmations with insufficient bot-wallet balance expose a separate callback handled by TelegramBotService;
     /// it is deliberately not parsed here because it abandons the XUI selection and starts wallet charging. Purchase
-    /// confirmation payload fallback is accepted only while the persisted bot-scoped state is still at the active
-    /// confirmation step, so an old callback cannot recreate an abandoned selection or debit the wallet.
+    /// confirmation is accepted only while the persisted bot-scoped state is still at the active confirmation step.
+    /// After a process restart, the full selection is rebuilt from that bot-scoped row rather than
+    /// callback plan fields, so an old button cannot replace an active service, duration, plan, count, or comment.
     /// Metered duration callbacks and canonical <c>days-N</c> selections are checked against the freshly loaded preset
     /// flags and custom-duration range before purchase state advances and again at confirmation. A catalog toggle
     /// therefore returns the buyer to current duration choices without a wallet, ledger, website, or XUI side effect.
+    /// Service, traffic, duration, unlimited-plan, account-count, and back callbacks replace durable transient state
+    /// explicitly, so values cleared in memory cannot survive through partial-update null semantics.
     /// The read-only <c>acfg</c> route carries only a numeric client id; it reloads panel data and verifies Telegram
     /// ownership before any SubId or configuration URL is requested, then sends the result in a separate message/file.
     /// The external <c>auren</c> route additionally requires current bot-scoped direct-search state matching the same
@@ -2877,7 +2950,21 @@ public class XuiV3BotFlowService
             selection.TrafficGb = null;
             selection.DurationKey = null;
             selection.UnlimitedPlanKey = null;
+            selection.AccountCount = 1;
+            selection.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selection);
+
+            await _userDbContext.ResetUserStatus(new User
+            {
+                Id = credUser.TelegramUserId,
+                Flow = PurchaseFlowName,
+                LastStep = PurchaseStepSelectService,
+                SelectedCountry = string.Empty,
+                SelectedPeriod = string.Empty,
+                Type = string.Empty,
+                TotoalGB = string.Empty,
+                PendingUserComment = string.Empty
+            });
 
             if (messageId != 0)
             {
@@ -2896,15 +2983,47 @@ public class XuiV3BotFlowService
 
         if (callback.Action == "cnt")
         {
+            var serviceKey = string.IsNullOrWhiteSpace(selectionState.ServiceKey)
+                ? user.SelectedCountry
+                : selectionState.ServiceKey;
+            var service = string.Equals(user.Flow, PurchaseFlowName, StringComparison.Ordinal)
+                ? FindService(serviceKey)
+                : null;
+            if (service != null)
+                RehydratePurchaseSelectionFromState(selectionState, service, user);
+
+            var target = DeterminePurchaseRecoveryTarget(
+                service,
+                selectionState,
+                PurchaseStepAccountCount);
+            if (target != PurchaseRecoveryTarget.None)
+            {
+                await RecoverPurchaseStateAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    credUser,
+                    user,
+                    selectionState,
+                    service,
+                    target,
+                    cancellationToken);
+                return true;
+            }
+
             var count = XuiV3PurchaseService.NormalizeAccountCount(callback.AccountCount ?? 1);
             selectionState.AccountCount = count;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            await _userDbContext.SaveUserStatus(new User
+            await _userDbContext.ResetUserStatus(new User
             {
                 Id = credUser.TelegramUserId,
                 Flow = PurchaseFlowName,
                 LastStep = PurchaseStepUserComment,
+                SelectedCountry = service.Key,
+                TotoalGB = selectionState.TrafficGb?.ToString(CultureInfo.InvariantCulture),
+                SelectedPeriod = selectionState.DurationKey ?? string.Empty,
+                Type = selectionState.UnlimitedPlanKey ?? string.Empty,
                 PendingAccountCount = count
             });
 
@@ -2928,6 +3047,22 @@ public class XuiV3BotFlowService
 
         if (callback.Action == "svc")
         {
+            var service = FindService(callback.ServiceKey);
+            if (service == null)
+            {
+                await RecoverPurchaseStateAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    credUser,
+                    user,
+                    selectionState,
+                    null,
+                    PurchaseRecoveryTarget.Service,
+                    cancellationToken);
+                return true;
+            }
+
             selectionState.ServiceKey = callback.ServiceKey;
             selectionState.TrafficGb = null;
             selectionState.DurationKey = null;
@@ -2936,17 +3071,17 @@ public class XuiV3BotFlowService
             selectionState.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            var service = _purchaseService.LoadCatalog().Services.FirstOrDefault(s => string.Equals(s.Key, callback.ServiceKey, StringComparison.OrdinalIgnoreCase));
-            if (service == null)
-                return false;
-
-            user.Flow = PurchaseFlowName;
-            user.LastStep = service.IsUnlimited ? PurchaseStepSelectUnlimitedPlan : PurchaseStepSelectTraffic;
-            user.SelectedCountry = service.Key;
-            user.SelectedPeriod = null;
-            user.Type = null;
-            user.TotoalGB = null;
-            await _userDbContext.SaveUserStatus(user);
+            await _userDbContext.ResetUserStatus(new User
+            {
+                Id = credUser.TelegramUserId,
+                Flow = PurchaseFlowName,
+                LastStep = service.IsUnlimited ? PurchaseStepSelectUnlimitedPlan : PurchaseStepSelectTraffic,
+                SelectedCountry = service.Key,
+                SelectedPeriod = string.Empty,
+                Type = string.Empty,
+                TotoalGB = string.Empty,
+                PendingUserComment = string.Empty
+            });
 
             if (messageId != 0)
             {
@@ -2969,19 +3104,23 @@ public class XuiV3BotFlowService
         if (callback.Action == "gb")
         {
             var service = FindService(callback.ServiceKey);
-            if (service == null || !callback.TrafficGb.HasValue || !XuiV3PurchaseService.MeetsMinimumTraffic(service, callback.TrafficGb.Value))
+            if (service == null || service.IsUnlimited || !callback.TrafficGb.HasValue ||
+                !XuiV3PurchaseService.MeetsMinimumTraffic(service, callback.TrafficGb.Value))
             {
-                if (messageId != 0 && service != null)
-                {
-                    await SafeEditMessageTextAsync(
-                        botClient,
-                        chatId: chatId,
-                        messageId: messageId,
-                        text: BuildMinimumTrafficMessage(service),
-                        replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
-                        cancellationToken: cancellationToken);
-                }
-
+                await RecoverPurchaseStateAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    credUser,
+                    user,
+                    selectionState,
+                    service,
+                    service == null
+                        ? PurchaseRecoveryTarget.Service
+                        : service.IsUnlimited
+                            ? PurchaseRecoveryTarget.UnlimitedPlan
+                            : PurchaseRecoveryTarget.Traffic,
+                    cancellationToken);
                 return true;
             }
 
@@ -2993,11 +3132,17 @@ public class XuiV3BotFlowService
             selectionState.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            user.Flow = PurchaseFlowName;
-            user.LastStep = PurchaseStepSelectDuration;
-            user.SelectedCountry = callback.ServiceKey;
-            user.TotoalGB = callback.TrafficGb?.ToString();
-            await _userDbContext.SaveUserStatus(user);
+            await _userDbContext.ResetUserStatus(new User
+            {
+                Id = credUser.TelegramUserId,
+                Flow = PurchaseFlowName,
+                LastStep = PurchaseStepSelectDuration,
+                SelectedCountry = service.Key,
+                TotoalGB = callback.TrafficGb.Value.ToString(CultureInfo.InvariantCulture),
+                SelectedPeriod = string.Empty,
+                Type = string.Empty,
+                PendingUserComment = string.Empty
+            });
 
             if (messageId != 0)
             {
@@ -3017,41 +3162,44 @@ public class XuiV3BotFlowService
         if (callback.Action == "dur")
         {
             var service = FindService(callback.ServiceKey);
-            if (service == null || !callback.TrafficGb.HasValue || !XuiV3PurchaseService.MeetsMinimumTraffic(service, callback.TrafficGb.Value))
+            if (service == null || service.IsUnlimited || !callback.TrafficGb.HasValue ||
+                !XuiV3PurchaseService.MeetsMinimumTraffic(service, callback.TrafficGb.Value))
             {
-                if (messageId != 0 && service != null)
-                {
-                    await SafeEditMessageTextAsync(
-                        botClient,
-                        chatId: chatId,
-                        messageId: messageId,
-                        text: BuildMinimumTrafficMessage(service),
-                        replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
-                        cancellationToken: cancellationToken);
-                }
-
+                await RecoverPurchaseStateAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    credUser,
+                    user,
+                    selectionState,
+                    service,
+                    service == null
+                        ? PurchaseRecoveryTarget.Service
+                        : service.IsUnlimited
+                            ? PurchaseRecoveryTarget.UnlimitedPlan
+                            : PurchaseRecoveryTarget.Traffic,
+                    cancellationToken);
                 return true;
             }
+
+            selectionState.ServiceKey = service.Key;
+            selectionState.TrafficGb = callback.TrafficGb;
 
             var duration = XuiV3PurchaseService.GetEnabledDurationOptions(service).FirstOrDefault(option =>
                 string.Equals(option.Key, callback.DurationKey, StringComparison.OrdinalIgnoreCase));
             if (duration == null)
             {
-                // Telegram buttons can outlive a catalog edit. Revalidate before persisting purchase state so a
-                // disabled duration never reaches account-count selection, wallet debit, or XUI account creation.
-                if (messageId != 0)
-                {
-                    await SafeEditMessageTextAsync(
-                        botClient,
-                        chatId: chatId,
-                        messageId: messageId,
-                        text: XuiV3PurchaseService.BuildDurationSelectionText(
-                            service,
-                            "این مدت غیرفعال شده است. لطفاً یکی از مدت‌های فعال را انتخاب کنید."),
-                        replyMarkup: _purchaseService.BuildDurationKeyboard(service.Key, callback.TrafficGb.Value),
-                        cancellationToken: cancellationToken);
-                }
-
+                // Telegram buttons can outlive catalog edits; durable and in-memory values must be cleared together.
+                await RecoverPurchaseStateAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    credUser,
+                    user,
+                    selectionState,
+                    service,
+                    PurchaseRecoveryTarget.Duration,
+                    cancellationToken);
                 return true;
             }
 
@@ -3063,12 +3211,17 @@ public class XuiV3BotFlowService
             selectionState.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            user.Flow = PurchaseFlowName;
-            user.LastStep = PurchaseStepAccountCount;
-            user.SelectedCountry = callback.ServiceKey;
-            user.TotoalGB = callback.TrafficGb?.ToString();
-            user.SelectedPeriod = callback.DurationKey;
-            await _userDbContext.SaveUserStatus(user);
+            await _userDbContext.ResetUserStatus(new User
+            {
+                Id = credUser.TelegramUserId,
+                Flow = PurchaseFlowName,
+                LastStep = PurchaseStepAccountCount,
+                SelectedCountry = service.Key,
+                TotoalGB = callback.TrafficGb.Value.ToString(CultureInfo.InvariantCulture),
+                SelectedPeriod = duration.Key,
+                Type = string.Empty,
+                PendingUserComment = string.Empty
+            });
 
             if (messageId != 0)
             {
@@ -3085,19 +3238,60 @@ public class XuiV3BotFlowService
 
         if (callback.Action == "upl")
         {
-            selectionState.ServiceKey = callback.ServiceKey;
-            selectionState.UnlimitedPlanKey = callback.UnlimitedPlanKey;
+            var service = FindService(callback.ServiceKey);
+            if (service == null || !service.IsUnlimited)
+            {
+                await RecoverPurchaseStateAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    credUser,
+                    user,
+                    selectionState,
+                    null,
+                    PurchaseRecoveryTarget.Service,
+                    cancellationToken);
+                return true;
+            }
+
+            selectionState.ServiceKey = service.Key;
             selectionState.TrafficGb = null;
             selectionState.DurationKey = null;
+            selectionState.UnlimitedPlanKey = callback.UnlimitedPlanKey;
+
+            var unlimitedPlan = service.UnlimitedPlans?.FirstOrDefault(plan =>
+                plan.IsEnabled &&
+                string.Equals(plan.Key, callback.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase));
+            if (unlimitedPlan == null)
+            {
+                await RecoverPurchaseStateAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    credUser,
+                    user,
+                    selectionState,
+                    service,
+                    PurchaseRecoveryTarget.UnlimitedPlan,
+                    cancellationToken);
+                return true;
+            }
+
             selectionState.AccountCount = 1;
             selectionState.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            user.Flow = PurchaseFlowName;
-            user.LastStep = PurchaseStepAccountCount;
-            user.SelectedCountry = callback.ServiceKey;
-            user.Type = callback.UnlimitedPlanKey;
-            await _userDbContext.SaveUserStatus(user);
+            await _userDbContext.ResetUserStatus(new User
+            {
+                Id = credUser.TelegramUserId,
+                Flow = PurchaseFlowName,
+                LastStep = PurchaseStepAccountCount,
+                SelectedCountry = service.Key,
+                SelectedPeriod = string.Empty,
+                Type = unlimitedPlan.Key,
+                TotoalGB = string.Empty,
+                PendingUserComment = string.Empty
+            });
 
             if (messageId != 0)
             {
@@ -3137,8 +3331,15 @@ public class XuiV3BotFlowService
             var hasSession = _sessionStore.TryGet(credUser.TelegramUserId, out var selection);
             if (!hasSession || selection == null || string.IsNullOrWhiteSpace(selection.ServiceKey))
             {
-                selection = callback.ToSelection();
-                Console.WriteLine($"[XUIv3] confirm fallback from callback data for user {credUser.TelegramUserId}");
+                // Callback payloads are presentation data and can outlive another purchase. Rebuild from the active
+                // bot-scoped confirmation row so an older button cannot replace the service, duration, plan, or count.
+                selection = new XuiV3PurchaseSelection
+                {
+                    ServiceKey = user.SelectedCountry,
+                    AccountCount = XuiV3PurchaseService.NormalizeAccountCount(user.PendingAccountCount),
+                    UserComment = user.PendingUserComment
+                };
+                Console.WriteLine($"[XUIv3] confirm fallback from bot-scoped state for user {credUser.TelegramUserId}");
             }
 
             if (selection == null || string.IsNullOrWhiteSpace(selection.ServiceKey))
@@ -3148,51 +3349,26 @@ public class XuiV3BotFlowService
             }
 
             var confirmationService = FindService(selection.ServiceKey);
-            if (confirmationService != null && !confirmationService.IsUnlimited)
-            {
-                if (!selection.TrafficGb.HasValue ||
-                    !XuiV3PurchaseService.MeetsMinimumTraffic(confirmationService, selection.TrafficGb.Value))
-                {
-                    selection.DurationKey = null;
-                    selection.TrafficGb = null;
-                    _sessionStore.Set(credUser.TelegramUserId, selection);
-                    user.LastStep = PurchaseStepSelectTraffic;
-                    user.SelectedPeriod = null;
-                    user.TotoalGB = null;
-                    await _userDbContext.SaveUserStatus(user);
-                    await SendOrEditTextAsync(
-                        botClient,
-                        chatId,
-                        messageId,
-                        BuildMinimumTrafficMessage(confirmationService),
-                        replyMarkup: _purchaseService.BuildTrafficKeyboard(confirmationService.Key),
-                        cancellationToken: cancellationToken);
-                    return true;
-                }
+            if (confirmationService != null)
+                RehydratePurchaseSelectionFromState(selection, confirmationService, user);
 
-                if (!XuiV3PurchaseService.TryResolveDurationKey(
-                        confirmationService,
-                        selection.DurationKey,
-                        out _))
-                {
-                    selection.DurationKey = null;
-                    _sessionStore.Set(credUser.TelegramUserId, selection);
-                    user.LastStep = PurchaseStepSelectDuration;
-                    user.SelectedPeriod = null;
-                    await _userDbContext.SaveUserStatus(user);
-                    await SendOrEditTextAsync(
-                        botClient,
-                        chatId,
-                        messageId,
-                        XuiV3PurchaseService.BuildDurationSelectionText(
-                            confirmationService,
-                            "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید."),
-                        replyMarkup: _purchaseService.BuildDurationKeyboard(
-                            confirmationService.Key,
-                            selection.TrafficGb.Value),
-                        cancellationToken: cancellationToken);
-                    return true;
-                }
+            var confirmationRecoveryTarget = DeterminePurchaseRecoveryTarget(
+                confirmationService,
+                selection,
+                PurchaseStepConfirm);
+            if (confirmationRecoveryTarget != PurchaseRecoveryTarget.None)
+            {
+                await RecoverPurchaseStateAsync(
+                    botClient,
+                    chatId,
+                    messageId,
+                    credUser,
+                    user,
+                    selection,
+                    confirmationService,
+                    confirmationRecoveryTarget,
+                    cancellationToken);
+                return true;
             }
 
             try
@@ -6974,6 +7150,248 @@ public class XuiV3BotFlowService
     private static string BuildMinimumTrafficMessage(XuiV3ServiceDefinition service)
     {
         return $"حداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است. لطفاً حجم بیشتری وارد کنید.";
+    }
+
+    /// <summary>
+    /// Finds the earliest safe purchase step for a selection restored from bot-scoped durable state.
+    /// </summary>
+    /// <param name="service">
+    /// Enabled live-catalog service resolved from the saved key, or <see langword="null"/> when the key was removed,
+    /// disabled, or absent.
+    /// </param>
+    /// <param name="selection">
+    /// Restored in-memory selection for the current bot and Telegram user. It may contain values saved under an older
+    /// catalog revision.
+    /// </param>
+    /// <param name="requiredStep">
+    /// Purchase step about to consume the incoming text or callback. Use the durable state step for text messages and
+    /// the destination step for callbacks such as account count.
+    /// </param>
+    /// <returns>
+    /// <see cref="PurchaseRecoveryTarget.None"/> when every value required by the step is valid in the live catalog;
+    /// otherwise the earliest step that can safely preserve valid service or traffic choices.
+    /// </returns>
+    /// <remarks>
+    /// This method performs no I/O and no price calculation. The central resolver remains fail-closed and is still
+    /// called before preview and confirmation; this check exists to turn stale UI state into a recoverable prompt
+    /// before user text can be consumed as a count or comment.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var target = DeterminePurchaseRecoveryTarget(service, selection, "select-user-comment");
+    /// </code>
+    /// </example>
+    private static PurchaseRecoveryTarget DeterminePurchaseRecoveryTarget(
+        XuiV3ServiceDefinition service,
+        XuiV3PurchaseSelection selection,
+        string requiredStep)
+    {
+        if (service == null || selection == null)
+            return PurchaseRecoveryTarget.Service;
+
+        if (string.Equals(requiredStep, PurchaseStepSelectService, StringComparison.Ordinal))
+            return PurchaseRecoveryTarget.Service;
+
+        if (service.IsUnlimited)
+        {
+            if (string.Equals(requiredStep, PurchaseStepSelectUnlimitedPlan, StringComparison.Ordinal))
+                return PurchaseRecoveryTarget.None;
+
+            if (!string.Equals(requiredStep, PurchaseStepAccountCount, StringComparison.Ordinal) &&
+                !string.Equals(requiredStep, PurchaseStepUserComment, StringComparison.Ordinal) &&
+                !string.Equals(requiredStep, PurchaseStepConfirm, StringComparison.Ordinal))
+            {
+                return PurchaseRecoveryTarget.UnlimitedPlan;
+            }
+
+            var planIsEnabled = service.UnlimitedPlans?.Any(plan =>
+                plan.IsEnabled &&
+                string.Equals(plan.Key, selection.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase)) == true;
+            return planIsEnabled
+                ? PurchaseRecoveryTarget.None
+                : PurchaseRecoveryTarget.UnlimitedPlan;
+        }
+
+        if (string.Equals(requiredStep, PurchaseStepSelectTraffic, StringComparison.Ordinal))
+            return PurchaseRecoveryTarget.None;
+
+        if (!selection.TrafficGb.HasValue ||
+            !XuiV3PurchaseService.MeetsMinimumTraffic(service, selection.TrafficGb.Value))
+        {
+            return PurchaseRecoveryTarget.Traffic;
+        }
+
+        if (string.Equals(requiredStep, PurchaseStepSelectDuration, StringComparison.Ordinal))
+            return PurchaseRecoveryTarget.None;
+
+        if (!string.Equals(requiredStep, PurchaseStepAccountCount, StringComparison.Ordinal) &&
+            !string.Equals(requiredStep, PurchaseStepUserComment, StringComparison.Ordinal) &&
+            !string.Equals(requiredStep, PurchaseStepConfirm, StringComparison.Ordinal))
+        {
+            return PurchaseRecoveryTarget.Duration;
+        }
+
+        return XuiV3PurchaseService.TryResolveDurationKey(service, selection.DurationKey, out _)
+            ? PurchaseRecoveryTarget.None
+            : PurchaseRecoveryTarget.Duration;
+    }
+
+    /// <summary>
+    /// Replaces an invalid owned-purchase state with the earliest safe step and shows the current catalog choices.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned bot that received the stale text or callback.</param>
+    /// <param name="chatId">Telegram chat id from the active update; it is used only for the recovery prompt.</param>
+    /// <param name="messageId">
+    /// Source Telegram message id for callback recovery, or zero for a text-message recovery that must send a new
+    /// message instead of editing user content.
+    /// </param>
+    /// <param name="credUser">
+    /// Shared credential profile for the current Telegram user. Only its user id, role, and safe audit identity are used.
+    /// </param>
+    /// <param name="user">
+    /// Bot-scoped durable conversation loaded for the bot that received the update. Its previous step is logged without
+    /// user-entered text or sensitive plan/payment data.
+    /// </param>
+    /// <param name="selection">
+    /// Bot-scoped in-memory selection to synchronize with the recovered durable state. Valid service and traffic values
+    /// are preserved when the target permits them.
+    /// </param>
+    /// <param name="service">Current enabled service, or <see langword="null"/> when service selection must restart.</param>
+    /// <param name="target">Earliest safe recovery step returned by <see cref="DeterminePurchaseRecoveryTarget"/>.</param>
+    /// <param name="cancellationToken">Token that cancels the users.db reset, audit write, or Telegram prompt.</param>
+    /// <returns>A task that completes after the state and prompt have been synchronized.</returns>
+    /// <remarks>
+    /// The database reset is scoped by the ambient bot id plus Telegram user id. It clears only transient conversation
+    /// values; wallets, ledger entries, orders, payments, XUI accounts, and states in other bots are untouched. The
+    /// triggering user message is intentionally not reused after recovery, preventing ordinary text from becoming an
+    /// order comment under a stale catalog selection.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// await RecoverPurchaseStateAsync(
+    ///     botClient, chatId, 0, credUser, user, selection, service,
+    ///     PurchaseRecoveryTarget.Duration, cancellationToken);
+    /// </code>
+    /// </example>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="cancellationToken"/> is cancelled during users.db, audit, or Telegram work.
+    /// </exception>
+    private async Task RecoverPurchaseStateAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        int messageId,
+        CredUser credUser,
+        User user,
+        XuiV3PurchaseSelection selection,
+        XuiV3ServiceDefinition service,
+        PurchaseRecoveryTarget target,
+        CancellationToken cancellationToken)
+    {
+        if (target == PurchaseRecoveryTarget.None)
+            return;
+
+        selection ??= new XuiV3PurchaseSelection();
+        if (target == PurchaseRecoveryTarget.Duration &&
+            (service == null || !selection.TrafficGb.HasValue ||
+             !XuiV3PurchaseService.MeetsMinimumTraffic(service, selection.TrafficGb.Value)))
+        {
+            target = PurchaseRecoveryTarget.Traffic;
+        }
+
+        if ((target == PurchaseRecoveryTarget.Traffic ||
+             target == PurchaseRecoveryTarget.Duration ||
+             target == PurchaseRecoveryTarget.UnlimitedPlan) && service == null)
+        {
+            target = PurchaseRecoveryTarget.Service;
+        }
+
+        var previousStep = user?.LastStep ?? string.Empty;
+        selection.AccountCount = 1;
+        selection.UserComment = null;
+
+        var replacement = new User
+        {
+            Id = credUser.TelegramUserId,
+            Flow = PurchaseFlowName,
+            PendingAccountCount = 0,
+            PendingUserComment = string.Empty,
+            SelectedPeriod = string.Empty,
+            Type = string.Empty,
+            TotoalGB = string.Empty
+        };
+
+        string prompt;
+        InlineKeyboardMarkup keyboard;
+        switch (target)
+        {
+            case PurchaseRecoveryTarget.Traffic:
+                selection.ServiceKey = service.Key;
+                selection.TrafficGb = null;
+                selection.DurationKey = null;
+                selection.UnlimitedPlanKey = null;
+                replacement.LastStep = PurchaseStepSelectTraffic;
+                replacement.SelectedCountry = service.Key;
+                prompt = "حجم انتخاب‌شده قبلی دیگر معتبر نیست. لطفاً حجم جدید را انتخاب یا به‌صورت عدد صحیح ارسال کنید.";
+                keyboard = _purchaseService.BuildTrafficKeyboard(service.Key);
+                break;
+
+            case PurchaseRecoveryTarget.Duration:
+                selection.ServiceKey = service.Key;
+                selection.DurationKey = null;
+                selection.UnlimitedPlanKey = null;
+                replacement.LastStep = PurchaseStepSelectDuration;
+                replacement.SelectedCountry = service.Key;
+                replacement.TotoalGB = selection.TrafficGb.Value.ToString(CultureInfo.InvariantCulture);
+                prompt = XuiV3PurchaseService.BuildDurationSelectionText(
+                    service,
+                    "مدت انتخاب‌شده قبلی دیگر فعال یا معتبر نیست. لطفاً یک مدت جدید انتخاب کنید.");
+                keyboard = _purchaseService.BuildDurationKeyboard(service.Key, selection.TrafficGb.Value);
+                break;
+
+            case PurchaseRecoveryTarget.UnlimitedPlan:
+                selection.ServiceKey = service.Key;
+                selection.TrafficGb = null;
+                selection.DurationKey = null;
+                selection.UnlimitedPlanKey = null;
+                replacement.LastStep = PurchaseStepSelectUnlimitedPlan;
+                replacement.SelectedCountry = service.Key;
+                prompt = "پلن نامحدود انتخاب‌شده قبلی دیگر فعال نیست. لطفاً یکی از پلن‌های فعال را انتخاب کنید.";
+                keyboard = _purchaseService.BuildUnlimitedPlanKeyboard(service.Key, credUser.IsColleague);
+                break;
+
+            default:
+                selection.ServiceKey = null;
+                selection.TrafficGb = null;
+                selection.DurationKey = null;
+                selection.UnlimitedPlanKey = null;
+                replacement.LastStep = PurchaseStepSelectService;
+                replacement.SelectedCountry = string.Empty;
+                prompt = "انتخاب قبلی شما دیگر فعال نیست. لطفاً نوع سرویس را دوباره انتخاب کنید.";
+                keyboard = _purchaseService.BuildServiceKeyboard();
+                break;
+        }
+
+        _sessionStore.Set(credUser.TelegramUserId, selection);
+        await _userDbContext.ResetUserStatus(replacement);
+        await _activityLog.LogWarningAsync(
+            "xui_v3_purchase_state_recovered",
+            credUser,
+            false,
+            new Dictionary<string, object>
+            {
+                ["previousStep"] = previousStep,
+                ["recoveryTarget"] = target.ToString(),
+                ["serviceKey"] = service?.Key ?? string.Empty
+            },
+            cancellationToken);
+
+        await SendOrEditTextAsync(
+            botClient,
+            chatId,
+            messageId,
+            prompt,
+            replyMarkup: keyboard,
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>

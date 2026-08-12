@@ -3302,8 +3302,12 @@ public class TenantBotService
     /// <remarks>
     /// Tenant purchase preserves its inline preset callbacks while accepting typed traffic and <c>days-N</c> duration
     /// selections. Both values are validated by the same global policy used by owned bots before an order, gateway
-    /// invoice, tenant balance movement, or XUI request can be created.
+    /// invoice, tenant balance movement, or XUI request can be created. A stale duration is cleared with an explicit
+    /// empty value because null is intentionally treated as "preserve" by legacy partial state updates.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="cancellationToken"/> is cancelled during users.db or Telegram work.
+    /// </exception>
     private async Task<bool> TRYHANDLETENANTPURCHASETEXTASYNC(
         ITelegramBotClient botClient,
         Message message,
@@ -3334,7 +3338,11 @@ public class TenantBotService
         if (service == null || service.IsUnlimited)
         {
             await _userDbcontext.ClearUserStatus(user);
-            await SendTenantHomeAsync(botClient, message.Chat.Id, tenant, cancellationToken);
+            await botClient.SendTextMessageAsync(
+                message.Chat.Id,
+                "سرویس انتخاب‌شده قبلی دیگر فعال نیست. لطفاً سرویس جدید را انتخاب کنید.",
+                cancellationToken: cancellationToken);
+            await SendServiceSelectionAsync(botClient, message.Chat.Id, tenant, cancellationToken);
             return true;
         }
 
@@ -3350,13 +3358,16 @@ public class TenantBotService
                 return true;
             }
 
-            await _userDbcontext.SaveUserStatus(new User
+            await _userDbcontext.ResetUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = TENANTPURCHASEFLOW,
                 LastStep = TENANTPURCHASESTEPDURATION,
                 SelectedCountry = service.Key,
-                TotoalGB = trafficGb.ToString(CultureInfo.InvariantCulture)
+                TotoalGB = trafficGb.ToString(CultureInfo.InvariantCulture),
+                SelectedPeriod = string.Empty,
+                Type = string.Empty,
+                PendingUserComment = string.Empty
             });
 
             await SHOWDURATIONOPTIONSASYNC(
@@ -3379,9 +3390,17 @@ public class TenantBotService
                     out var trafficGb) ||
                 !XuiV3PurchaseService.MeetsMinimumTraffic(service, trafficGb))
             {
-                user.LastStep = TENANTPURCHASESTEPTRAFFIC;
-                user.SelectedPeriod = null;
-                await _userDbcontext.SaveUserStatus(user);
+                await _userDbcontext.ResetUserStatus(new User
+                {
+                    Id = message.From.Id,
+                    Flow = TENANTPURCHASEFLOW,
+                    LastStep = TENANTPURCHASESTEPTRAFFIC,
+                    SelectedCountry = service.Key,
+                    SelectedPeriod = string.Empty,
+                    Type = string.Empty,
+                    TotoalGB = string.Empty,
+                    PendingUserComment = string.Empty
+                });
                 await botClient.SendTextMessageAsync(
                     message.Chat.Id,
                     BuildTenantMinimumTrafficMessage(service),
@@ -3542,9 +3561,14 @@ public class TenantBotService
     /// The method stores only temporary selection state in users.db. Preset duration keys honor their current enabled
     /// flag, while a numeric custom duration is independent of presets and must satisfy the current normal-service
     /// custom range. The actual renewal is not applied until a tenant payment order is settled, which keeps duplicate
-    /// callbacks idempotent.
+    /// callbacks idempotent. If a preset becomes disabled at confirmation, the duration is explicitly emptied while
+    /// preserving the tenant-scoped target-account UUID proof and the rest of the renewal state. A disabled unlimited
+    /// sub-plan returns to the active tenant-priced plan keyboard before any order is created.
     /// </remarks>
     /// <returns>A task that completes after the current state transition and its Telegram response.</returns>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="cancellationToken"/> is cancelled during users.db, Telegram, panel, or order work.
+    /// </exception>
     private async Task HANDLETENANTRENEWSTEPASYNC(
         ITelegramBotClient botClient,
         Message message,
@@ -3653,7 +3677,7 @@ public class TenantBotService
                 !XuiV3PurchaseService.TryResolveDurationKey(service, user.SelectedPeriod, out _))
             {
                 user.LastStep = TENANTRENEWSTEPDURATION;
-                user.SelectedPeriod = null;
+                user.SelectedPeriod = string.Empty;
                 await _userDbcontext.SaveUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     message.Chat.Id,
@@ -3661,6 +3685,22 @@ public class TenantBotService
                         service,
                         "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید."),
                     replyMarkup: BuildTenantRenewDurationKeyboard(service),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (service.IsUnlimited &&
+                service.UnlimitedPlans?.Any(plan =>
+                    plan.IsEnabled &&
+                    string.Equals(plan.Key, user.Type, StringComparison.OrdinalIgnoreCase)) != true)
+            {
+                user.LastStep = TENANTRENEWSTEPUNLIMITEDPLAN;
+                user.Type = string.Empty;
+                await _userDbcontext.SaveUserStatus(user);
+                await botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    "پلن نامحدود انتخاب‌شده دیگر فعال نیست. پلن جدید را انتخاب کنید.",
+                    replyMarkup: BuildTenantRenewUnlimitedKeyboard(service, tenant),
                     cancellationToken: cancellationToken);
                 return;
             }
@@ -4291,7 +4331,7 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// routes tenant customer inline callbacks through service selection, plan selection, payment creation, and manual checks.
+    /// Routes tenant customer inline callbacks through current service selection, plan selection, payment creation, and manual checks.
     /// </summary>
     /// <param name="botClient">tenant Bot client.</param>
     /// <param name="CallbackQuery">Incoming customer callback.</param>
@@ -4305,8 +4345,14 @@ public class TenantBotService
     /// Only callbacks with the tenant customer prefix are processed here. Shared account-management callbacks
     /// are routed to <see cref="XuiV3BotFlowService" /> by the update dispatcher so tenant storefront buttons can
     /// reuse the existing account details, search, renewal, and comment logic. Duration callbacks are checked against
-    /// the freshly loaded catalog before tenant state advances or a payable order can be created.
+    /// the freshly loaded catalog before tenant state advances or a payable order can be created. Removed services,
+    /// below-minimum traffic, disabled durations, and disabled unlimited plans reset only this tenant bot/customer
+    /// conversation to the earliest valid menu. Stale callback data never creates an order or payment invoice.
     /// </remarks>
+    /// <returns>A task that completes after the callback is rejected, recovered, or routed to its tenant operation.</returns>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="CancellationToken"/> is cancelled during users.db, Telegram, pricing, or payment work.
+    /// </exception>
     private async Task HANDLECUSTOMERCALLBACKASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -4382,25 +4428,44 @@ public class TenantBotService
             if (parts.Length == 3 && int.TryParse(parts[2], out var GB))
             {
                 var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => string.Equals(x.Key, parts[1], StringComparison.OrdinalIgnoreCase));
-                if (service == null || !XuiV3PurchaseService.MeetsMinimumTraffic(service, GB))
+                if (service == null || service.IsUnlimited)
                 {
+                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
+                }
+                else if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, GB))
+                {
+                    await _userDbcontext.ResetUserStatus(new User
+                    {
+                        Id = CallbackQuery.From.Id,
+                        Flow = TENANTPURCHASEFLOW,
+                        LastStep = TENANTPURCHASESTEPTRAFFIC,
+                        SelectedCountry = service.Key,
+                        SelectedPeriod = string.Empty,
+                        Type = string.Empty,
+                        TotoalGB = string.Empty,
+                        PendingUserComment = string.Empty
+                    });
                     await EDITORSENDASYNC(
                         botClient,
                         ChatId,
                         MessageId,
                         BuildTenantMinimumTrafficMessage(service),
-                        service == null ? null : BuildTenantTrafficInlineKeyboard(service),
+                        BuildTenantTrafficInlineKeyboard(service),
                         CancellationToken);
                 }
                 else
                 {
-                    await _userDbcontext.SaveUserStatus(new User
+                    await _userDbcontext.ResetUserStatus(new User
                     {
                         Id = CallbackQuery.From.Id,
                         Flow = TENANTPURCHASEFLOW,
                         LastStep = TENANTPURCHASESTEPDURATION,
                         SelectedCountry = service.Key,
-                        TotoalGB = GB.ToString(CultureInfo.InvariantCulture)
+                        TotoalGB = GB.ToString(CultureInfo.InvariantCulture),
+                        SelectedPeriod = string.Empty,
+                        Type = string.Empty,
+                        PendingUserComment = string.Empty
                     });
                     await SHOWDURATIONOPTIONSASYNC(botClient, ChatId, MessageId, tenant, parts[1], GB, CancellationToken);
                 }
@@ -4416,14 +4481,33 @@ public class TenantBotService
             if (parts.Length == 4 && int.TryParse(parts[2], out var GB))
             {
                 var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => string.Equals(x.Key, parts[1], StringComparison.OrdinalIgnoreCase));
-                if (service == null || !XuiV3PurchaseService.MeetsMinimumTraffic(service, GB))
+                if (service == null || service.IsUnlimited)
                 {
+                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
+                    await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
+                    return;
+                }
+
+                if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, GB))
+                {
+                    await _userDbcontext.ResetUserStatus(new User
+                    {
+                        Id = CallbackQuery.From.Id,
+                        Flow = TENANTPURCHASEFLOW,
+                        LastStep = TENANTPURCHASESTEPTRAFFIC,
+                        SelectedCountry = service.Key,
+                        SelectedPeriod = string.Empty,
+                        Type = string.Empty,
+                        TotoalGB = string.Empty,
+                        PendingUserComment = string.Empty
+                    });
                     await EDITORSENDASYNC(
                         botClient,
                         ChatId,
                         MessageId,
                         BuildTenantMinimumTrafficMessage(service),
-                        service == null ? null : BuildTenantTrafficInlineKeyboard(service),
+                        BuildTenantTrafficInlineKeyboard(service),
                         CancellationToken);
                     await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
                     return;
@@ -4433,6 +4517,17 @@ public class TenantBotService
                 {
                     // Tenant callback messages can remain clickable after an operator disables a duration. Refresh
                     // the current choices before order creation so no tenant balance or gateway flow can be reached.
+                    await _userDbcontext.ResetUserStatus(new User
+                    {
+                        Id = CallbackQuery.From.Id,
+                        Flow = TENANTPURCHASEFLOW,
+                        LastStep = TENANTPURCHASESTEPDURATION,
+                        SelectedCountry = service.Key,
+                        TotoalGB = GB.ToString(CultureInfo.InvariantCulture),
+                        SelectedPeriod = string.Empty,
+                        Type = string.Empty,
+                        PendingUserComment = string.Empty
+                    });
                     await SHOWDURATIONOPTIONSASYNC(botClient, ChatId, MessageId, tenant, service.Key, GB, CancellationToken);
                     await SafeAnswerCallbackQueryAsync(
                         botClient,
@@ -4457,9 +4552,42 @@ public class TenantBotService
             var parts = action.Split(':');
             if (parts.Length == 3)
             {
-                var selection = new XuiV3PurchaseSelection { ServiceKey = parts[1], UnlimitedPlanKey = parts[2] };
-                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
-                await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, MessageId, tenant, selection, CancellationToken);
+                var service = _purchaseService.GetEnabledServices().FirstOrDefault(candidate =>
+                    candidate.IsUnlimited &&
+                    string.Equals(candidate.Key, parts[1], StringComparison.OrdinalIgnoreCase));
+                var plan = service?.UnlimitedPlans?.FirstOrDefault(candidate =>
+                    candidate.IsEnabled &&
+                    string.Equals(candidate.Key, parts[2], StringComparison.OrdinalIgnoreCase));
+                if (service == null)
+                {
+                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
+                }
+                else if (plan == null)
+                {
+                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await SHOWSERVICEOPTIONSASYNC(
+                        botClient,
+                        ChatId,
+                        MessageId,
+                        tenant,
+                        service.Key,
+                        CallbackQuery.From.Id,
+                        CancellationToken);
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient,
+                        CallbackQuery.Id,
+                        "این پلن غیرفعال شده است. یک پلن فعال را انتخاب کنید.",
+                        showAlert: true,
+                        cancellationToken: CancellationToken);
+                    return;
+                }
+                else
+                {
+                    var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
+                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, MessageId, tenant, selection, CancellationToken);
+                }
             }
 
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
@@ -4768,7 +4896,7 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// SHOWS Traffic Options for Metered services or Unlimited plan Options for Unlimited services.
+    /// Shows current traffic options for a metered service or enabled sub-plans for an unlimited service.
     /// </summary>
     /// <param name="botClient">tenant Bot client.</param>
     /// <param name="ChatId">customer chat Id.</param>
@@ -4780,6 +4908,16 @@ public class TenantBotService
     /// message can continue the same purchase flow after the service callback.
     /// </param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <returns>A task that completes after tenant-scoped state and the current selection message are synchronized.</returns>
+    /// <remarks>
+    /// Selecting a metered service atomically clears duration, plan, traffic, count, and comment values from any older
+    /// purchase before installing the traffic step. A removed or disabled service clears this tenant conversation and
+    /// returns to the live service menu. Unlimited selection clears prior state before showing enabled plans. No order,
+    /// wallet, payment, or XUI operation is performed here.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="CancellationToken"/> is cancelled during users.db or Telegram work.
+    /// </exception>
     private async Task SHOWSERVICEOPTIONSASYNC(
         ITelegramBotClient botClient,
         ChatId ChatId,
@@ -4791,7 +4929,11 @@ public class TenantBotService
     {
         var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => x.Key == ServiceKey);
         if (service == null)
+        {
+            await _userDbcontext.ClearUserStatus(new User { Id = CustomerTelegramUserId });
+            await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             return;
+        }
 
         if (service.IsUnlimited)
         {
@@ -4816,12 +4958,16 @@ public class TenantBotService
             return;
         }
 
-        await _userDbcontext.SaveUserStatus(new User
+        await _userDbcontext.ResetUserStatus(new User
         {
             Id = CustomerTelegramUserId,
             Flow = TENANTPURCHASEFLOW,
             LastStep = TENANTPURCHASESTEPTRAFFIC,
-            SelectedCountry = service.Key
+            SelectedCountry = service.Key,
+            SelectedPeriod = string.Empty,
+            Type = string.Empty,
+            TotoalGB = string.Empty,
+            PendingUserComment = string.Empty
         });
 
         await EDITORSENDASYNC(
@@ -4881,7 +5027,10 @@ public class TenantBotService
     {
         var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => x.Key == ServiceKey);
         if (service == null)
+        {
+            await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             return;
+        }
 
         if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, TrafficGb))
         {
@@ -4939,7 +5088,11 @@ public class TenantBotService
     /// A custom-duration policy or preset can change while a Telegram pre-invoice remains visible. Invalid metered
     /// selections are restored to the tenant-scoped duration step and current options are shown. Full price validation
     /// is also repeated so malformed configuration cannot reach order, gateway, wallet, ledger, or XUI side effects.
+    /// The duration is cleared with an explicit empty string because null preserves legacy partial state.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">
+    /// Propagated when <paramref name="cancellationToken"/> is cancelled during users.db or Telegram recovery work.
+    /// </exception>
     private async Task<bool> EnsureTenantPurchaseSelectionIsCurrentAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -4951,6 +5104,13 @@ public class TenantBotService
             string.Equals(candidate.Key, selection?.ServiceKey, StringComparison.OrdinalIgnoreCase));
         if (service == null)
         {
+            await _userDbcontext.ClearUserStatus(new User { Id = callbackQuery.From.Id });
+            await SendServiceSelectionAsync(
+                botClient,
+                callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                tenant,
+                cancellationToken,
+                callbackQuery.Message?.MessageId);
             await SafeAnswerCallbackQueryAsync(
                 botClient,
                 callbackQuery.Id,
@@ -4967,14 +5127,16 @@ public class TenantBotService
         {
             if (selection.TrafficGb.HasValue && XuiV3PurchaseService.MeetsMinimumTraffic(service, selection.TrafficGb.Value))
             {
-                await _userDbcontext.SaveUserStatus(new User
+                await _userDbcontext.ResetUserStatus(new User
                 {
                     Id = callbackQuery.From.Id,
                     Flow = TENANTPURCHASEFLOW,
                     LastStep = TENANTPURCHASESTEPDURATION,
                     SelectedCountry = service.Key,
                     TotoalGB = selection.TrafficGb.Value.ToString(CultureInfo.InvariantCulture),
-                    SelectedPeriod = null
+                    SelectedPeriod = string.Empty,
+                    Type = string.Empty,
+                    PendingUserComment = string.Empty
                 });
                 await SHOWDURATIONOPTIONSASYNC(
                     botClient,
@@ -4986,6 +5148,27 @@ public class TenantBotService
                     cancellationToken,
                     "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید.");
             }
+            else
+            {
+                await _userDbcontext.ResetUserStatus(new User
+                {
+                    Id = callbackQuery.From.Id,
+                    Flow = TENANTPURCHASEFLOW,
+                    LastStep = TENANTPURCHASESTEPTRAFFIC,
+                    SelectedCountry = service.Key,
+                    SelectedPeriod = string.Empty,
+                    Type = string.Empty,
+                    TotoalGB = string.Empty,
+                    PendingUserComment = string.Empty
+                });
+                await EDITORSENDASYNC(
+                    botClient,
+                    callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                    callbackQuery.Message?.MessageId,
+                    BuildTenantMinimumTrafficMessage(service),
+                    BuildTenantTrafficInlineKeyboard(service),
+                    cancellationToken);
+            }
 
             await SafeAnswerCallbackQueryAsync(
                 botClient,
@@ -4994,6 +5177,32 @@ public class TenantBotService
                 showAlert: true,
                 cancellationToken: cancellationToken);
             return false;
+        }
+
+        if (service.IsUnlimited)
+        {
+            var planIsEnabled = service.UnlimitedPlans?.Any(plan =>
+                plan.IsEnabled &&
+                string.Equals(plan.Key, selection.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase)) == true;
+            if (!planIsEnabled)
+            {
+                await _userDbcontext.ClearUserStatus(new User { Id = callbackQuery.From.Id });
+                await SHOWSERVICEOPTIONSASYNC(
+                    botClient,
+                    callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                    callbackQuery.Message?.MessageId,
+                    tenant,
+                    service.Key,
+                    callbackQuery.From.Id,
+                    cancellationToken);
+                await SafeAnswerCallbackQueryAsync(
+                    botClient,
+                    callbackQuery.Id,
+                    "این پلن دیگر فعال نیست. یک پلن فعال را انتخاب کنید.",
+                    showAlert: true,
+                    cancellationToken: cancellationToken);
+                return false;
+            }
         }
 
         try

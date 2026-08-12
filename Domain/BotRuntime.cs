@@ -455,13 +455,14 @@ namespace Adminbot.Domain
         }
 
         /// <summary>
-        /// Applies only non-empty fields from a legacy User object.
-        /// This preserves older flow behavior where SaveUserStatus receives partial state updates.
+        /// Applies every non-null field from a legacy User object while preserving omitted partial values.
         /// </summary>
         /// <param name="user">Partial legacy state update.</param>
         /// <remarks>
-        /// A null <see cref="User.RenewTargetUuid"/> preserves the current proof across payment-method and plan updates;
-        /// an explicit empty value clears it. Callers must save the tracked state after this in-memory merge.
+        /// Null means "preserve the stored value" for all nullable legacy fields; an explicit empty string clears a
+        /// string field. This distinction preserves the renewal UUID proof across payment-method and plan updates but
+        /// means callers that must also clear numeric pending state should use a full reset instead of a partial save.
+        /// Callers must save the tracked state after this in-memory merge.
         /// </remarks>
         public void ApplyPartial(User user)
         {

@@ -797,6 +797,45 @@ public class XuiV3PurchaseService
     public string BuildSummaryText(XuiV3PurchaseSelection selection, bool isColleague)
     {
         var resolved = ResolvePurchase(selection, isColleague);
+        return BuildSummaryText(selection, resolved);
+    }
+
+    /// <summary>
+    /// Builds the final owned-bot purchase confirmation from an already resolved, immutable price snapshot.
+    /// </summary>
+    /// <param name="selection">
+    /// Current owned-bot selection. Its account count and optional comment are presentation values; its plan fields
+    /// must be the same values that produced <paramref name="resolved"/>.
+    /// </param>
+    /// <param name="resolved">
+    /// Authoritative result returned by <see cref="ResolvePurchase(XuiV3PurchaseSelection, bool)"/> for the same
+    /// selection and buyer role. The value contains the per-account toman price and metered price breakdown.
+    /// </param>
+    /// <returns>
+    /// Plain Persian Telegram text containing the selected plan, per-account and total prices, and the detailed
+    /// metered calculation. The method does not reread the catalog or recalculate the price.
+    /// </returns>
+    /// <remarks>
+    /// This overload lets a caller use one catalog snapshot for the summary, total payable amount, and payment-method
+    /// eligibility. Final purchase confirmation must still call the central resolver again so catalog changes made
+    /// after the preview fail closed before any wallet, ledger, order, or XUI effect.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown when <paramref name="selection"/> or <paramref name="resolved"/> is null.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// var resolved = purchaseService.ResolvePurchase(selection, credUser.IsColleague);
+    /// var text = purchaseService.BuildSummaryText(selection, resolved);
+    /// </code>
+    /// </example>
+    public string BuildSummaryText(
+        XuiV3PurchaseSelection selection,
+        XuiV3ResolvedPurchase resolved)
+    {
+        ArgumentNullException.ThrowIfNull(selection);
+        ArgumentNullException.ThrowIfNull(resolved);
+
         var accountCount = NormalizeAccountCount(selection.AccountCount);
         var totalPrice = resolved.PriceToman * accountCount;
         var text = "سفارش جدید\n";
