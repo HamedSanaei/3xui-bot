@@ -723,7 +723,8 @@ public class XuiV3AdminFlowService
     /// Super-admin creation never debits a customer wallet. Each successfully created account is optionally queued for
     /// Gozargah synchronization before the conversation returns to the main menu. The audit uses Telegram HTML with
     /// every dynamic value encoded before it enters a <c>code</c> entity, so comments or panel values cannot break the
-    /// logger message markup. Partial failures remain visible in both the admin response and the audit.
+    /// logger message markup. Partial failures remain visible in both the admin response and the audit. The audit also
+    /// reports summed panel API time and total operation time; deliberate bulk pacing affects only the latter.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// Thrown when the saved target Telegram user id is missing or invalid before the XUI request is created.
@@ -762,11 +763,18 @@ public class XuiV3AdminFlowService
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
 
+        using var operationTiming = XuiOperationTiming.Start();
         var bulkResult = await CreateAdminAccountsAsync(currentUser, message.From.Id, cancellationToken);
         if (bulkResult.SuccessfulCount == 0)
         {
             var failureMessage = XuiV3UserSafeError.ForAccountCreation(
                 bulkResult.Failures.FirstOrDefault()?.Message);
+            _logger.LogTelegramHtml(
+                BuildAdminBulkCreateLogMessage(
+                    currentUser,
+                    message.From.Id,
+                    bulkResult,
+                    operationTiming.Snapshot()));
             await FinishWithMessageAsync(
                 botClient,
                 message.Chat.Id,
@@ -826,7 +834,9 @@ public class XuiV3AdminFlowService
 
         await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "منوی اصلی", cancellationToken);
         _logger.LogTelegramHtml(
-            BuildAdminBulkCreateLogMessage(currentUser, message.From.Id, bulkResult));
+            BuildAdminBulkCreateLogMessage(currentUser, message.From.Id, bulkResult, operationTiming.Snapshot()));
+
+        var createTiming = operationTiming.Snapshot();
 
         var actorCredUser = await GetActivityActorAsync(message.From.Id);
         await _activityLog.LogBotActionAsync(
@@ -844,7 +854,9 @@ public class XuiV3AdminFlowService
                 ["trafficBytes"] = bulkResult.TrafficBytes,
                 ["durationDays"] = bulkResult.DurationDays,
                 ["accounts"] = bulkResult.CreatedAccounts.Select(x => x.Email).ToList(),
-                ["failures"] = bulkResult.Failures.Select(x => new { x.Index, x.Message }).ToList()
+                ["failures"] = bulkResult.Failures.Select(x => new { x.Index, x.Message }).ToList(),
+                ["panelApiElapsedMs"] = (long)createTiming.PanelApiElapsed.TotalMilliseconds,
+                ["totalElapsedMs"] = (long)createTiming.TotalElapsed.TotalMilliseconds
             },
             cancellationToken);
 
@@ -1012,7 +1024,8 @@ public class XuiV3AdminFlowService
     /// <remarks>
     /// The method mutates the XUI client only after the explicit <c>Yes Renew!</c> confirmation. After the panel update
     /// and any required counter reset succeed, it advances the volume-reminder cycle best-effort. Reminder persistence
-    /// never changes the panel outcome and has no wallet, payment, order, or ledger effect.
+    /// never changes the panel outcome and has no wallet, payment, order, or ledger effect. Terminal failure and
+    /// success audits include accumulated panel API time and end-to-end execution time.
     /// </remarks>
     private async Task HandleRenewConfirmAsync(
         ITelegramBotClient botClient,
@@ -1043,10 +1056,16 @@ public class XuiV3AdminFlowService
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
 
+        using var operationTiming = XuiOperationTiming.Start();
         var serverInfo = BuildConfiguredPanelServerInfo();
         var clientResponse = await ApiServicev3.GetClientAsync(serverInfo, _configuration, currentUser.ConfigLink, cancellationToken);
         if (!clientResponse.Success || clientResponse.Obj == null)
         {
+            _logger.LogTelegramHtml(BuildAdminOperationFailureLogMessage(
+                "تمدید اکانت نسخه ۳ توسط ادمین",
+                message.From.Id,
+                "اکانت برای تمدید پیدا نشد",
+                operationTiming.Snapshot()));
             await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "اکانت برای تمدید پیدا نشد.", cancellationToken);
             return;
         }
@@ -1064,6 +1083,12 @@ public class XuiV3AdminFlowService
         var updateResponse = await ApiServicev3.UpdateClientAsync(serverInfo, _configuration, client.Email, updatedClient, cancellationToken);
         if (!updateResponse.Success)
         {
+            _logger.LogTelegramHtml(BuildAdminOperationFailureLogMessage(
+                "تمدید اکانت نسخه ۳ توسط ادمین",
+                message.From.Id,
+                "پنل تمدید را رد کرد",
+                operationTiming.Snapshot(),
+                client.Email));
             await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, $"تمدید ناموفق بود.\n{updateResponse.Msg}", cancellationToken);
             return;
         }
@@ -1096,10 +1121,18 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
 
         await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "منوی اصلی", cancellationToken);
-        _logger.LogInformation(
-            BuildAdminRenewLogMessage(currentUser, message.From.Id, client, serverInfo, addTrafficGb, addDays).EscapeMarkdown());
+        _logger.LogTelegramHtml(
+            BuildAdminRenewLogMessage(
+                currentUser,
+                message.From.Id,
+                client,
+                serverInfo,
+                addTrafficGb,
+                addDays,
+                operationTiming.Snapshot()));
 
         var actorCredUser = await GetActivityActorAsync(message.From.Id);
+        var renewTiming = operationTiming.Snapshot();
         await _activityLog.LogBotActionAsync(
             "xui_v3_admin_account_renewed",
             actorCredUser,
@@ -1119,7 +1152,9 @@ public class XuiV3AdminFlowService
                 ["subLink"] = ApiServicev3.BuildSubscriptionLink(serverInfo, client.SubId ?? client.Email),
                 ["panelUrl"] = serverInfo.Url,
                 ["rootPath"] = serverInfo.RootPath,
-                ["comment"] = client.Comment
+                ["comment"] = client.Comment,
+                ["panelApiElapsedMs"] = (long)renewTiming.PanelApiElapsed.TotalMilliseconds,
+                ["totalElapsedMs"] = (long)renewTiming.TotalElapsed.TotalMilliseconds
             },
             cancellationToken);
 
@@ -2825,6 +2860,20 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// Applies the super-admin confirmation for deleting one user's revalidated expired XUI v3 accounts.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the owned bot hosting the super-admin panel.</param>
+    /// <param name="message">Confirmation message sent by the authenticated super-admin.</param>
+    /// <param name="currentUser">Bot-scoped admin state containing target user id and candidate account emails.</param>
+    /// <param name="mainMenu">Super-admin keyboard restored after cancellation, rejection, or completion.</param>
+    /// <param name="cancellationToken">Token that cancels panel, database, audit, and Telegram operations.</param>
+    /// <returns>A task that completes after the deletion result and central audit are delivered.</returns>
+    /// <remarks>
+    /// Target ownership and expiry are checked again against the live panel list before deletion. Success, partial
+    /// success, and terminal list failure logs include accumulated panel API time and end-to-end operation time. This
+    /// action has no wallet, order, payment, or ledger side effect.
+    /// </remarks>
     private async Task HandleDeleteExpiredConfirmAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -2866,10 +2915,16 @@ public class XuiV3AdminFlowService
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
 
+        using var operationTiming = XuiOperationTiming.Start();
         var serverInfo = BuildConfiguredPanelServerInfo();
         var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
         if (!clientsResponse.Success)
         {
+            _logger.LogTelegramHtml(BuildAdminOperationFailureLogMessage(
+                "حذف انبوه اکانت‌های منقضی نسخه ۳ توسط ادمین",
+                message.From.Id,
+                "دریافت لیست از پنل ناموفق بود",
+                operationTiming.Snapshot()));
             await FinishWithMessageAsync(
                 botClient,
                 message.Chat.Id,
@@ -2917,17 +2972,20 @@ public class XuiV3AdminFlowService
                     ["targetTelegramUserId"] = targetTelegramUserId,
                     ["deletedCount"] = deleted.Count,
                     ["failedCount"] = failed.Count,
-                    ["deletedAccounts"] = string.Join(",", deleted)
+                    ["deletedAccounts"] = string.Join(",", deleted),
+                    ["panelApiElapsedMs"] = (long)operationTiming.PanelApiElapsed.TotalMilliseconds,
+                    ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
                 },
                 cancellationToken);
         }
 
-        _logger.LogInformation(
+        _logger.LogTelegramHtml(
             BuildAdminDeleteExpiredLogMessage(
                 actorCredUser,
                 targetTelegramUserId,
                 deleted,
-                failed).EscapeMarkdown());
+                failed,
+                operationTiming.Snapshot()));
 
         await FinishWithMessageAsync(
             botClient,
@@ -3942,6 +4000,7 @@ public class XuiV3AdminFlowService
     /// Completed XUI bulk-creation result containing the local bulk order id, service and limit snapshot, successful
     /// account identifiers, and safe per-row failures. The result must not be null.
     /// </param>
+    /// <param name="timing">Monotonic panel-API and end-to-end duration snapshot for the admin create activity.</param>
     /// <returns>
     /// Non-null HTML-safe text whose dynamic values are wrapped in Telegram <c>code</c> entities. The returned text is
     /// intended only for <see cref="LoggerExtensions.LogTelegramHtml"/> and must not be sent as Markdown.
@@ -3953,14 +4012,15 @@ public class XuiV3AdminFlowService
     /// </remarks>
     /// <example>
     /// <code>
-    /// var audit = BuildAdminBulkCreateLogMessage(state, 123456789, bulkResult);
+    /// var audit = BuildAdminBulkCreateLogMessage(state, 123456789, bulkResult, timing.Snapshot());
     /// logger.LogTelegramHtml(audit);
     /// </code>
     /// </example>
     private static string BuildAdminBulkCreateLogMessage(
         User currentUser,
         long actorTelegramUserId,
-        XuiV3BulkCreationResult result)
+        XuiV3BulkCreationResult result,
+        XuiOperationTimingSnapshot timing)
     {
         var targetUserId = string.IsNullOrWhiteSpace(currentUser?.ConfigLink) ? "unknown" : currentUser.ConfigLink.Trim();
         var metadata = TryReadMetadata(result.CreatedAccounts.FirstOrDefault()?.Comment);
@@ -3993,6 +4053,9 @@ public class XuiV3AdminFlowService
                 sb.AppendLine($"ردیف <code>{failure.Index}</code> - <code>{Html(ShortenForLog(XuiV3UserSafeError.ForAccountCreation(failure.Message), 120))}</code>");
         }
 
+        sb.AppendLine();
+        sb.Append(XuiOperationTiming.BuildHtmlLines(timing));
+
         return sb.ToString();
     }
 
@@ -4021,59 +4084,117 @@ public class XuiV3AdminFlowService
         return normalized.Length <= maxLength ? normalized : normalized.Substring(0, maxLength) + "...";
     }
 
+    /// <summary>
+    /// Builds the HTML audit for one successful super-admin XUI renewal, including panel and end-to-end duration.
+    /// </summary>
+    /// <param name="currentUser">Bot-scoped admin state containing the selected target owner id.</param>
+    /// <param name="actorTelegramUserId">Numeric Telegram id of the configured super-admin actor.</param>
+    /// <param name="client">Renewed panel client after the accepted update and optional counter reset.</param>
+    /// <param name="serverInfo">Panel descriptor used to rebuild the protected subscription link.</param>
+    /// <param name="addTrafficGb">Traffic added or replaced, in GB.</param>
+    /// <param name="addDays">Days added or replaced; zero represents lifetime behavior.</param>
+    /// <param name="timing">Monotonic duration snapshot captured after customer/admin result delivery.</param>
+    /// <returns>HTML-safe private-channel audit text; dynamic values are encoded before insertion.</returns>
+    /// <remarks>This method formats only and has no XUI, database, Telegram, wallet, or order side effects.</remarks>
     private static string BuildAdminRenewLogMessage(
         User currentUser,
         long actorTelegramUserId,
         XuiV3Client client,
         ServerInfo serverInfo,
         int addTrafficGb,
-        int addDays)
+        int addDays,
+        XuiOperationTimingSnapshot timing)
     {
         var targetUserId = string.IsNullOrWhiteSpace(currentUser?.ConfigLink) ? client.TgId.ToString() : currentUser.ConfigLink.Trim();
         var metadata = TryReadMetadata(client?.Comment);
         var sb = new StringBuilder();
         sb.AppendLine("تمدید اکانت نسخه ۳ توسط ادمین");
-        sb.AppendLine($"ادمین `{actorTelegramUserId}`");
-        sb.AppendLine($"مالک `{targetUserId}`");
-        sb.AppendLine($"تاریخ ساخت `{FormatMetadataCreatedAt(metadata)}`");
+        sb.AppendLine($"ادمین <code>{actorTelegramUserId}</code>");
+        sb.AppendLine($"مالک <code>{Html(targetUserId)}</code>");
+        sb.AppendLine($"تاریخ ساخت <code>{Html(FormatMetadataCreatedAt(metadata))}</code>");
 
         if (!string.IsNullOrWhiteSpace(metadata?.ServiceName))
-            sb.AppendLine($"سرویس `{metadata.ServiceName}`");
+            sb.AppendLine($"سرویس <code>{Html(metadata.ServiceName)}</code>");
 
-        sb.AppendLine($"نام اکانت `{client.Email}`");
-        sb.AppendLine($"حجم اضافه `{addTrafficGb} GB`");
-        sb.AppendLine($"زمان اضافه `{(addDays <= 0 ? "نامحدود" : $"{addDays} روز")}`");
-        sb.AppendLine($"سابلینک `{ApiServicev3.BuildSubscriptionLink(serverInfo, client.SubId ?? client.Email)}`");
+        sb.AppendLine($"نام اکانت <code>{Html(client.Email)}</code>");
+        sb.AppendLine($"حجم اضافه <code>{addTrafficGb} GB</code>");
+        sb.AppendLine($"زمان اضافه <code>{Html(addDays <= 0 ? "نامحدود" : $"{addDays} روز")}</code>");
+        sb.AppendLine($"سابلینک <code>{Html(ApiServicev3.BuildSubscriptionLink(serverInfo, client.SubId ?? client.Email))}</code>");
+        sb.AppendLine();
+        sb.Append(XuiOperationTiming.BuildHtmlLines(timing));
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Builds a bounded HTML failure audit for a super-admin XUI mutation without exposing raw provider data.
+    /// </summary>
+    /// <param name="title">Fixed activity title identifying create, renew, delete, or edit behavior.</param>
+    /// <param name="actorTelegramUserId">Numeric Telegram id of the configured super-admin actor.</param>
+    /// <param name="result">Coarse safe outcome; raw response bodies and exception messages are forbidden.</param>
+    /// <param name="timing">Monotonic API and total duration snapshot captured at failure.</param>
+    /// <param name="accountEmail">Optional target account email/name; it may be null when lookup failed.</param>
+    /// <returns>HTML-safe text for <see cref="LoggerExtensions.LogTelegramHtml"/>.</returns>
+    /// <remarks>The method has no external or persistence side effects.</remarks>
+    private static string BuildAdminOperationFailureLogMessage(
+        string title,
+        long actorTelegramUserId,
+        string result,
+        XuiOperationTimingSnapshot timing,
+        string accountEmail = null)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine($"<b>{Html(title)}</b>");
+        builder.AppendLine();
+        builder.AppendLine($"ادمین: <code>{actorTelegramUserId}</code>");
+        builder.AppendLine($"نتیجه: <code>{Html(result)}</code>");
+        if (!string.IsNullOrWhiteSpace(accountEmail))
+            builder.AppendLine($"اکانت: <code>{Html(accountEmail)}</code>");
+        builder.AppendLine();
+        builder.Append(XuiOperationTiming.BuildHtmlLines(timing));
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Builds the HTML audit for one super-admin bulk deletion of expired XUI accounts.
+    /// </summary>
+    /// <param name="actor">Resolved super-admin credentials profile used for private audit attribution.</param>
+    /// <param name="targetTelegramUserId">Numeric Telegram id whose owned expired accounts were revalidated.</param>
+    /// <param name="deleted">Account emails accepted by the panel bulk-delete call; the collection may be empty.</param>
+    /// <param name="failed">Account emails not deleted; the collection may be empty.</param>
+    /// <param name="timing">Monotonic duration snapshot covering panel reads, delete call, and local result work.</param>
+    /// <returns>HTML-safe text for the central Telegram logger channel.</returns>
+    /// <remarks>The method formats only; it does not delete clients or modify state.</remarks>
     private static string BuildAdminDeleteExpiredLogMessage(
         CredUser actor,
         long targetTelegramUserId,
         IReadOnlyCollection<string> deleted,
-        IReadOnlyCollection<string> failed)
+        IReadOnlyCollection<string> failed,
+        XuiOperationTimingSnapshot timing)
     {
         var sb = new StringBuilder();
         sb.AppendLine("حذف اکانت‌های منقضی نسخه ۳ توسط ادمین");
-        sb.AppendLine($"تاریخ `{DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi()}`");
-        sb.AppendLine($"ادمین `{FormatActor(actor)}`");
-        sb.AppendLine($"کاربر هدف `{targetTelegramUserId}`");
-        sb.AppendLine($"تعداد حذف‌شده `{deleted?.Count ?? 0}`");
-        sb.AppendLine($"تعداد ناموفق `{failed?.Count ?? 0}`");
+        sb.AppendLine($"تاریخ <code>{Html(DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi())}</code>");
+        sb.AppendLine($"ادمین <code>{Html(FormatActor(actor))}</code>");
+        sb.AppendLine($"کاربر هدف <code>{targetTelegramUserId}</code>");
+        sb.AppendLine($"تعداد حذف‌شده <code>{deleted?.Count ?? 0}</code>");
+        sb.AppendLine($"تعداد ناموفق <code>{failed?.Count ?? 0}</code>");
 
         if (deleted != null && deleted.Count > 0)
         {
             sb.AppendLine("اکانت‌های حذف‌شده:");
             foreach (var email in deleted)
-                sb.AppendLine($"- `{email}`");
+                sb.AppendLine($"- <code>{Html(email)}</code>");
         }
 
         if (failed != null && failed.Count > 0)
         {
             sb.AppendLine("اکانت‌های حذف‌نشده:");
             foreach (var email in failed)
-                sb.AppendLine($"- `{email}`");
+                sb.AppendLine($"- <code>{Html(email)}</code>");
         }
+
+        sb.AppendLine();
+        sb.Append(XuiOperationTiming.BuildHtmlLines(timing));
 
         return sb.ToString();
     }

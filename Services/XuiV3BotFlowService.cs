@@ -520,6 +520,19 @@ public class XuiV3BotFlowService
         return true;
     }
 
+    /// <summary>
+    /// Handles slash-command activation and deactivation for one ownership-verified XUI v3 account.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the current owned bot.</param>
+    /// <param name="message">Incoming command containing an exact <c>/enable_</c> or <c>/disable_</c> target.</param>
+    /// <param name="credUser">Bot user whose numeric Telegram id must own the selected panel account.</param>
+    /// <param name="mainReplyMarkup">Main-menu keyboard restored after the operation or safe rejection.</param>
+    /// <param name="cancellationToken">Token that cancels panel, audit, activity-log, and Telegram work.</param>
+    /// <returns><c>true</c> when an account-state command was recognized; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// Authorization is revalidated before mutation. Every terminal panel outcome is written to the central logger
+    /// with accumulated XUI API time and end-to-end operation time; wallet, order, and renewal state are unchanged.
+    /// </remarks>
     public async Task<bool> TryHandleAccountActionAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -549,12 +562,20 @@ public class XuiV3BotFlowService
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
 
+        using var operationTiming = XuiOperationTiming.Start();
         try
         {
             var serverInfo = BuildConfiguredPanelServerInfo();
             var client = await FindClientByEmailAsync(serverInfo, email, credUser.TelegramUserId, cancellationToken);
             if (client == null || !ClientBelongsToUser(client, credUser.TelegramUserId))
             {
+                LogXuiOperationOutcome(
+                    enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                    "اکانت پیدا نشد یا مجاز نبود",
+                    credUser,
+                    operationTiming,
+                    accountEmail: email,
+                    source: "command");
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
@@ -588,10 +609,20 @@ public class XuiV3BotFlowService
                     {
                         ["accountEmail"] = email,
                         ["panelUrl"] = serverInfo.Url,
-                        ["rootPath"] = serverInfo.RootPath
+                        ["rootPath"] = serverInfo.RootPath,
+                        ["panelApiElapsedMs"] = (long)operationTiming.PanelApiElapsed.TotalMilliseconds,
+                        ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
                     },
                     cancellationToken);
             }
+
+            LogXuiOperationOutcome(
+                enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                updateResponse.Success ? "موفق" : "پنل تغییر را رد کرد",
+                credUser,
+                operationTiming,
+                accountEmail: client.Email ?? email,
+                source: "command");
 
             return true;
         }
@@ -609,6 +640,13 @@ public class XuiV3BotFlowService
                     ["requestedAction"] = enable ? "enable" : "disable"
                 },
                 cancellationToken);
+            LogXuiOperationOutcome(
+                enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                $"خطا ({ex.GetType().Name})",
+                credUser,
+                operationTiming,
+                accountEmail: email,
+                source: "command");
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "در انجام عملیات خطا رخ داد. جزئیات در ترمینال ثبت شد.",
@@ -1160,6 +1198,20 @@ public class XuiV3BotFlowService
         });
     }
 
+    /// <summary>
+    /// Runs the owned-bot confirmation flow that deletes the user's selected expired XUI v3 accounts.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the current owned bot.</param>
+    /// <param name="message">Incoming text used to start, confirm, cancel, or continue the deletion flow.</param>
+    /// <param name="credUser">Bot user whose numeric Telegram id is rechecked against every panel account.</param>
+    /// <param name="user">Bot-scoped persisted conversation state holding the confirmed account list.</param>
+    /// <param name="mainReplyMarkup">Main-menu keyboard restored after cancellation or completion.</param>
+    /// <param name="cancellationToken">Token that cancels panel, database, audit, and Telegram operations.</param>
+    /// <returns><c>true</c> when the message belongs to this flow; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// The final pass revalidates ownership and expiry before mutation. Its success, partial success, and terminal
+    /// failure audits contain accumulated panel API time and total operation time. No wallet is modified.
+    /// </remarks>
     public async Task<bool> TryHandleDeleteExpiredAccountsAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1202,6 +1254,7 @@ public class XuiV3BotFlowService
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
 
+            using var operationTiming = XuiOperationTiming.Start();
             try
             {
                 var emails = DeserializeEmailList(user.SubLink);
@@ -1220,6 +1273,12 @@ public class XuiV3BotFlowService
                 var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
                 if (!clientsResponse.Success)
                 {
+                    LogXuiOperationOutcome(
+                        "حذف انبوه اکانت‌های منقضی نسخه ۳",
+                        "دریافت لیست از پنل ناموفق بود",
+                        credUser,
+                        operationTiming,
+                        source: "owned-expired-delete");
                     await _userDbContext.ClearUserStatus(user);
                     await botClient.SendTextMessageAsync(
                         chatId: message.Chat.Id,
@@ -1271,7 +1330,9 @@ public class XuiV3BotFlowService
                         {
                             ["deletedCount"] = deleted.Count,
                             ["failedCount"] = failed.Count,
-                            ["deletedAccounts"] = string.Join(",", deleted)
+                            ["deletedAccounts"] = string.Join(",", deleted),
+                            ["panelApiElapsedMs"] = (long)operationTiming.PanelApiElapsed.TotalMilliseconds,
+                            ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
                         },
                         cancellationToken);
 
@@ -1286,6 +1347,15 @@ public class XuiV3BotFlowService
                             cancellationToken: cancellationToken);
                     }
                 }
+
+                LogXuiOperationOutcome(
+                    "حذف انبوه اکانت‌های منقضی نسخه ۳",
+                    failed.Count == 0 ? "موفق" : deleted.Count > 0 ? "موفقیت جزئی" : "ناموفق",
+                    credUser,
+                    operationTiming,
+                    source: "owned-expired-delete",
+                    requestedCount: eligibleEmails.Count,
+                    successfulCount: deleted.Count);
 
                 return true;
             }
@@ -1302,6 +1372,12 @@ public class XuiV3BotFlowService
                         ["telegramUserId"] = credUser.TelegramUserId
                     },
                     cancellationToken);
+                LogXuiOperationOutcome(
+                    "حذف انبوه اکانت‌های منقضی نسخه ۳",
+                    $"خطا ({ex.GetType().Name})",
+                    credUser,
+                    operationTiming,
+                    source: "owned-expired-delete");
                 await _userDbContext.ClearUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -1697,6 +1773,8 @@ public class XuiV3BotFlowService
     /// Every new renewal reloads the target by email and requires its UUID to equal the independent persisted target
     /// lock before the panel call. The payer is recorded as the renewal actor but never replaces the existing owner,
     /// TgId, SubId, UUID, password, or protocol identity. Legacy states without a lock remain owner-only.
+    /// The final central audit includes accumulated panel API time and total time from execution start through
+    /// settlement and customer delivery; customer decision and payment waiting time are excluded.
     /// </remarks>
     private async Task CompleteRenewAsync(
         ITelegramBotClient botClient,
@@ -1770,6 +1848,7 @@ public class XuiV3BotFlowService
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
 
+        using var operationTiming = XuiOperationTiming.Start();
         var serverInfo = BuildConfiguredPanelServerInfo();
         var hasExactTargetLock = !string.IsNullOrWhiteSpace(user.RenewTargetUuid);
         Console.WriteLine(
@@ -1778,6 +1857,13 @@ public class XuiV3BotFlowService
         var client = await GetAuthorizedRenewClientAsync(serverInfo, user, credUser.TelegramUserId, cancellationToken);
         if (client == null)
         {
+            LogXuiOperationOutcome(
+                "تمدید اکانت نسخه ۳",
+                "هدف تمدید پیدا نشد یا تغییر کرده است",
+                credUser,
+                operationTiming,
+                accountEmail: user.ConfigLink,
+                source: "renew");
             await SendOwnedRenewTerminalAsync(
                 botClient,
                 message.Chat.Id,
@@ -1814,6 +1900,14 @@ public class XuiV3BotFlowService
                     ["result"] = "panel-update-rejected"
                 },
                 cancellationToken);
+
+            LogXuiOperationOutcome(
+                "تمدید اکانت نسخه ۳",
+                "پنل تمدید را رد کرد",
+                credUser,
+                operationTiming,
+                accountEmail: client.Email,
+                source: "renew");
 
             await SendOwnedRenewTerminalAsync(
                 botClient,
@@ -1965,7 +2059,9 @@ public class XuiV3BotFlowService
                 $"ریست مصرف `{(renewal.ShouldResetTraffic ? (trafficResetApplied ? "انجام شد" : "ناموفق") : "نیاز نبود")}`",
                 $"سابلینک `{ApiServicev3.BuildSubscriptionLink(serverInfo, client.SubId ?? client.Email)}`",
                 $"کامنت `{client.Comment}`"
-            });
+            },
+            timing: operationTiming.Snapshot());
+        var renewTiming = operationTiming.Snapshot();
         await _activityLog.LogBotActionAsync(
             "xui_v3_account_renewed",
             credUser,
@@ -1998,7 +2094,9 @@ public class XuiV3BotFlowService
                 ["expiryShamsi"] = FormatExpiry(client.ExpiryTime),
                 ["subLink"] = ApiServicev3.BuildSubscriptionLink(serverInfo, client.SubId ?? client.Email),
                 ["panelUrl"] = serverInfo.Url,
-                ["rootPath"] = serverInfo.RootPath
+                ["rootPath"] = serverInfo.RootPath,
+                ["panelApiElapsedMs"] = (long)renewTiming.PanelApiElapsed.TotalMilliseconds,
+                ["totalElapsedMs"] = (long)renewTiming.TotalElapsed.TotalMilliseconds
             },
             cancellationToken);
 
@@ -2489,7 +2587,8 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// Starting a trial from the main keyboard intentionally clears any half-built purchase session for the same
     /// Telegram user. Without that reset, a metered purchase could later reach the summary step without
-    /// <c>TrafficGb</c> and throw an exception.
+    /// <c>TrafficGb</c> and throw an exception. Once creation begins, accepted and rejected panel outcomes are audited
+    /// with accumulated panel API time and total delivery time.
     /// </remarks>
     public async Task<bool> TryHandleFreeTrialAsync(
         ITelegramBotClient botClient,
@@ -2591,6 +2690,7 @@ public class XuiV3BotFlowService
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
 
+        using var operationTiming = XuiOperationTiming.Start();
         var serverInfo = BuildConfiguredPanelServerInfo();
         var trafficBytes = serviceKey == "national" ? NationalTrialBytes : NormalTrialBytes;
         var displayTrafficGb = 1;
@@ -2619,6 +2719,13 @@ public class XuiV3BotFlowService
                     ["rootPath"] = serverInfo.RootPath
                 },
                 cancellationToken);
+
+            LogXuiOperationOutcome(
+                "ساخت اکانت تست نسخه ۳",
+                "ناموفق",
+                credUser,
+                operationTiming,
+                source: serviceKey);
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -2657,6 +2764,15 @@ public class XuiV3BotFlowService
         }
 
         await _userDbContext.ClearUserStatus(user);
+        LogXuiOperationOutcome(
+            "ساخت اکانت تست نسخه ۳",
+            "موفق",
+            credUser,
+            operationTiming,
+            accountEmail: creation.Email,
+            source: serviceKey,
+            requestedCount: 1,
+            successfulCount: 1);
         return true;
     }
 
@@ -2777,6 +2893,8 @@ public class XuiV3BotFlowService
     /// Metered duration callbacks and canonical <c>days-N</c> selections are checked against the freshly loaded preset
     /// flags and custom-duration range before purchase state advances and again at confirmation. A catalog toggle
     /// therefore returns the buyer to current duration choices without a wallet, ledger, website, or XUI side effect.
+    /// Once final execution starts, create success, partial success, and terminal failure audits report accumulated
+    /// panel API time plus total settlement/delivery time; time spent waiting for user confirmation is excluded.
     /// Service, traffic, duration, unlimited-plan, account-count, and back callbacks replace durable transient state
     /// explicitly, so values cleared in memory cannot survive through partial-update null semantics.
     /// The read-only <c>acfg</c> route carries only a numeric client id; it reloads panel data and verifies Telegram
@@ -3606,6 +3724,7 @@ public class XuiV3BotFlowService
                 return true;
             }
 
+            XuiOperationTiming operationTiming = null;
             try
             {
                 if (selection.AccountCount <= 0)
@@ -3675,6 +3794,10 @@ public class XuiV3BotFlowService
                     }
                 }
 
+                // Begin actual execution only after plan and wallet eligibility are valid. This deliberately excludes
+                // the time the customer spent reviewing or confirming the purchase.
+                operationTiming = XuiOperationTiming.Start();
+
                 if (messageId != 0)
                 {
                     await SafeEditMessageTextAsync(
@@ -3728,6 +3851,15 @@ public class XuiV3BotFlowService
                         },
                         cancellationToken);
 
+                    LogXuiOperationOutcome(
+                        accountCount > 1 ? "ساخت انبوه اکانت نسخه ۳" : "ساخت اکانت نسخه ۳",
+                        "ناموفق",
+                        credUser,
+                        operationTiming,
+                        source: "purchase",
+                        requestedCount: bulkResult.RequestedCount,
+                        successfulCount: 0);
+
                     if (messageId != 0)
                     {
                         await SafeEditMessageTextAsync(
@@ -3765,6 +3897,15 @@ public class XuiV3BotFlowService
                                 ["error"] = debitResult.ErrorMessage ?? string.Empty
                             },
                             cancellationToken);
+
+                        LogXuiOperationOutcome(
+                            accountCount > 1 ? "ساخت انبوه اکانت نسخه ۳" : "ساخت اکانت نسخه ۳",
+                            "ساخته شد و پس از خطای تسویه برگشت خورد",
+                            credUser,
+                            operationTiming,
+                            source: "purchase-site-wallet",
+                            requestedCount: bulkResult.RequestedCount,
+                            successfulCount: bulkResult.SuccessfulCount);
 
                         if (messageId != 0)
                         {
@@ -3873,7 +4014,10 @@ public class XuiV3BotFlowService
                     paymentWalletSource: useSiteWallet && siteWalletDebitResult?.Success == true
                         ? "کیف پول سایت گذرگاه"
                         : "کیف پول ربات",
-                    details: BuildBulkPurchaseLogDetails(bulkResult, selection.UserComment));
+                    details: BuildBulkPurchaseLogDetails(bulkResult, selection.UserComment),
+                    timing: operationTiming.Snapshot());
+
+                var purchaseTiming = operationTiming.Snapshot();
 
                 await _activityLog.LogBotActionAsync(
                     accountCount > 1 ? "xui_v3_bulk_accounts_created" : "xui_v3_account_created",
@@ -3899,7 +4043,9 @@ public class XuiV3BotFlowService
                             : "bot_wallet",
                         ["panelUrl"] = serverInfo.Url,
                         ["rootPath"] = serverInfo.RootPath,
-                        ["userComment"] = selection.UserComment ?? string.Empty
+                        ["userComment"] = selection.UserComment ?? string.Empty,
+                        ["panelApiElapsedMs"] = (long)purchaseTiming.PanelApiElapsed.TotalMilliseconds,
+                        ["totalElapsedMs"] = (long)purchaseTiming.TotalElapsed.TotalMilliseconds
                     },
                     cancellationToken);
 
@@ -3928,6 +4074,12 @@ public class XuiV3BotFlowService
                         ["callbackData"] = callbackQuery.Data ?? string.Empty
                     },
                     cancellationToken);
+                LogXuiOperationOutcome(
+                    "ساخت اکانت نسخه ۳",
+                    $"خطا ({ex.GetType().Name})",
+                    credUser,
+                    operationTiming,
+                    source: "purchase");
                 if (messageId != 0)
                 {
                     await SafeEditMessageTextAsync(
@@ -3937,6 +4089,10 @@ public class XuiV3BotFlowService
                         text: "در ساخت اکانت خطا رخ داد. جزئیات در ترمینال ثبت شد.",
                         cancellationToken: cancellationToken);
                 }
+            }
+            finally
+            {
+                operationTiming?.Dispose();
             }
             return true;
         }
@@ -4479,6 +4635,21 @@ public class XuiV3BotFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// Confirms deletion of one owned account selected from the paged account list and audits the measured outcome.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the bot that received the callback.</param>
+    /// <param name="chatId">Telegram chat containing the source account card.</param>
+    /// <param name="messageId">Message id edited with the terminal deletion result.</param>
+    /// <param name="credUser">Current user whose Telegram id must still own the panel account.</param>
+    /// <param name="clientId">Numeric XUI client id encoded by the account-list callback.</param>
+    /// <param name="page">Zero-based account-list page restored by result navigation.</param>
+    /// <param name="cancellationToken">Token that cancels panel, activity-log, website-sync, and Telegram work.</param>
+    /// <returns>A task that completes after safe rejection or the delete result is delivered.</returns>
+    /// <remarks>
+    /// Ownership is revalidated immediately before deletion. The audit reports API and total elapsed duration but
+    /// never includes UUID, SubId, configuration data, token, or raw panel response content.
+    /// </remarks>
     private async Task HandleAccountDeleteConfirmCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -4488,9 +4659,16 @@ public class XuiV3BotFlowService
         int page,
         CancellationToken cancellationToken)
     {
+        using var operationTiming = XuiOperationTiming.Start();
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
+            LogXuiOperationOutcome(
+                "حذف اکانت نسخه ۳",
+                "اکانت پیدا نشد یا قبلاً حذف شده است",
+                credUser,
+                operationTiming,
+                source: "list");
             await botClient.SendTextMessageAsync(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای حذف پیدا نشد یا قبلاً حذف شده است.",
@@ -4502,6 +4680,13 @@ public class XuiV3BotFlowService
         var deleteResponse = await ApiServicev3.DeleteClientAsync(serverInfo, _configuration, client.Email, cancellationToken);
         if (!deleteResponse.Success)
         {
+            LogXuiOperationOutcome(
+                "حذف اکانت نسخه ۳",
+                "پنل حذف را رد کرد",
+                credUser,
+                operationTiming,
+                accountEmail: client.Email,
+                source: "list");
             await SafeEditMessageTextAsync(
                 botClient,
                 chatId: chatId,
@@ -4524,10 +4709,12 @@ public class XuiV3BotFlowService
             {
                 ["accountEmail"] = client.Email,
                 ["panelUrl"] = serverInfo.Url,
-                ["rootPath"] = serverInfo.RootPath
+                ["rootPath"] = serverInfo.RootPath,
+                ["panelApiElapsedMs"] = (long)operationTiming.PanelApiElapsed.TotalMilliseconds,
+                ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
             },
             cancellationToken);
-        LogAccountDelete(client, credUser, "list");
+        LogAccountDelete(client, credUser, "list", operationTiming.Snapshot());
         await _gozargahSiteSyncService.QueueDeleteAsync(
             ResolveGozargahSiteOwnerTelegramUserId(credUser),
             credUser.TelegramUserId,
@@ -4873,6 +5060,8 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// The method can be called by the confirmation callback or recovery worker. Snapshot and replacement identifiers
     /// are generated only when absent and persisted before the first POST. Every later call reuses those exact values.
+    /// Panel API time covers the current attempt. Total time uses the durable confirmation timestamp so a recovery
+    /// after restart still exposes end-to-end latency; API time lost with a crashed process is not guessed.
     /// </remarks>
     private async Task ProcessAccountChangeLinkOperationAsync(
         ITelegramBotClient botClient,
@@ -4888,6 +5077,7 @@ public class XuiV3BotFlowService
         if (operation == null || clientId == null || clientId <= 0)
             return;
 
+        using var operationTiming = XuiOperationTiming.Start();
         var serverInfo = BuildConfiguredPanelServerInfo();
 
         if (!string.Equals(
@@ -4901,6 +5091,7 @@ public class XuiV3BotFlowService
                 "panel-configuration-changed",
                 "The configured panel fingerprint differs from the panel that owns this operation.",
                 cancellationToken);
+            LogLinkChangeOutcome(operation, credUser, operationTiming, "پیکربندی پنل تغییر کرده؛ در انتظار بررسی");
             return;
         }
 
@@ -4941,6 +5132,7 @@ public class XuiV3BotFlowService
                         "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست. هیچ تغییری روی پنل انجام نشد.",
                         replyMarkup: BuildChangeLinkResultKeyboard(clientId.Value, page, fromSearch),
                         cancellationToken: cancellationToken);
+                    LogLinkChangeOutcome(operation, credUser, operationTiming, "دریافت اکانت از پنل ناموفق بود");
                     return;
                 }
 
@@ -4959,6 +5151,7 @@ public class XuiV3BotFlowService
                         "برای جلوگیری از حذف اطلاعات اکانت، تغییر لینک انجام نشد؛ وضعیت کامل inboundها یا مصرف از پنل دریافت نشد. هیچ تغییری روی اکانت اعمال نشده است.",
                         replyMarkup: BuildChangeLinkResultKeyboard(client.Id, page, fromSearch),
                         cancellationToken: cancellationToken);
+                    LogLinkChangeOutcome(operation, credUser, operationTiming, "اطلاعات کامل پنل دریافت نشد");
                     return;
                 }
 
@@ -5031,6 +5224,7 @@ public class XuiV3BotFlowService
                             "identity-observation-unknown",
                             "The panel could not establish whether the saved identity was committed.",
                             cancellationToken);
+                        LogLinkChangeOutcome(operation, credUser, operationTiming, "نتیجه پنل مبهم؛ در انتظار بازیابی");
                         return;
                     }
 
@@ -5042,6 +5236,7 @@ public class XuiV3BotFlowService
                             "identity-not-found",
                             "Neither the old nor the saved new identity could be proved on the panel.",
                             cancellationToken);
+                        LogLinkChangeOutcome(operation, credUser, operationTiming, "هویت اکانت قابل اثبات نیست؛ در انتظار بازیابی");
                         return;
                     }
 
@@ -5094,6 +5289,7 @@ public class XuiV3BotFlowService
                                 "identity-update-ambiguous",
                                 "The panel response was interrupted before the identity result could be verified.",
                                 cancellationToken);
+                            LogLinkChangeOutcome(operation, credUser, operationTiming, "پاسخ تغییر لینک مبهم؛ در انتظار بازیابی");
                             return;
                         }
 
@@ -5112,6 +5308,7 @@ public class XuiV3BotFlowService
                             "پنل تغییر لینک را نپذیرفت و هیچ شناسه‌ای تغییر نکرد. لطفاً بعداً دوباره تلاش کنید.",
                             replyMarkup: BuildChangeLinkResultKeyboard(client.Id, page, fromSearch),
                             cancellationToken: cancellationToken);
+                        LogLinkChangeOutcome(operation, credUser, operationTiming, "پنل تغییر لینک را رد کرد");
                         return;
                     }
                 }
@@ -5225,6 +5422,7 @@ public class XuiV3BotFlowService
                     preservation.Stage,
                     preservation.Message,
                     cancellationToken);
+                LogLinkChangeOutcome(operation, credUser, operationTiming, "تطبیق اطلاعات ناموفق؛ در انتظار بازیابی");
                 return;
             }
 
@@ -5262,6 +5460,7 @@ public class XuiV3BotFlowService
             {
                 try
                 {
+                    var linkChangeTiming = BuildLinkChangeTimingSnapshot(operation, operationTiming);
                     await _activityLog.LogBotActionAsync(
                         "xui_v3_account_link_changed",
                         credUser,
@@ -5283,7 +5482,9 @@ public class XuiV3BotFlowService
                             ["usedBytesAfter"] = (preservation.Traffic?.Up ?? 0) + (preservation.Traffic?.Down ?? 0),
                             ["usedGb"] = GetUsedBytes(client).ConvertBytesToGB(),
                             ["totalGb"] = GetTotalBytes(client).ConvertBytesToGB(),
-                            ["expiryShamsi"] = FormatExpiry(GetExpiryTime(client))
+                            ["expiryShamsi"] = FormatExpiry(GetExpiryTime(client)),
+                            ["panelApiElapsedMs"] = (long)linkChangeTiming.PanelApiElapsed.TotalMilliseconds,
+                            ["totalElapsedMs"] = (long)linkChangeTiming.TotalElapsed.TotalMilliseconds
                         },
                         cancellationToken);
 
@@ -5298,7 +5499,8 @@ public class XuiV3BotFlowService
                         newUuid,
                         newSubId,
                         newSubLink,
-                        serverInfo));
+                        serverInfo,
+                        linkChangeTiming));
                     await _linkChangeOperationStore.MarkPostActionsAsync(
                         operation.OperationKey,
                         siteSyncQueued: false,
@@ -5343,12 +5545,15 @@ public class XuiV3BotFlowService
         }
         catch (Exception ex)
         {
+            var failedTiming = BuildLinkChangeTimingSnapshot(operation, operationTiming);
             _logger.LogError(
                 ex,
-                "XUI link-change processing failed. operationKey={OperationKey}, botId={BotId}, clientId={ClientId}",
+                "XUI link-change processing failed. operationKey={OperationKey}, botId={BotId}, clientId={ClientId}, panelApiElapsed={PanelApiElapsed}, totalElapsed={TotalElapsed}",
                 operation.OperationKey,
                 operation.BotId,
-                clientId);
+                clientId,
+                XuiOperationTiming.Format(failedTiming.PanelApiElapsed),
+                XuiOperationTiming.Format(failedTiming.TotalElapsed));
             await _activityLog.LogErrorAsync(
                 "xui_v3_change_link_exception",
                 ex,
@@ -5663,6 +5868,21 @@ public class XuiV3BotFlowService
             cancellationToken);
     }
 
+    /// <summary>
+    /// Confirms deletion of one owned account selected through search and audits the measured panel result.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the bot that received the search callback.</param>
+    /// <param name="chatId">Telegram chat containing the search-result card.</param>
+    /// <param name="messageId">Message id edited with the terminal deletion result.</param>
+    /// <param name="credUser">Current user whose Telegram id must still own the panel account.</param>
+    /// <param name="clientId">Numeric XUI client id selected by the search callback.</param>
+    /// <param name="page">Zero-based search page restored by result navigation.</param>
+    /// <param name="cancellationToken">Token that cancels panel, activity-log, website-sync, and Telegram work.</param>
+    /// <returns>A task that completes after safe rejection or the delete result is delivered.</returns>
+    /// <remarks>
+    /// Ownership is revalidated before deletion. Failure and success are centrally logged with API and end-to-end
+    /// duration, without exposing account credentials or raw provider responses.
+    /// </remarks>
     private async Task HandleAccountSearchDeleteConfirmCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -5672,9 +5892,16 @@ public class XuiV3BotFlowService
         int page,
         CancellationToken cancellationToken)
     {
+        using var operationTiming = XuiOperationTiming.Start();
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
+            LogXuiOperationOutcome(
+                "حذف اکانت نسخه ۳",
+                "اکانت پیدا نشد یا قبلاً حذف شده است",
+                credUser,
+                operationTiming,
+                source: "search");
             await botClient.SendTextMessageAsync(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای حذف پیدا نشد یا قبلاً حذف شده است.",
@@ -5686,6 +5913,13 @@ public class XuiV3BotFlowService
         var deleteResponse = await ApiServicev3.DeleteClientAsync(serverInfo, _configuration, client.Email, cancellationToken);
         if (!deleteResponse.Success)
         {
+            LogXuiOperationOutcome(
+                "حذف اکانت نسخه ۳",
+                "پنل حذف را رد کرد",
+                credUser,
+                operationTiming,
+                accountEmail: client.Email,
+                source: "search");
             await SendOrEditTextAsync(
                 botClient,
                 chatId,
@@ -5708,10 +5942,12 @@ public class XuiV3BotFlowService
             {
                 ["accountEmail"] = client.Email,
                 ["panelUrl"] = serverInfo.Url,
-                ["rootPath"] = serverInfo.RootPath
+                ["rootPath"] = serverInfo.RootPath,
+                ["panelApiElapsedMs"] = (long)operationTiming.PanelApiElapsed.TotalMilliseconds,
+                ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
             },
             cancellationToken);
-        LogAccountDelete(client, credUser, "search");
+        LogAccountDelete(client, credUser, "search", operationTiming.Snapshot());
         await _gozargahSiteSyncService.QueueDeleteAsync(
             ResolveGozargahSiteOwnerTelegramUserId(credUser),
             credUser.TelegramUserId,
@@ -5750,6 +5986,7 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// Ownership is revalidated before the panel mutation. Wallets, orders, and conversation state are unchanged. On
     /// success the shared menu preserves search navigation and restores configuration retrieval for either state.
+    /// Terminal outcomes are centrally audited with panel API and total elapsed durations.
     /// </remarks>
     private async Task HandleAccountSearchStateCallbackAsync(
         ITelegramBotClient botClient,
@@ -5761,9 +5998,16 @@ public class XuiV3BotFlowService
         bool enable,
         CancellationToken cancellationToken)
     {
+        using var operationTiming = XuiOperationTiming.Start();
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
+            LogXuiOperationOutcome(
+                enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                "اکانت پیدا نشد یا مجاز نبود",
+                credUser,
+                operationTiming,
+                source: "search");
             await botClient.SendTextMessageAsync(
                 chatId: chatId,
                 text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
@@ -5781,6 +6025,13 @@ public class XuiV3BotFlowService
             cancellationToken);
         if (!updateResponse.Success)
         {
+            LogXuiOperationOutcome(
+                enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                "پنل تغییر را رد کرد",
+                credUser,
+                operationTiming,
+                accountEmail: client.Email,
+                source: "search");
             await SendOrEditTextAsync(
                 botClient,
                 chatId,
@@ -5800,7 +6051,9 @@ public class XuiV3BotFlowService
                 ["accountEmail"] = client.Email,
                 ["panelUrl"] = serverInfo.Url,
                 ["rootPath"] = serverInfo.RootPath,
-                ["source"] = "account_search_callback"
+                ["source"] = "account_search_callback",
+                ["panelApiElapsedMs"] = (long)operationTiming.PanelApiElapsed.TotalMilliseconds,
+                ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
             },
             cancellationToken);
 
@@ -5813,6 +6066,13 @@ public class XuiV3BotFlowService
             ParseMode.Html,
             BuildAccountDetailsKeyboard(client, page, IsClientRenewable(client), fromSearch: true),
             cancellationToken);
+        LogXuiOperationOutcome(
+            enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+            "موفق",
+            credUser,
+            operationTiming,
+            accountEmail: client.Email,
+            source: "search");
     }
 
     private async Task HandleAccountCommentStartCallbackAsync(
@@ -5884,7 +6144,8 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// The panel client is reloaded and ownership is checked before update. Bot metadata is preserved by the payload
     /// builder. A successful card uses the common menu, preserving the original list/search navigation and exposing
-    /// configuration retrieval without placing the account's SubId or URLs in callback data.
+    /// configuration retrieval without placing the account's SubId or URLs in callback data. Rejected and accepted
+    /// mutations are centrally audited with API and end-to-end durations.
     /// </remarks>
     private async Task ApplyAccountCommentAsync(
         ITelegramBotClient botClient,
@@ -5898,9 +6159,16 @@ public class XuiV3BotFlowService
         IReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
+        using var operationTiming = XuiOperationTiming.Start();
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
+            LogXuiOperationOutcome(
+                "تغییر کامنت اکانت نسخه ۳",
+                "اکانت پیدا نشد یا مجاز نبود",
+                credUser,
+                operationTiming,
+                source: fromSearch ? "search" : "list");
             await botClient.SendTextMessageAsync(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای تغییر کامنت پیدا نشد یا متعلق به حساب شما نیست.",
@@ -5914,6 +6182,13 @@ public class XuiV3BotFlowService
         var updateResponse = await ApiServicev3.UpdateClientAsync(serverInfo, _configuration, client.Email, payload, cancellationToken);
         if (!updateResponse.Success)
         {
+            LogXuiOperationOutcome(
+                "تغییر کامنت اکانت نسخه ۳",
+                "پنل تغییر را رد کرد",
+                credUser,
+                operationTiming,
+                accountEmail: client.Email,
+                source: fromSearch ? "search" : "list");
             await botClient.SendTextMessageAsync(
                 chatId: chatId,
                 text: $"تغییر کامنت ناموفق بود.\n{updateResponse.Msg}",
@@ -5932,7 +6207,9 @@ public class XuiV3BotFlowService
                 ["newComment"] = newComment,
                 ["panelUrl"] = serverInfo.Url,
                 ["rootPath"] = serverInfo.RootPath,
-                ["source"] = fromSearch ? "account_search" : "account_list"
+                ["source"] = fromSearch ? "account_search" : "account_list",
+                ["panelApiElapsedMs"] = (long)operationTiming.PanelApiElapsed.TotalMilliseconds,
+                ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
             },
             cancellationToken);
 
@@ -5948,6 +6225,13 @@ public class XuiV3BotFlowService
                 IsClientRenewable(client),
                 fromSearch),
             cancellationToken: cancellationToken);
+        LogXuiOperationOutcome(
+            "تغییر کامنت اکانت نسخه ۳",
+            "موفق",
+            credUser,
+            operationTiming,
+            accountEmail: client.Email,
+            source: fromSearch ? "search" : "list");
     }
 
     /// <summary>
@@ -6735,6 +7019,11 @@ public class XuiV3BotFlowService
     /// wallet. This value must describe the completed debit result rather than the payment button selected earlier.
     /// </param>
     /// <param name="details">Additional purchase details such as plan, account email, and subscription link.</param>
+    /// <param name="timing">
+    /// Monotonic duration snapshot for the completed activity. Panel time includes all XUI v3 calls and retries made
+    /// after execution began; total time also includes settlement, persistence, and any Telegram delivery completed
+    /// before the financial audit is emitted.
+    /// </param>
     /// <remarks>
     /// This method preserves the existing purchase metadata and adds the actual wallet source to the same central
     /// payment log. When a site-wallet debit fails after a renewal and the local bot wallet is used as compensation,
@@ -6749,7 +7038,8 @@ public class XuiV3BotFlowService
     ///     500_000,
     ///     400_000,
     ///     "کیف پول ربات",
-    ///     details);
+    ///     details,
+    ///     timing.Snapshot());
     /// </code>
     /// </example>
     private void LogV3Purchase(
@@ -6759,7 +7049,8 @@ public class XuiV3BotFlowService
         long? beforeBalance,
         long? afterBalance,
         string paymentWalletSource,
-        IEnumerable<string> details)
+        IEnumerable<string> details,
+        XuiOperationTimingSnapshot timing)
     {
         var message = new StringBuilder();
         var normalizedDetails = new List<string>();
@@ -6810,7 +7101,98 @@ public class XuiV3BotFlowService
             message.AppendLine(HtmlLogDetail(detail));
         }
 
+        message.AppendLine();
+        message.Append(XuiOperationTiming.BuildHtmlLines(timing));
+
         _logger.LogPayment(message.ToString());
+    }
+
+    /// <summary>
+    /// Writes one safe non-financial XUI operation outcome to the central Telegram logger channel with API and total durations.
+    /// </summary>
+    /// <param name="title">Fixed Persian activity title such as account comment change or account activation.</param>
+    /// <param name="result">Fixed coarse result such as successful, rejected, partial, or exception type.</param>
+    /// <param name="credUser">Telegram actor whose id and public profile are included in the audit.</param>
+    /// <param name="timing">Active monotonic operation timer captured immediately before the log is emitted.</param>
+    /// <param name="accountEmail">
+    /// Optional panel email/name safe for the private admin channel. UUID, SubId, configuration URLs, tokens, and raw
+    /// panel responses must not be passed here.
+    /// </param>
+    /// <param name="source">Optional fixed UI source such as list, search, command, or trial.</param>
+    /// <param name="requestedCount">Optional number of accounts requested by a bulk operation.</param>
+    /// <param name="successfulCount">Optional number of accounts completed by a bulk operation.</param>
+    /// <remarks>
+    /// This audit is operational and therefore uses HTML logging without the payment logger's database-backup side
+    /// effect. It must be called for both accepted and terminally failed panel mutations so the timings remain useful
+    /// for API-health comparison.
+    /// </remarks>
+    private void LogXuiOperationOutcome(
+        string title,
+        string result,
+        CredUser credUser,
+        XuiOperationTiming timing,
+        string accountEmail = null,
+        string source = null,
+        int? requestedCount = null,
+        int? successfulCount = null)
+    {
+        if (timing == null)
+            return;
+
+        LogXuiOperationOutcomeSnapshot(
+            title,
+            result,
+            credUser,
+            timing.Snapshot(),
+            accountEmail,
+            source,
+            requestedCount,
+            successfulCount);
+    }
+
+    /// <summary>
+    /// Writes one operational XUI audit from an immutable timing snapshot.
+    /// </summary>
+    /// <param name="title">Fixed activity title displayed in the private Telegram logger channel.</param>
+    /// <param name="result">Coarse safe outcome that excludes provider response bodies and exception messages.</param>
+    /// <param name="credUser">Telegram actor whose public identity is included in the audit.</param>
+    /// <param name="timing">API and end-to-end durations already captured for the activity.</param>
+    /// <param name="accountEmail">Optional panel email/name; credentials and subscription identifiers are forbidden.</param>
+    /// <param name="source">Optional stable route label such as list, search, purchase, or recovery.</param>
+    /// <param name="requestedCount">Optional number of requested accounts for bulk activity.</param>
+    /// <param name="successfulCount">Optional number of successful accounts for bulk activity.</param>
+    /// <remarks>
+    /// Snapshot input is required for durable workflows such as link-change recovery, where total time can span a
+    /// process restart and cannot be represented by the current in-memory timer alone.
+    /// </remarks>
+    private void LogXuiOperationOutcomeSnapshot(
+        string title,
+        string result,
+        CredUser credUser,
+        XuiOperationTimingSnapshot timing,
+        string accountEmail = null,
+        string source = null,
+        int? requestedCount = null,
+        int? successfulCount = null)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine($"<b>{Html(title)}</b>");
+        builder.AppendLine();
+        builder.AppendLine(TelegramUserLinkFormatter.HtmlSummary(credUser));
+        builder.AppendLine($"نتیجه: <code>{Html(result)}</code>");
+        if (!string.IsNullOrWhiteSpace(accountEmail))
+            builder.AppendLine($"اکانت: <code>{Html(accountEmail)}</code>");
+        if (!string.IsNullOrWhiteSpace(source))
+            builder.AppendLine($"مسیر: <code>{Html(source)}</code>");
+        if (requestedCount.HasValue)
+            builder.AppendLine($"تعداد درخواستی: <code>{requestedCount.Value}</code>");
+        if (successfulCount.HasValue)
+            builder.AppendLine($"تعداد موفق: <code>{successfulCount.Value}</code>");
+        builder.AppendLine($"BotId: <code>{Html(BotContextAccessor.CurrentBotId)}</code>");
+        builder.AppendLine($"BotType: <code>{Html(BotContextAccessor.CurrentBotType)}</code>");
+        builder.AppendLine();
+        builder.Append(XuiOperationTiming.BuildHtmlLines(timing));
+        _logger.LogTelegramHtml(builder.ToString());
     }
 
     /// <summary>
@@ -10497,6 +10879,83 @@ public class XuiV3BotFlowService
         return builder.ToString();
     }
 
+    /// <summary>
+    /// Combines the current link-change processor's panel time with the durable end-to-end confirmation duration.
+    /// </summary>
+    /// <param name="operation">
+    /// Persisted link-change saga. <see cref="XuiV3LinkChangeOperation.ConfirmedAtUtc"/> is the start of actual
+    /// execution and survives process restarts.
+    /// </param>
+    /// <param name="timing">Monotonic timer for the current foreground or recovery execution attempt.</param>
+    /// <returns>
+    /// A snapshot whose API duration covers the current execution attempt and whose total duration covers the whole
+    /// confirmed saga when a durable confirmation time is available.
+    /// </returns>
+    /// <remarks>
+    /// API time from a process that crashed cannot be reconstructed without persisting telemetry, so recovery logs
+    /// intentionally report the successful/final attempt's panel time while total time remains restart-safe.
+    /// </remarks>
+    private static XuiOperationTimingSnapshot BuildLinkChangeTimingSnapshot(
+        XuiV3LinkChangeOperation operation,
+        XuiOperationTiming timing)
+    {
+        var snapshot = timing?.Snapshot() ?? default;
+        if (operation?.ConfirmedAtUtc is not DateTime confirmedAtUtc)
+            return snapshot;
+
+        var totalElapsed = DateTime.UtcNow - confirmedAtUtc;
+        if (totalElapsed < TimeSpan.Zero)
+            totalElapsed = snapshot.TotalElapsed;
+
+        return new XuiOperationTimingSnapshot(snapshot.PanelApiElapsed, totalElapsed);
+    }
+
+    /// <summary>
+    /// Logs a safe failed or ambiguous link-change attempt with restart-aware total duration.
+    /// </summary>
+    /// <param name="operation">Durable link-change operation that supplies route, target name, and confirmation time.</param>
+    /// <param name="actor">Authenticated Telegram user who initiated the mutation.</param>
+    /// <param name="timing">Monotonic timer for panel calls made during the current execution attempt.</param>
+    /// <param name="result">Fixed Persian outcome with no raw panel response, exception detail, or secret identifier.</param>
+    /// <remarks>
+    /// Recovery may execute the same operation more than once. Each completed attempt is logged separately so API
+    /// health remains visible; total duration is calculated from the durable confirmation time when available.
+    /// </remarks>
+    private void LogLinkChangeOutcome(
+        XuiV3LinkChangeOperation operation,
+        CredUser actor,
+        XuiOperationTiming timing,
+        string result)
+    {
+        LogXuiOperationOutcomeSnapshot(
+            "تغییر لینک اکانت نسخه ۳",
+            result,
+            actor,
+            BuildLinkChangeTimingSnapshot(operation, timing),
+            accountEmail: operation?.OldEmail ?? operation?.NewEmail,
+            source: string.IsNullOrWhiteSpace(operation?.Source) ? "link-change" : operation.Source);
+    }
+
+    /// <summary>
+    /// Builds the private HTML audit for a completed XUI v3 identity/link rotation and appends measured durations.
+    /// </summary>
+    /// <param name="actor">Authenticated Telegram user who confirmed the link change.</param>
+    /// <param name="client">Pre-change panel client used to preserve service and ownership metadata.</param>
+    /// <param name="oldEmail">Panel email/name before rotation.</param>
+    /// <param name="oldUuid">Protocol UUID before rotation; included only in the private administrator audit.</param>
+    /// <param name="oldSubId">Subscription identifier before rotation.</param>
+    /// <param name="oldSubLink">Complete subscription link before rotation.</param>
+    /// <param name="newEmail">Panel email/name committed by the rotation saga.</param>
+    /// <param name="newUuid">Protocol UUID committed by the rotation saga.</param>
+    /// <param name="newSubId">Subscription identifier committed by the rotation saga.</param>
+    /// <param name="newSubLink">Complete replacement subscription link delivered to the account owner.</param>
+    /// <param name="serverInfo">Panel descriptor used for non-secret server attribution.</param>
+    /// <param name="timing">API and durable end-to-end timing snapshot for the completed saga.</param>
+    /// <returns>HTML-safe private-channel audit text including old/new identity data and elapsed durations.</returns>
+    /// <remarks>
+    /// This formatter has no panel, database, wallet, order, or Telegram side effects. Because the result contains
+    /// credentials and subscription links, it must only be sent to the configured private logger channel.
+    /// </remarks>
     private static string BuildChangeLinkLogMessage(
         CredUser actor,
         XuiV3Client client,
@@ -10508,7 +10967,8 @@ public class XuiV3BotFlowService
         string newUuid,
         string newSubId,
         string newSubLink,
-        ServerInfo serverInfo)
+        ServerInfo serverInfo,
+        XuiOperationTimingSnapshot timing)
     {
         var metadata = TryReadMetadata(client.Comment);
         var actorRole = actor?.IsColleague == true ? "همکار" : "کاربر عادی";
@@ -10552,6 +11012,8 @@ public class XuiV3BotFlowService
             builder.AppendLine($"• کامنت کاربر: <code>{Html(userComment)}</code>");
         builder.AppendLine($"• پنل: <code>{Html(serverInfo.Url)}</code>");
         builder.AppendLine($"• Root Path: <code>{Html(serverInfo.RootPath)}</code>");
+        builder.AppendLine();
+        builder.Append(XuiOperationTiming.BuildHtmlLines(timing));
         return builder.ToString();
     }
 
@@ -10561,11 +11023,16 @@ public class XuiV3BotFlowService
     /// <param name="client">Deleted XUI client as it existed before the panel delete call.</param>
     /// <param name="credUser">Telegram user who requested the delete action.</param>
     /// <param name="source">Delete surface, such as account list or search results.</param>
+    /// <param name="timing">Monotonic duration snapshot captured after the panel accepted the delete.</param>
     /// <remarks>
     /// The delete operation has already succeeded before this method is called. The log is best-effort and
     /// does not participate in the panel transaction, but it gives admins the same visibility as link changes.
     /// </remarks>
-    private void LogAccountDelete(XuiV3Client client, CredUser credUser, string source)
+    private void LogAccountDelete(
+        XuiV3Client client,
+        CredUser credUser,
+        string source,
+        XuiOperationTimingSnapshot timing)
     {
         var metadata = TryReadMetadata(client.Comment);
         var builder = new StringBuilder();
@@ -10580,6 +11047,8 @@ public class XuiV3BotFlowService
         builder.AppendLine($"BotId: <code>{Html(BotContextAccessor.CurrentBotId)}</code>");
         builder.AppendLine($"BotType: <code>{Html(BotContextAccessor.CurrentBotType)}</code>");
         builder.AppendLine($"زمان: <code>{Html(DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi())}</code>");
+        builder.AppendLine();
+        builder.Append(XuiOperationTiming.BuildHtmlLines(timing));
         _logger.LogPayment(builder.ToString());
     }
 
@@ -10689,7 +11158,8 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// The method reloads the panel client list and checks Telegram ownership before mutation. A successful update
     /// keeps the account card on its previous page and restores the same full action menu, including read-only
-    /// configuration retrieval. It does not change wallet, order, renewal, or conversation-state records.
+    /// configuration retrieval. It does not change wallet, order, renewal, or conversation-state records. Every
+    /// terminal panel outcome includes API and total elapsed durations in the private central audit.
     /// </remarks>
     private async Task HandleAccountStateCallbackAsync(
         ITelegramBotClient botClient,
@@ -10710,6 +11180,7 @@ public class XuiV3BotFlowService
             return;
         }
 
+        using var operationTiming = XuiOperationTiming.Start();
         try
         {
             var serverInfo = BuildConfiguredPanelServerInfo();
@@ -10718,6 +11189,12 @@ public class XuiV3BotFlowService
             var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
             if (!clientsResponse.Success)
             {
+                LogXuiOperationOutcome(
+                    enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                    "دریافت لیست از پنل ناموفق بود",
+                    credUser,
+                    operationTiming,
+                    source: "list");
                 await botClient.SendTextMessageAsync(
                     chatId: chatId,
                     text: $"دریافت اطلاعات اکانت ناموفق بود.\n{clientsResponse.Msg}",
@@ -10728,6 +11205,12 @@ public class XuiV3BotFlowService
             var client = clientsResponse.Obj?.FirstOrDefault(c => c.Id == clientId.Value);
             if (client == null || !ClientBelongsToUser(client, credUser.TelegramUserId))
             {
+                LogXuiOperationOutcome(
+                    enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                    "اکانت پیدا نشد یا مجاز نبود",
+                    credUser,
+                    operationTiming,
+                    source: "list");
                 await botClient.SendTextMessageAsync(
                     chatId: chatId,
                     text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
@@ -10757,6 +11240,14 @@ public class XuiV3BotFlowService
                     },
                     cancellationToken);
 
+                LogXuiOperationOutcome(
+                    enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                    "پنل تغییر را رد کرد",
+                    credUser,
+                    operationTiming,
+                    accountEmail: client.Email,
+                    source: "list");
+
                 await botClient.SendTextMessageAsync(
                     chatId: chatId,
                     text: $"متاسفانه عملیات مورد نظر انجام نشد.\n{updateResponse.Msg}",
@@ -10774,7 +11265,9 @@ public class XuiV3BotFlowService
                     ["accountEmail"] = client.Email,
                     ["panelUrl"] = serverInfo.Url,
                     ["rootPath"] = serverInfo.RootPath,
-                    ["source"] = "account_callback"
+                    ["source"] = "account_callback",
+                    ["panelApiElapsedMs"] = (long)operationTiming.PanelApiElapsed.TotalMilliseconds,
+                    ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
                 },
                 cancellationToken);
 
@@ -10805,6 +11298,14 @@ public class XuiV3BotFlowService
                     replyMarkup: updatedKeyboard,
                     cancellationToken: cancellationToken);
             }
+
+            LogXuiOperationOutcome(
+                enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                "موفق",
+                credUser,
+                operationTiming,
+                accountEmail: client.Email,
+                source: "list");
         }
         catch (Exception ex)
         {
@@ -10820,6 +11321,12 @@ public class XuiV3BotFlowService
                     ["requestedAction"] = enable ? "enable" : "disable"
                 },
                 cancellationToken);
+            LogXuiOperationOutcome(
+                enable ? "فعال‌سازی اکانت نسخه ۳" : "غیرفعال‌سازی اکانت نسخه ۳",
+                $"خطا ({ex.GetType().Name})",
+                credUser,
+                operationTiming,
+                source: "list");
             await botClient.SendTextMessageAsync(
                 chatId: chatId,
                 text: "در انجام عملیات خطا رخ داد. جزئیات در ترمینال ثبت شد.",

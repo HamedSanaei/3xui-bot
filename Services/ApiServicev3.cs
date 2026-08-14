@@ -1990,6 +1990,9 @@ public class ApiServicev3
     /// <remarks>
     /// Retry attempts stay out of the private Telegram logger channel, but are written with full exception details to
     /// the daily diagnostic file so transient panel problems remain reviewable without channel noise.
+    /// When an <see cref="XuiOperationTiming"/> scope is active, the complete logical request—including retry attempts
+    /// and configured backoff—is accumulated as panel API time. Calls made outside an operation scope remain unmeasured
+    /// and retain their previous behavior.
     /// </remarks>
     private static async Task<T> SendWithRetryAsync<T>(
         IConfiguration configuration,
@@ -1999,6 +2002,9 @@ public class ApiServicev3
         CancellationToken cancellationToken,
         XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
     {
+        // One measurement covers the complete logical request, including every retry and retry delay. The ambient
+        // operation scope is bot-update-local, so concurrent customer operations cannot mix their API durations.
+        using var panelMeasurement = XuiOperationTiming.BeginCurrentPanelCall();
         var appConfig = configuration?.Get<AppConfig>() ?? new AppConfig();
         var retryCount = appConfig.XuiV3TransientRetryCount < 0
             ? DefaultXuiV3TransientRetryCount
@@ -2083,6 +2089,25 @@ public class ApiServicev3
             retryMode);
     }
 
+    /// <summary>
+    /// Downloads one raw subscription representation while contributing its HTTP duration to the current XUI audit.
+    /// </summary>
+    /// <param name="serverInfo">
+    /// XUI server descriptor supplying the subscription base URL. Authentication secrets are resolved internally and
+    /// must never be embedded in log output.
+    /// </param>
+    /// <param name="pathPrefix">Configured relative subscription path such as <c>sub/</c> or <c>clash/</c>.</param>
+    /// <param name="subId">Required panel subscription identifier. It is sensitive and must never be logged.</param>
+    /// <param name="accept">HTTP Accept media type expected by the caller.</param>
+    /// <param name="cancellationToken">Token that cancels the outbound subscription request.</param>
+    /// <returns>The raw UTF-8 response body; it may be empty when the panel returns an empty successful response.</returns>
+    /// <remarks>
+    /// The complete request is measured only when a surrounding <see cref="XuiOperationTiming"/> scope exists. This
+    /// method does not create an operation scope by itself, so read-only subscription requests outside audited account
+    /// activities do not produce timing logs.
+    /// </remarks>
+    /// <exception cref="ArgumentException">Thrown when the configured base URL or path cannot form a valid URI.</exception>
+    /// <exception cref="HttpRequestException">Thrown when the subscription endpoint returns an unsuccessful response.</exception>
     private static async Task<string> SendSubscriptionRawAsync(
         ServerInfo serverInfo,
         string pathPrefix,
@@ -2090,6 +2115,7 @@ public class ApiServicev3
         string accept,
         CancellationToken cancellationToken)
     {
+        using var panelMeasurement = XuiOperationTiming.BeginCurrentPanelCall();
         var baseUrl = string.IsNullOrWhiteSpace(serverInfo.SubLinkUrl)
             ? serverInfo.Url
             : serverInfo.SubLinkUrl;

@@ -34,6 +34,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 ## Core Services
 
 - `Services/XuiV3PurchaseService.cs`: resolves service selections, validates plan rules, builds XUI v3 account metadata, and creates accounts.
+- `Services/XuiOperationTiming.cs`: ambient monotonic timing scope for XUI audits. The v3 transport sums complete
+  logical panel calls (including retries/backoff); legacy v2 routes wrap their panel calls explicitly. Central create,
+  renew, delete, activation, comment/link edit, trial, bulk-admin, and tenant fulfillment logs show both
+  `MM:SS.mmm` panel API time and end-to-end execution time. Total minutes are unbounded; total time includes local
+  persistence, settlement, Telegram delivery, and bulk pacing performed after execution starts, but excludes customer
+  confirmation/payment waiting. Link-change recovery preserves durable total time while API time covers only the
+  current process attempt.
 - `Services/XuiV3BotFlowService.cs`: shared customer account flows for owned and tenant bots: purchase, renewal,
   search, account list, link/comment changes, delete, state callbacks, and owner-checked configuration delivery. All
   owned account cards use one source-aware action keyboard; `x3:acfg:{clientId}` reloads ownership, reads

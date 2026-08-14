@@ -7061,6 +7061,8 @@ public class TelegramBotService : IHostedService
     /// <remarks>
     /// The structured <c>legacy_account_renewed</c> activity event is emitted only after the panel renewal succeeds and
     /// both wallet debit and ledger entry are persisted. This keeps weekly gross sales free from pending or failed work.
+    /// Legacy panel calls are measured explicitly because this v2 route does not use the shared v3 HTTP transport. The
+    /// central logger records both logical panel-call time and total renewal/settlement/delivery time.
     /// </remarks>
     private async Task FinalizeRenewCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
     {
@@ -7087,9 +7089,15 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-        ClientExtend client = await TryGetClient(user.ConfigLink);
+        using var operationTiming = XuiOperationTiming.Start();
+        ClientExtend client = await operationTiming.MeasureLegacyPanelCallAsync(() => TryGetClient(user.ConfigLink));
         if (client == null)
         {
+            _logger.LogInformation(
+                "Legacy account renewal failed before update. userId={UserId}, panelApiElapsed={PanelApiElapsed}, totalElapsed={TotalElapsed}",
+                credUser.TelegramUserId,
+                XuiOperationTiming.Format(operationTiming.PanelApiElapsed),
+                XuiOperationTiming.Format(operationTiming.TotalElapsed));
             await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
 
             await botClient.CustomSendTextMessageAsync(
@@ -7128,7 +7136,7 @@ public class TelegramBotService : IHostedService
                 accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB, ConfigLink = user.ConfigLink };
             }
             await _userDbContext.SaveUserStatus(new User { Id = user.Id, SelectedCountry = findedcountry });
-            var result = await UpdateAccount(accountDto);
+            var result = await operationTiming.MeasureLegacyPanelCallAsync(() => UpdateAccount(accountDto));
 
             if (result)
             {
@@ -7181,7 +7189,9 @@ public class TelegramBotService : IHostedService
                     },
                     CancellationToken.None);
 
-                var logMesseage = "تمدید \n" + $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
+                var logMesseage = "تمدید \n" + $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg +
+                                 $"\nزمان API پنل: {XuiOperationTiming.Format(operationTiming.PanelApiElapsed)}" +
+                                 $"\nزمان کل عملیات: {XuiOperationTiming.Format(operationTiming.TotalElapsed)}";
 
                 if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage.EscapeMarkdown());
 
@@ -7197,6 +7207,14 @@ public class TelegramBotService : IHostedService
                     await _userDbContext.SaveUserStatus(user);
                 }
 
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Legacy account renewal was rejected. userId={UserId}, panelApiElapsed={PanelApiElapsed}, totalElapsed={TotalElapsed}",
+                    credUser.TelegramUserId,
+                    XuiOperationTiming.Format(operationTiming.PanelApiElapsed),
+                    XuiOperationTiming.Format(operationTiming.TotalElapsed));
             }
         }
         else
@@ -7224,6 +7242,8 @@ public class TelegramBotService : IHostedService
     /// <remarks>
     /// The structured <c>legacy_account_purchased</c> event is written only after the created account is read back as
     /// enabled and the matching debit ledger entry exists. Wallet top-ups and failed creations are never sales events.
+    /// Legacy create and read-back calls are measured explicitly; their sum is reported as panel API time while total
+    /// time also includes wallet, persistence, activity logging, and customer delivery performed before the audit.
     /// </remarks>
     private async Task FinalizeCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
     {
@@ -7257,20 +7277,26 @@ public class TelegramBotService : IHostedService
 
         if (servers.ContainsKey(user.SelectedCountry))
         {
+            using var operationTiming = XuiOperationTiming.Start();
             var serverInfo = servers[user.SelectedCountry];
 
             AccountDto accountDto = new AccountDto { TelegramUserId = message.From.Id, IsColleague = credUser.IsColleague, AccountCounter = user.AccountCounter + 1, ServerInfo = serverInfo, SelectedCountry = user.SelectedCountry, SelectedPeriod = user.SelectedPeriod, AccType = user.Type, TotoalGB = user.TotoalGB };
 
-            var result = await CreateAccount(accountDto);
+            var result = await operationTiming.MeasureLegacyPanelCallAsync(() => CreateAccount(accountDto));
 
             if (result)
             {
                 user = await _userDbContext.GetUserStatus(user.Id);
 
-                ClientExtend client = await TryGetClient(user.ConfigLink);
+                ClientExtend client = await operationTiming.MeasureLegacyPanelCallAsync(() => TryGetClient(user.ConfigLink));
 
                 if (client == null || client?.Enable == false)
                 {
+                    _logger.LogInformation(
+                        "Legacy account creation read-back failed. userId={UserId}, panelApiElapsed={PanelApiElapsed}, totalElapsed={TotalElapsed}",
+                        credUser.TelegramUserId,
+                        XuiOperationTiming.Format(operationTiming.PanelApiElapsed),
+                        XuiOperationTiming.Format(operationTiming.TotalElapsed));
                     await botClient.CustomSendTextMessageAsync(
                                   chatId: message.Chat.Id,
                                   text: "متاسفانه مشکلی در ساخت اکانت شما به وجود آمد. مجدداً دقایقی دیگر تلاش کنید",
@@ -7317,7 +7343,9 @@ public class TelegramBotService : IHostedService
                     },
                     CancellationToken.None);
 
-                var logMesseage = $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg;
+                var logMesseage = $"یوزر `{credUser.TelegramUserId}` \n {credUser} \n با مبلغ {user._ConfigPrice}" + " اکانت زیر را خریداری کرد" + $"\n موجودی قبل از خرید {beforeBalance.FormatCurrency()}" + $"\n موجودی پس از خرید {afterBalance.FormatCurrency()}" + " \n \n" + msg +
+                                 $"\nزمان API پنل: {XuiOperationTiming.Format(operationTiming.PanelApiElapsed)}" +
+                                 $"\nزمان کل عملیات: {XuiOperationTiming.Format(operationTiming.TotalElapsed)}";
 
                 if (user.ConfigPrice > 1000) _logger.LogInformation(logMesseage.EscapeMarkdown());
 
@@ -7343,6 +7371,11 @@ public class TelegramBotService : IHostedService
             }
             else
             {
+                _logger.LogInformation(
+                    "Legacy account creation was rejected. userId={UserId}, panelApiElapsed={PanelApiElapsed}, totalElapsed={TotalElapsed}",
+                    credUser.TelegramUserId,
+                    XuiOperationTiming.Format(operationTiming.PanelApiElapsed),
+                    XuiOperationTiming.Format(operationTiming.TotalElapsed));
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "متاسفانه مشکلی در ساخت اکانت شما به وجود آمد. مجدداً دقایقی دیگر تلاش کنید",

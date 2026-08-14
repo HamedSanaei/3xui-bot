@@ -7134,23 +7134,25 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// PERFORMS the Shared one-time fulfillment for paid tenant orders from HooshPay, NowPayments, Tetraminator, or manual card Approval.
+    /// Performs the shared one-time account-creation fulfillment for a paid tenant storefront order.
     /// </summary>
-    /// <param name="order">local tenant order that links the customer, owner, payment Provider, and selected plan.</param>
-    /// <param name="Source">audit Source that caused fulfillment, for example ipn, manual-check, or assistant-final.</param>
-    /// <param name="HOOSHPAYPAYMENT">optional HooshPay row when the Source Provider is HooshPay.</param>
-    /// <param name="NOWPAYMENTSPAYMENT">optional NowPayments row when the Source Provider is NowPayments.</param>
+    /// <param name="order">Tenant-scoped order linking the customer, owner, payment provider, and selected plan.</param>
+    /// <param name="Source">Non-secret audit source such as IPN, manual check, or assistant confirmation.</param>
+    /// <param name="HOOSHPAYPAYMENT">Optional tracked HooshPay row when HooshPay funded the order.</param>
+    /// <param name="NOWPAYMENTSPAYMENT">Optional tracked NowPayments row when cryptocurrency funded the order.</param>
     /// <param name="DEBITOWNERBASECOST">
-    /// true for card-to-card receipts where the tenant owner received money directly and must Pay base cost from wallet.
-    /// false for PLATFORM GATEWAYS where only the owner's profit is credited.
+    /// <c>true</c> for card-to-card receipts where the tenant owner received money directly and must pay base cost from
+    /// the bot wallet; <c>false</c> for platform gateways where only owner profit is credited.
     /// </param>
-    /// <param name="CancellationToken">Cancellation Token for users.db, credentials.db, Telegram, and xui calls.</param>
-    /// <returns>settlement result with before/after owner wallet balances when fulfillment succeeds.</returns>
+    /// <param name="CancellationToken">Token that cancels users.db, credentials.db, Telegram, and XUI operations.</param>
+    /// <returns>A settlement result with owner-wallet before/after balances when fulfillment succeeds.</returns>
     /// <remarks>
     /// Idempotency:
     /// callback, customer check, and manual paths share a process-wide gate and reload the order before checking
     /// <see cref="TenantBotOrder.IsFulfilled" />. A completed order returns without creating another XUI account,
     /// owner wallet mutation, or ledger entry.
+    /// Timing begins only after the paid order, tenant, owner, customer, and plan are ready for execution. The central
+    /// audit reports accumulated panel API time and total fulfillment time and never includes gateway waiting time.
     /// </remarks>
     private async Task<NowPaymentsSettlementResult> FULFILLPAIDTENANTORDERASYNC(
         TenantBotOrder order,
@@ -7209,6 +7211,7 @@ public class TenantBotService
             AccountCount = 1
         };
 
+        using var operationTiming = XuiOperationTiming.Start();
         using (_botContextAccessor.Push(new BotRuntimeContext
         {
             Config = TENANTCONFIG,
@@ -7242,7 +7245,7 @@ public class TenantBotService
                     order.UpdatedAtUtc = DateTime.UtcNow;
                     await _userDbcontext.SaveChangesAsync(CancellationToken);
                     await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, created.Message, CancellationToken);
-                    LOGTENANTORDER(order, owner, customer, Source, "account-Create-failed");
+                    LOGTENANTORDER(order, owner, customer, Source, "account-Create-failed", timing: operationTiming.Snapshot());
                     return NowPaymentsSettlementResult.InvalidAmount();
                 }
 
@@ -7296,7 +7299,7 @@ public class TenantBotService
                 await NOTIFYTENANTCUSTOMERSUCCESSASYNC(order, created, CancellationToken);
                 await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, CancellationToken, settlement);
                 await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, settlement.BotWalletBefore, settlement.BotWalletAfter, CancellationToken);
-                LOGTENANTORDER(order, owner, customer, Source, "fulfilled", settlement);
+                LOGTENANTORDER(order, owner, customer, Source, "fulfilled", settlement, operationTiming.Snapshot());
                 return NowPaymentsSettlementResult.Applied(settlement.BotWalletBefore, settlement.BotWalletAfter);
             }
             catch (Exception ex)
@@ -7306,7 +7309,7 @@ public class TenantBotService
                 order.UpdatedAtUtc = DateTime.UtcNow;
                 await _userDbcontext.SaveChangesAsync(CancellationToken);
                 await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, ex.Message, CancellationToken);
-                LOGTENANTORDER(order, owner, customer, Source, "Exception");
+                LOGTENANTORDER(order, owner, customer, Source, $"Exception ({ex.GetType().Name})", timing: operationTiming.Snapshot());
                 return NowPaymentsSettlementResult.InvalidAmount();
             }
         }
@@ -8897,24 +8900,33 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Writes the operational payment/account log for A tenant storefront order.
+    /// Writes the operational payment/account log for a tenant storefront order.
     /// </summary>
-    /// <param name="order">tenant order being logged.</param>
-    /// <param name="owner">colleague owner shown in the log.</param>
-    /// <param name="customer">customer shown in the log.</param>
-    /// <param name="Source">settlement Source such as ipn, manual check, or Exception path.</param>
-    /// <param name="result">final local result of the order processing Attempt.</param>
+    /// <param name="order">Tenant-scoped order supplying plan, bot, provider, and amount context.</param>
+    /// <param name="owner">Colleague owner whose Telegram identity and settlement balance appear in the audit.</param>
+    /// <param name="customer">Customer who paid for or requested the tenant order.</param>
+    /// <param name="Source">Non-secret settlement source such as IPN, manual check, or exception path.</param>
+    /// <param name="result">Coarse final result of the current order-processing attempt.</param>
     /// <param name="settlement">
     /// Optional owner settlement result. Successful tenant fulfillment passes this value so the audit log can show
     /// bot-wallet and Gozargah website-wallet before/after values without adding new database columns.
     /// </param>
+    /// <param name="timing">
+    /// Optional panel-API and end-to-end duration snapshot for create or renewal fulfillment. Payment-only order logs
+    /// pass null because waiting for a gateway is not an XUI activity and must not be reported as API latency.
+    /// </param>
+    /// <remarks>
+    /// The method sends an HTML audit and does not itself mutate the order, wallets, ledger, payment, or XUI panel.
+    /// UUID locks, subscription identifiers, configuration links, provider bodies, and tokens are excluded.
+    /// </remarks>
     private void LOGTENANTORDER(
         TenantBotOrder order,
         CredUser owner,
         CredUser customer,
         string Source,
         string result,
-        TenantOwnerWalletSettlementResult settlement = null)
+        TenantOwnerWalletSettlementResult settlement = null,
+        XuiOperationTimingSnapshot? timing = null)
     {
         var settlementText = settlement == null
             ? string.Empty
@@ -8942,7 +8954,10 @@ public class TenantBotService
                       $"سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
                       settlementText +
                       $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>" +
-                      BuildTenantOrderErrorLine(order);
+                      BuildTenantOrderErrorLine(order) +
+                      (timing.HasValue
+                          ? "\n\n" + XuiOperationTiming.BuildHtmlLines(timing.Value)
+                          : string.Empty);
 
         _logger.LogPayment(Message);
     }
@@ -10223,6 +10238,8 @@ public class TenantBotService
     /// into tenant order errors, Telegram messages, or central payment logs.
     /// The volume-reminder cycle is advanced best-effort after the update/reset and before settlement persistence;
     /// reminder-state failure cannot roll back the panel renewal or alter owner/customer balances.
+    /// The central order audit reports accumulated panel API time and total renewal/settlement time; time waiting for
+    /// the payment provider or customer action is excluded.
     /// </remarks>
     private async Task<NowPaymentsSettlementResult> FULFILLPAIDTENANTRENEWORDERASYNC(
         TenantBotOrder order,
@@ -10237,6 +10254,7 @@ public class TenantBotService
         if (await ISTENANTORDERALREADYFULFILLEDASYNC(order, cancellationToken))
             return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
 
+        using var operationTiming = XuiOperationTiming.Start();
         var serverInfo = BuildConfiguredPanelServerInfo();
         var hasExactTargetLock = !string.IsNullOrWhiteSpace(order.TargetAccountUuid);
         var client = hasExactTargetLock
@@ -10258,7 +10276,7 @@ public class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _userDbcontext.SaveChangesAsync(cancellationToken);
             await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, "اکانت هدف تمدید پیدا نشد یا اطلاعات هویتی آن تغییر کرده است.", cancellationToken);
-            LOGTENANTORDER(order, owner, customer, source, "renew-target-authorization-failed");
+            LOGTENANTORDER(order, owner, customer, source, "renew-target-authorization-failed", timing: operationTiming.Snapshot());
             return NowPaymentsSettlementResult.NotFound();
         }
 
@@ -10281,7 +10299,7 @@ public class TenantBotService
                 order,
                 "تمدید در پنل انجام نشد. لطفاً کمی بعد وضعیت سفارش را دوباره بررسی کنید.",
                 cancellationToken);
-            LOGTENANTORDER(order, owner, customer, source, "renew-update-failed");
+            LOGTENANTORDER(order, owner, customer, source, "renew-update-failed", timing: operationTiming.Snapshot());
             return NowPaymentsSettlementResult.InvalidAmount();
         }
 
@@ -10365,7 +10383,7 @@ public class TenantBotService
         await SENDTENANTRENEWSUCCESSASYNC(order, renewal, cancellationToken);
         await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, cancellationToken, settlement);
         await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, settlement.BotWalletBefore, settlement.BotWalletAfter, cancellationToken);
-        LOGTENANTORDER(order, owner, customer, source, "renew-fulfilled", settlement);
+        LOGTENANTORDER(order, owner, customer, source, "renew-fulfilled", settlement, operationTiming.Snapshot());
         return NowPaymentsSettlementResult.Applied(settlement.BotWalletBefore, settlement.BotWalletAfter);
     }
 
