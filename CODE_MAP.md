@@ -86,7 +86,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   the embedded OFL-licensed `Assets/Fonts/NotoSans-Regular.ttf`; never fall back to `SKTypeface.Default`, because
   minimal Linux hosts can silently render every chart label blank.
 - `Services/WeeklyUsageReportHostedService.cs`: Saturday 00:01 Tehran report scheduler, catch-up behavior, users.db claim/lease idempotency, and direct central logger delivery through the default owned bot.
-- `Domain/GozargahSite.cs`: Gozargah site API client, sync event models, mapping, and retry helpers.
+- `Domain/GozargahSite.cs`: Gozargah site API client, sync event models, mapping, and retry helpers. `GozargahSiteApiClient.SendAsync<T>` validates HTTP status, Content-Type, and body shape before deserializing: HTML/error-page bodies (`<...`), explicit non-JSON content types, empty bodies, and invalid JSON all become unsuccessful `GozargahSiteApiResponse<T>` values with a bounded, whitespace-collapsed preview (never a raw `JsonReaderException`), so a temporary website failure cannot crash the Telegram update/purchase flow.
 
 ## Tenant Bot Rules
 
@@ -273,8 +273,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   from `PaymentMethod`, never transported in callbacks/logs, and exact email+UUID matching is repeated before preview,
   order creation, payment settlement, or XUI mutation. The payer is audit actor only; existing `TgId`, metadata owner,
   UUID, password, SubId, and protocol identity are preserved.
-- XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`.
-- XUI v3 account creation treats generated email as the idempotency key. If `addClient` or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
+- XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`. Read-only and idempotent-mutation endpoints keep that retry policy; every non-idempotent create (`/clients/add`, `/clients/bulkCreate`, inbound add/import, node add, geo-source add, client-group create, API-token create, DB import, backup-to-Telegram) is sent exactly once with `NoAutomaticRetry` because a timeout can hide a committed side effect.
+- XUI v3 account creation treats generated email as the idempotency key. `addClient` is never replayed: if the add or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
 - XUI v3 failures must never expose panel URLs, root paths, endpoints, responses, tokens, or cookies in Telegram.
   `XuiV3ApiException.Message` is redacted and `XuiV3UserSafeError` owns fixed user-facing creation errors; complete
   endpoint diagnostics are restricted to the private daily error file.
@@ -331,6 +331,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `SetMyCommands` is background initialization and must not stop an already registered receiver.
 - Super-admins can use `🤖 وضعیت ربات‌ها` to see process-local receiver health for every owned, assistant, and tenant bot. The report comes from `BotRuntimeStatusStore`; it never exposes tokens and does not call Telegram.
 - Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel.
+- Telegram `429 Too Many Requests` is handled centrally through `Domain/Logging/TelegramRateLimitPolicy.cs`: the polling error handler pauses the receiver for Telegram's `RetryAfter` (+1s buffer, capped at 60s) before the next `getUpdates` (Telegram.Bot 19.x does not delay on its own and would tight-loop), the update wrapper swallows a 429 after the same backoff instead of letting it kill the receiver, and `Domain/Logging/TelegramLogSuppression.cs` suppresses any log entry whose exception is a Telegram 429 so the logger never amplifies the rate-limit storm. Receivers keep polling after the window and are never restarted, so no duplicate receiver instances can appear.
 - `Domain/Logging/TelegramLogger.cs` also applies message-level channel suppression for known noncritical noise: stale Sales Assistant callbacks, unchanged Telegram edits, receipt-photo relay warnings that have a text fallback, repeated tenant forced-join probes, and Telegram polling 5xx/429/timeouts. Payment/audit logs and real token/XUI/settlement failures should still reach the private channel.
 - `CredentialsDbContext` and legacy `UserDbContext` state helper methods are still singleton-backed in DI and currently use a `SemaphoreSlim` gate as a temporary concurrency guard. The long-term fix is a separate refactor to per-operation DbContext/factory usage.
 - New wallet-ledger, referral, and scheduled usage-report operations use `UserDbContextFactory` per operation; legacy

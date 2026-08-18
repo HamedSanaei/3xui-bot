@@ -643,9 +643,15 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<XuiV3Inbound>> GetInboundAsync(ServerInfo serverInfo, IConfiguration configuration, int id, CancellationToken cancellationToken = default)
         => SendAsync<XuiV3Inbound>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/inbounds/get/{id}", null, true, cancellationToken);
 
-    /// <summary>POST /panel/api/inbounds/add. Creates an inbound. Body can include nested JSON settings and streamSettings.</summary>
+    /// <summary>
+    /// POST /panel/api/inbounds/add. Creates an inbound. Body can include nested JSON settings and streamSettings.
+    /// </summary>
+    /// <remarks>
+    /// Creating an inbound is a non-idempotent mutation, so transient failures are not automatically replayed; the
+    /// request is sent exactly once with <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> AddInboundAsync(ServerInfo serverInfo, IConfiguration configuration, XuiV3Inbound inbound, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/inbounds/add", inbound, true, cancellationToken);
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/inbounds/add", inbound, true, cancellationToken, retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
     /// <summary>POST /panel/api/inbounds/del/{id}. Deletes an inbound and its client stats rows.</summary>
     public static Task<XuiV3ApiResponse<JToken>> DeleteInboundAsync(ServerInfo serverInfo, IConfiguration configuration, int id, CancellationToken cancellationToken = default)
@@ -655,9 +661,15 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> BulkDeleteInboundsAsync(ServerInfo serverInfo, IConfiguration configuration, IEnumerable<int> ids, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/inbounds/bulkDel", new { ids = ids?.ToList() ?? new List<int>() }, true, cancellationToken);
 
-    /// <summary>POST /panel/api/inbounds/import. Imports an inbound JSON blob exported from a panel.</summary>
+    /// <summary>
+    /// POST /panel/api/inbounds/import. Imports an inbound JSON blob exported from a panel.
+    /// </summary>
+    /// <remarks>
+    /// Importing an inbound creates panel state and is non-idempotent, so the request is sent exactly once with
+    /// <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> ImportInboundAsync(ServerInfo serverInfo, IConfiguration configuration, object importPayload, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/inbounds/import", importPayload, true, cancellationToken);
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/inbounds/import", importPayload, true, cancellationToken, retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
     /// <summary>POST /panel/api/inbounds/update/{id}. Replaces an inbound configuration.</summary>
     public static Task<XuiV3ApiResponse<JToken>> UpdateInboundAsync(ServerInfo serverInfo, IConfiguration configuration, int id, XuiV3Inbound inbound, CancellationToken cancellationToken = default)
@@ -716,13 +728,54 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<XuiV3Client>> GetClientAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default)
         => SendAsync<XuiV3Client>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/clients/get/{EscapePath(email)}", null, true, cancellationToken);
 
-    /// <summary>POST /panel/api/clients/add. Creates a client and attaches it to one or more inbounds.</summary>
+    /// <summary>
+    /// POST /panel/api/clients/add. Creates a client and attaches it to one or more inbounds.
+    /// </summary>
+    /// <param name="serverInfo">Target XUI v3 panel descriptor containing endpoint and authentication metadata.</param>
+    /// <param name="configuration">Runtime timeout and retry configuration.</param>
+    /// <param name="request">Client payload plus the inbound ids the client must be attached to.</param>
+    /// <param name="cancellationToken">Token that cancels the panel request.</param>
+    /// <returns>The panel add-client response envelope. A failed response must not be replayed by the caller.</returns>
+    /// <remarks>
+    /// This endpoint is a non-idempotent mutation: a timeout can hide a committed server-side creation, so the request
+    /// is sent exactly once (<see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>). Ambiguous failures must be resolved
+    /// by reading the panel back by email through the creation recovery path instead of re-sending the mutation, which
+    /// would otherwise risk duplicate clients for one purchase.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> AddClientAsync(ServerInfo serverInfo, IConfiguration configuration, XuiV3ClientCreateRequest request, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/add", request, true, cancellationToken);
+        => SendAsync<JToken>(
+            serverInfo,
+            configuration,
+            HttpMethod.Post,
+            "/panel/api/clients/add",
+            request,
+            true,
+            cancellationToken,
+            retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
-    /// <summary>POST /panel/api/clients/bulkCreate. Creates many clients in one request.</summary>
+    /// <summary>
+    /// POST /panel/api/clients/bulkCreate. Creates many clients in one request.
+    /// </summary>
+    /// <param name="serverInfo">Target XUI v3 panel descriptor containing endpoint and authentication metadata.</param>
+    /// <param name="configuration">Runtime timeout and retry configuration.</param>
+    /// <param name="requests">Client payloads that must each be created and attached to their inbound ids.</param>
+    /// <param name="cancellationToken">Token that cancels the panel request.</param>
+    /// <returns>The panel bulk-create response envelope. A failed response must not be replayed by the caller.</returns>
+    /// <remarks>
+    /// Bulk creation is a non-idempotent mutation with no provider idempotency key. It is sent exactly once
+    /// (<see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>) so a timeout cannot hide a partially committed batch and
+    /// be replayed into duplicate clients.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> BulkCreateClientsAsync(ServerInfo serverInfo, IConfiguration configuration, IEnumerable<XuiV3ClientCreateRequest> requests, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/bulkCreate", requests?.ToList() ?? new List<XuiV3ClientCreateRequest>(), true, cancellationToken);
+        => SendAsync<JToken>(
+            serverInfo,
+            configuration,
+            HttpMethod.Post,
+            "/panel/api/clients/bulkCreate",
+            requests?.ToList() ?? new List<XuiV3ClientCreateRequest>(),
+            true,
+            cancellationToken,
+            retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
     /// <summary>
     /// Replaces an XUI v3 client row by email while normalizing legacy extension fields that newer panel versions
@@ -1496,9 +1549,15 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<List<string>>> GetClientGroupEmailsAsync(ServerInfo serverInfo, IConfiguration configuration, string name, CancellationToken cancellationToken = default)
         => SendAsync<List<string>>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/clients/groups/{EscapePath(name)}/emails", null, true, cancellationToken);
 
-    /// <summary>POST /panel/api/clients/groups/create. Creates a placeholder group.</summary>
+    /// <summary>
+    /// POST /panel/api/clients/groups/create. Creates a placeholder group.
+    /// </summary>
+    /// <remarks>
+    /// Group creation is a non-idempotent mutation, so the request is sent exactly once with
+    /// <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> CreateClientGroupAsync(ServerInfo serverInfo, IConfiguration configuration, string name, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/groups/create", new { name }, true, cancellationToken);
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/groups/create", new { name }, true, cancellationToken, retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
     /// <summary>POST /panel/api/clients/groups/delete. Deletes a group and clears that label from clients.</summary>
     public static Task<XuiV3ApiResponse<JToken>> DeleteClientGroupAsync(ServerInfo serverInfo, IConfiguration configuration, string name, CancellationToken cancellationToken = default)
@@ -1524,9 +1583,15 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<XuiV3Node>> GetNodeAsync(ServerInfo serverInfo, IConfiguration configuration, int id, CancellationToken cancellationToken = default)
         => SendAsync<XuiV3Node>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/nodes/get/{id}", null, true, cancellationToken);
 
-    /// <summary>POST /panel/api/nodes/add. Registers a remote node with URL and API token.</summary>
+    /// <summary>
+    /// POST /panel/api/nodes/add. Registers a remote node with URL and API token.
+    /// </summary>
+    /// <remarks>
+    /// Node registration creates panel state and is non-idempotent, so the request is sent exactly once with
+    /// <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> AddNodeAsync(ServerInfo serverInfo, IConfiguration configuration, XuiV3Node node, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/nodes/add", node, true, cancellationToken);
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/nodes/add", node, true, cancellationToken, retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
     /// <summary>POST /panel/api/nodes/update/{id}. Replaces a node connection definition.</summary>
     public static Task<XuiV3ApiResponse<JToken>> UpdateNodeAsync(ServerInfo serverInfo, IConfiguration configuration, int id, XuiV3Node node, CancellationToken cancellationToken = default)
@@ -1572,9 +1637,15 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> GetCustomGeoAliasesAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Get, "/panel/api/custom-geo/aliases", null, true, cancellationToken);
 
-    /// <summary>POST /panel/api/custom-geo/add. Adds a custom geo source URL.</summary>
+    /// <summary>
+    /// POST /panel/api/custom-geo/add. Adds a custom geo source URL.
+    /// </summary>
+    /// <remarks>
+    /// Adding a geo source creates panel state and is non-idempotent, so the request is sent exactly once with
+    /// <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> AddCustomGeoSourceAsync(ServerInfo serverInfo, IConfiguration configuration, XuiV3CustomGeoSource source, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/custom-geo/add", source, true, cancellationToken);
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/custom-geo/add", source, true, cancellationToken, retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
     /// <summary>POST /panel/api/custom-geo/update/{id}. Replaces a custom geo source.</summary>
     public static Task<XuiV3ApiResponse<JToken>> UpdateCustomGeoSourceAsync(ServerInfo serverInfo, IConfiguration configuration, int id, XuiV3CustomGeoSource source, CancellationToken cancellationToken = default)
@@ -1592,9 +1663,15 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> UpdateAllCustomGeoSourcesAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/custom-geo/update-all", null, true, cancellationToken);
 
-    /// <summary>POST /panel/api/backuptotgbot. Sends a DB backup to configured Telegram chats.</summary>
+    /// <summary>
+    /// POST /panel/api/backuptotgbot. Sends a DB backup to configured Telegram chats.
+    /// </summary>
+    /// <remarks>
+    /// The backup action has a real side effect on Telegram and is non-idempotent, so the request is sent exactly once
+    /// with <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/> instead of replaying a duplicate backup message.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> BackupToTelegramBotAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/backuptotgbot", null, true, cancellationToken);
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/backuptotgbot", null, true, cancellationToken, retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
     /// <summary>GET /panel/api/server/status. Real-time machine and Xray status.</summary>
     public static Task<XuiV3ApiResponse<XuiV3ServerStatus>> GetServerStatusAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
@@ -1684,7 +1761,18 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> GetXrayLogsAsync(ServerInfo serverInfo, IConfiguration configuration, int count, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/server/xraylogs/{count}", null, true, cancellationToken);
 
-    /// <summary>POST /panel/api/server/importDB. Restores the panel DB from a local SQLite file path.</summary>
+    /// <summary>
+    /// POST /panel/api/server/importDB. Restores the panel DB from a local SQLite file path.
+    /// </summary>
+    /// <param name="serverInfo">Target XUI v3 panel descriptor containing endpoint and authentication metadata.</param>
+    /// <param name="configuration">Runtime timeout and retry configuration.</param>
+    /// <param name="dbFilePath">Absolute path of the local SQLite database file to upload.</param>
+    /// <param name="cancellationToken">Token that cancels the multipart upload.</param>
+    /// <returns>The panel import response envelope.</returns>
+    /// <remarks>
+    /// Restoring a database overwrites panel state and is non-idempotent, so the upload is sent exactly once with
+    /// <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>; a timeout must never trigger a blind second import.
+    /// </remarks>
     public static async Task<XuiV3ApiResponse<JToken>> ImportDatabaseAsync(ServerInfo serverInfo, IConfiguration configuration, string dbFilePath, CancellationToken cancellationToken = default)
     {
         var fileName = Path.GetFileName(dbFilePath);
@@ -1702,7 +1790,8 @@ public class ApiServicev3
             true,
             cancellationToken,
             query: null,
-            requestBodyForLog: "<multipart-db-content>");
+            requestBodyForLog: "<multipart-db-content>",
+            retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
         return JsonConvert.DeserializeObject<XuiV3ApiResponse<JToken>>(raw) ?? new XuiV3ApiResponse<JToken>();
     }
 
@@ -1750,9 +1839,15 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<List<XuiV3ApiTokenInfo>>> GetApiTokensAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
         => SendAsync<List<XuiV3ApiTokenInfo>>(serverInfo, configuration, HttpMethod.Get, "/panel/setting/apiTokens", null, true, cancellationToken);
 
-    /// <summary>POST /panel/setting/apiTokens/create. Creates a Bearer token. The plaintext token is returned only once.</summary>
+    /// <summary>
+    /// POST /panel/setting/apiTokens/create. Creates a Bearer token. The plaintext token is returned only once.
+    /// </summary>
+    /// <remarks>
+    /// Token creation is non-idempotent and the plaintext is returned only once, so the request is sent exactly once
+    /// with <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/> to avoid losing or duplicating credentials.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<XuiV3ApiTokenCreated>> CreateApiTokenAsync(ServerInfo serverInfo, IConfiguration configuration, string name, CancellationToken cancellationToken = default)
-        => SendAsync<XuiV3ApiTokenCreated>(serverInfo, configuration, HttpMethod.Post, "/panel/setting/apiTokens/create", new { name }, true, cancellationToken);
+        => SendAsync<XuiV3ApiTokenCreated>(serverInfo, configuration, HttpMethod.Post, "/panel/setting/apiTokens/create", new { name }, true, cancellationToken, retryMode: XuiV3RequestRetryMode.NoAutomaticRetry);
 
     /// <summary>POST /panel/setting/apiTokens/delete/{id}. Permanently deletes an API token.</summary>
     public static Task<XuiV3ApiResponse<JToken>> DeleteApiTokenAsync(ServerInfo serverInfo, IConfiguration configuration, int id, CancellationToken cancellationToken = default)

@@ -1274,15 +1274,35 @@ public class MultiBotHostedService : IHostedService
     /// the affected tenant bot and then delegates normal error logging to the shared dispatcher.
     /// User-block and chat-not-found errors are treated as definitive per-user delivery failures. Request timeouts
     /// and Telegram 5xx responses are treated as transient polling transport failures and do not change chat state
-    /// or stop the receiver. A Telegram 409 getUpdates conflict means another
-    /// process or receiver is already polling the same token; this receiver is stopped to prevent noisy conflict
-    /// loops. Telegram 5xx gateway bursts are ignored here because the polling loop retries them and they otherwise
-    /// spam the private log channel.
+    /// or stop the receiver. A Telegram 429 rate limit pauses this receiver for Telegram's <c>RetryAfter</c> window
+    /// (plus a small buffer) before the polling loop issues the next <c>getUpdates</c>, because Telegram.Bot 19.x does
+    /// not delay on its own and would otherwise tight-loop through the whole rate-limit window. A Telegram 409
+    /// getUpdates conflict means another process or receiver is already polling the same token; this receiver is
+    /// stopped to prevent noisy conflict loops.
     /// </remarks>
     private async Task HandleBotPollingErrorAsync(string botId, Exception exception, CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested || exception is OperationCanceledException)
             return;
+
+        if (TelegramRateLimitPolicy.IsRateLimited(exception))
+        {
+            var retryDelay = TelegramRateLimitPolicy.GetRetryDelay(exception);
+            _logger.LogDebug(
+                "Telegram polling rate limited; pausing this receiver before the next getUpdates call. botId={BotId}, retryAfterSeconds={RetryAfterSeconds}",
+                botId,
+                retryDelay.TotalSeconds);
+            try
+            {
+                await Task.Delay(retryDelay, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // Receiver shutdown while waiting for the rate-limit window to pass is the normal stop path.
+            }
+
+            return;
+        }
 
         if (IsTelegramUserDeliveryError(exception))
         {
@@ -1403,12 +1423,13 @@ public class MultiBotHostedService : IHostedService
     /// </summary>
     /// <param name="exception">Exception raised by the Telegram polling loop.</param>
     /// <returns>
-    /// <c>true</c> for Telegram request timeouts and 5xx gateway/server responses that should be retried by polling;
-    /// otherwise <c>false</c>.
+    /// <c>true</c> for Telegram request timeouts, HTTP 429 rate limits, and 5xx gateway/server responses that should
+    /// be retried by polling; otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
     /// Telegram occasionally returns request timeouts or bursts of 502 Bad Gateway from <c>getUpdates</c>. Those
-    /// failures do not mean a user chat, bot token, or receiver is broken.
+    /// failures do not mean a user chat, bot token, or receiver is broken. HTTP 429 is included so startup probes and
+    /// polling treat rate limits as transient instead of reporting a tenant failure through the Telegram log channel.
     /// </remarks>
     private static bool IsTelegramTransientGatewayPollingError(Exception exception)
     {
@@ -1424,7 +1445,7 @@ public class MultiBotHostedService : IHostedService
             return false;
 
         var message = apiException.Message ?? string.Empty;
-        return apiException.ErrorCode is 500 or 502 or 503 or 504 ||
+        return apiException.ErrorCode is 429 or 500 or 502 or 503 or 504 ||
                message.Contains("bad gateway", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("gateway timeout", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("service unavailable", StringComparison.OrdinalIgnoreCase);

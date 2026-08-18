@@ -383,7 +383,10 @@ public class TelegramBotService : IHostedService
     /// Telegram can throw per-user delivery errors when a customer blocks an owned bot, tenant bot, or assistant bot.
     /// It can also raise transient request timeouts while sending a reply. Those errors are logged as skipped
     /// deliveries and are not rethrown, so the polling loop does not treat one unreachable chat or one slow Telegram
-    /// request as a receiver failure. All other exceptions are still logged and rethrown for the polling error pipeline.
+    /// request as a receiver failure. A Telegram 429 rate limit is likewise swallowed after backing off for
+    /// Telegram's <c>RetryAfter</c> window; rethrowing it would terminate the receiver, and reporting it back through
+    /// the Telegram logger channel would amplify the rate-limit storm. All other exceptions are still logged and
+    /// rethrown for the polling error pipeline.
     /// </remarks>
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
@@ -394,6 +397,40 @@ public class TelegramBotService : IHostedService
         catch (Exception ex)
         {
             var credUser = GetCreduserFromUpdate(update);
+            if (TelegramRateLimitPolicy.IsRateLimited(ex))
+            {
+                var retryDelay = TelegramRateLimitPolicy.GetRetryDelay(ex);
+                await _userActivityLog.LogWarningAsync(
+                    "handle_update_rate_limited",
+                    credUser,
+                    IsSuperAdminUser(credUser?.TelegramUserId ?? 0),
+                    new Dictionary<string, object>
+                    {
+                        ["updateType"] = update?.Type.ToString() ?? "unknown",
+                        ["telegramError"] = ex.Message ?? string.Empty,
+                        ["botId"] = BotContextAccessor.CurrentBotId ?? string.Empty
+                    },
+                    cancellationToken);
+
+                _logger.LogWarning(
+                    "Telegram update handling rate limited; backing off before the next update. botId={BotId}, userId={UserId}, chatId={ChatId}, retryAfterSeconds={RetryAfterSeconds}",
+                    BotContextAccessor.CurrentBotId,
+                    credUser?.TelegramUserId,
+                    update?.Message?.Chat.Id ?? update?.CallbackQuery?.Message?.Chat.Id,
+                    retryDelay.TotalSeconds);
+
+                try
+                {
+                    await Task.Delay(retryDelay, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Receiver shutdown while waiting for the rate-limit window is the normal stop path.
+                }
+
+                return;
+            }
+
             if (IsUserDeliveryPollingError(ex))
             {
                 await _userActivityLog.LogWarningAsync(
@@ -7827,13 +7864,13 @@ public class TelegramBotService : IHostedService
     /// </summary>
     /// <param name="exception">Exception raised by Telegram polling or update handling.</param>
     /// <returns>
-    /// <c>true</c> when Telegram returned a transient gateway/server response such as 502 Bad Gateway; otherwise
-    /// <c>false</c>.
+    /// <c>true</c> when Telegram returned a transient response such as a 429 rate limit or a 502 Bad Gateway;
+    /// otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
     /// These errors happen before a user update is available and are retried by the polling loop. They are written
     /// to the local activity file as warnings but logged only at debug level through <see cref="ILogger"/> so the
-    /// private Telegram logger channel does not receive repeated non-actionable 502 messages.
+    /// private Telegram logger channel does not receive repeated non-actionable rate-limit or 502 messages.
     /// </remarks>
     private static bool IsTransientTelegramPollingError(Exception exception)
     {
@@ -7841,7 +7878,7 @@ public class TelegramBotService : IHostedService
             return false;
 
         var message = apiException.Message ?? string.Empty;
-        return apiException.ErrorCode is 500 or 502 or 503 or 504 ||
+        return apiException.ErrorCode is 429 or 500 or 502 or 503 or 504 ||
                message.Contains("bad gateway", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("gateway timeout", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("service unavailable", StringComparison.OrdinalIgnoreCase);

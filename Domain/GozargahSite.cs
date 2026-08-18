@@ -517,18 +517,25 @@ namespace Adminbot.Domain
         /// <param name="body">Request body containing the <c>action</c> field and action-specific arguments.</param>
         /// <param name="cancellationToken">Cancellation token for the outbound HTTP request.</param>
         /// <returns>
-        /// Parsed API response. HTTP errors are converted to unsuccessful responses so callers can persist retry state.
-        /// Expected <c>get_user</c> misses are returned without warning logs because most bot users do not have a
-        /// Gozargah website account.
+        /// Parsed API response. HTTP errors, non-JSON content types, HTML/error-page bodies, empty bodies, and invalid
+        /// JSON are all converted to unsuccessful responses so callers can persist retry state and the Telegram update
+        /// flow never crashes with an unhandled <see cref="JsonReaderException"/>. Expected <c>get_user</c> misses are
+        /// returned without warning logs because most bot users do not have a Gozargah website account.
         /// </returns>
         /// <remarks>
         /// The API key is sent only in the Authorization header and is never written to logs. Configuration errors throw
         /// because callers should not enqueue website traffic when the API endpoint or key is missing.
         ///
+        /// Response validation:
+        /// Before any JSON deserialization the method checks the HTTP status, the Content-Type media type, and the
+        /// leading characters of the body. A reverse proxy or maintenance page commonly returns HTML with a 200 status;
+        /// those bodies are rejected with a sanitized diagnostic instead of being parsed. Diagnostic previews are
+        /// truncated and whitespace-collapsed so logs and retry states never receive huge markup or control characters.
+        ///
         /// Logging rule:
         /// A missing website user during wallet-button eligibility checks is a normal business outcome, not an
-        /// operational API failure. Other HTTP failures still emit warnings so sync, wallet debit, and order lifecycle
-        /// problems remain visible to operators.
+        /// operational API failure. Other HTTP and response-shape failures still emit warnings so sync, wallet debit,
+        /// and order lifecycle problems remain visible to operators.
         /// </remarks>
         private async Task<GozargahSiteApiResponse<T>> SendAsync<T>(object body, CancellationToken cancellationToken)
         {
@@ -545,29 +552,126 @@ namespace Adminbot.Domain
 
             using var response = await httpClient.SendAsync(request, cancellationToken);
             var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
+            var contentType = response.Content.Headers.ContentType?.MediaType;
+
             if (!response.IsSuccessStatusCode)
             {
                 if (!IsExpectedMissingUserResponse(action, response.StatusCode, responseText))
                 {
                     _logger.LogWarning(
-                        "Gozargah site API returned HTTP {StatusCode}. Body={Body}",
+                        "Gozargah site API returned HTTP {StatusCode} with content type {ContentType}. Body={BodyPreview}",
                         (int)response.StatusCode,
-                        responseText);
+                        contentType ?? "unknown",
+                        SanitizeBodyPreview(responseText));
                 }
 
                 return new GozargahSiteApiResponse<T>
                 {
                     Success = false,
-                    Message = $"HTTP {(int)response.StatusCode}: {responseText}"
+                    Message = $"HTTP {(int)response.StatusCode}: {SanitizeBodyPreview(responseText)}"
                 };
             }
 
-            return JsonConvert.DeserializeObject<GozargahSiteApiResponse<T>>(responseText) ??
-                   new GozargahSiteApiResponse<T>
-                   {
-                       Success = false,
-                       Message = "Gozargah site API returned an empty response."
-                   };
+            if (!HasJsonCompatibleContentType(contentType) || StartsWithMarkup(responseText))
+            {
+                _logger.LogWarning(
+                    "Gozargah site API returned a non-JSON success response with content type {ContentType}. Body={BodyPreview}",
+                    contentType ?? "unknown",
+                    SanitizeBodyPreview(responseText));
+
+                return new GozargahSiteApiResponse<T>
+                {
+                    Success = false,
+                    Message = $"Non-JSON response (content type {contentType ?? "unknown"}): {SanitizeBodyPreview(responseText)}"
+                };
+            }
+
+            try
+            {
+                return JsonConvert.DeserializeObject<GozargahSiteApiResponse<T>>(responseText) ??
+                       new GozargahSiteApiResponse<T>
+                       {
+                           Success = false,
+                           Message = "Gozargah site API returned an empty response."
+                       };
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Gozargah site API returned invalid JSON with content type {ContentType}. Body={BodyPreview}",
+                    contentType ?? "unknown",
+                    SanitizeBodyPreview(responseText));
+
+                return new GozargahSiteApiResponse<T>
+                {
+                    Success = false,
+                    Message = $"Invalid JSON response (content type {contentType ?? "unknown"}): {SanitizeBodyPreview(responseText)}"
+                };
+            }
+        }
+
+        /// <summary>
+        /// Checks whether a response body is safe to pass to JSON deserialization based on its content type.
+        /// </summary>
+        /// <param name="contentType">
+        /// Media type returned by the Gozargah website, or null when the response has no Content-Type header.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> when the media type is missing, JSON, or plain text (which some PHP APIs use for JSON bodies);
+        /// otherwise <c>false</c> so HTML/octet-stream/other binary responses are rejected before parsing.
+        /// </returns>
+        /// <remarks>
+        /// Missing and plain-text content types are allowed because the documented API endpoint can serve JSON without
+        /// a precise <c>application/json</c> header. Explicit HTML or binary content types are never parsed.
+        /// </remarks>
+        private static bool HasJsonCompatibleContentType(string contentType)
+        {
+            if (string.IsNullOrWhiteSpace(contentType))
+                return true;
+
+            return contentType.Contains("json", StringComparison.OrdinalIgnoreCase) ||
+                   contentType.Contains("text/plain", StringComparison.OrdinalIgnoreCase) ||
+                   contentType.Contains("text/json", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Detects HTML or XML error-page bodies that must never be handed to JSON deserialization.
+        /// </summary>
+        /// <param name="responseText">Raw response body returned by the Gozargah website API.</param>
+        /// <returns>
+        /// <c>true</c> when the trimmed body starts with a markup character such as <c>&lt;</c>, which is typical of
+        /// reverse-proxy, framework, or maintenance error pages; otherwise <c>false</c>.
+        /// </returns>
+        private static bool StartsWithMarkup(string responseText)
+        {
+            var trimmed = (responseText ?? string.Empty).TrimStart();
+            return trimmed.Length > 0 && trimmed[0] == '<';
+        }
+
+        /// <summary>
+        /// Produces a bounded, whitespace-collapsed preview of an API response body for logs and retry state.
+        /// </summary>
+        /// <param name="responseText">Raw response body returned by the Gozargah website API.</param>
+        /// <returns>
+        /// A single-line preview of at most <see cref="MaxBodyPreviewLength"/> characters, or an empty string when the
+        /// body is null. Control characters and surrounding whitespace are removed so markup or binary data cannot
+        /// flood the private logger channel or a persisted retry row.
+        /// </returns>
+        private static string SanitizeBodyPreview(string responseText)
+        {
+            const int MaxBodyPreviewLength = 500;
+
+            if (string.IsNullOrWhiteSpace(responseText))
+                return string.Empty;
+
+            var collapsed = new string(
+                responseText.Where(character => !char.IsControl(character)).ToArray())
+                .Trim();
+
+            return collapsed.Length <= MaxBodyPreviewLength
+                ? collapsed
+                : collapsed[..MaxBodyPreviewLength] + "...";
         }
 
         /// <summary>

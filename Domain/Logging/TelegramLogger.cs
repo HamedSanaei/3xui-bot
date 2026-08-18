@@ -143,56 +143,14 @@ namespace Adminbot.Domain.Logging
         /// stale callbacks, unchanged Telegram edits, receipt-photo relay failures that have a text fallback,
         /// repeated tenant forced-join probes, and Telegram polling 5xx/429/timeouts. Business failures such as
         /// invalid tokens, duplicate tokens, XUI delivery failures, and payment settlement errors are not suppressed.
+        ///
+        /// A Telegram 429 exception is suppressed structurally before any message text is inspected: the failure
+        /// being reported is Telegram rate limiting, so sending a Telegram notification about it would trigger
+        /// another send under the same rate limit and amplify the storm.
         /// </remarks>
         private bool ShouldSuppressChannelDelivery(string message, Exception exception)
         {
-            var combined = string.Join(
-                "\n",
-                new[]
-                {
-                    message ?? string.Empty,
-                    exception?.Message ?? string.Empty
-                }.Where(x => !string.IsNullOrWhiteSpace(x)));
-
-            if (string.IsNullOrWhiteSpace(combined))
-                return false;
-
-            if (ContainsOrdinalIgnoreCase(combined, "Ignoring stale sales-assistant callback answer") ||
-                ContainsOrdinalIgnoreCase(combined, "Ignoring unchanged sales-assistant reply markup") ||
-                ContainsOrdinalIgnoreCase(combined, "Ignoring unchanged sales-assistant receipt caption") ||
-                ContainsOrdinalIgnoreCase(combined, "sales assistant receipt notification failed") ||
-                ContainsOrdinalIgnoreCase(combined, "tenant forced-join validation failed") ||
-                ContainsOrdinalIgnoreCase(combined, "tenant forced-join check failed"))
-            {
-                return true;
-            }
-
-            var isTelegramPollingNoise =
-                ContainsOrdinalIgnoreCase(combined, "Telegram polling") ||
-                ContainsOrdinalIgnoreCase(combined, "polling delivery") ||
-                ContainsOrdinalIgnoreCase(combined, "getUpdates");
-
-            if (!isTelegramPollingNoise)
-                return false;
-
-            return ContainsOrdinalIgnoreCase(combined, "Bad Gateway") ||
-                   ContainsOrdinalIgnoreCase(combined, "gateway timeout") ||
-                   ContainsOrdinalIgnoreCase(combined, "service unavailable") ||
-                   ContainsOrdinalIgnoreCase(combined, "Too Many Requests") ||
-                   ContainsOrdinalIgnoreCase(combined, "Request timed out");
-        }
-
-        /// <summary>
-        /// Checks whether a string contains another string using ordinal, case-insensitive comparison.
-        /// </summary>
-        /// <param name="source">Text to inspect. A null value is treated as no match.</param>
-        /// <param name="value">Needle to find. A null or empty value is treated as no match.</param>
-        /// <returns><c>true</c> when <paramref name="value"/> appears in <paramref name="source"/>; otherwise <c>false</c>.</returns>
-        private static bool ContainsOrdinalIgnoreCase(string source, string value)
-        {
-            return !string.IsNullOrEmpty(source) &&
-                   !string.IsNullOrEmpty(value) &&
-                   source.IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0;
+            return TelegramLogSuppression.ShouldSuppress(message, exception);
         }
 
 
