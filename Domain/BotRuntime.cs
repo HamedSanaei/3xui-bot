@@ -375,6 +375,15 @@ namespace Adminbot.Domain
         /// valid UUID; those remain owner-checked. This lock grants no management or configuration permission.
         /// </remarks>
         public string RenewTargetUuid { get; set; }
+        /// <summary>
+        /// Stable confirmation-session identity used as the exactly-once renewal operation key.
+        /// </summary>
+        /// <remarks>
+        /// The value is generated once when the renewal flow enters the confirm step and stays stable across
+        /// Telegram redelivery, repeated confirm presses, and process restarts. It is cleared with the conversation
+        /// when the renewal finishes, so a later legitimate renewal starts a brand-new session and a new operation.
+        /// </remarks>
+        public string RenewalSessionId { get; set; }
         public int AccountCounter { get; set; }
         public int PendingAccountCount { get; set; }
         public string PendingUserComment { get; set; }
@@ -412,6 +421,7 @@ namespace Adminbot.Domain
                 LastFreeAcc = user.LastFreeAcc,
                 PaymentMethod = user.PaymentMethod ?? "credit",
                 RenewTargetUuid = user.RenewTargetUuid,
+                RenewalSessionId = user.RenewalSessionId,
                 AccountCounter = user.AccountCounter,
                 PendingAccountCount = user.PendingAccountCount,
                 PendingUserComment = user.PendingUserComment,
@@ -447,6 +457,7 @@ namespace Adminbot.Domain
                 LastFreeAcc = LastFreeAcc,
                 PaymentMethod = PaymentMethod ?? "credit",
                 RenewTargetUuid = RenewTargetUuid,
+                RenewalSessionId = RenewalSessionId,
                 AccountCounter = AccountCounter,
                 PendingAccountCount = PendingAccountCount,
                 PendingUserComment = PendingUserComment,
@@ -480,6 +491,7 @@ namespace Adminbot.Domain
             if (user.AccountCounter > AccountCounter) AccountCounter = user.AccountCounter;
             if (user.PaymentMethod != PaymentMethod) PaymentMethod = user.PaymentMethod;
             if (user.RenewTargetUuid != null) RenewTargetUuid = user.RenewTargetUuid;
+            if (user.RenewalSessionId != null) RenewalSessionId = user.RenewalSessionId;
             if (user.PendingAccountCount > 0) PendingAccountCount = user.PendingAccountCount;
             if (user.PendingUserComment != null) PendingUserComment = user.PendingUserComment;
             if (user.LastFreeAcc > DateTime.MinValue) LastFreeAcc = user.LastFreeAcc;
@@ -509,6 +521,7 @@ namespace Adminbot.Domain
             _ConfigPrice = "0";
             PaymentMethod = "credit";
             RenewTargetUuid = "";
+            RenewalSessionId = "";
             PendingAccountCount = 0;
             PendingUserComment = "";
             UpdatedAtUtc = DateTime.UtcNow;

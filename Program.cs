@@ -79,6 +79,7 @@ class Program
         builder.Services.AddSingleton<UsageReportChartRenderer>();
         builder.Services.AddSingleton<UsageReportDispatchStore>();
         builder.Services.AddSingleton<XuiV3VolumeReminderStateStore>();
+        builder.Services.AddSingleton<XuiV3RenewalOperationStore>();
         builder.Services.AddSingleton<WalletLedgerService>();
         builder.Services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();
         builder.Services.AddSingleton<ReferralService>();

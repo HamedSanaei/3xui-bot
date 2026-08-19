@@ -1080,18 +1080,58 @@ public class XuiV3AdminFlowService
         Console.WriteLine(
             $"[XUIv3] admin renew payload actor={message.From.Id}, email={client.Email}, durationDays={addDays}, currentExpiry={currentExpiryBeforeRenew}, newExpiry={updatedClient.ExpiryTime}, currentExpiryText={FormatExpiry(currentExpiryBeforeRenew)}, newExpiryText={FormatExpiry(updatedClient.ExpiryTime)}, resetTraffic={renewal.ShouldResetTraffic}, totalBytesAfter={renewal.TotalBytesAfterRenew}, targetAvailableBytes={renewal.TargetAvailableTrafficBytes}");
 
-        var updateResponse = await ApiServicev3.UpdateClientAsync(serverInfo, _configuration, client.Email, updatedClient, cancellationToken);
-        if (!updateResponse.Success)
+        var updateSucceeded = false;
+        try
         {
-            _logger.LogTelegramHtml(BuildAdminOperationFailureLogMessage(
-                "تمدید اکانت نسخه ۳ توسط ادمین",
-                message.From.Id,
-                "پنل تمدید را رد کرد",
-                operationTiming.Snapshot(),
-                client.Email));
-            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, $"تمدید ناموفق بود.\n{updateResponse.Msg}", cancellationToken);
-            return;
+            // The admin renewal mutation is sent exactly once with the absolute target; it is never blindly retried.
+            var updateResponse = await ApiServicev3.UpdateClientAsync(
+                serverInfo,
+                _configuration,
+                client.Email,
+                updatedClient,
+                cancellationToken,
+                XuiV3RequestRetryMode.NoAutomaticRetry);
+            updateSucceeded = updateResponse.Success;
+            if (!updateSucceeded)
+            {
+                _logger.LogTelegramHtml(BuildAdminOperationFailureLogMessage(
+                    "تمدید اکانت نسخه ۳ توسط ادمین",
+                    message.From.Id,
+                    "پنل تمدید را رد کرد",
+                    operationTiming.Snapshot(),
+                    client.Email));
+                await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, $"تمدید ناموفق بود.\n{updateResponse.Msg}", cancellationToken);
+                return;
+            }
         }
+        catch (Exception ex) when (ApiServicev3.IsTransientXuiTransportException(ex, cancellationToken))
+        {
+            // Ambiguous timeout: never re-send the update. Read the panel back and compare with the absolute target.
+            var recovery = await ReadAdminRenewalTargetAsync(serverInfo, client.Email, updatedClient, cancellationToken);
+            if (recovery == null)
+            {
+                await _activityLog.LogWarningAsync(
+                    "xui_v3_admin_renew_ambiguous",
+                    await GetActivityActorAsync(message.From.Id),
+                    true,
+                    new Dictionary<string, object>
+                    {
+                        ["accountEmail"] = client.Email,
+                        ["serviceKey"] = service?.Key ?? string.Empty,
+                        ["error"] = ex.Message ?? string.Empty
+                    },
+                    cancellationToken);
+                throw;
+            }
+
+            client = recovery;
+            updateSucceeded = true;
+            Console.WriteLine(
+                $"[XUIv3] admin renew recovered after ambiguous timeout. actor={message.From.Id}, email={client.Email}, totalBytes={client.TotalGB}");
+        }
+
+        if (!updateSucceeded)
+            return;
 
         var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
         await _volumeReminderStateStore.TryBeginNewCycleAfterRenewalAsync(
@@ -1171,6 +1211,49 @@ public class XuiV3AdminFlowService
                 cancellationToken: cancellationToken);
         }
 
+    }
+
+    /// <summary>
+    /// Reads an admin renewal target back from the panel and verifies it reached the absolute target.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel descriptor used only for the read-only request.</param>
+    /// <param name="email">XUI client email being renewed.</param>
+    /// <param name="updatedClient">Absolute replacement payload whose target values are compared.</param>
+    /// <param name="cancellationToken">Token that cancels the read-only panel request.</param>
+    /// <returns>
+    /// The fresh panel client when its quota and expiry already match or exceed the intended target; otherwise
+    /// <c>null</c>. A null result means the admin renewal must be treated as ambiguous and never re-sent.
+    /// </returns>
+    /// <remarks>
+    /// This is the read-only recovery for an admin renewal whose update timed out. It never sends another mutation;
+    /// a failed or inconclusive read returns null so the caller can surface the ambiguity instead of replaying the
+    /// update and possibly doubling the granted traffic.
+    /// </remarks>
+    private async Task<XuiV3Client> ReadAdminRenewalTargetAsync(
+        ServerInfo serverInfo,
+        string email,
+        XuiV3ClientPayload updatedClient,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await ApiServicev3.GetClientAsync(serverInfo, _configuration, email, cancellationToken);
+            if (!response.Success || response.Obj == null)
+                return null;
+
+            var current = response.Obj;
+            var currentTotal = current.TotalGB > 0 ? current.TotalGB : current.Traffic?.TotalGB ?? 0;
+            var currentExpiry = current.ExpiryTime != 0 ? current.ExpiryTime : current.Traffic?.ExpiryTime ?? 0;
+            var targetReached = currentTotal >= updatedClient.TotalGB &&
+                                (updatedClient.ExpiryTime < 0
+                                    ? currentExpiry == updatedClient.ExpiryTime
+                                    : updatedClient.ExpiryTime == 0 || currentExpiry >= updatedClient.ExpiryTime);
+            return targetReached ? current : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>

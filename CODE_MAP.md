@@ -58,6 +58,18 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   both `/start` and `/refresh` whenever their runtime starts.
 - Owned purchase/renewal insufficient-balance messages expose `wallet:charge`. The dispatcher trusts only the callback sender, clears that bot's persisted state plus its in-memory XUI selection, edits the source message, and opens the same live-gateway charge menu as `💰شارژ حساب کاربری`; tenant storefronts never receive this shortcut.
 - `Services/XuiV3RenewalPolicy.cs`: central renewal payload calculation for metered, national, and unlimited accounts.
+- `Services/XuiV3RenewalOperationStore.cs` + `Domain/XuiV3RenewalOperation.cs`: durable exactly-once renewal operations in
+  `users.db`. One operation row is created before the XUI mutation with the absolute target (TotalGB/ExpiryTime), the
+  full payload JSON, the expected pre-renewal state, and a stable `OperationKey` (owned bots: `renew-{botId}-{sessionId}`
+  from `BotUserState.RenewalSessionId`; tenant orders: `tenant-renew-{orderId}`; legacy confirms fall back to an intent
+  hash). A unique index plus lease-bound processing claims (`ClaimToken`) and the atomic pending/processing → applied
+  transition guarantee that only one executor sends the mutation and settles the wallet. Renewal mutations use
+  `NoAutomaticRetry`; timeouts are resolved by a read-only read-back that compares the panel client with the stored
+  target (`IsTargetReached`), never by replaying. Unknown outcomes are parked as `ambiguous` and reconciled read-only;
+  settlement is guarded by a `settling → settled` claim with a pre-inserted final-form wallet-ledger row (idempotency
+  key `renew:{operationId}`) so a wallet is never debited twice, and a crashed settlement claim is parked in
+  `manual_review`. `BotUserState.RenewalSessionId` is generated when the confirm step starts and cleared with the
+  conversation, so a later legitimate renewal gets a new operation.
 - `Services/XuiV3RenewalTargetParser.cs` + `XuiV3RenewalTargetResolver.cs`: shared side-effect-free exact renewal lookup
   for email, raw SubId/full subscription link, UUID, and VLESS/VMess/Trojan/Shadowsocks/Hysteria configurations. One
   fresh `clients/list` snapshot must produce exactly one client; configuration matching trusts only embedded UUID or
@@ -273,6 +285,14 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   from `PaymentMethod`, never transported in callbacks/logs, and exact email+UUID matching is repeated before preview,
   order creation, payment settlement, or XUI mutation. The payer is audit actor only; existing `TgId`, metadata owner,
   UUID, password, SubId, and protocol identity are preserved.
+- Owned-bot renewals are exactly-once end to end: the confirm step persists `RenewalSessionId`, `CompleteRenewAsync`
+  creates/claims a `XuiV3RenewalOperation`, sends the absolute target with `NoAutomaticRetry`, and on timeout recovers
+  by read-back only. Duplicate confirmations (redelivery, repeated presses, concurrent requests, restart) resolve to the
+  same operation and never re-mutate or re-charge; a crash take-over with an expired lease reads the panel back before
+  replaying the stored payload. Settlement and the central success log run once (guarded flags), and ambiguity is never
+  auto-replayed. The tenant renewal path `FULFILLPAIDTENANTRENEWORDERASYNC` has the same op guard keyed by order id,
+  but it is currently not wired into the live tenant fulfillment gate (`FULFILLPAIDTENANTORDERASYNC` still creates
+  accounts for every paid order kind) — wiring it is a separate tenant-fulfillment change.
 - XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`. Read-only and idempotent-mutation endpoints keep that retry policy; every non-idempotent create (`/clients/add`, `/clients/bulkCreate`, inbound add/import, node add, geo-source add, client-group create, API-token create, DB import, backup-to-Telegram) is sent exactly once with `NoAutomaticRetry` because a timeout can hide a committed side effect.
 - XUI v3 account creation treats generated email as the idempotency key. `addClient` is never replayed: if the add or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
 - XUI v3 failures must never expose panel URLs, root paths, endpoints, responses, tokens, or cookies in Telegram.

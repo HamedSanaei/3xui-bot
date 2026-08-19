@@ -91,6 +91,7 @@ public class TenantBotService
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TenantBotService> _logger;
     private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
+    private readonly XuiV3RenewalOperationStore _renewalOperationStore;
     private readonly Dictionary<string, TenantJoinCapabilityCacheEntry> _tenantJoinCapabilityCache = new(StringComparer.Ordinal);
     private readonly object _tenantJoinCapabilitySync = new();
 
@@ -143,6 +144,10 @@ public class TenantBotService
     /// Durable users.db volume-cycle store notified after a tenant renewal succeeds on the panel. Its best-effort state
     /// update never credits or debits the tenant owner and cannot change order fulfillment.
     /// </param>
+    /// <param name="RenewalOperationStore">
+    /// Durable users.db store that makes each tenant renewal mutation exactly-once: unique-key creation keyed by the
+    /// tenant order, lease-bound claims, atomic applied transition, and read-only timeout recovery.
+    /// </param>
     public TenantBotService(
         UserDbContext UserDbContext,
         CredentialsDbContext CredentialsDbContext,
@@ -164,7 +169,8 @@ public class TenantBotService
         UsageAnalyticsService UsageAnalyticsService,
         IServiceProvider ServiceProvider,
         ILogger<TenantBotService> Logger,
-        XuiV3VolumeReminderStateStore VolumeReminderStateStore)
+        XuiV3VolumeReminderStateStore VolumeReminderStateStore,
+        XuiV3RenewalOperationStore RenewalOperationStore)
     {
         _userDbcontext = UserDbContext;
         _credentialsDbContext = CredentialsDbContext;
@@ -188,6 +194,7 @@ public class TenantBotService
         _serviceProvider = ServiceProvider;
         _logger = Logger;
         _volumeReminderStateStore = VolumeReminderStateStore;
+        _renewalOperationStore = RenewalOperationStore;
     }
 
     /// <summary>
@@ -10288,21 +10295,461 @@ public class TenantBotService
             "tenant-renew",
             order.CustomerTelegramUserId,
             allowActorAsOwnerFallback: !hasExactTargetLock);
-        var updateResponse = await ApiServicev3.UpdateClientAsync(serverInfo, _configuration, client.Email, renewal.Payload, cancellationToken);
-        if (!updateResponse.Success)
+
+        // Exactly-once renewal guard: one operation row per tenant order. Repeated IPN/callback/check executions
+        // resolve to the same row and never issue another XUI update.
+        var tenantRenewalOperationKey = "tenant-renew-" + order.OrderId;
+        var existingOperation = await _renewalOperationStore.GetByKeyAsync(tenantRenewalOperationKey, cancellationToken);
+        if (existingOperation != null)
         {
-            order.PaymentStatus = TenantBotOrderStatuses.Failed;
-            order.ErrorMessage = "Panel renewal update was rejected.";
-            order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
-            await NOTIFYTENANTCUSTOMERFAILUREASYNC(
-                order,
-                "تمدید در پنل انجام نشد. لطفاً کمی بعد وضعیت سفارش را دوباره بررسی کنید.",
-                cancellationToken);
-            LOGTENANTORDER(order, owner, customer, source, "renew-update-failed", timing: operationTiming.Snapshot());
-            return NowPaymentsSettlementResult.InvalidAmount();
+            return await ReconcileExistingTenantRenewalAsync(
+                existingOperation, order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+                operationTiming, cancellationToken);
         }
 
+        var tenantRenewalOperation = await CreateTenantRenewalOperationAsync(
+            tenantRenewalOperationKey, order, tenant, client, renewal, cancellationToken);
+        if (tenantRenewalOperation == null)
+        {
+            var racedOperation = await _renewalOperationStore.GetByKeyAsync(tenantRenewalOperationKey, cancellationToken);
+            if (racedOperation != null)
+            {
+                return await ReconcileExistingTenantRenewalAsync(
+                    racedOperation, order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+                    operationTiming, cancellationToken);
+            }
+
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+
+        if (!await _renewalOperationStore.TryClaimFreshAsync(tenantRenewalOperation, cancellationToken))
+        {
+            return await ReconcileExistingTenantRenewalAsync(
+                tenantRenewalOperation, order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+                operationTiming, cancellationToken);
+        }
+
+        var tenantMutationSucceeded = false;
+        try
+        {
+            // The tenant renewal mutation is sent exactly once with the absolute target; it is never blindly retried.
+            var updateResponse = await ApiServicev3.UpdateClientAsync(
+                serverInfo,
+                _configuration,
+                client.Email,
+                renewal.Payload,
+                cancellationToken,
+                XuiV3RequestRetryMode.NoAutomaticRetry);
+            tenantMutationSucceeded = updateResponse.Success;
+            if (!tenantMutationSucceeded)
+            {
+                await _renewalOperationStore.MarkFailedAsync(
+                    tenantRenewalOperation,
+                    SanitizeTenantRenewalFailure(updateResponse.Msg),
+                    cancellationToken);
+                order.PaymentStatus = TenantBotOrderStatuses.Failed;
+                order.ErrorMessage = "Panel renewal update was rejected.";
+                order.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await NOTIFYTENANTCUSTOMERFAILUREASYNC(
+                    order,
+                    "تمدید در پنل انجام نشد. لطفاً کمی بعد وضعیت سفارش را دوباره بررسی کنید.",
+                    cancellationToken);
+                LOGTENANTORDER(order, owner, customer, source, "renew-update-failed", timing: operationTiming.Snapshot());
+                return NowPaymentsSettlementResult.InvalidAmount();
+            }
+        }
+        catch (Exception ex) when (ApiServicev3.IsTransientXuiTransportException(ex, cancellationToken))
+        {
+            // Ambiguous timeout: never send another update. Read the panel back and compare with the stored target.
+            var (outcome, recoveredClient) = await _renewalOperationStore.RecoverByReadBackAsync(
+                tenantRenewalOperation, serverInfo, _configuration, cancellationToken);
+            if (outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
+            {
+                tenantMutationSucceeded = true;
+                client = recoveredClient ?? client;
+            }
+            else
+            {
+                await _renewalOperationStore.MarkAmbiguousAsync(
+                    tenantRenewalOperation,
+                    outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Unavailable
+                        ? "Tenant renewal update timed out and the read-back could not determine the outcome."
+                        : "Tenant renewal update timed out and the read-back showed the target was not applied.",
+                    cancellationToken);
+                order.PaymentStatus = TenantBotOrderStatuses.Pending;
+                order.ErrorMessage = "نتیجه تمدید در پنل نامشخص است؛ سفارش بدون تمدید تکراری دوباره بررسی می‌شود.";
+                order.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                _logger.LogWarning(
+                    ex,
+                    "Tenant renewal outcome is ambiguous; the mutation will not be replayed. renewalOperationId={RenewalOperationId}, orderId={OrderId}",
+                    tenantRenewalOperation.OperationId,
+                    order.OrderId);
+                LOGTENANTORDER(order, owner, customer, source, "renew-ambiguous", timing: operationTiming.Snapshot());
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
+        }
+
+        if (!await _renewalOperationStore.MarkAppliedAsync(tenantRenewalOperation, cancellationToken))
+        {
+            return await ReconcileExistingTenantRenewalAsync(
+                tenantRenewalOperation, order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+                operationTiming, cancellationToken);
+        }
+
+        return await CompleteTenantRenewalFulfillmentAsync(
+            order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+            client, renewal, operationTiming, cancellationToken);
+    }
+
+    /// <summary>
+    /// Persists a new tenant renewal operation with the exact absolute target before the XUI mutation.
+    /// </summary>
+    /// <param name="operationKey">Stable key <c>tenant-renew-{orderId}</c>.</param>
+    /// <param name="order">Paid tenant renewal order that owns the operation.</param>
+    /// <param name="tenant">Tenant bot that owns the storefront.</param>
+    /// <param name="client">Fresh panel client whose pre-renewal state is snapshotted.</param>
+    /// <param name="renewal">Renewal calculation containing the absolute target payload.</param>
+    /// <param name="cancellationToken">Token that cancels the users.db insert.</param>
+    /// <returns>
+    /// The newly created operation, or <c>null</c> when a concurrent duplicate inserted the same key first.
+    /// </returns>
+    private async Task<XuiV3RenewalOperation> CreateTenantRenewalOperationAsync(
+        string operationKey,
+        TenantBotOrder order,
+        BotInstance tenant,
+        XuiV3Client client,
+        XuiV3RenewalCalculation renewal,
+        CancellationToken cancellationToken)
+    {
+        var draft = new XuiV3RenewalOperationStore.RenewalOperationDraft
+        {
+            OperationKey = operationKey,
+            BotId = tenant?.Id ?? order.TenantBotId,
+            TenantBotId = order.TenantBotId,
+            TenantBotOrderId = order.OrderId,
+            TelegramUserId = order.CustomerTelegramUserId,
+            TargetEmail = client.Email,
+            TargetUuid = order.TargetAccountUuid ?? string.Empty,
+            ServiceKey = order.ServiceKey,
+            AddedTrafficGb = renewal.RenewedTrafficGb,
+            AddedTrafficBytes = renewal.RenewedTrafficBytes,
+            AddedDurationDays = renewal.AddedDurationDays,
+            PriceToman = order.SalePriceToman,
+            PaymentMethod = "tenant_order",
+            ExpectedTotalBytesBefore = renewal.CurrentTotalBytes,
+            ExpectedExpiryTimeBefore = renewal.CurrentExpiryTime,
+            TargetTotalBytes = renewal.Payload.TotalGB,
+            TargetExpiryTime = renewal.Payload.ExpiryTime,
+            MutationPayloadJson = JsonConvert.SerializeObject(renewal.Payload),
+            ShouldResetTraffic = renewal.ShouldResetTraffic,
+            IsUnlimited = renewal.IsUnlimited
+        };
+
+        var (operation, created) = await _renewalOperationStore.CreateOrGetAsync(draft, cancellationToken);
+        return created ? operation : null;
+    }
+
+    /// <summary>
+    /// Resolves an already-existing tenant renewal operation without sending any new XUI mutation.
+    /// </summary>
+    /// <param name="operation">Existing operation row returned by the deduplication lookup.</param>
+    /// <param name="order">Paid tenant renewal order.</param>
+    /// <param name="owner">Tenant owner profile.</param>
+    /// <param name="customer">Tenant customer profile.</param>
+    /// <param name="tenant">Tenant bot instance.</param>
+    /// <param name="selection">Renewal plan selection stored on the order.</param>
+    /// <param name="source">Settlement source for audit.</param>
+    /// <param name="debitOwnerBaseCost">Whether the owner is debited base cost instead of credited profit.</param>
+    /// <param name="operationTiming">Active operation timer used for audits.</param>
+    /// <param name="cancellationToken">Token that cancels panel, users.db, and Telegram operations.</param>
+    /// <returns>
+    /// The fulfillment result. Applied operations continue the order fulfillment exactly once; ambiguous operations
+    /// are reconciled read-only; in-progress operations return without mutating.
+    /// </returns>
+    private async Task<NowPaymentsSettlementResult> ReconcileExistingTenantRenewalAsync(
+        XuiV3RenewalOperation operation,
+        TenantBotOrder order,
+        CredUser owner,
+        CredUser customer,
+        BotInstance tenant,
+        XuiV3PurchaseSelection selection,
+        string source,
+        bool debitOwnerBaseCost,
+        XuiOperationTiming operationTiming,
+        CancellationToken cancellationToken)
+    {
+        var serverInfo = BuildConfiguredPanelServerInfo();
+        switch (operation.Status)
+        {
+            case XuiV3RenewalOperationStatuses.Applied:
+                break;
+
+            case XuiV3RenewalOperationStatuses.Ambiguous:
+            {
+                var (outcome, recoveredClient) = await _renewalOperationStore.RecoverByReadBackAsync(
+                    operation, serverInfo, _configuration, cancellationToken);
+                if (outcome != XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
+                {
+                    _logger.LogWarning(
+                        "Tenant renewal remains ambiguous; no mutation will be replayed. renewalOperationId={RenewalOperationId}, orderId={OrderId}",
+                        operation.OperationId,
+                        order.OrderId);
+                    return NowPaymentsSettlementResult.ProviderNotPaid();
+                }
+
+                if (!await _renewalOperationStore.ResolveAmbiguousToAppliedAsync(operation, cancellationToken))
+                    return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
+                var renewal = RebuildTenantRenewalForOperation(operation);
+                var payload = RebuildTenantPayloadForOperation(operation);
+                if (payload != null)
+                {
+                    recoveredClient ??= BuildTenantMirroredClientForPayload(payload);
+                    recoveredClient.TotalGB = payload.TotalGB;
+                    recoveredClient.ExpiryTime = payload.ExpiryTime;
+                    recoveredClient.Comment = payload.Comment;
+                }
+
+                return await CompleteTenantRenewalFulfillmentAsync(
+                    order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+                    recoveredClient, renewal, operationTiming, cancellationToken);
+            }
+
+            case XuiV3RenewalOperationStatuses.Failed:
+                return NowPaymentsSettlementResult.InvalidAmount();
+
+            default:
+                if (operation.LeaseUntilUtc > DateTime.UtcNow)
+                    return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
+                // Expired lease: take over, read back first, and only send the stored mutation when the target is
+                // provably absent.
+                if (!await _renewalOperationStore.TryClaimStaleAsync(operation, cancellationToken))
+                    return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
+                return await ExecuteStoredTenantRenewalMutationAsync(
+                    operation, order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+                    operationTiming, cancellationToken);
+        }
+
+        // Applied: reload the order and continue the one-time fulfillment when it did not complete yet.
+        if (await ISTENANTORDERALREADYFULFILLEDASYNC(order, cancellationToken))
+            return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
+        var (readOutcome, readClient) = await _renewalOperationStore.RecoverByReadBackAsync(
+            operation, serverInfo, _configuration, cancellationToken);
+        var appliedClient = readOutcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied && readClient != null
+            ? readClient
+            : BuildTenantMirroredClientForPayload(RebuildTenantPayloadForOperation(operation));
+        return await CompleteTenantRenewalFulfillmentAsync(
+            order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+            appliedClient, RebuildTenantRenewalForOperation(operation), operationTiming, cancellationToken);
+    }
+
+    /// <summary>
+    /// Sends the stored tenant renewal target exactly once after a crash take-over proved it is absent.
+    /// </summary>
+    /// <param name="operation">Claimed operation holding the stored payload.</param>
+    /// <param name="order">Paid tenant renewal order.</param>
+    /// <param name="owner">Tenant owner profile.</param>
+    /// <param name="customer">Tenant customer profile.</param>
+    /// <param name="tenant">Tenant bot instance.</param>
+    /// <param name="selection">Renewal plan selection stored on the order.</param>
+    /// <param name="source">Settlement source for audit.</param>
+    /// <param name="debitOwnerBaseCost">Whether the owner is debited base cost instead of credited profit.</param>
+    /// <param name="operationTiming">Active operation timer used for audits.</param>
+    /// <param name="cancellationToken">Token that cancels panel, users.db, and Telegram operations.</param>
+    /// <returns>The fulfillment result after the stored mutation and its recovery.</returns>
+    private async Task<NowPaymentsSettlementResult> ExecuteStoredTenantRenewalMutationAsync(
+        XuiV3RenewalOperation operation,
+        TenantBotOrder order,
+        CredUser owner,
+        CredUser customer,
+        BotInstance tenant,
+        XuiV3PurchaseSelection selection,
+        string source,
+        bool debitOwnerBaseCost,
+        XuiOperationTiming operationTiming,
+        CancellationToken cancellationToken)
+    {
+        var serverInfo = BuildConfiguredPanelServerInfo();
+        var payload = RebuildTenantPayloadForOperation(operation);
+        if (payload == null || string.IsNullOrWhiteSpace(payload.Email))
+        {
+            await _renewalOperationStore.MarkAmbiguousAsync(
+                operation, "Stored tenant renewal payload is missing; manual reconciliation required.", cancellationToken);
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+
+        try
+        {
+            var updateResponse = await ApiServicev3.UpdateClientAsync(
+                serverInfo, _configuration, payload.Email, payload, cancellationToken,
+                XuiV3RequestRetryMode.NoAutomaticRetry);
+            if (!updateResponse.Success)
+            {
+                await _renewalOperationStore.MarkFailedAsync(
+                    operation, SanitizeTenantRenewalFailure(updateResponse.Msg), cancellationToken);
+                return NowPaymentsSettlementResult.InvalidAmount();
+            }
+        }
+        catch (Exception ex) when (ApiServicev3.IsTransientXuiTransportException(ex, cancellationToken))
+        {
+            var (outcome, recoveredClient) = await _renewalOperationStore.RecoverByReadBackAsync(
+                operation, serverInfo, _configuration, cancellationToken);
+            if (outcome != XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
+            {
+                await _renewalOperationStore.MarkAmbiguousAsync(
+                    operation,
+                    "Tenant renewal take-over mutation timed out and the read-back could not confirm the outcome.",
+                    cancellationToken);
+                _logger.LogWarning(
+                    ex,
+                    "Tenant renewal take-over mutation is ambiguous; it will not be replayed. renewalOperationId={RenewalOperationId}, orderId={OrderId}",
+                    operation.OperationId,
+                    order.OrderId);
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
+
+            if (!await _renewalOperationStore.MarkAppliedAsync(operation, cancellationToken))
+                return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
+            var renewal = RebuildTenantRenewalForOperation(operation);
+            recoveredClient ??= BuildTenantMirroredClientForPayload(payload);
+            recoveredClient.TotalGB = payload.TotalGB;
+            recoveredClient.ExpiryTime = payload.ExpiryTime;
+            recoveredClient.Comment = payload.Comment;
+            return await CompleteTenantRenewalFulfillmentAsync(
+                order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+                recoveredClient, renewal, operationTiming, cancellationToken);
+        }
+
+        if (!await _renewalOperationStore.MarkAppliedAsync(operation, cancellationToken))
+            return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
+        var renewalAfterMutation = RebuildTenantRenewalForOperation(operation);
+        var successClient = BuildTenantMirroredClientForPayload(payload);
+        successClient.TotalGB = payload.TotalGB;
+        successClient.ExpiryTime = payload.ExpiryTime;
+        successClient.Comment = payload.Comment;
+        return await CompleteTenantRenewalFulfillmentAsync(
+            order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+            successClient, renewalAfterMutation, operationTiming, cancellationToken);
+    }
+
+    /// <summary>
+    /// Rebuilds a display-only tenant renewal calculation from a stored operation after a crash take-over.
+    /// </summary>
+    /// <param name="operation">Operation whose stored target values feed the reconstruction.</param>
+    /// <returns>A detached renewal calculation used by reset and display code; it is never sent to XUI again.</returns>
+    private static XuiV3RenewalCalculation RebuildTenantRenewalForOperation(XuiV3RenewalOperation operation)
+    {
+        return new XuiV3RenewalCalculation
+        {
+            Payload = RebuildTenantPayloadForOperation(operation),
+            IsUnlimited = operation.IsUnlimited,
+            ShouldResetTraffic = operation.ShouldResetTraffic,
+            CurrentTotalBytes = operation.ExpectedTotalBytesBefore,
+            CurrentExpiryTime = operation.ExpectedExpiryTimeBefore,
+            RenewedTrafficGb = operation.AddedTrafficGb,
+            RenewedTrafficBytes = operation.AddedTrafficBytes,
+            TotalBytesAfterRenew = operation.TargetTotalBytes,
+            UpdatedExpiryTime = operation.TargetExpiryTime,
+            AddedDurationDays = operation.AddedDurationDays,
+            FinalDurationDays = operation.AddedDurationDays,
+            TargetAvailableTrafficGb = operation.AddedTrafficGb,
+            TargetAvailableTrafficBytes = operation.AddedTrafficBytes
+        };
+    }
+
+    /// <summary>
+    /// Deserializes the exact tenant renewal mutation payload persisted before the original attempt.
+    /// </summary>
+    /// <param name="operation">Operation whose stored payload JSON is loaded.</param>
+    /// <returns>The exact payload, or <c>null</c> when it is missing or corrupt.</returns>
+    private static XuiV3ClientPayload RebuildTenantPayloadForOperation(XuiV3RenewalOperation operation)
+    {
+        if (string.IsNullOrWhiteSpace(operation.MutationPayloadJson))
+            return null;
+
+        try
+        {
+            return JsonConvert.DeserializeObject<XuiV3ClientPayload>(operation.MutationPayloadJson);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Builds a minimal client view from the stored tenant payload for fulfillment rendering.
+    /// </summary>
+    /// <param name="payload">Stored absolute payload that was applied to the panel.</param>
+    /// <returns>A detached client mirroring the payload fields, or <c>null</c> when the payload is missing.</returns>
+    private static XuiV3Client BuildTenantMirroredClientForPayload(XuiV3ClientPayload payload)
+    {
+        if (payload == null)
+            return null;
+
+        return new XuiV3Client
+        {
+            Email = payload.Email,
+            SubId = payload.SubId,
+            TotalGB = payload.TotalGB,
+            ExpiryTime = payload.ExpiryTime,
+            Comment = payload.Comment,
+            Enable = payload.Enable,
+            TgId = payload.TgId,
+            Uuid = payload.Uuid,
+            Traffic = new XuiV3ClientTraffic { Email = payload.Email, TotalGB = payload.TotalGB, ExpiryTime = payload.ExpiryTime, Enable = payload.Enable }
+        };
+    }
+
+    /// <summary>
+    /// Bounds a tenant panel rejection message for storage on the renewal operation row.
+    /// </summary>
+    /// <param name="panelMessage">Raw panel message.</param>
+    /// <returns>A bounded sanitized message safe for the private diagnostics column.</returns>
+    private static string SanitizeTenantRenewalFailure(string panelMessage)
+    {
+        var value = string.IsNullOrWhiteSpace(panelMessage)
+            ? "panel rejected the renewal"
+            : panelMessage.Trim();
+        return value.Length <= 500 ? value : value[..500];
+    }
+
+    /// <summary>
+    /// Completes the one-time tenant renewal fulfillment after the XUI mutation is applied exactly once.
+    /// </summary>
+    /// <param name="order">Paid tenant renewal order that becomes fulfilled.</param>
+    /// <param name="owner">Tenant owner whose wallet is settled.</param>
+    /// <param name="customer">Tenant customer who pays.</param>
+    /// <param name="tenant">Tenant bot instance.</param>
+    /// <param name="selection">Renewal plan selection stored on the order.</param>
+    /// <param name="source">Settlement source such as IPN, manual check, or assistant confirmation.</param>
+    /// <param name="debitOwnerBaseCost">Whether the owner is debited base cost instead of credited profit.</param>
+    /// <param name="client">Fresh panel client whose fields mirror the applied payload.</param>
+    /// <param name="renewal">Renewal calculation used for reset and display values.</param>
+    /// <param name="operationTiming">Active operation timer used for audits.</param>
+    /// <param name="cancellationToken">Token that cancels panel, users.db, ledger, and Telegram operations.</param>
+    /// <returns>The settlement result; the order-level ledger uniqueness prevents any duplicate settlement.</returns>
+    private async Task<NowPaymentsSettlementResult> CompleteTenantRenewalFulfillmentAsync(
+        TenantBotOrder order,
+        CredUser owner,
+        CredUser customer,
+        BotInstance tenant,
+        XuiV3PurchaseSelection selection,
+        string source,
+        bool debitOwnerBaseCost,
+        XuiV3Client client,
+        XuiV3RenewalCalculation renewal,
+        XuiOperationTiming operationTiming,
+        CancellationToken cancellationToken)
+    {
+        var serverInfo = BuildConfiguredPanelServerInfo();
         var trafficResetApplied = !renewal.ShouldResetTraffic ||
                                   await RESETTENANTRENEWEDTRAFFICASYNC(
                                       serverInfo,
@@ -10342,7 +10789,7 @@ public class TenantBotService
             Email = client.Email,
             SubId = client.SubId,
             SubLink = order.CreatedSubLink,
-            TrafficGb = resolved.TrafficGb,
+            TrafficGb = renewal.RenewedTrafficGb,
             TrafficBytes = renewal.TotalBytesAfterRenew,
             ExpiryTime = renewal.UpdatedExpiryTime,
             DurationDays = renewal.FinalDurationDays,

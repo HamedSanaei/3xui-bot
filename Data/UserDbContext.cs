@@ -89,6 +89,15 @@ public class UserDbContext : DbContext
     public DbSet<ZibalPaymentInfo> ZibalPaymentInfos { get; set; }
 
     /// <summary>
+    /// Durable exactly-once records for XUI v3 renewal operations, keyed by confirmation session or tenant order.
+    /// </summary>
+    /// <remarks>
+    /// Rows are written to <c>users.db</c> before the XUI mutation and survive process restarts. The unique
+    /// OperationKey plus the atomic status/lease transitions make renewal mutation and settlement exactly-once.
+    /// </remarks>
+    public DbSet<XuiV3RenewalOperation> XuiV3RenewalOperations { get; set; }
+
+    /// <summary>
     /// Current SQLite path used by this context.
     /// </summary>
     public static string DatabasePath => _databasePath;
@@ -517,6 +526,35 @@ public class UserDbContext : DbContext
             entity.Property(x => x.BotUsername).HasMaxLength(128);
         });
 
+        modelBuilder.Entity<XuiV3RenewalOperation>(entity =>
+        {
+            entity.ToTable("XuiV3RenewalOperations");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.OperationKey).IsRequired().HasMaxLength(180);
+            entity.Property(x => x.OperationId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.BotId).HasMaxLength(64);
+            entity.Property(x => x.TenantBotId).HasMaxLength(64);
+            entity.Property(x => x.TenantBotOrderId).HasMaxLength(140);
+            entity.Property(x => x.TargetEmail).HasMaxLength(160);
+            entity.Property(x => x.TargetUuid).HasMaxLength(64);
+            entity.Property(x => x.ServiceKey).HasMaxLength(64);
+            entity.Property(x => x.PaymentMethod).HasMaxLength(64);
+            entity.Property(x => x.Status).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.SettlementStatus).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.ClaimToken).HasMaxLength(40);
+            entity.Property(x => x.LastError).HasMaxLength(2000);
+            // The unique key is the database-level duplicate guard for repeated confirmations.
+            entity.HasIndex(x => x.OperationKey).IsUnique();
+            entity.HasIndex(x => x.TenantBotOrderId)
+                .IsUnique()
+                .HasFilter("\"TenantBotOrderId\" IS NOT NULL");
+            entity.HasIndex(x => x.BotId);
+            entity.HasIndex(x => x.TelegramUserId);
+            entity.HasIndex(x => new { x.Status, x.LeaseUntilUtc });
+            entity.HasIndex(x => new { x.SettlementStatus, x.SettlementStartedAtUtc });
+        });
+
         modelBuilder.Entity<BotUserState>(entity =>
         {
             entity.ToTable("BotUserStates");
@@ -525,6 +563,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.BotId).HasMaxLength(64);
             entity.Property(x => x.PaymentMethod).HasMaxLength(64);
             entity.Property(x => x.RenewTargetUuid).HasMaxLength(64);
+            entity.Property(x => x.RenewalSessionId).HasMaxLength(64);
             entity.HasIndex(x => x.TelegramUserId);
             entity.HasIndex(x => x.Flow);
         });

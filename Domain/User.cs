@@ -51,6 +51,17 @@ public class User
     /// </remarks>
     [NotMapped]
     public string RenewTargetUuid { get; set; }
+    /// <summary>
+    /// Gets or sets the stable renewal confirmation-session identity used as the exactly-once operation key.
+    /// </summary>
+    /// <remarks>
+    /// This compatibility DTO property is not mapped to the legacy <c>Users</c> table. It is persisted only by
+    /// <see cref="BotUserState"/> for the current bot and Telegram user, is generated once when the renewal flow
+    /// enters the confirm step, and is cleared when the renewal finishes. A missing value identifies a legacy
+    /// in-flight confirmation and falls back to an intent-based operation key.
+    /// </remarks>
+    [NotMapped]
+    public string RenewalSessionId { get; set; }
     public int AccountCounter { get; set; }
     public int PendingAccountCount { get; set; }
     public string PendingUserComment { get; set; }
