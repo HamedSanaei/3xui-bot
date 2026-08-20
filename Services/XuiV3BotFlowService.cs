@@ -1502,7 +1502,9 @@ public class XuiV3BotFlowService
     /// current normal-service custom-duration range in <c>xui-v3-service-plans.json</c>. Invalid input keeps the user
     /// inside the same renewal step. A valid custom duration is persisted as <c>days-N</c> and revalidated by the
     /// central resolver before wallet debit or XUI renewal. Before preview, every new target is freshly reloaded and
-    /// must still match its saved email plus UUID; legacy states without a lock remain owner-only.
+    /// must still match its saved email plus UUID; legacy states without a lock remain owner-only. The preview also
+    /// checks the durable account-level operation lock, so an unresolved prior renewal cannot reach another payment
+    /// confirmation while automatic reconciliation is active.
     /// When a duration is disabled between preview and confirmation, an explicit empty string clears only the stored
     /// duration while the bot-scoped target-account UUID lock and the other renewal fields remain intact. A disabled
     /// unlimited sub-plan similarly returns to the current plan keyboard without consuming confirmation or charging.
@@ -1623,6 +1625,20 @@ public class XuiV3BotFlowService
                 return;
             }
 
+            if (await _renewalOperationStore.FindBlockingOperationAsync(
+                    previewClient.Uuid,
+                    previewClient.Email,
+                    cancellationToken: cancellationToken) != null)
+            {
+                await SendOwnedRenewTerminalAsync(
+                    botClient,
+                    message.Chat.Id,
+                    refreshedUser,
+                    "یک تمدید قبلی برای این اکانت در حال بررسی خودکار است. تمدید جدید تا مشخص‌شدن نتیجه موقتاً قفل است.",
+                    cancellationToken);
+                return;
+            }
+
             await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
             var canUseSiteWallet = await CanUseGozargahSiteWalletAsync(
                 credUser.TelegramUserId,
@@ -1673,6 +1689,20 @@ public class XuiV3BotFlowService
                     message.Chat.Id,
                     refreshedUser,
                     "اکانت هدف تمدید حذف شده یا شناسه آن تغییر کرده است. فرایند را دوباره شروع کنید.",
+                    cancellationToken);
+                return;
+            }
+
+            if (await _renewalOperationStore.FindBlockingOperationAsync(
+                    previewClient.Uuid,
+                    previewClient.Email,
+                    cancellationToken: cancellationToken) != null)
+            {
+                await SendOwnedRenewTerminalAsync(
+                    botClient,
+                    message.Chat.Id,
+                    refreshedUser,
+                    "یک تمدید قبلی برای این اکانت در حال بررسی خودکار است. تمدید جدید تا مشخص‌شدن نتیجه موقتاً قفل است.",
                     cancellationToken);
                 return;
             }
@@ -1910,6 +1940,23 @@ public class XuiV3BotFlowService
         }
 
         var currentExpiryBeforeRenew = GetExpiryTime(client);
+
+        var blockingOperation = await _renewalOperationStore.FindBlockingOperationAsync(
+            client.Uuid,
+            client.Email,
+            renewalOperationKey,
+            cancellationToken);
+        if (blockingOperation != null)
+        {
+            await SendOwnedRenewTerminalAsync(
+                botClient,
+                message.Chat.Id,
+                user,
+                "یک تمدید قبلی برای این اکانت هنوز در حال بررسی خودکار است. برای جلوگیری از تمدید تکراری، تمدید جدید این اکانت موقتاً قفل شده است.",
+                cancellationToken);
+            return;
+        }
+
         var renewal = XuiV3RenewalPolicy.Calculate(
             client,
             resolved,
@@ -1922,16 +1969,31 @@ public class XuiV3BotFlowService
 
         // Persist the absolute target exactly once before the mutation. If a concurrent duplicate inserted the
         // same operation first, resolve that row instead of computing or sending anything new.
-        var renewalOperation = await CreateOwnedRenewalOperationAsync(
-            renewalOperationKey,
-            user,
-            credUser,
-            service,
-            resolved,
-            client,
-            renewal,
-            useSiteWallet,
-            cancellationToken);
+        XuiV3RenewalOperation renewalOperation;
+        try
+        {
+            renewalOperation = await CreateOwnedRenewalOperationAsync(
+                renewalOperationKey,
+                user,
+                credUser,
+                service,
+                resolved,
+                client,
+                renewal,
+                useSiteWallet,
+                cancellationToken);
+        }
+        catch (XuiV3RenewalOperationStore.AccountRenewalLockedException)
+        {
+            // The filtered unique account index is the final guard when two different confirmation sessions race.
+            await SendOwnedRenewTerminalAsync(
+                botClient,
+                message.Chat.Id,
+                user,
+                "یک تمدید قبلی برای این اکانت هنوز در حال بررسی خودکار است. برای جلوگیری از تمدید تکراری، تمدید جدید این اکانت موقتاً قفل شده است.",
+                cancellationToken);
+            return;
+        }
         if (renewalOperation == null)
         {
             var racedOperation = await _renewalOperationStore.GetByKeyAsync(renewalOperationKey, cancellationToken);
@@ -1968,6 +2030,14 @@ public class XuiV3BotFlowService
                 renewalOperation,
                 operationTiming,
                 cancellationToken);
+            return;
+        }
+
+        if (!await _renewalOperationStore.MarkMutationStartedAsync(renewalOperation, cancellationToken))
+        {
+            await HandleExistingOwnedRenewalOperationAsync(
+                botClient, message, credUser, user, mainReplyMarkup, service, resolved, useSiteWallet,
+                renewalOperation, operationTiming, cancellationToken);
             return;
         }
 
@@ -2075,7 +2145,7 @@ public class XuiV3BotFlowService
                     botClient,
                     message.Chat.Id,
                     user,
-                    "نتیجه تمدید در پنل نامشخص است. برای جلوگیری از تمدید تکراری، عملیات دوباره اجرا نشد. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+                    "نتیجه تمدید در پنل هنوز قطعی نیست. درخواست به‌صورت خودکار بررسی می‌شود و برای جلوگیری از تمدید تکراری، تمدید جدید این اکانت موقتاً قفل است.",
                     cancellationToken);
                 return;
             }
@@ -2209,7 +2279,8 @@ public class XuiV3BotFlowService
             TenantBotOrderId = null,
             TelegramUserId = credUser.TelegramUserId,
             TargetEmail = client.Email,
-            TargetUuid = user.RenewTargetUuid ?? string.Empty,
+            // The durable account lock always uses the freshly loaded panel identity, including legacy owner flows.
+            TargetUuid = client.Uuid ?? string.Empty,
             ServiceKey = service?.Key,
             AddedTrafficGb = resolved.TrafficGb,
             AddedTrafficBytes = resolved.TrafficBytes,
@@ -2247,8 +2318,8 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// Applied operations are reconciled (settlement and single log finish exactly once); ambiguous operations are
     /// reconciled by a read-only read-back; failed operations are terminal; pending/processing operations with a
-    /// live lease are reported as in progress; only an expired lease may be taken over, and the take-over reads the
-    /// panel back before it may send the stored absolute target once.
+    /// live or expired lease are reported as locked. Once a mutation may have started, reconciliation is GET-only and
+    /// no stored payload is ever replayed.
     /// </remarks>
     private async Task HandleExistingOwnedRenewalOperationAsync(
         ITelegramBotClient botClient,
@@ -2277,6 +2348,15 @@ public class XuiV3BotFlowService
                     operation, operationTiming, cancellationToken);
                 return;
 
+            case XuiV3RenewalOperationStatuses.ManualReview:
+                await SendOwnedRenewTerminalAsync(
+                    botClient,
+                    message.Chat.Id,
+                    user,
+                    "نتیجه تمدید قبلی پس از بررسی خودکار قطعی نشده و برای بررسی دستی ثبت شده است. تمدید جدید این اکانت تا تعیین نتیجه قفل می‌ماند.",
+                    cancellationToken);
+                return;
+
             case XuiV3RenewalOperationStatuses.Failed:
                 await SendOwnedRenewTerminalAsync(
                     botClient,
@@ -2287,33 +2367,12 @@ public class XuiV3BotFlowService
                 return;
 
             default:
-                if (operation.LeaseUntilUtc > DateTime.UtcNow)
-                {
-                    await SendOwnedRenewTerminalAsync(
-                        botClient,
-                        message.Chat.Id,
-                        user,
-                        "تمدید در حال انجام است. لطفاً چند لحظه صبر کنید و دوباره تلاش کنید.",
-                        cancellationToken);
-                    return;
-                }
-
-                // The previous executor crashed or was abandoned. Take over the lease, read the panel back first,
-                // and only send the stored mutation when the target is provably absent.
-                if (!await _renewalOperationStore.TryClaimStaleAsync(operation, cancellationToken))
-                {
-                    await SendOwnedRenewTerminalAsync(
-                        botClient,
-                        message.Chat.Id,
-                        user,
-                        "تمدید در حال انجام است. لطفاً چند لحظه صبر کنید و دوباره تلاش کنید.",
-                        cancellationToken);
-                    return;
-                }
-
-                await ExecuteStoredRenewalMutationAsync(
-                    botClient, message, credUser, user, mainReplyMarkup, service, resolved, useSiteWallet,
-                    operation, operationTiming, cancellationToken);
+                await SendOwnedRenewTerminalAsync(
+                    botClient,
+                    message.Chat.Id,
+                    user,
+                    "تمدید قبلی این اکانت در حال انجام یا بررسی خودکار است. برای جلوگیری از تمدید تکراری، تمدید جدید موقتاً قفل شده است.",
+                    cancellationToken);
                 return;
         }
     }
@@ -2378,131 +2437,8 @@ public class XuiV3BotFlowService
             botClient,
             message.Chat.Id,
             user,
-            "نتیجه تمدید همچنان نامشخص است. برای جلوگیری از تمدید تکراری، عملیات دوباره اجرا نمی‌شود. لطفاً با پشتیبانی تماس بگیرید.",
+            "نتیجه تمدید هنوز قطعی نیست. درخواست به‌صورت خودکار بررسی می‌شود و تمدید جدید این اکانت تا مشخص‌شدن نتیجه موقتاً قفل است.",
             cancellationToken);
-    }
-
-    /// <summary>
-    /// Sends the stored absolute renewal target exactly once after a crash take-over proved it is absent.
-    /// </summary>
-    /// <param name="botClient">Telegram client of the active owned bot.</param>
-    /// <param name="message">Confirmation message that triggered the take-over.</param>
-    /// <param name="credUser">Payer profile.</param>
-    /// <param name="user">Bot-scoped renewal state.</param>
-    /// <param name="mainReplyMarkup">Owned-bot main keyboard.</param>
-    /// <param name="service">Resolved service definition.</param>
-    /// <param name="resolved">Resolved purchase containing price and plan.</param>
-    /// <param name="useSiteWallet">Whether the site wallet was selected.</param>
-    /// <param name="operation">Claimed operation holding the stored payload.</param>
-    /// <param name="operationTiming">Active operation timer used for audits.</param>
-    /// <param name="cancellationToken">Token that cancels Telegram, users.db, and panel operations.</param>
-    /// <returns>A task that completes after the stored mutation and its recovery.</returns>
-    /// <remarks>
-    /// This is the only path that sends a mutation for an existing operation, and it requires an expired lease plus
-    /// a read-back that proved the target absent. The payload is the exact JSON persisted before the original
-    /// attempt, so recovery can never add another increment.
-    /// </remarks>
-    private async Task ExecuteStoredRenewalMutationAsync(
-        ITelegramBotClient botClient,
-        Message message,
-        CredUser credUser,
-        User user,
-        IReplyMarkup mainReplyMarkup,
-        XuiV3ServiceDefinition service,
-        XuiV3ResolvedPurchase resolved,
-        bool useSiteWallet,
-        XuiV3RenewalOperation operation,
-        XuiOperationTiming operationTiming,
-        CancellationToken cancellationToken)
-    {
-        var serverInfo = BuildConfiguredPanelServerInfo();
-        var payload = RebuildPayloadForOperation(operation);
-        if (payload == null || string.IsNullOrWhiteSpace(payload.Email))
-        {
-            await _renewalOperationStore.MarkAmbiguousAsync(
-                operation,
-                "Stored mutation payload is missing; manual reconciliation required.",
-                cancellationToken);
-            await SendOwnedRenewTerminalAsync(
-                botClient,
-                message.Chat.Id,
-                user,
-                "تمدید قبلی ناتمام مانده و قابل ادامه نیست. لطفاً با پشتیبانی تماس بگیرید.",
-                cancellationToken);
-            return;
-        }
-
-        var mutationSucceeded = false;
-        try
-        {
-            var updateResponse = await ApiServicev3.UpdateClientAsync(
-                serverInfo,
-                _configuration,
-                payload.Email,
-                payload,
-                cancellationToken,
-                XuiV3RequestRetryMode.NoAutomaticRetry);
-            mutationSucceeded = updateResponse.Success;
-            if (!mutationSucceeded)
-            {
-                await _renewalOperationStore.MarkFailedAsync(
-                    operation, SanitizeRenewalFailure(updateResponse.Msg), cancellationToken);
-                await SendOwnedRenewTerminalAsync(
-                    botClient, message.Chat.Id, user,
-                    "تمدید در پنل انجام نشد. لطفاً دوباره تلاش کنید.", cancellationToken);
-                return;
-            }
-        }
-        catch (Exception ex) when (ApiServicev3.IsTransientXuiTransportException(ex, cancellationToken))
-        {
-            var (outcome, client) = await _renewalOperationStore.RecoverByReadBackAsync(
-                operation, serverInfo, _configuration, cancellationToken);
-            if (outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
-            {
-                mutationSucceeded = true;
-                if (await _renewalOperationStore.MarkAppliedAsync(operation, cancellationToken) && client != null)
-                {
-                    await CompleteAppliedOwnedRenewalAsync(
-                        botClient, message, credUser, user, mainReplyMarkup, service, resolved, useSiteWallet,
-                        operation, client, RebuildRenewalForOperation(operation), payload,
-                        null, operationTiming, cancellationToken);
-                    return;
-                }
-            }
-
-            await _renewalOperationStore.MarkAmbiguousAsync(
-                operation,
-                "Take-over renewal mutation timed out and the read-back could not confirm the outcome.",
-                cancellationToken);
-            _logger.LogWarning(
-                ex,
-                "XUI v3 renewal take-over mutation is ambiguous; it will not be replayed. renewalOperationId={RenewalOperationId}",
-                operation.OperationId);
-            await SendOwnedRenewTerminalAsync(
-                botClient, message.Chat.Id, user,
-                "نتیجه تمدید در پنل نامشخص است. برای جلوگیری از تمدید تکراری، عملیات دوباره اجرا نشد. لطفاً با پشتیبانی تماس بگیرید.",
-                cancellationToken);
-            return;
-        }
-
-        if (!await _renewalOperationStore.MarkAppliedAsync(operation, cancellationToken))
-        {
-            await ReconcileAppliedOwnedRenewalAsync(
-                botClient, message, credUser, user, mainReplyMarkup, service, resolved, useSiteWallet,
-                operation, operationTiming, cancellationToken);
-            return;
-        }
-
-        // Re-read the panel for the success message; fall back to the stored payload when the read fails.
-        var (finalOutcome, finalClient) = await _renewalOperationStore.RecoverByReadBackAsync(
-            operation, serverInfo, _configuration, cancellationToken);
-        var successClient = finalOutcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied && finalClient != null
-            ? finalClient
-            : BuildMirroredClientForPayload(payload);
-        await CompleteAppliedOwnedRenewalAsync(
-            botClient, message, credUser, user, mainReplyMarkup, service, resolved, useSiteWallet,
-            operation, successClient, RebuildRenewalForOperation(operation), payload,
-            null, operationTiming, cancellationToken);
     }
 
     /// <summary>
@@ -2579,6 +2515,99 @@ public class XuiV3BotFlowService
             user,
             "تمدید این اکانت قبلاً با موفقیت انجام شده است. برای تمدید مجدد، فرایند تمدید را از ابتدا شروع کنید.",
             cancellationToken);
+    }
+
+    /// <summary>
+    /// Completes financial settlement for an applied owned-bot renewal discovered by durable background recovery.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the operation's originating owned bot.</param>
+    /// <param name="operation">Applied, non-tenant operation containing the immutable payer, price, and target.</param>
+    /// <param name="cancellationToken">Host shutdown token for credentials, ledger, users.db, and notification work.</param>
+    /// <returns>
+    /// <c>true</c> when settlement is already complete or this call completed it; <c>false</c> when payer state is
+    /// unavailable, another executor is settling, or manual financial review is required.
+    /// </returns>
+    /// <remarks>
+    /// This entry point exists outside the Telegram callback state machine so a delayed panel commit can be charged
+    /// after restart. It never calls UpdateClient. The same atomic settlement claim and wallet-ledger idempotency key
+    /// used by callbacks protect the debit. Telegram delivery failure does not undo a completed settlement.
+    /// </remarks>
+    /// <example><code>await flow.SettleRecoveredOwnedRenewalAsync(botClient, operation, stoppingToken)</code></example>
+    public async Task<bool> SettleRecoveredOwnedRenewalAsync(
+        ITelegramBotClient botClient,
+        XuiV3RenewalOperation operation,
+        CancellationToken cancellationToken)
+    {
+        using var recoveryTiming = XuiOperationTiming.Start();
+        if (operation == null ||
+            !string.IsNullOrWhiteSpace(operation.TenantBotOrderId) ||
+            operation.Status != XuiV3RenewalOperationStatuses.Applied)
+        {
+            return false;
+        }
+
+        var credUser = await _credentialsDbContext.GetUserStatusWithId(operation.TelegramUserId);
+        if (credUser == null)
+            return false;
+
+        var resolved = new XuiV3ResolvedPurchase
+        {
+            Service = new XuiV3ServiceDefinition { Key = operation.ServiceKey },
+            TrafficGb = operation.AddedTrafficGb,
+            TrafficBytes = operation.AddedTrafficBytes,
+            DurationDays = operation.AddedDurationDays,
+            PriceToman = operation.PriceToman,
+            IsUnlimited = operation.IsUnlimited
+        };
+        var useSiteWallet = string.Equals(
+            operation.PaymentMethod,
+            "gozargah_site_wallet",
+            StringComparison.OrdinalIgnoreCase);
+        var settlement = await SettleOwnedRenewalAsync(
+            operation,
+            credUser,
+            resolved,
+            useSiteWallet,
+            siteWalletEligibility: null,
+            operation.TargetEmail,
+            cancellationToken);
+        if (settlement.InProgress || settlement.ManualReview)
+            return false;
+
+        if (await _renewalOperationStore.MarkSuccessLogSentAsync(operation, cancellationToken))
+        {
+            LogV3Purchase(
+                title: "تمدید اکانت نسخه ۳ (بازیابی خودکار)",
+                credUser: credUser,
+                priceToman: operation.PriceToman,
+                beforeBalance: settlement.BeforeBalance,
+                afterBalance: settlement.AfterBalance,
+                paymentWalletSource: useSiteWallet ? "کیف پول انتخاب‌شده در عملیات اصلی" : "کیف پول ربات",
+                details: new[]
+                {
+                    $"نام اکانت `{operation.TargetEmail}`",
+                    $"حجم اضافه `{operation.AddedTrafficGb} GB`",
+                    $"زمان اضافه `{(operation.AddedDurationDays <= 0 ? "نامحدود" : $"{operation.AddedDurationDays} روز")}`"
+                },
+                timing: recoveryTiming.Snapshot());
+        }
+
+        try
+        {
+            await botClient.SendTextMessageAsync(
+                operation.TelegramUserId,
+                "✅ نتیجه تمدید بررسی شد؛ تمدید در پنل اعمال شده بود و تسویه آن با موفقیت تکمیل شد.",
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Recovered renewal was settled but its customer notification failed. renewalOperationId={RenewalOperationId}",
+                operation.OperationId);
+        }
+
+        return true;
     }
 
     /// <summary>

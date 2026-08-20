@@ -538,11 +538,15 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantBotOrderId).HasMaxLength(140);
             entity.Property(x => x.TargetEmail).HasMaxLength(160);
             entity.Property(x => x.TargetUuid).HasMaxLength(64);
+            entity.Property(x => x.NormalizedTargetEmail).HasMaxLength(160);
+            entity.Property(x => x.NormalizedTargetUuid).HasMaxLength(64);
+            entity.Property(x => x.AccountLockKey).HasMaxLength(240);
             entity.Property(x => x.ServiceKey).HasMaxLength(64);
             entity.Property(x => x.PaymentMethod).HasMaxLength(64);
             entity.Property(x => x.Status).IsRequired().HasMaxLength(32);
             entity.Property(x => x.SettlementStatus).IsRequired().HasMaxLength(32);
             entity.Property(x => x.ClaimToken).HasMaxLength(40);
+            entity.Property(x => x.RecoveryClaimToken).HasMaxLength(40);
             entity.Property(x => x.LastError).HasMaxLength(2000);
             // The unique key is the database-level duplicate guard for repeated confirmations.
             entity.HasIndex(x => x.OperationKey).IsUnique();
@@ -553,6 +557,14 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.TelegramUserId);
             entity.HasIndex(x => new { x.Status, x.LeaseUntilUtc });
             entity.HasIndex(x => new { x.SettlementStatus, x.SettlementStartedAtUtc });
+            // A nullable partial unique key is held for the entire mutation-plus-settlement lifecycle. Clearing it is
+            // the only operation that permits another renewal for the same exact panel account.
+            entity.HasIndex(x => x.AccountLockKey)
+                .IsUnique()
+                .HasFilter("\"AccountLockKey\" IS NOT NULL");
+            entity.HasIndex(x => new { x.NormalizedTargetUuid, x.Status, x.SettlementStatus });
+            entity.HasIndex(x => new { x.NormalizedTargetEmail, x.Status, x.SettlementStatus });
+            entity.HasIndex(x => new { x.Status, x.NextReconcileAtUtc, x.RecoveryLeaseUntilUtc });
         });
 
         modelBuilder.Entity<BotUserState>(entity =>

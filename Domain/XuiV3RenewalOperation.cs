@@ -7,7 +7,8 @@ namespace Adminbot.Domain
     /// </summary>
     /// <remarks>
     /// The operation row is the exactly-once anchor for a single intended renewal. Only one executor may hold the
-    /// processing claim, and only the pending/processing to applied transition may trigger wallet settlement.
+    /// processing claim, account-level unresolved lock, and only the pending/processing to applied transition may
+    /// trigger wallet settlement.
     /// </remarks>
     public static class XuiV3RenewalOperationStatuses
     {
@@ -37,6 +38,12 @@ namespace Adminbot.Domain
         /// mutation is never replayed; the user must start a fresh renewal flow.
         /// </summary>
         public const string Failed = "failed";
+
+        /// <summary>
+        /// Automatic GET-only reconciliation stayed inconclusive beyond its bounded retry window. The account remains
+        /// locked until an operator proves the panel outcome and resolves both mutation and settlement state.
+        /// </summary>
+        public const string ManualReview = "manual_review";
     }
 
     /// <summary>
@@ -74,7 +81,8 @@ namespace Adminbot.Domain
     /// Telegram redelivery, repeated confirm presses, and concurrent duplicate requests all resolve to the same row.
     /// The absolute <see cref="TargetTotalBytes"/> and <see cref="TargetExpiryTime"/> are computed once from the
     /// expected pre-renewal state and are the values sent to the panel; recovery only ever re-reads the panel and
-    /// compares, it never re-computes another increment.
+    /// compares, it never re-computes or replays another increment. <see cref="AccountLockKey"/> prevents a different
+    /// confirmation/order from renewing the same UUID (email fallback) until settlement completes or failure is final.
     /// </remarks>
     public class XuiV3RenewalOperation
     {
@@ -142,10 +150,33 @@ namespace Adminbot.Domain
         public long TargetExpiryTime { get; set; }
 
         /// <summary>
-        /// Full replacement payload JSON that was sent to the panel. A crash take-over replays this exact payload
-        /// after a read-back proves the target is absent, so recovery never recomputes another increment.
+        /// Full replacement payload JSON that was sent to the panel. It is retained only for audit/display recovery;
+        /// no recovery path may replay this mutation after the first POST starts.
         /// </summary>
         public string MutationPayloadJson { get; set; }
+
+        /// <summary>
+        /// Canonical lowercase target email used for account-level unresolved-operation lookup. It is never exposed in
+        /// callback data or operational logs.
+        /// </summary>
+        public string NormalizedTargetEmail { get; set; }
+
+        /// <summary>
+        /// Canonical lowercase UUID used as the primary account identity for unresolved-operation lookup.
+        /// </summary>
+        public string NormalizedTargetUuid { get; set; }
+
+        /// <summary>
+        /// Active database lock key for this account. It remains populated while mutation or settlement is unresolved
+        /// and is cleared only after definitive failure or successful settlement.
+        /// </summary>
+        public string AccountLockKey { get; set; }
+
+        /// <summary>
+        /// UTC time persisted immediately before the one permitted <c>POST /UpdateClient</c> call. Once populated,
+        /// neither Telegram retries nor background recovery may send the mutation again.
+        /// </summary>
+        public DateTime? MutationStartedAtUtc { get; set; }
 
         /// <summary>Whether the renewal requires traffic counters to be reset after the panel update.</summary>
         public bool ShouldResetTraffic { get; set; }
@@ -168,7 +199,10 @@ namespace Adminbot.Domain
         /// <summary>UTC time when the single central success log entry was sent for this renewal.</summary>
         public DateTime? SuccessLogSentAtUtc { get; set; }
 
-        /// <summary>UTC lease deadline of the current processing claim; expired leases may be taken over.</summary>
+        /// <summary>
+        /// UTC lease deadline of the current processing claim. Expiry permits GET-only recovery after mutation start;
+        /// it never permits replaying UpdateClient.
+        /// </summary>
         public DateTime LeaseUntilUtc { get; set; }
 
         /// <summary>
@@ -176,6 +210,24 @@ namespace Adminbot.Domain
         /// transition requires this token so a slow executor cannot mark applied after a crashed lease was taken over.
         /// </summary>
         public string ClaimToken { get; set; }
+
+        /// <summary>Number of completed GET-only reconciliation attempts for the current ambiguous result.</summary>
+        public int ReconcileAttemptCount { get; set; }
+
+        /// <summary>UTC time after which the background worker may claim the next GET-only reconciliation attempt.</summary>
+        public DateTime? NextReconcileAtUtc { get; set; }
+
+        /// <summary>UTC time when the most recent GET-only reconciliation attempt finished.</summary>
+        public DateTime? LastReconcileAtUtc { get; set; }
+
+        /// <summary>UTC lease deadline held by one background reconciliation executor.</summary>
+        public DateTime? RecoveryLeaseUntilUtc { get; set; }
+
+        /// <summary>Opaque token identifying the current background reconciliation lease holder.</summary>
+        public string RecoveryClaimToken { get; set; }
+
+        /// <summary>UTC time when bounded automatic reconciliation escalated the operation to manual review.</summary>
+        public DateTime? ManualReviewAtUtc { get; set; }
 
         /// <summary>UTC creation time of the operation row.</summary>
         public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;

@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Adminbot.Domain;
@@ -25,6 +27,15 @@ public class XuiV3RenewalOperationStore
 
     /// <summary>Lease duration for a settlement claim before a crashed executor is treated as stale.</summary>
     private static readonly TimeSpan SettlementClaimLease = TimeSpan.FromMinutes(2);
+
+    /// <summary>Lease duration for one background GET-only reconciliation attempt.</summary>
+    public static readonly TimeSpan RecoveryLease = TimeSpan.FromMinutes(2);
+
+    /// <summary>Maximum automatic GET-only attempts before an inconclusive operation requires manual review.</summary>
+    public const int MaximumAutomaticReconcileAttempts = 12;
+
+    /// <summary>Maximum age of an ambiguous operation before automatic recovery escalates it to manual review.</summary>
+    public static readonly TimeSpan MaximumAutomaticReconcileAge = TimeSpan.FromHours(24);
 
     private readonly UserDbContextFactory _userDbContextFactory;
     private readonly ILogger<XuiV3RenewalOperationStore> _logger;
@@ -111,6 +122,66 @@ public class XuiV3RenewalOperationStore
     }
 
     /// <summary>
+    /// Raised when another unresolved mutation or settlement already owns the account-level renewal lock.
+    /// </summary>
+    /// <remarks>
+    /// The exception carries only a non-secret operation id. Callers should show a generic temporary-lock message and
+    /// must not retry <c>POST /UpdateClient</c> for the newly requested renewal.
+    /// </remarks>
+    public sealed class AccountRenewalLockedException : InvalidOperationException
+    {
+        /// <summary>Creates an account-lock exception for the existing unresolved operation.</summary>
+        /// <param name="operationId">Non-secret durable operation id that currently owns or represents the lock.</param>
+        public AccountRenewalLockedException(string operationId)
+            : base("The XUI account has an unresolved renewal operation.")
+        {
+            OperationId = operationId;
+        }
+
+        /// <summary>Non-secret durable id of the operation that blocks the new renewal.</summary>
+        public string OperationId { get; }
+    }
+
+    /// <summary>
+    /// Normalizes an XUI account email for durable lock comparison.
+    /// </summary>
+    /// <param name="email">Panel client email; null and whitespace are allowed and normalize to an empty string.</param>
+    /// <returns>Trimmed lowercase invariant email, or an empty string when no usable email was supplied.</returns>
+    /// <remarks>The normalized value is database-only identity data and must not be written to callbacks or logs.</remarks>
+    /// <example><code>NormalizeEmail(" Demo@Example ") == "demo@example"</code></example>
+    public static string NormalizeEmail(string email) => (email ?? string.Empty).Trim().ToLowerInvariant();
+
+    /// <summary>
+    /// Normalizes a panel UUID for primary account-lock comparison.
+    /// </summary>
+    /// <param name="uuid">Raw UUID from the freshly loaded panel client; null or invalid values are allowed.</param>
+    /// <returns>Canonical lowercase UUID, or an empty string when the value is not a valid UUID.</returns>
+    /// <remarks>UUID is preferred over email because account email may be edited without rebuilding the client.</remarks>
+    /// <example><code>NormalizeUuid("550E8400-E29B-41D4-A716-446655440000")</code></example>
+    public static string NormalizeUuid(string uuid) =>
+        Guid.TryParse((uuid ?? string.Empty).Trim(), out var parsed)
+            ? parsed.ToString("D").ToLowerInvariant()
+            : string.Empty;
+
+    /// <summary>
+    /// Builds the nullable unique lock key held by an unresolved renewal operation.
+    /// </summary>
+    /// <param name="uuid">Raw or normalized panel UUID; preferred when valid.</param>
+    /// <param name="email">Raw or normalized client email used only when UUID is unavailable.</param>
+    /// <returns>A stable UUID/email-prefixed key, or null when neither identity is usable.</returns>
+    /// <remarks>The returned value is sensitive database identity data and must never be logged.</remarks>
+    /// <example><code>BuildAccountLockKey(client.Uuid, client.Email)</code></example>
+    public static string BuildAccountLockKey(string uuid, string email)
+    {
+        var normalizedUuid = NormalizeUuid(uuid);
+        if (!string.IsNullOrEmpty(normalizedUuid))
+            return "uuid:" + normalizedUuid;
+
+        var normalizedEmail = NormalizeEmail(email);
+        return string.IsNullOrEmpty(normalizedEmail) ? null : "email:" + normalizedEmail;
+    }
+
+    /// <summary>
     /// Outcome of a read-only panel read-back used to reconcile an ambiguous renewal.
     /// </summary>
     public enum RecoveryOutcome
@@ -118,7 +189,10 @@ public class XuiV3RenewalOperationStore
         /// <summary>The panel provably holds the absolute target values; the operation may be marked applied.</summary>
         Applied,
 
-        /// <summary>The panel clearly does not hold the target yet; the mutation may be sent (take-over only).</summary>
+        /// <summary>
+        /// The panel clearly does not hold the target yet. A prior timed-out POST may still commit later, so the
+        /// operation remains locked and no mutation may be sent.
+        /// </summary>
         NotApplied,
 
         /// <summary>The panel could not be read; the operation must stay ambiguous and must not be mutated.</summary>
@@ -142,6 +216,12 @@ public class XuiV3RenewalOperationStore
         RenewalOperationDraft draft,
         CancellationToken cancellationToken = default)
     {
+        var normalizedUuid = NormalizeUuid(draft.TargetUuid);
+        var normalizedEmail = NormalizeEmail(draft.TargetEmail);
+        var accountLockKey = BuildAccountLockKey(normalizedUuid, normalizedEmail);
+        if (string.IsNullOrEmpty(accountLockKey))
+            throw new ArgumentException("A renewal operation requires a valid target UUID or email.", nameof(draft));
+
         var operationId = "renew-" + Guid.NewGuid().ToString("N");
         var now = DateTime.UtcNow;
         var row = new XuiV3RenewalOperation
@@ -154,6 +234,9 @@ public class XuiV3RenewalOperationStore
             TelegramUserId = draft.TelegramUserId,
             TargetEmail = draft.TargetEmail,
             TargetUuid = draft.TargetUuid,
+            NormalizedTargetEmail = normalizedEmail,
+            NormalizedTargetUuid = normalizedUuid,
+            AccountLockKey = accountLockKey,
             ServiceKey = draft.ServiceKey,
             AddedTrafficGb = draft.AddedTrafficGb,
             AddedTrafficBytes = draft.AddedTrafficBytes,
@@ -183,13 +266,89 @@ public class XuiV3RenewalOperationStore
         }
         catch (DbUpdateException)
         {
-            // Unique OperationKey violation: a concurrent duplicate inserted first.
+            // Either the same confirmation key or the same account lock won concurrently. Resolve both cases from
+            // users.db; never infer that a failed insert permits a panel mutation.
             context.ChangeTracker.Clear();
             var existing = await context.XuiV3RenewalOperations
                 .AsNoTracking()
-                .FirstAsync(x => x.OperationKey == draft.OperationKey, cancellationToken);
-            return (existing, false);
+                .FirstOrDefaultAsync(x => x.OperationKey == draft.OperationKey, cancellationToken);
+            if (existing != null)
+                return (existing, false);
+
+            var blocker = await FindBlockingOperationCoreAsync(
+                context,
+                normalizedUuid,
+                normalizedEmail,
+                excludedOperationKey: null,
+                cancellationToken);
+            throw new AccountRenewalLockedException(blocker?.OperationId ?? "unresolved");
         }
+    }
+
+    /// <summary>
+    /// Finds an unresolved renewal for the exact UUID, with normalized email as a compatibility fallback.
+    /// </summary>
+    /// <param name="targetUuid">Fresh panel UUID. Invalid or empty values cause email-only matching.</param>
+    /// <param name="targetEmail">Fresh panel email used as fallback and to cover historical rows.</param>
+    /// <param name="excludedOperationKey">Optional current confirmation key that must not block itself.</param>
+    /// <param name="cancellationToken">Token that cancels the users.db read.</param>
+    /// <returns>
+    /// The oldest detached unresolved operation for the account, or null when a new renewal may acquire the lock.
+    /// </returns>
+    /// <remarks>
+    /// Pending, processing, ambiguous, manual-review, and applied-but-unsettled rows block. Applied-and-settled and
+    /// definitively failed rows do not. The database unique lock remains the final concurrency guard after this read.
+    /// </remarks>
+    /// <example><code>await store.FindBlockingOperationAsync(client.Uuid, client.Email, key, token)</code></example>
+    public async Task<XuiV3RenewalOperation> FindBlockingOperationAsync(
+        string targetUuid,
+        string targetEmail,
+        string excludedOperationKey = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = _userDbContextFactory.CreateDbContext();
+        return await FindBlockingOperationCoreAsync(
+            context,
+            NormalizeUuid(targetUuid),
+            NormalizeEmail(targetEmail),
+            excludedOperationKey,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Executes the account-level unresolved lookup on an existing users.db context.
+    /// </summary>
+    /// <param name="context">Independent users.db context owned by the caller.</param>
+    /// <param name="normalizedUuid">Canonical UUID or empty string.</param>
+    /// <param name="normalizedEmail">Canonical email or empty string.</param>
+    /// <param name="excludedOperationKey">Optional operation key excluded from the result.</param>
+    /// <param name="cancellationToken">Token that cancels the query.</param>
+    /// <returns>The oldest detached blocking row, or null.</returns>
+    /// <remarks>Called by both the preflight read and the unique-index collision path on independent contexts.</remarks>
+    private static Task<XuiV3RenewalOperation> FindBlockingOperationCoreAsync(
+        UserDbContext context,
+        string normalizedUuid,
+        string normalizedEmail,
+        string excludedOperationKey,
+        CancellationToken cancellationToken)
+    {
+        return context.XuiV3RenewalOperations
+            .AsNoTracking()
+            .Where(x => excludedOperationKey == null || x.OperationKey != excludedOperationKey)
+            .Where(x =>
+                x.Status == XuiV3RenewalOperationStatuses.Pending ||
+                x.Status == XuiV3RenewalOperationStatuses.Processing ||
+                x.Status == XuiV3RenewalOperationStatuses.Ambiguous ||
+                x.Status == XuiV3RenewalOperationStatuses.ManualReview ||
+                (x.Status == XuiV3RenewalOperationStatuses.Applied &&
+                 x.SettlementStatus != XuiV3RenewalSettlementStatuses.Settled))
+            .Where(x =>
+                (!string.IsNullOrEmpty(normalizedUuid) && x.NormalizedTargetUuid == normalizedUuid) ||
+                (!string.IsNullOrEmpty(normalizedEmail) &&
+                 (string.IsNullOrEmpty(normalizedUuid) || string.IsNullOrEmpty(x.NormalizedTargetUuid)) &&
+                 x.NormalizedTargetEmail == normalizedEmail))
+            .OrderBy(x => x.CreatedAtUtc)
+            .FirstOrDefaultAsync(cancellationToken);
     }
 
     /// <summary>
@@ -247,17 +406,17 @@ public class XuiV3RenewalOperationStore
     }
 
     /// <summary>
-    /// Claims an operation whose previous lease expired (crashed or abandoned executor).
+    /// Claims an abandoned pending operation that has never started its panel mutation.
     /// </summary>
-    /// <param name="operation">Operation whose current status is pending or processing with an expired lease.</param>
+    /// <param name="operation">Pending operation whose mutation-start marker is still null.</param>
     /// <param name="cancellationToken">Token that cancels the conditional update.</param>
     /// <returns>
     /// <c>true</c> when this executor now holds the processing lease; otherwise <c>false</c> because another
-    /// executor holds a live lease.
+    /// executor already claimed it or the mutation-start marker proves the POST may have begun.
     /// </returns>
     /// <remarks>
-    /// The conditional update only matches pending rows and processing rows whose lease has expired, so two
-    /// take-overs cannot both win. The caller must perform a read-only read-back before sending any mutation.
+    /// Processing operations are deliberately excluded even after lease expiry: the previous POST outcome may be
+    /// delayed, so replaying it would risk a duplicate renewal. Such rows are recovered by GET only.
     /// </remarks>
     public async Task<bool> TryClaimStaleAsync(
         XuiV3RenewalOperation operation,
@@ -269,9 +428,9 @@ public class XuiV3RenewalOperationStore
         await using var context = _userDbContextFactory.CreateDbContext();
         var updated = await context.XuiV3RenewalOperations
             .Where(x => x.OperationKey == operation.OperationKey &&
-                        (x.Status == XuiV3RenewalOperationStatuses.Pending ||
-                         (x.Status == XuiV3RenewalOperationStatuses.Processing &&
-                          x.LeaseUntilUtc < now)))
+                        x.Status == XuiV3RenewalOperationStatuses.Pending &&
+                        x.MutationStartedAtUtc == null &&
+                        x.LeaseUntilUtc < now)
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Processing)
@@ -284,6 +443,47 @@ public class XuiV3RenewalOperationStore
         operation.LeaseUntilUtc = leaseUntil;
         operation.ClaimToken = claimToken;
         operation.UpdatedAtUtc = now;
+        return updated == 1;
+    }
+
+    /// <summary>
+    /// Persists the irreversible boundary immediately before the one allowed renewal mutation is sent.
+    /// </summary>
+    /// <param name="operation">Processing operation whose claim token is held by the current executor.</param>
+    /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
+    /// <returns>
+    /// <c>true</c> only for the executor that records the first mutation start and may call
+    /// <c>POST /UpdateClient</c>; <c>false</c> means no mutation may be sent.
+    /// </returns>
+    /// <remarks>
+    /// The marker is written before network I/O. A crash after this write is treated as ambiguous even if the request
+    /// may not have left the process; safety prefers a locked manual review over a possible duplicate mutation.
+    /// </remarks>
+    /// <example><code>if (await store.MarkMutationStartedAsync(operation, token)) await SendOnceAsync();</code></example>
+    public async Task<bool> MarkMutationStartedAsync(
+        XuiV3RenewalOperation operation,
+        CancellationToken cancellationToken = default)
+    {
+        var now = DateTime.UtcNow;
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var updated = await context.XuiV3RenewalOperations
+            .Where(x => x.OperationKey == operation.OperationKey &&
+                        x.Status == XuiV3RenewalOperationStatuses.Processing &&
+                        x.ClaimToken == operation.ClaimToken &&
+                        x.MutationStartedAtUtc == null)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.MutationStartedAtUtc, now)
+                    .SetProperty(x => x.NextReconcileAtUtc, now.AddSeconds(15))
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+
+        if (updated == 1)
+        {
+            operation.MutationStartedAtUtc = now;
+            operation.NextReconcileAtUtc = now.AddSeconds(15);
+        }
+
         return updated == 1;
     }
 
@@ -329,19 +529,17 @@ public class XuiV3RenewalOperationStore
     }
 
     /// <summary>
-    /// Atomically transitions an ambiguous operation to applied after a read-only read-back confirmed the target.
+    /// Atomically transitions an ambiguous or stale-processing operation to applied after GET confirmed the target.
     /// </summary>
-    /// <param name="operation">Operation currently in the ambiguous state whose panel read-back matched the target.</param>
+    /// <param name="operation">Ambiguous or stale-processing operation whose panel read-back matched the target.</param>
     /// <param name="cancellationToken">Token that cancels the conditional update.</param>
     /// <returns>
     /// <c>true</c> when this executor performed the ambiguous to applied transition and is therefore the only
     /// executor allowed to run settlement and success logging; <c>false</c> when another reconciler already applied it.
     /// </returns>
     /// <remarks>
-    /// Ambiguous operations carry no live processing claim, so this transition is guarded solely by the status value:
-    /// the conditional update only matches rows that are still ambiguous, which makes the transition atomic across
-    /// concurrent reconcilers. Callers must have just performed a read-only read-back that proved the panel holds
-    /// the absolute target; this method never sends a mutation.
+    /// The conditional update accepts ambiguous rows and stale processing rows claimed by background recovery. Callers
+    /// must have just performed a read-only read-back proving the absolute target; this method never sends a mutation.
     /// </remarks>
     public async Task<bool> ResolveAmbiguousToAppliedAsync(
         XuiV3RenewalOperation operation,
@@ -351,7 +549,8 @@ public class XuiV3RenewalOperationStore
         await using var context = _userDbContextFactory.CreateDbContext();
         var updated = await context.XuiV3RenewalOperations
             .Where(x => x.OperationKey == operation.OperationKey &&
-                        x.Status == XuiV3RenewalOperationStatuses.Ambiguous)
+                        (x.Status == XuiV3RenewalOperationStatuses.Ambiguous ||
+                         x.Status == XuiV3RenewalOperationStatuses.Processing))
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Applied)
@@ -391,6 +590,9 @@ public class XuiV3RenewalOperationStore
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Failed)
+                    .SetProperty(x => x.AccountLockKey, (string)null)
+                    .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
+                    .SetProperty(x => x.RecoveryClaimToken, (string)null)
                     .SetProperty(x => x.LastError, Truncate(error))
                     .SetProperty(x => x.UpdatedAtUtc, DateTime.UtcNow),
                 cancellationToken);
@@ -412,14 +614,20 @@ public class XuiV3RenewalOperationStore
         string error,
         CancellationToken cancellationToken = default)
     {
+        var now = DateTime.UtcNow;
         await using var context = _userDbContextFactory.CreateDbContext();
         await context.XuiV3RenewalOperations
-            .Where(x => x.OperationKey == operation.OperationKey)
+            .Where(x => x.OperationKey == operation.OperationKey &&
+                        x.Status == XuiV3RenewalOperationStatuses.Processing &&
+                        x.ClaimToken == operation.ClaimToken)
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Ambiguous)
+                    .SetProperty(x => x.NextReconcileAtUtc, now.AddSeconds(15))
+                    .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
+                    .SetProperty(x => x.RecoveryClaimToken, (string)null)
                     .SetProperty(x => x.LastError, Truncate(error))
-                    .SetProperty(x => x.UpdatedAtUtc, DateTime.UtcNow),
+                    .SetProperty(x => x.UpdatedAtUtc, now),
                 cancellationToken);
     }
 
@@ -478,18 +686,25 @@ public class XuiV3RenewalOperationStore
     /// <param name="client">Fresh client read from the panel.</param>
     /// <param name="operation">Operation whose target quota and expiry are compared.</param>
     /// <returns>
-    /// <c>true</c> when the client's total quota equals or exceeds the target and its expiry matches or exceeds the
-    /// target in the expected representation; otherwise <c>false</c>.
+    /// <c>true</c> when an available operation UUID still matches, the client's total quota equals or exceeds the
+    /// target, and expiry matches or exceeds the target in the expected representation; otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
     /// Negative expiries represent first-connection durations and are compared exactly; positive expiries are
-    /// absolute timestamps and are compared as greater-or-equal. The quota check is the primary signal: once the
-    /// absolute target quota is present, the renewal is considered applied and is never added to again.
+    /// absolute timestamps and are compared as greater-or-equal. A stored UUID prevents a rebuilt client that reused
+    /// the same email from satisfying another account's target. Legacy rows without UUID retain email lookup behavior.
     /// </remarks>
     public static bool IsTargetReached(XuiV3Client client, XuiV3RenewalOperation operation)
     {
         if (client == null || operation == null)
             return false;
+
+        var operationUuid = NormalizeUuid(operation.TargetUuid);
+        if (!string.IsNullOrEmpty(operationUuid) &&
+            !string.Equals(NormalizeUuid(client.Uuid), operationUuid, StringComparison.Ordinal))
+        {
+            return false;
+        }
 
         var totalBytes = ReadTotalBytes(client);
         if (totalBytes < operation.TargetTotalBytes)
@@ -503,6 +718,199 @@ public class XuiV3RenewalOperationStore
             return true;
 
         return expiry >= operation.TargetExpiryTime;
+    }
+
+    /// <summary>
+    /// Claims due mutation reconciliation and applied-but-unsettled rows for the durable background worker.
+    /// </summary>
+    /// <param name="maximumCount">Maximum rows to claim in one scan; must be between 1 and 100.</param>
+    /// <param name="cancellationToken">Application shutdown token that cancels users.db work.</param>
+    /// <returns>A detached list of rows whose independent recovery leases were acquired by this call.</returns>
+    /// <remarks>
+    /// Ambiguous and stale processing rows are eligible only after their backoff time. Applied-but-unsettled rows are
+    /// also returned so settlement can finish after a restart. Claiming never sends a panel mutation.
+    /// </remarks>
+    /// <example><code>var due = await store.ClaimDueReconciliationAsync(10, stoppingToken);</code></example>
+    public async Task<IReadOnlyList<XuiV3RenewalOperation>> ClaimDueReconciliationAsync(
+        int maximumCount,
+        CancellationToken cancellationToken = default)
+    {
+        maximumCount = Math.Clamp(maximumCount, 1, 100);
+        var now = DateTime.UtcNow;
+        await using var context = _userDbContextFactory.CreateDbContext();
+
+        // A pending row with no mutation marker cannot have called UpdateClient. Once its original lease is stale it
+        // is safe to fail and unlock; processing/mutation-started rows are never handled this way.
+        await context.XuiV3RenewalOperations
+            .Where(x => x.Status == XuiV3RenewalOperationStatuses.Pending &&
+                        x.MutationStartedAtUtc == null &&
+                        x.LeaseUntilUtc < now)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Failed)
+                    .SetProperty(x => x.AccountLockKey, (string)null)
+                    .SetProperty(x => x.LastError, "Pending renewal expired before the panel mutation started.")
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+
+        var candidateIds = await context.XuiV3RenewalOperations
+            .AsNoTracking()
+            .Where(x => x.RecoveryLeaseUntilUtc == null || x.RecoveryLeaseUntilUtc < now)
+            .Where(x =>
+                (x.Status == XuiV3RenewalOperationStatuses.Ambiguous &&
+                 (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now)) ||
+                (x.Status == XuiV3RenewalOperationStatuses.Processing &&
+                 x.MutationStartedAtUtc != null &&
+                 x.LeaseUntilUtc < now &&
+                 (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now)) ||
+                (x.Status == XuiV3RenewalOperationStatuses.Applied &&
+                 x.SettlementStatus != XuiV3RenewalSettlementStatuses.Settled &&
+                 x.SettlementStatus != XuiV3RenewalSettlementStatuses.ManualReview &&
+                 (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now)))
+            .OrderBy(x => x.NextReconcileAtUtc ?? x.CreatedAtUtc)
+            .Select(x => x.Id)
+            .Take(maximumCount * 2)
+            .ToListAsync(cancellationToken);
+
+        var claimed = new List<XuiV3RenewalOperation>(maximumCount);
+        foreach (var id in candidateIds)
+        {
+            if (claimed.Count >= maximumCount)
+                break;
+
+            var claimToken = Guid.NewGuid().ToString("N");
+            var updated = await context.XuiV3RenewalOperations
+                .Where(x => x.Id == id &&
+                            (x.RecoveryLeaseUntilUtc == null || x.RecoveryLeaseUntilUtc < now) &&
+                            (x.Status == XuiV3RenewalOperationStatuses.Ambiguous ||
+                             (x.Status == XuiV3RenewalOperationStatuses.Processing &&
+                              x.MutationStartedAtUtc != null && x.LeaseUntilUtc < now) ||
+                             (x.Status == XuiV3RenewalOperationStatuses.Applied &&
+                              x.SettlementStatus != XuiV3RenewalSettlementStatuses.Settled &&
+                              x.SettlementStatus != XuiV3RenewalSettlementStatuses.ManualReview)))
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(x => x.RecoveryClaimToken, claimToken)
+                        .SetProperty(x => x.RecoveryLeaseUntilUtc, now.Add(RecoveryLease))
+                        .SetProperty(x => x.UpdatedAtUtc, now),
+                    cancellationToken);
+            if (updated != 1)
+                continue;
+
+            var row = await context.XuiV3RenewalOperations
+                .AsNoTracking()
+                .FirstAsync(x => x.Id == id, cancellationToken);
+            claimed.Add(row);
+        }
+
+        return claimed;
+    }
+
+    /// <summary>
+    /// Persists one inconclusive GET-only recovery attempt and schedules bounded exponential backoff.
+    /// </summary>
+    /// <param name="operation">Claimed ambiguous/processing operation.</param>
+    /// <param name="reason">Sanitized operational reason without URLs, UUIDs, tokens, or panel response bodies.</param>
+    /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
+    /// <returns>
+    /// <c>true</c> when the operation was escalated to manual review; <c>false</c> when another automatic GET retry
+    /// was scheduled. A lost recovery lease also returns false without changing the row.
+    /// </returns>
+    /// <remarks>
+    /// A clear GET result below the target is still inconclusive because the original timed-out POST may commit later.
+    /// This method therefore never marks a mutation-started operation failed and never clears its account lock.
+    /// </remarks>
+    /// <example><code>await store.ScheduleInconclusiveReconciliationAsync(operation, "target-not-visible", token)</code></example>
+    public async Task<bool> ScheduleInconclusiveReconciliationAsync(
+        XuiV3RenewalOperation operation,
+        string reason,
+        CancellationToken cancellationToken = default)
+    {
+        var now = DateTime.UtcNow;
+        var attempt = operation.ReconcileAttemptCount + 1;
+        var manualReview = attempt >= MaximumAutomaticReconcileAttempts ||
+                           operation.CreatedAtUtc <= now.Subtract(MaximumAutomaticReconcileAge);
+        var delaySeconds = Math.Min(1800, 15 * Math.Pow(2, Math.Min(attempt - 1, 7)));
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var updated = await context.XuiV3RenewalOperations
+            .Where(x => x.OperationKey == operation.OperationKey &&
+                        (x.Status == XuiV3RenewalOperationStatuses.Ambiguous ||
+                         x.Status == XuiV3RenewalOperationStatuses.Processing) &&
+                        x.RecoveryClaimToken == operation.RecoveryClaimToken)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.Status, manualReview
+                        ? XuiV3RenewalOperationStatuses.ManualReview
+                        : XuiV3RenewalOperationStatuses.Ambiguous)
+                    .SetProperty(x => x.ReconcileAttemptCount, attempt)
+                    .SetProperty(x => x.LastReconcileAtUtc, now)
+                    .SetProperty(x => x.NextReconcileAtUtc, manualReview
+                        ? (DateTime?)null
+                        : now.AddSeconds(delaySeconds))
+                    .SetProperty(x => x.ManualReviewAtUtc, manualReview ? now : (DateTime?)null)
+                    .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
+                    .SetProperty(x => x.RecoveryClaimToken, (string)null)
+                    .SetProperty(x => x.LastError, Truncate(reason))
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+        return updated == 1 && manualReview;
+    }
+
+    /// <summary>
+    /// Releases a background recovery lease after settlement completed or another executor made the row terminal.
+    /// </summary>
+    /// <param name="operation">Operation carrying the current recovery claim token.</param>
+    /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
+    /// <returns>A task that completes after the lease is cleared when still owned by this executor.</returns>
+    /// <remarks>The account lock and mutation/settlement statuses are deliberately unchanged.</remarks>
+    /// <example><code>await store.ReleaseRecoveryClaimAsync(operation, stoppingToken)</code></example>
+    public async Task ReleaseRecoveryClaimAsync(
+        XuiV3RenewalOperation operation,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = _userDbContextFactory.CreateDbContext();
+        await context.XuiV3RenewalOperations
+            .Where(x => x.OperationKey == operation.OperationKey &&
+                        x.RecoveryClaimToken == operation.RecoveryClaimToken)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
+                    .SetProperty(x => x.RecoveryClaimToken, (string)null)
+                    .SetProperty(x => x.UpdatedAtUtc, DateTime.UtcNow),
+                cancellationToken);
+    }
+
+    /// <summary>
+    /// Releases an applied operation's recovery lease and delays another settlement attempt.
+    /// </summary>
+    /// <param name="operation">Applied operation carrying the current recovery claim token.</param>
+    /// <param name="reason">Sanitized reason why settlement could not complete.</param>
+    /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
+    /// <returns>A task that completes after a one-minute retry is scheduled.</returns>
+    /// <remarks>
+    /// This method does not change mutation status, release the account lock, or perform any financial operation.
+    /// The separate settlement guard decides whether a stale financial claim requires manual review.
+    /// </remarks>
+    /// <example><code>await store.ScheduleAppliedSettlementRetryAsync(operation, "payer unavailable", token)</code></example>
+    public async Task ScheduleAppliedSettlementRetryAsync(
+        XuiV3RenewalOperation operation,
+        string reason,
+        CancellationToken cancellationToken = default)
+    {
+        var now = DateTime.UtcNow;
+        await using var context = _userDbContextFactory.CreateDbContext();
+        await context.XuiV3RenewalOperations
+            .Where(x => x.OperationKey == operation.OperationKey &&
+                        x.Status == XuiV3RenewalOperationStatuses.Applied &&
+                        x.RecoveryClaimToken == operation.RecoveryClaimToken)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.NextReconcileAtUtc, now.AddMinutes(1))
+                    .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
+                    .SetProperty(x => x.RecoveryClaimToken, (string)null)
+                    .SetProperty(x => x.LastError, Truncate(reason))
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
     }
 
     // ------------------------------------------------------------------
@@ -530,6 +938,7 @@ public class XuiV3RenewalOperationStore
         await using var context = _userDbContextFactory.CreateDbContext();
         var updated = await context.XuiV3RenewalOperations
             .Where(x => x.OperationKey == operation.OperationKey &&
+                        x.Status == XuiV3RenewalOperationStatuses.Applied &&
                         x.SettlementStatus == XuiV3RenewalSettlementStatuses.Pending)
             .ExecuteUpdateAsync(
                 setters => setters
@@ -600,6 +1009,9 @@ public class XuiV3RenewalOperationStore
                 setters => setters
                     .SetProperty(x => x.SettlementStatus, XuiV3RenewalSettlementStatuses.Settled)
                     .SetProperty(x => x.SettledAtUtc, now)
+                    .SetProperty(x => x.AccountLockKey, (string)null)
+                    .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
+                    .SetProperty(x => x.RecoveryClaimToken, (string)null)
                     .SetProperty(x => x.UpdatedAtUtc, now),
                 cancellationToken);
 

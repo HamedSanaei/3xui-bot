@@ -94,6 +94,7 @@ class Program
         builder.Services.AddHostedService<XuiV3AccountExpiryReminderService>();
         builder.Services.AddHostedService<XuiV3VolumeExpirationReminderService>();
         builder.Services.AddHostedService<XuiV3LinkChangeRecoveryService>();
+        builder.Services.AddHostedService<XuiV3RenewalRecoveryService>();
         builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
         builder.Services.AddHostedService<ReferralReconciliationHostedService>();
         builder.Services.AddHostedService<WeeklyUsageReportHostedService>();

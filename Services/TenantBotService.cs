@@ -4177,7 +4177,8 @@ public class TenantBotService
     /// shared renewal policy. Active unlimited accounts show direct quota addition; expired unlimited accounts show
     /// replacement quota and a first-connection duration after reset. Metered renewals show the effective storefront
     /// per-GB and per-day calculation without exposing the tenant owner's colleague base rates. Fresh account data is
-    /// authorized again before rendering; an email/UUID mismatch clears state and prevents confirmation.
+    /// authorized again before rendering; an email/UUID mismatch clears state and prevents confirmation. An unresolved
+    /// account-level renewal lock stops the preview before the customer can create or fund another order.
     /// </remarks>
     private async Task SendTenantRenewSummaryAsync(
         ITelegramBotClient botClient,
@@ -4206,6 +4207,21 @@ public class TenantBotService
                 customer.TelegramUserId,
                 "اکانت هدف حذف شده یا UUID آن تغییر کرده است. بدون پرداخت دوباره از منوی تمدید اقدام کنید.",
                 allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        if (await _renewalOperationStore.FindBlockingOperationAsync(
+                client.Uuid,
+                client.Email,
+                cancellationToken: cancellationToken) != null)
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                "یک تمدید قبلی برای این اکانت در حال بررسی خودکار است. تمدید جدید تا مشخص‌شدن نتیجه موقتاً قفل است.",
+                allowSearchRestart: true,
                 cancellationToken);
             return;
         }
@@ -4259,7 +4275,8 @@ public class TenantBotService
     /// <remarks>
     /// The order is not fulfilled here. Payment callbacks and IPNs later call the shared tenant fulfillment
     /// routine, which applies the renewal exactly once. Every safely lockable renewal stores the normalized target UUID
-    /// on the order; old state or an owned legacy client without UUID leaves it null and remains owner-checked.
+    /// on the order; old state or an owned legacy client without UUID leaves it null and remains owner-checked. A live
+    /// unresolved-operation lookup runs before insertion so no new payable order is offered for a locked account.
     /// </remarks>
     private async Task CreateTenantRenewOrderFromStateAsync(
         ITelegramBotClient botClient,
@@ -4284,6 +4301,21 @@ public class TenantBotService
                 customer.TelegramUserId,
                 "اکانت هدف حذف شده یا UUID آن تغییر کرده است. هیچ سفارشی ساخته نشد.",
                 allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        if (await _renewalOperationStore.FindBlockingOperationAsync(
+                client.Uuid,
+                client.Email,
+                cancellationToken: cancellationToken) != null)
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                "یک تمدید قبلی برای این اکانت در حال بررسی خودکار است. هیچ سفارش پرداخت جدیدی ساخته نشد و تمدید این اکانت موقتاً قفل است.",
+                allowSearchRestart: true,
                 cancellationToken);
             return;
         }
@@ -7141,7 +7173,7 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Performs the shared one-time account-creation fulfillment for a paid tenant storefront order.
+    /// Performs shared one-time purchase or renewal fulfillment for a paid tenant storefront order.
     /// </summary>
     /// <param name="order">Tenant-scoped order linking the customer, owner, payment provider, and selected plan.</param>
     /// <param name="Source">Non-secret audit source such as IPN, manual check, or assistant confirmation.</param>
@@ -7156,8 +7188,9 @@ public class TenantBotService
     /// <remarks>
     /// Idempotency:
     /// callback, customer check, and manual paths share a process-wide gate and reload the order before checking
-    /// <see cref="TenantBotOrder.IsFulfilled" />. A completed order returns without creating another XUI account,
-    /// owner wallet mutation, or ledger entry.
+    /// <see cref="TenantBotOrder.IsFulfilled" />. Renewal orders are routed to the durable renewal saga before the
+    /// account-creation branch. A completed order returns without creating/updating XUI, mutating an owner wallet, or
+    /// appending another ledger entry.
     /// Timing begins only after the paid order, tenant, owner, customer, and plan are ready for execution. The central
     /// audit reports accumulated panel API time and total fulfillment time and never includes gateway waiting time.
     /// </remarks>
@@ -7217,6 +7250,28 @@ public class TenantBotService
             UnlimitedPlanKey = order.UnlimitedPlanKey,
             AccountCount = 1
         };
+
+        if (string.Equals(order.OrderKind, TenantBotOrderKinds.Renew, StringComparison.OrdinalIgnoreCase))
+        {
+            // Renewal must enter the account-level mutation lock; falling through to CreateAccountAsync would deliver
+            // a new account for a paid renewal and bypass delayed-commit reconciliation.
+            using (_botContextAccessor.Push(new BotRuntimeContext
+            {
+                Config = TENANTCONFIG,
+                Client = _botClientProvider.GetClient(order.TenantBotId)
+            }))
+            {
+                return await FULFILLPAIDTENANTRENEWORDERASYNC(
+                    order,
+                    owner,
+                    customer,
+                    tenant,
+                    selection,
+                    Source,
+                    DEBITOWNERBASECOST,
+                    CancellationToken);
+            }
+        }
 
         using var operationTiming = XuiOperationTiming.Start();
         using (_botContextAccessor.Push(new BotRuntimeContext
@@ -10221,6 +10276,57 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Resumes settlement of an applied tenant renewal operation outside provider and Telegram callback flows.
+    /// </summary>
+    /// <param name="operation">Applied tenant operation containing the immutable tenant order id.</param>
+    /// <param name="cancellationToken">Host shutdown token for order, wallet, ledger, panel-read, and notification work.</param>
+    /// <returns>
+    /// <c>true</c> when the tenant order was already fulfilled or fulfillment completed; <c>false</c> when the order
+    /// cannot yet be safely settled and must remain locked.
+    /// </returns>
+    /// <remarks>
+    /// The existing process-wide tenant fulfillment gate, order <c>IsFulfilled</c> check, and ledger uniqueness remain
+    /// the financial idempotency boundary. This method never calls UpdateClient for an existing operation; the normal
+    /// fulfillment path sees the applied operation and proceeds directly to one-time settlement.
+    /// </remarks>
+    /// <example><code>await tenantService.SettleRecoveredTenantRenewalAsync(operation, stoppingToken)</code></example>
+    public async Task<bool> SettleRecoveredTenantRenewalAsync(
+        XuiV3RenewalOperation operation,
+        CancellationToken cancellationToken)
+    {
+        if (operation == null ||
+            string.IsNullOrWhiteSpace(operation.TenantBotOrderId) ||
+            operation.Status != XuiV3RenewalOperationStatuses.Applied)
+        {
+            return false;
+        }
+
+        var order = await _userDbcontext.TenantBotOrders
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.OrderId == operation.TenantBotOrderId, cancellationToken);
+        if (order == null)
+            return false;
+
+        if (order.IsFulfilled)
+        {
+            await _renewalOperationStore.MarkSettledAsync(operation, cancellationToken);
+            return true;
+        }
+
+        await FULFILLPAIDTENANTORDERASYNC(
+            order,
+            "renewal-background-reconciliation",
+            null,
+            null,
+            order.ManualReceiptId.HasValue,
+            cancellationToken);
+        var refreshed = await _userDbcontext.TenantBotOrders
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == order.Id, cancellationToken);
+        return refreshed?.IsFulfilled == true;
+    }
+
+    /// <summary>
     /// Fulfills a paid tenant renewal order by updating the existing XUI client instead of creating a new one.
     /// </summary>
     /// <param name="order">Paid tenant order whose <see cref="TenantBotOrder.OrderKind"/> is <c>renew</c>.</param>
@@ -10289,6 +10395,22 @@ public class TenantBotService
 
         var resolved = _purchaseService.ResolvePurchase(selection, false);
         resolved.PriceToman = order.SalePriceToman;
+        var tenantRenewalOperationKey = "tenant-renew-" + order.OrderId;
+        var blockingOperation = await _renewalOperationStore.FindBlockingOperationAsync(
+            client.Uuid,
+            client.Email,
+            tenantRenewalOperationKey,
+            cancellationToken);
+        if (blockingOperation != null)
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Pending;
+            order.ErrorMessage = "تمدید قبلی این اکانت در حال بررسی خودکار است و تمدید جدید موقتاً قفل شده است.";
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, order.ErrorMessage, cancellationToken);
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+
         var renewal = XuiV3RenewalPolicy.Calculate(
             client,
             resolved,
@@ -10298,7 +10420,6 @@ public class TenantBotService
 
         // Exactly-once renewal guard: one operation row per tenant order. Repeated IPN/callback/check executions
         // resolve to the same row and never issue another XUI update.
-        var tenantRenewalOperationKey = "tenant-renew-" + order.OrderId;
         var existingOperation = await _renewalOperationStore.GetByKeyAsync(tenantRenewalOperationKey, cancellationToken);
         if (existingOperation != null)
         {
@@ -10307,8 +10428,21 @@ public class TenantBotService
                 operationTiming, cancellationToken);
         }
 
-        var tenantRenewalOperation = await CreateTenantRenewalOperationAsync(
-            tenantRenewalOperationKey, order, tenant, client, renewal, cancellationToken);
+        XuiV3RenewalOperation tenantRenewalOperation;
+        try
+        {
+            tenantRenewalOperation = await CreateTenantRenewalOperationAsync(
+                tenantRenewalOperationKey, order, tenant, client, renewal, cancellationToken);
+        }
+        catch (XuiV3RenewalOperationStore.AccountRenewalLockedException)
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Pending;
+            order.ErrorMessage = "تمدید قبلی این اکانت در حال بررسی خودکار است و تمدید جدید موقتاً قفل شده است.";
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, order.ErrorMessage, cancellationToken);
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
         if (tenantRenewalOperation == null)
         {
             var racedOperation = await _renewalOperationStore.GetByKeyAsync(tenantRenewalOperationKey, cancellationToken);
@@ -10323,6 +10457,13 @@ public class TenantBotService
         }
 
         if (!await _renewalOperationStore.TryClaimFreshAsync(tenantRenewalOperation, cancellationToken))
+        {
+            return await ReconcileExistingTenantRenewalAsync(
+                tenantRenewalOperation, order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
+                operationTiming, cancellationToken);
+        }
+
+        if (!await _renewalOperationStore.MarkMutationStartedAsync(tenantRenewalOperation, cancellationToken))
         {
             return await ReconcileExistingTenantRenewalAsync(
                 tenantRenewalOperation, order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
@@ -10378,7 +10519,7 @@ public class TenantBotService
                         : "Tenant renewal update timed out and the read-back showed the target was not applied.",
                     cancellationToken);
                 order.PaymentStatus = TenantBotOrderStatuses.Pending;
-                order.ErrorMessage = "نتیجه تمدید در پنل نامشخص است؛ سفارش بدون تمدید تکراری دوباره بررسی می‌شود.";
+                order.ErrorMessage = "نتیجه تمدید در پنل هنوز قطعی نیست؛ درخواست خودکار بررسی می‌شود و تمدید جدید این اکانت موقتاً قفل است.";
                 order.UpdatedAtUtc = DateTime.UtcNow;
                 await _userDbcontext.SaveChangesAsync(cancellationToken);
                 _logger.LogWarning(
@@ -10400,7 +10541,7 @@ public class TenantBotService
 
         return await CompleteTenantRenewalFulfillmentAsync(
             order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
-            client, renewal, operationTiming, cancellationToken);
+            client, renewal, tenantRenewalOperation, operationTiming, cancellationToken);
     }
 
     /// <summary>
@@ -10431,7 +10572,8 @@ public class TenantBotService
             TenantBotOrderId = order.OrderId,
             TelegramUserId = order.CustomerTelegramUserId,
             TargetEmail = client.Email,
-            TargetUuid = order.TargetAccountUuid ?? string.Empty,
+            // The operation lock is panel-derived even for compatible legacy tenant orders without an order UUID.
+            TargetUuid = client.Uuid ?? string.Empty,
             ServiceKey = order.ServiceKey,
             AddedTrafficGb = renewal.RenewedTrafficGb,
             AddedTrafficBytes = renewal.RenewedTrafficBytes,
@@ -10514,24 +10656,25 @@ public class TenantBotService
 
                 return await CompleteTenantRenewalFulfillmentAsync(
                     order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
-                    recoveredClient, renewal, operationTiming, cancellationToken);
+                    recoveredClient, renewal, operation, operationTiming, cancellationToken);
             }
 
             case XuiV3RenewalOperationStatuses.Failed:
                 return NowPaymentsSettlementResult.InvalidAmount();
 
+            case XuiV3RenewalOperationStatuses.ManualReview:
+                order.PaymentStatus = TenantBotOrderStatuses.Pending;
+                order.ErrorMessage = "نتیجه تمدید برای بررسی دستی ثبت شده و تمدید جدید این اکانت همچنان قفل است.";
+                order.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+
             default:
-                if (operation.LeaseUntilUtc > DateTime.UtcNow)
-                    return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
-
-                // Expired lease: take over, read back first, and only send the stored mutation when the target is
-                // provably absent.
-                if (!await _renewalOperationStore.TryClaimStaleAsync(operation, cancellationToken))
-                    return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
-
-                return await ExecuteStoredTenantRenewalMutationAsync(
-                    operation, order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
-                    operationTiming, cancellationToken);
+                order.PaymentStatus = TenantBotOrderStatuses.Pending;
+                order.ErrorMessage = "تمدید در حال انجام یا بررسی خودکار است و برای جلوگیری از تکرار موقتاً قفل شده است.";
+                order.UpdatedAtUtc = DateTime.UtcNow;
+                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                return NowPaymentsSettlementResult.ProviderNotPaid();
         }
 
         // Applied: reload the order and continue the one-time fulfillment when it did not complete yet.
@@ -10545,98 +10688,7 @@ public class TenantBotService
             : BuildTenantMirroredClientForPayload(RebuildTenantPayloadForOperation(operation));
         return await CompleteTenantRenewalFulfillmentAsync(
             order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
-            appliedClient, RebuildTenantRenewalForOperation(operation), operationTiming, cancellationToken);
-    }
-
-    /// <summary>
-    /// Sends the stored tenant renewal target exactly once after a crash take-over proved it is absent.
-    /// </summary>
-    /// <param name="operation">Claimed operation holding the stored payload.</param>
-    /// <param name="order">Paid tenant renewal order.</param>
-    /// <param name="owner">Tenant owner profile.</param>
-    /// <param name="customer">Tenant customer profile.</param>
-    /// <param name="tenant">Tenant bot instance.</param>
-    /// <param name="selection">Renewal plan selection stored on the order.</param>
-    /// <param name="source">Settlement source for audit.</param>
-    /// <param name="debitOwnerBaseCost">Whether the owner is debited base cost instead of credited profit.</param>
-    /// <param name="operationTiming">Active operation timer used for audits.</param>
-    /// <param name="cancellationToken">Token that cancels panel, users.db, and Telegram operations.</param>
-    /// <returns>The fulfillment result after the stored mutation and its recovery.</returns>
-    private async Task<NowPaymentsSettlementResult> ExecuteStoredTenantRenewalMutationAsync(
-        XuiV3RenewalOperation operation,
-        TenantBotOrder order,
-        CredUser owner,
-        CredUser customer,
-        BotInstance tenant,
-        XuiV3PurchaseSelection selection,
-        string source,
-        bool debitOwnerBaseCost,
-        XuiOperationTiming operationTiming,
-        CancellationToken cancellationToken)
-    {
-        var serverInfo = BuildConfiguredPanelServerInfo();
-        var payload = RebuildTenantPayloadForOperation(operation);
-        if (payload == null || string.IsNullOrWhiteSpace(payload.Email))
-        {
-            await _renewalOperationStore.MarkAmbiguousAsync(
-                operation, "Stored tenant renewal payload is missing; manual reconciliation required.", cancellationToken);
-            return NowPaymentsSettlementResult.ProviderNotPaid();
-        }
-
-        try
-        {
-            var updateResponse = await ApiServicev3.UpdateClientAsync(
-                serverInfo, _configuration, payload.Email, payload, cancellationToken,
-                XuiV3RequestRetryMode.NoAutomaticRetry);
-            if (!updateResponse.Success)
-            {
-                await _renewalOperationStore.MarkFailedAsync(
-                    operation, SanitizeTenantRenewalFailure(updateResponse.Msg), cancellationToken);
-                return NowPaymentsSettlementResult.InvalidAmount();
-            }
-        }
-        catch (Exception ex) when (ApiServicev3.IsTransientXuiTransportException(ex, cancellationToken))
-        {
-            var (outcome, recoveredClient) = await _renewalOperationStore.RecoverByReadBackAsync(
-                operation, serverInfo, _configuration, cancellationToken);
-            if (outcome != XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
-            {
-                await _renewalOperationStore.MarkAmbiguousAsync(
-                    operation,
-                    "Tenant renewal take-over mutation timed out and the read-back could not confirm the outcome.",
-                    cancellationToken);
-                _logger.LogWarning(
-                    ex,
-                    "Tenant renewal take-over mutation is ambiguous; it will not be replayed. renewalOperationId={RenewalOperationId}, orderId={OrderId}",
-                    operation.OperationId,
-                    order.OrderId);
-                return NowPaymentsSettlementResult.ProviderNotPaid();
-            }
-
-            if (!await _renewalOperationStore.MarkAppliedAsync(operation, cancellationToken))
-                return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
-
-            var renewal = RebuildTenantRenewalForOperation(operation);
-            recoveredClient ??= BuildTenantMirroredClientForPayload(payload);
-            recoveredClient.TotalGB = payload.TotalGB;
-            recoveredClient.ExpiryTime = payload.ExpiryTime;
-            recoveredClient.Comment = payload.Comment;
-            return await CompleteTenantRenewalFulfillmentAsync(
-                order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
-                recoveredClient, renewal, operationTiming, cancellationToken);
-        }
-
-        if (!await _renewalOperationStore.MarkAppliedAsync(operation, cancellationToken))
-            return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
-
-        var renewalAfterMutation = RebuildTenantRenewalForOperation(operation);
-        var successClient = BuildTenantMirroredClientForPayload(payload);
-        successClient.TotalGB = payload.TotalGB;
-        successClient.ExpiryTime = payload.ExpiryTime;
-        successClient.Comment = payload.Comment;
-        return await CompleteTenantRenewalFulfillmentAsync(
-            order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
-            successClient, renewalAfterMutation, operationTiming, cancellationToken);
+            appliedClient, RebuildTenantRenewalForOperation(operation), operation, operationTiming, cancellationToken);
     }
 
     /// <summary>
@@ -10733,6 +10785,9 @@ public class TenantBotService
     /// <param name="debitOwnerBaseCost">Whether the owner is debited base cost instead of credited profit.</param>
     /// <param name="client">Fresh panel client whose fields mirror the applied payload.</param>
     /// <param name="renewal">Renewal calculation used for reset and display values.</param>
+    /// <param name="renewalOperation">
+    /// Applied durable operation whose account lock is released only after order settlement is persisted.
+    /// </param>
     /// <param name="operationTiming">Active operation timer used for audits.</param>
     /// <param name="cancellationToken">Token that cancels panel, users.db, ledger, and Telegram operations.</param>
     /// <returns>The settlement result; the order-level ledger uniqueness prevents any duplicate settlement.</returns>
@@ -10746,6 +10801,7 @@ public class TenantBotService
         bool debitOwnerBaseCost,
         XuiV3Client client,
         XuiV3RenewalCalculation renewal,
+        XuiV3RenewalOperation renewalOperation,
         XuiOperationTiming operationTiming,
         CancellationToken cancellationToken)
     {
@@ -10817,6 +10873,10 @@ public class TenantBotService
         });
 
         await _userDbcontext.SaveChangesAsync(cancellationToken);
+
+        // Tenant order and ledger are now durable. Releasing the operation lock before this point could allow a
+        // second renewal while the first panel mutation was applied but its owner settlement was still incomplete.
+        await _renewalOperationStore.MarkSettledAsync(renewalOperation, cancellationToken);
 
         await _gozargahSiteSyncService.QueueUpdateAsync(
             order.OwnerTelegramUserId,
