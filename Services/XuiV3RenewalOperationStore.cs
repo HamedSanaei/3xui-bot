@@ -8,6 +8,8 @@ using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 /// <summary>
 /// Durable users.db store that makes XUI v3 renewal processing exactly-once.
@@ -36,6 +38,12 @@ public class XuiV3RenewalOperationStore
 
     /// <summary>Maximum age of an ambiguous operation before automatic recovery escalates it to manual review.</summary>
     public static readonly TimeSpan MaximumAutomaticReconcileAge = TimeSpan.FromHours(24);
+
+    /// <summary>Minimum successful unchanged observations before a timed-out mutation can be declared not applied.</summary>
+    public const int MinimumPreMutationObservations = 3;
+
+    /// <summary>Conservative time over which an unchanged client must be observed before releasing its renewal lock.</summary>
+    public static readonly TimeSpan PreMutationCommitGrace = TimeSpan.FromMinutes(10);
 
     private readonly UserDbContextFactory _userDbContextFactory;
     private readonly ILogger<XuiV3RenewalOperationStore> _logger;
@@ -114,11 +122,58 @@ public class XuiV3RenewalOperationStore
         /// <summary>Full replacement payload JSON sent to the panel.</summary>
         public string MutationPayloadJson { get; set; }
 
+        /// <summary>
+        /// Snapshot of the renewal-controlled fields read before the mutation. It must be produced by
+        /// <see cref="BuildPreMutationSnapshotJson"/> from the same fresh client used to calculate the target.
+        /// </summary>
+        public string PreMutationSnapshotJson { get; set; }
+
         /// <summary>Whether traffic counters must be reset after the panel update.</summary>
         public bool ShouldResetTraffic { get; set; }
 
         /// <summary>Whether unlimited renewal arithmetic was applied.</summary>
         public bool IsUnlimited { get; set; }
+
+        /// <summary>
+        /// Positive inbound ids observed before renewal for audit compatibility. Renewal does not modify attachment
+        /// membership, so this collection is never a mandatory reconciliation success criterion.
+        /// </summary>
+        public IReadOnlyCollection<int> ExpectedInboundIds { get; set; } = Array.Empty<int>();
+    }
+
+    /// <summary>
+    /// Detailed result of comparing one fresh panel client with the durable pre-mutation snapshot and absolute target.
+    /// </summary>
+    public sealed class RenewalComparisonResult
+    {
+        /// <summary>High-level state proven by the available read-only evidence.</summary>
+        public RecoveryOutcome Outcome { get; init; }
+
+        /// <summary>
+        /// Sanitized semicolon-separated field relations suitable for users.db and operational logs.
+        /// </summary>
+        public string Summary { get; init; }
+    }
+
+    /// <summary>
+    /// Minimal renewal-controlled panel state retained before mutation so a delayed timeout can be classified safely.
+    /// </summary>
+    private sealed class RenewalClientSnapshot
+    {
+        /// <summary>Quota in bytes before mutation.</summary>
+        public long TotalBytes { get; set; }
+
+        /// <summary>Expiry representation in panel milliseconds before mutation.</summary>
+        public long ExpiryTime { get; set; }
+
+        /// <summary>Client enabled state before mutation.</summary>
+        public bool Enable { get; set; }
+
+        /// <summary>Panel Telegram owner before mutation; compared only when renewal intentionally changes it.</summary>
+        public long TgId { get; set; }
+
+        /// <summary>Raw metadata before mutation; comparisons parse JSON semantically when possible.</summary>
+        public string Comment { get; set; }
     }
 
     /// <summary>
@@ -182,7 +237,7 @@ public class XuiV3RenewalOperationStore
     }
 
     /// <summary>
-    /// Outcome of a read-only panel read-back used to reconcile an ambiguous renewal.
+    /// Outcome of a detailed read-only comparison between a panel client, its pre-mutation snapshot, and target.
     /// </summary>
     public enum RecoveryOutcome
     {
@@ -190,13 +245,70 @@ public class XuiV3RenewalOperationStore
         Applied,
 
         /// <summary>
-        /// The panel clearly does not hold the target yet. A prior timed-out POST may still commit later, so the
-        /// operation remains locked and no mutation may be sent.
+        /// Every controlled field still exactly matches the stored pre-mutation snapshot. Several observations across
+        /// the commit-grace window are required before the operation can be failed and unlocked.
         /// </summary>
-        NotApplied,
+        DefinitelyPreMutation,
 
-        /// <summary>The panel could not be read; the operation must stay ambiguous and must not be mutated.</summary>
+        /// <summary>
+        /// At least one controlled field shows the target mutation while another required field does not. Settlement
+        /// is forbidden and the account must stay locked for manual review.
+        /// </summary>
+        PartiallyApplied,
+
+        /// <summary>
+        /// Identity or controlled state differs from both the stored pre-mutation snapshot and complete target without
+        /// proving this mutation. The account remains locked for manual review.
+        /// </summary>
+        Drifted,
+
+        /// <summary>The panel or required comparison evidence was unavailable; the operation stays locked.</summary>
         Unavailable
+    }
+
+    /// <summary>Durable action taken after persisting one background comparison result.</summary>
+    public enum ReconciliationDisposition
+    {
+        /// <summary>Another GET-only attempt was scheduled and the account remains locked.</summary>
+        RetryScheduled,
+
+        /// <summary>The operation moved to manual review and remains locked.</summary>
+        ManualReview,
+
+        /// <summary>Repeated unchanged observations proved NotApplied; settlement stayed untouched and lock cleared.</summary>
+        DefinitivelyFailed,
+
+        /// <summary>The recovery lease was lost or the row was no longer eligible; no transition occurred.</summary>
+        NoChange
+    }
+
+    /// <summary>
+    /// Serializes the exact renewal-controlled pre-mutation state without retaining passwords, SubIds, inbound
+    /// attachments, links, or other credentials.
+    /// </summary>
+    /// <param name="client">
+    /// Fresh panel client used to calculate the renewal. It is required and must already have exact UUID/email identity.
+    /// </param>
+    /// <returns>Compact JSON suitable for <see cref="XuiV3RenewalOperation.PreMutationSnapshotJson"/>.</returns>
+    /// <remarks>
+    /// The snapshot has no external side effects. Recovery may use it to release a lock only after several successful
+    /// GETs over <see cref="PreMutationCommitGrace"/> all prove the controlled state is unchanged.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="client"/> is null.</exception>
+    /// <example><code>draft.PreMutationSnapshotJson = BuildPreMutationSnapshotJson(client);</code></example>
+    public static string BuildPreMutationSnapshotJson(XuiV3Client client)
+    {
+        if (client == null)
+            throw new ArgumentNullException(nameof(client));
+
+        return JsonConvert.SerializeObject(new RenewalClientSnapshot
+        {
+            TotalBytes = ReadTotalBytes(client),
+            ExpiryTime = ReadExpiryTime(client),
+            Enable = client.Enable,
+            TgId = client.TgId,
+            Comment = client.Comment
+        }, Formatting.None);
     }
 
     /// <summary>
@@ -237,6 +349,13 @@ public class XuiV3RenewalOperationStore
             NormalizedTargetEmail = normalizedEmail,
             NormalizedTargetUuid = normalizedUuid,
             AccountLockKey = accountLockKey,
+            RecoveryEligible = true,
+            ExpectedInboundIdsJson = JsonConvert.SerializeObject(
+                (draft.ExpectedInboundIds ?? Array.Empty<int>())
+                    .Where(x => x > 0)
+                    .Distinct()
+                    .OrderBy(x => x)
+                    .ToArray()),
             ServiceKey = draft.ServiceKey,
             AddedTrafficGb = draft.AddedTrafficGb,
             AddedTrafficBytes = draft.AddedTrafficBytes,
@@ -248,6 +367,7 @@ public class XuiV3RenewalOperationStore
             TargetTotalBytes = draft.TargetTotalBytes,
             TargetExpiryTime = draft.TargetExpiryTime,
             MutationPayloadJson = draft.MutationPayloadJson,
+            PreMutationSnapshotJson = draft.PreMutationSnapshotJson,
             ShouldResetTraffic = draft.ShouldResetTraffic,
             IsUnlimited = draft.IsUnlimited,
             Status = XuiV3RenewalOperationStatuses.Pending,
@@ -532,6 +652,7 @@ public class XuiV3RenewalOperationStore
     /// Atomically transitions an ambiguous or stale-processing operation to applied after GET confirmed the target.
     /// </summary>
     /// <param name="operation">Ambiguous or stale-processing operation whose panel read-back matched the target.</param>
+    /// <param name="comparison">Applied comparison whose sanitized field summary is persisted with the transition.</param>
     /// <param name="cancellationToken">Token that cancels the conditional update.</param>
     /// <returns>
     /// <c>true</c> when this executor performed the ambiguous to applied transition and is therefore the only
@@ -543,8 +664,12 @@ public class XuiV3RenewalOperationStore
     /// </remarks>
     public async Task<bool> ResolveAmbiguousToAppliedAsync(
         XuiV3RenewalOperation operation,
+        RenewalComparisonResult comparison,
         CancellationToken cancellationToken = default)
     {
+        if (comparison?.Outcome != RecoveryOutcome.Applied)
+            throw new ArgumentException("An Applied comparison is required.", nameof(comparison));
+
         var now = DateTime.UtcNow;
         await using var context = _userDbContextFactory.CreateDbContext();
         var updated = await context.XuiV3RenewalOperations
@@ -554,6 +679,9 @@ public class XuiV3RenewalOperationStore
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Applied)
+                    .SetProperty(x => x.LastComparisonOutcome, comparison.Outcome.ToString())
+                    .SetProperty(x => x.LastMismatchSummary, comparison.Summary)
+                    .SetProperty(x => x.LastReconcileAtUtc, now)
                     .SetProperty(x => x.UpdatedAtUtc, now),
                 cancellationToken);
 
@@ -573,6 +701,7 @@ public class XuiV3RenewalOperationStore
     /// <param name="operation">Operation whose mutation was definitively rejected.</param>
     /// <param name="error">Sanitized error text without panel secrets.</param>
     /// <param name="cancellationToken">Token that cancels the update.</param>
+    /// <param name="comparison">Optional immediate GET-only comparison whose sanitized evidence should be retained.</param>
     /// <returns>A task that completes after the failed status is persisted.</returns>
     /// <remarks>
     /// Failed operations are terminal: no settlement occurred and the mutation is never replayed. The user must
@@ -612,7 +741,8 @@ public class XuiV3RenewalOperationStore
     public async Task MarkAmbiguousAsync(
         XuiV3RenewalOperation operation,
         string error,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        RenewalComparisonResult comparison = null)
     {
         var now = DateTime.UtcNow;
         await using var context = _userDbContextFactory.CreateDbContext();
@@ -626,29 +756,33 @@ public class XuiV3RenewalOperationStore
                     .SetProperty(x => x.NextReconcileAtUtc, now.AddSeconds(15))
                     .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
                     .SetProperty(x => x.RecoveryClaimToken, (string)null)
+                    .SetProperty(x => x.LastComparisonOutcome, comparison == null ? null : comparison.Outcome.ToString())
+                    .SetProperty(x => x.LastMismatchSummary, comparison == null ? null : comparison.Summary)
                     .SetProperty(x => x.LastError, Truncate(error))
                     .SetProperty(x => x.UpdatedAtUtc, now),
                 cancellationToken);
     }
 
     /// <summary>
-    /// Reads the panel client back by email and compares it with the operation's absolute target.
+    /// Reads an ambiguous renewal target using GET only and returns a detailed, identity-safe comparison.
     /// </summary>
-    /// <param name="operation">Operation holding the absolute target values.</param>
-    /// <param name="serverInfo">Configured XUI v3 panel descriptor used only for the read-only request.</param>
-    /// <param name="configuration">Runtime timeout and authentication configuration for the panel read.</param>
-    /// <param name="cancellationToken">Token that cancels the read-only panel request.</param>
+    /// <param name="operation">Recovery-eligible operation holding pre-mutation and absolute target evidence.</param>
+    /// <param name="serverInfo">Configured XUI v3 panel descriptor used only for authenticated read requests.</param>
+    /// <param name="configuration">Runtime timeout and read-only retry configuration.</param>
+    /// <param name="cancellationToken">Token that cancels panel reads.</param>
     /// <returns>
-    /// The recovery outcome plus the fresh panel client when the read succeeded. The client is
-    /// <see cref="RecoveryOutcome.Applied"/> only when the panel holds at least the target quota and the expected
-    /// expiry representation; <see cref="RecoveryOutcome.NotApplied"/> when the panel is clearly below the target;
-    /// <see cref="RecoveryOutcome.Unavailable"/> when the panel could not be read (client is null).
+    /// A sanitized comparison and the exact fresh client when available. The client is null for unavailable or
+    /// ambiguous identity results. Callers must persist the comparison before deciding settlement or backoff.
     /// </returns>
     /// <remarks>
-    /// This is the only recovery mechanism: it never sends another mutation. A timeout or failed read is always
-    /// <see cref="RecoveryOutcome.Unavailable"/>, which keeps the operation ambiguous.
+    /// The direct email endpoint is accepted only when its returned identity matches the operation. A mismatched or
+    /// absent direct result falls back to the complete client list and requires exactly one UUID match (email fallback
+    /// only for operations without UUID). A single same-email/different-UUID row is classified Drifted as a rebuilt
+    /// account. This protects against panels that return an unrelated client with HTTP 200. No path sends, reconstructs,
+    /// or replays a mutation.
     /// </remarks>
-    public async Task<(RecoveryOutcome Outcome, XuiV3Client Client)> RecoverByReadBackAsync(
+    /// <example><code>var (comparison, client) = await store.RecoverByReadBackAsync(op, panel, config, token);</code></example>
+    public async Task<(RenewalComparisonResult Comparison, XuiV3Client Client)> RecoverByReadBackAsync(
         XuiV3RenewalOperation operation,
         ServerInfo serverInfo,
         IConfiguration configuration,
@@ -657,18 +791,62 @@ public class XuiV3RenewalOperationStore
         try
         {
             var response = await ApiServicev3.GetClientAsync(serverInfo, configuration, operation.TargetEmail, cancellationToken);
-            if (!response.Success || response.Obj == null)
+            var directReturnedClient = response.Success && response.Obj != null;
+            var directIdentityMatched = directReturnedClient && ResponseIdentityMatches(response.Obj, operation);
+            var client = directIdentityMatched
+                ? response.Obj
+                : null;
+            var readSource = directIdentityMatched
+                ? "direct"
+                : directReturnedClient
+                    ? "list-after-direct-identity-mismatch"
+                    : "list-after-direct-miss";
+            if (client == null)
             {
-                _logger.LogWarning(
-                    "Renewal operation read-back found no client. operationId={OperationId}, success={Success}",
-                    operation.OperationId,
-                    response.Success);
-                return (RecoveryOutcome.Unavailable, null);
+                // A successful direct GET can still contain an unrelated client on affected panel builds. Never feed
+                // that object into target comparison; resolve the stored UUID from the complete read-only list.
+                var listResponse = await ApiServicev3.GetClientsAsync(serverInfo, configuration, cancellationToken);
+                if (!listResponse.Success)
+                    return (Unavailable("identity=unavailable;read=list-failed"), null);
+
+                var normalizedUuid = NormalizeUuid(operation.TargetUuid);
+                var normalizedEmail = NormalizeEmail(operation.TargetEmail);
+                var candidates = listResponse.Obj ?? new List<XuiV3Client>();
+                var matches = candidates
+                    .Where(x => !string.IsNullOrEmpty(normalizedUuid)
+                        ? string.Equals(NormalizeUuid(x.Uuid), normalizedUuid, StringComparison.Ordinal)
+                        : string.Equals(NormalizeEmail(x.Email), normalizedEmail, StringComparison.Ordinal))
+                    .Take(2)
+                    .ToList();
+                if (matches.Count == 0 && !string.IsNullOrEmpty(normalizedUuid))
+                {
+                    var recreatedEmailMatches = candidates
+                        .Where(x => string.Equals(NormalizeEmail(x.Email), normalizedEmail, StringComparison.Ordinal))
+                        .Take(2)
+                        .ToList();
+                    if (recreatedEmailMatches.Count == 1)
+                    {
+                        var drifted = CompareRenewalState(recreatedEmailMatches[0], operation);
+                        return (Result(drifted.Outcome, "read=list-recreated-email-match;" + drifted.Summary), recreatedEmailMatches[0]);
+                    }
+                }
+
+                if (matches.Count != 1)
+                    return (Unavailable(matches.Count == 0
+                        ? "identity=unavailable;read=list-no-match"
+                        : "identity=ambiguous;read=list-multiple-matches"), null);
+
+                client = matches[0];
             }
 
-            return IsTargetReached(response.Obj, operation)
-                ? (RecoveryOutcome.Applied, response.Obj)
-                : (RecoveryOutcome.NotApplied, response.Obj);
+            var compared = CompareRenewalState(client, operation);
+            var comparison = Result(compared.Outcome, "read=" + readSource + ";" + compared.Summary);
+            _logger.LogInformation(
+                "XUI v3 renewal read-back compared controlled fields. renewalOperationId={RenewalOperationId}, outcome={Outcome}, mismatchSummary={MismatchSummary}",
+                operation.OperationId,
+                comparison.Outcome,
+                comparison.Summary);
+            return (comparison, client);
         }
         catch (Exception ex)
         {
@@ -676,49 +854,201 @@ public class XuiV3RenewalOperationStore
                 ex,
                 "Renewal operation read-back failed; keeping the operation ambiguous. operationId={OperationId}",
                 operation.OperationId);
-            return (RecoveryOutcome.Unavailable, null);
+            return (Unavailable("identity=unavailable;read=transport-failure"), null);
         }
     }
 
     /// <summary>
-    /// Determines whether a panel client already holds the absolute target of a renewal operation.
+    /// Compares a fresh exact-identity client with the durable renewal pre-state and target field by field.
     /// </summary>
-    /// <param name="client">Fresh client read from the panel.</param>
-    /// <param name="operation">Operation whose target quota and expiry are compared.</param>
+    /// <param name="client">Fresh exact-identity client read from the panel; null produces Unavailable.</param>
+    /// <param name="operation">Recovery-eligible operation containing the immutable target and optional pre-snapshot.</param>
     /// <returns>
-    /// <c>true</c> when an available operation UUID still matches, the client's total quota equals or exceeds the
-    /// target, and expiry matches or exceeds the target in the expected representation; otherwise <c>false</c>.
+    /// Detailed state plus a sanitized per-field summary. No returned text contains email, UUID, metadata, quota,
+    /// expiry timestamp, URL, token, or response body.
     /// </returns>
     /// <remarks>
-    /// Negative expiries represent first-connection durations and are compared exactly; positive expiries are
-    /// absolute timestamps and are compared as greater-or-equal. A stored UUID prevents a rebuilt client that reused
-    /// the same email from satisfying another account's target. Legacy rows without UUID retain email lookup behavior.
+    /// UUID (email only for UUID-less legacy rows), quota, expiry, enabled state, and renewal metadata are authoritative.
+    /// Telegram owner is mandatory only when the target intentionally changes it. LimitIp, password, SubId, protocol
+    /// extras, traffic-row enable, and inbound membership are preserved rather than changed by renewal and therefore
+    /// cannot reject an otherwise complete target. JSON metadata is compared semantically so object property order and
+    /// whitespace do not create false mismatches.
     /// </remarks>
-    public static bool IsTargetReached(XuiV3Client client, XuiV3RenewalOperation operation)
+    /// <example><code>var result = CompareRenewalState(freshClient, operation);</code></example>
+    public static RenewalComparisonResult CompareRenewalState(
+        XuiV3Client client,
+        XuiV3RenewalOperation operation)
+    {
+        if (client == null || operation == null || !operation.RecoveryEligible)
+            return Unavailable("identity=unavailable;evidence=missing");
+
+        var operationUuid = NormalizeUuid(operation.TargetUuid);
+        var identityMatches = !string.IsNullOrEmpty(operationUuid)
+            ? string.Equals(NormalizeUuid(client.Uuid), operationUuid, StringComparison.Ordinal)
+            : string.Equals(NormalizeEmail(client.Email), NormalizeEmail(operation.TargetEmail), StringComparison.Ordinal);
+        if (!identityMatches)
+            return Result(RecoveryOutcome.Drifted, "identity=drifted;quota=unchecked;expiry=unchecked;enable=unchecked;metadata=unchecked;owner=unchecked");
+
+        XuiV3ClientPayload targetPayload;
+        RenewalClientSnapshot preSnapshot;
+        try
+        {
+            targetPayload = string.IsNullOrWhiteSpace(operation.MutationPayloadJson)
+                ? null
+                : JsonConvert.DeserializeObject<XuiV3ClientPayload>(operation.MutationPayloadJson);
+            preSnapshot = string.IsNullOrWhiteSpace(operation.PreMutationSnapshotJson)
+                ? null
+                : JsonConvert.DeserializeObject<RenewalClientSnapshot>(operation.PreMutationSnapshotJson);
+        }
+        catch (JsonException)
+        {
+            return Unavailable("identity=target;evidence=malformed");
+        }
+
+        if (targetPayload == null)
+            return Unavailable("identity=target;evidence=target-missing");
+
+        var totalBytes = ReadTotalBytes(client);
+        var expiry = ReadExpiryTime(client);
+        var quotaAtTarget = totalBytes >= operation.TargetTotalBytes;
+        var expiryAtTarget = ExpiryReached(expiry, operation.TargetExpiryTime);
+        var enableAtTarget = client.Enable == targetPayload.Enable;
+        var metadataAtTarget = SemanticJsonEquals(client.Comment, targetPayload.Comment);
+        var ownerChanged = preSnapshot != null && preSnapshot.TgId != targetPayload.TgId;
+        var ownerAtTarget = !ownerChanged || client.TgId == targetPayload.TgId;
+
+        var quotaAtPre = preSnapshot != null && totalBytes == preSnapshot.TotalBytes;
+        var expiryAtPre = preSnapshot != null && expiry == preSnapshot.ExpiryTime;
+        var enableAtPre = preSnapshot != null && client.Enable == preSnapshot.Enable;
+        var metadataAtPre = preSnapshot != null && SemanticJsonEquals(client.Comment, preSnapshot.Comment);
+        var ownerAtPre = preSnapshot != null && client.TgId == preSnapshot.TgId;
+
+        var summary = string.Join(";", new[]
+        {
+            "identity=target",
+            "quota=" + Relation(quotaAtTarget, quotaAtPre),
+            "expiry=" + Relation(expiryAtTarget, expiryAtPre),
+            "enable=" + Relation(enableAtTarget, enableAtPre),
+            "metadata=" + Relation(metadataAtTarget, metadataAtPre),
+            "owner=" + (ownerChanged ? Relation(ownerAtTarget, ownerAtPre) : "not-controlled")
+        });
+
+        if (quotaAtTarget && expiryAtTarget && enableAtTarget && metadataAtTarget && ownerAtTarget)
+            return Result(RecoveryOutcome.Applied, summary);
+
+        var completePreState = preSnapshot != null && quotaAtPre && expiryAtPre && enableAtPre && metadataAtPre && ownerAtPre;
+        if (completePreState)
+            return Result(RecoveryOutcome.DefinitelyPreMutation, summary);
+
+        var changedFieldShowsTarget =
+            (preSnapshot == null || operation.TargetTotalBytes != preSnapshot.TotalBytes) &&
+                (quotaAtTarget || HasMovedTowardTarget(totalBytes, preSnapshot?.TotalBytes, operation.TargetTotalBytes)) ||
+            (preSnapshot == null || operation.TargetExpiryTime != preSnapshot.ExpiryTime) &&
+                (expiryAtTarget || HasMovedTowardTarget(expiry, preSnapshot?.ExpiryTime, operation.TargetExpiryTime)) ||
+            (preSnapshot == null || targetPayload.Enable != preSnapshot.Enable) && enableAtTarget ||
+            (preSnapshot == null || !SemanticJsonEquals(targetPayload.Comment, preSnapshot.Comment)) && metadataAtTarget ||
+            ownerChanged && ownerAtTarget;
+        return Result(
+            changedFieldShowsTarget ? RecoveryOutcome.PartiallyApplied : RecoveryOutcome.Drifted,
+            summary);
+    }
+
+    /// <summary>Detects a numeric value moving away from pre-state in the target direction without reaching target.</summary>
+    /// <param name="actual">Fresh observed quota or expiry representation.</param>
+    /// <param name="pre">Stored pre-mutation value, or null when historical evidence is insufficient.</param>
+    /// <param name="target">Absolute mutation target.</param>
+    /// <returns><c>true</c> only when the value moved from pre toward target.</returns>
+    private static bool HasMovedTowardTarget(long actual, long? pre, long target)
+    {
+        if (!pre.HasValue || pre.Value == target)
+            return false;
+
+        return target > pre.Value
+            ? actual > pre.Value
+            : actual < pre.Value;
+    }
+
+    /// <summary>Checks exact response identity before a direct GET result is trusted.</summary>
+    /// <param name="client">Direct endpoint response, which may be null or unrelated on affected panels.</param>
+    /// <param name="operation">Operation supplying UUID-first identity and email fallback.</param>
+    /// <returns><c>true</c> only when the response identifies the operation target.</returns>
+    private static bool ResponseIdentityMatches(XuiV3Client client, XuiV3RenewalOperation operation)
     {
         if (client == null || operation == null)
             return false;
 
-        var operationUuid = NormalizeUuid(operation.TargetUuid);
-        if (!string.IsNullOrEmpty(operationUuid) &&
-            !string.Equals(NormalizeUuid(client.Uuid), operationUuid, StringComparison.Ordinal))
+        var uuid = NormalizeUuid(operation.TargetUuid);
+        return !string.IsNullOrEmpty(uuid)
+            ? string.Equals(NormalizeUuid(client.Uuid), uuid, StringComparison.Ordinal)
+            : string.Equals(NormalizeEmail(client.Email), NormalizeEmail(operation.TargetEmail), StringComparison.Ordinal);
+    }
+
+    /// <summary>Compares expiry using XUI's negative-duration, zero-lifetime, and positive absolute-time semantics.</summary>
+    /// <param name="actual">Fresh panel expiry in milliseconds.</param>
+    /// <param name="target">Durable target expiry in milliseconds.</param>
+    /// <returns><c>true</c> when the authoritative target representation has been reached.</returns>
+    private static bool ExpiryReached(long actual, long target) => target < 0 ? actual == target : target == 0 || actual >= target;
+
+    /// <summary>Semantically compares JSON metadata while retaining ordinal comparison for non-JSON legacy comments.</summary>
+    /// <param name="left">Observed metadata or legacy text.</param>
+    /// <param name="right">Stored target/pre metadata or legacy text.</param>
+    /// <returns><c>true</c> for semantically equal JSON regardless of whitespace/property order, or exact legacy text.</returns>
+    private static bool SemanticJsonEquals(string left, string right)
+    {
+        try
         {
-            return false;
+            return JToken.DeepEquals(
+                CanonicalizeJson(JToken.Parse(left ?? "null")),
+                CanonicalizeJson(JToken.Parse(right ?? "null")));
+        }
+        catch (JsonReaderException)
+        {
+            return string.Equals(left ?? string.Empty, right ?? string.Empty, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>Recursively sorts JSON object properties while preserving array order and scalar values.</summary>
+    /// <param name="token">Parsed metadata token.</param>
+    /// <returns>A detached canonical token suitable for semantic equality.</returns>
+    private static JToken CanonicalizeJson(JToken token)
+    {
+        if (token is JObject obj)
+        {
+            var canonical = new JObject();
+            foreach (var property in obj.Properties().OrderBy(x => x.Name, StringComparer.Ordinal))
+                canonical.Add(property.Name, CanonicalizeJson(property.Value));
+            return canonical;
         }
 
-        var totalBytes = ReadTotalBytes(client);
-        if (totalBytes < operation.TargetTotalBytes)
-            return false;
+        if (token is JArray array)
+            return new JArray(array.Select(CanonicalizeJson));
 
-        var expiry = ReadExpiryTime(client);
-        if (operation.TargetExpiryTime < 0)
-            return expiry == operation.TargetExpiryTime;
-
-        if (operation.TargetExpiryTime == 0)
-            return true;
-
-        return expiry >= operation.TargetExpiryTime;
+        return token.DeepClone();
     }
+
+    /// <summary>Maps target/pre booleans to a non-sensitive field relation label.</summary>
+    /// <param name="target">Whether the observed value satisfies target semantics.</param>
+    /// <param name="pre">Whether the observed value equals the pre-mutation snapshot.</param>
+    /// <returns><c>target</c>, <c>pre</c>, or <c>other</c>.</returns>
+    private static string Relation(bool target, bool pre) => target ? "target" : pre ? "pre" : "other";
+
+    /// <summary>Creates a detailed result with bounded sanitized summary text.</summary>
+    /// <param name="outcome">Comparison outcome.</param>
+    /// <param name="summary">Per-field relation labels without sensitive values.</param>
+    /// <returns>Immutable result safe for persistence and logs.</returns>
+    private static RenewalComparisonResult Result(RecoveryOutcome outcome, string summary) =>
+        new()
+        {
+            Outcome = outcome,
+            Summary = string.IsNullOrWhiteSpace(summary)
+                ? null
+                : summary.Length <= 1000 ? summary : summary[..1000]
+        };
+
+    /// <summary>Creates an unavailable comparison result.</summary>
+    /// <param name="summary">Sanitized reason labels.</param>
+    /// <returns>Unavailable result safe for persistence and logs.</returns>
+    private static RenewalComparisonResult Unavailable(string summary) => Result(RecoveryOutcome.Unavailable, summary);
 
     /// <summary>
     /// Claims due mutation reconciliation and applied-but-unsettled rows for the durable background worker.
@@ -742,7 +1072,8 @@ public class XuiV3RenewalOperationStore
         // A pending row with no mutation marker cannot have called UpdateClient. Once its original lease is stale it
         // is safe to fail and unlock; processing/mutation-started rows are never handled this way.
         await context.XuiV3RenewalOperations
-            .Where(x => x.Status == XuiV3RenewalOperationStatuses.Pending &&
+            .Where(x => x.RecoveryEligible &&
+                        x.Status == XuiV3RenewalOperationStatuses.Pending &&
                         x.MutationStartedAtUtc == null &&
                         x.LeaseUntilUtc < now)
             .ExecuteUpdateAsync(
@@ -757,16 +1088,17 @@ public class XuiV3RenewalOperationStore
             .AsNoTracking()
             .Where(x => x.RecoveryLeaseUntilUtc == null || x.RecoveryLeaseUntilUtc < now)
             .Where(x =>
-                (x.Status == XuiV3RenewalOperationStatuses.Ambiguous &&
-                 (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now)) ||
-                (x.Status == XuiV3RenewalOperationStatuses.Processing &&
-                 x.MutationStartedAtUtc != null &&
-                 x.LeaseUntilUtc < now &&
-                 (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now)) ||
-                (x.Status == XuiV3RenewalOperationStatuses.Applied &&
-                 x.SettlementStatus != XuiV3RenewalSettlementStatuses.Settled &&
-                 x.SettlementStatus != XuiV3RenewalSettlementStatuses.ManualReview &&
-                 (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now)))
+                x.RecoveryEligible &&
+                ((x.Status == XuiV3RenewalOperationStatuses.Ambiguous &&
+                  (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now)) ||
+                 (x.Status == XuiV3RenewalOperationStatuses.Processing &&
+                  x.MutationStartedAtUtc != null &&
+                  x.LeaseUntilUtc < now &&
+                  (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now)) ||
+                 (x.Status == XuiV3RenewalOperationStatuses.Applied &&
+                  x.SettlementStatus != XuiV3RenewalSettlementStatuses.Settled &&
+                  x.SettlementStatus != XuiV3RenewalSettlementStatuses.ManualReview &&
+                  (x.NextReconcileAtUtc == null || x.NextReconcileAtUtc <= now))))
             .OrderBy(x => x.NextReconcileAtUtc ?? x.CreatedAtUtc)
             .Select(x => x.Id)
             .Take(maximumCount * 2)
@@ -780,7 +1112,8 @@ public class XuiV3RenewalOperationStore
 
             var claimToken = Guid.NewGuid().ToString("N");
             var updated = await context.XuiV3RenewalOperations
-                .Where(x => x.Id == id &&
+            .Where(x => x.Id == id &&
+                            x.RecoveryEligible &&
                             (x.RecoveryLeaseUntilUtc == null || x.RecoveryLeaseUntilUtc < now) &&
                             (x.Status == XuiV3RenewalOperationStatuses.Ambiguous ||
                              (x.Status == XuiV3RenewalOperationStatuses.Processing &&
@@ -807,53 +1140,90 @@ public class XuiV3RenewalOperationStore
     }
 
     /// <summary>
-    /// Persists one inconclusive GET-only recovery attempt and schedules bounded exponential backoff.
+    /// Persists one detailed GET-only comparison and chooses safe retry, failure, or manual-review handling.
     /// </summary>
     /// <param name="operation">Claimed ambiguous/processing operation.</param>
-    /// <param name="reason">Sanitized operational reason without URLs, UUIDs, tokens, or panel response bodies.</param>
+    /// <param name="comparison">Detailed comparison containing only a sanitized per-field summary.</param>
     /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
     /// <returns>
-    /// <c>true</c> when the operation was escalated to manual review; <c>false</c> when another automatic GET retry
-    /// was scheduled. A lost recovery lease also returns false without changing the row.
+    /// The durable disposition. DefinitivelyFailed means repeated GETs over the grace window proved the mutation was
+    /// never applied and the account lock was released without touching settlement.
     /// </returns>
     /// <remarks>
-    /// A clear GET result below the target is still inconclusive because the original timed-out POST may commit later.
-    /// This method therefore never marks a mutation-started operation failed and never clears its account lock.
+    /// PartiallyApplied and Drifted results immediately require manual review and retain the lock. Unavailable results
+    /// use bounded backoff. DefinitelyPreMutation releases the lock only after at least
+    /// <see cref="MinimumPreMutationObservations"/> successful observations span <see cref="PreMutationCommitGrace"/>.
+    /// The method never invokes or authorizes another panel mutation and never changes settlement status.
     /// </remarks>
-    /// <example><code>await store.ScheduleInconclusiveReconciliationAsync(operation, "target-not-visible", token)</code></example>
-    public async Task<bool> ScheduleInconclusiveReconciliationAsync(
+    /// <example><code>await store.PersistReconciliationResultAsync(operation, comparison, token);</code></example>
+    public async Task<ReconciliationDisposition> PersistReconciliationResultAsync(
         XuiV3RenewalOperation operation,
-        string reason,
+        RenewalComparisonResult comparison,
         CancellationToken cancellationToken = default)
     {
+        if (comparison == null || comparison.Outcome == RecoveryOutcome.Applied)
+            throw new ArgumentException("A non-applied comparison is required.", nameof(comparison));
+
         var now = DateTime.UtcNow;
         var attempt = operation.ReconcileAttemptCount + 1;
-        var manualReview = attempt >= MaximumAutomaticReconcileAttempts ||
-                           operation.CreatedAtUtc <= now.Subtract(MaximumAutomaticReconcileAge);
+        var preObservation = comparison.Outcome == RecoveryOutcome.DefinitelyPreMutation;
+        var preservePreEvidence = comparison.Outcome == RecoveryOutcome.Unavailable;
+        var preCount = preObservation
+            ? operation.PreMutationObservationCount + 1
+            : preservePreEvidence ? operation.PreMutationObservationCount : 0;
+        var firstPreObservedAt = preObservation
+            ? operation.FirstPreMutationObservedAtUtc ?? now
+            : preservePreEvidence ? operation.FirstPreMutationObservedAtUtc : (DateTime?)null;
+        var graceElapsed = preObservation &&
+                           preCount >= MinimumPreMutationObservations &&
+                           firstPreObservedAt.HasValue &&
+                           now - firstPreObservedAt.Value >= PreMutationCommitGrace &&
+                           operation.MutationStartedAtUtc.HasValue &&
+                           now - operation.MutationStartedAtUtc.Value >= PreMutationCommitGrace;
+        var manualReview = comparison.Outcome is RecoveryOutcome.PartiallyApplied or RecoveryOutcome.Drifted ||
+                           (!graceElapsed &&
+                            (attempt >= MaximumAutomaticReconcileAttempts ||
+                             operation.CreatedAtUtc <= now.Subtract(MaximumAutomaticReconcileAge)));
         var delaySeconds = Math.Min(1800, 15 * Math.Pow(2, Math.Min(attempt - 1, 7)));
         await using var context = _userDbContextFactory.CreateDbContext();
         var updated = await context.XuiV3RenewalOperations
             .Where(x => x.OperationKey == operation.OperationKey &&
+                        x.RecoveryEligible &&
                         (x.Status == XuiV3RenewalOperationStatuses.Ambiguous ||
                          x.Status == XuiV3RenewalOperationStatuses.Processing) &&
                         x.RecoveryClaimToken == operation.RecoveryClaimToken)
             .ExecuteUpdateAsync(
                 setters => setters
-                    .SetProperty(x => x.Status, manualReview
-                        ? XuiV3RenewalOperationStatuses.ManualReview
-                        : XuiV3RenewalOperationStatuses.Ambiguous)
+                    .SetProperty(x => x.Status, graceElapsed
+                        ? XuiV3RenewalOperationStatuses.Failed
+                        : manualReview
+                            ? XuiV3RenewalOperationStatuses.ManualReview
+                            : XuiV3RenewalOperationStatuses.Ambiguous)
+                    .SetProperty(x => x.AccountLockKey, graceElapsed ? null : operation.AccountLockKey)
                     .SetProperty(x => x.ReconcileAttemptCount, attempt)
                     .SetProperty(x => x.LastReconcileAtUtc, now)
-                    .SetProperty(x => x.NextReconcileAtUtc, manualReview
+                    .SetProperty(x => x.NextReconcileAtUtc, manualReview || graceElapsed
                         ? (DateTime?)null
                         : now.AddSeconds(delaySeconds))
                     .SetProperty(x => x.ManualReviewAtUtc, manualReview ? now : (DateTime?)null)
+                    .SetProperty(x => x.PreMutationObservationCount, preCount)
+                    .SetProperty(x => x.FirstPreMutationObservedAtUtc, firstPreObservedAt)
+                    .SetProperty(x => x.LastComparisonOutcome, comparison.Outcome.ToString())
+                    .SetProperty(x => x.LastMismatchSummary, comparison.Summary)
                     .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
                     .SetProperty(x => x.RecoveryClaimToken, (string)null)
-                    .SetProperty(x => x.LastError, Truncate(reason))
+                    .SetProperty(x => x.LastError, graceElapsed
+                        ? "Repeated GET-only observations proved the renewal mutation was not applied."
+                        : manualReview
+                            ? "Renewal reconciliation requires manual review; see sanitized mismatch summary."
+                            : "Renewal reconciliation remains pending; see sanitized mismatch summary.")
                     .SetProperty(x => x.UpdatedAtUtc, now),
                 cancellationToken);
-        return updated == 1 && manualReview;
+        if (updated != 1)
+            return ReconciliationDisposition.NoChange;
+        if (graceElapsed)
+            return ReconciliationDisposition.DefinitivelyFailed;
+        return manualReview ? ReconciliationDisposition.ManualReview : ReconciliationDisposition.RetryScheduled;
     }
 
     /// <summary>

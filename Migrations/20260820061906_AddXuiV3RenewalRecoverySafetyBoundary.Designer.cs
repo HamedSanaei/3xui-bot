@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -9,9 +10,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    partial class UserDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260820061906_AddXuiV3RenewalRecoverySafetyBoundary")]
+    partial class AddXuiV3RenewalRecoverySafetyBoundary
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.8");
@@ -1815,22 +1818,11 @@ namespace Adminbot.Migrations
                     b.Property<long>("ExpectedTotalBytesBefore")
                         .HasColumnType("INTEGER");
 
-                    b.Property<DateTime?>("FirstPreMutationObservedAtUtc")
-                        .HasColumnType("TEXT");
-
                     b.Property<bool>("IsUnlimited")
                         .HasColumnType("INTEGER");
 
-                    b.Property<string>("LastComparisonOutcome")
-                        .HasMaxLength(40)
-                        .HasColumnType("TEXT");
-
                     b.Property<string>("LastError")
                         .HasMaxLength(2000)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("LastMismatchSummary")
-                        .HasMaxLength(1000)
                         .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("LastReconcileAtUtc")
@@ -1871,13 +1863,6 @@ namespace Adminbot.Migrations
 
                     b.Property<string>("PaymentMethod")
                         .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("PreMutationObservationCount")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("PreMutationSnapshotJson")
-                        .HasMaxLength(8000)
                         .HasColumnType("TEXT");
 
                     b.Property<long>("PriceToman")

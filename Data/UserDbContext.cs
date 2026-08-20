@@ -541,6 +541,8 @@ public class UserDbContext : DbContext
             entity.Property(x => x.NormalizedTargetEmail).HasMaxLength(160);
             entity.Property(x => x.NormalizedTargetUuid).HasMaxLength(64);
             entity.Property(x => x.AccountLockKey).HasMaxLength(240);
+            entity.Property(x => x.ExpectedInboundIdsJson).HasMaxLength(2000);
+            entity.Property(x => x.PreMutationSnapshotJson).HasMaxLength(8000);
             entity.Property(x => x.ServiceKey).HasMaxLength(64);
             entity.Property(x => x.PaymentMethod).HasMaxLength(64);
             entity.Property(x => x.Status).IsRequired().HasMaxLength(32);
@@ -548,6 +550,8 @@ public class UserDbContext : DbContext
             entity.Property(x => x.ClaimToken).HasMaxLength(40);
             entity.Property(x => x.RecoveryClaimToken).HasMaxLength(40);
             entity.Property(x => x.LastError).HasMaxLength(2000);
+            entity.Property(x => x.LastComparisonOutcome).HasMaxLength(40);
+            entity.Property(x => x.LastMismatchSummary).HasMaxLength(1000);
             // The unique key is the database-level duplicate guard for repeated confirmations.
             entity.HasIndex(x => x.OperationKey).IsUnique();
             entity.HasIndex(x => x.TenantBotOrderId)

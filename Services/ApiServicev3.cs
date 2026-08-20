@@ -2120,25 +2120,29 @@ public class ApiServicev3
             {
                 lastException = ex;
                 var delay = GetXuiRetryDelay(appConfig, attempt);
+                var transport = BuildTransportDiagnostic(ex, retryMode);
                 Console.WriteLine(
                     $"[XUIv3] transient API failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}, error={ex.Message}");
                 DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
                     configuration,
                     LogLevel.Warning,
                     nameof(ApiServicev3),
-                    $"XUI v3 transient request failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}",
+                    $"XUI v3 transient request failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}, {transport}",
                     ex);
                 await Task.Delay(delay, cancellationToken);
             }
             catch (Exception ex)
             {
+                var transport = BuildTransportDiagnostic(ex, retryMode);
                 // The Telegram-facing exception message is intentionally redacted. Keep the full endpoint and
-                // provider details only in the private daily diagnostic file for operational investigation.
+                // provider details only in the private daily diagnostic file. Every attempt owns and disposes its
+                // handler, and Connection: close disables reuse, so a TLS record-integrity failure already discards
+                // the failed connection. NoAutomaticRetry mutations still surface after this one attempt.
                 DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
                     configuration,
                     LogLevel.Error,
                     nameof(ApiServicev3),
-                    $"XUI v3 request failed after retry policy. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}",
+                    $"XUI v3 request failed after retry policy. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, {transport}",
                     ex);
                 throw;
             }
@@ -2316,6 +2320,56 @@ public class ApiServicev3
     }
 
     /// <summary>
+    /// Detects the OpenSSL TLS record-integrity failure observed on XUI add/update responses.
+    /// </summary>
+    /// <param name="exception">Root transport exception; nested IOException/OpenSSL exceptions are inspected.</param>
+    /// <returns><c>true</c> when any nested message contains bad-record-MAC or equivalent decryption markers.</returns>
+    /// <remarks>
+    /// This classifier is diagnostic only. It never makes a mutation retryable. The transport already uses one new
+    /// handler per attempt plus <c>Connection: close</c>, so the failed connection is disposed and the next independent
+    /// request gets a fresh connection without replaying the current add/update mutation.
+    /// </remarks>
+    /// <example><code>if (ApiServicev3.IsTlsRecordIntegrityFailure(ex)) markOutcomeAmbiguous();</code></example>
+    public static bool IsTlsRecordIntegrityFailure(Exception exception)
+    {
+        return FlattenExceptionChain(exception).Any(current =>
+        {
+            var message = current.Message ?? string.Empty;
+            return message.Contains("decryption failed", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("bad record mac", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("SSL_ERROR_SSL", StringComparison.OrdinalIgnoreCase) &&
+                   message.Contains("decrypt", StringComparison.OrdinalIgnoreCase);
+        });
+    }
+
+    /// <summary>Builds a sanitized transport-policy diagnostic for private failure logs.</summary>
+    /// <param name="exception">Failed HTTP attempt exception.</param>
+    /// <param name="retryMode">Replay policy controlling whether another logical attempt is permitted.</param>
+    /// <returns>
+    /// Protocol, reuse, handler-lifetime, retry-policy, and TLS-integrity labels without URL, token, body, or identity.
+    /// </returns>
+    /// <remarks>
+    /// A TLS record failure occurs before an HTTP response version exists; other exceptions report not-captured.
+    /// The caller separately logs the sanitized endpoint path under existing private diagnostics policy.
+    /// </remarks>
+    private static string BuildTransportDiagnostic(Exception exception, XuiV3RequestRetryMode retryMode)
+    {
+        var tlsRecordIntegrityFailure = IsTlsRecordIntegrityFailure(exception);
+        return string.Join(", ", new[]
+        {
+            "requestVersion=1.1",
+            "versionPolicy=exact",
+            "responseVersion=" + (tlsRecordIntegrityFailure ? "unavailable-before-http" : "not-captured"),
+            "connectionReuse=false",
+            "connectionClose=true",
+            "handlerScope=single-attempt",
+            "failedHandlerDisposed=true",
+            "tlsRecordIntegrityFailure=" + tlsRecordIntegrityFailure.ToString().ToLowerInvariant(),
+            "retryMode=" + retryMode
+        });
+    }
+
+    /// <summary>
     /// Checks whether an HTTP status code represents a temporary panel or gateway failure.
     /// </summary>
     /// <param name="statusCode">Numeric HTTP status code returned by 3x-ui or the proxy in front of it.</param>
@@ -2417,6 +2471,18 @@ public class ApiServicev3
         return body is HttpContent ? "<http-content>" : SerializeBody(body);
     }
 
+    /// <summary>Builds one authenticated HTTP/1.1 request with connection reuse explicitly disabled.</summary>
+    /// <param name="method">Panel endpoint HTTP method.</param>
+    /// <param name="uri">Fully resolved panel URI; it may contain an account path and must remain private.</param>
+    /// <param name="content">Fresh per-attempt content, or null for a bodyless request.</param>
+    /// <param name="serverInfo">Panel descriptor containing the bearer-token source.</param>
+    /// <param name="configuration">Fallback bearer-token configuration.</param>
+    /// <param name="authenticate">Whether to attach panel authentication.</param>
+    /// <returns>A caller-owned request that must be disposed after its single send.</returns>
+    /// <remarks>
+    /// Exact HTTP/1.1 plus <c>Connection: close</c> makes connection behavior deterministic for the affected reverse
+    /// proxy and prevents a TLS record-integrity failure from leaving a reusable connection in the application.
+    /// </remarks>
     private static HttpRequestMessage BuildRequest(
         HttpMethod method,
         Uri uri,
@@ -2427,6 +2493,7 @@ public class ApiServicev3
     {
         var request = new HttpRequestMessage(method, uri);
         request.Version = HttpVersion.Version11;
+        request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
         request.Headers.ConnectionClose = true;
 
         if (authenticate)

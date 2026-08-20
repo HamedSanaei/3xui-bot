@@ -1919,6 +1919,7 @@ public class XuiV3BotFlowService
         }
 
         var client = await GetAuthorizedRenewClientAsync(serverInfo, user, credUser.TelegramUserId, cancellationToken);
+        client = await LoadFreshRenewClientSnapshotAsync(serverInfo, client, cancellationToken);
         if (client == null)
         {
             LogXuiOperationOutcome(
@@ -2094,12 +2095,12 @@ public class XuiV3BotFlowService
         {
             // Ambiguous timeout/network failure: never send another update. Read the panel back and compare its
             // state with the stored absolute target; only then decide applied versus ambiguous.
-            var (recoveryOutcome, _) = await _renewalOperationStore.RecoverByReadBackAsync(
+            var (comparison, _) = await _renewalOperationStore.RecoverByReadBackAsync(
                 renewalOperation,
                 serverInfo,
                 _configuration,
                 cancellationToken);
-            if (recoveryOutcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
+            if (comparison.Outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
             {
                 mutationSucceeded = true;
                 _logger.LogInformation(
@@ -2109,10 +2110,14 @@ public class XuiV3BotFlowService
             }
             else
             {
-                var ambiguousReason = recoveryOutcome == XuiV3RenewalOperationStore.RecoveryOutcome.Unavailable
+                var ambiguousReason = comparison.Outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Unavailable
                     ? "XUI update timed out and the read-back could not determine whether the renewal was applied."
                     : "XUI update timed out and the read-back showed the target was not applied; the panel may still commit it later.";
-                await _renewalOperationStore.MarkAmbiguousAsync(renewalOperation, ambiguousReason, cancellationToken);
+                await _renewalOperationStore.MarkAmbiguousAsync(
+                    renewalOperation,
+                    ambiguousReason,
+                    cancellationToken,
+                    comparison);
 
                 await _activityLog.LogWarningAsync(
                     "xui_v3_renew_ambiguous",
@@ -2292,8 +2297,10 @@ public class XuiV3BotFlowService
             TargetTotalBytes = renewal.Payload.TotalGB,
             TargetExpiryTime = renewal.Payload.ExpiryTime,
             MutationPayloadJson = JsonConvert.SerializeObject(renewal.Payload),
+            PreMutationSnapshotJson = XuiV3RenewalOperationStore.BuildPreMutationSnapshotJson(client),
             ShouldResetTraffic = renewal.ShouldResetTraffic,
-            IsUnlimited = renewal.IsUnlimited
+            IsUnlimited = renewal.IsUnlimited,
+            ExpectedInboundIds = client.InboundIds ?? new List<int>()
         };
 
         var (operation, created) = await _renewalOperationStore.CreateOrGetAsync(draft, cancellationToken);
@@ -2410,11 +2417,11 @@ public class XuiV3BotFlowService
         CancellationToken cancellationToken)
     {
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var (outcome, client) = await _renewalOperationStore.RecoverByReadBackAsync(
+        var (comparison, client) = await _renewalOperationStore.RecoverByReadBackAsync(
             operation, serverInfo, _configuration, cancellationToken);
-        if (outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
+        if (comparison.Outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
         {
-            var applied = await _renewalOperationStore.ResolveAmbiguousToAppliedAsync(operation, cancellationToken);
+            var applied = await _renewalOperationStore.ResolveAmbiguousToAppliedAsync(operation, comparison, cancellationToken);
             if (applied && client != null)
             {
                 await CompleteAppliedOwnedRenewalAsync(
@@ -8648,6 +8655,51 @@ public class XuiV3BotFlowService
             .Where(client => EmailEquals(client.Email, user.ConfigLink) && ClientUuidEquals(client, targetUuid))
             .Take(2)
             .ToList() ?? new List<XuiV3Client>();
+        return matches.Count == 1 ? matches[0] : null;
+    }
+
+    /// <summary>
+    /// Reloads an authorized owned renewal target from the complete read-only client list for snapshot consistency.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel descriptor used only for the client-list GET.</param>
+    /// <param name="authorizedClient">Previously authorized client whose email and UUID identify the exact target.</param>
+    /// <param name="cancellationToken">Token that cancels the authenticated read-only panel request.</param>
+    /// <returns>
+    /// The unique fresh identity match, or null when the panel cannot prove a single exact target. The detached client
+    /// is suitable for the durable pre-mutation snapshot even when it has no inbound attachment.
+    /// </returns>
+    /// <remarks>
+    /// Renewal does not modify inbound membership, so attachment state is deliberately not a precondition or target
+    /// criterion. This method performs no wallet, operation, or panel mutation.
+    /// </remarks>
+    /// <example><code>client = await LoadFreshRenewClientSnapshotAsync(server, client, token)</code></example>
+    private async Task<XuiV3Client> LoadFreshRenewClientSnapshotAsync(
+        ServerInfo serverInfo,
+        XuiV3Client authorizedClient,
+        CancellationToken cancellationToken)
+    {
+        if (authorizedClient == null)
+            return null;
+
+        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        if (!response.Success)
+            return null;
+
+        var normalizedUuid = XuiV3RenewalOperationStore.NormalizeUuid(authorizedClient.Uuid);
+        var normalizedEmail = XuiV3RenewalOperationStore.NormalizeEmail(authorizedClient.Email);
+        var matches = (response.Obj ?? new List<XuiV3Client>())
+            .Where(x =>
+                string.Equals(
+                    XuiV3RenewalOperationStore.NormalizeEmail(x.Email),
+                    normalizedEmail,
+                    StringComparison.Ordinal) &&
+                (string.IsNullOrEmpty(normalizedUuid) ||
+                 string.Equals(
+                     XuiV3RenewalOperationStore.NormalizeUuid(x.Uuid),
+                     normalizedUuid,
+                     StringComparison.Ordinal)))
+            .Take(2)
+            .ToList();
         return matches.Count == 1 ? matches[0] : null;
     }
 

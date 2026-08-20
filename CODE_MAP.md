@@ -64,10 +64,16 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `AccountLockKey` prefers normalized panel UUID and falls back to normalized email, and remains held for pending,
   processing, ambiguous/manual-review, and applied-but-unsettled work. It is cleared only by definitive panel rejection
   or successful settlement. `Services/XuiV3RenewalRecoveryService.cs` claims durable recovery leases, performs GET-only
-  absolute-target reconciliation with bounded exponential backoff, settles recovered owned/tenant operations through
-  their existing idempotency boundaries, and escalates 12 attempts/24 hours to locked manual review. Migration
-  `20260820054739_AddXuiV3RenewalAccountLockRecovery` backfills identity metadata, parks historical unresolved duplicate
-  groups in manual review, and never debits wallets, repairs orders, or calls XUI.
+  detailed reconciliation with bounded exponential backoff, settles recovered owned/tenant operations through their
+  existing idempotency boundaries, and escalates unavailable evidence after 12 attempts/24 hours. Migration
+  `20260820061906_AddXuiV3RenewalRecoverySafetyBoundary` sets `RecoveryEligible=false` and parks every historical
+  pending/processing/ambiguous/applied-unsettled operation in manual review. Only post-migration inserts explicitly set
+  eligibility true; every worker claim is eligibility-filtered, and the migration never debits wallets, repairs orders,
+  settles history, or calls XUI. `20260820102235_AddXuiV3RenewalReconciliationEvidence` adds only nullable comparison/
+  pre-snapshot evidence and a zero observation counter; it performs no status or financial backfill. See Current
+  Gotchas for the five-state comparator, identity-safe direct/list read, ten-minute proven-pre-state unlock, and the
+  exact renewal-controlled fields. New operations still use a unique full-list identity snapshot before mutation, but
+  inbound attachment membership is valid when empty and is not changed or compared by renewal.
 - `Services/XuiV3RenewalTargetParser.cs` + `XuiV3RenewalTargetResolver.cs`: shared side-effect-free exact renewal lookup
   for email, raw SubId/full subscription link, UUID, and VLESS/VMess/Trojan/Shadowsocks/Hysteria configurations. One
   fresh `clients/list` snapshot must produce exactly one client; configuration matching trusts only embedded UUID or
@@ -285,11 +291,17 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   UUID, password, SubId, and protocol identity are preserved.
 - Owned and tenant renewals use the same account-level unresolved lock around their session/order operation key. A new
   renewal is rejected before mutation when UUID (or legacy email fallback) has pending, processing, ambiguous,
-  manual-review, or applied-unsettled work. Delayed panel commits are detected only by `IsTargetReached()` GET read-back;
-  recovered applied operations reuse owned settlement claims/ledger keys or the tenant fulfillment gate, and the lock
-  is released only after settlement persists. Customer ambiguity text states that automatic checking is active and the
-  account is temporarily renewal-locked.
-- XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`. Read-only and idempotent-mutation endpoints keep that retry policy; every non-idempotent create (`/clients/add`, `/clients/bulkCreate`, inbound add/import, node add, geo-source add, client-group create, API-token create, DB import, backup-to-Telegram) is sent exactly once with `NoAutomaticRetry` because a timeout can hide a committed side effect.
+  manual-review, or applied-unsettled work. GET-only recovery uses `CompareRenewalState` with Applied,
+  DefinitelyPreMutation, PartiallyApplied, Drifted, and Unavailable outcomes and persists a credential-free per-field
+  summary. UUID, quota, expiry, enabled state, semantically compared renewal metadata, and an intentionally changed
+  owner are authoritative; inbound membership, traffic-row enable, LimitIp, password, SubId, and preserved protocol
+  extras are not renewal-controlled success criteria. Direct `clients/get/{email}` results are identity-checked because
+  affected panels can return an unrelated client with HTTP 200; mismatch falls back to exactly one UUID match from
+  `clients/list`. Recovered Applied operations reuse the existing exactly-once settlement gates. Partial/drift stays
+  locked in ManualReview. A new operation stores a credential-free pre-mutation snapshot; at least three exact pre-state
+  GETs spanning ten minutes may mark it Failed/NotApplied, leave settlement untouched, clear the lock, and allow a fresh
+  renewal. Rows without that snapshot can never auto-unlock this way. Recovery never replays or recomputes UpdateClient.
+- XUI v3 API calls use bounded retry/backoff for transient TLS/socket/timeouts and HTTP `408/429/502/503/504/520-527`; retry settings live beside `xuiV3RequestTimeoutSeconds` in `Data/configuration.json`. Read-only and idempotent-mutation endpoints keep that retry policy; every non-idempotent create (`/clients/add`, `/clients/bulkCreate`, inbound add/import, node add, geo-source add, client-group create, API-token create, DB import, backup-to-Telegram) is sent exactly once with `NoAutomaticRetry` because a timeout can hide a committed side effect. The current transport creates/disposes one handler per attempt, sends exact HTTP/1.1 with `Connection: close`, and therefore never reuses a failed TLS connection. Private error diagnostics record request/response-version availability, reuse/handler policy, retry mode, and a sanitized bad-record-MAC classifier; a mutation failure is still never replayed.
 - XUI v3 account creation treats generated email as the idempotency key. `addClient` is never replayed: if the add or the follow-up client/link read fails ambiguously, the bot re-reads the panel by email and returns the recovered panel UUID/subId when the account exists instead of creating a duplicate.
 - XUI v3 failures must never expose panel URLs, root paths, endpoints, responses, tokens, or cookies in Telegram.
   `XuiV3ApiException.Message` is redacted and `XuiV3UserSafeError` owns fixed user-facing creation errors; complete

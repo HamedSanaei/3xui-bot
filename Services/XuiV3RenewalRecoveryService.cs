@@ -7,9 +7,10 @@ using Microsoft.Extensions.Logging;
 /// </summary>
 /// <remarks>
 /// Mutation recovery is strictly read-only: this worker calls <c>GET client</c> and compares the stored absolute
-/// target through <see cref="XuiV3RenewalOperationStore.IsTargetReached"/>. It never calls or delegates a call to
+/// target through <see cref="XuiV3RenewalOperationStore.CompareRenewalState"/>. It never calls or delegates a call to
 /// <c>POST /UpdateClient</c>. Applied operations reuse the callback settlement guards so financial effects remain
-/// exactly once. Inconclusive rows keep their account lock through exponential backoff and eventual manual review.
+/// exactly once. Partial/drift evidence stays locked for manual review; repeated exact pre-state evidence can release
+/// the lock as definitively not applied only after the conservative observation window.
 /// </remarks>
 public sealed class XuiV3RenewalRecoveryService : BackgroundService
 {
@@ -96,8 +97,8 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
     /// <param name="cancellationToken">Host shutdown token.</param>
     /// <returns>A task that completes after durable apply, settlement, backoff, or manual-review state is written.</returns>
     /// <remarks>
-    /// A GET result below target is not definitive failure because the original POST may still commit. Both unavailable
-    /// and below-target results therefore retain the lock and back off. Only absolute-target success permits settlement.
+    /// Applied permits settlement; repeated exact pre-mutation observations can safely fail and unlock after the grace
+    /// window. Partial application or drift moves to locked manual review, while unavailable reads back off.
     /// </remarks>
     private async Task RecoverOneAsync(
         XuiV3RenewalOperation operation,
@@ -107,30 +108,37 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
         {
             if (operation.Status != XuiV3RenewalOperationStatuses.Applied)
             {
-                var (outcome, _) = await _operationStore.RecoverByReadBackAsync(
+                var (comparison, _) = await _operationStore.RecoverByReadBackAsync(
                     operation,
                     BuildConfiguredPanelServerInfo(),
                     _configuration,
                     cancellationToken);
-                if (outcome != XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
+                if (comparison.Outcome != XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
                 {
-                    var manual = await _operationStore.ScheduleInconclusiveReconciliationAsync(
+                    var disposition = await _operationStore.PersistReconciliationResultAsync(
                         operation,
-                        outcome == XuiV3RenewalOperationStore.RecoveryOutcome.NotApplied
-                            ? "The absolute renewal target is not visible yet; delayed commit remains possible."
-                            : "The panel read-back was unavailable.",
+                        comparison,
                         cancellationToken);
-                    if (manual)
+                    if (disposition == XuiV3RenewalOperationStore.ReconciliationDisposition.ManualReview)
                     {
                         _logger.LogError(
-                            "XUI v3 renewal moved to manual review after bounded GET-only reconciliation. renewalOperationId={RenewalOperationId}",
-                            operation.OperationId);
+                            "XUI v3 renewal moved to locked manual review. renewalOperationId={RenewalOperationId}, outcome={Outcome}, mismatchSummary={MismatchSummary}",
+                            operation.OperationId,
+                            comparison.Outcome,
+                            comparison.Summary);
+                    }
+                    else if (disposition == XuiV3RenewalOperationStore.ReconciliationDisposition.DefinitivelyFailed)
+                    {
+                        _logger.LogWarning(
+                            "XUI v3 renewal was proven not applied and its account lock was released without settlement. renewalOperationId={RenewalOperationId}, mismatchSummary={MismatchSummary}",
+                            operation.OperationId,
+                            comparison.Summary);
                     }
 
                     return;
                 }
 
-                if (!await _operationStore.ResolveAmbiguousToAppliedAsync(operation, cancellationToken))
+                if (!await _operationStore.ResolveAmbiguousToAppliedAsync(operation, comparison, cancellationToken))
                 {
                     await _operationStore.ReleaseRecoveryClaimAsync(operation, cancellationToken);
                     return;
@@ -173,9 +181,13 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
             }
             else
             {
-                await _operationStore.ScheduleInconclusiveReconciliationAsync(
+                await _operationStore.PersistReconciliationResultAsync(
                     operation,
-                    "Unexpected GET-only reconciliation failure.",
+                    new XuiV3RenewalOperationStore.RenewalComparisonResult
+                    {
+                        Outcome = XuiV3RenewalOperationStore.RecoveryOutcome.Unavailable,
+                        Summary = "identity=unavailable;read=unexpected-failure"
+                    },
                     cancellationToken);
             }
         }

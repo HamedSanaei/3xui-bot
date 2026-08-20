@@ -156,6 +156,17 @@ namespace Adminbot.Domain
         public string MutationPayloadJson { get; set; }
 
         /// <summary>
+        /// Credential-free JSON snapshot of renewal-controlled fields immediately before the one permitted mutation.
+        /// It is used only to prove that a timed-out request definitely left the client unchanged.
+        /// </summary>
+        /// <remarks>
+        /// New operations populate this field before <c>POST /clients/update</c>. It may contain owner/metadata identity,
+        /// is users.db-only, and must never be logged. Historical null values can still reconcile to Applied from their
+        /// absolute target, but can never auto-unlock as definitely not applied.
+        /// </remarks>
+        public string PreMutationSnapshotJson { get; set; }
+
+        /// <summary>
         /// Canonical lowercase target email used for account-level unresolved-operation lookup. It is never exposed in
         /// callback data or operational logs.
         /// </summary>
@@ -171,6 +182,18 @@ namespace Adminbot.Domain
         /// and is cleared only after definitive failure or successful settlement.
         /// </summary>
         public string AccountLockKey { get; set; }
+
+        /// <summary>
+        /// Indicates that the operation was created under the post-migration mutation-start and account-lock protocol.
+        /// Historical rows remain false and are permanently excluded from automatic reconciliation and settlement.
+        /// </summary>
+        public bool RecoveryEligible { get; set; }
+
+        /// <summary>
+        /// JSON array of positive inbound ids observed immediately before renewal, retained for audit compatibility.
+        /// Renewal does not change inbound membership, so automatic success/failure comparison never requires equality.
+        /// </summary>
+        public string ExpectedInboundIdsJson { get; set; }
 
         /// <summary>
         /// UTC time persisted immediately before the one permitted <c>POST /UpdateClient</c> call. Once populated,
@@ -219,6 +242,29 @@ namespace Adminbot.Domain
 
         /// <summary>UTC time when the most recent GET-only reconciliation attempt finished.</summary>
         public DateTime? LastReconcileAtUtc { get; set; }
+
+        /// <summary>
+        /// Name of the most recent detailed reconciliation outcome: Applied, DefinitelyPreMutation,
+        /// PartiallyApplied, Drifted, or Unavailable.
+        /// </summary>
+        public string LastComparisonOutcome { get; set; }
+
+        /// <summary>
+        /// Sanitized per-field comparison summary. It contains only field names and relation labels, never account
+        /// identifiers, payloads, panel URLs, tokens, or raw response data.
+        /// </summary>
+        public string LastMismatchSummary { get; set; }
+
+        /// <summary>
+        /// Number of successful GET observations that proved the complete controlled state still equals the stored
+        /// pre-mutation snapshot during the current reconciliation sequence.
+        /// </summary>
+        public int PreMutationObservationCount { get; set; }
+
+        /// <summary>
+        /// UTC time of the first successful pre-mutation observation in the current conservative commit-grace window.
+        /// </summary>
+        public DateTime? FirstPreMutationObservedAtUtc { get; set; }
 
         /// <summary>UTC lease deadline held by one background reconciliation executor.</summary>
         public DateTime? RecoveryLeaseUntilUtc { get; set; }

@@ -6,18 +6,18 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace Adminbot.Migrations
 {
     /// <summary>
-    /// Adds account-level unresolved-renewal locks and durable GET-only reconciliation scheduling.
+    /// Adds account-level renewal locks, a post-migration recovery eligibility boundary, and GET-only scheduling.
     /// </summary>
     /// <remarks>
-    /// Historical rows are normalized without debiting wallets, changing tenant orders, or calling the panel. Existing
-    /// processing rows are conservatively treated as ambiguous because their POST may have started. If multiple
-    /// unresolved historical rows identify the same account, all are parked in manual review and only the oldest owns
-    /// the unique physical lock; lookup indexes still make every duplicate visible to operators and new-renewal checks.
+    /// Every pre-existing unresolved operation is quarantined in manual review with <c>RecoveryEligible = 0</c>.
+    /// The migration performs metadata-only writes: it never calls XUI, debits a wallet, appends a financial ledger,
+    /// settles a tenant order, or infers that an old mutation succeeded. Only runtime operations inserted after this
+    /// migration explicitly set recovery eligibility to true.
     /// </remarks>
-    public partial class AddXuiV3RenewalAccountLockRecovery : Migration
+    public partial class AddXuiV3RenewalRecoverySafetyBoundary : Migration
     {
-        /// <summary>Adds recovery columns, safely classifies historical rows, and creates lock/recovery indexes.</summary>
-        /// <param name="migrationBuilder">EF Core migration builder for the configured users.db SQLite database.</param>
+        /// <summary>Adds recovery columns, quarantines historical unresolved rows, and creates lookup/lock indexes.</summary>
+        /// <param name="migrationBuilder">EF Core migration builder for the users.db SQLite schema.</param>
         protected override void Up(MigrationBuilder migrationBuilder)
         {
             migrationBuilder.AddColumn<string>(
@@ -25,6 +25,13 @@ namespace Adminbot.Migrations
                 table: "XuiV3RenewalOperations",
                 type: "TEXT",
                 maxLength: 240,
+                nullable: true);
+
+            migrationBuilder.AddColumn<string>(
+                name: "ExpectedInboundIdsJson",
+                table: "XuiV3RenewalOperations",
+                type: "TEXT",
+                maxLength: 2000,
                 nullable: true);
 
             migrationBuilder.AddColumn<DateTime>(
@@ -79,15 +86,22 @@ namespace Adminbot.Migrations
                 maxLength: 40,
                 nullable: true);
 
+            migrationBuilder.AddColumn<bool>(
+                name: "RecoveryEligible",
+                table: "XuiV3RenewalOperations",
+                type: "INTEGER",
+                nullable: false,
+                defaultValue: false);
+
             migrationBuilder.AddColumn<DateTime>(
                 name: "RecoveryLeaseUntilUtc",
                 table: "XuiV3RenewalOperations",
                 type: "TEXT",
                 nullable: true);
 
-            // This backfill is deliberately metadata-only. It neither assumes that an ambiguous mutation failed nor
-            // repairs/debits any historical settlement. Processing rows may have crossed the network boundary, so
-            // they become GET-only ambiguous work and retain a lock.
+            // Historical operations predate the durable mutation-start protocol. Even an old Applied row may have an
+            // unsettled financial side effect, so all unresolved states are permanently quarantined. No financial
+            // table is touched here and RecoveryEligible intentionally retains its false database default.
             migrationBuilder.Sql(
                 """
                 UPDATE "XuiV3RenewalOperations"
@@ -96,38 +110,14 @@ namespace Adminbot.Migrations
                         WHEN length(trim(COALESCE("TargetUuid", ''))) = 36
                             THEN lower(trim("TargetUuid"))
                         ELSE ''
-                    END;
-
-                UPDATE "XuiV3RenewalOperations"
-                SET "MutationStartedAtUtc" = COALESCE("UpdatedAtUtc", "CreatedAtUtc"),
-                    "Status" = 'ambiguous',
-                    "NextReconcileAtUtc" = CURRENT_TIMESTAMP,
-                    "LastError" = 'Historical processing operation requires GET-only reconciliation.'
-                WHERE "Status" = 'processing';
-
-                UPDATE "XuiV3RenewalOperations" AS candidate
-                SET "Status" = 'manual_review',
+                    END,
+                    "Status" = 'manual_review',
                     "ManualReviewAtUtc" = CURRENT_TIMESTAMP,
                     "NextReconcileAtUtc" = NULL,
-                    "LastError" = 'Historical duplicate unresolved renewal requires manual review.'
-                WHERE (
-                        candidate."Status" IN ('pending', 'processing', 'ambiguous', 'manual_review')
-                        OR (candidate."Status" = 'applied' AND candidate."SettlementStatus" <> 'settled')
-                      )
-                  AND (
-                    SELECT COUNT(*)
-                    FROM "XuiV3RenewalOperations" AS duplicate
-                    WHERE (
-                            duplicate."Status" IN ('pending', 'processing', 'ambiguous', 'manual_review')
-                            OR (duplicate."Status" = 'applied' AND duplicate."SettlementStatus" <> 'settled')
-                          )
-                      AND CASE
-                            WHEN candidate."NormalizedTargetUuid" <> '' AND duplicate."NormalizedTargetUuid" <> ''
-                                THEN candidate."NormalizedTargetUuid" = duplicate."NormalizedTargetUuid"
-                            ELSE candidate."NormalizedTargetEmail" <> ''
-                                 AND candidate."NormalizedTargetEmail" = duplicate."NormalizedTargetEmail"
-                          END
-                  ) > 1;
+                    "RecoveryEligible" = 0,
+                    "LastError" = 'Historical unresolved renewal quarantined; explicit administrator review required.'
+                WHERE "Status" IN ('pending', 'processing', 'ambiguous', 'manual_review')
+                   OR ("Status" = 'applied' AND "SettlementStatus" <> 'settled');
 
                 UPDATE "XuiV3RenewalOperations" AS candidate
                 SET "AccountLockKey" = CASE
@@ -137,17 +127,11 @@ namespace Adminbot.Migrations
                             THEN 'email:' || candidate."NormalizedTargetEmail"
                         ELSE NULL
                     END
-                WHERE (
-                        candidate."Status" IN ('pending', 'processing', 'ambiguous', 'manual_review')
-                        OR (candidate."Status" = 'applied' AND candidate."SettlementStatus" <> 'settled')
-                      )
+                WHERE candidate."Status" = 'manual_review'
                   AND candidate."Id" = (
                     SELECT MIN(owner."Id")
                     FROM "XuiV3RenewalOperations" AS owner
-                    WHERE (
-                            owner."Status" IN ('pending', 'processing', 'ambiguous', 'manual_review')
-                            OR (owner."Status" = 'applied' AND owner."SettlementStatus" <> 'settled')
-                          )
+                    WHERE owner."Status" = 'manual_review'
                       AND CASE
                             WHEN candidate."NormalizedTargetUuid" <> '' AND owner."NormalizedTargetUuid" <> ''
                                 THEN candidate."NormalizedTargetUuid" = owner."NormalizedTargetUuid"
@@ -180,8 +164,8 @@ namespace Adminbot.Migrations
                 columns: new[] { "Status", "NextReconcileAtUtc", "RecoveryLeaseUntilUtc" });
         }
 
-        /// <summary>Removes recovery metadata and indexes without changing historical renewal or financial rows.</summary>
-        /// <param name="migrationBuilder">EF Core migration builder for the configured users.db SQLite database.</param>
+        /// <summary>Removes recovery metadata/indexes without changing renewal, order, wallet, or ledger history.</summary>
+        /// <param name="migrationBuilder">EF Core migration builder for the users.db SQLite schema.</param>
         protected override void Down(MigrationBuilder migrationBuilder)
         {
             migrationBuilder.DropIndex(
@@ -202,6 +186,10 @@ namespace Adminbot.Migrations
 
             migrationBuilder.DropColumn(
                 name: "AccountLockKey",
+                table: "XuiV3RenewalOperations");
+
+            migrationBuilder.DropColumn(
+                name: "ExpectedInboundIdsJson",
                 table: "XuiV3RenewalOperations");
 
             migrationBuilder.DropColumn(
@@ -234,6 +222,10 @@ namespace Adminbot.Migrations
 
             migrationBuilder.DropColumn(
                 name: "RecoveryClaimToken",
+                table: "XuiV3RenewalOperations");
+
+            migrationBuilder.DropColumn(
+                name: "RecoveryEligible",
                 table: "XuiV3RenewalOperations");
 
             migrationBuilder.DropColumn(

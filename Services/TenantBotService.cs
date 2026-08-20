@@ -10377,6 +10377,7 @@ public class TenantBotService
                 order.TargetAccountUuid,
                 cancellationToken)
             : await FindTenantClientAsync(serverInfo, order.TargetAccountEmail, cancellationToken);
+        client = await LOADFRESHTENANTRENEWSNAPSHOTASYNC(serverInfo, client, cancellationToken);
         var targetAuthorized = hasExactTargetLock ||
                                (client != null &&
                                 ClientBelongsToTenantCustomer(client, order.CustomerTelegramUserId, order.TenantBotId));
@@ -10503,9 +10504,9 @@ public class TenantBotService
         catch (Exception ex) when (ApiServicev3.IsTransientXuiTransportException(ex, cancellationToken))
         {
             // Ambiguous timeout: never send another update. Read the panel back and compare with the stored target.
-            var (outcome, recoveredClient) = await _renewalOperationStore.RecoverByReadBackAsync(
+            var (comparison, recoveredClient) = await _renewalOperationStore.RecoverByReadBackAsync(
                 tenantRenewalOperation, serverInfo, _configuration, cancellationToken);
-            if (outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
+            if (comparison.Outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
             {
                 tenantMutationSucceeded = true;
                 client = recoveredClient ?? client;
@@ -10514,10 +10515,11 @@ public class TenantBotService
             {
                 await _renewalOperationStore.MarkAmbiguousAsync(
                     tenantRenewalOperation,
-                    outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Unavailable
+                    comparison.Outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Unavailable
                         ? "Tenant renewal update timed out and the read-back could not determine the outcome."
                         : "Tenant renewal update timed out and the read-back showed the target was not applied.",
-                    cancellationToken);
+                    cancellationToken,
+                    comparison);
                 order.PaymentStatus = TenantBotOrderStatuses.Pending;
                 order.ErrorMessage = "نتیجه تمدید در پنل هنوز قطعی نیست؛ درخواست خودکار بررسی می‌شود و تمدید جدید این اکانت موقتاً قفل است.";
                 order.UpdatedAtUtc = DateTime.UtcNow;
@@ -10585,8 +10587,10 @@ public class TenantBotService
             TargetTotalBytes = renewal.Payload.TotalGB,
             TargetExpiryTime = renewal.Payload.ExpiryTime,
             MutationPayloadJson = JsonConvert.SerializeObject(renewal.Payload),
+            PreMutationSnapshotJson = XuiV3RenewalOperationStore.BuildPreMutationSnapshotJson(client),
             ShouldResetTraffic = renewal.ShouldResetTraffic,
-            IsUnlimited = renewal.IsUnlimited
+            IsUnlimited = renewal.IsUnlimited,
+            ExpectedInboundIds = client.InboundIds ?? new List<int>()
         };
 
         var (operation, created) = await _renewalOperationStore.CreateOrGetAsync(draft, cancellationToken);
@@ -10630,9 +10634,9 @@ public class TenantBotService
 
             case XuiV3RenewalOperationStatuses.Ambiguous:
             {
-                var (outcome, recoveredClient) = await _renewalOperationStore.RecoverByReadBackAsync(
+                var (comparison, recoveredClient) = await _renewalOperationStore.RecoverByReadBackAsync(
                     operation, serverInfo, _configuration, cancellationToken);
-                if (outcome != XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
+                if (comparison.Outcome != XuiV3RenewalOperationStore.RecoveryOutcome.Applied)
                 {
                     _logger.LogWarning(
                         "Tenant renewal remains ambiguous; no mutation will be replayed. renewalOperationId={RenewalOperationId}, orderId={OrderId}",
@@ -10641,7 +10645,7 @@ public class TenantBotService
                     return NowPaymentsSettlementResult.ProviderNotPaid();
                 }
 
-                if (!await _renewalOperationStore.ResolveAmbiguousToAppliedAsync(operation, cancellationToken))
+                if (!await _renewalOperationStore.ResolveAmbiguousToAppliedAsync(operation, comparison, cancellationToken))
                     return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
 
                 var renewal = RebuildTenantRenewalForOperation(operation);
@@ -10681,9 +10685,9 @@ public class TenantBotService
         if (await ISTENANTORDERALREADYFULFILLEDASYNC(order, cancellationToken))
             return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
 
-        var (readOutcome, readClient) = await _renewalOperationStore.RecoverByReadBackAsync(
+        var (readComparison, readClient) = await _renewalOperationStore.RecoverByReadBackAsync(
             operation, serverInfo, _configuration, cancellationToken);
-        var appliedClient = readOutcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied && readClient != null
+        var appliedClient = readComparison.Outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied && readClient != null
             ? readClient
             : BuildTenantMirroredClientForPayload(RebuildTenantPayloadForOperation(operation));
         return await CompleteTenantRenewalFulfillmentAsync(
@@ -11061,6 +11065,48 @@ public class TenantBotService
                 string.Equals(clientUuid, targetUuid, StringComparison.OrdinalIgnoreCase))
             .Take(2)
             .ToList() ?? new List<XuiV3Client>();
+        return matches.Count == 1 ? matches[0] : null;
+    }
+
+    /// <summary>
+    /// Reloads an authorized tenant renewal target from the complete list for a consistent pre-mutation snapshot.
+    /// </summary>
+    /// <param name="serverInfo">Configured panel descriptor used only for the authenticated client-list GET.</param>
+    /// <param name="authorizedClient">Previously authorized tenant target with exact email and optional UUID.</param>
+    /// <param name="cancellationToken">Token that cancels the read-only panel request.</param>
+    /// <returns>The unique exact identity match, or null when safe identity observation is impossible.</returns>
+    /// <remarks>
+    /// Renewal does not modify inbound membership, so an empty attachment set is valid. This method has no order,
+    /// wallet, Telegram, or panel mutation effects.
+    /// </remarks>
+    /// <example><code>client = await LOADFRESHTENANTRENEWSNAPSHOTASYNC(server, client, token)</code></example>
+    private async Task<XuiV3Client> LOADFRESHTENANTRENEWSNAPSHOTASYNC(
+        ServerInfo serverInfo,
+        XuiV3Client authorizedClient,
+        CancellationToken cancellationToken)
+    {
+        if (authorizedClient == null)
+            return null;
+
+        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        if (!response.Success)
+            return null;
+
+        var normalizedUuid = XuiV3RenewalOperationStore.NormalizeUuid(authorizedClient.Uuid);
+        var normalizedEmail = XuiV3RenewalOperationStore.NormalizeEmail(authorizedClient.Email);
+        var matches = (response.Obj ?? new List<XuiV3Client>())
+            .Where(x =>
+                string.Equals(
+                    XuiV3RenewalOperationStore.NormalizeEmail(x.Email),
+                    normalizedEmail,
+                    StringComparison.Ordinal) &&
+                (string.IsNullOrEmpty(normalizedUuid) ||
+                 string.Equals(
+                     XuiV3RenewalOperationStore.NormalizeUuid(x.Uuid),
+                     normalizedUuid,
+                     StringComparison.Ordinal)))
+            .Take(2)
+            .ToList();
         return matches.Count == 1 ? matches[0] : null;
     }
 
