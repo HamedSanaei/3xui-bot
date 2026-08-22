@@ -12,9 +12,10 @@ using Telegram.Bot.Types.ReplyMarkups;
 /// Periodically scans the complete XUI v3 client list and delivers durable 80/90/99 percent traffic reminders.
 /// </summary>
 /// <remarks>
-/// Each enabled iteration performs exactly one <c>/panel/api/clients/list</c> request. Client cycle and delivery state
-/// lives in <c>users.db</c>, while recipient profile/block information remains in <c>credentials.db</c>. Messages are
-/// sent by the owned or tenant bot recorded in the client metadata; no wallet, order, payment, or XUI mutation occurs.
+/// Each enabled iteration performs exactly one <c>/panel/api/clients/list</c> request. Only contradictory expiry
+/// evidence can schedule a backoff-controlled <c>GET clients/get/{email}</c> verification. Client cycle and delivery
+/// state lives in <c>users.db</c>, while recipient profile/block information remains in <c>credentials.db</c>. Messages
+/// are sent by the owned or tenant bot recorded in metadata; no wallet, order, payment, or XUI mutation occurs.
 /// </remarks>
 public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
 {
@@ -22,6 +23,10 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     private static readonly TimeSpan MinimumSameChatSpacing = TimeSpan.FromMilliseconds(1100);
     /// <summary>Minimum process-local spacing between any two volume-reminder Telegram sends.</summary>
     private static readonly TimeSpan MinimumGlobalSpacing = TimeSpan.FromMilliseconds(75);
+    /// <summary>Backoff after a transient direct-GET failure while contradictory expiry evidence remains unresolved.</summary>
+    private static readonly TimeSpan UnavailableProbeBackoff = TimeSpan.FromHours(1);
+    /// <summary>Backoff after a definitive expired result or identity mismatch that should not be probed every scan.</summary>
+    private static readonly TimeSpan DefinitiveProbeBackoff = TimeSpan.FromHours(24);
     private readonly IConfiguration _configuration;
     private readonly BotClientProvider _botClientProvider;
     private readonly BotRegistry _botRegistry;
@@ -127,6 +132,8 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     /// from looking like deletion, counter reset, or renewal. Lower thresholds are not emitted when the same scan
     /// first observes a higher threshold. Recoverably malformed individual client rows are skipped and summarized in
     /// one diagnostic entry so one historical panel row cannot abort reconciliation for every valid account.
+    /// A direct GET is allowed only when all list expiry sources say expired while current bot metadata disagrees;
+    /// its id and normalized email must match before its expiry evidence can be used.
     /// </remarks>
     private async Task RunScanAsync(AppConfig config, CancellationToken cancellationToken)
     {
@@ -141,8 +148,9 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
         }
 
         var nowUtc = DateTime.UtcNow;
+        var panelKey = XuiV3ClientUsageResolver.BuildPanelKey(serverInfo);
         var enabledServices = _purchaseService.GetEnabledServices();
-        var observations = new List<XuiV3VolumeReminderObservation>();
+        var evaluatedClients = new List<XuiV3VolumeReminderEvaluatedClient>();
         var malformedClientCount = 0;
         var firstMalformedClientId = 0;
         Exception firstMalformedClientException = null;
@@ -160,20 +168,12 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                 if (snapshot.TotalBytes <= 0 || snapshot.OwnerTelegramUserId <= 0 || IsSuperAdmin(config, snapshot.OwnerTelegramUserId))
                     continue;
 
-                var threshold = XuiV3ClientUsageResolver.GetHighestReachedThreshold(snapshot);
-                observations.Add(new XuiV3VolumeReminderObservation
+                evaluatedClients.Add(new XuiV3VolumeReminderEvaluatedClient
                 {
-                    ClientId = snapshot.ClientId,
-                    ClientCreatedAt = snapshot.ClientCreatedAt,
-                    Email = snapshot.Email,
-                    BotId = snapshot.CreatedByBotId,
-                    TelegramUserId = snapshot.OwnerTelegramUserId,
-                    PanelUpdatedAt = snapshot.PanelUpdatedAt,
-                    TotalBytes = snapshot.TotalBytes,
-                    UsedBytes = snapshot.UsedBytes,
-                    LastRenewedAtUtc = snapshot.LastRenewedAtUtc,
-                    HighestReachedThreshold = threshold,
-                    CanNotify = XuiV3ClientUsageResolver.CanNotifyVolumeThreshold(snapshot, nowUtc, threshold)
+                    Snapshot = snapshot,
+                    InitialEligibility = XuiV3ClientUsageResolver.EvaluateVolumeReminderEligibility(
+                        snapshot,
+                        nowUtc)
                 });
             }
             catch (Exception ex) when (IsRecoverableClientRecordException(ex))
@@ -198,7 +198,52 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                 firstMalformedClientId);
         }
 
-        var panelKey = XuiV3ClientUsageResolver.BuildPanelKey(serverInfo);
+        var dueProbeIds = await _stateStore.GetDueEligibilityProbeClientIdsAsync(
+            panelKey,
+            evaluatedClients
+                .Where(item => item.InitialEligibility.RequiresReadOnlyVerification)
+                .Select(item => item.Snapshot.ClientId)
+                .ToArray(),
+            nowUtc,
+            cancellationToken);
+        var observations = new List<XuiV3VolumeReminderObservation>(evaluatedClients.Count);
+        foreach (var evaluatedClient in evaluatedClients)
+        {
+            var snapshot = evaluatedClient.Snapshot;
+            var probe = dueProbeIds.Contains(snapshot.ClientId)
+                ? await VerifyExpiryEligibilityAsync(serverInfo, evaluatedClient, nowUtc, cancellationToken)
+                : XuiV3VolumeEligibilityProbeResult.NotAttempted(evaluatedClient.InitialEligibility);
+            var eligibility = probe.Eligibility;
+            observations.Add(new XuiV3VolumeReminderObservation
+            {
+                ClientId = snapshot.ClientId,
+                ClientCreatedAt = snapshot.ClientCreatedAt,
+                Email = snapshot.Email,
+                BotId = snapshot.CreatedByBotId,
+                TelegramUserId = snapshot.OwnerTelegramUserId,
+                PanelUpdatedAt = snapshot.PanelUpdatedAt,
+                TotalBytes = snapshot.TotalBytes,
+                UsedBytes = snapshot.UsedBytes,
+                LastRenewedAtUtc = snapshot.LastRenewedAtUtc,
+                HighestReachedThreshold = eligibility.Threshold,
+                IsEligible = eligibility.IsEligible,
+                EligibilityCode = eligibility.Code,
+                EligibilitySummary = eligibility.Summary,
+                EligibilityProbeAttempted = probe.Attempted,
+                EligibilityProbeAtUtc = probe.AttemptedAtUtc,
+                NextEligibilityProbeAtUtc = probe.NextAttemptAtUtc
+            });
+
+            if (probe.Attempted && !eligibility.IsEligible)
+            {
+                _logger.LogInformation(
+                    "XUI volume reminder expiry verification did not establish eligibility. clientId={ClientId}, result={Result}, evidence={Evidence}",
+                    snapshot.ClientId,
+                    eligibility.Code,
+                    eligibility.Summary);
+            }
+        }
+
         var candidates = await _stateStore.ReconcileAsync(panelKey, observations, nowUtc, cancellationToken);
         var startedKeys = await _stateStore.GetStartedBotUserKeysAsync(candidates, cancellationToken);
         var sent = 0;
@@ -215,6 +260,12 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                     candidate.BotId,
                     candidate.TelegramUserId)))
             {
+                await _stateStore.MarkRecipientIneligibleAsync(
+                    candidate,
+                    "recipient_not_started",
+                    "botScopedStart=missing",
+                    DateTime.UtcNow,
+                    cancellationToken);
                 skipped++;
                 continue;
             }
@@ -222,6 +273,12 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             var credUser = await _credentialsDbContext.GetUserStatusWithId(candidate.TelegramUserId);
             if (credUser == null || credUser.IsBlocked)
             {
+                await _stateStore.MarkRecipientIneligibleAsync(
+                    candidate,
+                    credUser == null ? "recipient_missing" : "recipient_blocked",
+                    credUser == null ? "credentials=missing" : "credentials=blocked",
+                    DateTime.UtcNow,
+                    cancellationToken);
                 skipped++;
                 continue;
             }
@@ -230,12 +287,30 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             if (bot?.Enabled != true ||
                 !string.Equals(bot.Id, candidate.BotId, StringComparison.OrdinalIgnoreCase))
             {
+                await _stateStore.MarkRecipientIneligibleAsync(
+                    candidate,
+                    "bot_unavailable",
+                    "originatingBot=missing_or_disabled",
+                    DateTime.UtcNow,
+                    cancellationToken);
                 skipped++;
                 continue;
             }
 
             var chatId = credUser.ChatID > 0 ? credUser.ChatID : candidate.TelegramUserId;
-            if (chatId <= 0 || !await _stateStore.TryClaimAsync(candidate, DateTime.UtcNow, cancellationToken))
+            if (chatId <= 0)
+            {
+                await _stateStore.MarkRecipientIneligibleAsync(
+                    candidate,
+                    "invalid_chat",
+                    "chatId=invalid",
+                    DateTime.UtcNow,
+                    cancellationToken);
+                skipped++;
+                continue;
+            }
+
+            if (!await _stateStore.TryClaimAsync(candidate, DateTime.UtcNow, cancellationToken))
             {
                 skipped++;
                 continue;
@@ -322,15 +397,185 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             }
         }
 
-        _logger.LogDebug(
-            "XUI v3 volume reminder scan finished. clients={ClientCount}, finiteObservations={ObservationCount}, candidates={CandidateCount}, sent={Sent}, skipped={Skipped}, failed={Failed}",
+        var eligibilityCounts = string.Join(
+            ',',
+            observations
+                .GroupBy(observation => observation.EligibilityCode ?? "unknown", StringComparer.Ordinal)
+                .OrderBy(group => group.Key, StringComparer.Ordinal)
+                .Select(group => $"{group.Key}={group.Count()}"));
+        _logger.LogInformation(
+            "XUI v3 volume reminder scan finished. clients={ClientCount}, finiteObservations={ObservationCount}, eligibility={EligibilityCounts}, candidates={CandidateCount}, sent={Sent}, skipped={Skipped}, failed={Failed}",
             response.Obj?.Count ?? 0,
             observations.Count,
+            eligibilityCounts,
             candidates.Count,
             sent,
             skipped,
             failed);
     }
+
+    /// <summary>
+    /// Resolves contradictory list expiry evidence through one identity-checked direct client GET.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI panel descriptor used by the existing authenticated transport.</param>
+    /// <param name="evaluatedClient">List snapshot and initial decision that requested read-only verification.</param>
+    /// <param name="nowUtc">Current UTC scan time used for the verified decision and durable backoff.</param>
+    /// <param name="cancellationToken">Host shutdown token for the single GET request.</param>
+    /// <returns>
+    /// A detached probe result containing the verified eligibility decision and next safe retry time. It never exposes
+    /// the email, UUID, subscription id, raw response body, panel token, or URI.
+    /// </returns>
+    /// <remarks>
+    /// This method calls only <c>GET /panel/api/clients/get/{email}</c>. Numeric id and normalized email must both
+    /// match the complete-list row before the response can establish eligibility. No panel mutation is attempted.
+    /// Transient failures use a one-hour backoff; a definitive expired result or identity mismatch uses 24 hours.
+    /// </remarks>
+    private async Task<XuiV3VolumeEligibilityProbeResult> VerifyExpiryEligibilityAsync(
+        ServerInfo serverInfo,
+        XuiV3VolumeReminderEvaluatedClient evaluatedClient,
+        DateTime nowUtc,
+        CancellationToken cancellationToken)
+    {
+        var attemptedAtUtc = nowUtc.Kind == DateTimeKind.Utc
+            ? nowUtc
+            : DateTime.SpecifyKind(nowUtc, DateTimeKind.Utc);
+        try
+        {
+            var directResponse = await ApiServicev3.GetClientAsync(
+                serverInfo,
+                _configuration,
+                evaluatedClient.Snapshot.Email,
+                cancellationToken);
+            if (!directResponse.Success || directResponse.Obj == null)
+            {
+                return XuiV3VolumeEligibilityProbeResult.FromAttempt(
+                    XuiV3VolumeReminderEligibilityResult.Create(
+                        XuiV3VolumeReminderEligibilityStatus.ReadOnlyVerificationUnavailable,
+                        evaluatedClient.InitialEligibility.Threshold,
+                        $"{evaluatedClient.InitialEligibility.Summary};probe=unavailable"),
+                    attemptedAtUtc,
+                    attemptedAtUtc.Add(UnavailableProbeBackoff));
+            }
+
+            var directClient = directResponse.Obj;
+            if (directClient.Id != evaluatedClient.Snapshot.ClientId ||
+                !string.Equals(
+                    directClient.Email?.Trim(),
+                    evaluatedClient.Snapshot.Email?.Trim(),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return XuiV3VolumeEligibilityProbeResult.FromAttempt(
+                    XuiV3VolumeReminderEligibilityResult.Create(
+                        XuiV3VolumeReminderEligibilityStatus.ReadOnlyVerificationIdentityMismatch,
+                        evaluatedClient.InitialEligibility.Threshold,
+                        $"{evaluatedClient.InitialEligibility.Summary};probe=identity_mismatch"),
+                    attemptedAtUtc,
+                    attemptedAtUtc.Add(DefinitiveProbeBackoff));
+            }
+
+            var directSnapshot = XuiV3ClientUsageResolver.Resolve(directClient);
+            var verifiedSnapshot = BuildVerifiedExpirySnapshot(evaluatedClient.Snapshot, directSnapshot);
+            var verifiedEligibility = XuiV3ClientUsageResolver.EvaluateVolumeReminderEligibility(
+                verifiedSnapshot,
+                attemptedAtUtc,
+                readOnlyVerificationCompleted: true);
+            var combinedEligibility = XuiV3VolumeReminderEligibilityResult.Create(
+                verifiedEligibility.Status,
+                verifiedEligibility.Threshold,
+                $"list[{evaluatedClient.InitialEligibility.Summary}];get[{verifiedEligibility.Summary}];probe=matched");
+            return XuiV3VolumeEligibilityProbeResult.FromAttempt(
+                combinedEligibility,
+                attemptedAtUtc,
+                combinedEligibility.IsEligible ? null : attemptedAtUtc.Add(DefinitiveProbeBackoff));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (IsRecoverableEligibilityProbeException(ex))
+        {
+            // Transport exception messages can embed the GET path (and therefore the account email), so only the
+            // numeric client id and exception type are safe for operational logging.
+            _logger.LogWarning(
+                "XUI volume reminder GET-only expiry verification failed. clientId={ClientId}, failureType={FailureType}",
+                evaluatedClient.Snapshot.ClientId,
+                ex.GetType().Name);
+            return XuiV3VolumeEligibilityProbeResult.FromAttempt(
+                XuiV3VolumeReminderEligibilityResult.Create(
+                    XuiV3VolumeReminderEligibilityStatus.ReadOnlyVerificationUnavailable,
+                    evaluatedClient.InitialEligibility.Threshold,
+                    $"{evaluatedClient.InitialEligibility.Summary};probe=transport_error"),
+                attemptedAtUtc,
+                attemptedAtUtc.Add(UnavailableProbeBackoff));
+        }
+    }
+
+    /// <summary>
+    /// Combines authoritative list usage with identity-checked direct-GET expiry evidence.
+    /// </summary>
+    /// <param name="listSnapshot">
+    /// Complete-list snapshot that supplies quota, consumption, ownership, bot routing, and current threshold.
+    /// </param>
+    /// <param name="directSnapshot">
+    /// Snapshot from the matching direct GET. Only expiry sources and fresher enablement flags are trusted because some
+    /// panel versions omit traffic counters from this endpoint.
+    /// </param>
+    /// <returns>
+    /// A detached snapshot that cannot lose a reached 80/90/99 threshold merely because the direct response omitted
+    /// quota or traffic, while still using only direct expiry evidence for time-validity verification.
+    /// </returns>
+    /// <remarks>
+    /// Call this helper only after numeric client id and normalized email have matched. It performs no I/O and does
+    /// not change the panel, users.db, credentials.db, wallet, or Telegram state.
+    /// </remarks>
+    private static XuiV3ClientUsageSnapshot BuildVerifiedExpirySnapshot(
+        XuiV3ClientUsageSnapshot listSnapshot,
+        XuiV3ClientUsageSnapshot directSnapshot)
+    {
+        ArgumentNullException.ThrowIfNull(listSnapshot);
+        ArgumentNullException.ThrowIfNull(directSnapshot);
+        return new XuiV3ClientUsageSnapshot
+        {
+            ClientId = listSnapshot.ClientId,
+            Email = listSnapshot.Email,
+            ClientCreatedAt = listSnapshot.ClientCreatedAt,
+            PanelUpdatedAt = listSnapshot.PanelUpdatedAt,
+            UsedBytes = listSnapshot.UsedBytes,
+            TotalBytes = listSnapshot.TotalBytes,
+            ExpiryTime = directSnapshot.ExpiryTime,
+            ClientExpiryTime = directSnapshot.ClientExpiryTime,
+            ClientExpirySourcePresent = directSnapshot.ClientExpirySourcePresent,
+            TrafficExpiryTime = directSnapshot.TrafficExpiryTime,
+            TrafficExpirySourcePresent = directSnapshot.TrafficExpirySourcePresent,
+            ExtensionExpiryTime = directSnapshot.ExtensionExpiryTime,
+            ExtensionExpirySourcePresent = directSnapshot.ExtensionExpirySourcePresent,
+            MetadataExpectedExpiryTime = listSnapshot.MetadataExpectedExpiryTime,
+            MetadataIndicatesLifetime = listSnapshot.MetadataIndicatesLifetime,
+            ClientEnabled = directSnapshot.ClientEnabled,
+            TrafficEnabled = directSnapshot.TrafficEnabled ?? listSnapshot.TrafficEnabled,
+            OwnerTelegramUserId = listSnapshot.OwnerTelegramUserId,
+            CreatedByBotId = listSnapshot.CreatedByBotId,
+            LastRenewedAtUtc = listSnapshot.LastRenewedAtUtc
+        };
+    }
+
+    /// <summary>
+    /// Identifies bounded direct-GET failures that should defer one account without aborting the complete scan.
+    /// </summary>
+    /// <param name="exception">Exception thrown by the GET transport or response normalization.</param>
+    /// <returns>
+    /// <c>true</c> for network, timeout, JSON-shape, and ordinary runtime failures; fatal process exceptions and host
+    /// cancellation are not accepted.
+    /// </returns>
+    private static bool IsRecoverableEligibilityProbeException(Exception exception)
+        => exception is HttpRequestException or
+           TimeoutException or
+           Newtonsoft.Json.JsonException or
+           ArgumentException or
+           FormatException or
+           OverflowException or
+           InvalidCastException or
+           InvalidOperationException;
 
     /// <summary>
     /// Identifies row-local panel-shape failures that may be skipped without invalidating the complete list response.
@@ -546,4 +791,61 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     /// <returns>Ordinal in-memory key; it is never persisted or exposed.</returns>
     private static string BuildChatRateKey(string botId, long chatId)
         => $"{botId}:{chatId}";
+}
+
+/// <summary>
+/// Couples one normalized complete-list snapshot with its initial volume-reminder eligibility decision.
+/// </summary>
+internal sealed class XuiV3VolumeReminderEvaluatedClient
+{
+    /// <summary>Normalized list snapshot containing usage, ownership, and separate expiry sources.</summary>
+    public XuiV3ClientUsageSnapshot Snapshot { get; init; }
+    /// <summary>Initial decision used directly or routed through bounded GET-only verification.</summary>
+    public XuiV3VolumeReminderEligibilityResult InitialEligibility { get; init; }
+}
+
+/// <summary>
+/// Detached outcome of an optional GET-only expiry verification, including its durable retry schedule.
+/// </summary>
+internal sealed class XuiV3VolumeEligibilityProbeResult
+{
+    /// <summary>Final eligibility decision used to persist the current observation.</summary>
+    public XuiV3VolumeReminderEligibilityResult Eligibility { get; init; }
+    /// <summary>Whether a direct panel GET was attempted during this scan.</summary>
+    public bool Attempted { get; init; }
+    /// <summary>UTC timestamp of the attempted direct GET, or null when durable backoff skipped it.</summary>
+    public DateTime? AttemptedAtUtc { get; init; }
+    /// <summary>UTC time at which another contradictory-expiry GET may run, or null when no backoff is required.</summary>
+    public DateTime? NextAttemptAtUtc { get; init; }
+
+    /// <summary>
+    /// Creates a result for a scan that retained an existing durable probe backoff.
+    /// </summary>
+    /// <param name="eligibility">Current list decision, normally <c>needs_readonly_verification</c>.</param>
+    /// <returns>A detached result that tells persistence to preserve prior probe timestamps.</returns>
+    public static XuiV3VolumeEligibilityProbeResult NotAttempted(
+        XuiV3VolumeReminderEligibilityResult eligibility)
+        => new()
+        {
+            Eligibility = eligibility ?? throw new ArgumentNullException(nameof(eligibility))
+        };
+
+    /// <summary>
+    /// Creates a result for one completed or failed GET-only verification attempt.
+    /// </summary>
+    /// <param name="eligibility">Sanitized final decision derived from the direct response or safe failure category.</param>
+    /// <param name="attemptedAtUtc">UTC timestamp at which the direct GET began.</param>
+    /// <param name="nextAttemptAtUtc">Optional UTC end of the durable retry backoff.</param>
+    /// <returns>A detached result whose probe timestamps should replace the persisted schedule.</returns>
+    public static XuiV3VolumeEligibilityProbeResult FromAttempt(
+        XuiV3VolumeReminderEligibilityResult eligibility,
+        DateTime attemptedAtUtc,
+        DateTime? nextAttemptAtUtc)
+        => new()
+        {
+            Eligibility = eligibility ?? throw new ArgumentNullException(nameof(eligibility)),
+            Attempted = true,
+            AttemptedAtUtc = attemptedAtUtc,
+            NextAttemptAtUtc = nextAttemptAtUtc
+        };
 }

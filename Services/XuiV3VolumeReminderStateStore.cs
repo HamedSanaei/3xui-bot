@@ -99,7 +99,7 @@ public sealed class XuiV3VolumeReminderStateStore
                     ApplyObservation(state, observation, utcNow);
                 }
 
-                if (observation.CanNotify &&
+                if (observation.IsEligible &&
                     observation.HighestReachedThreshold > state.HighestHandledThreshold &&
                     state.ClaimedThreshold == null)
                 {
@@ -125,6 +125,54 @@ public sealed class XuiV3VolumeReminderStateStore
         {
             _gate.Release();
         }
+    }
+
+    /// <summary>
+    /// Returns the numeric clients whose contradictory expiry evidence is due for a bounded GET-only verification.
+    /// </summary>
+    /// <param name="panelKey">Credential-free SHA-256 identity of the configured XUI panel.</param>
+    /// <param name="clientIds">
+    /// Positive numeric XUI client ids classified as needing verification by the current complete-list scan.
+    /// Duplicate and non-positive ids are ignored.
+    /// </param>
+    /// <param name="nowUtc">Current UTC scan time used to evaluate the durable per-client probe backoff.</param>
+    /// <param name="cancellationToken">Host shutdown token for the read-only users.db query.</param>
+    /// <returns>
+    /// A detached set containing clients with no prior reminder state, no active backoff, or an expired backoff.
+    /// The set can be empty and contains no email, UUID, subscription id, or panel credential.
+    /// </returns>
+    /// <remarks>
+    /// This method only schedules read-only panel probes; it never claims a threshold, advances a cycle, or sends a
+    /// Telegram message. Persisted backoff survives restarts and prevents historical expired clients from causing one
+    /// direct panel request on every periodic scan.
+    /// </remarks>
+    public async Task<IReadOnlySet<int>> GetDueEligibilityProbeClientIdsAsync(
+        string panelKey,
+        IReadOnlyCollection<int> clientIds,
+        DateTime nowUtc,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(panelKey))
+            throw new ArgumentException("Volume reminder panel key is required.", nameof(panelKey));
+
+        var requestedIds = clientIds?
+            .Where(clientId => clientId > 0)
+            .Distinct()
+            .ToArray() ?? Array.Empty<int>();
+        if (requestedIds.Length == 0)
+            return new HashSet<int>();
+
+        var utcNow = NormalizeUtc(nowUtc);
+        await using var context = _contextFactory.CreateDbContext();
+        var blockedIds = await context.XuiV3VolumeReminderStates
+            .AsNoTracking()
+            .Where(state => state.PanelKey == panelKey &&
+                            requestedIds.Contains(state.ClientId) &&
+                            state.NextEligibilityProbeAtUtc.HasValue &&
+                            state.NextEligibilityProbeAtUtc.Value > utcNow)
+            .Select(state => state.ClientId)
+            .ToListAsync(cancellationToken);
+        return requestedIds.Except(blockedIds).ToHashSet();
     }
 
     /// <summary>
@@ -166,6 +214,56 @@ public sealed class XuiV3VolumeReminderStateStore
         return rows
             .Select(x => BuildBotUserKey(x.BotId, x.TelegramUserId))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Persists a recipient-level rejection without consuming the current account threshold.
+    /// </summary>
+    /// <param name="candidate">Current-cycle candidate returned by <see cref="ReconcileAsync"/>.</param>
+    /// <param name="eligibilityCode">
+    /// Stable non-sensitive reason such as <c>recipient_not_started</c>, <c>recipient_blocked</c>, or
+    /// <c>bot_unavailable</c>; account identifiers and exception bodies must not be supplied.
+    /// </param>
+    /// <param name="eligibilitySummary">Optional sanitized categorical detail, limited to 1000 characters.</param>
+    /// <param name="nowUtc">Current UTC classification time.</param>
+    /// <param name="cancellationToken">Host shutdown token for the guarded users.db update.</param>
+    /// <returns>A task that completes after the diagnostic is persisted when the candidate cycle still matches.</returns>
+    /// <remarks>
+    /// No claim is created and <c>HighestHandledThreshold</c> is not advanced. A future scan can therefore deliver the
+    /// same threshold after the user starts the bot, is unblocked, or the originating bot becomes available.
+    /// </remarks>
+    public async Task MarkRecipientIneligibleAsync(
+        XuiV3VolumeReminderCandidate candidate,
+        string eligibilityCode,
+        string eligibilitySummary,
+        DateTime nowUtc,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        var utcNow = NormalizeUtc(nowUtc);
+        var safeCode = SanitizeEligibilityCode(eligibilityCode);
+        var safeSummary = SanitizeEligibilitySummary(eligibilitySummary);
+
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var context = _contextFactory.CreateDbContext();
+            await context.XuiV3VolumeReminderStates
+                .Where(state => state.PanelKey == candidate.PanelKey &&
+                                state.ClientId == candidate.ClientId &&
+                                state.CycleNumber == candidate.CycleNumber &&
+                                state.HighestHandledThreshold < candidate.Threshold &&
+                                state.ClaimedThreshold == null)
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(state => state.LastEligibilityCode, safeCode)
+                    .SetProperty(state => state.LastEligibilitySummary, safeSummary)
+                    .SetProperty(state => state.UpdatedAtUtc, utcNow),
+                    cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     /// <summary>
@@ -442,6 +540,14 @@ public sealed class XuiV3VolumeReminderStateStore
             TotalBytes = observation.TotalBytes,
             UsedBytes = observation.UsedBytes,
             LastRenewedAtUtc = NormalizeUtc(observation.LastRenewedAtUtc),
+            LastEligibilityCode = SanitizeEligibilityCode(observation.EligibilityCode),
+            LastEligibilitySummary = SanitizeEligibilitySummary(observation.EligibilitySummary),
+            LastEligibilityProbeAtUtc = observation.EligibilityProbeAttempted
+                ? NormalizeUtc(observation.EligibilityProbeAtUtc)
+                : null,
+            NextEligibilityProbeAtUtc = observation.EligibilityProbeAttempted
+                ? NormalizeUtc(observation.NextEligibilityProbeAtUtc)
+                : null,
             DeliveryStatus = XuiV3VolumeReminderDeliveryStatuses.Idle,
             CreatedAtUtc = nowUtc,
             UpdatedAtUtc = nowUtc,
@@ -501,6 +607,8 @@ public sealed class XuiV3VolumeReminderStateStore
                                 state.PanelUpdatedAt != observation.PanelUpdatedAt ||
                                 state.TotalBytes != observation.TotalBytes ||
                                 state.UsedBytes != observation.UsedBytes ||
+                                state.LastEligibilityCode != SanitizeEligibilityCode(observation.EligibilityCode) ||
+                                state.LastEligibilitySummary != SanitizeEligibilitySummary(observation.EligibilitySummary) ||
                                 NormalizeUtc(state.LastRenewedAtUtc) != NormalizeUtc(observation.LastRenewedAtUtc);
 
         state.ClientCreatedAt = observation.ClientCreatedAt;
@@ -511,6 +619,13 @@ public sealed class XuiV3VolumeReminderStateStore
         state.TotalBytes = observation.TotalBytes;
         state.UsedBytes = observation.UsedBytes;
         state.LastRenewedAtUtc = NormalizeUtc(observation.LastRenewedAtUtc);
+        state.LastEligibilityCode = SanitizeEligibilityCode(observation.EligibilityCode);
+        state.LastEligibilitySummary = SanitizeEligibilitySummary(observation.EligibilitySummary);
+        if (observation.EligibilityProbeAttempted)
+        {
+            state.LastEligibilityProbeAtUtc = NormalizeUtc(observation.EligibilityProbeAtUtc);
+            state.NextEligibilityProbeAtUtc = NormalizeUtc(observation.NextEligibilityProbeAtUtc);
+        }
         if (materiallyChanged || nowUtc - state.LastObservedAtUtc >= TimeSpan.FromHours(24))
         {
             state.LastObservedAtUtc = nowUtc;
@@ -533,6 +648,10 @@ public sealed class XuiV3VolumeReminderStateStore
         state.TelegramMessageId = null;
         state.LastError = null;
         state.LastDeliveredAtUtc = null;
+        state.LastEligibilityCode = null;
+        state.LastEligibilitySummary = null;
+        state.LastEligibilityProbeAtUtc = null;
+        state.NextEligibilityProbeAtUtc = null;
     }
 
     /// <summary>
@@ -642,6 +761,25 @@ public sealed class XuiV3VolumeReminderStateStore
     /// <returns>Null for an empty error, otherwise at most 2000 characters.</returns>
     private static string SanitizeError(string error)
         => string.IsNullOrWhiteSpace(error) ? null : error.Length <= 2000 ? error : error[..2000];
+
+    /// <summary>
+    /// Bounds a stable eligibility code before users.db persistence.
+    /// </summary>
+    /// <param name="code">Non-sensitive machine-readable code; account identifiers and secrets are forbidden.</param>
+    /// <returns>A lowercase bounded code, or <c>unknown</c> when the input is empty.</returns>
+    private static string SanitizeEligibilityCode(string code)
+    {
+        var normalized = string.IsNullOrWhiteSpace(code) ? "unknown" : code.Trim().ToLowerInvariant();
+        return normalized.Length <= 48 ? normalized : normalized[..48];
+    }
+
+    /// <summary>
+    /// Bounds a categorical eligibility summary before users.db persistence.
+    /// </summary>
+    /// <param name="summary">Diagnostic categories that must not contain account identifiers, URIs, or secrets.</param>
+    /// <returns>A nullable string containing at most 1000 characters.</returns>
+    private static string SanitizeEligibilitySummary(string summary)
+        => string.IsNullOrWhiteSpace(summary) ? null : summary.Length <= 1000 ? summary : summary[..1000];
 }
 
 /// <summary>
@@ -669,8 +807,18 @@ public sealed class XuiV3VolumeReminderObservation
     public DateTime? LastRenewedAtUtc { get; init; }
     /// <summary>Highest of 80, 90, or 99 reached by raw bytes, or zero.</summary>
     public int HighestReachedThreshold { get; init; }
-    /// <summary>Whether current time/enable/service rules allow this threshold to be sent.</summary>
-    public bool CanNotify { get; init; }
+    /// <summary>Whether current time and enablement evidence allows this threshold to proceed to recipient checks.</summary>
+    public bool IsEligible { get; init; }
+    /// <summary>Stable non-sensitive result code produced by detailed eligibility evaluation.</summary>
+    public string EligibilityCode { get; init; } = "unknown";
+    /// <summary>Sanitized categorical expiry and enablement evidence with no account identifiers.</summary>
+    public string EligibilitySummary { get; init; }
+    /// <summary>Whether this scan attempted an identity-checked direct GET for contradictory expiry evidence.</summary>
+    public bool EligibilityProbeAttempted { get; init; }
+    /// <summary>UTC timestamp of the GET-only probe attempted by this scan, or null when none ran.</summary>
+    public DateTime? EligibilityProbeAtUtc { get; init; }
+    /// <summary>UTC time after which another contradictory-expiry probe may run, or null when no backoff is needed.</summary>
+    public DateTime? NextEligibilityProbeAtUtc { get; init; }
 }
 
 /// <summary>

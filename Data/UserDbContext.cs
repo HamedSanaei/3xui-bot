@@ -512,6 +512,8 @@ public class UserDbContext : DbContext
             entity.Property(x => x.BotId).IsRequired().HasMaxLength(64);
             entity.Property(x => x.DeliveryStatus).IsRequired().HasMaxLength(32);
             entity.Property(x => x.LastError).HasMaxLength(2000);
+            entity.Property(x => x.LastEligibilityCode).HasMaxLength(48);
+            entity.Property(x => x.LastEligibilitySummary).HasMaxLength(1000);
             // One durable cycle row represents one physical numeric client on one credential-free panel identity.
             entity.HasIndex(x => new { x.PanelKey, x.ClientId }).IsUnique();
             entity.HasIndex(x => new { x.DeliveryStatus, x.LeaseUntilUtc });

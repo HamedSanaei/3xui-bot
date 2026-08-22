@@ -80,13 +80,15 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   protocol password, never host/fragment/display label. Password matching is ordinal and duplicate matches fail closed.
 - `Services/XuiV3ClientPlanEligibility.cs`: checks whether an XUI client belongs to active service inbounds.
 - `Services/XuiV3ClientUsageResolver.cs`: shared null-safe XUI list-response interpretation for consumption, quota,
-  expiry, `createdAt`, `updatedAt`, origin bot, and renewal metadata. A missing nested `traffic` object falls back to
-  top-level/extension fields; the volume worker isolates recoverably malformed rows so one client cannot abort a full
-  panel scan.
+  separate client/traffic/extension expiry evidence, `createdAt`, `updatedAt`, origin bot, and renewal metadata. Volume
+  eligibility is a detailed sanitized result; time expiry is definitive only when every present panel source agrees.
+  A missing nested `traffic` object falls back to top-level/extension fields.
 - `Services/XuiV3VolumeExpirationReminderService.cs` + `XuiV3VolumeReminderStateStore.cs`: one-list-request
   30-minute 80/90/99 traffic reminder worker and users.db cycle/claim idempotency. Notifications are bot-scoped,
-  separate per account, rate-limit-aware, and require a matching `BotUserState`; migration
-  `20260809000000_AddXuiV3VolumeReminderStates` needs no backfill.
+  separate per account, rate-limit-aware, and require a matching `BotUserState`. Contradictory list expiry versus
+  current bot metadata is resolved by one identity-checked `GET clients/get/{email}` only; failures use durable
+  per-client backoff and never consume a threshold. Migration `20260821203515_AddXuiV3VolumeReminderEligibilityDiagnostics`
+  adds nullable sanitized decision/probe fields without backfill or changes to existing cycles.
 - `Services/XuiV3AdminFlowService.cs`: super-admin XUI v3 management flows.
 - `Services/XuiV3LinkChangeOperationStore.cs`: per-operation users.db contexts, atomic confirmation, active-client uniqueness, leases, and bounded recovery state for link changes.
 - `Services/XuiV3LinkChangeRecoveryService.cs`: hosted worker that resumes the exact persisted email/UUID/subId after ambiguous XUI responses or process restarts.
@@ -254,11 +256,15 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - The daily 08:00 time-expiry reminder must exclude finite accounts whose bytes reached quota or whose traffic row is
   disabled at/above 99%; volume consumption messaging belongs only to the independent volume worker. Its optional
   config defaults are disabled/30 minutes, enabled interval must be 5-1440, and production config explicitly enables
-  30 minutes. The full clients list already supplies `updatedAt`, so never add per-client polling.
+  30 minutes. The full clients list supplies normal usage/`updatedAt`; direct client GETs are limited to persisted,
+  backoff-controlled read-only expiry verification and must never become general per-client polling.
 - `XuiV3VolumeReminderStates` is unique by credential-free `PanelKey + ClientId`. A cycle resets for counter drop,
   quota increase, client recreation, newer bot renewal metadata, or successful owned/admin/tenant renewal hook;
   `updatedAt` alone never resets it. Only the highest crossed threshold is sent, stale ambiguous claims are suppressed
   to prevent duplicates, and a successful renewal must never be rolled back when reminder-state persistence fails.
+  Volume eligibility persists a sanitized reason and per-expiry-source categories. A list/metadata expiry conflict is
+  verified read-only by numeric client id plus normalized email; GET failure/mismatch is fail-closed with backoff, does
+  not claim or advance 80/90/99, and no volume-reminder path may mutate an XUI account.
 - Metered XUI pricing is centralized in `XuiV3PurchaseService.ResolvePurchase`: finite durations charge
   `trafficGb * rolePricePerGb + days * rolePricePerDay`, while zero-day lifetime durations charge
   `trafficGb * rolePricePerGb * lifetimePriceMultiplier` and round upward to whole toman. Missing daily prices,

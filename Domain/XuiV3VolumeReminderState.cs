@@ -69,6 +69,24 @@ namespace Adminbot.Domain
         /// <summary>Sanitized latest delivery or persistence error retained for operational diagnosis.</summary>
         public string LastError { get; set; }
 
+        /// <summary>
+        /// Stable code for the latest volume/recipient eligibility decision; it never contains account identifiers.
+        /// </summary>
+        public string LastEligibilityCode { get; set; }
+
+        /// <summary>
+        /// Sanitized categorical expiry and enablement evidence for the latest eligibility decision.
+        /// </summary>
+        public string LastEligibilitySummary { get; set; }
+
+        /// <summary>UTC timestamp of the latest identity-checked GET-only eligibility probe.</summary>
+        public DateTime? LastEligibilityProbeAtUtc { get; set; }
+
+        /// <summary>
+        /// UTC time when another GET-only eligibility probe may run; null means no backoff is active.
+        /// </summary>
+        public DateTime? NextEligibilityProbeAtUtc { get; set; }
+
         /// <summary>UTC timestamp when this row was first created.</summary>
         public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
 
