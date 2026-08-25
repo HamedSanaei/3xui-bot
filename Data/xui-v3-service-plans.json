@@ -158,6 +158,66 @@
             "colleague": 1103000
           },
           "isEnabled": true
+        },
+        {
+          "key": "eco-m1",
+          "displayName": "اقتصادی (Eco) - یک ماه",
+          "days": 31,
+          "fairUsageGb": 50,
+          "maxUsers": 1,
+          "price": {
+            "user": 159500,
+            "colleague": 127600
+          },
+          "isEnabled": true,
+          "ownedColleagueOnly": true,
+          "tenantVisible": true,
+          "tenantUsesUserPrice": true
+        },
+        {
+          "key": "eco-m2",
+          "displayName": "اقتصادی (Eco) - دو ماه",
+          "days": 62,
+          "fairUsageGb": 85,
+          "maxUsers": 1,
+          "price": {
+            "user": 374500,
+            "colleague": 299600
+          },
+          "isEnabled": true,
+          "ownedColleagueOnly": true,
+          "tenantVisible": true,
+          "tenantUsesUserPrice": true
+        },
+        {
+          "key": "eco-m3",
+          "displayName": "اقتصادی (Eco) - سه ماه",
+          "days": 93,
+          "fairUsageGb": 115,
+          "maxUsers": 1,
+          "price": {
+            "user": 369500,
+            "colleague": 295600
+          },
+          "isEnabled": true,
+          "ownedColleagueOnly": true,
+          "tenantVisible": true,
+          "tenantUsesUserPrice": true
+        },
+        {
+          "key": "eco-m6",
+          "displayName": "اقتصادی (Eco) - شش ماه",
+          "days": 186,
+          "fairUsageGb": 215,
+          "maxUsers": 1,
+          "price": {
+            "user": 689500,
+            "colleague": 551600
+          },
+          "isEnabled": true,
+          "ownedColleagueOnly": true,
+          "tenantVisible": true,
+          "tenantUsesUserPrice": true
         }
       ]
     }

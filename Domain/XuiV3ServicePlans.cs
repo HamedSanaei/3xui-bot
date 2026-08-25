@@ -243,6 +243,14 @@ namespace Adminbot.Domain
         public int MaximumDays { get; set; } = 365;
     }
 
+    /// <summary>
+    /// Describes one fixed-price unlimited/fair-usage plan and its storefront audience policies.
+    /// </summary>
+    /// <remarks>
+    /// Audience flags affect only catalog visibility and selection authorization. After a plan is authorized, account
+    /// creation and renewal continue to use the standard unlimited XUI behavior derived from days, fair usage, and
+    /// maximum users. Missing JSON flags retain the legacy owned and tenant behavior through their property defaults.
+    /// </remarks>
     public class XuiV3UnlimitedPlan
     {
         public string Key { get; set; }
@@ -252,6 +260,34 @@ namespace Adminbot.Domain
         public int MaxUsers { get; set; } = 1;
         public XuiV3RolePrice Price { get; set; } = new XuiV3RolePrice();
         public bool IsEnabled { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether this plan is restricted to colleague customers in owned-bot storefronts.
+        /// </summary>
+        /// <remarks>
+        /// A missing JSON value defaults to <c>false</c>, preserving the visibility and eligibility of legacy plans.
+        /// This flag does not alter tenant visibility, super-admin operations, or role-specific price resolution.
+        /// </remarks>
+        public bool OwnedColleagueOnly { get; set; } = false;
+
+        /// <summary>
+        /// Gets or sets whether tenant-storefront customers may view, purchase, and renew this plan.
+        /// </summary>
+        /// <remarks>
+        /// A missing JSON value defaults to <c>true</c>, preserving legacy tenant behavior. Tenant flows revalidate
+        /// this policy when consuming callbacks, restored state, payment activation, and paid fulfillment.
+        /// </remarks>
+        public bool TenantVisible { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether tenant sale price is fixed to the plan's normal-user price.
+        /// </summary>
+        /// <remarks>
+        /// When enabled, tenant markup is ignored for this plan, owner base cost remains the colleague price, and
+        /// profit is the non-negative difference between those amounts. A missing value defaults to <c>false</c> so
+        /// existing plans retain the current tenant-markup calculation.
+        /// </remarks>
+        public bool TenantUsesUserPrice { get; set; } = false;
     }
 
     /// <summary>

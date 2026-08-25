@@ -27,13 +27,16 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Data/CredentialsDbContex.cs`: unchanged shared user wallet/profile data; referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
 - `Data/configuration.example.json`: sanitized configuration example including referral and four-gateway enable/readiness settings; all gateway switches and secret placeholders default to off/empty.
-- `Data/xui-v3-service-plans.json`: XUI v3 service catalog, inbounds, metered per-GB/per-day/lifetime pricing, duration availability, unlimited fair-usage plans, and `minimumTrafficGb`.
+- `Data/xui-v3-service-plans.json`: XUI v3 service catalog, inbounds, metered per-GB/per-day/lifetime pricing,
+  duration availability, unlimited fair-usage plans, per-storefront unlimited audience/price policies, and
+  `minimumTrafficGb`.
 - Historical migration filenames and `[Migration("timestamp_name")]` ids are immutable database history. Their CLR
   types use PascalCase to keep current compilers warning-free; never rename the files or attribute ids as cleanup.
 
 ## Core Services
 
-- `Services/XuiV3PurchaseService.cs`: resolves service selections, validates plan rules, builds XUI v3 account metadata, and creates accounts.
+- `Services/XuiV3PurchaseService.cs`: resolves service selections, validates plan rules, centralizes owned/tenant
+  unlimited-plan audience checks separately from role pricing, builds XUI v3 account metadata, and creates accounts.
 - `Services/XuiOperationTiming.cs`: ambient monotonic timing scope for XUI audits. The v3 transport sums complete
   logical panel calls (including retries/backoff); legacy v2 routes wrap their panel calls explicitly. Central create,
   renew, delete, activation, comment/link edit, trial, bulk-admin, and tenant fulfillment logs show both
@@ -111,6 +114,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Each tenant bot is a `BotInstance` with `Type = tenant` and id `tenant-{ownerTelegramUserId}`.
 - Tenant runtime state is scoped by `BotId + TelegramUserId` in `BotUserStates`; never key tenant customer flow only by Telegram user id.
 - Tenant customers reuse shared XUI account flows where possible, but tenant payments and fulfillment go through `TenantBotOrder`.
+- Unlimited sub-plans carry catalog-only storefront policies: `OwnedColleagueOnly` restricts owned customer purchase
+  and renewal to colleague profiles, `TenantVisible` controls tenant display and authorization, and
+  `TenantUsesUserPrice` fixes tenant sale to the public/user amount while keeping colleague price as owner base cost.
+  Tenant markup remains authoritative for every plan where `TenantUsesUserPrice=false`; no policy is inferred from a
+  key prefix, display name, traffic quota, or user limit.
 - Tenant account-card renewal callbacks are intercepted before the shared owned-wallet handler and enter the tenant
   order flow. Renewal entry no longer filters ownership: email, SubId/subscription link, UUID, or supported config may
   select another user's account. A non-owner target pauses at state `renew-confirm-external-target` and fixed callback
@@ -273,6 +281,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   purchase/renewal; the separate fixed-price `kind=unlimited` plans do not use these metered fields. The resolver also
   returns the authoritative metered component breakdown, and owned-bot final purchase/renewal previews must format
   that stored breakdown rather than recalculate rates or subtotals in the Telegram presentation layer.
+- Unlimited audience and role price are intentionally separate. Generic `ResolvePurchase(selection, isColleague)`
+  remains capable of resolving both public and colleague prices for tenant calculations; owned and tenant wrappers
+  revalidate their respective audience policy before preview, callbacks/state consumption, payment/order creation,
+  and final fulfillment. The Eco unlimited plans are owned-colleague-only but tenant-visible. Their tenant sale is the
+  configured user price regardless of markup, owner base cost is the colleague price, and profit is never negative.
+  Missing policy fields preserve legacy behavior (`false`, `true`, `false` respectively), so no database migration or
+  callback/state format change is required. Super-admin manual creation remains an administrative `IsEnabled` flow.
 - Owned XUI purchase state restored from `BotUserStates` is revalidated against the live catalog before count,
   comment, preview, or confirmation is consumed. Removed/disabled service, low traffic, disabled/custom-out-of-range
   duration, and disabled unlimited sub-plan lazily return only that bot/user to the earliest valid selection step;

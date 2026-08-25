@@ -1655,7 +1655,7 @@ public class XuiV3BotFlowService
 
         if (user.LastStep == RenewStepUnlimitedPlan)
         {
-            var plan = TryGetUnlimitedPlanFromText(service, message.Text);
+            var plan = TryGetUnlimitedPlanFromText(service, message.Text, credUser.IsColleague);
             if (plan == null)
             {
                 await botClient.SendTextMessageAsync(
@@ -1750,10 +1750,14 @@ public class XuiV3BotFlowService
                 return;
             }
 
+            var selectedUnlimitedPlan = service.IsUnlimited
+                ? service.UnlimitedPlans?.FirstOrDefault(plan =>
+                    string.Equals(plan.Key, user.Type, StringComparison.OrdinalIgnoreCase))
+                : null;
             if (service.IsUnlimited &&
-                service.UnlimitedPlans?.Any(plan =>
-                    plan.IsEnabled &&
-                    string.Equals(plan.Key, user.Type, StringComparison.OrdinalIgnoreCase)) != true)
+                !XuiV3PurchaseService.IsUnlimitedPlanAvailableForOwnedBot(
+                    selectedUnlimitedPlan,
+                    credUser.IsColleague))
             {
                 user.LastStep = RenewStepUnlimitedPlan;
                 user.Type = string.Empty;
@@ -1815,6 +1819,8 @@ public class XuiV3BotFlowService
     /// Every new renewal reloads the target by email and requires its UUID to equal the independent persisted target
     /// lock before the panel call. The payer is recorded as the renewal actor but never replaces the existing owner,
     /// TgId, SubId, UUID, password, or protocol identity. Legacy states without a lock remain owner-only.
+    /// Unlimited selections are resolved through the owned-audience gate immediately before balance and XUI work, so
+    /// a role or catalog change cannot turn a colleague-only plan into an ordinary-customer renewal.
     /// The final central audit includes accumulated panel API time and total time from execution start through
     /// settlement and customer delivery; customer decision and payment waiting time are excluded.
     /// </remarks>
@@ -1836,7 +1842,7 @@ public class XuiV3BotFlowService
                 DurationKey = user.SelectedPeriod
             };
 
-        var resolved = _purchaseService.ResolvePurchase(selection, credUser.IsColleague);
+        var resolved = _purchaseService.ResolveOwnedPurchase(selection, credUser.IsColleague);
         var useSiteWallet = string.Equals(user.PaymentMethod, "gozargah_site_wallet", StringComparison.OrdinalIgnoreCase);
         if (!useSiteWallet && credUser.AccountBalance < resolved.PriceToman)
         {
@@ -3335,7 +3341,11 @@ public class XuiV3BotFlowService
             return true;
         }
 
-        var recoveryTarget = DeterminePurchaseRecoveryTarget(service, selection, user.LastStep);
+        var recoveryTarget = DeterminePurchaseRecoveryTarget(
+            service,
+            selection,
+            user.LastStep,
+            credUser.IsColleague);
         if (recoveryTarget != PurchaseRecoveryTarget.None)
         {
             await RecoverPurchaseStateAsync(
@@ -3434,7 +3444,7 @@ public class XuiV3BotFlowService
             // use the same live-catalog snapshot. Confirmation deliberately resolves again immediately before effects.
             selection.ServiceKey = service.Key;
             selection.AccountCount = XuiV3PurchaseService.NormalizeAccountCount(user.PendingAccountCount);
-            var resolved = _purchaseService.ResolvePurchase(selection, credUser.IsColleague);
+            var resolved = _purchaseService.ResolveOwnedPurchase(selection, credUser.IsColleague);
             var totalPrice = resolved.PriceToman * selection.AccountCount;
             var canUseSiteWallet = await CanUseGozargahSiteWalletAsync(
                 credUser.TelegramUserId,
@@ -4325,7 +4335,8 @@ public class XuiV3BotFlowService
             var target = DeterminePurchaseRecoveryTarget(
                 service,
                 selectionState,
-                PurchaseStepAccountCount);
+                PurchaseStepAccountCount,
+                credUser.IsColleague);
             if (target != PurchaseRecoveryTarget.None)
             {
                 await RecoverPurchaseStateAsync(
@@ -4590,8 +4601,13 @@ public class XuiV3BotFlowService
             selectionState.UnlimitedPlanKey = callback.UnlimitedPlanKey;
 
             var unlimitedPlan = service.UnlimitedPlans?.FirstOrDefault(plan =>
-                plan.IsEnabled &&
                 string.Equals(plan.Key, callback.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase));
+            if (!XuiV3PurchaseService.IsUnlimitedPlanAvailableForOwnedBot(
+                    unlimitedPlan,
+                    credUser.IsColleague))
+            {
+                unlimitedPlan = null;
+            }
             if (unlimitedPlan == null)
             {
                 await RecoverPurchaseStateAsync(
@@ -4685,7 +4701,8 @@ public class XuiV3BotFlowService
             var confirmationRecoveryTarget = DeterminePurchaseRecoveryTarget(
                 confirmationService,
                 selection,
-                PurchaseStepConfirm);
+                PurchaseStepConfirm,
+                credUser.IsColleague);
             if (confirmationRecoveryTarget != PurchaseRecoveryTarget.None)
             {
                 await RecoverPurchaseStateAsync(
@@ -4709,7 +4726,7 @@ public class XuiV3BotFlowService
                 if (selection.UserComment == null)
                     selection.UserComment = user.PendingUserComment;
 
-                var resolved = _purchaseService.ResolvePurchase(selection, credUser.IsColleague);
+                var resolved = _purchaseService.ResolveOwnedPurchase(selection, credUser.IsColleague);
                 var accountCount = XuiV3PurchaseService.NormalizeAccountCount(selection.AccountCount);
                 var totalPrice = resolved.PriceToman * accountCount;
                 var useSiteWallet = callback.Action == "sitepay";
@@ -8860,6 +8877,9 @@ public class XuiV3BotFlowService
     /// Purchase step about to consume the incoming text or callback. Use the durable state step for text messages and
     /// the destination step for callbacks such as account count.
     /// </param>
+    /// <param name="isColleague">
+    /// Current owned-bot buyer role used to reject an enabled unlimited plan that is restricted to colleagues.
+    /// </param>
     /// <returns>
     /// <see cref="PurchaseRecoveryTarget.None"/> when every value required by the step is valid in the live catalog;
     /// otherwise the earliest step that can safely preserve valid service or traffic choices.
@@ -8871,13 +8891,18 @@ public class XuiV3BotFlowService
     /// </remarks>
     /// <example>
     /// <code>
-    /// var target = DeterminePurchaseRecoveryTarget(service, selection, "select-user-comment");
+    /// var target = DeterminePurchaseRecoveryTarget(
+    ///     service,
+    ///     selection,
+    ///     "select-user-comment",
+    ///     credUser.IsColleague);
     /// </code>
     /// </example>
     private static PurchaseRecoveryTarget DeterminePurchaseRecoveryTarget(
         XuiV3ServiceDefinition service,
         XuiV3PurchaseSelection selection,
-        string requiredStep)
+        string requiredStep,
+        bool isColleague)
     {
         if (service == null || selection == null)
             return PurchaseRecoveryTarget.Service;
@@ -8897,10 +8922,9 @@ public class XuiV3BotFlowService
                 return PurchaseRecoveryTarget.UnlimitedPlan;
             }
 
-            var planIsEnabled = service.UnlimitedPlans?.Any(plan =>
-                plan.IsEnabled &&
-                string.Equals(plan.Key, selection.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase)) == true;
-            return planIsEnabled
+            var selectedPlan = service.UnlimitedPlans?.FirstOrDefault(plan =>
+                string.Equals(plan.Key, selection.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase));
+            return XuiV3PurchaseService.IsUnlimitedPlanAvailableForOwnedBot(selectedPlan, isColleague)
                 ? PurchaseRecoveryTarget.None
                 : PurchaseRecoveryTarget.UnlimitedPlan;
         }
@@ -9048,7 +9072,7 @@ public class XuiV3BotFlowService
                 selection.UnlimitedPlanKey = null;
                 replacement.LastStep = PurchaseStepSelectUnlimitedPlan;
                 replacement.SelectedCountry = service.Key;
-                prompt = "پلن نامحدود انتخاب‌شده قبلی دیگر فعال نیست. لطفاً یکی از پلن‌های فعال را انتخاب کنید.";
+                prompt = "پلن نامحدود انتخاب‌شده قبلی دیگر برای حساب شما فعال یا قابل انتخاب نیست. لطفاً یک پلن معتبر انتخاب کنید.";
                 keyboard = _purchaseService.BuildUnlimitedPlanKeyboard(service.Key, credUser.IsColleague);
                 break;
 
@@ -9160,10 +9184,28 @@ public class XuiV3BotFlowService
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
     }
 
+    /// <summary>
+    /// Builds the owned-bot reply keyboard for unlimited purchase and renewal plan selection.
+    /// </summary>
+    /// <param name="service">Enabled unlimited service loaded from the current global catalog.</param>
+    /// <param name="isColleague">
+    /// Current owned-bot customer role used for both audience filtering and the displayed role price.
+    /// </param>
+    /// <returns>
+    /// A reply keyboard containing only plans available to the owned customer, followed by an explicit cancel row.
+    /// </returns>
+    /// <remarks>
+    /// Typed text and final state are revalidated separately; hiding a reply button is not treated as authorization.
+    /// This method has no persistence, wallet, Telegram-send, payment, or XUI side effects.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var keyboard = BuildUnlimitedPlanReplyKeyboard(service, credUser.IsColleague);
+    /// </code>
+    /// </example>
     private static ReplyKeyboardMarkup BuildUnlimitedPlanReplyKeyboard(XuiV3ServiceDefinition service, bool isColleague)
     {
-        var rows = service.UnlimitedPlans
-            .Where(plan => plan.IsEnabled)
+        var rows = XuiV3PurchaseService.GetUnlimitedPlansForOwnedBot(service, isColleague)
             .Select(plan => new KeyboardButton($"{plan.DisplayName} [{plan.Key}] - {plan.Price.GetForRole(isColleague).FormatCurrency()}"))
             .Chunk(1)
             .Select(chunk => chunk.ToArray())
@@ -9379,8 +9421,8 @@ public class XuiV3BotFlowService
     /// Renewal price in Iranian toman, or <c>0</c> when the state is incomplete and no site-wallet button should be shown.
     /// </returns>
     /// <remarks>
-    /// The method mirrors renewal summary selection resolution without reading the panel. Final renewal still recalculates
-    /// price, account ownership, and renewal policy before updating 3x-ui.
+    /// The method mirrors renewal summary selection resolution without reading the panel and applies the owned audience
+    /// policy. Final renewal still recalculates price, target identity, and renewal policy before updating 3x-ui.
     /// </remarks>
     private long ResolveRenewPriceToman(User user, bool isColleague)
     {
@@ -9397,7 +9439,7 @@ public class XuiV3BotFlowService
                 DurationKey = user.SelectedPeriod
             };
 
-        return _purchaseService.ResolvePurchase(selection, isColleague).PriceToman;
+        return _purchaseService.ResolveOwnedPurchase(selection, isColleague).PriceToman;
     }
 
     /// <summary>
@@ -9674,7 +9716,7 @@ public class XuiV3BotFlowService
                 DurationKey = user.SelectedPeriod
             };
 
-        var resolved = _purchaseService.ResolvePurchase(selection, isColleague);
+        var resolved = _purchaseService.ResolveOwnedPurchase(selection, isColleague);
         var durationText = resolved.DurationDays <= 0 ? "نامحدود / لایف‌تایم" : $"{resolved.DurationDays} روز";
         var hasExactTargetLock = !string.IsNullOrWhiteSpace(user.RenewTargetUuid);
         var renewal = XuiV3RenewalPolicy.Calculate(
@@ -9741,11 +9783,30 @@ public class XuiV3BotFlowService
             : null;
     }
 
-    private static XuiV3UnlimitedPlan TryGetUnlimitedPlanFromText(XuiV3ServiceDefinition service, string text)
+    /// <summary>
+    /// Matches owned-bot reply text to an unlimited plan that remains available to the current buyer role.
+    /// </summary>
+    /// <param name="service">Current enabled unlimited service definition.</param>
+    /// <param name="text">
+    /// Telegram reply text containing a bracketed plan key, raw key, or exact display name. Null values do not match.
+    /// </param>
+    /// <param name="isColleague">Current owned-bot buyer role used for the centralized audience check.</param>
+    /// <returns>The matching authorized plan, or <c>null</c> for unknown, disabled, or role-forbidden text.</returns>
+    /// <remarks>
+    /// The comparison is case-insensitive for stable keys and display text. It performs no state or financial mutation.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var plan = TryGetUnlimitedPlanFromText(service, message.Text, credUser.IsColleague);
+    /// </code>
+    /// </example>
+    private static XuiV3UnlimitedPlan TryGetUnlimitedPlanFromText(
+        XuiV3ServiceDefinition service,
+        string text,
+        bool isColleague)
     {
         var key = ExtractBracketValue(text);
-        return service.UnlimitedPlans.FirstOrDefault(plan =>
-            plan.IsEnabled &&
+        return XuiV3PurchaseService.GetUnlimitedPlansForOwnedBot(service, isColleague).FirstOrDefault(plan =>
             (string.Equals(plan.Key, key, StringComparison.OrdinalIgnoreCase) ||
              string.Equals(plan.Key, text?.Trim(), StringComparison.OrdinalIgnoreCase) ||
              string.Equals(plan.DisplayName, text?.Trim(), StringComparison.OrdinalIgnoreCase)));

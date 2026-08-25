@@ -3743,10 +3743,12 @@ public class TenantBotService
                 return;
             }
 
+            var selectedUnlimitedPlan = service.IsUnlimited
+                ? service.UnlimitedPlans?.FirstOrDefault(plan =>
+                    string.Equals(plan.Key, user.Type, StringComparison.OrdinalIgnoreCase))
+                : null;
             if (service.IsUnlimited &&
-                service.UnlimitedPlans?.Any(plan =>
-                    plan.IsEnabled &&
-                    string.Equals(plan.Key, user.Type, StringComparison.OrdinalIgnoreCase)) != true)
+                !XuiV3PurchaseService.IsUnlimitedPlanAvailableForTenant(selectedUnlimitedPlan))
             {
                 user.LastStep = TENANTRENEWSTEPUNLIMITEDPLAN;
                 user.Type = string.Empty;
@@ -4178,7 +4180,8 @@ public class TenantBotService
     /// replacement quota and a first-connection duration after reset. Metered renewals show the effective storefront
     /// per-GB and per-day calculation without exposing the tenant owner's colleague base rates. Fresh account data is
     /// authorized again before rendering; an email/UUID mismatch clears state and prevents confirmation. An unresolved
-    /// account-level renewal lock stops the preview before the customer can create or fund another order.
+    /// account-level renewal lock stops the preview before the customer can create or fund another order. Unlimited
+    /// state is also checked against the current tenant-visible catalog before the summary can expose a payable action.
     /// </remarks>
     private async Task SendTenantRenewSummaryAsync(
         ITelegramBotClient botClient,
@@ -4189,7 +4192,7 @@ public class TenantBotService
         CancellationToken cancellationToken)
     {
         var selection = BuildTenantRenewSelectionFromState(user);
-        var resolved = _purchaseService.ResolvePurchase(selection, false);
+        var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
         var price = CalculateTenantPrice(tenant, selection);
         var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
         var serverInfo = BuildConfiguredPanelServerInfo();
@@ -4277,6 +4280,7 @@ public class TenantBotService
     /// routine, which applies the renewal exactly once. Every safely lockable renewal stores the normalized target UUID
     /// on the order; old state or an owned legacy client without UUID leaves it null and remains owner-checked. A live
     /// unresolved-operation lookup runs before insertion so no new payable order is offered for a locked account.
+    /// Authoritative tenant pricing rejects a hidden unlimited plan before the order row is created.
     /// </remarks>
     private async Task CreateTenantRenewOrderFromStateAsync(
         ITelegramBotClient botClient,
@@ -4437,13 +4441,23 @@ public class TenantBotService
     /// <summary>
     /// Builds the reply keyboard used to choose an unlimited renewal plan with tenant prices.
     /// </summary>
-    /// <param name="service">Unlimited XUI service definition.</param>
-    /// <param name="tenant">Tenant bot whose markup controls displayed prices.</param>
-    /// <returns>Reply keyboard containing unlimited plans and cancel.</returns>
+    /// <param name="service">Unlimited XUI service definition loaded from the current global catalog.</param>
+    /// <param name="tenant">
+    /// Tenant bot whose authoritative pricing policy controls the displayed customer price.
+    /// </param>
+    /// <returns>Reply keyboard containing only tenant-visible unlimited plans and an explicit cancel row.</returns>
+    /// <remarks>
+    /// Each label uses <see cref="CalculateTenantPrice" /> so fixed-public-price plans and ordinary markup plans cannot
+    /// drift from order pricing. Typed selections and final state are revalidated separately before any side effect.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var keyboard = BuildTenantRenewUnlimitedKeyboard(service, tenant);
+    /// </code>
+    /// </example>
     private ReplyKeyboardMarkup BuildTenantRenewUnlimitedKeyboard(XuiV3ServiceDefinition service, BotInstance tenant)
     {
-        var rows = service.UnlimitedPlans
-            .Where(x => x.IsEnabled)
+        var rows = XuiV3PurchaseService.GetUnlimitedPlansForTenant(service)
             .OrderBy(x => x.Days)
             .Select(plan =>
             {
@@ -4574,10 +4588,22 @@ public class TenantBotService
     /// </summary>
     /// <param name="service">Unlimited service containing plan options.</param>
     /// <param name="text">Customer text containing display name or key.</param>
-    /// <returns>The matched plan, or <c>null</c> when invalid.</returns>
+    /// <returns>
+    /// The matched tenant-visible plan, or <c>null</c> when the text is unknown or the plan is disabled or hidden from
+    /// tenant storefronts.
+    /// </returns>
+    /// <remarks>
+    /// Possession of a reply label or plan key is not authorization. This method performs no state, order, payment,
+    /// wallet, or XUI mutation.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var plan = FindTenantUnlimitedPlan(service, message.Text);
+    /// </code>
+    /// </example>
     private static XuiV3UnlimitedPlan FindTenantUnlimitedPlan(XuiV3ServiceDefinition service, string text)
     {
-        return service.UnlimitedPlans.FirstOrDefault(x => x.IsEnabled &&
+        return XuiV3PurchaseService.GetUnlimitedPlansForTenant(service).FirstOrDefault(x =>
             (string.Equals(text, x.Key, StringComparison.OrdinalIgnoreCase) ||
              string.Equals(text, x.DisplayName, StringComparison.OrdinalIgnoreCase) ||
              (text?.Contains($"[{x.Key}]", StringComparison.OrdinalIgnoreCase) == true)));
@@ -4894,8 +4920,7 @@ public class TenantBotService
                 var service = _purchaseService.GetEnabledServices().FirstOrDefault(candidate =>
                     candidate.IsUnlimited &&
                     string.Equals(candidate.Key, parts[1], StringComparison.OrdinalIgnoreCase));
-                var plan = service?.UnlimitedPlans?.FirstOrDefault(candidate =>
-                    candidate.IsEnabled &&
+                var plan = XuiV3PurchaseService.GetUnlimitedPlansForTenant(service).FirstOrDefault(candidate =>
                     string.Equals(candidate.Key, parts[2], StringComparison.OrdinalIgnoreCase));
                 if (service == null)
                 {
@@ -5237,26 +5262,34 @@ public class TenantBotService
     /// <summary>
     /// Shows current traffic options for a metered service or enabled sub-plans for an unlimited service.
     /// </summary>
-    /// <param name="botClient">tenant Bot client.</param>
-    /// <param name="ChatId">customer chat Id.</param>
-    /// <param name="MessageId">optional Message Id to edit.</param>
-    /// <param name="tenant">current tenant Bot row.</param>
-    /// <param name="ServiceKey">selected xui service key.</param>
+    /// <param name="botClient">Telegram client for the tenant storefront handling the customer callback.</param>
+    /// <param name="ChatId">Telegram chat id of the tenant customer receiving the live service choices.</param>
+    /// <param name="MessageId">Optional Telegram message id to edit; null sends a new selection message.</param>
+    /// <param name="tenant">
+    /// Tenant bot row whose markup or fixed-public-price policy determines each displayed sale amount.
+    /// </param>
+    /// <param name="ServiceKey">Global enabled XUI service key selected by the tenant customer callback.</param>
     /// <param name="CustomerTelegramUserId">
     /// Numeric Telegram user id of the tenant customer. This is stored in users.db state so a typed traffic
     /// message can continue the same purchase flow after the service callback.
     /// </param>
-    /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <param name="CancellationToken">Token that cancels users.db state changes and Telegram delivery.</param>
     /// <returns>A task that completes after tenant-scoped state and the current selection message are synchronized.</returns>
     /// <remarks>
     /// Selecting a metered service atomically clears duration, plan, traffic, count, and comment values from any older
     /// purchase before installing the traffic step. A removed or disabled service clears this tenant conversation and
-    /// returns to the live service menu. Unlimited selection clears prior state before showing enabled plans. No order,
-    /// wallet, payment, or XUI operation is performed here.
+    /// returns to the live service menu. Unlimited selection clears prior state before showing only tenant-visible
+    /// plans priced by <see cref="CalculateTenantPrice" />. No order, wallet, payment, or XUI operation is performed.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="CancellationToken"/> is cancelled during users.db or Telegram work.
     /// </exception>
+    /// <example>
+    /// <code>
+    /// await SHOWSERVICEOPTIONSASYNC(
+    ///     botClient, chatId, messageId, tenant, "unlimited", customerTelegramUserId, cancellationToken);
+    /// </code>
+    /// </example>
     private async Task SHOWSERVICEOPTIONSASYNC(
         ITelegramBotClient botClient,
         ChatId ChatId,
@@ -5277,8 +5310,7 @@ public class TenantBotService
         if (service.IsUnlimited)
         {
             await _userDbcontext.ClearUserStatus(new User { Id = CustomerTelegramUserId });
-            var rows = service.UnlimitedPlans
-                .Where(x => x.IsEnabled)
+            var rows = XuiV3PurchaseService.GetUnlimitedPlansForTenant(service)
                 .Select(plan =>
                 {
                     var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
@@ -5425,13 +5457,20 @@ public class TenantBotService
     /// </returns>
     /// <remarks>
     /// A custom-duration policy or preset can change while a Telegram pre-invoice remains visible. Invalid metered
-    /// selections are restored to the tenant-scoped duration step and current options are shown. Full price validation
-    /// is also repeated so malformed configuration cannot reach order, gateway, wallet, ledger, or XUI side effects.
+    /// selections are restored to the tenant-scoped duration step and current options are shown. Unlimited selections
+    /// hidden by <c>TenantVisible</c> are restored to the current tenant plan selector. Full price validation is also
+    /// repeated so malformed configuration cannot reach order, gateway, wallet, ledger, or XUI side effects.
     /// The duration is cleared with an explicit empty string because null preserves legacy partial state.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="cancellationToken"/> is cancelled during users.db or Telegram recovery work.
     /// </exception>
+    /// <example>
+    /// <code>
+    /// var current = await EnsureTenantPurchaseSelectionIsCurrentAsync(
+    ///     botClient, callbackQuery, tenant, selection, cancellationToken);
+    /// </code>
+    /// </example>
     private async Task<bool> EnsureTenantPurchaseSelectionIsCurrentAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -5520,10 +5559,9 @@ public class TenantBotService
 
         if (service.IsUnlimited)
         {
-            var planIsEnabled = service.UnlimitedPlans?.Any(plan =>
-                plan.IsEnabled &&
-                string.Equals(plan.Key, selection.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase)) == true;
-            if (!planIsEnabled)
+            var selectedPlan = service.UnlimitedPlans?.FirstOrDefault(plan =>
+                string.Equals(plan.Key, selection.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase));
+            if (!XuiV3PurchaseService.IsUnlimitedPlanAvailableForTenant(selectedPlan))
             {
                 await _userDbcontext.ClearUserStatus(new User { Id = callbackQuery.From.Id });
                 await SHOWSERVICEOPTIONSASYNC(
@@ -5578,11 +5616,13 @@ public class TenantBotService
     /// Current global plan selection. A metered duration may be an enabled preset or canonical <c>days-N</c> custom key.
     /// </param>
     /// <param name="CancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <returns>A task that completes after the tenant-visible pre-invoice and payment choices are delivered.</returns>
     /// <remarks>
     /// The shared resolver revalidates service, traffic, and duration before the summary is built. Metered summaries
     /// show traffic and daily components using customer-visible effective tenant rates; markup pricing never exposes
-    /// the owner's raw colleague cost. This method sends UI only and does not create an order, invoice, wallet movement,
-    /// ledger entry, or XUI account.
+    /// the owner's raw colleague cost. Unlimited selections are tenant-authorized again, and fixed-public-price policy
+    /// changes only the displayed sale amount. This method sends UI only and does not create an order, invoice, wallet
+    /// movement, ledger entry, or XUI account.
     ///
     /// Every enabled online gateway is displayed as instant and includes its customer-facing fee percentage:
     /// NOWPayments 0%, Tetraminator 12%, UniquePay 12%, and HooshPay 15%. Callback data remains unchanged, so
@@ -5591,7 +5631,7 @@ public class TenantBotService
     private async Task SHOWCUSTOMERCONFIRMASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, XuiV3PurchaseSelection selection, CancellationToken CancellationToken)
     {
         var Price = CalculateTenantPrice(tenant, selection);
-        var resolved = _purchaseService.ResolvePurchase(selection, false);
+        var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
         var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, Price.SalePriceToman);
         var Text = "📌 <b>پیش‌فاکتور خرید</b>\n\n" +
                    $"سرویس: <b>{Html(resolved.Service.DisplayName)}</b>\n" +
@@ -7190,7 +7230,8 @@ public class TenantBotService
     /// callback, customer check, and manual paths share a process-wide gate and reload the order before checking
     /// <see cref="TenantBotOrder.IsFulfilled" />. Renewal orders are routed to the durable renewal saga before the
     /// account-creation branch. A completed order returns without creating/updating XUI, mutating an owner wallet, or
-    /// appending another ledger entry.
+    /// appending another ledger entry. Before a paid purchase mutates XUI, its unlimited plan must still be enabled and
+    /// tenant-visible; a hidden or removed plan fails the order without creating an account or settling owner funds.
     /// Timing begins only after the paid order, tenant, owner, customer, and plan are ready for execution. The central
     /// audit reports accumulated panel API time and total fulfillment time and never includes gateway waiting time.
     /// </remarks>
@@ -7271,6 +7312,29 @@ public class TenantBotService
                     DEBITOWNERBASECOST,
                     CancellationToken);
             }
+        }
+
+        try
+        {
+            _ = _purchaseService.ResolveTenantPurchase(selection, false);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Failed;
+            order.ErrorMessage = "Tenant purchase plan is no longer available for fulfillment.";
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            _logger.LogWarning(
+                ex,
+                "Paid tenant purchase fulfillment rejected by current plan audience. tenantBotId={TenantBotId}, orderId={OrderId}, serviceKey={ServiceKey}",
+                order.TenantBotId,
+                order.OrderId,
+                order.ServiceKey);
+            await NOTIFYTENANTCUSTOMERFAILUREASYNC(
+                order,
+                "پلن این سفارش دیگر در فروشگاه فعال نیست و اکانتی ساخته نشد. لطفاً با پشتیبانی تماس بگیرید.",
+                CancellationToken);
+            return NowPaymentsSettlementResult.InvalidAmount();
         }
 
         using var operationTiming = XuiOperationTiming.Start();
@@ -9194,8 +9258,15 @@ public class TenantBotService
     /// Per-day display never reveals the owner's colleague base cost. With no markup it shows the public daily rate;
     /// with markup it shows the effective marked-up daily rate. Final order prices are still calculated from the
     /// complete selection by <see cref="CalculateTenantPrice" />, not by multiplying this presentation value.
-    /// This method performs no database writes, wallet changes, gateway calls, or Telegram sends.
+    /// Unlimited lists contain only tenant-visible plans; fixed-public-price plans show the configured public amount
+    /// without exposing colleague base cost or profit. This method performs no database writes, wallet changes,
+    /// gateway calls, or Telegram sends.
     /// </remarks>
+    /// <example>
+    /// <code>
+    /// var text = BUILDTENANTTARIFFSTEXT(tenant);
+    /// </code>
+    /// </example>
     private string BUILDTENANTTARIFFSTEXT(BotInstance tenant)
     {
         var Builder = new System.Text.StringBuilder();
@@ -9210,7 +9281,7 @@ public class TenantBotService
             Builder.AppendLine($"🔹 <b>{Html(service.DisplayName)}</b>");
             if (service.IsUnlimited)
             {
-                foreach (var plan in service.UnlimitedPlans.Where(x => x.IsEnabled).OrderBy(x => x.Days))
+                foreach (var plan in XuiV3PurchaseService.GetUnlimitedPlansForTenant(service).OrderBy(x => x.Days))
                 {
                     var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
                     var Price = CalculateTenantPrice(tenant, selection).SalePriceToman;
@@ -9505,19 +9576,40 @@ public class TenantBotService
     /// </returns>
     /// <remarks>
     /// The shared resolver first applies per-GB, per-day, or lifetime-multiplier pricing for both public and colleague
-    /// roles. A positive tenant markup replaces the public sale with the colleague total multiplied by that markup;
-    /// the sale is never below owner base cost. This method does not debit or credit a wallet and does not create an
-    /// order, ledger entry, gateway invoice, or XUI account.
+    /// roles. For ordinary plans, a positive tenant markup replaces the public sale with the colleague total multiplied
+    /// by that markup and the sale is never below owner base cost. A plan with <c>TenantUsesUserPrice</c> instead fixes
+    /// sale to its public/user total, keeps colleague total as base cost, and ignores tenant markup. This method does
+    /// not debit or credit a wallet and does not create an order, ledger entry, gateway invoice, or XUI account.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when the selected global plan or its financial configuration is invalid or disabled.
+    /// Thrown when the selected global plan is invalid, disabled, hidden from tenants, or has invalid financial data.
     /// </exception>
+    /// <exception cref="ArgumentException">Thrown when generic selection values are malformed.</exception>
+    /// <exception cref="OverflowException">Thrown when a calculated whole-toman amount exceeds <see cref="long" />.</exception>
+    /// <example>
+    /// <code>
+    /// var price = CalculateTenantPrice(
+    ///     tenant,
+    ///     new XuiV3PurchaseSelection { ServiceKey = "unlimited", UnlimitedPlanKey = "configured-plan-key" });
+    /// </code>
+    /// </example>
     private TenantPriceResult CalculateTenantPrice(BotInstance tenant, XuiV3PurchaseSelection selection)
     {
-        var PUBLICRESOLVED = _purchaseService.ResolvePurchase(selection, false);
-        var COLLEAGUERESOLVED = _purchaseService.ResolvePurchase(selection, true);
+        var PUBLICRESOLVED = _purchaseService.ResolveTenantPurchase(selection, false);
+        var COLLEAGUERESOLVED = _purchaseService.ResolveTenantPurchase(selection, true);
         var BASECOST = COLLEAGUERESOLVED.PriceToman;
         var sale = PUBLICRESOLVED.PriceToman;
+
+        if (PUBLICRESOLVED.UnlimitedPlan?.TenantUsesUserPrice == true)
+        {
+            return new TenantPriceResult
+            {
+                SalePriceToman = sale,
+                BaseCostToman = BASECOST,
+                ProfitToman = Math.Max(0, sale - BASECOST)
+            };
+        }
+
         var markup = Math.Max(0, tenant?.TenantPriceMarkupPercent ?? 0);
         // default sale Price is public TARIFF; A custom markup overrides it from colleague base cost.
         if (markup > 0)
@@ -10351,6 +10443,7 @@ public class TenantBotService
     /// into tenant order errors, Telegram messages, or central payment logs.
     /// The volume-reminder cycle is advanced best-effort after the update/reset and before settlement persistence;
     /// reminder-state failure cannot roll back the panel renewal or alter owner/customer balances.
+    /// The selected unlimited plan is revalidated against tenant visibility before renewal calculation or XUI mutation.
     /// The central order audit reports accumulated panel API time and total renewal/settlement time; time waiting for
     /// the payment provider or customer action is excluded.
     /// </remarks>
@@ -10394,7 +10487,30 @@ public class TenantBotService
             return NowPaymentsSettlementResult.NotFound();
         }
 
-        var resolved = _purchaseService.ResolvePurchase(selection, false);
+        XuiV3ResolvedPurchase resolved;
+        try
+        {
+            resolved = _purchaseService.ResolveTenantPurchase(selection, false);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Failed;
+            order.ErrorMessage = "Tenant renewal plan is no longer available for fulfillment.";
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            _logger.LogWarning(
+                ex,
+                "Paid tenant renewal fulfillment rejected by current plan audience. tenantBotId={TenantBotId}, orderId={OrderId}, serviceKey={ServiceKey}",
+                order.TenantBotId,
+                order.OrderId,
+                order.ServiceKey);
+            await NOTIFYTENANTCUSTOMERFAILUREASYNC(
+                order,
+                "پلن تمدید این سفارش دیگر در فروشگاه فعال نیست و اکانت تغییر نکرد. لطفاً با پشتیبانی تماس بگیرید.",
+                cancellationToken);
+            return NowPaymentsSettlementResult.InvalidAmount();
+        }
+
         resolved.PriceToman = order.SalePriceToman;
         var tenantRenewalOperationKey = "tenant-renew-" + order.OrderId;
         var blockingOperation = await _renewalOperationStore.FindBlockingOperationAsync(
@@ -11865,12 +11981,21 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// internal Price BREAKDOWN for tenant storefront orders.
+    /// Carries the authoritative whole-toman sale, base-cost, and profit amounts for one tenant storefront selection.
     /// </summary>
+    /// <remarks>
+    /// Instances are detached calculation results. Callers persist the values on an order before payment and must not
+    /// recalculate profit independently during settlement. All values use Iranian toman major units.
+    /// </remarks>
     private sealed class TenantPriceResult
     {
+        /// <summary>Gets or sets the exact amount charged to the tenant customer in Iranian toman.</summary>
         public long SalePriceToman { get; set; }
+
+        /// <summary>Gets or sets the tenant owner's colleague-rate base cost in Iranian toman.</summary>
         public long BaseCostToman { get; set; }
+
+        /// <summary>Gets or sets the non-negative tenant profit in Iranian toman.</summary>
         public long ProfitToman { get; set; }
     }
 }

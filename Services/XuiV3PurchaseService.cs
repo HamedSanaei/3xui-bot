@@ -32,7 +32,7 @@ public class XuiV3PurchaseService
     /// </summary>
     /// <returns>
     /// A detached in-memory catalog loaded from the configured JSON path. The returned catalog is safe for pricing
-    /// only after this method's metered-price validation succeeds.
+    /// only after metered rules and opt-in unlimited fixed-tenant-price rules validate successfully.
     /// </returns>
     /// <remarks>
     /// The file is re-read on every call, so operational changes to duration availability and prices take effect
@@ -41,7 +41,8 @@ public class XuiV3PurchaseService
     /// </remarks>
     /// <exception cref="FileNotFoundException">Thrown when the configured catalog file does not exist.</exception>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when a metered daily price, lifetime multiplier, duration-day value, or custom-duration policy is invalid.
+    /// Thrown when a metered price/duration policy is invalid or an enabled fixed-user-price unlimited plan lacks the
+    /// positive public and colleague rates required for tenant sale and base-cost calculation.
     /// </exception>
     /// <example>
     /// <code>
@@ -52,7 +53,7 @@ public class XuiV3PurchaseService
     public XuiV3ServicePlanCatalog LoadCatalog()
     {
         var catalog = XuiV3ServicePlanCatalog.Load(_appConfig.XuiV3ServicePlansPath);
-        ValidateMeteredPricingConfiguration(catalog);
+        ValidateCatalogPricingConfiguration(catalog);
         return catalog;
     }
 
@@ -79,6 +80,105 @@ public class XuiV3PurchaseService
     }
 
     /// <summary>
+    /// Determines whether an unlimited plan may be selected by a customer in an owned-bot storefront.
+    /// </summary>
+    /// <param name="plan">
+    /// Unlimited plan loaded from the global service-plan catalog. A null value is treated as unavailable.
+    /// </param>
+    /// <param name="isColleague">
+    /// Current owned-bot buyer role from <see cref="CredUser.IsColleague" />. Pass <c>true</c> only after the live
+    /// credentials profile and any configured colleague-role refresh have been applied.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the plan is enabled and either unrestricted or the buyer is a colleague; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// This is an audience check, not a price selector. Callers must still use the central resolver with the desired
+    /// role price. The method has no catalog, database, Telegram, wallet, payment, or XUI side effects.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// if (XuiV3PurchaseService.IsUnlimitedPlanAvailableForOwnedBot(plan, credUser.IsColleague))
+    /// {
+    ///     // The owned customer may continue to pricing.
+    /// }
+    /// </code>
+    /// </example>
+    public static bool IsUnlimitedPlanAvailableForOwnedBot(XuiV3UnlimitedPlan plan, bool isColleague)
+    {
+        return plan != null &&
+               plan.IsEnabled &&
+               (!plan.OwnedColleagueOnly || isColleague);
+    }
+
+    /// <summary>
+    /// Determines whether an unlimited plan may be selected by a tenant-storefront customer.
+    /// </summary>
+    /// <param name="plan">
+    /// Unlimited plan loaded from the global service-plan catalog. A null value is treated as unavailable.
+    /// </param>
+    /// <returns><c>true</c> when the plan is enabled and tenant-visible; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// Owned colleague restrictions are intentionally ignored because tenant audience and owned audience are
+    /// independent catalog policies. This method performs no I/O and does not calculate or mutate a price.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var visible = XuiV3PurchaseService.IsUnlimitedPlanAvailableForTenant(plan);
+    /// </code>
+    /// </example>
+    public static bool IsUnlimitedPlanAvailableForTenant(XuiV3UnlimitedPlan plan)
+    {
+        return plan != null && plan.IsEnabled && plan.TenantVisible;
+    }
+
+    /// <summary>
+    /// Gets the enabled unlimited plans available to one owned-bot buyer role.
+    /// </summary>
+    /// <param name="service">
+    /// Unlimited service definition from the global catalog. Null services or null plan collections produce an empty
+    /// result and must not be interpreted as authorization.
+    /// </param>
+    /// <param name="isColleague">Current owned-bot buyer role used only for audience filtering.</param>
+    /// <returns>
+    /// A detached list in catalog order. The list can be empty and contains no plans forbidden to the supplied role.
+    /// </returns>
+    /// <remarks>The method is side-effect-free and does not filter by price amount.</remarks>
+    /// <example>
+    /// <code>
+    /// var plans = XuiV3PurchaseService.GetUnlimitedPlansForOwnedBot(service, isColleague: false);
+    /// </code>
+    /// </example>
+    public static IReadOnlyList<XuiV3UnlimitedPlan> GetUnlimitedPlansForOwnedBot(
+        XuiV3ServiceDefinition service,
+        bool isColleague)
+    {
+        return service?.UnlimitedPlans?
+            .Where(plan => IsUnlimitedPlanAvailableForOwnedBot(plan, isColleague))
+            .ToList() ?? new List<XuiV3UnlimitedPlan>();
+    }
+
+    /// <summary>
+    /// Gets the enabled unlimited plans exposed by one service to tenant storefronts.
+    /// </summary>
+    /// <param name="service">
+    /// Unlimited service definition from the global catalog. Null services or plan collections produce an empty list.
+    /// </param>
+    /// <returns>A detached tenant-visible list in catalog order; the result can be empty.</returns>
+    /// <remarks>The method applies no tenant markup and has no persistence, wallet, Telegram, or XUI side effects.</remarks>
+    /// <example>
+    /// <code>
+    /// var plans = XuiV3PurchaseService.GetUnlimitedPlansForTenant(service);
+    /// </code>
+    /// </example>
+    public static IReadOnlyList<XuiV3UnlimitedPlan> GetUnlimitedPlansForTenant(XuiV3ServiceDefinition service)
+    {
+        return service?.UnlimitedPlans?
+            .Where(IsUnlimitedPlanAvailableForTenant)
+            .ToList() ?? new List<XuiV3UnlimitedPlan>();
+    }
+
+    /// <summary>
     /// Resolves a raw Telegram purchase or renewal selection into the concrete XUI v3 plan, price, traffic, and duration.
     /// </summary>
     /// <param name="selection">
@@ -93,13 +193,15 @@ public class XuiV3PurchaseService
     /// <returns>
     /// A normalized purchase result containing the enabled service and plan, traffic bytes, duration days, limit IP,
     /// and whole-toman unit price. Metered results also contain the authoritative component breakdown used to explain
-    /// that same unit price. The returned object is safe to use for account creation and invoice totals.
+    /// that same unit price. Storefront callers must apply the appropriate owned or tenant audience wrapper before
+    /// using the result for account creation, renewal, or invoice totals.
     /// </returns>
     /// <remarks>
-    /// This method is the shared financial policy gate for owned bots and tenant bots. Metered finite durations add
+    /// This method is the shared role-price resolver for owned bots and tenant bots. Metered finite durations add
     /// role-specific daily cost to traffic cost; zero-day durations multiply only the traffic cost. Custom-day keys are
-    /// revalidated against the current normal-service policy. Disabled presets, stale callbacks, and invalid typed
-    /// values are rejected before wallet, tenant-order, ledger, or XUI side effects.
+    /// revalidated against the current normal-service policy. Unlimited storefront audience is deliberately not
+    /// inferred from <paramref name="isColleague" />: owned callers use <see cref="ResolveOwnedPurchase" /> and tenant
+    /// callers use <see cref="ResolveTenantPurchase" /> before wallet, order, ledger, or XUI side effects.
     /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="selection"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
@@ -606,6 +708,73 @@ public class XuiV3PurchaseService
     }
 
     /// <summary>
+    /// Resolves an owned-bot selection and enforces the selected unlimited plan's owned audience policy.
+    /// </summary>
+    /// <param name="selection">
+    /// Owned customer selection restored from the current callback, reply text, or bot-scoped durable state.
+    /// </param>
+    /// <param name="isColleague">
+    /// Current owned-bot customer role. The same value selects the normal-user or colleague price after authorization.
+    /// </param>
+    /// <returns>
+    /// The authoritative resolved purchase when its service and plan remain enabled and available to the owned buyer.
+    /// </returns>
+    /// <remarks>
+    /// This wrapper keeps audience authorization separate from <see cref="ResolvePurchase" />, which tenant pricing
+    /// must call for both public and colleague rates. It performs no financial or XUI mutation.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="selection" /> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when generic resolution fails or an unlimited plan is not available to the current owned buyer role.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// var resolved = purchaseService.ResolveOwnedPurchase(selection, credUser.IsColleague);
+    /// </code>
+    /// </example>
+    public XuiV3ResolvedPurchase ResolveOwnedPurchase(XuiV3PurchaseSelection selection, bool isColleague)
+    {
+        var resolved = ResolvePurchase(selection, isColleague);
+        if (resolved.IsUnlimited && !IsUnlimitedPlanAvailableForOwnedBot(resolved.UnlimitedPlan, isColleague))
+            throw new InvalidOperationException($"Unlimited plan '{selection?.UnlimitedPlanKey}' is not available for this owned-bot customer.");
+
+        return resolved;
+    }
+
+    /// <summary>
+    /// Resolves a tenant-storefront selection and enforces the selected unlimited plan's tenant visibility policy.
+    /// </summary>
+    /// <param name="selection">
+    /// Tenant purchase or renewal selection from live callback data, bot-scoped state, or a persisted tenant order.
+    /// </param>
+    /// <param name="isColleague">
+    /// Price role only: pass <c>false</c> for customer/public price and <c>true</c> for tenant-owner base cost.
+    /// </param>
+    /// <returns>The authoritative resolved purchase when its unlimited plan remains tenant-visible.</returns>
+    /// <remarks>
+    /// Owned colleague restrictions are intentionally not evaluated. Calling this method for both role values yields
+    /// the two inputs required by authoritative tenant pricing without coupling audience to price role.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="selection" /> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when generic resolution fails or the selected unlimited plan is hidden from tenant storefronts.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// var publicRate = purchaseService.ResolveTenantPurchase(selection, isColleague: false);
+    /// var baseRate = purchaseService.ResolveTenantPurchase(selection, isColleague: true);
+    /// </code>
+    /// </example>
+    public XuiV3ResolvedPurchase ResolveTenantPurchase(XuiV3PurchaseSelection selection, bool isColleague)
+    {
+        var resolved = ResolvePurchase(selection, isColleague);
+        if (resolved.IsUnlimited && !IsUnlimitedPlanAvailableForTenant(resolved.UnlimitedPlan))
+            throw new InvalidOperationException($"Unlimited plan '{selection?.UnlimitedPlanKey}' is not available for tenant storefronts.");
+
+        return resolved;
+    }
+
+    /// <summary>
     /// Calculates the final whole-toman unit price for a metered service selection.
     /// </summary>
     /// <param name="service">Enabled global metered service containing role-specific rates.</param>
@@ -736,11 +905,28 @@ public class XuiV3PurchaseService
         return new InlineKeyboardMarkup(rows);
     }
 
+    /// <summary>
+    /// Builds the owned-bot unlimited-plan callback keyboard for the current buyer role.
+    /// </summary>
+    /// <param name="serviceKey">Enabled global unlimited service key encoded into generated callbacks.</param>
+    /// <param name="isColleague">Current owned-bot buyer role used for audience filtering and displayed price.</param>
+    /// <returns>
+    /// An inline keyboard containing only owned-authorized plans with a positive role price, followed by back navigation.
+    /// </returns>
+    /// <remarks>
+    /// Keyboard visibility is presentation only. Callback, restored state, preview, and confirmation handlers must use
+    /// <see cref="ResolveOwnedPurchase" /> or the same central audience predicate before any side effect.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var keyboard = purchaseService.BuildUnlimitedPlanKeyboard("unlimited", credUser.IsColleague);
+    /// </code>
+    /// </example>
     public InlineKeyboardMarkup BuildUnlimitedPlanKeyboard(string serviceKey, bool isColleague)
     {
         var service = FindService(serviceKey);
-        var rows = service.UnlimitedPlans
-            .Where(p => p.IsEnabled && p.Price.GetForRole(isColleague) > 0)
+        var rows = GetUnlimitedPlansForOwnedBot(service, isColleague)
+            .Where(p => p.Price.GetForRole(isColleague) > 0)
             .Select(plan => new[]
             {
                 InlineKeyboardButton.WithCallbackData(
@@ -784,8 +970,9 @@ public class XuiV3PurchaseService
     /// detailed metered price breakdown when applicable. Dynamic user comments remain plain text.
     /// </returns>
     /// <remarks>
-    /// The message is preview-only. It reads the current global catalog through <see cref="ResolvePurchase" /> but does
-    /// not debit a wallet, write a ledger row, create an XUI account, or send Telegram content itself.
+    /// The message is preview-only. It reads the current global catalog through <see cref="ResolveOwnedPurchase" /> so
+    /// role-forbidden unlimited plans fail closed, but it does not debit a wallet, write a ledger row, create an XUI
+    /// account, or send Telegram content itself.
     /// </remarks>
     /// <exception cref="InvalidOperationException">Thrown when the selected service, duration, or pricing configuration is invalid.</exception>
     /// <exception cref="OverflowException">Thrown when the configured price exceeds the supported toman range.</exception>
@@ -796,7 +983,7 @@ public class XuiV3PurchaseService
     /// </example>
     public string BuildSummaryText(XuiV3PurchaseSelection selection, bool isColleague)
     {
-        var resolved = ResolvePurchase(selection, isColleague);
+        var resolved = ResolveOwnedPurchase(selection, isColleague);
         return BuildSummaryText(selection, resolved);
     }
 
@@ -808,8 +995,8 @@ public class XuiV3PurchaseService
     /// must be the same values that produced <paramref name="resolved"/>.
     /// </param>
     /// <param name="resolved">
-    /// Authoritative result returned by <see cref="ResolvePurchase(XuiV3PurchaseSelection, bool)"/> for the same
-    /// selection and buyer role. The value contains the per-account toman price and metered price breakdown.
+    /// Authoritative result returned by <see cref="ResolveOwnedPurchase" /> for the same selection and buyer role. The
+    /// value contains the per-account toman price and metered price breakdown.
     /// </param>
     /// <returns>
     /// Plain Persian Telegram text containing the selected plan, per-account and total prices, and the detailed
@@ -825,7 +1012,7 @@ public class XuiV3PurchaseService
     /// </exception>
     /// <example>
     /// <code>
-    /// var resolved = purchaseService.ResolvePurchase(selection, credUser.IsColleague);
+    /// var resolved = purchaseService.ResolveOwnedPurchase(selection, credUser.IsColleague);
     /// var text = purchaseService.BuildSummaryText(selection, resolved);
     /// </code>
     /// </example>
@@ -874,11 +1061,13 @@ public class XuiV3PurchaseService
     /// </param>
     /// <returns>
     /// HTML-formatted Persian text that is safe to send with <c>ParseMode.Html</c>. The text includes only enabled
-    /// plans, role-specific per-GB/per-day prices, applicable lifetime multipliers, and valid traffic presets.
+    /// plans available to the owned buyer role, role-specific prices, applicable lifetime multipliers, and valid
+    /// traffic presets.
     /// </returns>
     /// <remarks>
-    /// The tariff message is derived from <c>xui-v3-service-plans.json</c> and omits disabled durations. This method
-    /// does not persist data or calculate a payable invoice; <see cref="ResolvePurchase" /> remains authoritative.
+    /// The tariff message is derived from <c>xui-v3-service-plans.json</c> and omits disabled durations and unlimited
+    /// plans unavailable to the supplied owned role. It does not persist data or calculate a payable invoice;
+    /// <see cref="ResolveOwnedPurchase" /> remains authoritative for checkout.
     /// </remarks>
     /// <example>
     /// <code>
@@ -905,10 +1094,9 @@ public class XuiV3PurchaseService
             if (service.IsUnlimited)
             {
                 builder.AppendLine($"♾ <b>{Html(service.DisplayName)}</b>");
-                var plans = service.UnlimitedPlans?
-                    .Where(plan => plan.IsEnabled)
+                var plans = GetUnlimitedPlansForOwnedBot(service, isColleague)
                     .OrderBy(plan => plan.Days)
-                    .ToList() ?? new List<XuiV3UnlimitedPlan>();
+                    .ToList();
 
                 foreach (var plan in plans)
                 {
@@ -1508,7 +1696,7 @@ public class XuiV3PurchaseService
     }
 
     /// <summary>
-    /// Validates metered duration-pricing fields before any catalog consumer can display or charge them.
+    /// Validates metered pricing and opt-in unlimited tenant-price policies before catalog values can be charged.
     /// </summary>
     /// <param name="catalog">
     /// Detached global XUI v3 catalog loaded from JSON. Null collections are tolerated for legacy compatibility.
@@ -1519,10 +1707,15 @@ public class XuiV3PurchaseService
     /// This method has no persistence or external-service side effects.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when a metered daily role price is negative, a lifetime multiplier is not positive and finite, a
-    /// configured duration is invalid, or a custom-duration policy violates service or range constraints.
+    /// Thrown when a metered financial or duration setting is invalid, or an enabled unlimited plan that fixes tenant
+    /// sale price to its user rate omits a positive user or colleague price.
     /// </exception>
-    private static void ValidateMeteredPricingConfiguration(XuiV3ServicePlanCatalog catalog)
+    /// <example>
+    /// <code>
+    /// ValidateCatalogPricingConfiguration(catalog);
+    /// </code>
+    /// </example>
+    private static void ValidateCatalogPricingConfiguration(XuiV3ServicePlanCatalog catalog)
     {
         foreach (var service in catalog?.Services ?? new List<XuiV3ServiceDefinition>())
         {
@@ -1544,7 +1737,21 @@ public class XuiV3PurchaseService
             }
 
             if (service.IsUnlimited)
+            {
+                foreach (var plan in service.UnlimitedPlans ?? new List<XuiV3UnlimitedPlan>())
+                {
+                    if (plan?.IsEnabled != true || !plan.TenantUsesUserPrice)
+                        continue;
+
+                    if (plan.Price == null || plan.Price.User <= 0 || plan.Price.Colleague <= 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Unlimited plan '{plan.Key}' in service '{service.Key}' requires positive user and colleague prices when tenantUsesUserPrice is enabled.");
+                    }
+                }
+
                 continue;
+            }
 
             if ((service.PricePerDay?.User ?? 0L) < 0 || (service.PricePerDay?.Colleague ?? 0L) < 0)
                 throw new InvalidOperationException($"Service '{service.Key}' cannot have a negative daily price.");
