@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -9,9 +10,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    partial class UserDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260825230309_AddPaymentSettlementNotifications")]
+    partial class AddPaymentSettlementNotifications
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.8");
@@ -1432,26 +1435,6 @@ namespace Adminbot.Migrations
                     b.Property<DateTime>("CreatedAtUtc")
                         .HasColumnType("TEXT");
 
-                    b.Property<int>("CreationAttemptCount")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime?>("CreationAttemptedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CreationErrorCode")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("CreationResolvedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CreationState")
-                        .IsRequired()
-                        .ValueGeneratedOnAdd()
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT")
-                        .HasDefaultValue("ambiguous");
-
                     b.Property<string>("Currency")
                         .HasMaxLength(16)
                         .HasColumnType("TEXT");
@@ -1588,8 +1571,6 @@ namespace Adminbot.Migrations
                     b.HasIndex("TenantBotOrderId");
 
                     b.HasIndex("TenantOwnerTelegramUserId");
-
-                    b.HasIndex("CreationState", "NextInquiryAtUtc");
 
                     b.HasIndex("IsAddedToBalance", "SettlementState", "NextInquiryAtUtc");
 

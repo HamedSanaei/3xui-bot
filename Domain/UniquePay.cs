@@ -57,8 +57,35 @@ public sealed class UniquePayPaymentInfo
     /// <summary>Provider invoice currency; verified responses may use <c>IRT</c> or <c>toman</c>.</summary>
     public string Currency { get; set; }
 
-    /// <summary>Latest local provider state: pending, paid, or failed verification.</summary>
+    /// <summary>Latest local provider payment state: pending, paid, or failed verification.</summary>
     public string PaymentStatus { get; set; } = UniquePayStatuses.Pending;
+
+    /// <summary>
+    /// Durable lifecycle state of the single allowed mutating create-invoice attempt.
+    /// </summary>
+    /// <remarks>
+    /// This state is independent of <see cref="PaymentStatus"/>. In particular, an ambiguous HTTP 5xx or transport
+    /// result remains read-only-inquiry eligible while never authorizing another create POST.
+    /// </remarks>
+    public string CreationState { get; set; } = UniquePayCreationStates.Ambiguous;
+
+    /// <summary>
+    /// Number of create-invoice POST attempts reserved for this merchant hash; safe rows must never exceed one.
+    /// </summary>
+    public int CreationAttemptCount { get; set; }
+
+    /// <summary>UTC time persisted before the one permitted create-invoice POST can reach the provider.</summary>
+    public DateTime? CreationAttemptedAtUtc { get; set; }
+
+    /// <summary>
+    /// UTC time when creation became definitively created or failed; null means the POST outcome remains ambiguous.
+    /// </summary>
+    public DateTime? CreationResolvedAtUtc { get; set; }
+
+    /// <summary>
+    /// Sanitized create-only result code retained even when later inquiry attempts update <see cref="ErrorCode"/>.
+    /// </summary>
+    public string CreationErrorCode { get; set; }
 
     /// <summary>Latest value of UniquePay's informational <c>isVerified</c> field.</summary>
     public bool IsProviderVerified { get; set; }
@@ -194,7 +221,7 @@ public sealed class UniquePayPaymentInfo
         if (feePercent < 0 || feePercent > 100)
             throw new ArgumentOutOfRangeException(nameof(feePercent), "UniquePay fee percent must be between zero and 100.");
 
-        return new UniquePayPaymentInfo
+        var payment = new UniquePayPaymentInfo
         {
             HashId = CreateHashId(telegramUserId),
             TelegramUserId = telegramUserId,
@@ -208,6 +235,8 @@ public sealed class UniquePayPaymentInfo
             NextInquiryAtUtc = DateTime.UtcNow,
             CreatedAtUtc = DateTime.UtcNow
         };
+        payment.BeginCreationAttempt(payment.CreatedAtUtc);
+        return payment;
     }
 
     /// <summary>
@@ -229,7 +258,11 @@ public sealed class UniquePayPaymentInfo
         RefId = response.RefId ?? RefId;
         PaymentLink = response.PaymentLink ?? PaymentLink;
         RawResponseJson = response.RawResponseJson ?? RawResponseJson;
-        UpdatedAtUtc = DateTime.UtcNow;
+        var now = DateTime.UtcNow;
+        CreationState = UniquePayCreationStates.Created;
+        CreationResolvedAtUtc = now;
+        CreationErrorCode = null;
+        UpdatedAtUtc = now;
     }
 
     /// <summary>
@@ -257,6 +290,10 @@ public sealed class UniquePayPaymentInfo
         RawResponseJson = response?.RawResponseJson ?? RawResponseJson;
         if (response?.Invoice != null)
         {
+            // A hash-addressed GET that returns a concrete invoice proves that the earlier ambiguous POST committed.
+            CreationState = UniquePayCreationStates.Created;
+            CreationResolvedAtUtc ??= DateTime.UtcNow;
+            CreationErrorCode = null;
             // Public check-invoice responses normally identify the invoice through invoice.id, not root refId.
             RefId ??= !string.IsNullOrWhiteSpace(response.RefId)
                 ? response.RefId
@@ -270,6 +307,106 @@ public sealed class UniquePayPaymentInfo
         }
         UpdatedAtUtc = DateTime.UtcNow;
     }
+
+    /// <summary>
+    /// Durably reserves the one permitted create-invoice mutation before any provider network call can begin.
+    /// </summary>
+    /// <param name="attemptedAtUtc">
+    /// UTC time recorded in users.db before the POST. The caller must save the payment row before invoking UniquePay.
+    /// </param>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when a create attempt was already reserved for this payment, preventing accidental mutation replay.
+    /// </exception>
+    /// <remarks>
+    /// A crash after this state is saved but before bytes reach the provider is intentionally treated as ambiguous.
+    /// Recovery may use only <c>check-invoice</c>; it must never guess that the POST was not sent.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// payment.BeginCreationAttempt(DateTime.UtcNow);
+    /// context.Add(payment);
+    /// await context.SaveChangesAsync(cancellationToken);
+    /// // Only now may the single create-invoice POST be called.
+    /// </code>
+    /// </example>
+    public void BeginCreationAttempt(DateTime attemptedAtUtc)
+    {
+        if (CreationAttemptCount != 0 || CreationAttemptedAtUtc.HasValue)
+            throw new InvalidOperationException("UniquePay create-invoice mutation has already been reserved.");
+
+        CreationState = UniquePayCreationStates.Attempting;
+        CreationAttemptCount = 1;
+        CreationAttemptedAtUtc = attemptedAtUtc;
+        CreationResolvedAtUtc = null;
+        CreationErrorCode = null;
+        UpdatedAtUtc = attemptedAtUtc;
+    }
+
+    /// <summary>
+    /// Records the result classification of the one create-invoice POST without ever scheduling another POST.
+    /// </summary>
+    /// <param name="definitiveFailure">
+    /// <c>true</c> only when local configuration or an authoritative non-transient provider rejection proves that no
+    /// usable invoice was created; <c>false</c> for timeout, disconnect, 5xx, rate limit, or malformed success data.
+    /// </param>
+    /// <param name="sanitizedErrorCode">
+    /// Credential-free HTTP/provider or local error category. Response bodies, hashes, and tokens must not be passed.
+    /// </param>
+    /// <param name="observedAtUtc">UTC time when the single attempt returned or failed locally.</param>
+    /// <remarks>
+    /// Ambiguous results remain locked to GET-only reconciliation and keep <see cref="CreationResolvedAtUtc"/> null.
+    /// Definitive failures terminate automatic reconciliation through the caller's payment/schedule transition.
+    /// </remarks>
+    public void RecordCreationFailure(
+        bool definitiveFailure,
+        string sanitizedErrorCode,
+        DateTime observedAtUtc)
+    {
+        CreationState = definitiveFailure
+            ? UniquePayCreationStates.Failed
+            : UniquePayCreationStates.Ambiguous;
+        CreationErrorCode = string.IsNullOrWhiteSpace(sanitizedErrorCode)
+            ? (definitiveFailure ? "create_failed" : "create_ambiguous")
+            : sanitizedErrorCode.Trim();
+        CreationResolvedAtUtc = definitiveFailure ? observedAtUtc : null;
+        UpdatedAtUtc = observedAtUtc;
+    }
+}
+
+/// <summary>
+/// Durable lifecycle values for the exactly-once UniquePay invoice-creation mutation.
+/// </summary>
+/// <remarks>
+/// These values describe only the create POST. Payment proof remains exclusively in authoritative inquiry data and
+/// <see cref="UniquePayStatuses"/>; a <see cref="Created"/> value does not mean paid.
+/// </remarks>
+public static class UniquePayCreationStates
+{
+    /// <summary>The single POST was reserved durably and may have reached the provider.</summary>
+    public const string Attempting = "attempting";
+
+    /// <summary>A valid create response or a later hash inquiry proved that the provider invoice exists.</summary>
+    public const string Created = "created";
+
+    /// <summary>The single POST had a timeout, disconnect, 5xx, rate-limit, or malformed/incomplete success result.</summary>
+    public const string Ambiguous = "ambiguous";
+
+    /// <summary>An authoritative non-transient rejection proved that automatic inquiry should stop.</summary>
+    public const string Failed = "failed";
+
+    /// <summary>GET-only reconciliation exhausted its configured budget without proving invoice existence.</summary>
+    public const string ManualReview = "manual_review";
+
+    /// <summary>
+    /// Determines whether an explicit read-only inquiry is safe for a creation lifecycle.
+    /// </summary>
+    /// <param name="state">Persisted creation state; null legacy values are treated as ambiguous and recoverable.</param>
+    /// <returns>
+    /// <c>false</c> only for a definitive failed create. Manual-review rows remain explicitly GET-checkable but are
+    /// excluded from the automatic worker query.
+    /// </returns>
+    public static bool IsReadOnlyInquiryAllowed(string state)
+        => !string.Equals(state, Failed, StringComparison.Ordinal);
 }
 
 /// <summary>
@@ -554,7 +691,10 @@ public sealed class UniquePay
     /// Creates one UniquePay invoice without automatic retry.
     /// </summary>
     /// <param name="hashId">Globally unique merchant hash already persisted in users.db.</param>
-    /// <param name="amountToman">Base amount in Iranian toman/IRT, excluding the gateway fee; must be positive.</param>
+    /// <param name="amountToman">
+    /// Base amount in Iranian toman/IRT, excluding the gateway fee. It must be greater than 50,000 toman; exactly
+    /// 50,000 is not accepted by the current provider contract.
+    /// </param>
     /// <param name="redirectUrl">
     /// Absolute platform return URL containing the merchant hash only as a lookup hint; it is not payment proof.
     /// </param>
@@ -564,6 +704,9 @@ public sealed class UniquePay
     /// </param>
     /// <param name="cancellationToken">Cancellation token for the single create request.</param>
     /// <returns>A validated response containing matching hash id, provider reference, and payment link.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown before request construction when <paramref name="amountToman"/> is 50,000 toman or less.
+    /// </exception>
     /// <exception cref="UniquePayApiException">Thrown for provider rejection or malformed/incomplete response.</exception>
     /// <remarks>
     /// Uses UniquePay's documented bot-compatible <c>/api/ddbot/create-invoice</c> route because the generic route
@@ -574,7 +717,7 @@ public sealed class UniquePay
     /// <code>
     /// var invoice = await uniquePay.CreateInvoiceAsync(
     ///     payment.HashId,
-    ///     amountToman: 50000,
+    ///     amountToman: 50001,
     ///     redirectUrl: "https://merchant.example/uniquepay-return?hashId=example",
     ///     callbackUrl: "https://merchant.example/uniquepay-callback?hashId=example",
     ///     cancellationToken);
@@ -588,8 +731,7 @@ public sealed class UniquePay
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(hashId);
-        if (amountToman <= 0)
-            throw new ArgumentOutOfRangeException(nameof(amountToman), "UniquePay invoice amount must be positive toman.");
+        UniquePayAmountPolicy.EnsureValid(amountToman);
 
         var fields = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -963,7 +1105,6 @@ public sealed class UniquePaySettlementService
     private readonly CredentialsDbContext _credentialsDbContext;
     private readonly WalletLedgerService _walletLedgerService;
     private readonly ReferralService _referralService;
-    private readonly BotClientProvider _botClientProvider;
     private readonly ILogger<UniquePaySettlementService> _logger;
 
     /// <summary>
@@ -978,7 +1119,6 @@ public sealed class UniquePaySettlementService
     /// <param name="credentialsDbContext">credentials.db context containing the shared wallet balance.</param>
     /// <param name="walletLedgerService">Idempotent append-only wallet-ledger writer.</param>
     /// <param name="referralService">Global owned-bot referral engine for final official wallet payments.</param>
-    /// <param name="botClientProvider">Bot client provider used for best-effort customer delivery.</param>
     /// <param name="logger">Operational and payment logger; provider credentials are never included.</param>
     /// <exception cref="ArgumentNullException">
     /// Thrown when <paramref name="userDbContextFactory"/> is null because settlement cannot safely reuse the legacy
@@ -990,7 +1130,6 @@ public sealed class UniquePaySettlementService
         CredentialsDbContext credentialsDbContext,
         WalletLedgerService walletLedgerService,
         ReferralService referralService,
-        BotClientProvider botClientProvider,
         ILogger<UniquePaySettlementService> logger)
     {
         _configuration = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -998,7 +1137,6 @@ public sealed class UniquePaySettlementService
         _credentialsDbContext = credentialsDbContext;
         _walletLedgerService = walletLedgerService;
         _referralService = referralService;
-        _botClientProvider = botClientProvider;
         _logger = logger;
     }
 
@@ -1008,13 +1146,14 @@ public sealed class UniquePaySettlementService
     /// <param name="payment">Tracked payment already verified against an authoritative check response.</param>
     /// <param name="source">Safe audit source such as customer-check, return-trigger, or reconciliation-worker.</param>
     /// <param name="notifyChatId">Optional Telegram destination override; null uses the saved payment chat.</param>
-    /// <param name="cancellationToken">Cancellation token for wallet, database, referral, and notification work.</param>
+    /// <param name="cancellationToken">Cancellation token for wallet, database, referral, and outbox work.</param>
     /// <returns>Applied, AlreadyAdded, ProviderNotPaid, UserNotFound, or NotFound.</returns>
     /// <remarks>
     /// The process-wide gate and persisted <see cref="UniquePayPaymentInfo.IsAddedToBalance"/> marker prevent duplicate
     /// wallet mutations when return, customer button, and worker race. The append-only ledger has a second unique key.
     /// Each attempt reloads the payment through an independent users.db context so the paid state written by the
-    /// authoritative reconciliation context cannot be hidden by a stale singleton EF Core change tracker.
+    /// authoritative reconciliation context cannot be hidden by a stale singleton EF Core change tracker. The first
+    /// credit and unique notification row are committed in one users.db save; retry delivery cannot call settlement.
     /// </remarks>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(
         UniquePayPaymentInfo payment,
@@ -1138,10 +1277,21 @@ public sealed class UniquePaySettlementService
             tracked.BalanceAfter = after;
             tracked.SettledAtUtc ??= DateTime.UtcNow;
             tracked.UpdatedAtUtc = DateTime.UtcNow;
+            // The unique outbox row shares the same users.db save as the exactly-once settlement marker.
+            var notificationChatId = notifyChatId ?? tracked.ChatId;
+            context.PaymentSettlementNotifications.Add(
+                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                    provider: "uniquepay",
+                    providerPaymentId: tracked.Id,
+                    botId: tracked.BotId,
+                    telegramUserId: tracked.TelegramUserId,
+                    chatId: notificationChatId,
+                    amountToman: tracked.BaseAmountToman,
+                    messageText: $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.",
+                    createdAtUtc: tracked.SettledAtUtc.Value));
             await context.SaveChangesAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, before, after, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
-            await NotifyCustomerAsync(tracked, notifyChatId ?? tracked.ChatId, provisional: false, cancellationToken);
             await LogSettlementOnceAsync(context, tracked, user, before, after, source, cancellationToken);
             return NowPaymentsSettlementResult.Applied(before, after);
         }
@@ -1157,7 +1307,7 @@ public sealed class UniquePaySettlementService
     /// <param name="payment">Owned-wallet payment whose latest official inquiry still reports unpaid.</param>
     /// <param name="approvedByTelegramUserId">Configured super-admin Telegram id persisted for financial audit.</param>
     /// <param name="notifyChatId">Optional customer chat override; null uses the chat saved on the payment row.</param>
-    /// <param name="cancellationToken">Cancellation token for claim, wallet, users.db, ledger, and Telegram operations.</param>
+    /// <param name="cancellationToken">Cancellation token for claim, wallet, users.db, ledger, and outbox operations.</param>
     /// <returns>Applied for the first credit, AlreadyAdded for a duplicate decision, or a non-mutating failure status.</returns>
     /// <remarks>
     /// The amount always comes from immutable <see cref="UniquePayPaymentInfo.BaseAmountToman"/>. Tenant orders,
@@ -1166,6 +1316,8 @@ public sealed class UniquePaySettlementService
     /// Referral processing is permanently excluded for this provisional credit; a later official confirmation writes
     /// audit only and never retroactively creates a referral reward. The refreshed eligibility row is loaded with an
     /// independent users.db context so an older tracked status cannot authorize or reject the administrator's action.
+    /// The provisional first-credit marker and customer notification are saved together; later official confirmation
+    /// does not create a second notification.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1263,10 +1415,21 @@ public sealed class UniquePaySettlementService
             tracked.SettledAtUtc ??= DateTime.UtcNow;
             tracked.NextInquiryAtUtc ??= DateTime.UtcNow.AddMinutes(1);
             tracked.UpdatedAtUtc = DateTime.UtcNow;
+            // Later official provider confirmation audits this credit only; it cannot enqueue another message.
+            var notificationChatId = notifyChatId ?? tracked.ChatId;
+            context.PaymentSettlementNotifications.Add(
+                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                    provider: "uniquepay",
+                    providerPaymentId: tracked.Id,
+                    botId: tracked.BotId,
+                    telegramUserId: tracked.TelegramUserId,
+                    chatId: notificationChatId,
+                    amountToman: tracked.BaseAmountToman,
+                    messageText: $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت.",
+                    createdAtUtc: tracked.SettledAtUtc.Value));
             await context.SaveChangesAsync(cancellationToken);
 
             await EnsureProvisionalLedgerAsync(tracked, before, after, cancellationToken);
-            await NotifyCustomerAsync(tracked, notifyChatId ?? tracked.ChatId, provisional: true, cancellationToken);
             LogProvisionalSettlement(tracked, user, before, after);
             return NowPaymentsSettlementResult.Applied(before, after);
         }
@@ -1447,40 +1610,6 @@ public sealed class UniquePaySettlementService
                 UniquePayStatuses.IsPaid(payment.PaymentStatus),
                 IsProvisional: false),
             cancellationToken);
-
-    /// <summary>
-    /// Sends a best-effort confirmation through the originating owned bot after durable settlement.
-    /// </summary>
-    /// <param name="payment">Settled payment containing the originating bot and credited amount.</param>
-    /// <param name="chatId">Telegram chat id; zero suppresses delivery.</param>
-    /// <param name="provisional">Whether the message must identify the credit as a super-admin provisional action.</param>
-    /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
-    private async Task NotifyCustomerAsync(
-        UniquePayPaymentInfo payment,
-        long chatId,
-        bool provisional,
-        CancellationToken cancellationToken)
-    {
-        if (chatId == 0)
-            return;
-        try
-        {
-            await _botClientProvider.GetClient(payment.BotId).SendTextMessageAsync(
-                chatId,
-                provisional
-                    ? $"اعتبار کیف پول شما به میزان {payment.BaseAmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت."
-                    : $"اعتبار کیف پول شما به میزان {payment.BaseAmountToman.FormatCurrency()} افزایش یافت.",
-                cancellationToken: cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(
-                ex,
-                "UniquePay customer settlement notification failed. paymentId={PaymentId}, userId={UserId}",
-                payment.Id,
-                payment.TelegramUserId);
-        }
-    }
 
     /// <summary>
     /// Sends the central one-time successful UniquePay payment report after durable financial work.
@@ -1711,8 +1840,10 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// <returns>A task that completes after all selected rows have been inspected.</returns>
     /// <remarks>
     /// The process-wide gate serializes provider inquiries, while each database operation owns an independent EF Core
-    /// context. Only rows below the configured automatic-attempt cap and with a due non-null schedule are selected.
-    /// Callback, browser-return, customer, and admin triggers remain available after automatic recovery polling stops.
+    /// context. Before selecting due work, ambiguous create rows that exhausted the configured cap are moved once to
+    /// creation-level manual review and their automatic schedule is cleared. Only rows below the cap with a due
+    /// non-null schedule are selected. Callback, browser-return, customer, and admin triggers remain GET-only and
+    /// available after automatic recovery polling stops.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1726,6 +1857,46 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         var batchSize = Math.Clamp(_configuration.UniquePayReconciliationBatchSize, 1, 500);
         var maxAttempts = Math.Clamp(_configuration.UniquePayReconciliationMaxAttempts, 1, 100);
         await using var context = _userDbContextFactory.CreateDbContext();
+
+        var exhaustedAmbiguousIds = await context.UniquePayPaymentInfos
+            .AsNoTracking()
+            .Where(x => (x.CreationState == UniquePayCreationStates.Attempting ||
+                         x.CreationState == UniquePayCreationStates.Ambiguous ||
+                         x.CreationState == null) &&
+                        x.PaymentStatus != UniquePayStatuses.Paid &&
+                        x.PaymentStatus != UniquePayStatuses.Failed &&
+                        x.PaymentStatus != UniquePayStatuses.Expired &&
+                        x.PaymentStatus != UniquePayStatuses.Cancelled &&
+                        (x.InquiryAttemptCount >= maxAttempts || x.NextInquiryAtUtc == null))
+            .OrderBy(x => x.Id)
+            .Select(x => x.Id)
+            .Take(25)
+            .ToListAsync(cancellationToken);
+
+        var exhaustedAmbiguousCount = await context.UniquePayPaymentInfos
+            .Where(x => (x.CreationState == UniquePayCreationStates.Attempting ||
+                         x.CreationState == UniquePayCreationStates.Ambiguous ||
+                         x.CreationState == null) &&
+                        x.PaymentStatus != UniquePayStatuses.Paid &&
+                        x.PaymentStatus != UniquePayStatuses.Failed &&
+                        x.PaymentStatus != UniquePayStatuses.Expired &&
+                        x.PaymentStatus != UniquePayStatuses.Cancelled &&
+                        (x.InquiryAttemptCount >= maxAttempts || x.NextInquiryAtUtc == null))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.CreationState, UniquePayCreationStates.ManualReview)
+                    .SetProperty(x => x.CreationErrorCode, "create_reconciliation_exhausted")
+                    .SetProperty(x => x.NextInquiryAtUtc, (DateTime?)null)
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+
+        if (exhaustedAmbiguousCount > 0)
+        {
+            _logger.LogWarning(
+                "UniquePay ambiguous creation recovery reached manual review. count={Count}, samplePaymentIds={PaymentIds}",
+                exhaustedAmbiguousCount,
+                string.Join(",", exhaustedAmbiguousIds));
+        }
 
         // Persist the stopped schedule so old deployments with thousands of attempts no longer appear due in
         // operational database inspection. Null only disables automatic scans; explicit HTTP/Telegram triggers do
@@ -1750,6 +1921,8 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
                         x.PaymentStatus != UniquePayStatuses.Failed &&
                         x.PaymentStatus != UniquePayStatuses.Expired &&
                         x.PaymentStatus != UniquePayStatuses.Cancelled &&
+                        x.CreationState != UniquePayCreationStates.Failed &&
+                        x.CreationState != UniquePayCreationStates.ManualReview &&
                         x.SettlementState != UniquePaySettlementStates.ManualReview &&
                         (x.SettlementState != UniquePaySettlementStates.Processing ||
                          x.SettlementStartedAtUtc == null ||
@@ -1960,6 +2133,12 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// </param>
     /// <param name="cancellationToken">Cancellation token for provider and settlement operations.</param>
     /// <returns>Settlement result from the authoritative inquiry and downstream fulfillment.</returns>
+    /// <remarks>
+    /// Definitive creation failures are not queried automatically or interactively. Ambiguous and manual-review create
+    /// states may be resolved only through <c>check-invoice</c>; an invoice object proves creation, while an absent or
+    /// undocumented response cannot authorize another create mutation. Settlement continues through the existing
+    /// wallet/tenant idempotency services only after full paid verification.
+    /// </remarks>
     private async Task<NowPaymentsSettlementResult> ReconcilePaymentCoreAsync(
         int paymentId,
         string source,
@@ -1976,6 +2155,8 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         {
             return NowPaymentsSettlementResult.AlreadyAdded(payment.BalanceAfter ?? 0);
         }
+        if (!UniquePayCreationStates.IsReadOnlyInquiryAllowed(payment.CreationState))
+            return NowPaymentsSettlementResult.ProviderNotPaid();
         if ((!allowTerminalRecheck && UniquePayStatuses.IsTerminal(payment.PaymentStatus)) ||
             string.Equals(payment.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal))
         {
@@ -1986,6 +2167,24 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         {
             var response = await _uniquePay.CheckInvoiceAsync(payment.HashId, cancellationToken);
             payment.Apply(response, GetNextAutomaticInquiryAtUtc(payment.InquiryAttemptCount + 1));
+            if (response.Invoice == null)
+            {
+                // No authoritative not-found contract is present in the checked-in provider documentation. A
+                // structurally valid but invoice-less response therefore remains inconclusive and cannot prove that
+                // the ambiguous POST did not commit.
+                payment.ErrorCode = "provider_check_inconclusive";
+                payment.ErrorMessage = "UniquePay inquiry did not return an authoritative invoice object.";
+                payment.UpdatedAtUtc = DateTime.UtcNow;
+                _logger.LogWarning(
+                    "UniquePay inquiry retry detail: provider response was inconclusive. paymentId={PaymentId}, tenantOrderId={TenantOrderId}, attempt={Attempt}, creationState={CreationState}",
+                    payment.Id,
+                    payment.TenantBotOrderId,
+                    payment.InquiryAttemptCount,
+                    payment.CreationState);
+                await context.SaveChangesAsync(cancellationToken);
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
+
             var providerTerminalStatus = UniquePayStatuses.GetProviderTerminalStatus(response.Invoice);
             if (providerTerminalStatus != null)
             {
@@ -2050,7 +2249,14 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
             payment.ErrorCode = "provider_check_failed";
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            LogFailureWithThrottle(payment, "UniquePay invoice inquiry failed.", ex);
+            _logger.LogWarning(
+                ex,
+                "UniquePay inquiry retry detail: provider request failed. paymentId={PaymentId}, tenantOrderId={TenantOrderId}, attempt={Attempt}, creationState={CreationState}, nextInquiryAtUtc={NextInquiryAtUtc}",
+                payment.Id,
+                payment.TenantBotOrderId,
+                payment.InquiryAttemptCount,
+                payment.CreationState,
+                payment.NextInquiryAtUtc);
             await context.SaveChangesAsync(cancellationToken);
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
@@ -2096,14 +2302,15 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     }
 
     /// <summary>
-    /// Sends a transition/hourly-throttled logger-channel error for one payment.
+    /// Sends a transition/hourly-throttled terminal or verification logger-channel error for one payment.
     /// </summary>
     /// <param name="payment">Payment whose safe identifiers and amount are logged.</param>
     /// <param name="message">Non-secret failure category.</param>
     /// <param name="exception">Optional sanitized provider/transport exception.</param>
     /// <remarks>
-    /// Repeated network failures are limited to one report per hour. The first terminal or verification-failed result
-    /// after a provisional credit bypasses that throttle so the operator always receives the required clawback-review alert.
+    /// Per-attempt transport/inquiry failures use a separate local-only structured message and do not call this method.
+    /// Repeated terminal or verification events are limited to one report per hour. The first terminal result after a
+    /// provisional credit bypasses that throttle so the operator receives the required clawback-review alert.
     /// </remarks>
     private void LogFailureWithThrottle(
         UniquePayPaymentInfo payment,
@@ -2130,10 +2337,9 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
             : message;
         _logger.LogError(
             exception,
-            "{Message} paymentId={PaymentId}, hashId={HashId}, tenantOrderId={TenantOrderId}, botId={BotId}, amountToman={AmountToman}, errorCode={ErrorCode}, provisional={Provisional}, approvedBy={ApprovedBy}",
+            "{Message} paymentId={PaymentId}, tenantOrderId={TenantOrderId}, botId={BotId}, amountToman={AmountToman}, errorCode={ErrorCode}, provisional={Provisional}, approvedBy={ApprovedBy}",
             effectiveMessage,
             payment.Id,
-            payment.HashId,
             payment.TenantBotOrderId,
             payment.BotId,
             payment.BaseAmountToman,

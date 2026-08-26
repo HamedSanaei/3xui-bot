@@ -47,7 +47,9 @@
       "description": "سرویس اینترنت عادی با چند اینباند",
       "kind": "metered",
       "isEnabled": true,
-      "inboundIds": [202 , 200 , 190 , 188],
+      "inboundIds": [
+        188, 190, 200, 202, 206, 207, 212, 215, 216, 217, 218, 219, 220
+      ],
       "multiInbound": true,
       "inboundProfileKeys": ["normal"],
       "fallbackInboundTypes": ["tunnel"],
@@ -106,7 +108,9 @@
       "description": "نامحدود با مصرف منصفانه، محدودیت زمان و تعداد کاربر",
       "kind": "unlimited",
       "isEnabled": true,
-      "inboundIds": [202 , 200 , 190 , 188],
+      "inboundIds": [
+        188, 190, 200, 202, 206, 207, 212, 215, 216, 217, 218, 219, 220
+      ],
       "multiInbound": true,
       "inboundProfileKeys": ["unlimited"],
       "fallbackInboundTypes": ["tunnel"],
@@ -182,7 +186,7 @@
           "maxUsers": 1,
           "price": {
             "user": 374500,
-            "colleague": 299600
+            "colleague": 219600
           },
           "isEnabled": true,
           "ownedColleagueOnly": true,

@@ -98,6 +98,8 @@ class Program
         builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
         builder.Services.AddHostedService<ReferralReconciliationHostedService>();
         builder.Services.AddHostedService<WeeklyUsageReportHostedService>();
+        // This delivery-only worker reads the users.db outbox and Telegram; it cannot repeat wallet settlement.
+        builder.Services.AddHostedService<PaymentSettlementNotificationWorker>();
         builder.Services.AddSingleton<UniquePayReconciliationHostedService>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
 

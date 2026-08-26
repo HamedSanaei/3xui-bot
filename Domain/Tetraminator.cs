@@ -417,7 +417,7 @@ public sealed class TetraminatorSettlementService
     /// <param name="credentialsDbContext">credentials.db context containing the original user wallet balance.</param>
     /// <param name="walletLedgerService">Append-only users.db ledger writer with unique idempotency keys.</param>
     /// <param name="referralService">Existing global owned-bot referral settlement and reconciliation service.</param>
-    /// <param name="botClientProvider">Provider used for best-effort notification through the originating owned bot.</param>
+    /// <param name="botClientProvider">Resolves the originating bot client used only for central log attribution.</param>
     /// <param name="botRegistry">Runtime bot metadata registry used to restore the originating bot context.</param>
     /// <param name="botContextAccessor">Async bot context accessor used while logging and notifying settlement.</param>
     /// <param name="logger">Structured operational logger; API credentials are never included.</param>
@@ -447,8 +447,12 @@ public sealed class TetraminatorSettlementService
     /// <param name="payment">Locally persisted payment already verified against provider pay id and amount.</param>
     /// <param name="source">Audit source such as callback, customer check, or super-admin check.</param>
     /// <param name="notifyChatId">Optional Telegram chat override.</param>
-    /// <param name="cancellationToken">Cancellation token for database and notification work.</param>
+    /// <param name="cancellationToken">Cancellation token for wallet, users.db, ledger, referral, and outbox work.</param>
     /// <returns>Applied, AlreadyAdded, ProviderNotPaid, UserNotFound, or NotFound.</returns>
+    /// <remarks>
+    /// The first wallet credit and unique notification row share one users.db save. Telegram delivery runs later and
+    /// cannot repeat this settlement path.
+    /// </remarks>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(
         TetraminatorPaymentInfo payment,
         string source,
@@ -503,13 +507,24 @@ public sealed class TetraminatorSettlementService
             payment.BalanceAfter = after;
             payment.SettledAtUtc ??= DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
+            // Persist the notification with the first-credit marker before ledger/referral follow-up work.
+            var notificationChatId = notifyChatId ?? user.ChatID;
+            _userDbContext.PaymentSettlementNotifications.Add(
+                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                    provider: "tetraminator",
+                    providerPaymentId: payment.Id,
+                    botId: payment.BotId,
+                    telegramUserId: payment.TelegramUserId,
+                    chatId: notificationChatId,
+                    amountToman: payment.AmountToman,
+                    messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
+                    createdAtUtc: payment.SettledAtUtc.Value));
             await _userDbContext.SaveChangesAsync(cancellationToken);
             await EnsureOfficialLedgerAsync(payment, before, after, cancellationToken);
             await ProcessReferralAsync(payment, cancellationToken);
 
             using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
             {
-                await NotifyUserAsync(payment, notifyChatId ?? user.ChatID, false, cancellationToken);
                 LogSettlement(payment, user, before, after, source, false);
             }
             return NowPaymentsSettlementResult.Applied(before, after);
@@ -526,8 +541,9 @@ public sealed class TetraminatorSettlementService
     /// <param name="payment">Pending wallet-charge payment; tenant orders are rejected.</param>
     /// <param name="approvedByTelegramUserId">Authenticated super-admin Telegram id persisted for audit.</param>
     /// <param name="notifyChatId">Optional customer chat id override.</param>
-    /// <param name="cancellationToken">Cancellation token for wallet, users.db, ledger, and Telegram operations.</param>
+    /// <param name="cancellationToken">Cancellation token for wallet, users.db, ledger, and outbox operations.</param>
     /// <returns>Applied for the first provisional credit or a non-mutating settlement status.</returns>
+    /// <remarks>Later official confirmation cannot enqueue or deliver a second customer notification.</remarks>
     public async Task<NowPaymentsSettlementResult> ApplyProvisionalPaymentAsync(
         TetraminatorPaymentInfo payment,
         long approvedByTelegramUserId,
@@ -570,13 +586,24 @@ public sealed class TetraminatorSettlementService
             payment.BalanceAfter = after;
             payment.SettledAtUtc = DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
+            // Official reconciliation after this provisional credit cannot enqueue a duplicate notification.
+            var notificationChatId = notifyChatId ?? user.ChatID;
+            _userDbContext.PaymentSettlementNotifications.Add(
+                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                    provider: "tetraminator",
+                    providerPaymentId: payment.Id,
+                    botId: payment.BotId,
+                    telegramUserId: payment.TelegramUserId,
+                    chatId: notificationChatId,
+                    amountToman: payment.AmountToman,
+                    messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت.",
+                    createdAtUtc: payment.SettledAtUtc.Value));
             await _userDbContext.SaveChangesAsync(cancellationToken);
 
             await EnsureProvisionalLedgerAsync(payment, before, after, cancellationToken);
 
             using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
             {
-                await NotifyUserAsync(payment, notifyChatId ?? user.ChatID, true, cancellationToken);
                 LogSettlement(payment, user, before, after, "admin-provisional", true);
             }
             return NowPaymentsSettlementResult.Applied(before, after);
@@ -675,30 +702,6 @@ public sealed class TetraminatorSettlementService
             cancellationToken);
 
     /// <summary>
-    /// Sends a best-effort customer notification after durable financial settlement.
-    /// </summary>
-    /// <param name="payment">Settled payment containing bot attribution and credited amount.</param>
-    /// <param name="chatId">Telegram chat id of the wallet owner; zero suppresses delivery.</param>
-    /// <param name="provisional">Whether the notification describes a super-admin provisional credit.</param>
-    /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
-    private async Task NotifyUserAsync(TetraminatorPaymentInfo payment, long chatId, bool provisional, CancellationToken cancellationToken)
-    {
-        if (chatId == 0)
-            return;
-        try
-        {
-            var text = provisional
-                ? $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت."
-                : $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.";
-            await _botClientProvider.GetClient(payment.BotId).SendTextMessageAsync(chatId, text, cancellationToken: cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Tetraminator customer settlement notification failed. paymentId={PaymentId}, userId={UserId}", payment.Id, payment.TelegramUserId);
-        }
-    }
-
-    /// <summary>
     /// Writes the central financial audit for an official or provisional wallet credit.
     /// </summary>
     /// <param name="payment">Settled payment identifiers and amount.</param>
@@ -783,7 +786,7 @@ public sealed class TetraminatorSettlementService
     /// Builds the original owned-bot runtime context captured on the payment row.
     /// </summary>
     /// <param name="payment">Payment containing originating bot id and username attribution.</param>
-    /// <returns>Runtime context used only for notification and central payment logging.</returns>
+    /// <returns>Runtime context used only for central payment logging.</returns>
     private BotRuntimeContext CreatePaymentBotContext(TetraminatorPaymentInfo payment)
     {
         var bot = _botRegistry.GetById(payment.BotId);

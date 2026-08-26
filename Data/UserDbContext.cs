@@ -5,8 +5,8 @@ using System.Threading;
 /// <summary>
 /// Entity Framework context for <c>users.db</c>.
 /// It stores bot-scoped conversation state, payment metadata, tenant storefront definitions,
-/// tenant orders, tenant ledger rows, XUI volume-reminder cycles, cookies, and other runtime data that must not live
-/// in <c>credentials.db</c>.
+/// tenant orders, tenant ledger rows, durable settlement-notification delivery, XUI volume-reminder cycles, cookies,
+/// and other runtime data that must not live in <c>credentials.db</c>.
 /// </summary>
 /// <remarks>
 /// Multi-instance support is implemented here by routing the legacy <see cref="User"/> state API
@@ -85,6 +85,10 @@ public class UserDbContext : DbContext
     public DbSet<TetraminatorPaymentInfo> TetraminatorPaymentInfos { get; set; }
     /// <summary>Persisted UniquePay invoices and polling/settlement audit state for owned and tenant payments.</summary>
     public DbSet<UniquePayPaymentInfo> UniquePayPaymentInfos { get; set; }
+    /// <summary>
+    /// Durable, independently retried Telegram notifications created by first-time owned-wallet settlements.
+    /// </summary>
+    public DbSet<PaymentSettlementNotification> PaymentSettlementNotifications { get; set; }
 
     public DbSet<ZibalPaymentInfo> ZibalPaymentInfos { get; set; }
 
@@ -168,8 +172,8 @@ public class UserDbContext : DbContext
 
     /// <summary>
     /// Defines the <c>users.db</c> schema, indexes, and field limits for payments, bot instances,
-    /// tenant orders, ledgers, bot-scoped conversation state, idempotent scheduled-report delivery, and durable
-    /// per-client XUI volume-reminder cycles and claims.
+    /// tenant orders, ledgers, bot-scoped conversation state, settlement-notification outbox delivery, idempotent
+    /// scheduled-report delivery, and durable per-client XUI volume-reminder cycles and claims.
     /// </summary>
     /// <param name="modelBuilder">EF Core model builder used by migrations and runtime metadata.</param>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -256,6 +260,11 @@ public class UserDbContext : DbContext
             entity.Property(x => x.Currency).HasMaxLength(16);
             entity.Property(x => x.FeePayer).HasMaxLength(32);
             entity.Property(x => x.PaymentStatus).HasMaxLength(64);
+            entity.Property(x => x.CreationState)
+                .IsRequired()
+                .HasMaxLength(32)
+                .HasDefaultValue(UniquePayCreationStates.Ambiguous);
+            entity.Property(x => x.CreationErrorCode).HasMaxLength(128);
             entity.Property(x => x.BotId).HasMaxLength(64);
             entity.Property(x => x.BotUsername).HasMaxLength(128);
             entity.Property(x => x.PaymentPurpose).HasMaxLength(64);
@@ -269,7 +278,29 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.PaymentPurpose);
             entity.HasIndex(x => x.TenantBotOrderId);
             entity.HasIndex(x => x.TenantOwnerTelegramUserId);
+            entity.HasIndex(x => new { x.CreationState, x.NextInquiryAtUtc });
             entity.HasIndex(x => new { x.IsAddedToBalance, x.SettlementState, x.NextInquiryAtUtc });
+        });
+
+        modelBuilder.Entity<PaymentSettlementNotification>(entity =>
+        {
+            entity.ToTable("PaymentSettlementNotifications");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.NotificationKey).IsRequired().HasMaxLength(220);
+            entity.Property(x => x.Provider).IsRequired().HasMaxLength(48);
+            entity.Property(x => x.BotId).HasMaxLength(64);
+            entity.Property(x => x.MessageText).IsRequired().HasMaxLength(4096);
+            entity.Property(x => x.Status)
+                .IsRequired()
+                .HasMaxLength(32)
+                .HasDefaultValue(PaymentSettlementNotificationStatuses.Pending);
+            entity.Property(x => x.ClaimToken).HasMaxLength(64);
+            entity.Property(x => x.LastError).HasMaxLength(512);
+            entity.HasIndex(x => x.NotificationKey).IsUnique();
+            entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc, x.LeaseUntilUtc });
+            entity.HasIndex(x => x.TelegramUserId);
+            entity.HasIndex(x => x.BotId);
         });
 
         modelBuilder.Entity<BotInstance>(entity =>

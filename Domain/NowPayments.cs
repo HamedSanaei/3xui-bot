@@ -691,7 +691,7 @@ namespace Adminbot.Domain
         /// </summary>
         /// <param name="userDbContext">users.db context containing NOWPayments rows and settlement metadata.</param>
         /// <param name="credentialsDbContext">credentials.db context that owns shared wallet balances.</param>
-        /// <param name="botClientProvider">Provider used to notify the correct bot/chat after successful settlement.</param>
+        /// <param name="botClientProvider">Resolves the originating bot client used only for central log attribution.</param>
         /// <param name="botRegistry">Runtime bot registry used to resolve the payment's bot context for logging.</param>
         /// <param name="botContextAccessor">Async-local context accessor used while sending payment logs.</param>
         /// <param name="walletLedgerService">Append-only ledger writer for successful wallet credits.</param>
@@ -731,7 +731,7 @@ namespace Adminbot.Domain
         /// <param name="payment">Tracked NOWPayments wallet-charge row with a final paid provider status.</param>
         /// <param name="source">Non-secret settlement source such as IPN, return check, or admin provider re-check.</param>
         /// <param name="notifyChatId">Optional Telegram chat id override used only for the success notification.</param>
-        /// <param name="cancellationToken">Cancellation token for both databases, ledger, referral, and Telegram work.</param>
+        /// <param name="cancellationToken">Cancellation token for both databases, ledger, referral, and outbox work.</param>
         /// <returns>
         /// Applied with original before/after balances, AlreadyAdded for an idempotent replay, ProviderNotPaid when
         /// the row is not a final wallet charge, or a missing-user result without mutation.
@@ -740,6 +740,8 @@ namespace Adminbot.Domain
         /// The persisted payment-row flag prevents a repeated callback in the running service from changing the
         /// wallet twice. Repeated IPNs repair a missing users.db ledger and replay pending referral work.
         /// Tenant, partial, provisional, pending, failed, and refunded rows are not eligible for this referral path.
+        /// The first credit and its unique customer-notification row are saved together; Telegram retries are handled
+        /// by a delivery-only worker that has no wallet or settlement dependency.
         /// </remarks>
         public async Task<NowPaymentsSettlementResult> ApplyFinishedPaymentAsync(
             SwapinoPaymentInfo payment,
@@ -786,6 +788,19 @@ namespace Adminbot.Domain
                 payment.BalanceBefore = beforeBalance;
                 payment.BalanceAfter = afterBalance;
                 payment.SettledAtUtc ??= DateTime.UtcNow;
+                // Persist delivery with the first-credit marker; retries never call this financial service.
+                var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
+                _userDbContext.PaymentSettlementNotifications.Add(
+                    PaymentSettlementNotification.CreateOwnedWalletCredit(
+                        provider: "nowpayments",
+                        providerPaymentId: payment.Id,
+                        botId: payment.BotId,
+                        telegramUserId: payment.TelegramUserId,
+                        chatId: notificationChatId,
+                        amountToman: payment.AmountToman,
+                        messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
+                                     "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
+                        createdAtUtc: payment.SettledAtUtc.Value));
                 await _userDbContext.SaveChangesAsync(cancellationToken);
 
                 await EnsureOriginalLedgerAsync(
@@ -798,7 +813,6 @@ namespace Adminbot.Domain
                 await ProcessReferralAsync(payment, isProvisional: false, cancellationToken);
                 using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
                 {
-                    await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
                     LogPayment(
                         payment,
                         credUser,
@@ -824,11 +838,12 @@ namespace Adminbot.Domain
         /// <param name="creditedAmountToman">Positive partial credit amount in Iranian toman.</param>
         /// <param name="source">Non-secret settlement audit source.</param>
         /// <param name="notifyChatId">Optional Telegram chat id override for the partial-credit notification.</param>
-        /// <param name="cancellationToken">Cancellation token for wallet, payment row, ledger, and notification work.</param>
+        /// <param name="cancellationToken">Cancellation token for wallet, payment row, ledger, and outbox work.</param>
         /// <returns>Applied/AlreadyAdded/missing-user/invalid-amount settlement status.</returns>
         /// <remarks>
         /// Partial payments use a dedicated wallet and ledger idempotency key. They never call the referral service
-        /// and therefore cannot consume first eligible payment status.
+        /// and therefore cannot consume first eligible payment status. Its one customer notification is enqueued with
+        /// the first-credit marker and delivered independently.
         /// </remarks>
         public async Task<NowPaymentsSettlementResult> ApplyPartialPaymentAsync(
             SwapinoPaymentInfo payment,
@@ -881,6 +896,20 @@ namespace Adminbot.Domain
                 payment_status = payment.PaymentStatus
             }, Formatting.None);
 
+            // Partial settlement is still a one-time wallet credit and owns exactly one durable customer message.
+            var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
+            _userDbContext.PaymentSettlementNotifications.Add(
+                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                    provider: "nowpayments",
+                    providerPaymentId: payment.Id,
+                    botId: payment.BotId,
+                    telegramUserId: payment.TelegramUserId,
+                    chatId: notificationChatId,
+                    amountToman: payment.AmountToman,
+                    messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
+                                 "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
+                    createdAtUtc: payment.SettledAtUtc.Value));
+
             await _userDbContext.SaveChangesAsync(cancellationToken);
 
             await _walletLedgerService.RecordAsync(
@@ -902,7 +931,6 @@ namespace Adminbot.Domain
                 cancellationToken: cancellationToken);
             using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
             {
-                await NotifyUserAsync(credUser, payment, notifyChatId, cancellationToken);
                 LogPayment(payment, credUser, beforeBalance, afterBalance, source);
             }
 
@@ -1172,35 +1200,6 @@ namespace Adminbot.Domain
                    $"OrderId={payment.OrderId}; InvoiceId={invoiceId}; PaymentId={paymentId}; " +
                    $"Status={status}; ActuallyPaid={data.ActuallyPaid}; PayCurrency={payment.PayCurrency ?? data.PayCurrency}; " +
                    "Confirm or force the payment inside NOWPayments first, then run the bot check again.";
-        }
-
-        private async Task NotifyUserAsync(
-            CredUser credUser,
-            SwapinoPaymentInfo payment,
-            long? notifyChatId,
-            CancellationToken cancellationToken)
-        {
-            var chatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
-            if (chatId == 0)
-                return;
-
-            var botClient = _botClientProvider.GetClient(payment.BotId);
-
-            var text = $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
-                       "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.";
-
-            try
-            {
-                await botClient.SendTextMessageAsync(
-                    chatId: chatId,
-                    text: text,
-                    parseMode: ParseMode.Html,
-                    cancellationToken: cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"NOWPayments user notification failed: {ex.Message}");
-            }
         }
 
         private void LogPayment(

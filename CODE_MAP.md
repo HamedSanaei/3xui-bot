@@ -8,6 +8,10 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 - `Program.cs`: ASP.NET host, DI registration, EF migration startup, controller mapping, bot runtime registration, hosted services.
 - `Services/BotRuntimeServices.cs`: bot registry, bot context accessor, bot client provider, and multi-bot receiver startup.
+  Every receiver generation first proves that no webhook remains. Transient webhook GET/delete/verification failures
+  leave the bot enabled and enter host-lifetime recovery with capped exponential backoff; runtime webhook conflicts use
+  the same bot-scoped recovery. Per-bot lifecycle gates plus the receiver registry remain the single-receiver boundary,
+  while a genuine second-process `getUpdates` conflict is stopped for operator review rather than auto-restarted.
 - `Services/TelegramBotService.cs`: main dispatcher for owned bots and legacy/admin/customer flows.
 - `Services/TenantBotService.cs`: tenant owner panel and tenant customer storefront flows.
 - `Controllers/PaymentController.cs`: payment IPN endpoints and gateway callbacks.
@@ -23,7 +27,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 ## Data Stores
 
-- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox, weekly usage-report dispatch leases, and durable XUI volume-reminder cycles/claims.
+- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox, owned-wallet settlement-notification outbox, weekly usage-report dispatch leases, and durable XUI volume-reminder cycles/claims.
 - `Data/CredentialsDbContex.cs`: unchanged shared user wallet/profile data; referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
 - `Data/configuration.example.json`: sanitized configuration example including referral and four-gateway enable/readiness settings; all gateway switches and secret placeholders default to off/empty.
@@ -100,13 +104,18 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/WalletLedgerService.cs`: append-only wallet ledger for credits/debits.
 - `Services/ReferralService.cs`: global owned-bot relationship registration, reward calculation, users.db state/ledger idempotency, user stats, notifications, and startup reconciliation.
 - `Domain/PaymentGatewayAvailability.cs`: process-wide live snapshot for HooshPay, Tetraminator, UniquePay, and NOWPayments. Super-admin target-state callbacks use this service; only root `enabled` booleans are persisted through the byte-preserving atomic JSON editor. API credentials remain restart-loaded and are never displayed or logged.
-- `Domain/UniquePay.cs`: UniquePay Bearer/form-urlencoded bot-gateway client, owned-wallet settlement, fail-closed authoritative verification for both official toman fee-payer contracts, durable settlement claims, restricted provisional OWNED credits, callback coordination, and bounded recovery polling. New invoice creation is single-attempt; inquiry is read-only.
+- `Domain/UniquePay.cs`: UniquePay Bearer/form-urlencoded bot-gateway client, owned-wallet settlement, fail-closed authoritative verification for both official toman fee-payer contracts, durable settlement claims, restricted provisional OWNED credits, callback coordination, and bounded recovery polling. New invoice creation is single-attempt; inquiry is read-only. `CreationState` independently records `attempting`, `created`, `ambiguous`, `failed`, or `manual_review`: the one POST reservation is saved before network I/O, while HTTP 5xx/timeouts/disconnects/malformed success remain GET-only recoverable and can never authorize another create call.
 - `Services/UsageAnalyticsService.cs`: completed Tehran-day aggregation of JSONL messages/callbacks, successful owned sales, and fulfilled tenant sales; excludes global super-admin ids and supports tenant bot filtering.
 - `Services/UsageReportChartRenderer.cs`: cross-platform SkiaSharp high-resolution line-chart PNG renderer with
   explicit Y scales, every weekly/monthly date, adaptive value labels, point markers, and current-versus-previous weekly comparison. It uses
   the embedded OFL-licensed `Assets/Fonts/NotoSans-Regular.ttf`; never fall back to `SKTypeface.Default`, because
   minimal Linux hosts can silently render every chart label blank.
 - `Services/WeeklyUsageReportHostedService.cs`: Saturday 00:01 Tehran report scheduler, catch-up behavior, users.db claim/lease idempotency, and direct central logger delivery through the default owned bot.
+- `Services/PaymentSettlementNotificationWorker.cs` + `Domain/PaymentSettlementNotification.cs`: delivery-only owned-wallet
+  success notification outbox. The first settlement credit and unique outbox row share one users.db save; a 15-second
+  worker claims two-minute leases and performs bounded transient Telegram retries without any credentials.db, wallet,
+  provider-settlement, tenant, or XUI dependency. Expired claims become `delivery_uncertain` and are never resent
+  automatically because Telegram may already have accepted the message.
 - `Domain/GozargahSite.cs`: Gozargah site API client, sync event models, mapping, and retry helpers. `GozargahSiteApiClient.SendAsync<T>` validates HTTP status, Content-Type, and body shape before deserializing: HTML/error-page bodies (`<...`), explicit non-JSON content types, empty bodies, and invalid JSON all become unsuccessful `GozargahSiteApiResponse<T>` values with a bounded, whitespace-collapsed preview (never a raw `JsonReaderException`), so a temporary website failure cannot crash the Telegram update/purchase flow.
 
 ## Tenant Bot Rules
@@ -136,9 +145,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 ## Payment and Ledger Rules
 
 - NOWPayments and HooshPay payment records live in `users.db` and can be linked to tenant orders.
-- UniquePay payment records live in `users.db` (`UniquePayPaymentInfos`) and link owned wallet charges or tenant orders through `HashId`, optional provider `RefId`, and `TenantBotOrder.UniquePayPaymentInfoId`. Migration `20260731000000_AddUniquePayPayments` also adds `BotInstance.TenantUniquePayEnabled` (default `true`) and reconciliation indexes; `credentials.db` is unchanged.
+- UniquePay payment records live in `users.db` (`UniquePayPaymentInfos`) and link owned wallet charges or tenant orders through `HashId`, optional provider `RefId`, and `TenantBotOrder.UniquePayPaymentInfoId`. New tenant orders persist that payment FK after the local payment insert and before the provider POST, so an ambiguous provider response cannot orphan the reserved attempt. Migration `20260826152240_AddUniquePayCreationLifecycle` adds the explicit create lifecycle/index, classifies historical rows without provider or financial work, preserves inquiry counters/schedules, and fills an order FK only when exactly one payment row matches. It never replays create, settles a payment, credits a wallet, fulfills an order, or backfills a notification. `credentials.db` is unchanged.
 - UniquePay amounts are Iranian toman and the authoritative API may label the currency `IRT` or `toman`. Settlement remains fail-closed: `check-invoice` must return `status=true`, `code=200`, `isPaid=true`, the saved provider reference must match `invoice.id`, and any returned root hash must match the saved merchant hash. Production inquiry responses can omit that root hash echo. The live buyer alias is `feePayer=user`: `invoice.amount` must equal the stored base and `payableAmount` must equal `base + fee + uniqueAmount`; owner-paid responses use `base + uniqueAmount`. Legacy `feePayer=buyer` responses without payable fields retain the documented `invoice.amount - invoice.fee = base` rule. The fee must match the snapshotted percentage within one toman. `isVerified` is informational and not a settlement requirement.
-- UniquePay invoices use `/api/ddbot/create-invoice` so each OWNED/TENANT invoice carries separate configured return and callback URLs. The unsigned `POST /uniquepay-callback`, browser return, and customer check are lookup triggers only; every financial change still requires authoritative `/api/check-invoice`. Recovery polling uses `NextInquiryAtUtc`, exponential backoff, a configurable hard attempt cap (default 12), and independent factory-created EF contexts; reaching the cap stops automatic queries but never blocks callback/return/customer/admin inquiry or settlement. Disabling the global switch blocks new invoices only. Explicit provider lifecycle hints map to `expired`, `cancelled`, or `failed`; absent/unknown hints remain `pending`, and network errors remain retryable within the recovery cap. Creation failures log safe bot/tenant/order/payment identifiers and provider status codes only.
+- UniquePay invoices use `/api/ddbot/create-invoice` so each OWNED/TENANT invoice carries separate configured return and callback URLs. The unsigned `POST /uniquepay-callback`, browser return, and customer check are lookup triggers only; every financial change still requires authoritative `/api/check-invoice`. Recovery polling uses `NextInquiryAtUtc`, exponential backoff, a configurable hard attempt cap (default 12), and independent factory-created EF contexts; an ambiguous create reaching the cap moves once to create-level `manual_review` and releases no mutation replay. Explicit callback/return/customer/admin inquiry remains GET-only and may still prove the same invoice exists. Repeated inquiry-attempt details remain in local structured logs but are suppressed from the Telegram logger; the first create failure and the terminal manual-review transition remain visible. Disabling the global switch blocks new invoices only. Explicit provider lifecycle hints map to `expired`, `cancelled`, or `failed`; absent/unknown hints remain pending, and no undocumented provider response is guessed to mean invoice-not-found.
 - UniquePay settlement uses an atomic users.db claim (`pending -> processing -> settled`) before wallet/XUI side effects. Because wallet/tenant fulfillment crosses users.db, credentials.db, and XUI, a process crash after the claim is ambiguous; claims stale for 30 minutes move to `manual_review` and are never automatically replayed, preventing duplicate wallet credit, owner profit, or account delivery.
 - Migration `20260801000000_AddUniquePayProvisionalApproval` adds provisional audit fields and safely requeues only unsettled rows failed by the former currency/fee-payer validator. Data-only migration `20260801220000_RequeueUniquePayOptionalHashFailures` requeues uncredited rows rejected by the former mandatory hash-echo rule; all are freshly verified before settlement. Super-admin `Verify payment` accepts `UP:<internal-id>`, Hash ID, or Ref ID; it always performs an official inquiry first. A still-unpaid, valid OWNED wallet invoice can be credited provisionally through two confirmation stages using only its stored base amount. TENANT invoices, terminal/mismatched responses, and provider/network failures cannot be provisionally approved. No referral is awarded; later official confirmation records audit only, while later terminal failure is logged for human review without automatic clawback.
 - Data-only migration `20260802000000_RequeueUniquePayUserFeePayerFailures` requeues uncredited rows rejected before the live `feePayer=user` buyer alias/payable contract was supported; the worker still requires a fresh fully matching paid response before settlement.
@@ -150,6 +159,10 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   per-tenant `TenantHooshPayEnabled` preference. Disabling either switch hides and blocks only new invoices, including
   stale Telegram callbacks; existing rows remain eligible for status checks, IPN processing, and settlement. A missing
   global key is disabled, while the tracked operational configuration explicitly keeps the gateway enabled.
+- Provider invoice amount limits are enforced both at owned/tenant UI boundaries and inside the provider clients before
+  request construction. HooshPay accepts inclusive 50,000 through 1,000,000 toman. UniquePay requires strictly more
+  than 50,000 toman, so 50,000 is rejected and 50,001 is valid. Invalid tenant purchase callbacks create no order or
+  payment row; invalid tenant renewal callbacks preserve the existing pending order but create no provider/payment row.
 - NOWPayments creation uses the same live global snapshot and, for tenant storefronts, `TenantNowPaymentsEnabled`;
   IPN validation and settlement of existing crypto invoices continue when new creation is disabled.
 - Tetraminator is the second rial gateway for owned wallet charges and direct tenant purchase/renew orders. Its
@@ -217,6 +230,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   forms (`09`, `98`, `+98`, `0098`) to `+989...`. Own foreign contacts are rejected with the active owned bot's
   clickable support account; the manual super-admin override remains intentionally international-capable.
 - Payment/order fulfillment paths must be idempotent: duplicate IPNs, repeated checks, or repeated assistant confirmations must not create another account or ledger entry.
+- Official or provisional first-time owned-wallet credits for NOWPayments, HooshPay, Tetraminator, and UniquePay enqueue
+  one `PaymentSettlementNotifications` row keyed by provider + local payment id. Callback replay/`AlreadyAdded` creates
+  no second row. Telegram timeout cannot roll back or repeat credit, and retry delivery never invokes settlement.
+  Migration `20260825230309_AddPaymentSettlementNotifications` creates an empty table and indexes only: it performs no
+  historical backfill, notification, provider call, wallet mutation, tenant fulfillment, or XUI work.
 - Tenant fulfillment must reload the order and treat an existing `TenantBotLedgerEntry` for the same `TenantBotOrderId` as already fulfilled; this protects against stale singleton EF tracking and duplicate "check status" clicks.
 - If XUI account creation times out after a tenant card-to-card receipt is approved, keep the order unfulfilled but retryable and leave Sales Assistant approval controls available. Do not mark timeout as a definitive failed payment.
 - If Sales Assistant cannot relay a tenant card-to-card receipt photo, it must send a text-only fallback with the same approve/reject/detail callbacks so the owner can still confirm the receipt.
@@ -365,7 +383,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   callbacks without changing state. Owner-panel no-op edits should be detected before calling Telegram.
 - Telegram blocked-user, deactivated-user, chat-not-found, and forbidden errors are definitive per-user delivery
   failures. `Request timed out` is a transient transport failure and must never be described as an unreachable chat.
-- Telegram `409 getUpdates` conflict means another process/receiver is polling the same token. `MultiBotHostedService` stops only the affected receiver and logs a critical message; operators still need to remove the duplicate deployment, old service, screen/tmux process, or webhook/polling conflict that owns the token.
+- Before every `MultiBotHostedService` receiver generation, Telegram webhook state is probed once. An active webhook is
+  deleted with `dropPendingUpdates=false` and absence is verified before `StartReceiving`; transient probe/delete
+  failure starts no receiver and uses the existing serialized recovery. Runtime `webhook is active` 409 schedules one
+  bot-scoped stop/preflight/restart task. A real duplicate `getUpdates` process remains critical and is never restarted
+  automatically; operators must remove the duplicate deployment, old service, or screen/tmux process.
 - XUI/HTTP `TaskCanceledException`, `TimeoutException`, and `HttpClient.Timeout` during update handling are treated as external operation timeouts. The active bot logs `handle_update_external_timeout` and sends a best-effort retry notice instead of turning the panel delay into a Telegram polling failure.
 - `Domain/Logging/TelegramLogger.cs` truncates plain-text application logs before sending them to Telegram so large exception stacks do not trigger `message is too long` and create secondary logger noise.
 - `Domain/Logging/DailyErrorFileLoggerProvider.cs` writes warning/error/critical diagnostics with full exception chains

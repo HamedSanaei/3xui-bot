@@ -6094,6 +6094,14 @@ public class TelegramBotService : IHostedService
             }
             else if (message.Text == "تایید نهایی")
             {
+                var confirmedAmount = long.TryParse(
+                    user.ConfigLink,
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out var parsedConfirmedAmount)
+                    ? parsedConfirmedAmount
+                    : 0;
+
                 if (user.PaymentMethod == "zibal")
                 {
                     user.LastStep = "payment_method_selection";
@@ -6110,7 +6118,8 @@ public class TelegramBotService : IHostedService
                 }
 
                 if (user.PaymentMethod == "hooshpay" &&
-                    !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay))
+                    (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) ||
+                     !HooshPayAmountPolicy.IsValid(confirmedAmount)))
                 {
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
@@ -6119,7 +6128,9 @@ public class TelegramBotService : IHostedService
 
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
-                        text: "درگاه هوش‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        text: !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay)
+                            ? "درگاه هوش‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید."
+                            : HooshPayAmountPolicy.BuildUserMessage(),
                         replyMarkup: BuildChargePaymentMethodKeyboard(),
                         cancellationToken: cancellationToken);
                     return;
@@ -6141,7 +6152,8 @@ public class TelegramBotService : IHostedService
                 }
 
                 if (user.PaymentMethod == "uniquepay" &&
-                    !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay))
+                    (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) ||
+                     !UniquePayAmountPolicy.IsValid(confirmedAmount)))
                 {
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
@@ -6149,7 +6161,9 @@ public class TelegramBotService : IHostedService
                     await _userDbContext.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
-                        text: "درگاه یونیک‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        text: !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay)
+                            ? "درگاه یونیک‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید."
+                            : UniquePayAmountPolicy.BuildUserMessage(),
                         replyMarkup: BuildChargePaymentMethodKeyboard(),
                         cancellationToken: cancellationToken);
                     return;
@@ -6531,7 +6545,11 @@ public class TelegramBotService : IHostedService
             }
             else if (IsGatewayAction(message.Text, HooshPayGatewayAction, "درگاه ریالی هوش‌پی"))
             {
-                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay))
+                var amount = long.TryParse(user.ConfigLink, NumberStyles.Integer, CultureInfo.InvariantCulture, out var selectedAmount)
+                    ? selectedAmount
+                    : 0;
+                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) ||
+                    !HooshPayAmountPolicy.IsValid(amount))
                 {
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
@@ -6539,7 +6557,9 @@ public class TelegramBotService : IHostedService
                     await _userDbContext.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
-                        text: "درگاه هوش‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        text: !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay)
+                            ? "درگاه هوش‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید."
+                            : HooshPayAmountPolicy.BuildUserMessage(),
                         replyMarkup: BuildChargePaymentMethodKeyboard(),
                         cancellationToken: cancellationToken);
                     return;
@@ -6570,7 +6590,11 @@ public class TelegramBotService : IHostedService
             }
             else if (IsGatewayAction(message.Text, UniquePayGatewayAction, "درگاه ریالی یونیک‌پی"))
             {
-                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay))
+                var amount = long.TryParse(user.ConfigLink, NumberStyles.Integer, CultureInfo.InvariantCulture, out var selectedAmount)
+                    ? selectedAmount
+                    : 0;
+                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) ||
+                    !UniquePayAmountPolicy.IsValid(amount))
                 {
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
@@ -6578,7 +6602,9 @@ public class TelegramBotService : IHostedService
                     await _userDbContext.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
-                        text: "درگاه یونیک‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        text: !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay)
+                            ? "درگاه یونیک‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید."
+                            : UniquePayAmountPolicy.BuildUserMessage(),
                         replyMarkup: BuildChargePaymentMethodKeyboard(),
                         cancellationToken: cancellationToken);
                     return;
@@ -8370,8 +8396,9 @@ public class TelegramBotService : IHostedService
     /// Cancellation token propagated to users.db, HooshPay HTTP, and Telegram operations.
     /// </param>
     /// <remarks>
-    /// The global switch is checked before creating a local payment row or calling HooshPay. Disabling new invoices
-    /// does not affect status checks, IPN processing, or settlement of rows created while the gateway was enabled.
+    /// The global switch and HooshPay's inclusive 50,000 through 1,000,000 toman range are checked before creating a
+    /// local payment row or calling the provider. Invalid persisted or crafted state returns to payment-method
+    /// selection without provider contact. Disabling new invoices does not affect existing inquiry or settlement.
     /// </remarks>
     private async Task CreateHooshPayWalletChargeAsync(
         Message message,
@@ -8389,7 +8416,23 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-        long amount = Convert.ToInt64(user.ConfigLink);
+        var amount = long.TryParse(user.ConfigLink, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedAmount)
+            ? parsedAmount
+            : 0;
+        if (!HooshPayAmountPolicy.IsValid(amount))
+        {
+            user.LastStep = "payment_method_selection";
+            user.Flow = "charge";
+            user.PaymentMethod = string.Empty;
+            await _userDbContext.SaveUserStatus(user);
+            await ActiveBotClient.CustomSendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: HooshPayAmountPolicy.BuildUserMessage(),
+                replyMarkup: BuildChargePaymentMethodKeyboard(),
+                cancellationToken: cancellationToken);
+            return;
+        }
+
         var payment = HooshPayPaymentInfo.CreateWalletCharge(
             credUser.TelegramUserId,
             amount,
@@ -8536,9 +8579,11 @@ public class TelegramBotService : IHostedService
     /// <param name="user">Persisted charge state containing the requested base amount in Iranian toman.</param>
     /// <param name="cancellationToken">Cancellation token for users.db, the single create request, and Telegram delivery.</param>
     /// <remarks>
-    /// The live global switch is rechecked before any row or provider request is created. The local merchant hash is
-    /// persisted first, creation is attempted once through the bot-compatible endpoint, and an ambiguous failure
-    /// remains auditable for manual/provider inquiry. The invoice-specific unsigned callback and browser return only
+    /// The live global switch and UniquePay's exclusive minimum (greater than 50,000 toman) are rechecked before any
+    /// row or provider request is created. Invalid state returns to payment-method selection without persistence or
+    /// HTTP. For valid amounts the local merchant hash and one-attempt creation reservation are persisted first,
+    /// creation is attempted once, and an ambiguous failure remains locked to read-only provider inquiry. The
+    /// invoice-specific unsigned callback and browser return only
     /// trigger authoritative inquiry. The displayed 12% is the gateway fee; UniquePay decides whether the
     /// <c>user</c>/<c>buyer</c> or owner bears it, while only the immutable local base amount can be credited.
     /// </remarks>
@@ -8558,7 +8603,23 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-        var amount = Convert.ToInt64(user.ConfigLink, CultureInfo.InvariantCulture);
+        var amount = long.TryParse(user.ConfigLink, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedAmount)
+            ? parsedAmount
+            : 0;
+        if (!UniquePayAmountPolicy.IsValid(amount))
+        {
+            user.LastStep = "payment_method_selection";
+            user.Flow = "charge";
+            user.PaymentMethod = string.Empty;
+            await _userDbContext.SaveUserStatus(user);
+            await ActiveBotClient.SendTextMessageAsync(
+                message.Chat.Id,
+                UniquePayAmountPolicy.BuildUserMessage(),
+                replyMarkup: BuildChargePaymentMethodKeyboard(),
+                cancellationToken: cancellationToken);
+            return;
+        }
+
         await _userDbContext.ClearUserStatus(user);
         var payment = UniquePayPaymentInfo.CreateWalletCharge(
             credUser.TelegramUserId,
@@ -8621,9 +8682,14 @@ public class TelegramBotService : IHostedService
         catch (Exception ex)
         {
             var definitiveFailure = UniquePay.IsDefinitiveCreateFailure(ex);
-            payment.ErrorCode = ex is UniquePayApiException apiException
+            var creationErrorCode = ex is UniquePayApiException apiException
                 ? apiException.StatusCode.ToString(CultureInfo.InvariantCulture)
                 : "create_failed";
+            payment.RecordCreationFailure(
+                definitiveFailure,
+                creationErrorCode,
+                DateTime.UtcNow);
+            payment.ErrorCode = creationErrorCode;
             payment.ErrorMessage = ex.Message;
             payment.RawResponseJson = ex is UniquePayApiException providerError
                 ? providerError.ResponseBody
@@ -8638,19 +8704,20 @@ public class TelegramBotService : IHostedService
             payment.UpdatedAtUtc = DateTime.UtcNow;
             await _userDbContext.SaveChangesAsync(cancellationToken);
 
-            // Token and request headers are absent from both the local row and this structured logger event.
+            // Merchant hashes, response bodies, tokens, and request headers are excluded from this operational event.
             _logger.LogError(
                 ex,
-                "UniquePay invoice creation failed. botId={BotId}, userId={UserId}, paymentId={PaymentId}, hashId={HashId}, amountToman={AmountToman}, providerCode={ProviderCode}",
+                "UniquePay invoice creation failed. botId={BotId}, userId={UserId}, paymentId={PaymentId}, amountToman={AmountToman}, providerCode={ProviderCode}",
                 BotContextAccessor.CurrentBotId,
                 credUser.TelegramUserId,
                 payment.Id,
-                payment.HashId,
                 amount,
                 payment.ErrorCode);
             await ActiveBotClient.SendTextMessageAsync(
                 message.Chat.Id,
-                "ساخت فاکتور یونیک‌پی ناموفق بود. مشکل برای مدیر سیستم ثبت شد؛ لطفاً از درگاه دیگری استفاده کنید.",
+                definitiveFailure
+                    ? "ساخت فاکتور یونیک‌پی ناموفق بود. مشکل برای مدیر سیستم ثبت شد؛ لطفاً از درگاه دیگری استفاده کنید."
+                    : "نتیجه ساخت فاکتور یونیک‌پی نامشخص است. وضعیت آن به‌صورت خودکار و فقط با استعلام امن بررسی می‌شود و درخواست ساخت دوباره ارسال نخواهد شد.",
                 replyMarkup: MainReplyMarkupKeyboardFa(),
                 cancellationToken: cancellationToken);
         }
@@ -10037,4 +10104,3 @@ public class TelegramBotService : IHostedService
         return new ChatId(value);
     }
 }
-

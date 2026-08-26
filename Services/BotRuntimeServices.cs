@@ -260,6 +260,8 @@ public class BotRegistry
 public class BotClientProvider
 {
     private readonly BotRegistry _registry;
+    /// <summary>Creates a fresh client after first use or explicit invalidation without changing cache semantics.</summary>
+    private readonly Func<BotInstanceConfig, ITelegramBotClient> _clientFactory;
     private readonly Dictionary<string, ITelegramBotClient> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _syncRoot = new();
 
@@ -268,8 +270,29 @@ public class BotClientProvider
     /// </summary>
     /// <param name="registry">Runtime bot registry.</param>
     public BotClientProvider(BotRegistry registry)
+        : this(registry, bot => new TelegramBotClient(bot.Token))
     {
-        _registry = registry;
+    }
+
+    /// <summary>
+    /// Creates a provider with an alternate Telegram client factory for transport-level lifecycle verification.
+    /// </summary>
+    /// <param name="registry">Runtime registry that remains authoritative for bot ids and current tokens.</param>
+    /// <param name="clientFactory">
+    /// Factory that receives the resolved bot configuration and returns a client for that bot. It must not share a
+    /// client across different bot tokens. Production uses the public constructor; tests may invoke this constructor
+    /// through reflection so invalidation still recreates the controlled transport.
+    /// </param>
+    /// <remarks>
+    /// This constructor is internal so dependency injection continues selecting the production constructor. It does
+    /// not change caching: one client remains cached per internal bot id until <see cref="Invalidate"/> is called.
+    /// </remarks>
+    internal BotClientProvider(
+        BotRegistry registry,
+        Func<BotInstanceConfig, ITelegramBotClient> clientFactory)
+    {
+        _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+        _clientFactory = clientFactory ?? throw new ArgumentNullException(nameof(clientFactory));
     }
 
     /// <summary>
@@ -307,7 +330,9 @@ public class BotClientProvider
             if (_clients.TryGetValue(bot.Id, out var existing))
                 return existing;
 
-            var created = new TelegramBotClient(bot.Token);
+            var created = _clientFactory(bot);
+            if (created == null)
+                throw new InvalidOperationException("The Telegram client factory returned null.");
             _clients[bot.Id] = created;
             return created;
         }
@@ -623,17 +648,22 @@ public class MultiBotHostedService : IHostedService
     private CancellationTokenSource _receivingCts;
     private readonly Dictionary<string, CancellationTokenSource> _botReceivers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SemaphoreSlim> _lifecycleGates = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Process-local deduplication set ensuring repeated callbacks from one webhook-conflicted receiver schedule only
+    /// one stop/preflight/restart recovery task for that internal bot id.
+    /// </summary>
+    private readonly HashSet<string> _webhookConflictRecoveries = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _syncRoot = new();
 
     /// <summary>
-    /// Maximum number of background recovery passes used to start enabled bots that missed the first startup pass.
-    /// </summary>
-    private const int StartupRecoveryMaxAttempts = 20;
-
-    /// <summary>
-    /// Delay between background recovery passes for transient Telegram startup failures.
+    /// Initial delay between background recovery passes for transient Telegram startup failures.
     /// </summary>
     private static readonly TimeSpan StartupRecoveryDelay = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Maximum bounded delay between persistent recovery passes for an enabled receiver that remains offline.
+    /// </summary>
+    private static readonly TimeSpan StartupRecoveryMaximumDelay = TimeSpan.FromMinutes(5);
 
     /// <summary>
     /// Creates the hosted receiver manager.
@@ -684,8 +714,9 @@ public class MultiBotHostedService : IHostedService
     /// <remarks>
     /// Startup is deliberately not all-or-nothing. A bounded <c>GetMe</c> timeout starts one optimistic receiver and
     /// command setup continues in the background. The recovery loop handles only enabled bots that still have no
-    /// registered receiver; duplicate and invalid-token decisions remain non-retryable. Per-bot lifecycle gates
-    /// prevent startup recovery and owner actions from creating overlapping polling loops.
+    /// registered receiver and continues with capped exponential backoff for the host lifetime; duplicate, disabled,
+    /// and invalid-token decisions remain non-retryable. Per-bot lifecycle gates prevent startup recovery and owner
+    /// actions from creating overlapping polling loops.
     /// </remarks>
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -719,8 +750,10 @@ public class MultiBotHostedService : IHostedService
     /// <remarks>
     /// This method is intentionally fail-soft. A revoked tenant token disables only that tenant row in users.db
     /// and never stops other owned or tenant bots from starting. Owned bot tokens come from configuration and are
-    /// never modified automatically. A transient <c>getMe</c> timeout starts one optimistic receiver and returns
-    /// <c>true</c>; only failures that prevent receiver registration use the bounded synchronous retry loop.
+    /// never modified automatically. Before each receiver generation, webhook absence is confirmed and an active
+    /// webhook is removed without dropping pending updates. A webhook probe/removal failure does not start polling
+    /// and remains eligible for the persistent, capped-backoff recovery loop. A transient <c>getMe</c> timeout may
+    /// still start one optimistic receiver after that webhook preflight succeeds.
     /// </remarks>
     public async Task<bool> StartBotAsync(string botId, CancellationToken cancellationToken = default)
     {
@@ -794,13 +827,14 @@ public class MultiBotHostedService : IHostedService
     /// </param>
     /// <returns>
     /// A <see cref="BotStartupResult" /> value describing whether a receiver started, was already running, should
-    /// be skipped permanently, or failed in a way that can be retried by the bounded startup recovery loop.
+    /// be skipped permanently, or failed in a way that can be retried by the persistent startup recovery loop.
     /// </returns>
     /// <remarks>
     /// This method is the single startup path for owned, tenant, and assistant bots and must be called while holding
     /// the corresponding lifecycle gate. It mutates tenant rows only when Telegram proves the token is invalid or
-    /// duplicate-token protection chooses another bot. A transient preflight failure still registers one receiver;
-    /// command setup and identity refresh continue in the background.
+    /// duplicate-token protection chooses another bot. Webhook preflight must succeed before registration; only a
+    /// transient <c>getMe</c> failure may use optimistic registration. Command setup and identity refresh continue in
+    /// the background.
     /// </remarks>
     private async Task<BotStartupResult> StartBotCoreAsync(string botId, CancellationToken cancellationToken = default)
     {
@@ -857,6 +891,8 @@ public class MultiBotHostedService : IHostedService
             var client = _clientProvider.GetClient(bot.Id);
             Telegram.Bot.Types.User me = null;
             Exception transientProbeError = null;
+
+            await EnsureLongPollingWebhookClearedAsync(client, bot, cancellationToken);
 
             try
             {
@@ -964,10 +1000,10 @@ public class MultiBotHostedService : IHostedService
             if (IsTelegramTransientStartupError(ex))
             {
                 _runtimeStatusStore.MarkFailed(bot, "transient_startup_failed", ex.Message);
-                _logger.LogWarning(
-                    ex,
-                    "Telegram bot receiver startup hit a transient Telegram/network error and can be retried. botId={BotId}",
-                    bot.Id);
+                _logger.LogInformation(
+                    "Telegram bot receiver startup hit a transient Telegram/network error; persistent recovery remains active. botId={BotId}, errorType={ErrorType}",
+                    bot.Id,
+                    ex.GetType().Name);
                 return BotStartupResult.TransientFailure;
             }
 
@@ -984,6 +1020,51 @@ public class MultiBotHostedService : IHostedService
 
             return BotStartupResult.TransientFailure;
         }
+    }
+
+    /// <summary>
+    /// Verifies that Telegram has no active webhook before one long-polling receiver generation starts.
+    /// </summary>
+    /// <param name="client">Telegram client already resolved for the current internal bot id.</param>
+    /// <param name="bot">
+    /// Runtime bot configuration used only for safe structured attribution. Its token and webhook URL are never
+    /// logged by this method.
+    /// </param>
+    /// <param name="cancellationToken">Host or owner-operation token that cancels the bounded Telegram probes.</param>
+    /// <returns>A task that completes only after webhook absence has been confirmed.</returns>
+    /// <remarks>
+    /// This guard is called once per receiver generation, not once per polling iteration. When Telegram reports an
+    /// active webhook, it calls <c>deleteWebhook</c> with <c>dropPendingUpdates=false</c> and performs a second read-only
+    /// probe. Any probe, delete, or verification failure prevents <c>StartReceiving</c>; the existing serialized
+    /// startup recovery can then retry without creating two receivers for the same bot.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when Telegram still reports an active webhook after the delete operation completes.
+    /// </exception>
+    private async Task EnsureLongPollingWebhookClearedAsync(
+        ITelegramBotClient client,
+        BotInstanceConfig bot,
+        CancellationToken cancellationToken)
+    {
+        using var initialProbeCts = CreateStartupProbeCancellation(cancellationToken);
+        var webhookInfo = await client.GetWebhookInfoAsync(initialProbeCts.Token);
+        if (string.IsNullOrWhiteSpace(webhookInfo?.Url))
+            return;
+
+        _logger.LogWarning(
+            "Active Telegram webhook detected before long polling; removing it without dropping pending updates. botId={BotId}, botType={BotType}",
+            bot.Id,
+            bot.Type);
+
+        using var deleteCts = CreateStartupProbeCancellation(cancellationToken);
+        await client.DeleteWebhookAsync(
+            dropPendingUpdates: false,
+            cancellationToken: deleteCts.Token);
+
+        using var verificationCts = CreateStartupProbeCancellation(cancellationToken);
+        var verified = await client.GetWebhookInfoAsync(verificationCts.Token);
+        if (!string.IsNullOrWhiteSpace(verified?.Url))
+            throw new InvalidOperationException("Telegram still reports an active webhook after deletion.");
     }
 
     /// <summary>
@@ -1112,58 +1193,75 @@ public class MultiBotHostedService : IHostedService
     /// <param name="cancellationToken">
     /// Linked host shutdown token. Cancelling it stops the recovery loop without throwing into the hosted service.
     /// </param>
-    /// <returns>A task that completes after every missing receiver starts, cancellation is requested, or retry budget is exhausted.</returns>
+    /// <returns>
+    /// A task that completes after every missing receiver starts, all remaining bots become definitively
+    /// non-retryable, or host cancellation is requested.
+    /// </returns>
     /// <remarks>
     /// This is a process-local safety net for transient Telegram startup failures. It does not replace the normal
     /// tenant owner start button; it only repairs the common Ubuntu restart race where one or more configured owned
     /// bots fail <c>GetMe</c> or <c>SetMyCommands</c> once and would otherwise remain offline until another service
-    /// restart.
+    /// restart. Recovery is persistent but its delay is exponentially backed off and capped, so a longer Telegram
+    /// outage cannot leave an enabled tenant permanently offline or create a tight retry loop.
     /// </remarks>
     private async Task RecoverMissingStartupReceiversAsync(
         HashSet<string> nonRetryableBotIds,
         CancellationToken cancellationToken)
     {
-        try
+        var attempt = 0;
+        while (!cancellationToken.IsCancellationRequested)
         {
-            for (var attempt = 1; attempt <= StartupRecoveryMaxAttempts && !cancellationToken.IsCancellationRequested; attempt++)
+            try
             {
-                await Task.Delay(StartupRecoveryDelay, cancellationToken);
                 var missingBots = GetRetryableMissingBots(nonRetryableBotIds);
                 if (missingBots.Count == 0)
                     return;
 
+                attempt++;
+                var delay = CalculateStartupRecoveryDelay(attempt);
+                await Task.Delay(delay, cancellationToken);
+
                 foreach (var bot in missingBots)
                 {
                     _logger.LogInformation(
-                        "Retrying Telegram bot receiver startup. botId={BotId}, attempt={Attempt}/{MaxAttempts}",
+                        "Retrying Telegram bot receiver startup. botId={BotId}, attempt={Attempt}, delaySeconds={DelaySeconds}",
                         bot.Id,
                         attempt,
-                        StartupRecoveryMaxAttempts);
+                        delay.TotalSeconds);
 
                     var result = await StartBotAttemptSerializedAsync(bot.Id, cancellationToken);
                     if (IsNonRetryableStartupResult(result))
                         nonRetryableBotIds.Add(bot.Id);
                 }
             }
-
-            var stillMissing = GetRetryableMissingBots(nonRetryableBotIds)
-                .Select(bot => bot.Id)
-                .ToArray();
-            if (stillMissing.Length > 0)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogCritical(
-                    "Telegram bot receiver startup recovery exhausted. missingBotIds={MissingBotIds}",
-                    string.Join(",", stillMissing));
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Telegram bot receiver startup recovery pass failed; persistent recovery remains active.");
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            // Host shutdown is the normal way to stop the background recovery loop.
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Telegram bot receiver startup recovery loop failed.");
-        }
+    }
+
+    /// <summary>
+    /// Calculates a capped exponential delay for persistent receiver startup or webhook recovery.
+    /// </summary>
+    /// <param name="attemptNumber">One-based transient recovery attempt number; values below one are treated as one.</param>
+    /// <returns>A delay starting at 15 seconds and capped at five minutes.</returns>
+    /// <remarks>
+    /// The cap bounds outage recovery latency while avoiding rapid repeated Telegram webhook probes. Lifecycle gates
+    /// remain the concurrency boundary; this delay never authorizes a second receiver.
+    /// </remarks>
+    /// <example>
+    /// Attempt one waits 15 seconds, attempt two 30 seconds, and later attempts never exceed five minutes.
+    /// </example>
+    private static TimeSpan CalculateStartupRecoveryDelay(int attemptNumber)
+    {
+        var exponent = Math.Clamp(attemptNumber - 1, 0, 20);
+        var seconds = StartupRecoveryDelay.TotalSeconds * Math.Pow(2d, exponent);
+        return TimeSpan.FromSeconds(Math.Min(StartupRecoveryMaximumDelay.TotalSeconds, seconds));
     }
 
     /// <summary>
@@ -1278,7 +1376,8 @@ public class MultiBotHostedService : IHostedService
     /// (plus a small buffer) before the polling loop issues the next <c>getUpdates</c>, because Telegram.Bot 19.x does
     /// not delay on its own and would otherwise tight-loop through the whole rate-limit window. A Telegram 409
     /// getUpdates conflict means another process or receiver is already polling the same token; this receiver is
-    /// stopped to prevent noisy conflict loops.
+    /// stopped to prevent noisy conflict loops. Telegram's distinct "webhook is active" conflict schedules one
+    /// bot-scoped recovery generation, which clears the webhook through the startup guard before polling resumes.
     /// </remarks>
     private async Task HandleBotPollingErrorAsync(string botId, Exception exception, CancellationToken cancellationToken)
     {
@@ -1323,6 +1422,14 @@ public class MultiBotHostedService : IHostedService
         }
 
         var bot = _registry.GetById(botId);
+        if (bot != null &&
+            string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) &&
+            IsTelegramWebhookPollingConflict(exception))
+        {
+            ScheduleWebhookConflictRecovery(bot);
+            return;
+        }
+
         if (bot != null &&
             string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) &&
             IsTelegramGetUpdatesConflict(exception))
@@ -1371,6 +1478,134 @@ public class MultiBotHostedService : IHostedService
     }
 
     /// <summary>
+    /// Schedules at most one webhook-conflict recovery task for an affected bot receiver generation.
+    /// </summary>
+    /// <param name="bot">Current runtime bot whose long-polling receiver encountered Telegram's webhook conflict.</param>
+    /// <remarks>
+    /// The process-local set suppresses duplicate callbacks from the same failing receiver. Recovery stops the
+    /// affected receiver through its lifecycle gate and retries the shared serialized startup path with capped
+    /// exponential backoff until the bot starts, becomes definitively non-retryable, or the host stops. The receiver
+    /// cancellation token is deliberately not reused because stopping that generation cancels it. The per-bot
+    /// lifecycle gate and receiver registry remain the only authority capable of creating a polling generation.
+    /// </remarks>
+    private void ScheduleWebhookConflictRecovery(BotInstanceConfig bot)
+    {
+        lock (_syncRoot)
+        {
+            if (!_webhookConflictRecoveries.Add(bot.Id))
+                return;
+        }
+
+        _ = Task.Run(
+            async () =>
+            {
+                try
+                {
+                    _logger.LogWarning(
+                        "Telegram long polling stopped because a webhook is active; bot-scoped recovery will remove it. botId={BotId}, botType={BotType}",
+                        bot.Id,
+                        bot.Type);
+
+                    await StopBotAsync(bot.Id);
+                    var hostToken = _receivingCts?.Token ?? CancellationToken.None;
+                    await RecoverWebhookConflictReceiverAsync(bot.Id, bot.Type, hostToken);
+                }
+                catch (OperationCanceledException) when (_receivingCts?.IsCancellationRequested == true)
+                {
+                    // Host shutdown is the normal terminal path for an in-flight recovery generation.
+                }
+                catch (Exception recoveryException)
+                {
+                    _logger.LogError(
+                        recoveryException,
+                        "Telegram webhook-conflict recovery failed. botId={BotId}, botType={BotType}",
+                        bot.Id,
+                        bot.Type);
+                }
+                finally
+                {
+                    lock (_syncRoot)
+                        _webhookConflictRecoveries.Remove(bot.Id);
+                }
+            },
+            CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Persistently restarts one receiver after Telegram reported that a webhook blocked long polling.
+    /// </summary>
+    /// <param name="botId">
+    /// Internal registry bot id whose stopped receiver must be recreated; this is not the Telegram numeric bot id.
+    /// </param>
+    /// <param name="botType">Safe owned/tenant runtime type used only for structured operational attribution.</param>
+    /// <param name="cancellationToken">Host-lifetime token that permanently ends recovery during shutdown.</param>
+    /// <returns>
+    /// A task that completes after startup succeeds, the current registry entry becomes non-retryable, or the host
+    /// stops. The method never creates a receiver outside the normal per-bot lifecycle gate.
+    /// </returns>
+    /// <remarks>
+    /// Each attempt re-runs the webhook GET/delete/verify preflight through <see cref="StartBotAttemptSerializedAsync"/>.
+    /// Transient Telegram timeouts and transport failures use capped exponential backoff and do not permanently take an
+    /// enabled tenant offline. Duplicate-token, disabled, missing-token, and invalid-token decisions stop recovery.
+    /// </remarks>
+    /// <example>
+    /// Runtime webhook conflicts call this helper only after the affected receiver generation has been stopped.
+    /// </example>
+    private async Task RecoverWebhookConflictReceiverAsync(
+        string botId,
+        string botType,
+        CancellationToken cancellationToken)
+    {
+        var attempt = 0;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            attempt++;
+            var result = await StartBotAttemptSerializedAsync(botId, cancellationToken);
+            if (result is BotStartupResult.Started or BotStartupResult.AlreadyRunning)
+                return;
+
+            if (IsNonRetryableStartupResult(result))
+            {
+                _logger.LogError(
+                    "Telegram webhook-conflict recovery stopped after a non-retryable startup decision. botId={BotId}, botType={BotType}, result={Result}",
+                    botId,
+                    botType,
+                    result);
+                return;
+            }
+
+            var delay = CalculateStartupRecoveryDelay(attempt);
+            _logger.LogInformation(
+                "Telegram webhook-conflict receiver remains offline after a transient preflight failure; retry is scheduled. botId={BotId}, botType={BotType}, attempt={Attempt}, delaySeconds={DelaySeconds}",
+                botId,
+                botType,
+                attempt,
+                delay.TotalSeconds);
+            await Task.Delay(delay, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Detects Telegram's conflict response that specifically forbids <c>getUpdates</c> while a webhook is active.
+    /// </summary>
+    /// <param name="exception">Exception raised by the Telegram long-polling receiver.</param>
+    /// <returns><c>true</c> only for the webhook-versus-long-polling conflict; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// This classification must run before duplicate-poller classification. Only this conflict is safe to recover
+    /// automatically by deleting the webhook; a real second <c>getUpdates</c> process remains an operator incident.
+    /// </remarks>
+    private static bool IsTelegramWebhookPollingConflict(Exception exception)
+    {
+        if (exception is not ApiRequestException apiException || apiException.ErrorCode != 409)
+            return false;
+
+        var message = apiException.Message ?? string.Empty;
+        return message.Contains("webhook is active", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("use deleteWebhook", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("can't use getUpdates method while webhook", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// Detects Telegram's long-polling conflict response for duplicate getUpdates receivers.
     /// </summary>
     /// <param name="exception">Exception raised by the Telegram polling loop.</param>
@@ -1379,8 +1614,9 @@ public class MultiBotHostedService : IHostedService
     /// otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
-    /// A 409 conflict is different from a user delivery failure. Continuing to poll will create an error loop, so
-    /// the caller stops only the affected bot receiver and leaves the rest of the process alive.
+    /// A duplicate-poller conflict is different from both a user delivery failure and the separately recoverable
+    /// webhook conflict. Continuing to poll would create an error loop, so the caller stops only the affected bot and
+    /// requires the competing process to be removed by an operator.
     /// </remarks>
     private static bool IsTelegramGetUpdatesConflict(Exception exception)
     {
@@ -1388,9 +1624,9 @@ public class MultiBotHostedService : IHostedService
             return false;
 
         var message = apiException.Message ?? string.Empty;
-        return apiException.ErrorCode == 409 ||
-               message.Contains("terminated by other getUpdates request", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("only one bot instance is running", StringComparison.OrdinalIgnoreCase);
+        return !IsTelegramWebhookPollingConflict(exception) &&
+               (message.Contains("terminated by other getUpdates request", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("only one bot instance is running", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>
