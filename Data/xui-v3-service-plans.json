@@ -176,7 +176,7 @@
           "isEnabled": true,
           "ownedColleagueOnly": true,
           "tenantVisible": true,
-          "tenantUsesUserPrice": true
+          "tenantUsesUserPrice": false
         },
         {
           "key": "eco-m2",
@@ -191,7 +191,7 @@
           "isEnabled": true,
           "ownedColleagueOnly": true,
           "tenantVisible": true,
-          "tenantUsesUserPrice": true
+          "tenantUsesUserPrice": false
         },
         {
           "key": "eco-m3",
@@ -206,7 +206,7 @@
           "isEnabled": true,
           "ownedColleagueOnly": true,
           "tenantVisible": true,
-          "tenantUsesUserPrice": true
+          "tenantUsesUserPrice": false
         },
         {
           "key": "eco-m6",
@@ -221,7 +221,7 @@
           "isEnabled": true,
           "ownedColleagueOnly": true,
           "tenantVisible": true,
-          "tenantUsesUserPrice": true
+          "tenantUsesUserPrice": false
         }
       ]
     }

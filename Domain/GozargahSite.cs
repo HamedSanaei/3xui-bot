@@ -556,7 +556,8 @@ namespace Adminbot.Domain
 
             if (!response.IsSuccessStatusCode)
             {
-                if (!IsExpectedMissingUserResponse(action, response.StatusCode, responseText))
+                if (!IsExpectedMissingUserResponse(action, response.StatusCode, responseText) &&
+                    !IsExpectedMissingOrderResponse(action, response.StatusCode, responseText))
                 {
                     _logger.LogWarning(
                         "Gozargah site API returned HTTP {StatusCode} with content type {ContentType}. Body={BodyPreview}",
@@ -722,6 +723,31 @@ namespace Adminbot.Domain
             return string.Equals(action, "get_user", StringComparison.OrdinalIgnoreCase) &&
                    statusCode == HttpStatusCode.NotFound &&
                    responseText?.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// Detects the normal "order does not exist" response from the Gozargah order endpoints.
+        /// </summary>
+        /// <param name="action">Action name extracted from the request body.</param>
+        /// <param name="statusCode">HTTP status code returned by the website API.</param>
+        /// <param name="responseText">Raw response body returned by the website API.</param>
+        /// <returns>
+        /// <c>true</c> when the response is the expected missing-order result for <c>delete_order</c> or
+        /// <c>update_order</c>; otherwise <c>false</c>, meaning the caller should keep normal warning logs.
+        /// </returns>
+        /// <remarks>
+        /// A delete re-issued after the order is already gone has reached its goal, and an update about to fall back
+        /// to create is a handled business path. Both would otherwise flood the private logger channel on every retry,
+        /// mirroring why the missing <c>get_user</c> result is not treated as an operational failure.
+        /// </remarks>
+        private static bool IsExpectedMissingOrderResponse(string action, HttpStatusCode statusCode, string responseText)
+        {
+            if (statusCode != HttpStatusCode.NotFound)
+                return false;
+            if (responseText?.IndexOf("not found", StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+            return string.Equals(action, "delete_order", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(action, "update_order", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -1235,6 +1261,16 @@ namespace Adminbot.Domain
                 if (syncEvent.Operation == GozargahSiteSyncOperations.Delete)
                 {
                     response = await _apiClient.DeleteOrderAsync(payload.Name ?? syncEvent.Email, cancellationToken);
+
+                    // A website order that does not exist is the desired end state for a delete: the order is already
+                    // absent. Treat it as a completed (skipped) event instead of a retryable failure that would resend
+                    // the same request and flood the logger channel every two minutes.
+                    if (!response.Success && LooksLikeMissingOrder(response.Message))
+                    {
+                        MarkSkipped(syncEvent, "Gozargah site order was already absent; delete treated as completed.");
+                        await _userDbContext.SaveChangesAsync(cancellationToken);
+                        return true;
+                    }
                 }
                 else if (syncEvent.Operation == GozargahSiteSyncOperations.Create)
                 {

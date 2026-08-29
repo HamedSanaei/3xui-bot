@@ -248,6 +248,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Website records for tenant purchases belong to the tenant owner while preserving buyer Telegram id for audit.
 - Pending sync events may need to re-read fresh XUI panel data before a super-admin retry.
 - `get_user` HTTP 404 from the Gozargah website means the Telegram user has no website account; wallet-button checks treat it as expected and must not spam the Telegram logger channel.
+- A `delete_order` that hits a missing website order is the desired end state (the order is already absent). `TrySendEventAsync` marks such a delete as skipped instead of leaving it `Failed`, and `SendAsync` suppresses the warning for expected `delete_order`/`update_order` 404 "not found" responses (mirroring the `get_user` exemption). Without this, a stuck/duplicate delete stays `Failed` and the two-minute `GozargahSiteSyncRetryService` resends and re-logs it forever, flooding the logger channel with repeated `Order not found.` messages.
 - Owned-bot profile/status messages should display Gozargah `get_user` 404/not-found as `متصل نشده`, not as the raw HTTP/API error.
 - A successful non-banned `get_user` lookup means the owned-bot buyer should be promoted to `CredUser.IsColleague=true` before tariffs, purchases, or renewals are priced.
 - Optional Gozargah `get_user` lookups for owned-bot pricing and wallet-button visibility are fail-soft with a short timeout; a slow website API must not block tariff or purchase menus.
@@ -302,8 +303,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Unlimited audience and role price are intentionally separate. Generic `ResolvePurchase(selection, isColleague)`
   remains capable of resolving both public and colleague prices for tenant calculations; owned and tenant wrappers
   revalidate their respective audience policy before preview, callbacks/state consumption, payment/order creation,
-  and final fulfillment. The Eco unlimited plans are owned-colleague-only but tenant-visible. Their tenant sale is the
-  configured user price regardless of markup, owner base cost is the colleague price, and profit is never negative.
+  and final fulfillment. The Eco unlimited plans are owned-colleague-only but tenant-visible. They use ordinary tenant
+  markup pricing: zero markup keeps the configured user price, while positive markup applies to the colleague base
+  cost; owner base cost remains the colleague price and profit is never negative.
   Missing policy fields preserve legacy behavior (`false`, `true`, `false` respectively), so no database migration or
   callback/state format change is required. Super-admin manual creation remains an administrative `IsEnabled` flow.
 - Owned XUI purchase state restored from `BotUserStates` is revalidated against the live catalog before count,
