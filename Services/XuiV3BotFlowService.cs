@@ -1345,13 +1345,15 @@ public class XuiV3BotFlowService
 
                     foreach (var deletedClient in eligibleClients.Where(client => deleted.Contains(client.Email, StringComparer.OrdinalIgnoreCase)))
                     {
-                        await _gozargahSiteSyncService.QueueDeleteAsync(
-                            ResolveGozargahSiteOwnerTelegramUserId(credUser),
-                            credUser.TelegramUserId,
-                            deletedClient,
-                            $"delete-expired-{deletedClient.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
-                            ResolveGozargahTenantBotId(),
-                            cancellationToken: cancellationToken);
+                        await QueueGozargahSyncBestEffortAsync(
+                            "owned-expired-delete",
+                            () => _gozargahSiteSyncService.QueueDeleteAsync(
+                                ResolveGozargahSiteOwnerTelegramUserId(credUser),
+                                credUser.TelegramUserId,
+                                deletedClient,
+                                $"delete-expired-{deletedClient.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                                ResolveGozargahTenantBotId(),
+                                cancellationToken: cancellationToken));
                     }
                 }
 
@@ -2816,14 +2818,16 @@ public class XuiV3BotFlowService
             },
             cancellationToken);
 
-        await _gozargahSiteSyncService.QueueUpdateAsync(
-            ResolveGozargahSiteOwnerTelegramUserId(credUser),
-            credUser.TelegramUserId,
-            client,
-            serverInfo,
-            $"renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
-            ResolveGozargahTenantBotId(),
-            cancellationToken: cancellationToken);
+        await QueueGozargahSyncBestEffortAsync(
+            "renew",
+            () => _gozargahSiteSyncService.QueueUpdateAsync(
+                ResolveGozargahSiteOwnerTelegramUserId(credUser),
+                credUser.TelegramUserId,
+                client,
+                serverInfo,
+                $"renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                ResolveGozargahTenantBotId(),
+                cancellationToken: cancellationToken));
     }
 
     /// <summary>
@@ -4931,13 +4935,15 @@ public class XuiV3BotFlowService
 
                 foreach (var createdAccount in bulkResult.CreatedAccounts)
                 {
-                    await _gozargahSiteSyncService.QueueCreateAsync(
-                        ResolveGozargahSiteOwnerTelegramUserId(credUser),
-                        credUser.TelegramUserId,
-                        createdAccount,
-                        bulkResult.BulkOrderId,
-                        ResolveGozargahTenantBotId(),
-                        cancellationToken: cancellationToken);
+                    await QueueGozargahSyncBestEffortAsync(
+                        "create",
+                        () => _gozargahSiteSyncService.QueueCreateAsync(
+                            ResolveGozargahSiteOwnerTelegramUserId(credUser),
+                            credUser.TelegramUserId,
+                            createdAccount,
+                            bulkResult.BulkOrderId,
+                            ResolveGozargahTenantBotId(),
+                            cancellationToken: cancellationToken));
 
                     var createdAccountText = _purchaseService.BuildCreatedAccountText(createdAccount);
                     if (!string.IsNullOrWhiteSpace(createdAccount.SubLink))
@@ -5709,13 +5715,15 @@ public class XuiV3BotFlowService
             },
             cancellationToken);
         LogAccountDelete(client, credUser, "list", operationTiming.Snapshot());
-        await _gozargahSiteSyncService.QueueDeleteAsync(
-            ResolveGozargahSiteOwnerTelegramUserId(credUser),
-            credUser.TelegramUserId,
-            client,
-            $"delete-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
-            ResolveGozargahTenantBotId(),
-            cancellationToken: cancellationToken);
+        await QueueGozargahSyncBestEffortAsync(
+            "delete",
+            () => _gozargahSiteSyncService.QueueDeleteAsync(
+                ResolveGozargahSiteOwnerTelegramUserId(credUser),
+                credUser.TelegramUserId,
+                client,
+                $"delete-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                ResolveGozargahTenantBotId(),
+                cancellationToken: cancellationToken));
 
         await SafeEditMessageTextAsync(
             botClient,
@@ -6942,13 +6950,15 @@ public class XuiV3BotFlowService
             },
             cancellationToken);
         LogAccountDelete(client, credUser, "search", operationTiming.Snapshot());
-        await _gozargahSiteSyncService.QueueDeleteAsync(
-            ResolveGozargahSiteOwnerTelegramUserId(credUser),
-            credUser.TelegramUserId,
-            client,
-            $"delete-search-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
-            ResolveGozargahTenantBotId(),
-            cancellationToken: cancellationToken);
+        await QueueGozargahSyncBestEffortAsync(
+            "search-delete",
+            () => _gozargahSiteSyncService.QueueDeleteAsync(
+                ResolveGozargahSiteOwnerTelegramUserId(credUser),
+                credUser.TelegramUserId,
+                client,
+                $"delete-search-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                ResolveGozargahTenantBotId(),
+                cancellationToken: cancellationToken));
 
         await SendOrEditTextAsync(
             botClient,
@@ -9455,10 +9465,11 @@ public class XuiV3BotFlowService
     /// </remarks>
     private static long ResolveGozargahSiteOwnerTelegramUserId(CredUser credUser)
     {
-        if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) &&
-            BotContextAccessor.CurrentBotOwnerTelegramUserId.HasValue)
+        if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
         {
-            return BotContextAccessor.CurrentBotOwnerTelegramUserId.Value;
+            // A tenant order belongs to the storefront owner on Gozargah. Never fall back to the buyer when a
+            // tenant context is incomplete; doing so would silently register the order under the wrong website user.
+            return BotContextAccessor.CurrentBotOwnerTelegramUserId.GetValueOrDefault();
         }
 
         return credUser?.TelegramUserId ?? 0;
@@ -9477,6 +9488,31 @@ public class XuiV3BotFlowService
         return string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase)
             ? BotContextAccessor.CurrentBotId
             : null;
+    }
+
+    /// <summary>
+    /// Queues an optional Gozargah lifecycle mirror without changing the user-facing XUI operation result.
+    /// </summary>
+    /// <param name="operation">Short operation label used only for diagnostics.</param>
+    /// <param name="enqueue">Outbox enqueue/send delegate executed after the panel mutation succeeds.</param>
+    /// <returns>A task that completes after the best-effort mirror attempt.</returns>
+    /// <remarks>
+    /// The panel operation is authoritative for the customer flow. A website lookup, outbox, or network error is
+    /// therefore logged and left for a later explicit recovery rather than being surfaced as a failed account action.
+    /// </remarks>
+    private async Task QueueGozargahSyncBestEffortAsync(string operation, Func<Task> enqueue)
+    {
+        try
+        {
+            await enqueue();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Gozargah sync enqueue failed after XUI operation. operation={Operation}",
+                operation);
+        }
     }
 
     /// <summary>
@@ -12156,13 +12192,7 @@ public class XuiV3BotFlowService
 
     private static string NormalizeUserComment(string text)
     {
-        if (string.IsNullOrWhiteSpace(text))
-            return string.Empty;
-
-        var normalized = text.Replace("\r", " ").Replace("\n", " ").Trim();
-        return normalized.Length <= 200
-            ? normalized
-            : normalized.Substring(0, 200);
+        return XuiV3PurchaseService.NormalizeOptionalUserComment(text, 200) ?? string.Empty;
     }
 
     /// <summary>

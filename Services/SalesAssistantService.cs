@@ -22,6 +22,7 @@ public class SalesAssistantService
     private readonly BotRegistry _botRegistry;
     private readonly BotClientProvider _botClientProvider;
     private readonly IServiceProvider _serviceProvider;
+    private readonly XuiV3PurchaseService _purchaseService;
     private readonly ILogger<SalesAssistantService> _logger;
 
     /// <summary>
@@ -31,18 +32,21 @@ public class SalesAssistantService
     /// <param name="BotRegistry">runtime registry used to resolve the configured assistant Bot.</param>
     /// <param name="BotClientProvider">Telegram client Provider used to Send assistant notifications.</param>
     /// <param name="ServiceProvider">service Provider used to resolve <see cref="TenantBotService" /> for final receipt Approval.</param>
+    /// <param name="PurchaseService">XUI v3 catalog service used to render the persisted purchase plan safely.</param>
     /// <param name="Logger">Logger used for failed assistant delivery or callback processing.</param>
     public SalesAssistantService(
         UserDbContext UserDbContext,
         BotRegistry BotRegistry,
         BotClientProvider BotClientProvider,
         IServiceProvider ServiceProvider,
+        XuiV3PurchaseService PurchaseService,
         ILogger<SalesAssistantService> Logger)
     {
         _userDbcontext = UserDbContext;
         _botRegistry = BotRegistry;
         _botClientProvider = BotClientProvider;
         _serviceProvider = ServiceProvider;
+        _purchaseService = PurchaseService;
         _logger = Logger;
     }
 
@@ -144,11 +148,23 @@ public class SalesAssistantService
         if (assistant == null || string.IsNullOrWhiteSpace(assistant.Token))
             return;
 
+        TenantBotOrder order = null;
+        try
+        {
+            order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+                x => x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId,
+                CancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "sales assistant receipt order lookup failed. RECEIPTID={RECEIPTID}", receipt.Id);
+        }
         var Text =
             "🧾 <b>رسید کارت‌به‌کارت جدید</b>\n\n" +
             $"🤖 ربات: <code>{Html(receipt.TenantBotUsername)}</code>\n" +
             $"🧾 سفارش: <code>{Html(receipt.OrderId)}</code>\n" +
-            $"👤 مشتری: <code>{receipt.CustomerTelegramUserId}</code>\n" +
+            BuildCustomerSummary(order, receipt.CustomerTelegramUserId) +
+            BuildPaymentPlanSummary(order) +
             $"💰 مبلغ: <code>{Html(receipt.AmountToman.FormatCurrency())}</code>\n\n" +
             "برای ساخت اکانت ابتدا تایید و سپس تایید نهایی را بزنید.";
 
@@ -186,7 +202,7 @@ public class SalesAssistantService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "sales assistant receipt notification failed. RECEIPTID={RECEIPTID}", receipt.Id);
-            await SENDMANUALRECEIPTFALLBACKTEXTASYNC(receipt, Text, keyboard, ex, CancellationToken);
+            await SENDMANUALRECEIPTFALLBACKTEXTASYNC(receipt, Text, keyboard, CancellationToken);
         }
     }
 
@@ -204,10 +220,6 @@ public class SalesAssistantService
     /// Inline review keyboard containing approve, reject, and detail callbacks. It must be kept identical to the
     /// photo path so the owner can still complete the receipt flow from the fallback message.
     /// </param>
-    /// <param name="originalError">
-    /// The Telegram or file-download exception that prevented photo delivery. Its message is included only as
-    /// HTML-encoded diagnostic text and must not contain secrets or bot tokens.
-    /// </param>
     /// <param name="CancellationToken">
     /// Cancellation token for the fallback Telegram send operation.
     /// </param>
@@ -221,7 +233,6 @@ public class SalesAssistantService
         TenantManualPaymentReceipt receipt,
         string baseText,
         InlineKeyboardMarkup keyboard,
-        Exception originalError,
         CancellationToken CancellationToken)
     {
         var assistant = GetAssistantBot();
@@ -235,7 +246,7 @@ public class SalesAssistantService
             $"\nOrderId: <code>{Html(receipt.OrderId)}</code>" +
             $"\nTenantBot: <code>{Html(receipt.TenantBotId)}</code>" +
             $"\nCustomerId: <code>{receipt.CustomerTelegramUserId}</code>" +
-            $"\nخطای عکس: <code>{Html(originalError.Message)}</code>";
+            "\nخطای عکس: <code>ارسال تصویر ناموفق بود؛ جزئیات در لاگ ثبت شده است.</code>";
 
         try
         {
@@ -453,7 +464,7 @@ public class SalesAssistantService
             "🔎 <b>جزئیات رسید کارت‌به‌کارت</b>\n\n" +
             $"🤖 ربات: <code>{Html(receipt.TenantBotUsername)}</code>\n" +
             $"🧾 سفارش: <code>{Html(receipt.OrderId)}</code>\n" +
-            $"👤 مشتری: <code>{receipt.CustomerTelegramUserId}</code>\n" +
+            BuildCustomerSummary(order, receipt.CustomerTelegramUserId) +
             $"💰 مبلغ رسید: <code>{Html(receipt.AmountToman.FormatCurrency())}</code>\n" +
             $"📌 وضعیت رسید: <code>{Html(receipt.Status)}</code>\n";
 
@@ -464,6 +475,7 @@ public class SalesAssistantService
         }
 
         text +=
+            BuildPaymentPlanSummary(order) +
             $"📌 وضعیت سفارش: <code>{Html(order.PaymentStatus)}</code>\n" +
             $"🏷 مبلغ فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
             $"💳 هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
@@ -582,6 +594,147 @@ public class SalesAssistantService
         {
             _logger.LogWarning(ex, "Ignoring unchanged sales-assistant reply markup. messageId={MessageId}", messageId);
         }
+    }
+
+    /// <summary>
+    /// Builds the HTML-safe customer identity block used by receipt captions and detail views.
+    /// </summary>
+    /// <param name="order">Tenant order containing the cached Telegram profile fields, when available.</param>
+    /// <param name="fallbackTelegramUserId">Customer id copied to the receipt row.</param>
+    /// <returns>Customer name link, username, and numeric id lines.</returns>
+    /// <remarks>
+    /// Telegram deep links are best-effort: privacy settings may prevent opening the profile or sending a message.
+    /// The numeric id is therefore always rendered independently of the link.
+    /// </remarks>
+    private static string BuildCustomerSummary(TenantBotOrder order, long fallbackTelegramUserId)
+    {
+        var telegramUserId = order?.CustomerTelegramUserId > 0
+            ? order.CustomerTelegramUserId
+            : fallbackTelegramUserId;
+        var firstName = order?.CustomerFirstName?.Trim();
+        var lastName = order?.CustomerLastName?.Trim();
+        var fullName = string.Join(" ", new[] { firstName, lastName }.Where(value => !string.IsNullOrWhiteSpace(value)));
+        if (string.IsNullOrWhiteSpace(fullName))
+            fullName = NormalizeUsername(order?.CustomerUsername) ?? telegramUserId.ToString();
+
+        var linkedName = telegramUserId > 0
+            ? $"<a href=\"tg://user?id={telegramUserId}\">{Html(fullName)}</a>"
+            : $"<code>{Html(fullName)}</code>";
+        var username = NormalizeUsername(order?.CustomerUsername);
+
+        return $"👤 مشتری: {linkedName}\n" +
+               $"🔹 یوزرنیم: <code>{Html(username ?? "ندارد")}</code>\n" +
+               $"🆔 آیدی عددی: <code>{telegramUserId}</code>\n";
+    }
+
+    /// <summary>
+    /// Builds the provider and persisted plan block for a tenant order.
+    /// </summary>
+    /// <param name="order">Tenant order whose provider and catalog keys are displayed.</param>
+    /// <returns>HTML-safe payment-provider and plan lines, or an empty string when no order is available.</returns>
+    /// <remarks>
+    /// Catalog loading is presentation-only and failure-safe. Historical orders remain reviewable when a service or
+    /// duration was later disabled or removed from the live catalog.
+    /// </remarks>
+    private string BuildPaymentPlanSummary(TenantBotOrder order)
+    {
+        if (order == null)
+            return string.Empty;
+
+        var provider = FormatPaymentProvider(order.PaymentProvider);
+        var plan = ResolvePlanLabel(order);
+        return $"💳 درگاه: <code>{Html(provider)}</code>\n" +
+               $"📦 پلن: <code>{Html(plan)}</code>\n";
+    }
+
+    /// <summary>
+    /// Maps persisted payment-provider keys to stable Persian labels for the sales assistant.
+    /// </summary>
+    /// <param name="provider">Persisted provider key.</param>
+    /// <returns>A non-sensitive user-facing provider label.</returns>
+    private static string FormatPaymentProvider(string provider)
+    {
+        return provider?.Trim().ToLowerInvariant() switch
+        {
+            "hooshpay" => "هوش‌پی",
+            "nowpayments" => "ارز دیجیتال",
+            "uniquepay" => "یونیک‌پی",
+            "tetraminator" => "تترامیناتور",
+            "tenant_card" => "کارت‌به‌کارت",
+            _ => "سایر/نامشخص"
+        };
+    }
+
+    /// <summary>
+    /// Resolves a readable service, duration, traffic, or unlimited-plan label from the live catalog and order keys.
+    /// </summary>
+    /// <param name="order">Persisted tenant order containing stable service and plan keys.</param>
+    /// <returns>A safe plan label with persisted-key fallback when the catalog is unavailable.</returns>
+    private string ResolvePlanLabel(TenantBotOrder order)
+    {
+        var serviceKey = order.ServiceKey?.Trim();
+        var serviceLabel = serviceKey;
+        try
+        {
+            var service = _purchaseService.GetEnabledServices().FirstOrDefault(item =>
+                string.Equals(item.Key, serviceKey, StringComparison.OrdinalIgnoreCase));
+            if (service != null)
+            {
+                serviceLabel = string.IsNullOrWhiteSpace(service.DisplayName) ? service.Key : service.DisplayName;
+                if (service.IsUnlimited)
+                {
+                    var unlimited = XuiV3PurchaseService.GetUnlimitedPlansForTenant(service)
+                        .FirstOrDefault(item => string.Equals(item.Key, order.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase));
+                    var unlimitedLabel = unlimited == null
+                        ? order.UnlimitedPlanKey
+                        : (string.IsNullOrWhiteSpace(unlimited.DisplayName) ? unlimited.Key : unlimited.DisplayName);
+                    return string.IsNullOrWhiteSpace(unlimitedLabel)
+                        ? serviceLabel ?? "نامشخص"
+                        : $"{serviceLabel} — {unlimitedLabel}";
+                }
+
+                var duration = XuiV3PurchaseService.GetEnabledDurationOptions(service)
+                    .FirstOrDefault(item => string.Equals(item.Key, order.DurationKey, StringComparison.OrdinalIgnoreCase));
+                var durationLabel = duration == null
+                    ? XuiV3PurchaseService.FormatDurationSelectionKey(order.DurationKey)
+                    : (string.IsNullOrWhiteSpace(duration.DisplayName) ? duration.Key : duration.DisplayName);
+                var trafficLabel = order.TrafficGb.GetValueOrDefault() > 0
+                    ? $"{order.TrafficGb.Value} GB"
+                    : "حجم نامشخص";
+                return string.Join(" — ", new[] { serviceLabel, durationLabel, trafficLabel }
+                    .Where(value => !string.IsNullOrWhiteSpace(value)));
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "sales assistant plan catalog lookup failed. OrderId={OrderId}", order.OrderId);
+        }
+
+        var fallback = new[]
+        {
+            serviceLabel,
+            string.IsNullOrWhiteSpace(order.UnlimitedPlanKey)
+                ? XuiV3PurchaseService.FormatDurationSelectionKey(order.DurationKey)
+                : order.UnlimitedPlanKey,
+            order.TrafficGb.GetValueOrDefault() > 0 ? $"{order.TrafficGb.Value} GB" : null
+        };
+        return string.Join(" — ", fallback.Where(value => !string.IsNullOrWhiteSpace(value))) is { Length: > 0 } value
+            ? value
+            : "نامشخص";
+    }
+
+    /// <summary>
+    /// Normalizes one stored Telegram username for display without exposing malformed whitespace.
+    /// </summary>
+    /// <param name="username">Stored username with or without an at-sign.</param>
+    /// <returns>Username including one leading at-sign, or <c>null</c> when unavailable.</returns>
+    private static string NormalizeUsername(string username)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+            return null;
+
+        var normalized = username.Trim().TrimStart('@');
+        return string.IsNullOrWhiteSpace(normalized) ? null : $"@{normalized}";
     }
 
     /// <summary>

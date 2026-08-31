@@ -20,6 +20,10 @@ namespace Adminbot.Domain
         public int LimitIp { get; set; }
         public long PriceToman { get; set; }
         public string Currency { get; set; } = "toman";
+        /// <summary>
+        /// Optional human comment supplied during account creation. Null means no user comment was requested.
+        /// </summary>
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
         public string UserComment { get; set; }
         public string BulkOrderId { get; set; }
         public int? BulkIndex { get; set; }

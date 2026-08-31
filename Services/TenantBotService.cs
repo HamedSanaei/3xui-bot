@@ -7650,13 +7650,15 @@ public class TenantBotService
 
                 await _userDbcontext.SaveChangesAsync(CancellationToken);
 
-                await _gozargahSiteSyncService.QueueCreateAsync(
-                    order.OwnerTelegramUserId,
-                    order.CustomerTelegramUserId,
-                    created,
-                    order.OrderId,
-                    order.TenantBotId,
-                    CancellationToken);
+                await QueueGozargahSyncBestEffortAsync(
+                    "tenant-create",
+                    () => _gozargahSiteSyncService.QueueCreateAsync(
+                        order.OwnerTelegramUserId,
+                        order.CustomerTelegramUserId,
+                        created,
+                        order.OrderId,
+                        order.TenantBotId,
+                        CancellationToken));
 
                 await NOTIFYTENANTCUSTOMERSUCCESSASYNC(order, created, CancellationToken);
                 await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, CancellationToken, settlement);
@@ -9399,6 +9401,32 @@ public class TenantBotService
         return order.IsFulfilled || string.IsNullOrWhiteSpace(order.ErrorMessage)
             ? string.Empty
             : $"\nخطا: <code>{Html(order.ErrorMessage)}</code>";
+    }
+
+    /// <summary>
+    /// Attempts to enqueue one Gozargah lifecycle event without changing the durable tenant-order outcome.
+    /// </summary>
+    /// <param name="operation">Short operation label used only for bounded diagnostics.</param>
+    /// <param name="enqueue">Outbox enqueue/send delegate for the already-fulfilled account operation.</param>
+    /// <returns>A task that completes after the best-effort enqueue attempt.</returns>
+    /// <remarks>
+    /// Account creation, renewal, settlement, and ledger writes are durable before this method is called. A database,
+    /// API, timeout, or cancellation failure while recording the optional website mirror must therefore be isolated;
+    /// the existing Gozargah retry worker can recover rows that were persisted successfully.
+    /// </remarks>
+    private async Task QueueGozargahSyncBestEffortAsync(string operation, Func<Task> enqueue)
+    {
+        try
+        {
+            await enqueue();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Tenant Gozargah sync enqueue failed after durable fulfillment. operation={Operation}",
+                operation);
+        }
     }
 
     /// <summary>
@@ -11285,14 +11313,16 @@ public class TenantBotService
         // second renewal while the first panel mutation was applied but its owner settlement was still incomplete.
         await _renewalOperationStore.MarkSettledAsync(renewalOperation, cancellationToken);
 
-        await _gozargahSiteSyncService.QueueUpdateAsync(
-            order.OwnerTelegramUserId,
-            order.CustomerTelegramUserId,
-            client,
-            serverInfo,
-            order.OrderId,
-            order.TenantBotId,
-            cancellationToken);
+        await QueueGozargahSyncBestEffortAsync(
+            "tenant-renew",
+            () => _gozargahSiteSyncService.QueueUpdateAsync(
+                order.OwnerTelegramUserId,
+                order.CustomerTelegramUserId,
+                client,
+                serverInfo,
+                order.OrderId,
+                order.TenantBotId,
+                cancellationToken));
 
         await SENDTENANTRENEWSUCCESSASYNC(order, renewal, cancellationToken);
         await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, cancellationToken, settlement);

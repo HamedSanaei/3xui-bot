@@ -41,6 +41,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 - `Services/XuiV3PurchaseService.cs`: resolves service selections, validates plan rules, centralizes owned/tenant
   unlimited-plan audience checks separately from role pricing, builds XUI v3 account metadata, and creates accounts.
+  `NormalizeOptionalUserComment` converts empty/skip input to null and omits it from new panel metadata, while keeping
+  technical ownership/Telegram fields intact.
 - `Services/XuiOperationTiming.cs`: ambient monotonic timing scope for XUI audits. The v3 transport sums complete
   logical panel calls (including retries/backoff); legacy v2 routes wrap their panel calls explicitly. Central create,
   renew, delete, activation, comment/link edit, trial, bulk-admin, and tenant fulfillment logs show both
@@ -101,11 +103,15 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   comments omit the line, while unavailable/mismatched/malformed detail responses defer only that account before
   time dedup or volume claim. Legacy tenant-sale audit text stored in `UserComment` is treated as internal/absent. A
   detail GET already used for expiry verification is reused for comment extraction.
-- `Services/XuiV3AdminFlowService.cs`: super-admin XUI v3 management flows.
+- `Services/XuiV3AdminFlowService.cs`: super-admin XUI v3 management flows. Historical sync, admin renewal, and
+  expired-account deletion resolve tenant-created clients back to the storefront owner's Gozargah account while
+  preserving the buyer's panel `tguserid`; missing tenant ownership fails closed.
 - `Services/XuiV3LinkChangeOperationStore.cs`: per-operation users.db contexts, atomic confirmation, active-client uniqueness, leases, and bounded recovery state for link changes.
 - `Services/XuiV3LinkChangeRecoveryService.cs`: hosted worker that resumes the exact persisted email/UUID/subId after ambiguous XUI responses or process restarts.
 - `Services/BroadcastManager.cs`: queued broadcast engine with progress/status tracking and retry behavior.
 - `Services/SalesAssistantService.cs`: central assistant bot for tenant sale notifications and manual receipt approval.
+  Receipt captions/details include an HTML-safe Telegram name link, username, numeric id, mapped payment provider, and
+  catalog-aware plan label with historical-key fallback; photo-delivery fallback messages never expose raw exceptions.
 - `Services/WalletLedgerService.cs`: append-only wallet ledger for credits/debits.
 - `Services/ReferralService.cs`: global owned-bot relationship registration, reward calculation, users.db state/ledger idempotency, user stats, notifications, and startup reconciliation.
 - `Domain/PaymentGatewayAvailability.cs`: process-wide live snapshot for HooshPay, Tetraminator, UniquePay, and NOWPayments. Super-admin target-state callbacks use this service; only root `enabled` booleans are persisted through the byte-preserving atomic JSON editor. API credentials remain restart-loaded and are never displayed or logged.
@@ -121,7 +127,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   worker claims two-minute leases and performs bounded transient Telegram retries without any credentials.db, wallet,
   provider-settlement, tenant, or XUI dependency. Expired claims become `delivery_uncertain` and are never resent
   automatically because Telegram may already have accepted the message.
-- `Domain/GozargahSite.cs`: Gozargah site API client, sync event models, mapping, and retry helpers. `GozargahSiteApiClient.SendAsync<T>` validates HTTP status, Content-Type, and body shape before deserializing: HTML/error-page bodies (`<...`), explicit non-JSON content types, empty bodies, and invalid JSON all become unsuccessful `GozargahSiteApiResponse<T>` values with a bounded, whitespace-collapsed preview (never a raw `JsonReaderException`), so a temporary website failure cannot crash the Telegram update/purchase flow.
+- `Domain/GozargahSite.cs`: Gozargah site API client, typed owner/buyer sync ownership, sync event models, mapping,
+  and retry helpers. Tenant website events use the colleague owner as the site account and retain the buyer separately;
+  successful-event dedupe includes site owner and tenant bot. `GozargahSiteApiClient.SendAsync<T>` validates HTTP status,
+  Content-Type, and body shape before deserializing: HTML/error-page bodies (`<...`), explicit non-JSON content types,
+  empty bodies, and invalid JSON all become unsuccessful `GozargahSiteApiResponse<T>` values with a bounded,
+  whitespace-collapsed preview (never a raw `JsonReaderException`), so a temporary website failure cannot crash the
+  Telegram update/purchase flow.
 
 ## Tenant Bot Rules
 
@@ -250,7 +262,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 - Site sync is optional and controlled by `GozargahSite*` config flags.
 - Successful create/update/delete/link-change operations enqueue or send sync events through the outbox in `users.db`.
-- Website records for tenant purchases belong to the tenant owner while preserving buyer Telegram id for audit.
+- Website records for tenant purchases belong to the tenant owner while preserving buyer Telegram id for audit. This
+  owner/buyer split applies to create, renew/update, rename, delete, expired-delete, historical sync, and admin
+  recovery; it never rewrites the XUI client's `tguserid` or `XuiV3ClientMetadata.TelegramUserId`.
+- Gozargah enqueue/send is best-effort after a durable panel/order/ledger effect in tenant and shared customer flows;
+  website failures are logged and retried from the outbox without turning a valid account operation into failure.
 - Pending sync events may need to re-read fresh XUI panel data before a super-admin retry.
 - `get_user` HTTP 404 from the Gozargah website means the Telegram user has no website account; wallet-button checks treat it as expected and must not spam the Telegram logger channel.
 - A `delete_order` that hits a missing website order is the desired end state (the order is already absent). `TrySendEventAsync` marks such a delete as skipped instead of leaving it `Failed`, and `SendAsync` suppresses the warning for expected `delete_order`/`update_order` 404 "not found" responses (mirroring the `get_user` exemption). Without this, a stuck/duplicate delete stays `Failed` and the two-minute `GozargahSiteSyncRetryService` resends and re-logs it forever, flooding the logger channel with repeated `Order not found.` messages.

@@ -14,6 +14,22 @@ using Newtonsoft.Json.Linq;
 namespace Adminbot.Domain
 {
     /// <summary>
+    /// Identifies the website owner and the buyer separately for one Gozargah lifecycle operation.
+    /// </summary>
+    /// <remarks>
+    /// Tenant storefronts register the order under the colleague that owns the storefront while retaining the
+    /// customer's Telegram id for audit. This value never changes the corresponding 3x-ui client metadata.
+    /// </remarks>
+    public sealed record GozargahSyncOwnership(
+        long SiteOwnerTelegramUserId,
+        long BuyerTelegramUserId,
+        string TenantBotId = null)
+    {
+        /// <summary>Gets whether the operation belongs to a tenant storefront.</summary>
+        public bool IsTenant => !string.IsNullOrWhiteSpace(TenantBotId);
+    }
+
+    /// <summary>
     /// Operation names stored in <see cref="GozargahSiteSyncEvent.Operation"/> for the Gozargah site outbox.
     /// </summary>
     public static class GozargahSiteSyncOperations
@@ -1181,7 +1197,7 @@ namespace Adminbot.Domain
             string tenantBotId = null,
             CancellationToken cancellationToken = default)
         {
-            if (!_appConfig.GozargahSiteRealtimeDeleteSyncEnabled)
+            if (!_appConfig.GozargahSiteRealtimeDeleteSyncEnabled || siteOwnerTelegramUserId <= 0)
                 return null;
 
             var payload = new GozargahSiteOrderPayload
@@ -1355,8 +1371,17 @@ namespace Adminbot.Domain
             if (!_appConfig.GozargahSiteSyncEnabled || payload == null)
                 return null;
 
+            var ownership = new GozargahSyncOwnership(
+                siteOwnerTelegramUserId,
+                buyerTelegramUserId,
+                string.IsNullOrWhiteSpace(tenantBotId) ? null : tenantBotId.Trim());
+            if (ownership.SiteOwnerTelegramUserId <= 0)
+                return null;
+
             var existing = await _userDbContext.GozargahSiteSyncEvents.FirstOrDefaultAsync(
                 x => x.Operation == operation &&
+                     x.TelegramUserId == ownership.SiteOwnerTelegramUserId &&
+                     x.TenantBotId == ownership.TenantBotId &&
                      x.Email == email &&
                      x.PreviousEmail == previousEmail &&
                      x.Uuid == uuid &&
@@ -1369,10 +1394,10 @@ namespace Adminbot.Domain
             var syncEvent = new GozargahSiteSyncEvent
             {
                 BotId = BotContextAccessor.CurrentBotId,
-                TenantBotId = tenantBotId,
-                TelegramUserId = siteOwnerTelegramUserId,
-                OwnerTelegramUserId = tenantBotId == null ? null : siteOwnerTelegramUserId,
-                BuyerTelegramUserId = buyerTelegramUserId <= 0 || buyerTelegramUserId == siteOwnerTelegramUserId ? null : buyerTelegramUserId,
+                TenantBotId = ownership.TenantBotId,
+                TelegramUserId = ownership.SiteOwnerTelegramUserId,
+                OwnerTelegramUserId = ownership.IsTenant ? ownership.SiteOwnerTelegramUserId : null,
+                BuyerTelegramUserId = ownership.BuyerTelegramUserId <= 0 || ownership.BuyerTelegramUserId == ownership.SiteOwnerTelegramUserId ? null : ownership.BuyerTelegramUserId,
                 Email = email,
                 PreviousEmail = previousEmail,
                 Uuid = uuid,
@@ -1550,7 +1575,7 @@ namespace Adminbot.Domain
             string trackingCode,
             CancellationToken cancellationToken)
         {
-            if (string.IsNullOrWhiteSpace(name))
+            if (siteOwnerTelegramUserId <= 0 || string.IsNullOrWhiteSpace(name))
                 return null;
 
             var siteUser = await _apiClient.GetUserAsync(siteOwnerTelegramUserId, cancellationToken);

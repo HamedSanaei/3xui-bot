@@ -12,6 +12,34 @@ public class XuiV3PurchaseService
 
     public const int MaxBulkAccountCount = 10;
 
+    /// <summary>
+    /// Normalizes an optional account comment before it is persisted in XUI metadata.
+    /// </summary>
+    /// <param name="text">Raw comment text or one of the supported no-comment labels.</param>
+    /// <param name="maxLength">Maximum persisted length for this flow.</param>
+    /// <returns>A trimmed comment, or <c>null</c> when the input means no comment.</returns>
+    /// <remarks>
+    /// Empty comments are omitted from the metadata JSON so the 3x-ui user-comment field stays empty. This method is
+    /// intentionally independent from presentation text such as «ندارد»; that label must never be persisted.
+    /// </remarks>
+    public static string NormalizeOptionalUserComment(string text, int maxLength = 300)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        var normalized = text.Replace("\r", " ").Replace("\n", " ").Trim();
+        if (normalized.Length == 0 ||
+            normalized.Equals("ادامه بدون کامنت", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Equals("رد کردن", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Equals("بدون کامنت", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var boundedLength = maxLength <= 0 ? 300 : maxLength;
+        return normalized.Length <= boundedLength ? normalized : normalized[..boundedLength];
+    }
+
     /// <summary>Stable catalog key of the only metered service that may accept typed custom durations.</summary>
     private const string NormalServiceKey = "normal";
 
@@ -1574,7 +1602,7 @@ public class XuiV3PurchaseService
             DurationDays = resolved.DurationDays,
             LimitIp = resolved.LimitIp,
             PriceToman = priceToman,
-            UserComment = metadataOptions.UserComment,
+            UserComment = NormalizeOptionalUserComment(metadataOptions.UserComment),
             BulkOrderId = metadataOptions.BulkOrderId,
             BulkIndex = metadataOptions.BulkIndex,
             BulkTotal = metadataOptions.BulkTotal,

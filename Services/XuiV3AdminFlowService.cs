@@ -72,6 +72,7 @@ public class XuiV3AdminFlowService
     private readonly TetraminatorSettlementService _tetraminatorSettlementService;
     /// <summary>Serialized authoritative UniquePay inquiry and provisional-decision coordinator.</summary>
     private readonly UniquePayReconciliationHostedService _uniquePayReconciliation;
+    private readonly BotRegistry _botRegistry;
     private readonly TenantBotService _tenantBotService;
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
@@ -96,6 +97,7 @@ public class XuiV3AdminFlowService
     /// <param name="uniquePayReconciliation">
     /// Official UniquePay inquiry coordinator used by status checks and both provisional-approval stages.
     /// </param>
+    /// <param name="botRegistry">Runtime registry used to resolve tenant storefront owners from panel metadata.</param>
     /// <param name="tenantBotService">Tenant storefront settlement service for direct tenant orders.</param>
     /// <param name="purchaseService">Shared XuiV3 purchase and renewal service.</param>
     /// <param name="gozargahSiteSyncService">
@@ -119,6 +121,7 @@ public class XuiV3AdminFlowService
         Tetraminator tetraminator,
         TetraminatorSettlementService tetraminatorSettlementService,
         UniquePayReconciliationHostedService uniquePayReconciliation,
+        BotRegistry botRegistry,
         TenantBotService tenantBotService,
         XuiV3PurchaseService purchaseService,
         GozargahSiteSyncService gozargahSiteSyncService,
@@ -137,6 +140,7 @@ public class XuiV3AdminFlowService
         _tetraminator = tetraminator;
         _tetraminatorSettlementService = tetraminatorSettlementService;
         _uniquePayReconciliation = uniquePayReconciliation;
+        _botRegistry = botRegistry;
         _tenantBotService = tenantBotService;
         _purchaseService = purchaseService;
         _gozargahSiteSyncService = gozargahSiteSyncService;
@@ -814,12 +818,14 @@ public class XuiV3AdminFlowService
         {
             foreach (var createdAccount in bulkResult.CreatedAccounts)
             {
-                await _gozargahSiteSyncService.QueueCreateAsync(
-                    syncTargetTelegramUserId,
-                    syncTargetTelegramUserId,
-                    createdAccount,
-                    bulkResult.BulkOrderId,
-                    cancellationToken: cancellationToken);
+                await QueueGozargahSyncBestEffortAsync(
+                    "admin-create",
+                    () => _gozargahSiteSyncService.QueueCreateAsync(
+                        syncTargetTelegramUserId,
+                        syncTargetTelegramUserId,
+                        createdAccount,
+                        bulkResult.BulkOrderId,
+                        cancellationToken: cancellationToken));
             }
         }
 
@@ -1199,16 +1205,19 @@ public class XuiV3AdminFlowService
             cancellationToken);
 
         var renewMetadata = TryReadMetadata(client.Comment);
-        var syncOwnerTelegramUserId = client.TgId != 0 ? client.TgId : renewMetadata?.TelegramUserId ?? 0;
-        if (syncOwnerTelegramUserId > 0)
+        var renewalOwnership = await ResolveGozargahOwnershipAsync(client, renewMetadata, cancellationToken);
+        if (renewalOwnership != null)
         {
-            await _gozargahSiteSyncService.QueueUpdateAsync(
-                syncOwnerTelegramUserId,
-                syncOwnerTelegramUserId,
-                client,
-                serverInfo,
-                $"admin-renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
-                cancellationToken: cancellationToken);
+            await QueueGozargahSyncBestEffortAsync(
+                "admin-renew",
+                () => _gozargahSiteSyncService.QueueUpdateAsync(
+                    renewalOwnership.SiteOwnerTelegramUserId,
+                    renewalOwnership.BuyerTelegramUserId,
+                    client,
+                    serverInfo,
+                    $"admin-renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                    renewalOwnership.TenantBotId,
+                    cancellationToken: cancellationToken));
         }
 
     }
@@ -3060,6 +3069,34 @@ public class XuiV3AdminFlowService
                     ["totalElapsedMs"] = (long)operationTiming.TotalElapsed.TotalMilliseconds
                 },
                 cancellationToken);
+
+            foreach (var deletedClient in eligibleClients)
+            {
+                var ownership = await ResolveGozargahOwnershipAsync(
+                    deletedClient,
+                    TryReadMetadata(deletedClient.Comment),
+                    cancellationToken);
+                if (ownership == null)
+                    continue;
+
+                try
+                {
+                    await _gozargahSiteSyncService.QueueDeleteAsync(
+                        ownership.SiteOwnerTelegramUserId,
+                        ownership.BuyerTelegramUserId,
+                        deletedClient,
+                        $"admin-delete-expired-{deletedClient.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+                        ownership.TenantBotId,
+                        cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Admin Gozargah delete enqueue failed after panel deletion. email={Email}",
+                        deletedClient.Email);
+                }
+            }
         }
 
         _logger.LogTelegramHtml(
@@ -3514,20 +3551,24 @@ public class XuiV3AdminFlowService
             }
 
             var metadata = TryReadMetadata(client.Comment);
-            var ownerTelegramUserId = client.TgId != 0 ? client.TgId : metadata?.TelegramUserId ?? 0;
-            if (ownerTelegramUserId <= 0)
+            var ownership = await ResolveGozargahOwnershipAsync(client, metadata, cancellationToken);
+            if (ownership == null)
             {
                 skippedCount++;
                 continue;
             }
 
-            var syncEvent = await _gozargahSiteSyncService.QueueUpdateAsync(
-                ownerTelegramUserId,
-                ownerTelegramUserId,
-                client,
-                serverInfo,
-                $"historical-{client.Email}",
-                cancellationToken: cancellationToken);
+            GozargahSiteSyncEvent syncEvent = null;
+            await QueueGozargahSyncBestEffortAsync(
+                "historical-sync",
+                async () => syncEvent = await _gozargahSiteSyncService.QueueUpdateAsync(
+                    ownership.SiteOwnerTelegramUserId,
+                    ownership.BuyerTelegramUserId,
+                    client,
+                    serverInfo,
+                    $"historical-{client.Email}",
+                    ownership.TenantBotId,
+                    cancellationToken: cancellationToken));
 
             if (syncEvent == null)
             {
@@ -4673,11 +4714,7 @@ public class XuiV3AdminFlowService
 
     private static string NormalizeUserComment(string text)
     {
-        if (string.IsNullOrWhiteSpace(text))
-            return string.Empty;
-
-        var normalized = text.Trim();
-        return normalized.Length <= 300 ? normalized : normalized.Substring(0, 300);
+        return XuiV3PurchaseService.NormalizeOptionalUserComment(text) ?? string.Empty;
     }
 
     private async Task FinishWithMessageAsync(
@@ -4917,6 +4954,110 @@ public class XuiV3AdminFlowService
                    TelegramUserId = telegramUserId,
                    ChatID = telegramUserId
                };
+    }
+
+    /// <summary>
+    /// Queues an optional Gozargah mirror without changing the result of a completed admin panel operation.
+    /// </summary>
+    /// <param name="operation">Short operation label used only for diagnostics.</param>
+    /// <param name="enqueue">Outbox enqueue/send delegate.</param>
+    /// <returns>A task that completes after the best-effort enqueue attempt.</returns>
+    private async Task QueueGozargahSyncBestEffortAsync(string operation, Func<Task> enqueue)
+    {
+        try
+        {
+            await enqueue();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Admin Gozargah sync enqueue failed after panel operation. operation={Operation}", operation);
+        }
+    }
+
+    /// <summary>
+    /// Resolves the Gozargah website owner for an XUI client without changing the panel owner id.
+    /// </summary>
+    /// <param name="client">Fresh panel client whose Telegram id is the buyer/technical owner.</param>
+    /// <param name="metadata">Parsed panel metadata containing the creating bot id and buyer id.</param>
+    /// <param name="cancellationToken">Token used when the persisted tenant registry must be consulted.</param>
+    /// <returns>
+    /// Tenant-aware ownership when the buyer id is valid; <c>null</c> when a tenant owner is missing or the client
+    /// has no usable Telegram id.
+    /// </returns>
+    /// <remarks>
+    /// A tenant account is registered on the website under the colleague that owns the storefront, while the buyer
+    /// remains the panel <c>tguserid</c>. Missing tenant ownership is fail-closed so an account cannot be attributed
+    /// to the wrong website user during admin renewal or historical repair.
+    /// </remarks>
+    private async Task<GozargahSyncOwnership> ResolveGozargahOwnershipAsync(
+        XuiV3Client client,
+        XuiV3ClientMetadata metadata,
+        CancellationToken cancellationToken)
+    {
+        var buyerTelegramUserId = client?.TgId > 0
+            ? client.TgId
+            : metadata?.TelegramUserId ?? 0;
+        if (buyerTelegramUserId <= 0)
+            return null;
+
+        var createdByBotId = metadata?.CreatedByBotId?.Trim();
+        if (string.IsNullOrWhiteSpace(createdByBotId))
+            return new GozargahSyncOwnership(buyerTelegramUserId, buyerTelegramUserId);
+
+        var configuredBot = _botRegistry.Bots.FirstOrDefault(bot =>
+            string.Equals(bot.Id, createdByBotId, StringComparison.OrdinalIgnoreCase));
+        if (configuredBot?.Type == null ||
+            !string.Equals(configuredBot.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
+        {
+            var persistedBot = await _userDbContext.BotInstances
+                .AsNoTracking()
+                .FirstOrDefaultAsync(bot => bot.Id == createdByBotId, cancellationToken);
+            if (persistedBot == null ||
+                !string.Equals(persistedBot.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
+            {
+                if (createdByBotId.StartsWith("tenant-", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning(
+                        "Cannot verify tenant bot ownership for Gozargah sync. tenantBotId={TenantBotId}, buyerTelegramUserId={BuyerTelegramUserId}, email={Email}",
+                        createdByBotId,
+                        buyerTelegramUserId,
+                        client?.Email);
+                    return null;
+                }
+
+                return new GozargahSyncOwnership(buyerTelegramUserId, buyerTelegramUserId);
+            }
+
+            if (persistedBot.OwnerTelegramUserId.GetValueOrDefault() <= 0)
+            {
+                _logger.LogWarning(
+                    "Cannot resolve Gozargah owner for tenant client. tenantBotId={TenantBotId}, buyerTelegramUserId={BuyerTelegramUserId}, email={Email}",
+                    createdByBotId,
+                    buyerTelegramUserId,
+                    client?.Email);
+                return null;
+            }
+
+            return new GozargahSyncOwnership(
+                persistedBot.OwnerTelegramUserId.Value,
+                buyerTelegramUserId,
+                persistedBot.Id);
+        }
+
+        if (configuredBot.OwnerTelegramUserId.GetValueOrDefault() <= 0)
+        {
+            _logger.LogWarning(
+                "Cannot resolve Gozargah owner for configured tenant client. tenantBotId={TenantBotId}, buyerTelegramUserId={BuyerTelegramUserId}, email={Email}",
+                configuredBot.Id,
+                buyerTelegramUserId,
+                client?.Email);
+            return null;
+        }
+
+        return new GozargahSyncOwnership(
+            configuredBot.OwnerTelegramUserId.Value,
+            buyerTelegramUserId,
+            configuredBot.Id);
     }
 
     private static XuiV3ClientMetadata TryReadMetadata(string comment)
