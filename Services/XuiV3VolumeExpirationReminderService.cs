@@ -13,9 +13,10 @@ using Telegram.Bot.Types.ReplyMarkups;
 /// </summary>
 /// <remarks>
 /// Each enabled iteration performs exactly one <c>/panel/api/clients/list</c> request. Only contradictory expiry
-/// evidence can schedule a backoff-controlled <c>GET clients/get/{email}</c> verification. Client cycle and delivery
-/// state lives in <c>users.db</c>, while recipient profile/block information remains in <c>credentials.db</c>. Messages
-/// are sent by the owned or tenant bot recorded in metadata; no wallet, order, payment, or XUI mutation occurs.
+/// evidence and newly due reminder-comment enrichment can schedule a <c>GET clients/get/{email}</c>. A verified
+/// expiry GET is reused for its customer comment. Client cycle and delivery state lives in <c>users.db</c>, while
+/// recipient profile/block information remains in <c>credentials.db</c>. Messages are sent by the owned or tenant bot
+/// recorded in metadata; no wallet, order, payment, or XUI mutation occurs.
 /// </remarks>
 public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
 {
@@ -132,8 +133,9 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     /// from looking like deletion, counter reset, or renewal. Lower thresholds are not emitted when the same scan
     /// first observes a higher threshold. Recoverably malformed individual client rows are skipped and summarized in
     /// one diagnostic entry so one historical panel row cannot abort reconciliation for every valid account.
-    /// A direct GET is allowed only when all list expiry sources say expired while current bot metadata disagrees;
-    /// its id and normalized email must match before its expiry evidence can be used.
+    /// A direct GET is allowed when all list expiry sources conflict with current metadata or when a newly due
+    /// candidate needs its customer comment. Identity must match before either expiry or comment data can be used,
+    /// and a successful expiry-verification response is reused rather than requested twice.
     /// </remarks>
     private async Task RunScanAsync(AppConfig config, CancellationToken cancellationToken)
     {
@@ -170,6 +172,7 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
 
                 evaluatedClients.Add(new XuiV3VolumeReminderEvaluatedClient
                 {
+                    ListClient = client,
                     Snapshot = snapshot,
                     InitialEligibility = XuiV3ClientUsageResolver.EvaluateVolumeReminderEligibility(
                         snapshot,
@@ -207,6 +210,7 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             nowUtc,
             cancellationToken);
         var observations = new List<XuiV3VolumeReminderObservation>(evaluatedClients.Count);
+        var verifiedComments = new Dictionary<int, XuiV3ReminderCommentResolution>();
         foreach (var evaluatedClient in evaluatedClients)
         {
             var snapshot = evaluatedClient.Snapshot;
@@ -214,6 +218,8 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                 ? await VerifyExpiryEligibilityAsync(serverInfo, evaluatedClient, nowUtc, cancellationToken)
                 : XuiV3VolumeEligibilityProbeResult.NotAttempted(evaluatedClient.InitialEligibility);
             var eligibility = probe.Eligibility;
+            if (probe.CommentResolution != null)
+                verifiedComments[snapshot.ClientId] = probe.CommentResolution;
             observations.Add(new XuiV3VolumeReminderObservation
             {
                 ClientId = snapshot.ClientId,
@@ -246,6 +252,7 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
 
         var candidates = await _stateStore.ReconcileAsync(panelKey, observations, nowUtc, cancellationToken);
         var startedKeys = await _stateStore.GetStartedBotUserKeysAsync(candidates, cancellationToken);
+        var evaluatedClientsById = evaluatedClients.ToDictionary(item => item.Snapshot.ClientId);
         var sent = 0;
         var skipped = 0;
         var failed = 0;
@@ -310,6 +317,37 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                 continue;
             }
 
+            if (!verifiedComments.TryGetValue(candidate.ClientId, out var commentResolution))
+            {
+                if (!evaluatedClientsById.TryGetValue(candidate.ClientId, out var evaluatedClient))
+                {
+                    _logger.LogDebug(
+                        "XUI volume reminder comment enrichment deferred. clientId={ClientId}, result={Result}",
+                        candidate.ClientId,
+                        "list_snapshot_missing");
+                    skipped++;
+                    continue;
+                }
+
+                commentResolution = await XuiV3ReminderCommentResolver.ResolveAsync(
+                    serverInfo,
+                    _configuration,
+                    evaluatedClient.ListClient,
+                    cancellationToken);
+            }
+
+            if (!commentResolution.Success)
+            {
+                // No claim has been taken yet, so the same threshold remains eligible after the detail endpoint or
+                // metadata is repaired. Only numeric id and categorical status are safe for diagnostics.
+                _logger.LogDebug(
+                    "XUI volume reminder comment enrichment deferred. clientId={ClientId}, result={Result}",
+                    candidate.ClientId,
+                    commentResolution.Status);
+                skipped++;
+                continue;
+            }
+
             if (!await _stateStore.TryClaimAsync(candidate, DateTime.UtcNow, cancellationToken))
             {
                 skipped++;
@@ -322,7 +360,12 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                 Message delivered;
                 using (_botContextAccessor.Push(new BotRuntimeContext { Config = bot, Client = botClient }))
                 {
-                    delivered = await SendWithRateLimitAsync(botClient, chatId, candidate, cancellationToken);
+                    delivered = await SendWithRateLimitAsync(
+                        botClient,
+                        chatId,
+                        candidate,
+                        commentResolution.UserComment,
+                        cancellationToken);
                 }
 
                 try
@@ -445,7 +488,8 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                 serverInfo,
                 _configuration,
                 evaluatedClient.Snapshot.Email,
-                cancellationToken);
+                cancellationToken,
+                suppressIdentifierBearingRetryLogs: true);
             if (!directResponse.Success || directResponse.Obj == null)
             {
                 return XuiV3VolumeEligibilityProbeResult.FromAttempt(
@@ -458,11 +502,10 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             }
 
             var directClient = directResponse.Obj;
-            if (directClient.Id != evaluatedClient.Snapshot.ClientId ||
-                !string.Equals(
-                    directClient.Email?.Trim(),
-                    evaluatedClient.Snapshot.Email?.Trim(),
-                    StringComparison.OrdinalIgnoreCase))
+            var commentResolution = XuiV3ReminderCommentResolver.ResolveVerifiedClient(
+                evaluatedClient.ListClient,
+                directClient);
+            if (commentResolution.Status == XuiV3ReminderCommentResolutionStatus.IdentityMismatch)
             {
                 return XuiV3VolumeEligibilityProbeResult.FromAttempt(
                     XuiV3VolumeReminderEligibilityResult.Create(
@@ -470,7 +513,8 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                         evaluatedClient.InitialEligibility.Threshold,
                         $"{evaluatedClient.InitialEligibility.Summary};probe=identity_mismatch"),
                     attemptedAtUtc,
-                    attemptedAtUtc.Add(DefinitiveProbeBackoff));
+                    attemptedAtUtc.Add(DefinitiveProbeBackoff),
+                    commentResolution);
             }
 
             var directSnapshot = XuiV3ClientUsageResolver.Resolve(directClient);
@@ -486,7 +530,8 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             return XuiV3VolumeEligibilityProbeResult.FromAttempt(
                 combinedEligibility,
                 attemptedAtUtc,
-                combinedEligibility.IsEligible ? null : attemptedAtUtc.Add(DefinitiveProbeBackoff));
+                combinedEligibility.IsEligible ? null : attemptedAtUtc.Add(DefinitiveProbeBackoff),
+                commentResolution);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -609,6 +654,10 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     /// <param name="botClient">Originating owned or tenant Telegram client.</param>
     /// <param name="chatId">Private Telegram chat id of the verified account owner.</param>
     /// <param name="candidate">Claimed client/cycle/threshold whose message is being sent.</param>
+    /// <param name="userComment">
+    /// Identity-checked, normalized customer-authored comment, or an empty string when no comment was registered.
+    /// It is untrusted display text and is HTML-encoded by the message builder.
+    /// </param>
     /// <param name="cancellationToken">Host shutdown token for pacing, retry delay, and Telegram transport.</param>
     /// <returns>The concrete Telegram message accepted by the bot API.</returns>
     /// <remarks>
@@ -619,6 +668,7 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
         ITelegramBotClient botClient,
         long chatId,
         XuiV3VolumeReminderCandidate candidate,
+        string userComment,
         CancellationToken cancellationToken)
     {
         for (var attempt = 1; ; attempt++)
@@ -628,7 +678,7 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             {
                 var message = await botClient.SendTextMessageAsync(
                     chatId: chatId,
-                    text: BuildMessage(candidate),
+                    text: BuildMessage(candidate, userComment),
                     parseMode: ParseMode.Html,
                     replyMarkup: BuildKeyboard(candidate),
                     cancellationToken: cancellationToken);
@@ -673,8 +723,13 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     /// Builds the Persian HTML reminder for one account and threshold.
     /// </summary>
     /// <param name="candidate">Claimed reminder candidate containing only owner-safe account and usage facts.</param>
-    /// <returns>Customer-facing HTML text for 80, 90, or final 99 percent consumption.</returns>
-    private static string BuildMessage(XuiV3VolumeReminderCandidate candidate)
+    /// <param name="userComment">
+    /// Verified normalized customer comment, or an empty string. The value is HTML-encoded before rendering.
+    /// </param>
+    /// <returns>
+    /// Customer-facing HTML text for 80, 90, or final 99 percent consumption, including the optional comment.
+    /// </returns>
+    private static string BuildMessage(XuiV3VolumeReminderCandidate candidate, string userComment)
     {
         var builder = new StringBuilder();
         if (candidate.Threshold >= XuiV3ClientUsageResolver.FinalThreshold99)
@@ -682,6 +737,8 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             builder.AppendLine("⛔️ پایان حجم اکانت");
             builder.AppendLine();
             builder.AppendLine($"اکانت: <code>{Html(candidate.Email)}</code>");
+            if (!string.IsNullOrWhiteSpace(userComment))
+                builder.AppendLine($"📝 کامنت: <code>{Html(userComment)}</code>");
             builder.AppendLine($"مصرف: <b>{Html(FormatTraffic(candidate.UsedBytes))}</b> از <b>{Html(FormatTraffic(candidate.TotalBytes))}</b>");
             builder.AppendLine();
             builder.AppendLine("شما کل حجم خود را مصرف کرده‌اید و اکانت شما تمام شد.");
@@ -694,6 +751,8 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             : "⚠️ یادآوری مصرف حجم");
         builder.AppendLine();
         builder.AppendLine($"اکانت: <code>{Html(candidate.Email)}</code>");
+        if (!string.IsNullOrWhiteSpace(userComment))
+            builder.AppendLine($"📝 کامنت: <code>{Html(userComment)}</code>");
         builder.AppendLine($"شما به <b>{candidate.Threshold}٪</b> مصرف حجم بسته خود رسیده‌اید.");
         builder.AppendLine($"مصرف فعلی: <b>{Html(FormatTraffic(candidate.UsedBytes))}</b> از <b>{Html(FormatTraffic(candidate.TotalBytes))}</b>");
         builder.AppendLine();
@@ -798,6 +857,11 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
 /// </summary>
 internal sealed class XuiV3VolumeReminderEvaluatedClient
 {
+    /// <summary>
+    /// Original complete-list client retained only in memory for identity-checked reminder-comment enrichment.
+    /// Its email, UUID, SubId, and raw comment must never be written to structured logs or users.db.
+    /// </summary>
+    public XuiV3Client ListClient { get; init; }
     /// <summary>Normalized list snapshot containing usage, ownership, and separate expiry sources.</summary>
     public XuiV3ClientUsageSnapshot Snapshot { get; init; }
     /// <summary>Initial decision used directly or routed through bounded GET-only verification.</summary>
@@ -805,7 +869,8 @@ internal sealed class XuiV3VolumeReminderEvaluatedClient
 }
 
 /// <summary>
-/// Detached outcome of an optional GET-only expiry verification, including its durable retry schedule.
+/// Detached outcome of an optional GET-only expiry verification, including its durable retry schedule and reusable
+/// user-comment result when a matching detail response was available.
 /// </summary>
 internal sealed class XuiV3VolumeEligibilityProbeResult
 {
@@ -817,6 +882,10 @@ internal sealed class XuiV3VolumeEligibilityProbeResult
     public DateTime? AttemptedAtUtc { get; init; }
     /// <summary>UTC time at which another contradictory-expiry GET may run, or null when no backoff is required.</summary>
     public DateTime? NextAttemptAtUtc { get; init; }
+    /// <summary>
+    /// Comment result extracted from the same identity-checked GET, or null when no direct response was available.
+    /// </summary>
+    public XuiV3ReminderCommentResolution CommentResolution { get; init; }
 
     /// <summary>
     /// Creates a result for a scan that retained an existing durable probe backoff.
@@ -836,16 +905,21 @@ internal sealed class XuiV3VolumeEligibilityProbeResult
     /// <param name="eligibility">Sanitized final decision derived from the direct response or safe failure category.</param>
     /// <param name="attemptedAtUtc">UTC timestamp at which the direct GET began.</param>
     /// <param name="nextAttemptAtUtc">Optional UTC end of the durable retry backoff.</param>
+    /// <param name="commentResolution">
+    /// Optional user-comment result extracted from the same detail response. It contains no raw metadata or id.
+    /// </param>
     /// <returns>A detached result whose probe timestamps should replace the persisted schedule.</returns>
     public static XuiV3VolumeEligibilityProbeResult FromAttempt(
         XuiV3VolumeReminderEligibilityResult eligibility,
         DateTime attemptedAtUtc,
-        DateTime? nextAttemptAtUtc)
+        DateTime? nextAttemptAtUtc,
+        XuiV3ReminderCommentResolution commentResolution = null)
         => new()
         {
             Eligibility = eligibility ?? throw new ArgumentNullException(nameof(eligibility)),
             Attempted = true,
             AttemptedAtUtc = attemptedAtUtc,
-            NextAttemptAtUtc = nextAttemptAtUtc
+            NextAttemptAtUtc = nextAttemptAtUtc,
+            CommentResolution = commentResolution
         };
 }

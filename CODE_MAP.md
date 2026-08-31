@@ -96,6 +96,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   current bot metadata is resolved by one identity-checked `GET clients/get/{email}` only; failures use durable
   per-client backoff and never consume a threshold. Migration `20260821203515_AddXuiV3VolumeReminderEligibilityDiagnostics`
   adds nullable sanitized decision/probe fields without backfill or changes to existing cycles.
+- `Services/XuiV3ReminderCommentResolver.cs`: shared GET-only, identity-checked extraction of
+  `XuiV3ClientMetadata.UserComment` for due time/volume reminders. Raw panel comments are never exposed; missing user
+  comments omit the line, while unavailable/mismatched/malformed detail responses defer only that account before
+  time dedup or volume claim. Legacy tenant-sale audit text stored in `UserComment` is treated as internal/absent. A
+  detail GET already used for expiry verification is reused for comment extraction.
 - `Services/XuiV3AdminFlowService.cs`: super-admin XUI v3 management flows.
 - `Services/XuiV3LinkChangeOperationStore.cs`: per-operation users.db contexts, atomic confirmation, active-client uniqueness, leases, and bounded recovery state for link changes.
 - `Services/XuiV3LinkChangeRecoveryService.cs`: hosted worker that resumes the exact persisted email/UUID/subId after ambiguous XUI responses or process restarts.
@@ -284,7 +289,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   disabled at/above 99%; volume consumption messaging belongs only to the independent volume worker. Its optional
   config defaults are disabled/30 minutes, enabled interval must be 5-1440, and production config explicitly enables
   30 minutes. The full clients list supplies normal usage/`updatedAt`; direct client GETs are limited to persisted,
-  backoff-controlled read-only expiry verification and must never become general per-client polling.
+  backoff-controlled expiry verification or newly due reminder-comment enrichment and must never become general
+  per-client polling. Reminder messages show only the verified customer `UserComment`, never raw metadata JSON.
 - `XuiV3VolumeReminderStates` is unique by credential-free `PanelKey + ClientId`. A cycle resets for counter drop,
   quota increase, client recreation, newer bot renewal metadata, or successful owned/admin/tenant renewal hook;
   `updatedAt` alone never resets it. Only the highest crossed threshold is sent, stale ambiguous claims are suppressed

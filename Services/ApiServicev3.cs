@@ -724,9 +724,60 @@ public class ApiServicev3
         return SendAsync<JToken>(serverInfo, configuration, HttpMethod.Get, "/panel/api/clients/list/paged", null, true, cancellationToken, queryValues);
     }
 
-    /// <summary>GET /panel/api/clients/get/{email}. Fetches one client by email.</summary>
-    public static Task<XuiV3ApiResponse<XuiV3Client>> GetClientAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default)
-        => SendAsync<XuiV3Client>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/clients/get/{EscapePath(email)}", null, true, cancellationToken);
+    /// <summary>
+    /// Fetches one current XUI client detail row by its exact panel email.
+    /// </summary>
+    /// <param name="serverInfo">
+    /// Authenticated XUI v3 panel descriptor. Its URL and token must remain in trusted server-side memory.
+    /// </param>
+    /// <param name="configuration">Runtime timeout, authentication, and read-only retry configuration.</param>
+    /// <param name="email">
+    /// Exact client email obtained from an already authorized or complete-list panel row. It is escaped as one URL
+    /// segment and must not be accepted directly from an unverified callback or written to operational logs.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the authenticated detail request and permitted retry delay.</param>
+    /// <param name="suppressIdentifierBearingRetryLogs">
+    /// <c>true</c> to issue one GET attempt without shared retry diagnostics because the URI contains a private email;
+    /// <c>false</c> to retain the existing bounded read-only retries for established callers.
+    /// </param>
+    /// <returns>
+    /// The panel response envelope containing the current client, or an unsuccessful envelope that callers must
+    /// classify. The returned UUID, SubId, comment, and extension fields are sensitive and must not be logged.
+    /// </returns>
+    /// <remarks>
+    /// Calls <c>GET /panel/api/clients/get/{email}</c> and never mutates panel state. Reminder enrichment passes
+    /// <paramref name="suppressIdentifierBearingRetryLogs"/> as <c>true</c>; all existing callers keep their prior
+    /// retry behavior through the default value.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var response = await ApiServicev3.GetClientAsync(
+    ///     serverInfo,
+    ///     configuration,
+    ///     authorizedClient.Email,
+    ///     cancellationToken,
+    ///     suppressIdentifierBearingRetryLogs: true);
+    /// </code>
+    /// </example>
+    /// <exception cref="XuiV3ApiException">Thrown when the panel returns an unsuccessful HTTP status.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is cancelled.</exception>
+    public static Task<XuiV3ApiResponse<XuiV3Client>> GetClientAsync(
+        ServerInfo serverInfo,
+        IConfiguration configuration,
+        string email,
+        CancellationToken cancellationToken = default,
+        bool suppressIdentifierBearingRetryLogs = false)
+        => SendAsync<XuiV3Client>(
+            serverInfo,
+            configuration,
+            HttpMethod.Get,
+            $"/panel/api/clients/get/{EscapePath(email)}",
+            null,
+            true,
+            cancellationToken,
+            retryMode: suppressIdentifierBearingRetryLogs
+                ? XuiV3RequestRetryMode.NoAutomaticRetry
+                : XuiV3RequestRetryMode.ReadOnly);
 
     /// <summary>
     /// POST /panel/api/clients/add. Creates a client and attaches it to one or more inbounds.
