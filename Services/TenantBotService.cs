@@ -700,7 +700,9 @@ public class TenantBotService
     /// Normal list/search callbacks remain owner-checked because a numeric id is not an identifier proof. The
     /// <c>auren</c> callback requires saved exact-identifier search state, while <c>rgo</c> requires the persisted
     /// third-party warning state. Every selected target stores a fresh UUID separately from payment choice. These
-    /// callbacks grant renewal only and never configuration, mutation, or ownership access.
+    /// callbacks grant renewal only and never configuration, mutation, or ownership access. Before a selector is shown,
+    /// the per-email detail comment is read and identity-checked so a positive-expiry unlimited account sharing normal
+    /// inbounds cannot be misclassified from an incomplete list row.
     /// </remarks>
     private async Task HANDLETENANTRENEWFROMCALLBACKASYNC(
         ITelegramBotClient botClient,
@@ -768,18 +770,23 @@ public class TenantBotService
             return;
         }
 
-        var service = ResolveTenantServiceForClient(client);
-        if (service == null)
+        var serviceResolution = await ResolveTenantRenewalServiceAsync(
+            BuildConfiguredPanelServerInfo(),
+            client,
+            cancellationToken);
+        if (!serviceResolution.Success)
         {
             await SendTenantRenewTerminalAsync(
                 botClient,
                 chatId,
                 customer.TelegramUserId,
-                "این اکانت مربوط به پلن‌های فعال فروشگاه نیست و از این مسیر قابل تمدید نیست.",
+                BuildTenantRenewServiceResolutionFailureText(serviceResolution.Status),
                 allowSearchRestart: allowExternalRenew,
                 cancellationToken);
             return;
         }
+
+        var service = serviceResolution.Service;
 
         var belongsToCustomer = ClientBelongsToTenantCustomer(client, customer.TelegramUserId, tenant.Id);
         if (!TryNormalizeTenantClientUuid(client.Uuid, out var targetUuid) && !belongsToCustomer)
@@ -3606,8 +3613,11 @@ public class TenantBotService
     /// flag, while a numeric custom duration is independent of presets and must satisfy the current normal-service
     /// custom range. The actual renewal is not applied until a tenant payment order is settled, which keeps duplicate
     /// callbacks idempotent. If a preset becomes disabled at confirmation, the duration is explicitly emptied while
-    /// preserving the tenant-scoped target-account identity lock and the rest of the renewal state. A disabled unlimited
-    /// sub-plan returns to the active tenant-priced plan keyboard before any order is created.
+    /// preserving the tenant-scoped target-account identity lock and the rest of the renewal state. Before any traffic,
+    /// duration, plan, or confirmation text is consumed, the target is reloaded and its identity-checked detail comment
+    /// is compared with the saved service key. A stale service selection is reset to the current category without
+    /// creating an order or calling a payment provider. A disabled unlimited sub-plan returns to the active tenant-priced
+    /// plan keyboard before any order is created.
     /// </remarks>
     /// <returns>A task that completes after the current state transition and its Telegram response.</returns>
     /// <exception cref="OperationCanceledException">
@@ -3646,15 +3656,38 @@ public class TenantBotService
             return;
         }
 
-        var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => string.Equals(x.Key, user.SelectedCountry, StringComparison.OrdinalIgnoreCase));
-        if (service == null)
+        var serverInfo = BuildConfiguredPanelServerInfo();
+        var renewalClient = await GetAuthorizedTenantRenewClientAsync(
+            serverInfo,
+            user,
+            customer.TelegramUserId,
+            tenant.Id,
+            cancellationToken);
+        var serviceResolution = await ResolveTenantRenewalServiceAsync(
+            serverInfo,
+            renewalClient,
+            cancellationToken);
+        if (!serviceResolution.Success)
         {
             await SendTenantRenewTerminalAsync(
                 botClient,
                 message.Chat.Id,
                 message.From.Id,
-                "سرویس اکانت برای تمدید پیدا نشد. دوباره از منوی تمدید اقدام کنید.",
+                BuildTenantRenewServiceResolutionFailureText(serviceResolution.Status),
                 allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        var service = serviceResolution.Service;
+        if (!string.Equals(service.Key, user.SelectedCountry, StringComparison.OrdinalIgnoreCase))
+        {
+            await RecoverTenantRenewServiceSelectionAsync(
+                botClient,
+                message.Chat.Id,
+                tenant,
+                user,
+                service,
                 cancellationToken);
             return;
         }
@@ -3781,7 +3814,9 @@ public class TenantBotService
     /// <remarks>
     /// The panel-derived UUID is persisted separately in <see cref="User.RenewTargetUuid"/> for every safely lockable
     /// renewal and is checked again before summary, order creation, and fulfillment. An owned UUID-less legacy client
-    /// retains owner checks. No identifier grants account-management access or changes XUI ownership metadata.
+    /// retains owner checks. After target resolution, the identity-checked per-email comment is the authoritative service
+    /// category; transient detail failure without readable list metadata stops safely. No identifier grants
+    /// account-management access or changes XUI ownership metadata.
     /// </remarks>
     private async Task STARTTENANTRENEWSELECTIONASYNC(
         ITelegramBotClient botClient,
@@ -3844,18 +3879,20 @@ public class TenantBotService
 
         var client = resolution.Client;
 
-        var service = ResolveTenantServiceForClient(client);
-        if (service == null)
+        var serviceResolution = await ResolveTenantRenewalServiceAsync(serverInfo, client, cancellationToken);
+        if (!serviceResolution.Success)
         {
             await SendTenantRenewTerminalAsync(
                 botClient,
                 message.Chat.Id,
                 message.From.Id,
-                "این اکانت مربوط به پلن‌های فعال فروشگاه نیست و از این مسیر قابل تمدید نیست.",
+                BuildTenantRenewServiceResolutionFailureText(serviceResolution.Status),
                 allowSearchRestart: false,
                 cancellationToken);
             return;
         }
+
+        var service = serviceResolution.Service;
 
         if (!ClientBelongsToTenantCustomer(client, customer.TelegramUserId, tenant.Id))
         {
@@ -4044,6 +4081,63 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Repairs a tenant renewal state whose saved service category no longer matches the target's authoritative comment.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram client for the active tenant storefront. It is used only to show the corrected selector.
+    /// </param>
+    /// <param name="chatId">Tenant customer chat receiving the recovery message and replacement keyboard.</param>
+    /// <param name="tenant">
+    /// Active tenant bot whose markup and tenant-visible unlimited plans determine displayed renewal prices.
+    /// </param>
+    /// <param name="user">
+    /// Bot-scoped conversation row for the current tenant plus Telegram user. Its exact email and UUID target lock are
+    /// preserved, while traffic, duration, and unlimited-plan selections are explicitly cleared.
+    /// </param>
+    /// <param name="service">
+    /// Enabled service resolved from identity-checked live client metadata or the configured legacy fallback.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels users.db persistence and Telegram delivery.</param>
+    /// <returns>A task that completes after the corrected tenant state and selector are delivered.</returns>
+    /// <remarks>
+    /// This recovery has no payment, wallet, order, provider, or XUI mutation side effects. Empty strings are assigned
+    /// deliberately because partial user-state persistence treats <c>null</c> as "preserve the previous value".
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// await RecoverTenantRenewServiceSelectionAsync(
+    ///     botClient, chatId, tenant, state, resolvedService, cancellationToken);
+    /// </code>
+    /// </example>
+    private async Task RecoverTenantRenewServiceSelectionAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        BotInstance tenant,
+        User user,
+        XuiV3ServiceDefinition service,
+        CancellationToken cancellationToken)
+    {
+        user.Flow = TENANTRENEWFLOW;
+        user.LastStep = service.IsUnlimited ? TENANTRENEWSTEPUNLIMITEDPLAN : TENANTRENEWSTEPTRAFFIC;
+        user.SelectedCountry = service.Key;
+        user.TotoalGB = string.Empty;
+        user.SelectedPeriod = string.Empty;
+        user.Type = string.Empty;
+        user.PendingUserComment = string.Empty;
+        await _userDbcontext.SaveUserStatus(user);
+
+        await botClient.SendTextMessageAsync(
+            chatId,
+            $"نوع سرویس اکانت از اطلاعات فعلی پنل دوباره تشخیص داده شد: <b>{Html(service.DisplayName)}</b>\n" +
+            "انتخاب قبلی کنار گذاشته شد. لطفاً گزینه تمدید مناسب این سرویس را انتخاب کنید.",
+            parseMode: ParseMode.Html,
+            replyMarkup: service.IsUnlimited
+                ? BuildTenantRenewUnlimitedKeyboard(service, tenant)
+                : BuildTenantRenewTrafficKeyboard(service),
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
     /// Revalidates and confirms a tenant third-party renewal warning before any plan or payable order is created.
     /// </summary>
     /// <param name="botClient">Tenant Telegram client that received the fixed callback.</param>
@@ -4056,7 +4150,9 @@ public class TenantBotService
     /// <returns>A task that completes after safe rejection or delivery of the tenant plan selector.</returns>
     /// <remarks>
     /// Callback data contains no account identity. Email, UUID, eligibility, and bot-scoped state are checked again;
-    /// stale or cross-bot callbacks cannot create an order or expose any account-management action.
+    /// stale or cross-bot callbacks cannot create an order or expose any account-management action. The current detail
+    /// comment is read again before the selector is shown, so a warning saved with a stale or incomplete list category
+    /// cannot continue under the wrong tenant service.
     /// </remarks>
     private async Task HANDLETENANTEXTERNALRENEWTARGETCONFIRMATIONASYNC(
         ITelegramBotClient botClient,
@@ -4089,18 +4185,23 @@ public class TenantBotService
             customer.TelegramUserId,
             tenant.Id,
             cancellationToken);
-        var service = client == null ? null : ResolveTenantServiceForClient(client);
-        if (client == null || service == null)
+        var serviceResolution = await ResolveTenantRenewalServiceAsync(
+            BuildConfiguredPanelServerInfo(),
+            client,
+            cancellationToken);
+        if (!serviceResolution.Success)
         {
             await SendTenantRenewTerminalAsync(
                 botClient,
                 chatId,
                 customer.TelegramUserId,
-                "اکانت هدف حذف شده، شناسه آن تغییر کرده یا دیگر در پلن‌های فعال قابل تمدید نیست.",
+                BuildTenantRenewServiceResolutionFailureText(serviceResolution.Status),
                 allowSearchRestart: false,
                 cancellationToken);
             return;
         }
+
+        var service = serviceResolution.Service;
 
         await STARTTENANTRENEWPLANSELECTIONASYNC(
             botClient,
@@ -4180,8 +4281,10 @@ public class TenantBotService
     /// replacement quota and a first-connection duration after reset. Metered renewals show the effective storefront
     /// per-GB and per-day calculation without exposing the tenant owner's colleague base rates. Fresh account data is
     /// authorized again before rendering; an email/UUID mismatch clears state and prevents confirmation. An unresolved
-    /// account-level renewal lock stops the preview before the customer can create or fund another order. Unlimited
-    /// state is also checked against the current tenant-visible catalog before the summary can expose a payable action.
+    /// account-level renewal lock stops the preview before the customer can create or fund another order. The current
+    /// detail comment is resolved before price resolution, and a service mismatch returns the same exact target to the
+    /// correct category selector instead of rendering a payable summary. Unlimited state is also checked against the
+    /// current tenant-visible catalog before the summary can expose a payable action.
     /// </remarks>
     private async Task SendTenantRenewSummaryAsync(
         ITelegramBotClient botClient,
@@ -4191,10 +4294,6 @@ public class TenantBotService
         User user,
         CancellationToken cancellationToken)
     {
-        var selection = BuildTenantRenewSelectionFromState(user);
-        var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
-        var price = CalculateTenantPrice(tenant, selection);
-        var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
         var serverInfo = BuildConfiguredPanelServerInfo();
         var client = await GetAuthorizedTenantRenewClientAsync(
             serverInfo,
@@ -4213,6 +4312,36 @@ public class TenantBotService
                 cancellationToken);
             return;
         }
+
+        var serviceResolution = await ResolveTenantRenewalServiceAsync(serverInfo, client, cancellationToken);
+        if (!serviceResolution.Success)
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                BuildTenantRenewServiceResolutionFailureText(serviceResolution.Status),
+                allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        if (!string.Equals(serviceResolution.Service.Key, user.SelectedCountry, StringComparison.OrdinalIgnoreCase))
+        {
+            await RecoverTenantRenewServiceSelectionAsync(
+                botClient,
+                chatId,
+                tenant,
+                user,
+                serviceResolution.Service,
+                cancellationToken);
+            return;
+        }
+
+        var selection = BuildTenantRenewSelectionFromState(user);
+        var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
+        var price = CalculateTenantPrice(tenant, selection);
+        var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
 
         if (await _renewalOperationStore.FindBlockingOperationAsync(
                 client.Uuid,
@@ -4280,7 +4409,9 @@ public class TenantBotService
     /// routine, which applies the renewal exactly once. Every safely lockable renewal stores the normalized target UUID
     /// on the order; old state or an owned legacy client without UUID leaves it null and remains owner-checked. A live
     /// unresolved-operation lookup runs before insertion so no new payable order is offered for a locked account.
-    /// Authoritative tenant pricing rejects a hidden unlimited plan before the order row is created.
+    /// Authoritative tenant pricing rejects a hidden unlimited plan before the order row is created. The target's live
+    /// detail metadata is also compared with the saved service category; a mismatch resets the state selector and creates
+    /// no order, payment row, provider request, wallet entry, or XUI mutation.
     /// </remarks>
     private async Task CreateTenantRenewOrderFromStateAsync(
         ITelegramBotClient botClient,
@@ -4305,6 +4436,31 @@ public class TenantBotService
                 customer.TelegramUserId,
                 "اکانت هدف حذف شده یا UUID آن تغییر کرده است. هیچ سفارشی ساخته نشد.",
                 allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        var serviceResolution = await ResolveTenantRenewalServiceAsync(serverInfo, client, cancellationToken);
+        if (!serviceResolution.Success)
+        {
+            await SendTenantRenewTerminalAsync(
+                botClient,
+                chatId,
+                customer.TelegramUserId,
+                BuildTenantRenewServiceResolutionFailureText(serviceResolution.Status),
+                allowSearchRestart: false,
+                cancellationToken);
+            return;
+        }
+
+        if (!string.Equals(serviceResolution.Service.Key, user.SelectedCountry, StringComparison.OrdinalIgnoreCase))
+        {
+            await RecoverTenantRenewServiceSelectionAsync(
+                botClient,
+                chatId,
+                tenant,
+                user,
+                serviceResolution.Service,
                 cancellationToken);
             return;
         }
@@ -6006,7 +6162,7 @@ public class TenantBotService
         var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
         if (order == null)
         {
-            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد، قبلاً پردازش شده یا نوع سرویس اکانت با سفارش سازگار نیست. دوباره از منوی تمدید اقدام کنید.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
 
@@ -6125,7 +6281,7 @@ public class TenantBotService
         var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
         if (order == null)
         {
-            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد، قبلاً پردازش شده یا نوع سرویس اکانت با سفارش سازگار نیست. دوباره از منوی تمدید اقدام کنید.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
 
@@ -6254,7 +6410,7 @@ public class TenantBotService
             await SafeAnswerCallbackQueryAsync(
                 botClient,
                 callbackQuery.Id,
-                "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.",
+                "سفارش تمدید پیدا نشد، قبلاً پردازش شده یا نوع سرویس اکانت با سفارش سازگار نیست. دوباره از منوی تمدید اقدام کنید.",
                 showAlert: true,
                 cancellationToken: cancellationToken);
             return;
@@ -6553,7 +6709,7 @@ public class TenantBotService
         var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
         if (order == null)
         {
-            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد، قبلاً پردازش شده یا نوع سرویس اکانت با سفارش سازگار نیست. دوباره از منوی تمدید اقدام کنید.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
         if (!IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))
@@ -6745,7 +6901,7 @@ public class TenantBotService
         var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
         if (order == null)
         {
-            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد، قبلاً پردازش شده یا نوع سرویس اکانت با سفارش سازگار نیست. دوباره از منوی تمدید اقدام کنید.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
 
@@ -6777,13 +6933,15 @@ public class TenantBotService
     /// <param name="customer">Current tenant customer.</param>
     /// <param name="cancellationToken">Cancellation token for the database lookup.</param>
     /// <returns>
-    /// The tracked pending renewal order when ownership, status, current plan eligibility, and current tenant sale price
-    /// all match; otherwise <c>null</c>. A null result must not be used to create a payment record or provider invoice.
+    /// The tracked pending renewal order when ownership, status, exact target identity, metadata-derived service category,
+    /// current plan eligibility, and current tenant sale price all match; otherwise <c>null</c>. A null result must not be
+    /// used to create a payment record or provider invoice.
     /// </returns>
     /// <remarks>
     /// This guard prevents a stored <c>days-N</c> order from becoming payable after custom durations are disabled or
     /// narrowed, and also rejects price/markup changes between summary and provider selection. It performs read-only
-    /// validation and does not mutate the order, wallet, ledger, payment provider, or XUI account.
+    /// validation and does not mutate the order, wallet, ledger, payment provider, or XUI account. It performs read-only
+    /// list/detail XUI calls so a previously misclassified or later-changed account cannot be funded under another service.
     /// </remarks>
     private async Task<TenantBotOrder> GetPendingTenantRenewOrderAsync(
         int orderDbId,
@@ -6801,6 +6959,51 @@ public class TenantBotService
             cancellationToken);
         if (order == null)
             return null;
+
+        XuiV3Client client;
+        try
+        {
+            var serverInfo = BuildConfiguredPanelServerInfo();
+            var hasExactTargetLock = !string.IsNullOrWhiteSpace(order.TargetAccountUuid);
+            client = hasExactTargetLock
+                ? await FINDTENANTRENEWTARGETBYLOCKASYNC(
+                    serverInfo,
+                    order.TargetAccountEmail,
+                    order.TargetAccountUuid,
+                    cancellationToken)
+                : await FindTenantClientAsync(serverInfo, order.TargetAccountEmail, cancellationToken);
+            if (client == null ||
+                (!hasExactTargetLock &&
+                 !ClientBelongsToTenantCustomer(client, customer.TelegramUserId, tenant.Id)))
+            {
+                return null;
+            }
+
+            var serviceResolution = await ResolveTenantRenewalServiceAsync(serverInfo, client, cancellationToken);
+            if (!serviceResolution.Success ||
+                !string.Equals(serviceResolution.Service.Key, order.ServiceKey, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "Tenant renewal payment activation rejected by live account service. orderId={OrderId}, storedServiceKey={StoredServiceKey}, resolutionStatus={ResolutionStatus}, liveServiceKey={LiveServiceKey}",
+                    order.OrderId,
+                    order.ServiceKey,
+                    serviceResolution.Status,
+                    serviceResolution.Service?.Key ?? "none");
+                return null;
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                "Tenant renewal payment activation target revalidation failed. orderId={OrderId}, errorType={ErrorType}",
+                order.OrderId,
+                ex.GetType().Name);
+            return null;
+        }
 
         try
         {
@@ -10494,6 +10697,8 @@ public class TenantBotService
     /// The volume-reminder cycle is advanced best-effort after the update/reset and before settlement persistence;
     /// reminder-state failure cannot roll back the panel renewal or alter owner/customer balances.
     /// The selected unlimited plan is revalidated against tenant visibility before renewal calculation or XUI mutation.
+    /// The identity-checked detail comment must also resolve to the same service key stored on the paid order. A transient
+    /// detail-read failure remains retryable; a definitive metadata mismatch fails before UpdateClient and requires support.
     /// The central order audit reports accumulated panel API time and total renewal/settlement time; time waiting for
     /// the payment provider or customer action is excluded.
     /// </remarks>
@@ -10535,6 +10740,38 @@ public class TenantBotService
             await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, "اکانت هدف تمدید پیدا نشد یا اطلاعات هویتی آن تغییر کرده است.", cancellationToken);
             LOGTENANTORDER(order, owner, customer, source, "renew-target-authorization-failed", timing: operationTiming.Snapshot());
             return NowPaymentsSettlementResult.NotFound();
+        }
+
+        var serviceResolution = await ResolveTenantRenewalServiceAsync(serverInfo, client, cancellationToken);
+        if (!serviceResolution.Success &&
+            serviceResolution.Status == XuiV3TenantRenewalServiceResolutionStatus.DetailUnavailable)
+        {
+            _logger.LogWarning(
+                "Paid tenant renewal service revalidation is temporarily unavailable. tenantBotId={TenantBotId}, orderId={OrderId}",
+                order.TenantBotId,
+                order.OrderId);
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+
+        if (!serviceResolution.Success ||
+            !string.Equals(serviceResolution.Service.Key, order.ServiceKey, StringComparison.OrdinalIgnoreCase))
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Failed;
+            order.ErrorMessage = "Tenant renewal target service does not match the paid order service.";
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            _logger.LogError(
+                "Paid tenant renewal rejected before XUI mutation because the live account service differed. tenantBotId={TenantBotId}, orderId={OrderId}, storedServiceKey={StoredServiceKey}, resolutionStatus={ResolutionStatus}, liveServiceKey={LiveServiceKey}",
+                order.TenantBotId,
+                order.OrderId,
+                order.ServiceKey,
+                serviceResolution.Status,
+                serviceResolution.Service?.Key ?? "none");
+            await NOTIFYTENANTCUSTOMERFAILUREASYNC(
+                order,
+                "نوع سرویس فعلی اکانت با سفارش پرداخت‌شده یکسان نیست؛ اکانت تغییر نکرد. لطفاً برای بررسی پرداخت با پشتیبانی تماس بگیرید.",
+                cancellationToken);
+            return NowPaymentsSettlementResult.InvalidAmount();
         }
 
         XuiV3ResolvedPurchase resolved;
@@ -11425,170 +11662,130 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Resolves the active service definition for an existing XUI client.
+    /// Reads the authoritative tenant renewal comment and resolves the account's current service category.
     /// </summary>
-    /// <param name="client">XUI client whose metadata and inbound ids are inspected.</param>
-    /// <returns>The matching enabled service, or <c>null</c> when the client is outside active plan inbounds.</returns>
-    /// <remarks>
-    /// Tenant normal and unlimited services can share the same XUI inbound ids. Metadata is therefore trusted first.
-    /// If an older or link-changed account has no readable metadata, fallback inference uses the negative
-    /// first-use expiry convention to identify unlimited accounts; otherwise shared public inbounds resolve to
-    /// the normal metered service instead of incorrectly showing unlimited renewal plans.
-    /// </remarks>
-    private XuiV3ServiceDefinition ResolveTenantServiceForClient(XuiV3Client client)
-    {
-        var metadata = TryReadTenantMetadata(client?.Comment);
-        var services = _purchaseService.GetEnabledServices();
-        if (!string.IsNullOrWhiteSpace(metadata?.ServiceKey))
-        {
-            var byMetadata = services
-                .FirstOrDefault(x => string.Equals(x.Key, metadata.ServiceKey, StringComparison.OrdinalIgnoreCase));
-            if (byMetadata != null)
-                return byMetadata;
-        }
-
-        var inboundIds = GetTenantClientInboundIds(client, metadata);
-        if (inboundIds.Count == 0)
-            return null;
-
-        var nationalService = services.FirstOrDefault(service =>
-            IsNationalTenantService(service) && ServiceHasAnyInbound(service, inboundIds));
-        if (nationalService != null)
-            return nationalService;
-
-        var normalService = services.FirstOrDefault(service =>
-            IsNormalTenantService(service) && ServiceHasAnyInbound(service, inboundIds));
-        if (normalService != null && !LooksLikeUnlimitedTenantClient(client, metadata))
-            return normalService;
-
-        var unlimitedService = services.FirstOrDefault(service =>
-            service.IsUnlimited && ServiceHasAnyInbound(service, inboundIds));
-        if (unlimitedService != null)
-            return unlimitedService;
-
-        return services.FirstOrDefault(service =>
-            !service.IsUnlimited && ServiceHasAnyInbound(service, inboundIds));
-    }
-
-    /// <summary>
-    /// Checks whether a tenant service definition represents the national metered service.
-    /// </summary>
-    /// <param name="service">Service definition loaded from the XUI v3 plan file.</param>
-    /// <returns><c>true</c> when the service key or inbound profile identifies national traffic.</returns>
-    private static bool IsNationalTenantService(XuiV3ServiceDefinition service)
-    {
-        return string.Equals(service?.Key, "national", StringComparison.OrdinalIgnoreCase) ||
-               (service?.InboundProfileKeys?.Any(key => string.Equals(key, "national", StringComparison.OrdinalIgnoreCase)) ?? false);
-    }
-
-    /// <summary>
-    /// Checks whether a tenant service definition represents the normal metered service.
-    /// </summary>
-    /// <param name="service">Service definition loaded from the XUI v3 plan file.</param>
-    /// <returns><c>true</c> when the service key or inbound profile identifies normal metered traffic.</returns>
-    private static bool IsNormalTenantService(XuiV3ServiceDefinition service)
-    {
-        return string.Equals(service?.Key, "normal", StringComparison.OrdinalIgnoreCase) ||
-               (service?.InboundProfileKeys?.Any(key => string.Equals(key, "normal", StringComparison.OrdinalIgnoreCase)) ?? false);
-    }
-
-    /// <summary>
-    /// Checks whether a tenant service overlaps at least one inbound id from an existing XUI client.
-    /// </summary>
-    /// <param name="service">Service definition whose inbound ids are tested.</param>
-    /// <param name="inboundIds">Inbound ids read from the XUI client and its metadata.</param>
-    /// <returns><c>true</c> when the service and client share at least one inbound id.</returns>
-    private static bool ServiceHasAnyInbound(XuiV3ServiceDefinition service, IReadOnlyCollection<int> inboundIds)
-    {
-        return service?.InboundIds != null &&
-               inboundIds != null &&
-               service.InboundIds.Any(inboundIds.Contains);
-    }
-
-    /// <summary>
-    /// Infers whether a tenant client is likely an unlimited account when metadata is missing.
-    /// </summary>
-    /// <param name="client">XUI client read from the panel.</param>
-    /// <param name="metadata">Parsed client metadata, when available.</param>
+    /// <param name="serverInfo">
+    /// Configured XUI v3 panel descriptor used only for authenticated read-only client detail access.
+    /// </param>
+    /// <param name="listClient">
+    /// Exact client already authorized by email plus UUID, or by the legacy tenant-owner rule. Its identifiers and
+    /// comment are sensitive and are never included in operational logs.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the read-only panel request.</param>
     /// <returns>
-    /// <c>true</c> when metadata explicitly says unlimited or the panel expiry uses the negative
-    /// first-use-duration convention used by unlimited plans.
+    /// A sanitized service decision. Success contains the enabled category used by renewal; failure must stop state,
+    /// order, payment-provider, wallet, and XUI mutation work until the customer starts or retries safely. On success,
+    /// <paramref name="listClient" /> is enriched in memory with the authoritative structured comment when available.
     /// </returns>
     /// <remarks>
-    /// This fallback intentionally does not classify by inbound ids alone because normal and unlimited storefront
-    /// plans can share the same inbounds. That exact ambiguity caused metered accounts to show unlimited renewal
-    /// options after link changes when the panel response did not include service metadata.
+    /// <c>clients/list</c> can omit the comment needed to distinguish normal and unlimited accounts that share inbounds.
+    /// This method therefore reads <c>clients/get/{email}</c>, validates email/UUID/numeric-id identity, and delegates the
+    /// policy decision to the side-effect-free resolver. A transient detail failure may use already-readable list metadata
+    /// but never the normal legacy fallback, preventing a network outage from changing the account category. Copying the
+    /// verified comment onto the detached list row ensures the renewal policy preserves the original owner and audit history;
+    /// it does not write to the panel or database.
     /// </remarks>
-    private static bool LooksLikeUnlimitedTenantClient(XuiV3Client client, XuiV3ClientMetadata metadata)
+    /// <example>
+    /// <code>
+    /// var resolution = await ResolveTenantRenewalServiceAsync(server, client, cancellationToken);
+    /// if (!resolution.Success)
+    ///     return;
+    /// </code>
+    /// </example>
+    private async Task<XuiV3TenantRenewalServiceResolution> ResolveTenantRenewalServiceAsync(
+        ServerInfo serverInfo,
+        XuiV3Client listClient,
+        CancellationToken cancellationToken)
     {
-        if (string.Equals(metadata?.ServiceKind, XuiV3ServiceKinds.Unlimited, StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        if (!string.IsNullOrWhiteSpace(metadata?.ServiceKey) &&
-            string.Equals(metadata.ServiceKey, "unlimited", StringComparison.OrdinalIgnoreCase))
+        if (listClient == null || string.IsNullOrWhiteSpace(listClient.Email))
         {
-            return true;
+            return XuiV3TenantRenewalServiceResolver.Resolve(
+                listClient,
+                detailClient: null,
+                XuiV3TenantClientDetailAvailability.NotFound,
+                _purchaseService.GetEnabledServices());
         }
 
-        return GetTenantExpiryTime(client) < 0;
-    }
-
-    /// <summary>
-    /// Reads the XUI expiry timestamp from a tenant client using panel fields and known extra payload keys.
-    /// </summary>
-    /// <param name="client">XUI client returned by the panel; may omit the top-level expiry field.</param>
-    /// <returns>Expiry timestamp in milliseconds, <c>0</c> for lifetime, or a negative first-use duration.</returns>
-    private static long GetTenantExpiryTime(XuiV3Client client)
-    {
-        if (client == null)
-            return 0;
-
-        if (client.ExpiryTime != 0)
-            return client.ExpiryTime;
-
-        return ReadTenantLongExtra(client.Extra, "expiryTime", "expiry_time", "expiry");
-    }
-
-    /// <summary>
-    /// Reads a long value from a tenant client's raw XUI extra JSON.
-    /// </summary>
-    /// <param name="extra">Raw extra dictionary returned by the XUI panel.</param>
-    /// <param name="keys">Candidate property names that may hold the desired value.</param>
-    /// <returns>The first parsed long value, or <c>0</c> when no key is present.</returns>
-    private static long ReadTenantLongExtra(IDictionary<string, JToken> extra, params string[] keys)
-    {
-        if (extra == null || keys == null || keys.Length == 0)
-            return 0;
-
-        foreach (var key in keys)
+        XuiV3Client detailClient = null;
+        var detailAvailability = XuiV3TenantClientDetailAvailability.Unavailable;
+        try
         {
-            if (string.IsNullOrWhiteSpace(key) || !extra.TryGetValue(key, out var token) || token == null)
-                continue;
-
-            if (token.Type == JTokenType.Integer)
-                return token.Value<long>();
-
-            if (long.TryParse(token.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
-                return value;
+            var response = await ApiServicev3.GetClientAsync(
+                serverInfo,
+                _configuration,
+                listClient.Email,
+                cancellationToken);
+            if (response.Success && response.Obj != null)
+            {
+                detailClient = response.Obj;
+                detailAvailability = XuiV3TenantClientDetailAvailability.Available;
+            }
+        }
+        catch (XuiV3ApiException ex) when (ex.StatusCode == StatusCodes.Status404NotFound)
+        {
+            detailAvailability = XuiV3TenantClientDetailAvailability.NotFound;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                "Tenant renewal client-detail lookup failed; service fallback is restricted to readable list metadata. errorType={ErrorType}",
+                ex.GetType().Name);
         }
 
-        return 0;
+        var resolution = XuiV3TenantRenewalServiceResolver.Resolve(
+            listClient,
+            detailClient,
+            detailAvailability,
+            _purchaseService.GetEnabledServices());
+        if (resolution.Success && !string.IsNullOrWhiteSpace(resolution.AuthoritativeComment))
+        {
+            // The list endpoint may omit comment metadata. Keep the verified detail comment on this detached snapshot so
+            // renewal calculation preserves the original owner/service audit fields instead of rebuilding them from payer state.
+            listClient.Comment = resolution.AuthoritativeComment;
+        }
+
+        if (resolution.Success)
+        {
+            _logger.LogDebug(
+                "Tenant renewal service resolved. source={ResolutionSource}, serviceKey={ServiceKey}",
+                resolution.Source,
+                resolution.Service.Key);
+        }
+        else
+        {
+            _logger.LogWarning(
+                "Tenant renewal service resolution rejected. status={ResolutionStatus}",
+                resolution.Status);
+        }
+
+        return resolution;
     }
 
     /// <summary>
-    /// Reads all known inbound ids from the client and its JSON metadata.
+    /// Maps a sanitized tenant renewal service resolution failure to customer-facing retry guidance.
     /// </summary>
-    /// <param name="client">XUI client read from the panel.</param>
-    /// <param name="metadata">Parsed metadata from the client comment, when available.</param>
-    /// <returns>A distinct list of inbound ids attached to the client.</returns>
-    private static List<int> GetTenantClientInboundIds(XuiV3Client client, XuiV3ClientMetadata metadata)
+    /// <param name="status">Resolver status containing no client identifiers or raw metadata.</param>
+    /// <returns>Persian text safe to display in a tenant customer chat.</returns>
+    private static string BuildTenantRenewServiceResolutionFailureText(
+        XuiV3TenantRenewalServiceResolutionStatus status)
     {
-        var ids = new List<int>();
-        if (metadata?.InboundIds != null)
-            ids.AddRange(metadata.InboundIds);
-        if (client?.InboundIds != null)
-            ids.AddRange(client.InboundIds);
-        return ids.Where(id => id > 0).Distinct().ToList();
+        return status switch
+        {
+            XuiV3TenantRenewalServiceResolutionStatus.DetailUnavailable =>
+                "دریافت اطلاعات کامل نوع سرویس از پنل موقتاً ناموفق بود. کمی بعد دوباره تلاش کنید؛ هیچ سفارش یا پرداختی ساخته نشد.",
+            XuiV3TenantRenewalServiceResolutionStatus.ClientMissing or
+            XuiV3TenantRenewalServiceResolutionStatus.IdentityMismatch =>
+                "اکانت هدف حذف شده یا اطلاعات هویتی آن تغییر کرده است. هیچ سفارش یا پرداختی ساخته نشد.",
+            XuiV3TenantRenewalServiceResolutionStatus.MetadataConflict =>
+                "اطلاعات نوع سرویس این اکانت در پنل ناسازگار است و تمدید امن آن ممکن نیست. لطفاً با پشتیبانی تماس بگیرید.",
+            XuiV3TenantRenewalServiceResolutionStatus.ServiceUnavailable =>
+                "نوع سرویس ثبت‌شده برای این اکانت در حال حاضر در فروشگاه فعال نیست.",
+            _ => "این اکانت مربوط به پلن‌های فعال فروشگاه نیست و از این مسیر قابل تمدید نیست."
+        };
     }
 
     /// <summary>

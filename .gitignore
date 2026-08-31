@@ -177,6 +177,7 @@ Data/servers*.json
 *.env
 .env
 .env.*
+.freebuff
 
 # Bot/user activity logs and generated build artifacts
 Logs/

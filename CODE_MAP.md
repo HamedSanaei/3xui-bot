@@ -330,6 +330,14 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   from `PaymentMethod`, never transported in callbacks/logs, and exact email+UUID matching is repeated before preview,
   order creation, payment settlement, or XUI mutation. The payer is audit actor only; existing `TgId`, metadata owner,
   UUID, password, SubId, and protocol identity are preserved.
+- Tenant renewal service classification uses the identity-checked `clients/get/{email}` comment before any inbound or
+  expiry inference because active normal and unlimited accounts share inbounds and an unlimited first-use expiry becomes
+  positive after connection. `ServiceKey` plus `ServiceKind` must agree with one enabled catalog service; stale state or
+  an unpaid order whose service differs is rejected before provider/payment work, and paid fulfillment rechecks the same
+  rule before `UpdateClient`. A transient detail failure may use readable list metadata but never legacy inference.
+  After a successful detail read with no usable metadata, legacy fallback remains national inbound, negative expiry as
+  unlimited, then the deliberate normal default. The verified comment is copied only onto the detached renewal snapshot
+  so owner/audit metadata survives calculation; it is never logged or exposed. No schema migration is required.
 - Owned and tenant renewals use the same account-level unresolved lock around their session/order operation key. A new
   renewal is rejected before mutation when UUID (or legacy email fallback) has pending, processing, ambiguous,
   manual-review, or applied-unsettled work. GET-only recovery uses `CompareRenewalState` with Applied,
