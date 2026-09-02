@@ -172,7 +172,7 @@ public class UserDbContext : DbContext
 
     /// <summary>
     /// Defines the <c>users.db</c> schema, indexes, and field limits for payments, bot instances,
-    /// tenant orders, ledgers, bot-scoped conversation state, settlement-notification outbox delivery, idempotent
+    /// tenant orders and renewal-category evidence, ledgers, bot-scoped conversation state, settlement-notification outbox delivery, idempotent
     /// scheduled-report delivery, and durable per-client XUI volume-reminder cycles and claims.
     /// </summary>
     /// <param name="modelBuilder">EF Core model builder used by migrations and runtime metadata.</param>
@@ -337,6 +337,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.OrderKind).HasMaxLength(32);
             entity.Property(x => x.TargetAccountEmail).HasMaxLength(160);
             entity.Property(x => x.TargetAccountUuid).HasMaxLength(64);
+            entity.Property(x => x.RenewalServiceResolutionMode).HasMaxLength(48);
             entity.Property(x => x.ServiceKey).HasMaxLength(64);
             entity.Property(x => x.DurationKey).HasMaxLength(64);
             entity.Property(x => x.UnlimitedPlanKey).HasMaxLength(64);
@@ -613,6 +614,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.PaymentMethod).HasMaxLength(64);
             entity.Property(x => x.RenewTargetUuid).HasMaxLength(64);
             entity.Property(x => x.RenewalSessionId).HasMaxLength(64);
+            entity.Property(x => x.RenewalServiceResolutionMode).HasMaxLength(48);
             entity.HasIndex(x => x.TelegramUserId);
             entity.HasIndex(x => x.Flow);
         });

@@ -26,7 +26,12 @@ internal enum XuiV3TenantRenewalServiceResolutionStatus
     ServiceUnavailable,
 
     /// <summary>No enabled catalog service matched either metadata or the legacy inbound/expiry fallback.</summary>
-    OutsideActiveServices
+    OutsideActiveServices,
+
+    /// <summary>
+    /// A legacy client has no authoritative service metadata and matches more than one enabled service category.
+    /// </summary>
+    ServiceSelectionRequired
 }
 
 /// <summary>
@@ -49,11 +54,8 @@ internal enum XuiV3TenantRenewalServiceResolutionSource
     /// <summary>A legacy negative first-use expiry selected the unlimited service.</summary>
     LegacyUnlimitedExpiry,
 
-    /// <summary>A legacy shared positive/zero-expiry account used the configured normal-service default.</summary>
-    LegacyNormalDefault,
-
-    /// <summary>A final legacy inbound match selected another enabled metered service.</summary>
-    LegacyMeteredInbound
+    /// <summary>A single compatible legacy service was selected without relying on a normal-service default.</summary>
+    LegacyOnlyCompatibleService
 }
 
 /// <summary>
@@ -96,8 +98,24 @@ internal sealed class XuiV3TenantRenewalServiceResolution
     /// </remarks>
     public string AuthoritativeComment { get; init; }
 
+    /// <summary>
+    /// Gets the enabled services compatible with an identity-verified legacy client when customer selection is required.
+    /// </summary>
+    /// <remarks>
+    /// The collection contains catalog definitions only and never account identifiers. Tenant callers must additionally
+    /// enforce storefront visibility before rendering or accepting a choice. An empty collection means no manual choice
+    /// is available.
+    /// </remarks>
+    public IReadOnlyList<XuiV3ServiceDefinition> CandidateServices { get; init; } =
+        Array.Empty<XuiV3ServiceDefinition>();
+
     /// <summary>Gets whether the client may continue through tenant renewal using <see cref="Service" />.</summary>
     public bool Success => Status == XuiV3TenantRenewalServiceResolutionStatus.Resolved && Service != null;
+
+    /// <summary>Gets whether an identity-verified legacy client needs an explicit compatible service choice.</summary>
+    public bool RequiresCustomerSelection =>
+        Status == XuiV3TenantRenewalServiceResolutionStatus.ServiceSelectionRequired &&
+        CandidateServices.Count > 0;
 }
 
 /// <summary>
@@ -135,8 +153,9 @@ internal static class XuiV3TenantRenewalServiceResolver
     /// <remarks>
     /// When the detail lookup is unavailable, readable list metadata may still produce a safe result; legacy fallback is
     /// not allowed because a transient network failure must not turn an active unlimited client into a normal client.
-    /// After a successful detail lookup with no readable metadata, legacy behavior is retained: national inbound first,
-    /// negative first-use expiry second, normal shared-inbound default third, and another metered inbound last.
+    /// After a successful detail lookup with no readable metadata, national inbound and negative first-use expiry remain
+    /// deterministic. A positive/zero-expiry client that matches both normal and unlimited services is returned as an
+    /// explicit service-selection decision instead of being silently classified as normal.
     /// </remarks>
     /// <example>
     /// <code>
@@ -285,8 +304,9 @@ internal static class XuiV3TenantRenewalServiceResolver
     /// <param name="enabledServices">Current enabled catalog services.</param>
     /// <returns>A legacy service decision or an outside-active-services failure.</returns>
     /// <remarks>
-    /// The normal default for a positive/zero-expiry shared inbound is intentional product behavior for legacy accounts.
-    /// It is reached only after a successful detail read proves that usable structured metadata is genuinely absent.
+    /// Positive/zero expiry cannot distinguish an unlimited account after first connection from a metered account when
+    /// both share inbounds. Such clients return compatible candidates and require a separately persisted customer choice;
+    /// quota, duration, free-form comment, and plan-name heuristics are deliberately not trusted.
     /// </remarks>
     private static XuiV3TenantRenewalServiceResolution ResolveLegacy(
         XuiV3Client listClient,
@@ -313,16 +333,24 @@ internal static class XuiV3TenantRenewalServiceResolver
                 return Success(unlimited, XuiV3TenantRenewalServiceResolutionSource.LegacyUnlimitedExpiry);
         }
 
-        var normal = enabledServices.FirstOrDefault(service =>
-            IsNormalService(service) && HasAnyInbound(service, inboundIds));
-        if (normal != null)
-            return Success(normal, XuiV3TenantRenewalServiceResolutionSource.LegacyNormalDefault);
+        var compatibleServices = enabledServices
+            .Where(service => HasAnyInbound(service, inboundIds))
+            .Where(service => !IsNationalService(service))
+            .DistinctBy(service => service.Key, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (compatibleServices.Count == 1)
+        {
+            return Success(
+                compatibleServices[0],
+                XuiV3TenantRenewalServiceResolutionSource.LegacyOnlyCompatibleService);
+        }
 
-        var metered = enabledServices.FirstOrDefault(service =>
-            !service.IsUnlimited && HasAnyInbound(service, inboundIds));
-        return metered == null
-            ? Failure(XuiV3TenantRenewalServiceResolutionStatus.OutsideActiveServices)
-            : Success(metered, XuiV3TenantRenewalServiceResolutionSource.LegacyMeteredInbound);
+        if (compatibleServices.Count > 1)
+        {
+            return SelectionRequired(compatibleServices);
+        }
+
+        return Failure(XuiV3TenantRenewalServiceResolutionStatus.OutsideActiveServices);
     }
 
     /// <summary>
@@ -460,6 +488,33 @@ internal static class XuiV3TenantRenewalServiceResolver
         {
             Status = status,
             Source = XuiV3TenantRenewalServiceResolutionSource.None
+        };
+    }
+
+    /// <summary>Creates a sanitized legacy-category decision that requires explicit customer selection.</summary>
+    /// <param name="candidateServices">
+    /// Enabled catalog services whose inbound membership matches the same identity-verified client. The collection must
+    /// not contain account data and may include services that the tenant layer subsequently hides from its storefront.
+    /// </param>
+    /// <returns>
+    /// A non-successful resolution carrying distinct compatible service definitions and no account identifiers or raw
+    /// metadata.
+    /// </returns>
+    /// <remarks>
+    /// This method has no persistence, Telegram, payment, wallet, provider, or XUI side effects. A caller may continue
+    /// only after it stores an explicit tenant-visible choice and revalidates it against a fresh panel read.
+    /// </remarks>
+    private static XuiV3TenantRenewalServiceResolution SelectionRequired(
+        IEnumerable<XuiV3ServiceDefinition> candidateServices)
+    {
+        return new XuiV3TenantRenewalServiceResolution
+        {
+            Status = XuiV3TenantRenewalServiceResolutionStatus.ServiceSelectionRequired,
+            Source = XuiV3TenantRenewalServiceResolutionSource.None,
+            CandidateServices = candidateServices?
+                .Where(service => service != null)
+                .DistinctBy(service => service.Key, StringComparer.OrdinalIgnoreCase)
+                .ToList() ?? new List<XuiV3ServiceDefinition>()
         };
     }
 }

@@ -761,13 +761,14 @@ public class ApiServicev3
     /// </example>
     /// <exception cref="XuiV3ApiException">Thrown when the panel returns an unsuccessful HTTP status.</exception>
     /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is cancelled.</exception>
-    public static Task<XuiV3ApiResponse<XuiV3Client>> GetClientAsync(
+    public static async Task<XuiV3ApiResponse<XuiV3Client>> GetClientAsync(
         ServerInfo serverInfo,
         IConfiguration configuration,
         string email,
         CancellationToken cancellationToken = default,
         bool suppressIdentifierBearingRetryLogs = false)
-        => SendAsync<XuiV3Client>(
+    {
+        var response = await SendAsync<JToken>(
             serverInfo,
             configuration,
             HttpMethod.Get,
@@ -778,6 +779,101 @@ public class ApiServicev3
             retryMode: suppressIdentifierBearingRetryLogs
                 ? XuiV3RequestRetryMode.NoAutomaticRetry
                 : XuiV3RequestRetryMode.ReadOnly);
+
+        return NormalizeClientDetailResponse(response);
+    }
+
+    /// <summary>
+    /// Normalizes direct and nested 3x-ui client-detail envelopes into one detached client snapshot.
+    /// </summary>
+    /// <param name="response">
+    /// Authenticated response returned by <c>GET /panel/api/clients/get/{email}</c>. Its object may be either the
+    /// client itself or a wrapper containing <c>client</c> plus top-level <c>inboundIds</c>. The response can contain
+    /// UUID, SubId, comment, and other private account data and must never be logged or exposed directly.
+    /// </param>
+    /// <returns>
+    /// A new response envelope whose object is the normalized client. An unsuccessful panel envelope stays
+    /// unsuccessful. A successful but malformed payload becomes an unsuccessful, identifier-free result with no
+    /// client so callers fail closed instead of comparing an empty object with an authorized list row.
+    /// </returns>
+    /// <remarks>
+    /// Current 3x-ui releases return <c>obj.client</c> and keep inbound membership in <c>obj.inboundIds</c>, while
+    /// older compatible deployments may return the client directly in <c>obj</c>. This method performs no HTTP call,
+    /// panel mutation, persistence, wallet operation, tenant operation, or logging. Numeric id, email, UUID, and SubId
+    /// are not synthesized; downstream identity checks remain authoritative.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var normalized = NormalizeClientDetailResponse(rawResponse);
+    /// if (normalized.Success)
+    ///     use(normalized.Obj);
+    /// </code>
+    /// </example>
+    internal static XuiV3ApiResponse<XuiV3Client> NormalizeClientDetailResponse(
+        XuiV3ApiResponse<JToken> response)
+    {
+        if (response?.Success != true)
+        {
+            return new XuiV3ApiResponse<XuiV3Client>
+            {
+                Success = false,
+                Msg = response?.Msg
+            };
+        }
+
+        var payload = response.Obj;
+        XuiV3Client client = null;
+        try
+        {
+            if (payload is JObject wrapper &&
+                wrapper.GetValue("client", StringComparison.OrdinalIgnoreCase) is JObject nestedClient)
+            {
+                client = nestedClient.ToObject<XuiV3Client>();
+                if (client != null &&
+                    wrapper.GetValue("inboundIds", StringComparison.OrdinalIgnoreCase) is JArray inboundIds)
+                {
+                    client.InboundIds = inboundIds
+                        .Values<int>()
+                        .Where(id => id > 0)
+                        .Distinct()
+                        .ToList();
+                }
+
+                if (client != null &&
+                    client.Traffic == null &&
+                    wrapper.GetValue("traffic", StringComparison.OrdinalIgnoreCase) is JObject traffic)
+                {
+                    client.Traffic = traffic.ToObject<XuiV3ClientTraffic>();
+                }
+            }
+            else if (payload != null && payload.Type is not JTokenType.Null and not JTokenType.Undefined)
+            {
+                client = payload.ToObject<XuiV3Client>();
+            }
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or ArgumentException or FormatException or OverflowException)
+        {
+            // Parsing failures are intentionally collapsed into the identifier-free malformed result below. Raw panel
+            // payloads and embedded client credentials must never appear in operational or Telegram logs.
+            client = null;
+        }
+
+        if (client == null || string.IsNullOrWhiteSpace(client.Email))
+        {
+            return new XuiV3ApiResponse<XuiV3Client>
+            {
+                Success = false,
+                Msg = "Client detail response did not contain a client identity."
+            };
+        }
+
+        return new XuiV3ApiResponse<XuiV3Client>
+        {
+            Success = true,
+            Msg = response.Msg,
+            Obj = client
+        };
+    }
 
     /// <summary>
     /// POST /panel/api/clients/add. Creates a client and attaches it to one or more inbounds.

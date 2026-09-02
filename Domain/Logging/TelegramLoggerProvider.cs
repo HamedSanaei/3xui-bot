@@ -1,9 +1,5 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
-using Telegram.Bot;
 using Adminbot.Domain;
 
 namespace Adminbot.Domain.Logging
@@ -21,12 +17,11 @@ namespace Adminbot.Domain.Logging
     public class TelegramLoggerProvider : ILoggerProvider
     {
         private readonly Func<string, LogLevel, bool> _filter;
-        private readonly BotClientProvider _botClientProvider;
         private readonly BotRegistry _botRegistry;
         private readonly BotContextAccessor _botContextAccessor;
         private readonly string _fallbackChannelId;
         private readonly string _fallbackBackupChannelId;
-        private readonly AppConfig _appConfig;
+        private readonly TelegramLogDispatcher _dispatcher;
 
         /// <summary>
         /// Initializes a provider that creates <see cref="TelegramLogger"/> instances.
@@ -35,29 +30,25 @@ namespace Adminbot.Domain.Logging
         /// Optional application filter. It is evaluated after the built-in framework-noise guard.
         /// Return <c>true</c> to allow the log entry to be posted to Telegram.
         /// </param>
-        /// <param name="botClientProvider">Provider used by each logger to select the current bot client.</param>
         /// <param name="botRegistry">Runtime registry used to resolve logger channels for default and tenant contexts.</param>
         /// <param name="botContextAccessor">Async-local bot context accessor used while logging tenant/owned bot work.</param>
         /// <param name="fallbackChannelId">Fallback Telegram log channel id when the active bot has no logger channel.</param>
         /// <param name="fallbackBackupChannelId">Fallback Telegram backup channel id used by payment logs.</param>
-        /// <param name="appConfig">Application configuration that contains the active users.db and credentials.db paths.</param>
-        public TelegramLoggerProvider(
+        /// <param name="dispatcher">Shared durable outbox dispatcher; must not be null.</param>
+        internal TelegramLoggerProvider(
             Func<string, LogLevel, bool> filter,
-            BotClientProvider botClientProvider,
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
             string fallbackChannelId,
             string fallbackBackupChannelId,
-            AppConfig appConfig)
+            TelegramLogDispatcher dispatcher)
         {
             _filter = filter;
-            _botClientProvider = botClientProvider;
             _botRegistry = botRegistry;
             _botContextAccessor = botContextAccessor;
             _fallbackChannelId = fallbackChannelId;
             _fallbackBackupChannelId = fallbackBackupChannelId;
-            _appConfig = appConfig ?? new AppConfig();
-
+            _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         }
 
         public ILogger CreateLogger(string categoryName)
@@ -65,17 +56,16 @@ namespace Adminbot.Domain.Logging
             return new TelegramLogger(
                 categoryName,
                 ShouldForwardToTelegram,
-                _botClientProvider,
                 _botRegistry,
                 _botContextAccessor,
                 _fallbackChannelId,
                 _fallbackBackupChannelId,
-                _appConfig);
+                _dispatcher);
         }
 
         public void Dispose()
         {
-            // Clean up here if needed
+            _dispatcher.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
 
         /// <summary>

@@ -1,5 +1,20 @@
 # AGENTS.md
 
+## Repository policy: agents must never credit themselves
+
+Every AI agent working in this repository MUST NOT write or leave its own name, agent identity, product/tool name, or any self-identifying marker as a contributor anywhere in the repository, under any circumstances.
+
+This is an absolute rule with no exceptions. It applies to, but is not limited to:
+
+- Commit authorship, commit authors, and commit-message footers such as `Co-Authored-By:`, `Generated with ...`, or any attribution after the commit message body. Once a change enters the repository, the only credited author must be the human owner of the repository.
+- `CODE_MAP.md`, `README` files, release notes, and any other documentation that credits, attributes, or mentions the agent that performed the work.
+- Source-code comments, XML documentation comments, file headers, and license headers that name an agent.
+- Any other file, string, or metadata tracked in the repository.
+
+An agent is anonymous tooling used by the repository owner. All credit and authorship for every change belong exclusively to the repository owner and human contributors. If an agent ever detects that its own name or identity has been written into the repository (for example in a past commit message, a comment, or a documentation file), it must report the finding to the owner for removal and must not repeat the naming.
+
+---
+
 ## Primary rule: write IntelliSense-visible documentation
 
 This repository requires documentation that appears when developers hover over or call a method in the IDE.

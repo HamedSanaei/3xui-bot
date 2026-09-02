@@ -51,6 +51,11 @@ class Program
         ValidateTetraminatorConfiguration(appConfig);
 
         ConfigureDatabasePaths(builder.Environment.ContentRootPath, appConfig);
+        // Telegrams logs use their own SQLite outbox next to the runtime databases. The path is resolved against
+        // the content root (never the shell current directory) so systemctl/reboot restarts always reopen the same
+        // durable file, and it is printed at startup like the main database paths.
+        var telegramOutboxDatabasePath = Path.Combine(builder.Environment.ContentRootPath, "Data", "telegram-log-outbox.db");
+        Console.WriteLine($"[TelegramOutbox] path: {telegramOutboxDatabasePath}");
         ConfigureWebServer(builder, appConfig);
 
         builder.Services.AddSingleton<IConfiguration>(configuration);
@@ -71,6 +76,18 @@ class Program
         builder.Services.AddSingleton<BotContextAccessor>();
         builder.Services.AddSingleton<BotRegistry>();
         builder.Services.AddSingleton<BotClientProvider>();
+        // The outbox dispatcher resolves each bot client by internal BotId at delivery time, so no Telegram client
+        // object ever has to survive a restart. The options carry the runtime database paths used by payment backups.
+        builder.Services.AddSingleton<TelegramLogDispatcher>(sp =>
+        {
+            var clientProvider = sp.GetRequiredService<BotClientProvider>();
+            return new TelegramLogDispatcher(
+                botId => new TelegramBotLogSender(clientProvider.GetClient(botId)),
+                TelegramLogDispatcherOptions.CreateDefault(
+                    telegramOutboxDatabasePath,
+                    appConfig.UserDatabasePath,
+                    appConfig.CredentialsDatabasePath));
+        });
         builder.Services.AddSingleton<BotRuntimeStatusStore>();
         builder.Services.AddSingleton<XuiV3PurchaseService>();
         builder.Services.AddSingleton<XuiV3PurchaseSessionStore>();
@@ -144,12 +161,11 @@ class Program
         {
             // Keep Telegram channel clean: app logs go to Telegram, framework request noise does not.
             loggingBuilder.Services.AddSingleton<ILoggerProvider>(sp => new TelegramLoggerProvider(ShouldSendTelegramLog,
-                sp.GetRequiredService<BotClientProvider>(),
                 sp.GetRequiredService<BotRegistry>(),
                 sp.GetRequiredService<BotContextAccessor>(),
                 configuration["loggerChannel"],
                 configuration["backupChannel"],
-                appConfig
+                sp.GetRequiredService<TelegramLogDispatcher>()
                 ));
             // Keep the complete operational diagnostic trail on disk even when the Telegram channel suppresses noise.
             loggingBuilder.Services.AddSingleton<ILoggerProvider>(sp => new DailyErrorFileLoggerProvider(

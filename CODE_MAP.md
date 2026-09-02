@@ -258,6 +258,18 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - When a tenant order later fulfills successfully after an earlier timeout/failure, clear stale `TenantBotOrder.ErrorMessage` and linked receipt errors before saving so successful order details and audit logs do not keep showing old timeout text.
 - Super-admin `Verify payment` accepts tenant storefront `OrderId` values. It retries the same tenant fulfillment path and resends stored account details for fulfilled orders instead of creating another account.
 
+## Telegram Logger
+
+- Durable Telegram log outbox (Payment EventId 1000 and TelegramHtml EventId 1001 only): outbox SQLite file printed at startup as `[TelegramOutbox] path:` — `<contentRoot>/Data/telegram-log-outbox.db` (production: `<publish>/Data/telegram-log-outbox.db`, resolved against the content root, never the shell cwd). WAL journal, `synchronous=FULL` re-applied per pooled connection, 5s busy timeout, parameterized statements, short single-purpose transactions, and per-message WAL checkpoint never run inside transactions; `PRAGMA wal_checkpoint(TRUNCATE)` + `PRAGMA optimize` run every 10 minutes, DeadLetter rows older than 90 days are purged then.
+- Schema: `TelegramLogOutbox(Id, CreatedAtUtc, Priority, DeliveryKind, BotId, LoggerChannelId, BackupChannelId, Message, AttemptCount, NextAttemptAtUtc, LastError, Status, LeaseUntilUtc, LastAttemptAtUtc)` plus index `(Status, NextAttemptAtUtc, Priority, Id)`. ParseMode is derived deterministically from DeliveryKind (Payment/Html → HTML, Plain → none) and is not stored; legacy dev-iteration DBs keep an unused `ParseMode` column and are migrated by adding the lease columns. Only identifiers are persisted — `BotId` is resolved to a live `ITelegramBotClient` via `BotClientProvider` at delivery time, so no client object must survive a restart.
+- Durable pipeline (`Domain/Logging/TelegramLogOutbox.cs` + `Domain/Logging/TelegramLogDispatcher.cs`): producer snapshot → synchronous SQLite INSERT/COMMIT (the logger call blocks only for the commit and returns `false` locally if it fails; failure is counted and console/file-logged, never re-logged through Telegram and never allowed to crash payment settlement) → wake signal → single serialized worker drains directly from SQLite (signal wake-up for latency plus a 5s periodic scan for lost wake-ups: even a crash between COMMIT and signal cannot lose a record). Atomic claim is a conditional UPDATE (`Status=Pending AND NextAttemptAtUtc<=now` → `Status=Sending`, `AttemptCount+1`, `LeaseUntilUtc=now+2min`, `LastAttemptAtUtc=now`) so two workers/restarts cannot double-own a row. Startup force-resets every Sending row without honoring the lease (single-instance assumption: the documented production unit `/etc/systemd/system/vpnetiranbot.service` in `comands.txt` runs exactly one `ExecStart` process against this DB, so a fresh process proves the previous owner is gone; two processes sharing one outbox DB is deliberately NOT supported — no distributed locking). The periodic scan additionally expires `LeaseUntilUtc<now` rows for multi-worker safety. `dotnet publish` (the documented deploy command, same `--no-restore` run) does not delete or rewrite `publish/Data/*` — verified byte-identical across republish — so the outbox and `users.db`/`credentials.db` survive application upgrades; only a deploy step that manually `rm -rf`s the publish directory could lose them. Telegram I/O never runs inside an outbox transaction and never inside a SQLite transaction.
+- Retry/classification (all numbers in `Domain/Logging/TelegramRateLimitPolicy.cs`): success → DELETE row (no Delivered history; at-least-once duplicate window is the only cost). 429 → `Status=Pending`, `NextAttemptAtUtc=now+RetryAfter(+1s buffer, capped 61s)`; a restart mid-cooldown still waits. Transient (HttpRequestException, TaskCanceledException/timeout, 5xx, IO) → exponential backoff 5s,10s,20s,… capped at 5 minutes, persisted as `NextAttemptAtUtc`. Permanent (400 bad request/can't parse entities/chat not found, 401, 403 bot blocked, 410) → retried with the same short backoff and DeadLettered on the 3rd failed attempt: `Status=DeadLetter` + `LastError` + `AttemptCount` retained for inspection, never deleted implicitly, never retried forever. Sends are paced ≥350ms; shutdown mid-send leaves the row Sending for lease recovery (never ack, never lose).
+- Dispatcher fairness and memory: one drain round claims at most 2 Payment + 1 Html rows (2:1 weighted, starvation-free) and then at most 1 Normal item; candidates load in pages of 96, so a 1000-row backlog never loads into RAM. Normal (plain-text) logs stay non-durable: bounded Channel capacity 256 with deterministic drop+count on overflow, so a Telegram outage cannot grow disk for informational noise. Backlog warning `[TelegramOutbox] backlog high: pending=…` prints to console/file (never Telegram) at most once per minute above 200 pending. Shutdown prints enqueued/delivered/rateLimited/transient/deadLettered/backup stats.
+- Payment database backups are a coalesced side effect, decoupled from log acknowledgement: after a Payment row's Telegram delivery succeeds the dispatcher requests a backup, and a single-flight loop with a 1.5s burst debounce (5s hard cap under continuous traffic) runs at most one backup at a time against `users_backup.db`/`credentials_backup.db` (temp files adjacent to the source DBs; users.db/credentials.db paths come from the runtime AppConfig). A 20-payment burst therefore produces 1-2 backup runs, never 20 and never two concurrent copies. Backup failures stay fail-soft per database.
+- Invariants enforced by the outbox harness (outside the repository): a durable Payment/Audit record is never silently lost due to process restart, server reboot, Telegram outage, 429 cooldown, full in-memory queue, or lost wake-up; crash between Telegram success and local DELETE is the accepted at-least-once duplicate window; 1000-record outage keeps RAM bounded (single-digit MB growth) and drains fully after recovery.
+
+## Gozargah Site Sync
+
 ## Gozargah Site Sync
 
 - Site sync is optional and controlled by `GozargahSite*` config flags.
@@ -352,14 +364,21 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   from `PaymentMethod`, never transported in callbacks/logs, and exact email+UUID matching is repeated before preview,
   order creation, payment settlement, or XUI mutation. The payer is audit actor only; existing `TgId`, metadata owner,
   UUID, password, SubId, and protocol identity are preserved.
-- Tenant renewal service classification uses the identity-checked `clients/get/{email}` comment before any inbound or
-  expiry inference because active normal and unlimited accounts share inbounds and an unlimited first-use expiry becomes
-  positive after connection. `ServiceKey` plus `ServiceKind` must agree with one enabled catalog service; stale state or
-  an unpaid order whose service differs is rejected before provider/payment work, and paid fulfillment rechecks the same
-  rule before `UpdateClient`. A transient detail failure may use readable list metadata but never legacy inference.
-  After a successful detail read with no usable metadata, legacy fallback remains national inbound, negative expiry as
-  unlimited, then the deliberate normal default. The verified comment is copied only onto the detached renewal snapshot
-  so owner/audit metadata survives calculation; it is never logged or exposed. No schema migration is required.
+- `ApiServicev3.GetClientAsync` normalizes both legacy direct `obj` and current 3x-ui `obj.client` detail envelopes,
+  merging wrapper `inboundIds` without synthesizing identity. Tenant renewal classification uses that identity-checked
+  detail comment before inbound/expiry inference because active normal and unlimited accounts share inbounds and an
+  unlimited first-use expiry becomes positive after connection. `ServiceKey` plus `ServiceKind` must agree with one
+  enabled catalog service. A transient detail failure may use readable list metadata but never legacy inference.
+- After a successful detail read with no usable metadata, national inbound and negative first-use expiry remain
+  deterministic. A positive/zero-expiry legacy account matching multiple categories must preserve its exact email+UUID
+  lock and let the customer explicitly choose among live tenant-compatible services; quota, duration, display text, and
+  free-form comments are never heuristics. `BotUserState` and `TenantBotOrder.RenewalServiceResolutionMode` persist the
+  evidence. Migration `20260901234439_AddTenantRenewalServiceResolutionMode` adds nullable columns only, with no backfill
+  or financial/XUI work. Null historical unpaid ambiguous orders must be recreated; null paid ambiguous orders stop for
+  support review before `UpdateClient`. Payment activation and fulfillment revalidate the current candidate set.
+- Tenant metered tariffs show effective storefront per-GB/per-day rates, active/custom durations, and exactly one sample
+  whose total comes from authoritative tenant pricing. Purchase and renewal payment-choice messages explain that verified
+  online payments fulfill automatically, while card-to-card waits for tenant-owner approval and may take longer.
 - Owned and tenant renewals use the same account-level unresolved lock around their session/order operation key. A new
   renewal is rejected before mutation when UUID (or legacy email fallback) has pending, processing, ambiguous,
   manual-review, or applied-unsettled work. GET-only recovery uses `CompareRenewalState` with Applied,

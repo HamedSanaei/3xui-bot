@@ -1,16 +1,6 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
-using System;
-using Telegram.Bot;
-using Telegram.Bot.Types;
-using Adminbot.Utils;
 using Adminbot.Domain;
-
-
-
 
 namespace Adminbot.Domain.Logging
 {
@@ -20,56 +10,52 @@ namespace Adminbot.Domain.Logging
     /// </summary>
     /// <remarks>
     /// The default owned bot performs channel delivery so tenant and secondary owned bots need no direct access to the
-    /// private logger channel. Every delivery is best-effort and must never fail the originating bot operation.
+    /// private logger channel. Payment and HTML audit events are committed to the durable SQLite outbox before this
+    /// method returns (crash-, outage-, and restart-safe), while ordinary plain-text events stay in a bounded
+    /// best-effort memory queue. Logger failures are contained locally and must never fail the originating bot
+    /// operation or payment settlement.
     /// </remarks>
     public class TelegramLogger : ILogger
     {
-        /// <summary>
-        /// Maximum plain-text log length sent to Telegram, kept below Telegram's hard 4096-character limit.
-        /// </summary>
-        private const int MaxTelegramLogMessageLength = 3900;
         private readonly string _categoryName;
         private readonly Func<string, LogLevel, bool> _filter;
-        private readonly BotClientProvider _botClientProvider;
         private readonly BotRegistry _botRegistry;
         private readonly BotContextAccessor _botContextAccessor;
         private readonly string _fallbackChannelId;
         private readonly string _fallbackBackupChannelId;
-        private readonly AppConfig _appConfig;
+        private readonly TelegramLogDispatcher _dispatcher;
 
         /// <summary>
-        /// Creates a Telegram-backed logger that can post operational logs and database backups.
+        /// Creates a Telegram-backed logger that can post operational logs and request database backups.
         /// </summary>
         /// <param name="categoryName">Logger category name supplied by Microsoft.Extensions.Logging.</param>
         /// <param name="filter">Provider-level filter that decides whether a log level/category should be sent.</param>
-        /// <param name="botClientProvider">Provider used to resolve the current/default Telegram bot client.</param>
         /// <param name="botRegistry">Runtime registry used to resolve logger and backup channels per bot context.</param>
         /// <param name="botContextAccessor">Async-local bot context accessor for owned/tenant logging routes.</param>
         /// <param name="fallbackChannelId">Fallback private logger channel id from legacy configuration.</param>
         /// <param name="fallbackBackupChannelId">Fallback backup channel id used when the current bot has no backup channel.</param>
-        /// <param name="appConfig">Application configuration containing the resolved database paths to back up.</param>
+        /// <param name="dispatcher">Shared durable outbox dispatcher; must not be null.</param>
         /// <remarks>
-        /// Payment logs are routed to the logger channel while database documents are routed to the backup channel.
-        /// Both operations are best-effort and must never fail payment settlement or Telegram update handling.
+        /// Payment logs are routed to the logger channel while database backups are requested through the same bot.
+        /// Both operations are best-effort at the Telegram layer and durable for Payment/Html at the outbox layer;
+        /// they must never fail payment settlement or Telegram update handling.
         /// </remarks>
-        public TelegramLogger(
+        internal TelegramLogger(
             string categoryName,
             Func<string, LogLevel, bool> filter,
-            BotClientProvider botClientProvider,
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
             string fallbackChannelId,
             string fallbackBackupChannelId,
-            AppConfig appConfig)
+            TelegramLogDispatcher dispatcher)
         {
             _categoryName = categoryName;
             _filter = filter;
-            _botClientProvider = botClientProvider;
             _botRegistry = botRegistry;
             _botContextAccessor = botContextAccessor;
             _fallbackChannelId = fallbackChannelId;
             _fallbackBackupChannelId = fallbackBackupChannelId;
-            _appConfig = appConfig ?? new AppConfig();
+            _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         }
 
         public IDisposable BeginScope<TState>(TState state) => default;
@@ -82,15 +68,20 @@ namespace Adminbot.Domain.Logging
         /// <typeparam name="TState">Structured logger state type supplied by Microsoft.Extensions.Logging.</typeparam>
         /// <param name="logLevel">Severity evaluated against the configured category filter before delivery.</param>
         /// <param name="eventId">
-        /// Event identity selecting payment HTML with backups, operational HTML without backups, or ordinary plain text.
+        /// Event identity selecting payment HTML with backups (<c>1000/Payment</c>), operational HTML
+        /// (<c>1001/TelegramHtml</c>), or ordinary plain text.
         /// </param>
         /// <param name="state">Structured event state passed to <paramref name="formatter"/>; it may be null.</param>
         /// <param name="exception">Optional exception used by channel-noise suppression and the formatter.</param>
         /// <param name="formatter">Required formatter that produces the final channel message from state and exception.</param>
         /// <remarks>
-        /// Event 1000/Payment uses the financial HTML and database-backup path. Event 1001/TelegramHtml uses HTML
-        /// without backup side effects. All other events stay plain text so arbitrary application logs cannot be
-        /// interpreted as Telegram markup. Dispatch is fire-and-forget and failures are contained by the send helpers.
+        /// Event 1000/Payment and 1001/TelegramHtml are committed to the durable SQLite outbox synchronously —
+        /// the SQLite INSERT/COMMIT completes before this method returns — so the record survives process crash,
+        /// systemctl restart, reboot, Telegram outage, and lost in-memory wake-ups. Delivery itself is asynchronous
+        /// and serialized by <see cref="TelegramLogDispatcher"/>. All other events stay plain text in a bounded
+        /// memory-only queue so arbitrary application logs cannot be interpreted as Telegram markup and cannot grow
+        /// disk usage. A failed outbox commit is counted and printed to console/file only; it never crashes the
+        /// caller and is never re-logged through Telegram.
         /// </remarks>
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
         {
@@ -107,19 +98,23 @@ namespace Adminbot.Domain.Logging
                 return;
             }
 
-            if (eventId.Id == 1000 && eventId.Name == "Payment")
+            var delivery = eventId.Id == 1000 && eventId.Name == "Payment"
+                ? TelegramLogDeliveryKind.Payment
+                : eventId.Id == 1001 && eventId.Name == "TelegramHtml"
+                    ? TelegramLogDeliveryKind.Html
+                    : TelegramLogDeliveryKind.Plain;
+
+            if (delivery == TelegramLogDeliveryKind.Plain)
             {
-                _ = Task.Run(() => LogPayment(message));
-            }
-            else if (eventId.Id == 1001 && eventId.Name == "TelegramHtml")
-            {
-                _ = Task.Run(() => SendHtmlMessageToChannelAsync(message));
-            }
-            else
-            {
-                _ = Task.Run(() => SendMessageToChannelAsync(message));
+                _dispatcher.EnqueueNormal(new TelegramLogItem(
+                    delivery, message, CurrentLoggingBotConfig?.Id ?? string.Empty,
+                    CurrentLoggerChannelId, CurrentBackupChannelId));
+                return;
             }
 
+            _dispatcher.EnqueueDurable(new TelegramLogItem(
+                delivery, message, CurrentLoggingBotConfig?.Id ?? string.Empty,
+                CurrentLoggerChannelId, CurrentBackupChannelId));
         }
 
         /// <summary>
@@ -154,201 +149,6 @@ namespace Adminbot.Domain.Logging
             return TelegramLogSuppression.ShouldSuppress(message, exception);
         }
 
-
-        /// <summary>
-        /// Creates and sends best-effort copies of all configured runtime databases to the backup channel.
-        /// </summary>
-        /// <returns>A task that completes after each configured database has been copied and sent or skipped.</returns>
-        /// <remarks>
-        /// SQLite keeps both databases open while the bot is running. Each backup is copied with read/write/delete
-        /// sharing into a temporary file before upload. Failures are isolated per database so a locked
-        /// <c>credentials.db</c> does not prevent <c>users.db</c> from being sent, and backup failures never block
-        /// payment settlement or crash a Telegram receiver.
-        /// </remarks>
-        private async Task BackupDatabasesAsync()
-        {
-            foreach (var database in GetDatabaseBackupTargets())
-                await BackupDatabaseAsync(database.SourcePath, database.TempPath, database.FileName);
-        }
-
-        /// <summary>
-        /// Copies one SQLite database and sends it to the configured backup channel.
-        /// </summary>
-        /// <param name="sourceDbPath">Source database path resolved from configuration.</param>
-        /// <param name="backupDbPath">Temporary backup path used only for Telegram upload.</param>
-        /// <param name="fileName">Document file name shown in Telegram, such as <c>users.db</c>.</param>
-        /// <returns>A task that completes after the copy/send attempt finishes.</returns>
-        /// <remarks>
-        /// The method is fail-soft by design. It logs copy or Telegram upload failures to console and returns so
-        /// the payment log path can continue without surfacing database lock errors to customers or admins.
-        /// </remarks>
-        private async Task BackupDatabaseAsync(string sourceDbPath, string backupDbPath, string fileName)
-        {
-            try
-            {
-                await using var source = new System.IO.FileStream(
-                    sourceDbPath,
-                    System.IO.FileMode.Open,
-                    System.IO.FileAccess.Read,
-                    System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete);
-                await using var destination = new System.IO.FileStream(
-                    backupDbPath,
-                    System.IO.FileMode.Create,
-                    System.IO.FileAccess.Write,
-                    System.IO.FileShare.None);
-                await source.CopyToAsync(destination);
-            }
-            catch (IOException ex)
-            {
-                Console.WriteLine($"An error occurred while copying {fileName}: {ex.Message}");
-                return;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"An unexpected error occurred while copying {fileName}: {ex.Message}");
-                return;
-            }
-
-            try
-            {
-                await using Stream stream = System.IO.File.OpenRead(backupDbPath);
-                await CurrentBotClient.SendDocumentAsync(
-                    chatId: CurrentBackupChannelId,
-                    document: InputFile.FromStream(stream: stream, fileName: fileName),
-                    caption: $"{fileName} - {DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi()}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"An error occurred while sending {fileName} backup: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Gets the database files that should be sent after financial logs.
-        /// </summary>
-        /// <returns>
-        /// Backup targets for <c>credentials.db</c> and <c>users.db</c>, using configured paths when available.
-        /// </returns>
-        /// <remarks>
-        /// The backup channel receives both the shared credentials wallet/profile database and the users runtime
-        /// database because payments, tenant orders, invoices, states, and ledgers now live in <c>users.db</c>.
-        /// </remarks>
-        private IEnumerable<(string SourcePath, string TempPath, string FileName)> GetDatabaseBackupTargets()
-        {
-            yield return (
-                string.IsNullOrWhiteSpace(_appConfig.CredentialsDatabasePath) ? "./Data/credentials.db" : _appConfig.CredentialsDatabasePath,
-                "./Data/credentials_backup.db",
-                "credentials.db");
-            yield return (
-                string.IsNullOrWhiteSpace(_appConfig.UserDatabasePath) ? "./Data/users.db" : _appConfig.UserDatabasePath,
-                "./Data/users_backup.db",
-                "users.db");
-        }
-
-        /// <summary>
-        /// Sends an HTML payment/audit log to the selected operational logger channel and starts a non-blocking database backup.
-        /// </summary>
-        /// <param name="message">
-        /// HTML-safe log text prepared by the payment or tenant flow. The method sends it with
-        /// <see cref="Telegram.Bot.Types.Enums.ParseMode.Html"/>.
-        /// </param>
-        /// <returns>A task that completes after the log message has been sent.</returns>
-        /// <remarks>
-        /// The credentials backup is intentionally fire-and-forget. A locked database file, missing backup
-        /// channel, or Telegram document failure must not delay or fail the payment settlement path. Logs from
-        /// non-default owned bots and tenant storefronts are routed through the default owned bot because only that
-        /// bot is guaranteed to post to the private central logger channel.
-        /// </remarks>
-        public async Task LogPayment(string message)
-        {
-            try
-            {
-                await CurrentBotClient.SendTextMessageAsync(
-                    CurrentLoggerChannelId,
-                    message,
-                    parseMode: Telegram.Bot.Types.Enums.ParseMode.Html
-                );
-
-                _ = Task.Run(BackupDatabasesAsync);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Exception in LogPayment: {ex.Message}");
-            }
-        }
-
-        private async Task SendMessageToChannelAsync(string message)
-        {
-            try
-            {
-                await CurrentBotClient.SendTextMessageAsync(CurrentLoggerChannelId, TruncateForTelegramLog(message));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Exception caught in logger: {ex.Message}");
-                // You might want to log to a local file here as a fallback
-            }
-        }
-
-        /// <summary>
-        /// Sends one pre-encoded non-financial audit to the central logger channel using Telegram HTML entities.
-        /// </summary>
-        /// <param name="message">
-        /// Bounded HTML-safe audit text produced by a trusted builder. Dynamic values must already be HTML-encoded.
-        /// </param>
-        /// <returns>A task that completes after Telegram accepts the message or the best-effort failure is contained.</returns>
-        /// <remarks>
-        /// This path deliberately does not start database backups. Plain application logs remain on
-        /// <see cref="SendMessageToChannelAsync"/> so arbitrary angle brackets are never interpreted as markup.
-        /// </remarks>
-        private async Task SendHtmlMessageToChannelAsync(string message)
-        {
-            try
-            {
-                await CurrentBotClient.SendTextMessageAsync(
-                    CurrentLoggerChannelId,
-                    message ?? string.Empty,
-                    parseMode: Telegram.Bot.Types.Enums.ParseMode.Html);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Exception caught in HTML logger: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Truncates a plain-text application log so Telegram accepts it as one message.
-        /// </summary>
-        /// <param name="message">
-        /// Plain-text log message generated by Microsoft.Extensions.Logging. The value may be empty or may include
-        /// a full exception stack trace.
-        /// </param>
-        /// <returns>
-        /// The original message when it fits Telegram's message size limit; otherwise a shortened message with a
-        /// marker that tells admins the stack was truncated.
-        /// </returns>
-        /// <remarks>
-        /// Telegram rejects text messages above its size limit with <c>message is too long</c>. Logger failures must
-        /// never create a second noisy exception while the bot is already handling another failure.
-        /// </remarks>
-        private static string TruncateForTelegramLog(string message)
-        {
-            if (string.IsNullOrEmpty(message) || message.Length <= MaxTelegramLogMessageLength)
-                return message ?? string.Empty;
-
-            return message[..MaxTelegramLogMessageLength] + "\n...[log truncated for Telegram]";
-        }
-
-        /// <summary>
-        /// Gets the Telegram client that is allowed to post operational logs.
-        /// </summary>
-        /// <remarks>
-        /// Non-default owned bots and tenant storefront bots are not guaranteed to be members of the private central
-        /// operational log channel. The default owned bot sends every operational log so successful purchases from any
-        /// brand or tenant storefront reach the same private channel.
-        /// </remarks>
-        private ITelegramBotClient CurrentBotClient => _botClientProvider.GetClient(CurrentLoggingBotConfig?.Id);
-
         /// <summary>
         /// Gets the bot whose update is currently being handled, or the default owned bot when no context exists.
         /// </summary>
@@ -376,6 +176,5 @@ namespace Adminbot.Domain.Logging
         private string CurrentBackupChannelId => string.IsNullOrWhiteSpace(CurrentLoggingBotConfig?.BackupChannel)
             ? _fallbackBackupChannelId
             : CurrentLoggingBotConfig.BackupChannel;
-
     }
 }

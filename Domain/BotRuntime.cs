@@ -150,6 +150,26 @@ namespace Adminbot.Domain
     }
 
     /// <summary>
+    /// Stable evidence modes persisted for tenant renewal service-category authorization.
+    /// </summary>
+    /// <remarks>
+    /// These values separate an authoritative metadata decision from a deterministic legacy fallback and an explicit
+    /// customer choice for a legacy client whose shared inbounds cannot distinguish normal from unlimited service.
+    /// They grant renewal permission only when the current email, UUID, and compatible live services are revalidated.
+    /// </remarks>
+    public static class TenantRenewalServiceResolutionModes
+    {
+        /// <summary>The service was read from identity-checked structured XUI client metadata.</summary>
+        public const string Metadata = "metadata";
+
+        /// <summary>The service was uniquely determined from legacy national inbound, first-use expiry, or one compatible service.</summary>
+        public const string LegacyDeterministic = "legacy_deterministic";
+
+        /// <summary>The customer explicitly selected one currently compatible service for an otherwise ambiguous legacy client.</summary>
+        public const string CustomerSelectedLegacy = "customer_selected_legacy";
+    }
+
+    /// <summary>
     /// Represents one direct-sale order made inside a colleague tenant bot.
     /// The order links customer, owner, selected XUI plan, HooshPay invoice, fulfillment result, and owner profit.
     /// </summary>
@@ -185,6 +205,16 @@ namespace Adminbot.Domain
         /// UUID; those remain owner-checked. The value must not enter callbacks, messages, or operational logs.
         /// </remarks>
         public string TargetAccountUuid { get; set; }
+        /// <summary>
+        /// Gets or sets the evidence mode that authorized <see cref="ServiceKey" /> for a tenant renewal order.
+        /// </summary>
+        /// <remarks>
+        /// This value is null for historical orders. New renewals persist one value from
+        /// <see cref="TenantRenewalServiceResolutionModes" /> before payment-provider creation. A customer-selected
+        /// legacy mode is valid only while a fresh identity-checked panel read still lists the stored service among the
+        /// compatible candidates. It never transfers account ownership or management access.
+        /// </remarks>
+        public string RenewalServiceResolutionMode { get; set; }
         public string ServiceKey { get; set; }
         public int? TrafficGb { get; set; }
         public string DurationKey { get; set; }
@@ -384,6 +414,15 @@ namespace Adminbot.Domain
         /// when the renewal finishes, so a later legitimate renewal starts a brand-new session and a new operation.
         /// </remarks>
         public string RenewalSessionId { get; set; }
+        /// <summary>
+        /// Gets or sets the evidence mode for the temporary tenant renewal service category.
+        /// </summary>
+        /// <remarks>
+        /// The value is scoped by <see cref="BotId" /> plus <see cref="TelegramUserId" /> and is cleared with the
+        /// conversation. It is copied to a tenant renewal order only after the exact email and UUID target and the live
+        /// compatible service set are revalidated. Owned renewal flows leave it empty.
+        /// </remarks>
+        public string RenewalServiceResolutionMode { get; set; }
         public int AccountCounter { get; set; }
         public int PendingAccountCount { get; set; }
         public string PendingUserComment { get; set; }
@@ -399,8 +438,9 @@ namespace Adminbot.Domain
         /// <param name="user">Legacy User state object collected by existing call sites.</param>
         /// <returns>A new BotUserState that can be inserted into users.db.</returns>
         /// <remarks>
-        /// The conversion copies an optional renewal UUID target lock into the specified bot scope. It performs no account,
-        /// wallet, order, or panel operation and callers remain responsible for persisting the returned row.
+        /// The conversion copies an optional renewal UUID target lock and tenant service-resolution evidence into the
+        /// specified bot scope. It performs no account, wallet, order, or panel operation and callers remain responsible
+        /// for persisting the returned row.
         /// </remarks>
         public static BotUserState FromUser(string botId, User user)
         {
@@ -422,6 +462,7 @@ namespace Adminbot.Domain
                 PaymentMethod = user.PaymentMethod ?? "credit",
                 RenewTargetUuid = user.RenewTargetUuid,
                 RenewalSessionId = user.RenewalSessionId,
+                RenewalServiceResolutionMode = user.RenewalServiceResolutionMode,
                 AccountCounter = user.AccountCounter,
                 PendingAccountCount = user.PendingAccountCount,
                 PendingUserComment = user.PendingUserComment,
@@ -436,8 +477,8 @@ namespace Adminbot.Domain
         /// </summary>
         /// <returns>A User object with the same conversation fields and Telegram user id.</returns>
         /// <remarks>
-        /// The sensitive renewal UUID target lock is copied so later preview/payment handlers can revalidate it; the returned
-        /// compatibility DTO is detached and does not authorize any action by itself.
+        /// The sensitive renewal UUID target lock and tenant service-resolution evidence are copied so later preview/payment
+        /// handlers can revalidate them; the returned compatibility DTO is detached and authorizes no action by itself.
         /// </remarks>
         public User ToUser()
         {
@@ -458,6 +499,7 @@ namespace Adminbot.Domain
                 PaymentMethod = PaymentMethod ?? "credit",
                 RenewTargetUuid = RenewTargetUuid,
                 RenewalSessionId = RenewalSessionId,
+                RenewalServiceResolutionMode = RenewalServiceResolutionMode,
                 AccountCounter = AccountCounter,
                 PendingAccountCount = PendingAccountCount,
                 PendingUserComment = PendingUserComment,
@@ -472,9 +514,9 @@ namespace Adminbot.Domain
         /// <param name="user">Partial legacy state update.</param>
         /// <remarks>
         /// Null means "preserve the stored value" for all nullable legacy fields; an explicit empty string clears a
-        /// string field. This distinction preserves the renewal UUID target lock across payment-method and plan updates but
-        /// means callers that must also clear numeric pending state should use a full reset instead of a partial save.
-        /// Callers must save the tracked state after this in-memory merge.
+        /// string field. This distinction preserves the renewal UUID target lock and service-resolution evidence across
+        /// payment-method and plan updates but means callers that must clear either value must pass an empty string or use
+        /// a full reset. Callers must save the tracked state after this in-memory merge.
         /// </remarks>
         public void ApplyPartial(User user)
         {
@@ -492,6 +534,7 @@ namespace Adminbot.Domain
             if (user.PaymentMethod != PaymentMethod) PaymentMethod = user.PaymentMethod;
             if (user.RenewTargetUuid != null) RenewTargetUuid = user.RenewTargetUuid;
             if (user.RenewalSessionId != null) RenewalSessionId = user.RenewalSessionId;
+            if (user.RenewalServiceResolutionMode != null) RenewalServiceResolutionMode = user.RenewalServiceResolutionMode;
             if (user.PendingAccountCount > 0) PendingAccountCount = user.PendingAccountCount;
             if (user.PendingUserComment != null) PendingUserComment = user.PendingUserComment;
             if (user.LastFreeAcc > DateTime.MinValue) LastFreeAcc = user.LastFreeAcc;
@@ -504,8 +547,9 @@ namespace Adminbot.Domain
         /// Clears transient flow fields while keeping the bot/user row and long-lived counters.
         /// </summary>
         /// <remarks>
-        /// Renewal UUID target lock and payment choice are cleared with the conversation so a later flow cannot inherit
-        /// authorization. Wallets, tenant orders, account metadata, and state rows belonging to other bots are untouched.
+        /// Renewal UUID target lock, tenant category evidence, and payment choice are cleared with the conversation so a
+        /// later flow cannot inherit authorization. Wallets, tenant orders, account metadata, and state rows belonging to
+        /// other bots are untouched.
         /// </remarks>
         public void Clear()
         {
@@ -522,6 +566,7 @@ namespace Adminbot.Domain
             PaymentMethod = "credit";
             RenewTargetUuid = "";
             RenewalSessionId = "";
+            RenewalServiceResolutionMode = "";
             PendingAccountCount = 0;
             PendingUserComment = "";
             UpdatedAtUtc = DateTime.UtcNow;

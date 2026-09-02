@@ -62,6 +62,16 @@ public class User
     /// </remarks>
     [NotMapped]
     public string RenewalSessionId { get; set; }
+    /// <summary>
+    /// Gets or sets the persisted evidence mode for a tenant renewal service-category decision.
+    /// </summary>
+    /// <remarks>
+    /// This compatibility DTO property is not mapped to the legacy <c>Users</c> table. It is stored only on the
+    /// bot-scoped <see cref="BotUserState" /> row and is copied to a tenant renewal order after live email/UUID and
+    /// service compatibility checks. Owned renewal flows leave it empty.
+    /// </remarks>
+    [NotMapped]
+    public string RenewalServiceResolutionMode { get; set; }
     public int AccountCounter { get; set; }
     public int PendingAccountCount { get; set; }
     public string PendingUserComment { get; set; }
