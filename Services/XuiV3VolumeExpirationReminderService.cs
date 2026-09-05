@@ -32,7 +32,7 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     private readonly BotClientProvider _botClientProvider;
     private readonly BotRegistry _botRegistry;
     private readonly BotContextAccessor _botContextAccessor;
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly CredentialsStore _credentialsDbContext;
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly XuiV3VolumeReminderStateStore _stateStore;
     private readonly ILogger<XuiV3VolumeExpirationReminderService> _logger;
@@ -57,12 +57,13 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     /// <param name="purchaseService">Plan catalog used to restrict reminders to currently active service inbounds.</param>
     /// <param name="stateStore">Durable users.db cycle, start-evidence, and delivery-claim store.</param>
     /// <param name="logger">Structured operational logger that never receives panel tokens or subscription secrets.</param>
+    /// <remarks>The background worker uses detached global profile reads and existing bot-scoped reminder claims; no credentials tracker survives between scans.</remarks>
     public XuiV3VolumeExpirationReminderService(
         IConfiguration configuration,
         BotClientProvider botClientProvider,
         BotRegistry botRegistry,
         BotContextAccessor botContextAccessor,
-        CredentialsDbContext credentialsDbContext,
+        CredentialsStore credentialsDbContext,
         XuiV3PurchaseService purchaseService,
         XuiV3VolumeReminderStateStore stateStore,
         ILogger<XuiV3VolumeExpirationReminderService> logger)

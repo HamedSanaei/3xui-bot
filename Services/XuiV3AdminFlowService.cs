@@ -60,8 +60,10 @@ public class XuiV3AdminFlowService
     private const int MaxTelegramTextLength = 3900;
     private const string SkipCommentText = "ادامه بدون کامنت";
 
-    private readonly UserDbContext _userDbContext;
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly UserWorkflowStore _workflow;
+    /// <summary>Independent bot/user state operations; no EF context is retained by the store.</summary>
+    private readonly UserStateStore _state;
+    private readonly CredentialsStore _credentialsDbContext;
     private readonly IConfiguration _configuration;
     private readonly AppConfig _appConfig;
     private readonly NowPayments _nowPayments;
@@ -83,6 +85,7 @@ public class XuiV3AdminFlowService
     /// <summary>
     /// Creates the super-admin XuiV3 flow service and injects the payment and tenant services needed by admin tools.
     /// </summary>
+    /// <param name="stateStore">Factory-backed state reader/writer isolated by runtime bot id and Telegram user id.</param>
     /// <param name="userDbContext">Runtime database containing admin flow state and payment rows.</param>
     /// <param name="credentialsDbContext">Shared profile and wallet database.</param>
     /// <param name="configuration">Application configuration containing XuiV3 and payment settings.</param>
@@ -110,9 +113,11 @@ public class XuiV3AdminFlowService
     /// Durable users.db volume-cycle store notified after the panel accepts an admin renewal. Reminder persistence is
     /// best-effort and never changes the account update or any financial state.
     /// </param>
+    /// <remarks>Register this handler as scoped so admin execution never shares its users.db tracker with another update or recovery worker.</remarks>
     public XuiV3AdminFlowService(
-        UserDbContext userDbContext,
-        CredentialsDbContext credentialsDbContext,
+        UserWorkflowStore userDbContext,
+        UserStateStore stateStore,
+        CredentialsStore credentialsDbContext,
         IConfiguration configuration,
         NowPayments nowPayments,
         NowPaymentsSettlementService settlementService,
@@ -129,7 +134,8 @@ public class XuiV3AdminFlowService
         UserActivityLogService activityLog,
         XuiV3VolumeReminderStateStore volumeReminderStateStore)
     {
-        _userDbContext = userDbContext;
+        _workflow = userDbContext;
+        _state = stateStore;
         _credentialsDbContext = credentialsDbContext;
         _configuration = configuration;
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -167,6 +173,7 @@ public class XuiV3AdminFlowService
     /// <param name="mainMenu">Reply keyboard returned when a flow finishes.</param>
     /// <param name="cancellationToken">Cancellation token for Telegram, database, payment, and panel operations.</param>
     /// <returns><c>true</c> when the message was consumed by this service; otherwise <c>false</c>.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     public async Task<bool> TryHandleMessageAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -257,8 +264,8 @@ public class XuiV3AdminFlowService
 
         if (message.Text == "➕ Create New Account")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await _userDbContext.SaveUserStatus(new User
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = FlowName,
@@ -282,8 +289,8 @@ public class XuiV3AdminFlowService
 
         if (message.Text == "🔄 Renew Existing Account")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await _userDbContext.SaveUserStatus(new User
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = FlowName,
@@ -354,7 +361,7 @@ public class XuiV3AdminFlowService
 
         if (message.Text == "ℹ️ Get Account Info")
         {
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = FlowName,
@@ -372,7 +379,7 @@ public class XuiV3AdminFlowService
 
         if (message.Text == "✔️ Verify payment")
         {
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = FlowName,
@@ -390,7 +397,7 @@ public class XuiV3AdminFlowService
 
         if (message.Text == "🗑 Delete expired accounts")
         {
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = FlowName,
@@ -408,7 +415,7 @@ public class XuiV3AdminFlowService
         if (message.Text == "🚫 Ban user" || message.Text == "✅ Unban user")
         {
             var shouldBlock = message.Text == "🚫 Ban user";
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = FlowName,
@@ -427,7 +434,7 @@ public class XuiV3AdminFlowService
 
         if (message.Text == "✉️ Send message to user")
         {
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = FlowName,
@@ -445,6 +452,13 @@ public class XuiV3AdminFlowService
         return false;
     }
 
+    /// <summary>Validates the target Telegram user and advances the administrator account-creation conversation.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleCreateTargetUserAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -471,7 +485,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -487,6 +501,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Validates the selected service and prompts for the next administrator provisioning parameter.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleCreateServiceAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -508,7 +530,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -525,6 +547,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Validates traffic in GB and saves it before prompting for the administrator account duration.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleCreateTrafficAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -546,7 +576,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -561,6 +591,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Validates the requested duration in days and advances the administrator account-creation conversation.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleCreateDurationAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -583,7 +621,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -598,6 +636,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Validates an unlimited plan choice and saves the corresponding administrator provisioning selection.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleCreateUnlimitedPlanAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -620,7 +666,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -635,6 +681,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Accepts an account count within MaxBulkAccountCount and prompts for an optional order comment.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleCreateAccountCountAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -657,7 +711,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -672,6 +726,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Validates the optional order comment and advances the prepared administrator provisioning request.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleCreateUserCommentAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -686,7 +748,7 @@ public class XuiV3AdminFlowService
             ? string.Empty
             : NormalizeUserComment(message.Text);
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -694,7 +756,7 @@ public class XuiV3AdminFlowService
             PendingUserComment = userComment
         });
 
-        var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
+        var refreshedUser = await _state.GetUserStatus(message.From.Id);
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
             text: BuildCreateSummary(refreshedUser),
@@ -868,6 +930,14 @@ public class XuiV3AdminFlowService
 
     }
 
+    /// <summary>Finds the administrator-selected account and prepares its renewal parameters in this bot conversation.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleRenewAccountAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -921,7 +991,7 @@ public class XuiV3AdminFlowService
 
         var service = ResolveServiceForClient(client);
         var metadata = TryReadMetadata(client.Comment);
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -938,6 +1008,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Validates the renewal traffic selection and persists the next administrator renewal step.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleRenewTrafficAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -957,7 +1035,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -973,6 +1051,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Validates the renewal duration and advances the prepared administrator renewal request.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleRenewDurationAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -998,7 +1084,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -1006,7 +1092,7 @@ public class XuiV3AdminFlowService
             SelectedPeriod = durationDays.Value.ToString()
         });
 
-        var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
+        var refreshedUser = await _state.GetUserStatus(message.From.Id);
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
             text: await BuildRenewSummaryAsync(refreshedUser, cancellationToken),
@@ -1334,7 +1420,7 @@ public class XuiV3AdminFlowService
             return true;
         }
 
-        var payment = await _userDbContext.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+        var payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken));
         if (payment == null)
         {
             await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت مورد نظر پیدا نشد.", true, cancellationToken);
@@ -1501,8 +1587,8 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        var payment = await _userDbContext.SwapinoPaymentInfos
-            .FirstOrDefaultAsync(p => p.OrderId == input || p.PaymentId == input || p.InvoiceId == input, cancellationToken);
+        var payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos
+            .FirstOrDefaultAsync(p => p.OrderId == input || p.PaymentId == input || p.InvoiceId == input, cancellationToken));
 
         if (payment == null)
         {
@@ -1545,7 +1631,7 @@ public class XuiV3AdminFlowService
                 var status = await _nowPayments.GetPaymentStatusAsync(paymentId, cancellationToken);
                 data.Apply(status);
                 payment.SetNowPaymentsData(data);
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
             }
 
             if (NowPaymentsStatuses.IsPaid(data.PaymentStatus ?? payment.PaymentStatus))
@@ -1622,10 +1708,10 @@ public class XuiV3AdminFlowService
     {
         TetraminatorPaymentInfo payment = null;
         if (int.TryParse(input, out var paymentId))
-            payment = await _userDbContext.TetraminatorPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
-        payment ??= await _userDbContext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+            payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken));
+        payment ??= await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.FirstOrDefaultAsync(
             p => p.OrderId == input || p.PayId == input,
-            cancellationToken);
+            cancellationToken));
         if (payment == null)
             return false;
 
@@ -1657,7 +1743,7 @@ public class XuiV3AdminFlowService
                 payment.PaymentStatus = TetraminatorStatuses.Paid;
                 payment.PaidAtUtc ??= DateTime.UtcNow;
             }
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             if (verified)
             {
@@ -1676,7 +1762,7 @@ public class XuiV3AdminFlowService
             payment.ErrorCode = "provider_inquiry_failed";
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             _logger.LogError(ex, "Tetraminator super-admin inquiry failed. paymentId={PaymentId}, orderId={OrderId}", payment.Id, payment.OrderId);
             await FinishWithMessageAsync(
                 botClient,
@@ -1710,7 +1796,7 @@ public class XuiV3AdminFlowService
             string.Equals(payment.ErrorCode, "provider_not_paid", StringComparison.Ordinal) &&
             CanProvisionallyApproveTetraminator(payment))
         {
-            await _userDbContext.ClearUserStatus(currentUser);
+            await _state.ClearUserStatus(currentUser);
             await botClient.SendTextMessageAsync(
                 message.Chat.Id,
                 BuildTetraminatorPaymentInfo(payment, settlement) +
@@ -1760,11 +1846,11 @@ public class XuiV3AdminFlowService
     {
         HooshPayPaymentInfo payment = null;
         if (int.TryParse(input, out var paymentId))
-            payment = await _userDbContext.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+            payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken));
 
-        payment ??= await _userDbContext.HooshPayPaymentInfos.FirstOrDefaultAsync(
+        payment ??= await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.FirstOrDefaultAsync(
             p => p.OrderId == input || p.InvoiceUid == input,
-            cancellationToken);
+            cancellationToken));
 
         if (payment == null)
             return false;
@@ -1801,13 +1887,13 @@ public class XuiV3AdminFlowService
                 invoice,
                 verify
             });
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
         }
         catch (Exception ex)
         {
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await FinishWithMessageAsync(
                 botClient,
@@ -1823,7 +1909,7 @@ public class XuiV3AdminFlowService
         if (verify?.paid == true || HooshPayStatuses.IsPaid(payment.PaymentStatus))
         {
             payment.PaymentStatus = HooshPayStatuses.Paid;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             // Admin manual checks must respect payment purpose to avoid charging tenant customers' wallets.
             var isTenantOrder = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase);
             if (!isTenantOrder)
@@ -1863,7 +1949,7 @@ public class XuiV3AdminFlowService
 
         if (settlement == null && CanProvisionallyApproveHooshPay(payment))
         {
-            await _userDbContext.ClearUserStatus(currentUser);
+            await _state.ClearUserStatus(currentUser);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: BuildHooshPayPaymentInfo(payment, settlement) +
@@ -1916,14 +2002,14 @@ public class XuiV3AdminFlowService
         UniquePayPaymentInfo payment = null;
         if (TryParseUniquePayInternalId(input, out var paymentId))
         {
-            payment = await _userDbContext.UniquePayPaymentInfos
-                .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
+            payment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos
+                .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken));
         }
         else
         {
-            payment = await _userDbContext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+            payment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.FirstOrDefaultAsync(
                 x => x.HashId == input || x.RefId == input,
-                cancellationToken);
+                cancellationToken));
         }
 
         if (payment == null)
@@ -1934,7 +2020,7 @@ public class XuiV3AdminFlowService
             "admin-check",
             allowTerminalRecheck: true,
             cancellationToken);
-        await _userDbContext.Entry(payment).ReloadAsync(cancellationToken);
+        await _workflow.ReloadAsync(payment, cancellationToken);
 
         var actor = await GetActivityActorAsync(message.From.Id);
         await _activityLog.LogBotActionAsync(
@@ -1956,7 +2042,7 @@ public class XuiV3AdminFlowService
 
         if (UniquePaySettlementService.CanApplyProvisionalCredit(payment))
         {
-            await _userDbContext.ClearUserStatus(currentUser);
+            await _state.ClearUserStatus(currentUser);
             await botClient.SendTextMessageAsync(
                 message.Chat.Id,
                 BuildUniquePayPaymentInfo(payment, settlement) +
@@ -2031,7 +2117,7 @@ public class XuiV3AdminFlowService
             return true;
         }
 
-        var payment = await _userDbContext.UniquePayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+        var payment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken));
         if (payment == null)
         {
             await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت UniquePay پیدا نشد.", true, cancellationToken);
@@ -2110,7 +2196,7 @@ public class XuiV3AdminFlowService
                 payment.ChatId == 0 ? null : payment.ChatId,
                 "admin-provisional-confirm-refresh",
                 cancellationToken);
-            await _userDbContext.Entry(payment).ReloadAsync(cancellationToken);
+            await _workflow.ReloadAsync(payment, cancellationToken);
 
             if (UniquePayStatuses.IsPaid(payment.PaymentStatus))
             {
@@ -2275,7 +2361,7 @@ public class XuiV3AdminFlowService
             return true;
         }
 
-        var payment = await _userDbContext.TetraminatorPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+        var payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken));
         if (payment == null)
         {
             await AnswerCallbackSafelyAsync(botClient, callbackQuery, "پرداخت تترامیناتور پیدا نشد.", true, cancellationToken);
@@ -2364,7 +2450,7 @@ public class XuiV3AdminFlowService
                 payment.PaymentStatus = TetraminatorStatuses.Paid;
                 payment.PaidAtUtc ??= DateTime.UtcNow;
             }
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             if (verified)
             {
@@ -2602,12 +2688,12 @@ public class XuiV3AdminFlowService
             if (!string.IsNullOrWhiteSpace(verify?.status))
                 payment.PaymentStatus = verify.status;
             payment.RawResponseJson = JsonConvert.SerializeObject(new { invoice, verify });
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             if (verify?.paid == true || HooshPayStatuses.IsPaid(payment.PaymentStatus))
             {
                 payment.PaymentStatus = HooshPayStatuses.Paid;
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 await _hooshPaySettlementService.RecordProviderConfirmationAfterProvisionalAsync(
                     payment,
                     "admin-provisional-confirm-refresh",
@@ -2884,6 +2970,14 @@ public class XuiV3AdminFlowService
         return true;
     }
 
+    /// <summary>Lists one target user's expired or depleted accounts and prepares an explicit deletion confirmation.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleDeleteExpiredTargetUserAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -2935,7 +3029,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -3164,6 +3258,14 @@ public class XuiV3AdminFlowService
             ParseMode.Html);
     }
 
+    /// <summary>Validates the target Telegram user before requesting an administrator private-message draft.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandlePrivateMessageTargetAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -3185,7 +3287,7 @@ public class XuiV3AdminFlowService
         }
 
         var targetUser = await _credentialsDbContext.GetUserStatusWithId(targetTelegramUserId);
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -3200,6 +3302,14 @@ public class XuiV3AdminFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Validates a nonempty private-message draft of at most 3900 characters and displays a confirmation preview.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandlePrivateMessageTextAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -3229,7 +3339,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = FlowName,
@@ -3478,6 +3588,14 @@ public class XuiV3AdminFlowService
         return true;
     }
 
+    /// <summary>Clears the current bot/user administrative conversation and returns its main menu.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="chatId">Telegram destination chat id in the active bot, not an internal user or tenant database id.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task CancelAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -3485,7 +3603,7 @@ public class XuiV3AdminFlowService
         CancellationToken cancellationToken,
         IReplyMarkup mainMenu = null)
     {
-        await _userDbContext.ClearUserStatus(currentUser);
+        await _state.ClearUserStatus(currentUser);
         await botClient.SendTextMessageAsync(
             chatId: chatId,
             text: "عملیات لغو شد.",
@@ -3976,6 +4094,12 @@ public class XuiV3AdminFlowService
             };
     }
 
+    /// <summary>Creates one free admin-issued account using the administrator's durable conversation intent.</summary>
+    /// <param name="currentUser">Detached bot/admin state containing target Telegram owner and the selected plan.</param>
+    /// <param name="actorTelegramUserId">Authenticated super-admin Telegram id recorded in creation metadata.</param>
+    /// <param name="cancellationToken">Cancellation of intent persistence, panel work and metadata updates.</param>
+    /// <returns>The verified account or safe failed result; no wallet debit is performed.</returns>
+    /// <remarks>The session is saved before HTTP and its creation key is reused across duplicate confirmations.</remarks>
     private async Task<XuiV3AccountCreationResult> CreateAdminAccountAsync(
         User currentUser,
         long actorTelegramUserId,
@@ -3984,6 +4108,7 @@ public class XuiV3AdminFlowService
         if (!long.TryParse(currentUser.ConfigLink, out var targetTelegramUserId))
             throw new InvalidOperationException("Target telegram user id is not valid.");
 
+        await EnsureAdminCreationSessionAsync(currentUser);
         var service = FindService(currentUser.SelectedCountry);
         var selection = service.IsUnlimited
             ? new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = currentUser.Type }
@@ -4011,6 +4136,7 @@ public class XuiV3AdminFlowService
             cancellationToken,
             new XuiV3AccountMetadataOptions
             {
+                OperationKey = $"admin-create:{BotContextAccessor.CurrentBotId}:{actorTelegramUserId}:{currentUser.PurchaseSessionId}:1",
                 CreatedByTelegramUserId = actorTelegramUserId,
                 LastUpdatedByTelegramUserId = actorTelegramUserId,
                 LastAction = "admin-create",
@@ -4047,6 +4173,12 @@ public class XuiV3AdminFlowService
         return creation;
     }
 
+    /// <summary>Creates an admin-issued batch whose accounts share a durable confirmation-session identity.</summary>
+    /// <param name="currentUser">Detached bot/admin state identifying the target customer, plan and account count.</param>
+    /// <param name="actorTelegramUserId">Authenticated super-admin Telegram id; admin issuance does not debit a wallet.</param>
+    /// <param name="cancellationToken">Cancellation of local reservation and external provisioning.</param>
+    /// <returns>The verified subset of the batch and any safe failure; uncertain creation remains reserved for review.</returns>
+    /// <remarks>Each account receives its own stable index under the persisted batch session key.</remarks>
     private async Task<XuiV3BulkCreationResult> CreateAdminAccountsAsync(
         User currentUser,
         long actorTelegramUserId,
@@ -4055,6 +4187,7 @@ public class XuiV3AdminFlowService
         if (!long.TryParse(currentUser.ConfigLink, out var targetTelegramUserId))
             throw new InvalidOperationException("Target telegram user id is not valid.");
 
+        await EnsureAdminCreationSessionAsync(currentUser);
         var selection = BuildCreateSelection(currentUser);
         var accountCount = XuiV3PurchaseService.NormalizeAccountCount(currentUser.PendingAccountCount);
         selection.AccountCount = accountCount;
@@ -4075,6 +4208,7 @@ public class XuiV3AdminFlowService
             serverInfo.Url,
             new XuiV3BulkCreateOptions
             {
+                BulkOrderId = $"admin-create:{BotContextAccessor.CurrentBotId}:{actorTelegramUserId}:{currentUser.PurchaseSessionId}",
                 AccountCount = accountCount,
                 UserComment = currentUser.PendingUserComment,
                 CreatedByTelegramUserId = actorTelegramUserId,
@@ -4084,6 +4218,17 @@ public class XuiV3AdminFlowService
                 SaveUserStatus = false
             },
             cancellationToken);
+    }
+
+    /// <summary>Persists an admin creation intent before the first panel mutation.</summary>
+    /// <param name="state">Detached conversation keyed by the current bot and the admin's Telegram user id.</param>
+    /// <returns>A task completing when a new session key is saved or the existing key is retained.</returns>
+    /// <remarks>A cleared conversation starts a new intent; repeated confirmations reuse the same session.</remarks>
+    private async Task EnsureAdminCreationSessionAsync(User state)
+    {
+        if (!string.IsNullOrWhiteSpace(state.PurchaseSessionId)) return;
+        state.PurchaseSessionId = Guid.NewGuid().ToString("N");
+        await _state.SaveUserStatus(state);
     }
 
     private static string BuildAdminCreateLogMessage(
@@ -4717,6 +4862,16 @@ public class XuiV3AdminFlowService
         return XuiV3PurchaseService.NormalizeOptionalUserComment(text) ?? string.Empty;
     }
 
+    /// <summary>Clears the administrative conversation and sends its final result with the supplied menu.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="chatId">Telegram destination chat id in the active bot, not an internal user or tenant database id.</param>
+    /// <param name="currentUser">Detached administrator conversation snapshot belonging to the current BotId plus Telegram user id.</param>
+    /// <param name="mainMenu">Reply markup for the caller's authorized main menu, or null to send without replacement markup.</param>
+    /// <param name="text">Result text already prepared for the selected parse mode; escape user input when HTML or Markdown is used.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <param name="parseMode">Telegram parse mode matching the supplied text; null sends unformatted text.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task FinishWithMessageAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -4726,7 +4881,7 @@ public class XuiV3AdminFlowService
         CancellationToken cancellationToken,
         ParseMode? parseMode = null)
     {
-        await _userDbContext.ClearUserStatus(currentUser);
+        await _state.ClearUserStatus(currentUser);
         await botClient.SendTextMessageAsync(
             chatId: chatId,
             text: text,
@@ -5009,9 +5164,9 @@ public class XuiV3AdminFlowService
         if (configuredBot?.Type == null ||
             !string.Equals(configuredBot.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
         {
-            var persistedBot = await _userDbContext.BotInstances
+            var persistedBot = await _workflow.ReadAsync(async db => await db.BotInstances
                 .AsNoTracking()
-                .FirstOrDefaultAsync(bot => bot.Id == createdByBotId, cancellationToken);
+                .FirstOrDefaultAsync(bot => bot.Id == createdByBotId, cancellationToken));
             if (persistedBot == null ||
                 !string.Equals(persistedBot.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
             {

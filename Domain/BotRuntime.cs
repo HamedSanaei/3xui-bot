@@ -414,6 +414,8 @@ namespace Adminbot.Domain
         /// when the renewal finishes, so a later legitimate renewal starts a brand-new session and a new operation.
         /// </remarks>
         public string RenewalSessionId { get; set; }
+        /// <summary>Owned purchase session id scoped by BotId and TelegramUserId; cleared with transient conversation state.</summary>
+        public string PurchaseSessionId { get; set; }
         /// <summary>
         /// Gets or sets the evidence mode for the temporary tenant renewal service category.
         /// </summary>
@@ -462,6 +464,7 @@ namespace Adminbot.Domain
                 PaymentMethod = user.PaymentMethod ?? "credit",
                 RenewTargetUuid = user.RenewTargetUuid,
                 RenewalSessionId = user.RenewalSessionId,
+                PurchaseSessionId = user.PurchaseSessionId,
                 RenewalServiceResolutionMode = user.RenewalServiceResolutionMode,
                 AccountCounter = user.AccountCounter,
                 PendingAccountCount = user.PendingAccountCount,
@@ -499,6 +502,7 @@ namespace Adminbot.Domain
                 PaymentMethod = PaymentMethod ?? "credit",
                 RenewTargetUuid = RenewTargetUuid,
                 RenewalSessionId = RenewalSessionId,
+                PurchaseSessionId = PurchaseSessionId,
                 RenewalServiceResolutionMode = RenewalServiceResolutionMode,
                 AccountCounter = AccountCounter,
                 PendingAccountCount = PendingAccountCount,
@@ -534,6 +538,7 @@ namespace Adminbot.Domain
             if (user.PaymentMethod != PaymentMethod) PaymentMethod = user.PaymentMethod;
             if (user.RenewTargetUuid != null) RenewTargetUuid = user.RenewTargetUuid;
             if (user.RenewalSessionId != null) RenewalSessionId = user.RenewalSessionId;
+            if (user.PurchaseSessionId != null) PurchaseSessionId = user.PurchaseSessionId;
             if (user.RenewalServiceResolutionMode != null) RenewalServiceResolutionMode = user.RenewalServiceResolutionMode;
             if (user.PendingAccountCount > 0) PendingAccountCount = user.PendingAccountCount;
             if (user.PendingUserComment != null) PendingUserComment = user.PendingUserComment;
@@ -566,6 +571,7 @@ namespace Adminbot.Domain
             PaymentMethod = "credit";
             RenewTargetUuid = "";
             RenewalSessionId = "";
+            PurchaseSessionId = "";
             RenewalServiceResolutionMode = "";
             PendingAccountCount = 0;
             PendingUserComment = "";

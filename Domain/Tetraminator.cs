@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.Net;
@@ -400,9 +401,9 @@ public sealed class Tetraminator
 /// </remarks>
 public sealed class TetraminatorSettlementService
 {
-    private static readonly SemaphoreSlim SettlementGate = new(1, 1);
-    private readonly UserDbContext _userDbContext;
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private static readonly AsyncKeyedGate SettlementGate = new();
+    private readonly UserDbContextFactory _userDbContextFactory;
+    private readonly CredentialsStore _credentialsDbContext;
     private readonly WalletLedgerService _walletLedgerService;
     private readonly ReferralService _referralService;
     private readonly BotClientProvider _botClientProvider;
@@ -413,7 +414,7 @@ public sealed class TetraminatorSettlementService
     /// <summary>
     /// Creates the owned-wallet settlement boundary for Tetraminator payments.
     /// </summary>
-    /// <param name="userDbContext">users.db context containing payment audit and settlement flags.</param>
+    /// <param name="userDbContext">Factory for operation-owned users.db contexts. Detached input rows are reloaded before writes.</param>
     /// <param name="credentialsDbContext">credentials.db context containing the original user wallet balance.</param>
     /// <param name="walletLedgerService">Append-only users.db ledger writer with unique idempotency keys.</param>
     /// <param name="referralService">Existing global owned-bot referral settlement and reconciliation service.</param>
@@ -421,9 +422,10 @@ public sealed class TetraminatorSettlementService
     /// <param name="botRegistry">Runtime bot metadata registry used to restore the originating bot context.</param>
     /// <param name="botContextAccessor">Async bot context accessor used while logging and notifying settlement.</param>
     /// <param name="logger">Structured operational logger; API credentials are never included.</param>
+    /// <remarks>Official and provisional settlement coordinate per invoice and reuse the same wallet receipt key. The users.db ledger remains a separate commit.</remarks>
     public TetraminatorSettlementService(
-        UserDbContext userDbContext,
-        CredentialsDbContext credentialsDbContext,
+        UserDbContextFactory userDbContext,
+        CredentialsStore credentialsDbContext,
         WalletLedgerService walletLedgerService,
         ReferralService referralService,
         BotClientProvider botClientProvider,
@@ -431,7 +433,7 @@ public sealed class TetraminatorSettlementService
         BotContextAccessor botContextAccessor,
         ILogger<TetraminatorSettlementService> logger)
     {
-        _userDbContext = userDbContext;
+        _userDbContextFactory = userDbContext;
         _credentialsDbContext = credentialsDbContext;
         _walletLedgerService = walletLedgerService;
         _referralService = referralService;
@@ -459,6 +461,7 @@ public sealed class TetraminatorSettlementService
         long? notifyChatId = null,
         CancellationToken cancellationToken = default)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
         if (!IsWalletCharge(payment) ||
@@ -470,9 +473,14 @@ public sealed class TetraminatorSettlementService
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
 
-        await SettlementGate.WaitAsync(cancellationToken);
+        using var settlementGateLease = await SettlementGate.EnterAsync(payment.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
         try
         {
+            // Reload after the payment-keyed gate: another bot or webhook may have committed while this caller waited.
+            payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
+            await _workflow.ReloadAsync(payment, cancellationToken);
+            if (!IsWalletCharge(payment) || !TetraminatorStatuses.IsPaid(payment.PaymentStatus) || string.IsNullOrWhiteSpace(payment.PayId) || !payment.PaidAtUtc.HasValue || !string.IsNullOrWhiteSpace(payment.ErrorCode))
+                return NowPaymentsSettlementResult.ProviderNotPaid();
             var user = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
             if (user == null)
                 return NowPaymentsSettlementResult.UserNotFound();
@@ -485,7 +493,7 @@ public sealed class TetraminatorSettlementService
                     {
                         payment.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
                         payment.UpdatedAtUtc = DateTime.UtcNow;
-                        await _userDbContext.SaveChangesAsync(cancellationToken);
+                        await _workflow.SaveAsync(cancellationToken);
                         LogOfficialConfirmationAfterProvisional(payment, user, source);
                     }
                 }
@@ -498,9 +506,11 @@ public sealed class TetraminatorSettlementService
             }
 
             var before = user.AccountBalance;
-            if (!await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.AmountToman))
+            if (!await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.AmountToman, $"payment:tetraminator:{payment.Id}:credit", botId: payment.BotId))
                 return NowPaymentsSettlementResult.UserNotFound();
-            var after = checked(before + payment.AmountToman);
+            var walletReceipt = await _credentialsDbContext.GetWalletOperationAsync($"payment:tetraminator:{payment.Id}:credit");
+            before = walletReceipt.BeforeBalance;
+            var after = walletReceipt.AfterBalance;
 
             payment.IsAddedToBalance = true;
             payment.BalanceBefore = before;
@@ -509,7 +519,7 @@ public sealed class TetraminatorSettlementService
             payment.UpdatedAtUtc = DateTime.UtcNow;
             // Persist the notification with the first-credit marker before ledger/referral follow-up work.
             var notificationChatId = notifyChatId ?? user.ChatID;
-            _userDbContext.PaymentSettlementNotifications.Add(
+            _workflow.Add(
                 PaymentSettlementNotification.CreateOwnedWalletCredit(
                     provider: "tetraminator",
                     providerPaymentId: payment.Id,
@@ -519,7 +529,7 @@ public sealed class TetraminatorSettlementService
                     amountToman: payment.AmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
                     createdAtUtc: payment.SettledAtUtc.Value));
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             await EnsureOfficialLedgerAsync(payment, before, after, cancellationToken);
             await ProcessReferralAsync(payment, cancellationToken);
 
@@ -531,7 +541,7 @@ public sealed class TetraminatorSettlementService
         }
         finally
         {
-            SettlementGate.Release();
+            settlementGateLease.Dispose();
         }
     }
 
@@ -550,14 +560,18 @@ public sealed class TetraminatorSettlementService
         long? notifyChatId = null,
         CancellationToken cancellationToken = default)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
         if (!IsWalletCharge(payment) || (!payment.IsAddedToBalance && !CanApplyProvisionalCredit(payment)))
             return NowPaymentsSettlementResult.InvalidAmount();
 
-        await SettlementGate.WaitAsync(cancellationToken);
+        using var settlementGateLease = await SettlementGate.EnterAsync(payment.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
         try
         {
+            // Reload after the payment-keyed gate: another bot or webhook may have committed while this caller waited.
+            payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
+            await _workflow.ReloadAsync(payment, cancellationToken);
             var user = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
             if (user == null)
                 return NowPaymentsSettlementResult.UserNotFound();
@@ -575,9 +589,11 @@ public sealed class TetraminatorSettlementService
             }
 
             var before = user.AccountBalance;
-            if (!await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.AmountToman))
+            if (!await _credentialsDbContext.AddFund(payment.TelegramUserId, payment.AmountToman, $"payment:tetraminator:{payment.Id}:credit", botId: payment.BotId, approvalKind: "provisional", approvedByTelegramUserId: approvedByTelegramUserId))
                 return NowPaymentsSettlementResult.UserNotFound();
-            var after = checked(before + payment.AmountToman);
+            var walletReceipt = await _credentialsDbContext.GetWalletOperationAsync($"payment:tetraminator:{payment.Id}:credit");
+            before = walletReceipt.BeforeBalance;
+            var after = walletReceipt.AfterBalance;
             payment.IsAddedToBalance = true;
             payment.IsProvisionallyApproved = true;
             payment.ProvisionalApprovedAtUtc = DateTime.UtcNow;
@@ -588,7 +604,7 @@ public sealed class TetraminatorSettlementService
             payment.UpdatedAtUtc = DateTime.UtcNow;
             // Official reconciliation after this provisional credit cannot enqueue a duplicate notification.
             var notificationChatId = notifyChatId ?? user.ChatID;
-            _userDbContext.PaymentSettlementNotifications.Add(
+            _workflow.Add(
                 PaymentSettlementNotification.CreateOwnedWalletCredit(
                     provider: "tetraminator",
                     providerPaymentId: payment.Id,
@@ -598,7 +614,7 @@ public sealed class TetraminatorSettlementService
                     amountToman: payment.AmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت.",
                     createdAtUtc: payment.SettledAtUtc.Value));
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await EnsureProvisionalLedgerAsync(payment, before, after, cancellationToken);
 
@@ -610,7 +626,7 @@ public sealed class TetraminatorSettlementService
         }
         finally
         {
-            SettlementGate.Release();
+            settlementGateLease.Dispose();
         }
     }
 
@@ -622,6 +638,7 @@ public sealed class TetraminatorSettlementService
     /// <param name="after">Wallet balance in toman after the credit.</param>
     /// <param name="cancellationToken">Cancellation token for the users.db ledger insert.</param>
     /// <returns>The existing or newly persisted ledger entry selected by its stable idempotency key.</returns>
+    /// <remarks>Official and provisional settlement coordinate per invoice and reuse the same wallet receipt key. The users.db ledger remains a separate commit.</remarks>
     private Task<WalletLedgerEntry> EnsureOfficialLedgerAsync(TetraminatorPaymentInfo payment, long before, long after, CancellationToken cancellationToken)
     {
         var sourceKey = ReferralService.BuildSourcePaymentKey("tetraminator", TenantBotPaymentPurposes.WalletCharge, GetStablePaymentId(payment));
@@ -640,7 +657,7 @@ public sealed class TetraminatorSettlementService
             botId: payment.BotId,
             botUsername: payment.BotUsername,
             botType: BotInstanceTypes.Owned,
-            idempotencyKey: $"wallet-credit:{sourceKey}",
+            idempotencyKey: $"payment:tetraminator:{payment.Id}:credit",
             cancellationToken: cancellationToken);
     }
 
@@ -676,7 +693,7 @@ public sealed class TetraminatorSettlementService
             botId: payment.BotId,
             botUsername: payment.BotUsername,
             botType: BotInstanceTypes.Owned,
-            idempotencyKey: $"wallet-credit:tetraminator-provisional:{GetStablePaymentId(payment)}",
+            idempotencyKey: $"payment:tetraminator:{payment.Id}:credit",
             cancellationToken: cancellationToken);
 
     /// <summary>

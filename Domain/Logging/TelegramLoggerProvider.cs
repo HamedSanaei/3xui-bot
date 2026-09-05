@@ -63,10 +63,9 @@ namespace Adminbot.Domain.Logging
                 _dispatcher);
         }
 
-        public void Dispose()
-        {
-            _dispatcher.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
+        /// <summary>Releases this lightweight provider; the host owns and asynchronously drains the shared dispatcher.</summary>
+        /// <remarks>Disposing the dispatcher here would double-dispose the DI singleton and block on asynchronous shutdown.</remarks>
+        public void Dispose() { }
 
         /// <summary>
         /// Applies the provider-level Telegram forwarding policy for one log entry.

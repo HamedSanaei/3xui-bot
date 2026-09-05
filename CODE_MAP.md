@@ -15,20 +15,28 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Services/TelegramBotService.cs`: main dispatcher for owned bots and legacy/admin/customer flows.
 - `Services/TenantBotService.cs`: tenant owner panel and tenant customer storefront flows.
 - `Controllers/PaymentController.cs`: payment IPN endpoints and gateway callbacks.
+- `Services/TelegramUpdateScheduler.cs` + `Services/TelegramUpdateInboxStore.cs` + `Services/TelegramUpdateExecutor.cs`:
+  durable bounded Telegram update inbox in `users.db`. Receivers only persist updates; the scheduler claims and
+  executes them with per-bot/per-user FIFO lanes, weighted round-robin, bounded concurrency, startup recovery, and
+  shutdown drain (see the Durable Telegram Inbox section below).
 
 ## Build and Publish
 
 - Restore/build: `dotnet restore`, then `dotnet build Adminbot.sln --configuration Release --no-restore`.
 - Server publish: `dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained false` from the repository root.
-- The solution intentionally contains only the production `Adminbot` project. Do not add a separate test project or test-framework dependency unless the user explicitly requests that repository structure in the current task.
-- `Adminbot.csproj` excludes `Adminbot.Tests/**` from default SDK items so stale untracked `bin/obj` files in an existing server checkout cannot be compiled after the removed test project is deployed.
+- The solution contains the production `Adminbot` project plus `Adminbot.Tests` (xunit, added explicitly for the
+  Telegram concurrency/reliability task). Tests never ship: `Adminbot.Tests` is `IsPublishable=false`, the app does not
+  reference it, and the Release publish output contains no test assemblies.
+- `Adminbot.csproj` excludes `Adminbot.Tests/**` from default SDK items so stale nested `bin/obj` files in an existing server checkout cannot be compiled into the application.
 - `Adminbot.csproj` explicitly pins `SQLitePCLRaw.bundle_e_sqlite3` to patched 2.1.12 so EF Core's native
   SQLite library, provider, and core packages resolve as one compatible family instead of vulnerable 2.1.11.
 
 ## Data Stores
 
-- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox, owned-wallet settlement-notification outbox, weekly usage-report dispatch leases, and durable XUI volume-reminder cycles/claims.
-- `Data/CredentialsDbContex.cs`: unchanged shared user wallet/profile data; referral must not add tables, columns, or models to this database.
+- `Data/UserDbContext.cs`: bot state, tenant bot settings, payment records, broadcast jobs, wallet ledger, global referral relationships/events/rewards, tenant orders, Gozargah sync outbox, owned-wallet settlement-notification outbox, weekly usage-report dispatch leases, durable XUI volume-reminder cycles/claims, the durable Telegram update inbox (`TelegramUpdateInbox`), and XUI creation reservations (`XuiV3CreationOperations`).
+- `Data/CredentialsDbContex.cs`: shared user wallet/profile data plus the append-only durable `WalletOperations`
+  receipt table (balance mutation + receipt commit atomically in one credentials.db transaction; see the Wallet
+  Operations section). Referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
 - `Data/configuration.example.json`: sanitized configuration example including referral and four-gateway enable/readiness settings; all gateway switches and secret placeholders default to off/empty.
 - `Data/xui-v3-service-plans.json`: XUI v3 service catalog, inbounds, metered per-GB/per-day/lifetime pricing,
@@ -268,7 +276,67 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Payment database backups are a coalesced side effect, decoupled from log acknowledgement: after a Payment row's Telegram delivery succeeds the dispatcher requests a backup, and a single-flight loop with a 1.5s burst debounce (5s hard cap under continuous traffic) runs at most one backup at a time against `users_backup.db`/`credentials_backup.db` (temp files adjacent to the source DBs; users.db/credentials.db paths come from the runtime AppConfig). A 20-payment burst therefore produces 1-2 backup runs, never 20 and never two concurrent copies. Backup failures stay fail-soft per database.
 - Invariants enforced by the outbox harness (outside the repository): a durable Payment/Audit record is never silently lost due to process restart, server reboot, Telegram outage, 429 cooldown, full in-memory queue, or lost wake-up; crash between Telegram success and local DELETE is the accepted at-least-once duplicate window; 1000-record outage keeps RAM bounded (single-digit MB growth) and drains fully after recovery.
 
-## Gozargah Site Sync
+## Durable Telegram Update Inbox and Scheduler
+
+- Lifecycle: `TelegramUpdateScheduler.EnqueueAsync` (called by each bot receiver) durably persists the full update in
+  `users.db` (`TelegramUpdateInbox`) BEFORE the receiver moves on; if the row already exists for `BotId + UpdateId` it
+  is recognized as a duplicate and accepted without capacity. Admission is bounded by unfinished rows
+  (`telegramUpdateQueueCapacity`, default 1000) and waits with backpressure rather than dropping. The scheduler then
+  claims rows with an atomic `queued -> running` conditional update and executes them; terminal outcomes are persisted
+  (`completed` erases the private payload, `uncertain` keeps it plus a coarse failure code).
+- Ordering: lanes are `BotId + TelegramUserId` (zero = the separate anonymous/fallback lane). Only lane heads are
+  eligible (`ReadReadyAsync` excludes rows whose lane has an earlier non-completed row), so one user's updates are
+  strict FIFO while different users and different bots run concurrently. Round-robin across bots with per-bot user
+  cursors prevents starvation; global active-handler concurrency is bounded by `telegramUpdateMaxConcurrency`
+  (default 16). Idle keyed state is removed; no per-user workers or in-memory queue is required for correctness — the
+  DB scan (25ms loop, 500ms error backoff) is the source of truth and lost wake-ups cannot lose updates.
+- Execution and BotContext: `TelegramUpdateExecutor` resolves the EXACT bot by the stored `BotId` (never the default
+  bot), refuses disabled/unavailable bots (their queued work stays deferred), pushes the bot runtime context through
+  `BotContextAccessor` inside `using` semantics (restored even on exceptions), and runs each update in its own DI
+  scope (`TelegramBotService` is scoped; a regression test asserts no singleton captures a scoped context).
+  `TelegramUpdateExecutionScope` exposes the inbox sequence via AsyncLocal so wallet receipts and creation
+  reservations can store an audit reference; it never stores payloads or clients.
+- Restart/shutdown: startup `RecoverAsync` marks leftover `running` claims `uncertain` (never blindly replayed),
+  keeps queued work, and expires completed dedup receipts after 7 days. Shutdown closes admission, drains runnable
+  work for `telegramUpdateShutdownDrainSeconds` (default 90), then cancels handlers and quarantines whatever is still
+  active; `HostOptions.ShutdownTimeout` is drain + 30s. Uncertain rows block later same-lane work until an operator
+  resolves them via `ResolveReviewedAsync` (audit reference + admin id; no handler replay).
+- `Services/AsyncKeyedGate.cs`: short-lived per-resource in-process mutex (payment id, order id, sync-event id,
+  invoice id) with idle-key removal; correctness across restarts always comes from durable database state, not gates.
+- `Services/UserWorkflowStore.cs`: scoped per execution; every read returns detached snapshots (context disposed
+  immediately), `SaveAsync` reloads each changed row, validates its original scalars, applies only changed fields in
+  one short transaction, and fails with `DbUpdateConcurrencyException` instead of overwriting newer state. Multi-row
+  batches commit atomically and never attach the input snapshot. Reload after conflict; never retry external work.
+- `Data/SqliteOperation.cs`: retries ONLY SQLite BUSY/LOCKED (5/6), at most 3 attempts, fresh context per attempt,
+  bounded 50/150ms + 0-50ms jitter backoff, never network inside the delegate. Both databases run WAL with a 5s busy
+  timeout and private cache; connections are per-operation and short.
+
+## Wallet Operations (durable receipts)
+
+- Every balance mutation (debit, credit, refund, purchase, renewal, referral reward, provisional payment, settlement,
+  admin adjustment) goes through `CredentialsStore.MutateWalletAsync`: the `WalletOperation` receipt and the balance
+  change commit in ONE credentials.db transaction; the receipt records before/after balance, signed toman amount,
+  `OperationKey` (a business key such as `payment:hooshpay:{id}:credit` or `purchase:{orderId}:debit`, never a
+  Telegram update id), approval evidence (`official`/`provisional`/`partial` + admin id), `BotId`, and inbox sequence.
+  Reusing a key with the same user+amount returns the original receipt (idempotent, survives restart); reusing it
+  with different financial parameters throws loudly. No bot client or gateway object is ever stored.
+- `users.db` ledger (`WalletLedgerService.RecordAsync`) is written after the credentials commit, keyed by the same
+  operation key. A crash between the two commits is repaired by `WalletOperationReconciliationService`: it reads
+  committed-but-unreconciled receipts older than one minute, writes the missing users.db ledger entry idempotently,
+  completes payment/referral metadata, and only then marks `ReconciledAtUtc`. It never changes balances, never calls
+  providers, and never infers history from current balances. A receipt whose payment target is missing stays pending
+  for operator review (never falsely reconciled). There is deliberately NO distributed transaction between the two
+  databases.
+
+## XUI Creation Reservations
+
+- `Services/XuiV3CreationOperationStore.cs` + `Domain/XuiV3CreationOperation.cs`: before the non-idempotent XUI
+  `addClient` POST, the first caller persists a stable client identity and requested plan parameters in users.db
+  (`OperationKey`, owner, `PanelKey`, inbound ids, business parameters JSON). Exactly one claimant receives
+  `MayCreate`; after a timeout/ambiguous response the operation is resolved by read-back (GET by generated email) —
+  never by a second POST. `AppliedAtUtc` is written only after proven creation. Reusing a reservation with conflicting
+  plan parameters fails loudly. A handled-but-unproven creation leaves the linked inbox row `uncertain` for operator
+  review, and later work for the same lane cannot overtake it.
 
 ## Gozargah Site Sync
 
@@ -455,6 +523,15 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel.
 - Telegram `429 Too Many Requests` is handled centrally through `Domain/Logging/TelegramRateLimitPolicy.cs`: the polling error handler pauses the receiver for Telegram's `RetryAfter` (+1s buffer, capped at 60s) before the next `getUpdates` (Telegram.Bot 19.x does not delay on its own and would tight-loop), the update wrapper swallows a 429 after the same backoff instead of letting it kill the receiver, and `Domain/Logging/TelegramLogSuppression.cs` suppresses any log entry whose exception is a Telegram 429 so the logger never amplifies the rate-limit storm. Receivers keep polling after the window and are never restarted, so no duplicate receiver instances can appear.
 - `Domain/Logging/TelegramLogger.cs` also applies message-level channel suppression for known noncritical noise: stale Sales Assistant callbacks, unchanged Telegram edits, receipt-photo relay warnings that have a text fallback, repeated tenant forced-join probes, routine XUI v3 volume-reminder scan summaries, and Telegram polling 5xx/429/timeouts. Suppression is Telegram-provider-only, so standard/local logging retains these entries; payment/audit logs and real token/XUI/settlement failures still reach the private channel.
-- `CredentialsDbContext` and legacy `UserDbContext` state helper methods are still singleton-backed in DI and currently use a `SemaphoreSlim` gate as a temporary concurrency guard. The long-term fix is a separate refactor to per-operation DbContext/factory usage.
-- New wallet-ledger, referral, and scheduled usage-report operations use `UserDbContextFactory` per operation; legacy
-  conversation/payment code still uses the singleton contexts and their compatibility gates.
+- Tenant forced-join activation validates the tenant bot identity, channel access, administrator-list access, and that the
+  bot itself is an administrator; it never probes the tenant owner's membership. Runtime storefront access still checks
+  each actual customer with `GetChatMember` and remains fail-closed. Only Telegram 400 `PARTICIPANT_ID_INVALID` receives
+  one 500ms cancellation-aware retry; unrelated 400 responses and permission failures are never retried.
+- All production data access uses factories with short-lived contexts (`UserDbContextFactory`,
+  `CredentialsDbContextFactory`, `CredentialsStore`, `UserStateStore`, `UserWorkflowStore`, inbox/creation/settlement
+  stores). No EF-tracked entity survives a Telegram/XUI/gateway/website HTTP call or `Task.Delay`; reads are
+  `AsNoTracking` detached snapshots, writes reload their targets in the saving context. The only process-wide lock
+  left is the daily error file logger's append lock (protects a genuinely global file resource); `MultiBotHostedService`
+  serializes receiver start/stop per `BotId` through per-bot lifecycle gates. The legacy `PeriodicTaskRunner`
+  (`async void` timer + static DbContext) and `ZibalHttpServer` are dead code with no source references and are not
+  registered anywhere.

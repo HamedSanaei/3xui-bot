@@ -388,15 +388,15 @@ public class XuiV3RenewalOperationStore
         {
             // Either the same confirmation key or the same account lock won concurrently. Resolve both cases from
             // users.db; never infer that a failed insert permits a panel mutation.
-            context.ChangeTracker.Clear();
-            var existing = await context.XuiV3RenewalOperations
+            await using var recovery = _userDbContextFactory.CreateDbContext();
+            var existing = await recovery.XuiV3RenewalOperations
                 .AsNoTracking()
                 .FirstOrDefaultAsync(x => x.OperationKey == draft.OperationKey, cancellationToken);
             if (existing != null)
                 return (existing, false);
 
             var blocker = await FindBlockingOperationCoreAsync(
-                context,
+                recovery,
                 normalizedUuid,
                 normalizedEmail,
                 excludedOperationKey: null,
@@ -1416,109 +1416,6 @@ public class XuiV3RenewalOperationStore
                     .SetProperty(x => x.UpdatedAtUtc, now),
                 cancellationToken);
         return updated == 1;
-    }
-
-    /// <summary>
-    /// Creates or returns the wallet ledger row for one renewal settlement using the operation id as the
-    /// idempotency key.
-    /// </summary>
-    /// <param name="operation">Operation whose settlement is being recorded.</param>
-    /// <param name="telegramUserId">Telegram user id of the wallet owner being debited.</param>
-    /// <param name="amountToman">Positive debit amount in Iranian toman.</param>
-    /// <param name="provider">Ledger provider such as <c>wallet</c> or <c>gozargah_site_wallet_fallback_bot_wallet</c>.</param>
-    /// <param name="referenceId">XUI client email used as the ledger reference.</param>
-    /// <param name="description">Human-readable ledger description.</param>
-    /// <param name="beforeBalance">Wallet balance in toman immediately before the debit.</param>
-    /// <param name="afterBalance">
-    /// Expected wallet balance after the debit. For the deterministic <c>Pay</c> mutation this is exactly
-    /// <c>beforeBalance - amountToman</c> and is written before the debit so a crash can never double-charge.
-    /// </param>
-    /// <param name="cancellationToken">Token that cancels the users.db insert.</param>
-    /// <returns>
-    /// The ledger row and whether this call inserted it. When <c>Existed</c> is true a previous executor already
-    /// created the row and the caller must reconcile the wallet balance instead of debiting blindly.
-    /// </returns>
-    /// <remarks>
-    /// The unique wallet-ledger idempotency index is the final duplicate guard shared with
-    /// <see cref="WalletLedgerService"/>: writing the final-form row before the wallet debit makes a second debit
-    /// impossible because any later executor sees the row and reconciles instead of paying again.
-    /// </remarks>
-    public async Task<(WalletLedgerEntry Row, bool Existed)> EnsureSettlementLedgerAsync(
-        XuiV3RenewalOperation operation,
-        long telegramUserId,
-        long amountToman,
-        string provider,
-        string referenceId,
-        string description,
-        long beforeBalance,
-        long afterBalance,
-        CancellationToken cancellationToken = default)
-    {
-        var idempotencyKey = BuildSettlementLedgerKey(operation);
-        await using var context = _userDbContextFactory.CreateDbContext();
-        var existing = await context.WalletLedgerEntries
-            .FirstOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey, cancellationToken);
-        if (existing != null)
-            return (existing, true);
-
-        var row = new WalletLedgerEntry
-        {
-            BotId = BotContextAccessor.CurrentBotId,
-            BotUsername = BotContextAccessor.CurrentBotUsername,
-            BotType = BotContextAccessor.CurrentBotType,
-            TelegramUserId = telegramUserId,
-            Direction = WalletLedgerDirections.Debit,
-            AmountToman = amountToman,
-            BalanceBefore = beforeBalance,
-            BalanceAfter = afterBalance,
-            Reason = WalletLedgerReasons.AccountRenew,
-            Provider = provider,
-            ReferenceType = "xui-v3-client",
-            ReferenceId = referenceId,
-            Description = description,
-            IdempotencyKey = idempotencyKey,
-            CreatedAtUtc = DateTime.UtcNow
-        };
-
-        context.WalletLedgerEntries.Add(row);
-        try
-        {
-            await context.SaveChangesAsync(cancellationToken);
-            return (row, false);
-        }
-        catch (DbUpdateException)
-        {
-            context.ChangeTracker.Clear();
-            var concurrent = await context.WalletLedgerEntries
-                .AsNoTracking()
-                .FirstAsync(x => x.IdempotencyKey == idempotencyKey, cancellationToken);
-            return (concurrent, true);
-        }
-    }
-
-    /// <summary>
-    /// Writes the real post-debit balance onto a settlement ledger row created by
-    /// <see cref="EnsureSettlementLedgerAsync"/>.
-    /// </summary>
-    /// <param name="ledgerRowId">Internal users.db id of the pre-inserted ledger row.</param>
-    /// <param name="afterBalance">Actual wallet balance after the debit completed.</param>
-    /// <param name="cancellationToken">Token that cancels the update.</param>
-    /// <returns>A task that completes after the balance update is persisted.</returns>
-    /// <remarks>
-    /// The deterministic <c>Pay</c> debit always results in exactly <c>before - amount</c>, so this update is a
-    /// verification write; the row is already in final form, which is what makes the pre-insert crash-safe.
-    /// </remarks>
-    public async Task FinalizeSettlementLedgerAsync(
-        int ledgerRowId,
-        long afterBalance,
-        CancellationToken cancellationToken = default)
-    {
-        await using var context = _userDbContextFactory.CreateDbContext();
-        await context.WalletLedgerEntries
-            .Where(x => x.Id == ledgerRowId)
-            .ExecuteUpdateAsync(
-                setters => setters.SetProperty(x => x.BalanceAfter, afterBalance),
-                cancellationToken);
     }
 
     /// <summary>

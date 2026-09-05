@@ -243,7 +243,7 @@ public class ApiService
 
 
         // Create the HttpClient with the custom handler
-        var httpClient = new HttpClient(handler);
+        using var httpClient = new HttpClient(handler);
 
         try
         {
@@ -297,6 +297,11 @@ public class ApiService
     }
 
     //it called by methodes in program.cs
+    /// <summary>Creates one legacy v2 account and saves its bot-scoped delivery state.</summary>
+    /// <param name="accountDto">Required private panel request and global Telegram owner; never log its authentication cookie.</param>
+    /// <returns>True for proven creation and saved state; false for a handled panel/HTTP failure.</returns>
+    /// <remarks>Panel I/O is outside SQLite writes. VMess templates are copied before customer-specific mutation.
+    /// Legacy HTTP uses its request timeout; interrupted scheduler executions must be reviewed, never replayed wholesale.</remarks>
     public static async Task<bool> CreateUserAccount(AccountDto accountDto)
     {
         string sessionCookie = accountDto.SessionCookie;
@@ -318,7 +323,7 @@ public class ApiService
         handler.CookieContainer = cookieContainer;
 
         // Create the HttpClient with the custom handler
-        var httpClient = new HttpClient(handler);
+        using var httpClient = new HttpClient(handler);
 
         // Now you can use the httpClient to make requests with the specified cookie
 
@@ -364,24 +369,22 @@ public class ApiService
                 if (accountDto.AccType == "tunnel")
                 {
 
-                    var configLink = accountDto.ServerInfo.VmessTemplate;
+                    var configLink = RuntimeSnapshot.Copy(accountDto.ServerInfo.VmessTemplate);
                     configLink.Ps += client.Email;
                     configLink.Id = client.Id;
 
                     //Console.WriteLine(responseBody);
-                    UserDbContext _userDbContext = new UserDbContext();
+                    var _userStateStore = UserStateStore.ForConfiguredDatabase();
 
-                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = configLink.ToVMessLink(), Email = client.Email, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email });
-                    await _userDbContext.SaveChangesAsync();
+                    await _userStateStore.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = configLink.ToVMessLink(), Email = client.Email, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email });
                     return true;
                 }
                 else if (accountDto.AccType == "realityv6")
                 {
                     var vlessLink = $"vless://{client.Id}@{accountDto.ServerInfo.Vless.Domain}:443?type=tcp&security=reality&flow=xtls-rprx-vision&fp=firefox&pbk=kGzzo-8w_p6XHOyF1Pr1jiGjgqjICkWJyNw7ksML3yY&sni=www.google-analytics.com&sid=6c0eefcb#RealityMTN-{client.Email}";
-                    UserDbContext _userDbContext = new UserDbContext();
+                    var _userStateStore = UserStateStore.ForConfiguredDatabase();
 
-                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = vlessLink, Email = client.Email });
-                    await _userDbContext.SaveChangesAsync();
+                    await _userStateStore.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = vlessLink, Email = client.Email });
                     return true;
                 }
                 else
@@ -404,6 +407,10 @@ public class ApiService
         return false;
     }
 
+    /// <summary>Updates a legacy v2 account and stores the resulting delivery state for the active bot.</summary>
+    /// <param name="accountDto">Required private panel request, current client, and Telegram owner; do not log cookies or links.</param>
+    /// <returns>True when the panel update and state persistence succeed; false for handled transport failures.</returns>
+    /// <remarks>Uses a private VMess template copy and short factory-backed state writes after HTTP completes.</remarks>
     public static async Task<bool> UpdateUserAccount(AccountDtoUpdate accountDto)
     {
         string sessionCookie = accountDto.SessionCookie;
@@ -422,7 +429,7 @@ public class ApiService
         handler.CookieContainer = cookieContainer;
 
         // Create the HttpClient with the custom handler
-        var httpClient = new HttpClient(handler);
+        using var httpClient = new HttpClient(handler);
 
         // Now you can use the httpClient to make requests with the specified cookie
 
@@ -457,15 +464,14 @@ public class ApiService
                 if (accountDto.AccType == "tunnel")
                 {
 
-                    var configLink = accountDto.ServerInfo.VmessTemplate;
+                    var configLink = RuntimeSnapshot.Copy(accountDto.ServerInfo.VmessTemplate);
                     configLink.Ps += client.Email;
                     configLink.Id = client.Id;
 
                     //Console.WriteLine(responseBody);
-                    UserDbContext _userDbContext = new UserDbContext();
+                    var _userStateStore = UserStateStore.ForConfiguredDatabase();
 
-                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
-                    await _userDbContext.SaveChangesAsync();
+                    await _userStateStore.SaveUserStatus(new User { Id = accountDto.TelegramUserId, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
                     return true;
                 }
                 else if (accountDto.AccType == "realityv6")
@@ -477,10 +483,9 @@ public class ApiService
                         int commaIndex = vlessLink.IndexOf('&');
                         vlessLink = vlessLink.Insert(commaIndex, "&flow=xtls-rprx-vision");
                     }
-                    UserDbContext _userDbContext = new UserDbContext();
+                    var _userStateStore = UserStateStore.ForConfiguredDatabase();
 
-                    await _userDbContext.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = vlessLink, Email = client.Email });
-                    await _userDbContext.SaveChangesAsync();
+                    await _userStateStore.SaveUserStatus(new User { Id = accountDto.TelegramUserId, ConfigLink = vlessLink, Email = client.Email });
                     return true;
                 }
                 else
@@ -578,6 +583,11 @@ public class ApiService
         return requestBody;
     }
 
+    /// <summary>Finds a legacy account across configured panels and saves a detached delivery snapshot for the active bot.</summary>
+    /// <param name="email">Required exact private panel account email; do not expose another customer's configuration.</param>
+    /// <param name="tgUserId">Global Telegram owner id whose bot-scoped conversation receives the result.</param>
+    /// <returns>The matching client and configured country tag; the client may be null when no panel contains it.</returns>
+    /// <remarks>Each panel request completes before state persistence. Mutable protocol templates are copied per result.</remarks>
     public static async Task<(ClientExtend ClientExtend, string SelectedCountry)> FetchClientByEmail(string email, long tgUserId)
     {
 
@@ -617,7 +627,7 @@ public class ApiService
                     handler.CookieContainer = cookieContainer;
 
                     // Create the HttpClient with the custom handler
-                    var httpClient = new HttpClient(handler);
+                    using var httpClient = new HttpClient(handler);
 
                     // Now you can use the httpClient to make requests with the specified cookie
                     InboundState result = null;
@@ -683,16 +693,15 @@ public class ApiService
 
                     emailClient = client;
 
-                    var configLink = kvp.Value.VmessTemplate;
+                    var configLink = RuntimeSnapshot.Copy(kvp.Value.VmessTemplate);
                     configLink.Ps += client.Email;
                     configLink.Id = client.Id;
 
                     //Console.WriteLine(responseBody);
-                    UserDbContext _userDbContext = new UserDbContext();
+                    var _userStateStore = UserStateStore.ForConfiguredDatabase();
 
                     // this Is VERY IMPPRTANT  the renew method use this!
-                    await _userDbContext.SaveUserStatus(new User { Id = tgUserId, ConfigLink = configLink.ToVMessLink(), Email = email, SubLink = kvp.Value.SubLinkUrl + client.Email, SelectedCountry = kvp.Key });
-                    await _userDbContext.SaveChangesAsync();
+                    await _userStateStore.SaveUserStatus(new User { Id = tgUserId, ConfigLink = configLink.ToVMessLink(), Email = email, SubLink = kvp.Value.SubLinkUrl + client.Email, SelectedCountry = kvp.Key });
 
                     return (ClientExtend: emailClient, SelectedCountry: kvp.Key);
                 }
@@ -731,7 +740,7 @@ public class ApiService
         handler.CookieContainer = cookieContainer;
 
         // Create the HttpClient with the custom handler
-        var httpClient = new HttpClient(handler);
+        using var httpClient = new HttpClient(handler);
 
         // Now you can use the httpClient to make requests with the specified cookie
         InboundState result = null;
@@ -826,7 +835,7 @@ public class ApiService
         handler.CookieContainer = cookieContainer;
 
         // Create the HttpClient with the custom handler
-        var httpClient = new HttpClient(handler);
+        using var httpClient = new HttpClient(handler);
 
         // Now you can use the httpClient to make requests with the specified cookie
         InboundState result = null;
@@ -980,7 +989,7 @@ public class ApiService
         handler.CookieContainer = cookieContainer;
 
         // Create the HttpClient with the custom handler
-        var httpClient = new HttpClient(handler);
+        using var httpClient = new HttpClient(handler);
 
         // Now you can use the httpClient to make requests with the specified cookie
 
@@ -1019,7 +1028,7 @@ public class ApiService
                 // //Console.WriteLine(responseBody);
                 // UserDbContext _userDbContext = new UserDbContext();
 
-                // await _userDbContext.SaveUserStatus(new User { Id = telegramUserId, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
+                // await _userStateStore.SaveUserStatus(new User { Id = telegramUserId, SubLink = accountDto.ServerInfo.SubLinkUrl + client.Email, ConfigLink = configLink.ToVMessLink(), Email = client.Email });
                 // await _userDbContext.SaveChangesAsync();
                 return true;
 

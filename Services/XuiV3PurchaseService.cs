@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Adminbot.Utils;
@@ -5,6 +6,7 @@ using Newtonsoft.Json;
 using Microsoft.Extensions.Configuration;
 using Telegram.Bot.Types.ReplyMarkups;
 
+/// <summary>Resolves authoritative XUI plans and reserves durable creation identities for owned and tenant flows.</summary>
 public class XuiV3PurchaseService
 {
     /// <summary>Maximum custom duration that configuration and customer input may request, in whole days.</summary>
@@ -48,11 +50,19 @@ public class XuiV3PurchaseService
 
     private readonly IConfiguration _configuration;
     private readonly AppConfig _appConfig;
+    private readonly XuiV3CreationOperationStore _creationOperations;
 
-    public XuiV3PurchaseService(IConfiguration configuration)
+    /// <summary>Creates the shared catalog and durable provisioning service.</summary>
+    /// <param name="configuration">Required runtime pricing and private transport configuration.</param>
+    /// <param name="contextFactory">Optional factory override for isolated tooling; production injects its configured users.db factory.</param>
+    /// <remarks>Retains catalog configuration and a context factory; no live database context is shared across customer provisioning calls.</remarks>
+    public XuiV3PurchaseService(IConfiguration configuration, UserDbContextFactory contextFactory = null)
     {
         _configuration = configuration;
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
+        _creationOperations = new(contextFactory ?? new UserDbContextFactory(
+            new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<UserDbContext>()
+                .UseSqlite(SqliteOperation.ConnectionString(UserDbContext.DatabasePath)).Options));
     }
 
     /// <summary>
@@ -1180,6 +1190,17 @@ public class XuiV3PurchaseService
         return System.Net.WebUtility.HtmlEncode(value ?? string.Empty);
     }
 
+    /// <summary>Resolves a purchase and provisions one account using the caller's stable business operation key.</summary>
+    /// <param name="user">Detached global credentials profile identifying the Telegram owner and pricing role.</param>
+    /// <param name="serverInfo">Required private panel endpoint and authentication; never log credentials.</param>
+    /// <param name="selection">Required tenant or owned plan selection; catalog pricing is revalidated before provisioning.</param>
+    /// <param name="selectedCountry">Panel tag used in legacy bot/user state and account metadata.</param>
+    /// <param name="cancellationToken">Cancellation of local reservation and external panel operations.</param>
+    /// <param name="metadataOptions">Optional audit/state options; supplies the stable order/account operation key for recovery.</param>
+    /// <returns>Creation proof or a safe failed result. A failed or ambiguous reservation never authorizes another addClient.</returns>
+    /// <remarks>This method creates no wallet transaction. Callers settle proven creation separately before Telegram delivery.
+    /// Client identity is persisted before HTTP when the operation key is supplied; repeated calls use read-back only.</remarks>
+    /// <example><code>var result = await service.CreateAccountAsync(user, panel, selection, "primary", token, metadataOptions);</code></example>
     public async Task<XuiV3AccountCreationResult> CreateAccountAsync(
         CredUser user,
         ServerInfo serverInfo,
@@ -1214,6 +1235,9 @@ public class XuiV3PurchaseService
             _configuration,
             new XuiV3CreateAccountOptions
             {
+                OperationKey = metadataOptions.OperationKey,
+                OperationStore = _creationOperations,
+                PriceToman = priceToman,
                 InboundIds = inboundIds,
                 TrafficGb = resolved.TrafficGb,
                 TrafficBytes = trafficBytes,
@@ -1297,6 +1321,7 @@ public class XuiV3PurchaseService
             cancellationToken.ThrowIfCancellationRequested();
             var createOptions = new XuiV3AccountMetadataOptions
             {
+                OperationKey = $"create:{bulkOrderId}:{i}",
                 UserComment = options.UserComment,
                 BulkOrderId = bulkOrderId,
                 BulkIndex = i,
@@ -1366,6 +1391,18 @@ public class XuiV3PurchaseService
         return result;
     }
 
+    /// <summary>Reserves and creates one free trial for the caller's bot/user eligibility cycle.</summary>
+    /// <param name="user">Detached global Telegram profile of the eligible customer.</param>
+    /// <param name="serverInfo">Required private panel endpoint and authentication.</param>
+    /// <param name="serviceKey">Required enabled trial service catalog key.</param>
+    /// <param name="displayTrafficGb">Positive display allowance in GB; the byte quota is authoritative.</param>
+    /// <param name="trafficBytes">Authoritative nonnegative panel quota in bytes.</param>
+    /// <param name="durationDays">Positive trial lifetime in whole days.</param>
+    /// <param name="trialKey">Catalog/audit identity of the free trial type.</param>
+    /// <param name="operationKey">Required stable bot/user/service eligibility-cycle key, reused until that trial is resolved.</param>
+    /// <param name="cancellationToken">Cancellation of reservation, HTTP and state persistence.</param>
+    /// <returns>Verified creation or a safe failure requiring read-back/review; never another POST for the same cycle.</returns>
+    /// <remarks>No wallet is charged. Eligibility remains with the caller and the last-success timestamp is unchanged on failure.</remarks>
     public async Task<XuiV3AccountCreationResult> CreateTrialAccountAsync(
         CredUser user,
         ServerInfo serverInfo,
@@ -1374,6 +1411,7 @@ public class XuiV3PurchaseService
         long trafficBytes,
         int durationDays,
         string trialKey,
+        string operationKey,
         CancellationToken cancellationToken = default)
     {
         var service = FindService(serviceKey);
@@ -1414,6 +1452,9 @@ public class XuiV3PurchaseService
             _configuration,
             new XuiV3CreateAccountOptions
             {
+                OperationKey = operationKey,
+                OperationStore = _creationOperations,
+                PriceToman = 0,
                 InboundIds = inboundIds,
                 TrafficGb = displayTrafficGb,
                 TrafficBytes = trafficBytes,
@@ -1442,6 +1483,11 @@ public class XuiV3PurchaseService
             cancellationToken);
     }
 
+    /// <summary>Resolves the next display counter without retaining a conversation context.</summary>
+    /// <param name="user">Nullable detached profile; its positive Telegram id selects the current bot's state.</param>
+    /// <param name="metadataOptions">Optional explicit counter, trial flag, and state-saving policy.</param>
+    /// <returns>The explicit counter, next bot/user counter, or zero when state tracking is disabled.</returns>
+    /// <remarks>The durable creation reservation, rather than this display counter, identifies retries.</remarks>
     private static async Task<int> ResolveAccountCounterAsync(CredUser user, XuiV3AccountMetadataOptions metadataOptions)
     {
         if (metadataOptions?.AccountCounter > 0)
@@ -1456,8 +1502,8 @@ public class XuiV3PurchaseService
             return 0;
         }
 
-        var userDbContext = new UserDbContext();
-        var flowUser = await userDbContext.GetUserStatus(user.TelegramUserId);
+        var userStateStore = UserStateStore.ForConfiguredDatabase();
+        var flowUser = await userStateStore.GetUserStatus(user.TelegramUserId);
         return flowUser.AccountCounter + 1;
     }
 
@@ -1806,6 +1852,8 @@ public class XuiV3PurchaseService
 
 public class XuiV3AccountMetadataOptions
 {
+    /// <summary>Stable order/account creation key; repeated invocation can only recover the original client by GET.</summary>
+    public string OperationKey { get; set; }
     public string UserComment { get; set; }
     public string BulkOrderId { get; set; }
     public int? BulkIndex { get; set; }

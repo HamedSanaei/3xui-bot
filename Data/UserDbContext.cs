@@ -20,20 +20,13 @@ public class UserDbContext : DbContext
 {
     private static string _databasePath = "./Data/users.db";
 
-    /// <summary>
-    /// Serializes legacy state-helper calls made through the singleton <see cref="UserDbContext"/> service.
-    /// </summary>
-    /// <remarks>
-    /// Most modern code should use scoped/per-operation contexts, but the legacy bot state API is still injected as
-    /// a singleton. This gate prevents overlapping EF Core operations when several bot receivers touch those helper
-    /// methods at the same time.
-    /// </remarks>
-    private readonly SemaphoreSlim _dbGate = new(1, 1);
+    /// <summary>Immutable connection options reused by compatibility state-store calls; never a shared change tracker.</summary>
+    private readonly DbContextOptions<UserDbContext> _operationOptions;
 
     /// <summary>
     /// Creates a users.db context that resolves its SQLite path from <see cref="ConfigureDatabasePath"/>.
     /// </summary>
-    /// <remarks>This constructor is retained for the legacy singleton context and EF migration tooling.</remarks>
+    /// <remarks>This constructor is retained for explicitly owned legacy background operations.</remarks>
     public UserDbContext()
     {
     }
@@ -46,12 +39,17 @@ public class UserDbContext : DbContext
     public UserDbContext(DbContextOptions<UserDbContext> options)
         : base(options)
     {
+        _operationOptions = options;
     }
 
     public DbSet<User> Users { get; set; }
+    /// <summary>Private durable Telegram inputs and terminal deduplication receipts, isolated by runtime bot id.</summary>
+    public DbSet<TelegramUpdateInboxEntry> TelegramUpdateInbox { get; set; }
+    /// <summary>Private durable XUI creation identities that prevent a second addClient after a restart.</summary>
+    public DbSet<XuiV3CreationOperation> XuiV3CreationOperations { get; set; }
     public DbSet<BotInstance> BotInstances { get; set; }
     public DbSet<BotUserState> BotUserStates { get; set; }
-    // Tenant storefront state stays in users.db; credentials.db remains wallet/profile only.
+    // Tenant storefront state stays in users.db; credentials.db owns global profiles, balances, and wallet receipts.
     public DbSet<TenantBotOrder> TenantBotOrders { get; set; }
     public DbSet<TenantBotLedgerEntry> TenantBotLedgerEntries { get; set; }
     public DbSet<WalletLedgerEntry> WalletLedgerEntries { get; set; }
@@ -106,49 +104,9 @@ public class UserDbContext : DbContext
     /// </summary>
     public static string DatabasePath => _databasePath;
 
-    /// <summary>
-    /// Runs a legacy users.db helper while holding the singleton context concurrency gate.
-    /// </summary>
-    /// <typeparam name="T">Return type produced by the protected helper operation.</typeparam>
-    /// <param name="operation">
-    /// Asynchronous users.db operation to execute. The delegate must not call another gated helper on the same
-    /// context instance.
-    /// </param>
-    /// <returns>The value returned by <paramref name="operation"/> after the gate is released.</returns>
-    /// <remarks>
-    /// This is a temporary compatibility guard for singleton registration. It keeps state reads/writes from
-    /// colliding across owned and tenant Telegram receivers without changing database schema.
-    /// </remarks>
-    private async Task<T> RunSerializedAsync<T>(Func<Task<T>> operation)
-    {
-        await _dbGate.WaitAsync();
-        try
-        {
-            return await operation();
-        }
-        finally
-        {
-            _dbGate.Release();
-        }
-    }
 
-    /// <summary>
-    /// Runs a legacy users.db helper while holding the singleton context concurrency gate.
-    /// </summary>
-    /// <param name="operation">Asynchronous users.db operation that does not return a value.</param>
-    /// <returns>A task that completes after <paramref name="operation"/> finishes and the gate is released.</returns>
-    private async Task RunSerializedAsync(Func<Task> operation)
-    {
-        await _dbGate.WaitAsync();
-        try
-        {
-            await operation();
-        }
-        finally
-        {
-            _dbGate.Release();
-        }
-    }
+
+
 
     /// <summary>
     /// Configures the SQLite database path before the application creates or migrates the context.
@@ -164,10 +122,11 @@ public class UserDbContext : DbContext
     /// Configures SQLite when the context was created without externally supplied options.
     /// </summary>
     /// <param name="optionsBuilder">EF Core options builder for this context instance.</param>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
         if (!optionsBuilder.IsConfigured)
-            optionsBuilder.UseSqlite($"Data Source={_databasePath};Cache=Shared");
+            optionsBuilder.UseSqlite(SqliteOperation.ConnectionString(_databasePath));
     }
 
     /// <summary>
@@ -176,8 +135,25 @@ public class UserDbContext : DbContext
     /// scheduled-report delivery, and durable per-client XUI volume-reminder cycles and claims.
     /// </summary>
     /// <param name="modelBuilder">EF Core model builder used by migrations and runtime metadata.</param>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<XuiV3CreationOperation>(entity =>
+        {
+            entity.HasKey(x => x.OperationKey);
+            entity.Property(x => x.OperationKey).HasMaxLength(240);
+            entity.HasIndex(x => new { x.TelegramUserId, x.CreatedAtUtc });
+            entity.HasIndex(x => x.InboxSequence);
+        });
+        modelBuilder.Entity<TelegramUpdateInboxEntry>(entity =>
+        {
+            entity.HasKey(x => x.Sequence);
+            entity.HasIndex(x => new { x.BotId, x.UpdateId }).IsUnique();
+            entity.HasIndex(x => new { x.BotId, x.TelegramUserId, x.Sequence });
+            entity.HasIndex(x => new { x.Status, x.Sequence });
+            entity.Property(x => x.BotId).IsRequired();
+            entity.Property(x => x.Status).IsRequired();
+        });
         base.OnModelCreating(modelBuilder);
 
         modelBuilder.Entity<SwapinoPaymentInfo>(entity =>
@@ -621,250 +597,45 @@ public class UserDbContext : DbContext
     }
 
 
-    /// <summary>
-    /// Saves the legacy conversation state for the current bot and Telegram user.
-    /// </summary>
-    /// <param name="user">
-    /// Legacy state object used by the old bot flows. Its <c>Id</c> is mapped to <c>TelegramUserId</c>,
-    /// and the active <c>BotId</c> is read from <see cref="BotContextAccessor.CurrentBotId"/>.
-    /// </param>
-    /// <returns>A task that completes after the bot-scoped state row is inserted or updated.</returns>
-    public async Task SaveUserStatus(User user)
+    /// <summary>Creates a factory-backed compatibility store; it never reuses this context's tracker.</summary>
+    private UserStateStore StateStore => new(new UserDbContextFactory(_operationOptions ??
+        new DbContextOptionsBuilder<UserDbContext>().UseSqlite(SqliteOperation.ConnectionString(_databasePath)).Options));
 
-    {
-        await RunSerializedAsync(async () =>
-        {
-            var context = new UserDbContext();
-            var botId = GetCurrentBotId();
-            // Schema creation and updates are handled by migrations at application startup.
+    /// <summary>Applies partial state for the active bot and Telegram user through an isolated context.</summary>
+    /// <param name="user">Detached state; null fields preserve existing values.</param>
+    /// <returns>A task completing after persistence.</returns>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    public Task SaveUserStatus(User user) => StateStore.SaveUserStatus(user);
 
-            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == user.Id);
+    /// <summary>Clears only the active bot's transient state for a Telegram user.</summary>
+    /// <param name="user">Detached snapshot identifying the Telegram user.</param>
+    /// <returns>A task completing after persistence.</returns>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    public Task ClearUserStatus(User user) => StateStore.ClearUserStatus(user);
 
-            if (existingUser == null)
-            {
-                // User does not exist, create a new user
-                context.BotUserStates.Add(BotUserState.FromUser(botId, user));
-            }
-            else
-            {
-                // User already exists, update the user's information if needed
-                existingUser.ApplyPartial(user);
-            }
-            await context.SaveChangesAsync();
-        });
-    }
+    /// <summary>Atomically clears and replaces the active bot's transient state.</summary>
+    /// <param name="user">Detached replacement snapshot identifying the Telegram user.</param>
+    /// <returns>A task completing after the short transaction commits.</returns>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    public Task ResetUserStatus(User user) => StateStore.ResetUserStatus(user);
 
+    /// <summary>Checks legacy creation prerequisites in the active bot without tracking entities.</summary>
+    /// <param name="teluserid">Telegram sender id in the active bot.</param>
+    /// <returns>True when required creation state is present.</returns>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    public Task<bool> IsUserReadyToCreate(long teluserid) => StateStore.IsUserReadyToCreate(teluserid);
 
-    /// <summary>
-    /// Clears the saved conversation state for one user in the current bot without touching the same user in other bots.
-    /// </summary>
-    /// <param name="user">Legacy state object whose <c>Id</c> identifies the Telegram user to clear.</param>
-    /// <returns>A task that completes after the clear operation is persisted.</returns>
-    public async Task ClearUserStatus(User user)
-    {
-        await RunSerializedAsync(async () =>
-        {
-            var context = new UserDbContext();
-            var botId = GetCurrentBotId();
-            // context.Database.EnsureCreated(); // Create the database if it doesn't exist
+    /// <summary>Checks legacy renewal prerequisites in the active bot without tracking entities.</summary>
+    /// <param name="teluserid">Telegram sender id in the active bot.</param>
+    /// <returns>True when required renewal state is present.</returns>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    public Task<bool> IsUserReadyToUpdate(long teluserid) => StateStore.IsUserReadyToUpdate(teluserid);
 
-            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == user.Id);
-
-            if (existingUser == null)
-            {
-                // User does not exist, create a new user
-                var newState = BotUserState.FromUser(botId, user);
-                newState.Clear();
-                context.BotUserStates.Add(newState);
-            }
-            else
-            {
-                // User already exists, update the user's information if needed
-                existingUser.Clear();
-            }
-            await context.SaveChangesAsync();
-        });
-    }
-
-    /// <summary>
-    /// Atomically clears one bot-scoped conversation and replaces it with an explicit recovery state.
-    /// </summary>
-    /// <param name="user">
-    /// Complete transient state to keep after the reset. <see cref="User.Id"/> must be the Telegram user id from the
-    /// current update; the owning bot id is read from <see cref="BotContextAccessor.CurrentBotId"/>. Empty strings are
-    /// accepted as explicit cleared values, while wallet, order, payment, account, and other-bot data are never touched.
-    /// </param>
-    /// <returns>A task that completes after the clear-and-replace operation is committed to <c>users.db</c>.</returns>
-    /// <remarks>
-    /// Use this method when a state-machine recovery must remove stale partial fields such as duration, comment, or
-    /// account count. Unlike two separate calls to <see cref="ClearUserStatus"/> and <see cref="SaveUserStatus"/>, the
-    /// reset and replacement share one serialized database operation, so another update cannot observe the cleared
-    /// intermediate state. Long-lived free-account timestamps and counters are preserved by
-    /// <see cref="BotUserState.Clear"/> and <see cref="BotUserState.ApplyPartial"/>.
-    /// </remarks>
-    /// <example>
-    /// <code>
-    /// await db.ResetUserStatus(new User
-    /// {
-    ///     Id = telegramUserId,
-    ///     Flow = "xui-v3",
-    ///     LastStep = "select-duration",
-    ///     SelectedCountry = "normal",
-    ///     TotoalGB = "10"
-    /// });
-    /// </code>
-    /// </example>
-    /// <exception cref="ArgumentNullException">Thrown when <paramref name="user"/> is null.</exception>
-    public async Task ResetUserStatus(User user)
-    {
-        ArgumentNullException.ThrowIfNull(user);
-
-        await RunSerializedAsync(async () =>
-        {
-            var context = new UserDbContext();
-            var botId = GetCurrentBotId();
-            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(
-                state => state.BotId == botId && state.TelegramUserId == user.Id);
-
-            if (existingUser == null)
-            {
-                existingUser = BotUserState.FromUser(botId, new User { Id = user.Id });
-                context.BotUserStates.Add(existingUser);
-            }
-
-            existingUser.Clear();
-            existingUser.ApplyPartial(user);
-            await context.SaveChangesAsync();
-        });
-    }
-
-    /// <summary>
-    /// Checks whether the current bot has collected all legacy purchase fields needed to create an account.
-    /// </summary>
-    /// <param name="teluserid">Telegram user id whose bot-scoped state should be inspected.</param>
-    /// <returns>
-    /// <c>true</c> when the required create-flow fields are present; otherwise <c>false</c>.
-    /// A missing state row is created as an empty bot-scoped state and returns <c>false</c>.
-    /// </returns>
-    public async Task<bool> IsUserReadyToCreate(long teluserid)
-    {
-        return await RunSerializedAsync(async () =>
-        {
-            UserDbContext context = new UserDbContext();
-            var botId = GetCurrentBotId();
-            // context.Database.EnsureCreated(); // Create the database if it doesn't exist
-
-            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == teluserid);
-
-            if (existingUser == null)
-            {
-                // User does not exist, create a new user
-                context.BotUserStates.Add(BotUserState.FromUser(botId, new User { Id = teluserid }));
-                return false;
-            }
-
-            if (existingUser.Type == "realityv6")
-            {
-                existingUser.TotoalGB = "500";
-            }
-
-            if (!string.IsNullOrEmpty(existingUser.LastStep) && !string.IsNullOrEmpty(existingUser.SelectedCountry) && !string.IsNullOrEmpty(existingUser.SelectedPeriod) && !string.IsNullOrEmpty(existingUser.TotoalGB) && !string.IsNullOrEmpty(existingUser.Type))
-            {
-                return true;
-            }
-            else
-            {
-                return false;
-            }
-        });
-
-
-    }
-
-
-    /// <summary>
-    /// Checks whether the current bot has collected all legacy renewal/update fields needed to continue.
-    /// </summary>
-    /// <param name="teluserid">Telegram user id whose bot-scoped state should be inspected.</param>
-    /// <returns>
-    /// <c>true</c> when the required update-flow fields are present; otherwise <c>false</c>.
-    /// A missing state row is created as an empty bot-scoped state and returns <c>false</c>.
-    /// </returns>
-    public async Task<bool> IsUserReadyToUpdate(long teluserid)
-    {
-        return await RunSerializedAsync(async () =>
-        {
-            UserDbContext context = new UserDbContext();
-            var botId = GetCurrentBotId();
-            // context.Database.EnsureCreated(); // Create the database if it doesn't exist
-
-            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == teluserid);
-
-            if (existingUser == null)
-            {
-                // User does not exist, create a new user
-                context.BotUserStates.Add(BotUserState.FromUser(botId, new User { Id = teluserid }));
-                return false;
-            }
-
-            if (existingUser.Type == "realityv6")
-            {
-                existingUser.TotoalGB = "500";
-            }
-
-            if (!string.IsNullOrEmpty(existingUser.LastStep) && !string.IsNullOrEmpty(existingUser.SelectedPeriod) && !string.IsNullOrEmpty(existingUser.TotoalGB))
-            {
-                return true;
-            }
-            else
-            {
-                return false;
-            }
-        });
-
-
-    }
-
-    /// <summary>
-    /// Loads the legacy conversation state for the current bot and returns it as the existing <see cref="User"/> model.
-    /// </summary>
-    /// <param name="userId">Telegram user id to load for the active bot context.</param>
-    /// <returns>
-    /// The saved state converted from <see cref="BotUserState"/>, or a new empty <see cref="User"/> when no row exists.
-    /// </returns>
-    public async Task<User> GetUserStatus(long userId)
-    {
-        return await RunSerializedAsync(async () =>
-        {
-            var context = new UserDbContext();
-            var botId = GetCurrentBotId();
-            // context.Database.EnsureCreated(); // Create the database if it doesn't exist
-
-            var existingUser = await context.BotUserStates.FirstOrDefaultAsync(u => u.BotId == botId && u.TelegramUserId == userId);
-
-            if (existingUser != null)
-            {
-                // User does not exist, create a new user
-                return existingUser.ToUser();
-            }
-            else
-            {
-                var newUser = new User { Id = userId };
-
-                return newUser;
-            }
-        });
-
-    }
-
-    /// <summary>
-    /// Resolves the bot id that should scope legacy state reads and writes.
-    /// </summary>
-    /// <returns>The current async bot id, or the default bot id when no update context is active.</returns>
-    private static string GetCurrentBotId()
-    {
-        return BotContextAccessor.CurrentBotId;
-    }
+    /// <summary>Reads a detached conversation snapshot for the active bot and Telegram user.</summary>
+    /// <param name="userId">Telegram sender id in the active bot.</param>
+    /// <returns>A detached state or an empty snapshot; never a tracked entity.</returns>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    public Task<User> GetUserStatus(long userId) => StateStore.GetUserStatus(userId);
 
 }
 
@@ -873,9 +644,8 @@ public class UserDbContext : DbContext
 /// run concurrently.
 /// </summary>
 /// <remarks>
-/// Legacy conversation-state helpers still use the singleton context, while newer financial and background workers
-/// use this factory so each operation owns its EF Core change tracker and can rely on database uniqueness for
-/// concurrency control.
+/// Conversation stores and financial/background operations use independent contexts. Legacy coordinating services
+/// receive a disposable context for their logical execution scope; no application singleton retains a live tracker.
 /// </remarks>
 public sealed class UserDbContextFactory
 {

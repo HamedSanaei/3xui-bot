@@ -117,8 +117,8 @@ public sealed class XuiV3LinkChangeOperationStore
         }
         catch (DbUpdateException)
         {
-            context.ChangeTracker.Clear();
-            var winner = await FindActiveAsync(context, operation.PanelKey, operation.ClientId, cancellationToken);
+            await using var recovery = _contextFactory.CreateDbContext();
+            var winner = await FindActiveAsync(recovery, operation.PanelKey, operation.ClientId, cancellationToken);
             if (winner != null)
                 return winner;
             throw;

@@ -18,7 +18,7 @@ using Telegram.Bot.Types.ReplyMarkups;
 public class SalesAssistantService
 {
     private const string CALLBACKPREFIX = "SA:";
-    private readonly UserDbContext _userDbcontext;
+    private readonly UserDbContextFactory _userDbContextFactory;
     private readonly BotRegistry _botRegistry;
     private readonly BotClientProvider _botClientProvider;
     private readonly IServiceProvider _serviceProvider;
@@ -28,21 +28,22 @@ public class SalesAssistantService
     /// <summary>
     /// creates the sales assistant service with the runtime Bot registry and tenant order database dependencies.
     /// </summary>
-    /// <param name="UserDbContext">users.db context containing tenant orders and receipt rows.</param>
+    /// <param name="UserDbContext">Factory for operation-owned users.db contexts. Detached input rows are reloaded before writes.</param>
     /// <param name="BotRegistry">runtime registry used to resolve the configured assistant Bot.</param>
     /// <param name="BotClientProvider">Telegram client Provider used to Send assistant notifications.</param>
     /// <param name="ServiceProvider">service Provider used to resolve <see cref="TenantBotService" /> for final receipt Approval.</param>
     /// <param name="PurchaseService">XUI v3 catalog service used to render the persisted purchase plan safely.</param>
     /// <param name="Logger">Logger used for failed assistant delivery or callback processing.</param>
+    /// <remarks>Each operation owns its users.db context. Receipt/order checks preserve tenant-owner authorization; financial approval delegates to the durable tenant fulfillment boundary.</remarks>
     public SalesAssistantService(
-        UserDbContext UserDbContext,
+        UserDbContextFactory UserDbContext,
         BotRegistry BotRegistry,
         BotClientProvider BotClientProvider,
         IServiceProvider ServiceProvider,
         XuiV3PurchaseService PurchaseService,
         ILogger<SalesAssistantService> Logger)
     {
-        _userDbcontext = UserDbContext;
+        _userDbContextFactory = UserDbContext;
         _botRegistry = BotRegistry;
         _botClientProvider = BotClientProvider;
         _serviceProvider = ServiceProvider;
@@ -142,8 +143,10 @@ public class SalesAssistantService
     /// the receipt photo is first DOWNLOADED through the tenant Bot that received it and then UPLOADED Again
     /// through the sales assistant Bot because Telegram file IDENTIFIERS are not safely REUSABLE across bots.
     /// </remarks>
+    /// <returns>A task completing after the owner receipt notification attempt; the receipt approval state is unchanged.</returns>
     public async Task NOTIFYMANUALRECEIPTASYNC(TenantManualPaymentReceipt receipt, CancellationToken CancellationToken)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         var assistant = GetAssistantBot();
         if (assistant == null || string.IsNullOrWhiteSpace(assistant.Token))
             return;
@@ -151,9 +154,9 @@ public class SalesAssistantService
         TenantBotOrder order = null;
         try
         {
-            order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+            order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
                 x => x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId,
-                CancellationToken);
+                CancellationToken));
         }
         catch (Exception ex)
         {
@@ -273,8 +276,10 @@ public class SalesAssistantService
     /// final confirmation is idempotent through the tenant order fulfillment service. REPEATED CLICKS do not
     /// Create another account or another ledger entry when the order is already fulfilled.
     /// </remarks>
+    /// <returns>A task completing after the authorized receipt action and its Telegram response.</returns>
     private async Task HANDLECALLBACKASYNC(ITelegramBotClient botClient, CallbackQuery CallbackQuery, CancellationToken CancellationToken)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         var Data = CallbackQuery.Data ?? string.Empty;
         if (!Data.StartsWith(CALLBACKPREFIX, StringComparison.Ordinal))
         {
@@ -357,14 +362,14 @@ public class SalesAssistantService
 
         if (parts[0] == "REJECT")
         {
-            var receipt = await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == RECEIPTID, CancellationToken);
+            var receipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == RECEIPTID, CancellationToken));
             if (receipt != null && receipt.Status == TenantManualPaymentReceiptStatuses.Pending)
             {
                 receipt.Status = TenantManualPaymentReceiptStatuses.Rejected;
                 receipt.ReviewerTelegramUserId = CallbackQuery.From.Id;
                 receipt.RejectedAtUtc = DateTime.UtcNow;
                 receipt.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
             }
 
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "رسید رد شد.", showAlert: true, cancellationToken: CancellationToken);
@@ -449,16 +454,17 @@ public class SalesAssistantService
         long ownerTelegramUserId,
         CancellationToken CancellationToken)
     {
-        var receipt = await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == receiptId, CancellationToken);
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
+        var receipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == receiptId, CancellationToken));
         if (receipt == null)
             return new ReceiptDetailsView("رسید پیدا نشد.", false, false);
 
         if (receipt.OwnerTelegramUserId != ownerTelegramUserId)
             return new ReceiptDetailsView("این رسید متعلق به ربات فروشگاهی شما نیست.", false, false);
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId,
-            CancellationToken);
+            CancellationToken));
 
         var text =
             "🔎 <b>جزئیات رسید کارت‌به‌کارت</b>\n\n" +
@@ -502,15 +508,17 @@ public class SalesAssistantService
     /// <param name="ownerTelegramUserId">Telegram user id of the assistant user.</param>
     /// <param name="CancellationToken">Cancellation token for users.db reads.</param>
     /// <returns><c>true</c> when the linked order is fulfilled and details can be resent.</returns>
+    /// <remarks>Each operation owns its users.db context. Receipt/order checks preserve tenant-owner authorization; financial approval delegates to the durable tenant fulfillment boundary.</remarks>
     private async Task<bool> IsReceiptOrderFulfilledAsync(int receiptId, long ownerTelegramUserId, CancellationToken CancellationToken)
     {
-        var receipt = await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == receiptId, CancellationToken);
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
+        var receipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == receiptId, CancellationToken));
         if (receipt == null || receipt.OwnerTelegramUserId != ownerTelegramUserId)
             return false;
 
-        return await _userDbcontext.TenantBotOrders.AnyAsync(
+        return await _workflow.ReadAsync(async db => await db.TenantBotOrders.AnyAsync(
             x => (x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId) && x.IsFulfilled,
-            CancellationToken);
+            CancellationToken));
     }
 
     /// <summary>
@@ -529,7 +537,8 @@ public class SalesAssistantService
     /// </remarks>
     private async Task<bool> CanRetryReceiptApprovalAsync(int receiptId, long ownerTelegramUserId, CancellationToken CancellationToken)
     {
-        var receipt = await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == receiptId, CancellationToken);
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
+        var receipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == receiptId, CancellationToken));
         if (receipt == null ||
             receipt.OwnerTelegramUserId != ownerTelegramUserId ||
             string.Equals(receipt.Status, TenantManualPaymentReceiptStatuses.Rejected, StringComparison.OrdinalIgnoreCase))
@@ -537,9 +546,9 @@ public class SalesAssistantService
             return false;
         }
 
-        return await _userDbcontext.TenantBotOrders.AnyAsync(
+        return await _workflow.ReadAsync(async db => await db.TenantBotOrders.AnyAsync(
             x => (x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId) && !x.IsFulfilled,
-            CancellationToken);
+            CancellationToken));
     }
 
     /// <summary>

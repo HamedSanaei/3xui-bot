@@ -20,7 +20,7 @@ using System.Security.Cryptography.X509Certificates;
 /// synced into <c>users.db</c>, tenant bots are hydrated from the database, and
 /// <see cref="MultiBotHostedService"/> starts one Telegram receiver per enabled bot.
 /// </remarks>
-class Program
+public class Program
 {
     /// <summary>
     /// Builds the ASP.NET host, applies migrations, synchronizes bot instances, and starts HTTP plus Telegram processing.
@@ -58,27 +58,59 @@ class Program
         Console.WriteLine($"[TelegramOutbox] path: {telegramOutboxDatabasePath}");
         ConfigureWebServer(builder, appConfig);
 
-        builder.Services.AddSingleton<IConfiguration>(configuration);
-        builder.Services.AddSingleton(appConfig);
-        builder.Services.AddSingleton<IPaymentGatewayAvailability>(sp =>
+        RegisterApplicationServices(builder.Services, configuration, appConfig, builder.Environment.ContentRootPath);
+
+        builder.Host.UseDefaultServiceProvider(options => { options.ValidateScopes = true; options.ValidateOnBuild = true; });
+        var app = builder.Build();
+        using (var scope = app.Services.CreateScope())
+        {
+            var userDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+            userDb.Database.Migrate();
+            var botRegistry = scope.ServiceProvider.GetRequiredService<BotRegistry>();
+            // Sync configured brand bots first, then hydrate runtime-created tenant bots from users.db.
+            await SyncBotInstancesAsync(userDb, botRegistry);
+            await botRegistry.LoadTenantBotsFromDatabaseAsync(userDb);
+            await using var credentialsDb = scope.ServiceProvider.GetRequiredService<CredentialsDbContextFactory>().CreateDbContext();
+            credentialsDb.Database.Migrate();
+            await credentialsDb.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
+            await userDb.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
+        }
+        app.MapControllers();
+        app.Run();
+
+
+    }
+
+    /// <summary>Registers the production service graph without starting receivers or opening deployed databases.</summary>
+    /// <param name="services">Required application service collection.</param>
+    /// <param name="configuration">Runtime configuration; private values must never be written to logs or test output.</param>
+    /// <param name="appConfig">Validated application options with resolved absolute database paths.</param>
+    /// <param name="contentRootPath">Application content root for local configuration and logging outbox paths.</param>
+    /// <remarks>Singletons retain factories only. Legacy coordinated handler graphs are scoped to one execution; state and wallet stores own shorter contexts.</remarks>
+    public static void RegisterApplicationServices(IServiceCollection services, IConfiguration configuration, AppConfig appConfig, string contentRootPath)
+    {
+        var telegramOutboxDatabasePath = Path.Combine(contentRootPath, "Data", "telegram-log-outbox.db");
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddSingleton(appConfig);
+        services.AddSingleton<IPaymentGatewayAvailability>(sp =>
             new PaymentGatewayAvailabilityService(
                 appConfig,
-                Path.Combine(builder.Environment.ContentRootPath, "Data", "configuration.json"),
+                Path.Combine(contentRootPath, "Data", "configuration.json"),
                 sp.GetRequiredService<ILogger<PaymentGatewayAvailabilityService>>()));
-        builder.Services.AddSingleton<NowPayments>();
-        builder.Services.AddSingleton<NowPaymentsSettlementService>();
-        builder.Services.AddSingleton<HooshPay>();
-        builder.Services.AddSingleton<HooshPaySettlementService>();
-        builder.Services.AddSingleton<Tetraminator>();
-        builder.Services.AddSingleton<TetraminatorSettlementService>();
-        builder.Services.AddSingleton<UniquePay>();
-        builder.Services.AddSingleton<UniquePaySettlementService>();
-        builder.Services.AddSingleton<BotContextAccessor>();
-        builder.Services.AddSingleton<BotRegistry>();
-        builder.Services.AddSingleton<BotClientProvider>();
+        services.AddSingleton<NowPayments>();
+        services.AddScoped<NowPaymentsSettlementService>();
+        services.AddSingleton<HooshPay>();
+        services.AddScoped<HooshPaySettlementService>();
+        services.AddSingleton<Tetraminator>();
+        services.AddScoped<TetraminatorSettlementService>();
+        services.AddSingleton<UniquePay>();
+        services.AddScoped<UniquePaySettlementService>();
+        services.AddSingleton<BotContextAccessor>();
+        services.AddSingleton<BotRegistry>();
+        services.AddSingleton<BotClientProvider>();
         // The outbox dispatcher resolves each bot client by internal BotId at delivery time, so no Telegram client
         // object ever has to survive a restart. The options carry the runtime database paths used by payment backups.
-        builder.Services.AddSingleton<TelegramLogDispatcher>(sp =>
+        services.AddSingleton<TelegramLogDispatcher>(sp =>
         {
             var clientProvider = sp.GetRequiredService<BotClientProvider>();
             return new TelegramLogDispatcher(
@@ -88,76 +120,78 @@ class Program
                     appConfig.UserDatabasePath,
                     appConfig.CredentialsDatabasePath));
         });
-        builder.Services.AddSingleton<BotRuntimeStatusStore>();
-        builder.Services.AddSingleton<XuiV3PurchaseService>();
-        builder.Services.AddSingleton<XuiV3PurchaseSessionStore>();
-        builder.Services.AddSingleton<UserActivityLogService>();
-        builder.Services.AddSingleton<UsageAnalyticsService>();
-        builder.Services.AddSingleton<UsageReportChartRenderer>();
-        builder.Services.AddSingleton<UsageReportDispatchStore>();
-        builder.Services.AddSingleton<XuiV3VolumeReminderStateStore>();
-        builder.Services.AddSingleton<XuiV3RenewalOperationStore>();
-        builder.Services.AddSingleton<WalletLedgerService>();
-        builder.Services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();
-        builder.Services.AddSingleton<ReferralService>();
-        builder.Services.AddSingleton<GozargahSiteApiClient>();
-        builder.Services.AddSingleton<GozargahSiteSyncService>();
-        builder.Services.AddSingleton<OwnedBotNotificationService>();
-        builder.Services.AddSingleton<SalesAssistantService>();
-        builder.Services.AddSingleton<TenantBotService>();
-        builder.Services.AddSingleton<XuiV3LinkChangeOperationStore>();
-        builder.Services.AddSingleton<XuiV3BotFlowService>();
-        builder.Services.AddSingleton<XuiV3AdminFlowService>();
-        builder.Services.AddHostedService<XuiV3AccountExpiryReminderService>();
-        builder.Services.AddHostedService<XuiV3VolumeExpirationReminderService>();
-        builder.Services.AddHostedService<XuiV3LinkChangeRecoveryService>();
-        builder.Services.AddHostedService<XuiV3RenewalRecoveryService>();
-        builder.Services.AddHostedService<GozargahSiteSyncRetryService>();
-        builder.Services.AddHostedService<ReferralReconciliationHostedService>();
-        builder.Services.AddHostedService<WeeklyUsageReportHostedService>();
+        services.AddSingleton<BotRuntimeStatusStore>();
+        services.AddSingleton<XuiV3PurchaseService>();
+        services.AddSingleton<XuiV3PurchaseSessionStore>();
+        services.AddSingleton<UserActivityLogService>();
+        services.AddSingleton<UsageAnalyticsService>();
+        services.AddSingleton<UsageReportChartRenderer>();
+        services.AddSingleton<UsageReportDispatchStore>();
+        services.AddSingleton<XuiV3VolumeReminderStateStore>();
+        services.AddSingleton<XuiV3RenewalOperationStore>();
+        services.AddSingleton<WalletLedgerService>();
+        services.AddHostedService<WalletOperationReconciliationService>();
+        services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();
+        services.AddSingleton<ReferralService>();
+        services.AddSingleton<GozargahSiteApiClient>();
+        services.AddScoped<GozargahSiteSyncService>();
+        services.AddScoped<OwnedBotNotificationService>();
+        services.AddScoped<SalesAssistantService>();
+        services.AddScoped<TenantBotService>();
+        services.AddSingleton<XuiV3LinkChangeOperationStore>();
+        services.AddScoped<XuiV3BotFlowService>();
+        services.AddScoped<XuiV3AdminFlowService>();
+        services.AddHostedService<XuiV3AccountExpiryReminderService>();
+        services.AddHostedService<XuiV3VolumeExpirationReminderService>();
+        services.AddHostedService<XuiV3LinkChangeRecoveryService>();
+        services.AddHostedService<XuiV3RenewalRecoveryService>();
+        services.AddHostedService<GozargahSiteSyncRetryService>();
+        services.AddHostedService<ReferralReconciliationHostedService>();
+        services.AddHostedService<WeeklyUsageReportHostedService>();
         // This delivery-only worker reads the users.db outbox and Telegram; it cannot repeat wallet settlement.
-        builder.Services.AddHostedService<PaymentSettlementNotificationWorker>();
-        builder.Services.AddSingleton<UniquePayReconciliationHostedService>();
-        builder.Services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
+        services.AddHostedService<PaymentSettlementNotificationWorker>();
+        services.AddSingleton<UniquePayReconciliationHostedService>();
+        services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
 
-        builder.Services.AddSingleton<TelegramBotService>();
-        builder.Services.AddSingleton<MultiBotHostedService>();
-        builder.Services.AddHostedService(sp => sp.GetRequiredService<MultiBotHostedService>());
+        services.AddScoped<TelegramBotService>();
+        TelegramUpdateScheduler.ValidateConfiguration(appConfig);
+        services.Configure<HostOptions>(options => options.ShutdownTimeout =
+            TimeSpan.FromSeconds(appConfig.TelegramUpdateShutdownDrainSeconds + 30));
+        services.AddSingleton<TelegramUpdateInboxStore>();
+        services.AddSingleton<ITelegramUpdateExecutor, TelegramUpdateExecutor>();
+        services.AddSingleton<TelegramUpdateScheduler>();
+        services.AddSingleton<ITelegramUpdateScheduler>(sp => sp.GetRequiredService<TelegramUpdateScheduler>());
+        // Hosted services stop in reverse registration order: receivers stop before the scheduler drains accepted work.
+        services.AddHostedService(sp => sp.GetRequiredService<TelegramUpdateScheduler>());
+        services.AddSingleton<MultiBotHostedService>();
+        services.AddHostedService(sp => sp.GetRequiredService<MultiBotHostedService>());
 
         //services.AddHostedService<ZibalPaymentCheckerService>();
 
-        builder.Services.AddSingleton<UserDbContext>(sp =>
-        {
-            // Initialize and configure your Dbcontext here
-            return new UserDbContext();
-        });
+        services.AddScoped<UserDbContext>(sp => sp.GetRequiredService<UserDbContextFactory>().CreateDbContext());
         var userContextOptions = new DbContextOptionsBuilder<UserDbContext>()
             .UseSqlite(BuildSqliteConnectionString(appConfig.UserDatabasePath, readWriteCreate: true))
             .Options;
-        builder.Services.AddSingleton(new UserDbContextFactory(userContextOptions));
+        services.AddSingleton(new UserDbContextFactory(userContextOptions));
+        services.AddSingleton<UserStateStore>();
+        services.AddScoped<UserWorkflowStore>();
 
 
         var optionsBuilder = new DbContextOptionsBuilder<CredentialsDbContext>();
         optionsBuilder.UseSqlite(BuildSqliteConnectionString(appConfig.CredentialsDatabasePath, readWriteCreate: true));
-        var context = new CredentialsDbContext(optionsBuilder.Options);
-        //context.Database.Migrate();
+        services.AddSingleton(new CredentialsDbContextFactory(optionsBuilder.Options));
+        services.AddSingleton<CredentialsStore>();
+        services.AddSingleton<BroadcastManager>();
+        services.AddHostedService(sp => sp.GetRequiredService<BroadcastManager>());
 
-        builder.Services.AddSingleton<CredentialsDbContext>(sp =>
-        {
-            // Initialize and configure your Dbcontext here
-            return new CredentialsDbContext(optionsBuilder.Options);
-        });
-        builder.Services.AddSingleton<BroadcastManager>();
-        builder.Services.AddHostedService(sp => sp.GetRequiredService<BroadcastManager>());
-
-        builder.Services.AddSingleton<ITelegramBotClient>(sp =>
+        services.AddSingleton<ITelegramBotClient>(sp =>
         {
 
             return sp.GetRequiredService<BotClientProvider>().GetDefaultClient();
 
         });
 
-        builder.Services.AddLogging(loggingBuilder =>
+        services.AddLogging(loggingBuilder =>
         {
             // Keep Telegram channel clean: app logs go to Telegram, framework request noise does not.
             loggingBuilder.Services.AddSingleton<ILoggerProvider>(sp => new TelegramLoggerProvider(ShouldSendTelegramLog,
@@ -173,73 +207,6 @@ class Program
                 sp.GetRequiredService<BotContextAccessor>()));
         });
 
-        var app = builder.Build();
-        using (var scope = app.Services.CreateScope())
-        {
-            var userDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-            userDb.Database.Migrate();
-            var botRegistry = scope.ServiceProvider.GetRequiredService<BotRegistry>();
-            // Sync configured brand bots first, then hydrate runtime-created tenant bots from users.db.
-            await SyncBotInstancesAsync(userDb, botRegistry);
-            await botRegistry.LoadTenantBotsFromDatabaseAsync(userDb);
-            var credentialsDb = scope.ServiceProvider.GetRequiredService<CredentialsDbContext>();
-            credentialsDb.Database.Migrate();
-        }
-        app.MapControllers();
-        app.Run();
-
-        // await new HostBuilder()
-        //     .ConfigureServices(async (hostContext, services) =>
-        //     {
-        //         // Build configuration manually
-        //         var configuration = new ConfigurationBuilder()
-        //             .AddJsonFile("./Data/configuration.json", optional: false, reloadOnChange: true)
-        //             .Build();
-
-        //         services.AddSingleton<IConfiguration>(configuration);
-
-        //         services.AddHostedService<TelegramBotService>();
-
-        //         //services.AddHostedService<ZibalPaymentCheckerService>();
-
-        //         services.AddSingleton<UserDbContext>(sp =>
-        //         {
-        //             // Initialize and configure your Dbcontext here
-        //             return new UserDbContext();
-        //         });
-
-
-        //         var optionsBuilder = new DbContextOptionsBuilder<CredentialsDbContext>();
-        //         optionsBuilder.UseSqlite("Data Source=./Data/credentials.db;Mode=ReadWrite;Cache=Shared");
-        //         var context = new CredentialsDbContext(optionsBuilder.Options);
-        //         //context.Database.Migrate();
-
-        //         services.AddSingleton<CredentialsDbContext>(sp =>
-        //         {
-        //             // Initialize and configure your Dbcontext here
-        //             return new CredentialsDbContext(optionsBuilder.Options);
-        //         });
-        //         services.AddSingleton<BroadcastManager>();
-
-
-        //         services.AddSingleton<ITelegramBotClient>(sp =>
-        //         {
-        //             return new TelegramBotClient("6034372537:AAGU3YjVo7a5NBoGwyVBy_eiVuQbE0kPFg8");
-        //             // return new TelegramBotClient(configuration["botToken"]);
-
-        //         });
-
-        //         services.AddLogging(builder =>
-        //        {
-        //            // Use a factory to resolve dependencies more cleanly
-        //            builder.Services.AddSingleton<ILoggerProvider>(sp => new TelegramLoggerProvider((_, logLevel) => logLevel >= LogLevel.Information,
-        //                sp.GetRequiredService<ITelegramBotClient>(),
-        //                configuration["loggerChannel"],
-        //                configuration["backupChannel"]
-        //                ));
-        //        });
-        //     })
-        //     .RunConsoleAsync();
     }
 
     /// <summary>
@@ -487,11 +454,12 @@ class Program
     }
 
     /// <summary>
-    /// Builds a SQLite connection string with shared cache and the requested open mode.
+    /// Builds a SQLite connection string with private cache, a five-second busy timeout, and the requested open mode.
     /// </summary>
     /// <param name="databasePath">Absolute database file path.</param>
     /// <param name="readWriteCreate">When true the database may be created; otherwise it must already exist.</param>
     /// <returns>SQLite connection string used by EF Core.</returns>
+    /// <remarks>Both application databases use private-cache SQLite connections with a five-second busy timeout; WAL is initialized before receivers start.</remarks>
     private static string BuildSqliteConnectionString(string databasePath, bool readWriteCreate)
     {
         var builder = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
@@ -500,7 +468,8 @@ class Program
             Mode = readWriteCreate
                 ? Microsoft.Data.Sqlite.SqliteOpenMode.ReadWriteCreate
                 : Microsoft.Data.Sqlite.SqliteOpenMode.ReadWrite,
-            Cache = Microsoft.Data.Sqlite.SqliteCacheMode.Shared
+            Cache = Microsoft.Data.Sqlite.SqliteCacheMode.Private,
+            DefaultTimeout = 5
         };
 
         return builder.ToString();

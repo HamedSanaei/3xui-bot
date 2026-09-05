@@ -174,6 +174,9 @@ namespace Adminbot.Migrations
                     b.Property<string>("PendingUserComment")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("PurchaseSessionId")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("RenewTargetUuid")
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
@@ -953,6 +956,56 @@ namespace Adminbot.Migrations
                     b.HasIndex("TenantBotOrderId");
 
                     b.ToTable("SwapinoPaymentInfos", (string)null);
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.TelegramUpdateInboxEntry", b =>
+                {
+                    b.Property<long>("Sequence")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("AcceptedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BotId")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("CompletedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("FailureCode")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Payload")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("StartedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("TelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("UpdateId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("UpdateType")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Sequence");
+
+                    b.HasIndex("BotId", "UpdateId")
+                        .IsUnique();
+
+                    b.HasIndex("Status", "Sequence");
+
+                    b.HasIndex("BotId", "TelegramUserId", "Sequence");
+
+                    b.ToTable("TelegramUpdateInbox");
                 });
 
             modelBuilder.Entity("Adminbot.Domain.TenantBotLedgerEntry", b =>
@@ -1749,6 +1802,45 @@ namespace Adminbot.Migrations
                     b.ToTable("WalletLedgerEntries", (string)null);
                 });
 
+            modelBuilder.Entity("Adminbot.Domain.XuiV3CreationOperation", b =>
+                {
+                    b.Property<string>("OperationKey")
+                        .HasMaxLength(240)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("AppliedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BusinessParametersJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ClientJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("InboundIdsJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("InboxSequence")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("PanelKey")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("TelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("OperationKey");
+
+                    b.HasIndex("InboxSequence");
+
+                    b.HasIndex("TelegramUserId", "CreatedAtUtc");
+
+                    b.ToTable("XuiV3CreationOperations");
+                });
+
             modelBuilder.Entity("Adminbot.Domain.XuiV3LinkChangeOperation", b =>
                 {
                     b.Property<int>("Id")
@@ -2326,6 +2418,9 @@ namespace Adminbot.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("PendingUserComment")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PurchaseSessionId")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("SelectedCountry")

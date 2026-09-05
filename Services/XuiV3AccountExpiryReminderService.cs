@@ -24,7 +24,7 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
     private readonly BotClientProvider _botClientProvider;
     private readonly BotRegistry _botRegistry;
     private readonly BotContextAccessor _botContextAccessor;
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly CredentialsStore _credentialsDbContext;
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly AppConfig _appConfig;
     private readonly TimeZoneInfo _iranTimeZone;
@@ -33,12 +33,20 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
     private Task _workerTask;
     private int _disposed;
 
+    /// <summary>Creates the expiry worker without retaining a global credentials change tracker.</summary>
+    /// <param name="configuration">Reminder schedule and private panel transport settings.</param>
+    /// <param name="botClientProvider">Bot-keyed clients used for reminder delivery.</param>
+    /// <param name="botRegistry">Current owned and tenant runtime metadata.</param>
+    /// <param name="botContextAccessor">Restores the correct bot identity during each reminder delivery.</param>
+    /// <param name="credentialsDbContext">Factory-backed global profile store; every read is detached.</param>
+    /// <param name="purchaseService">Shared catalog and account formatting service.</param>
+    /// <remarks>Construction performs no database or Telegram write. The tracked worker owns its shutdown lifetime.</remarks>
     public XuiV3AccountExpiryReminderService(
         IConfiguration configuration,
         BotClientProvider botClientProvider,
         BotRegistry botRegistry,
         BotContextAccessor botContextAccessor,
-        CredentialsDbContext credentialsDbContext,
+        CredentialsStore credentialsDbContext,
         XuiV3PurchaseService purchaseService)
     {
         _configuration = configuration;

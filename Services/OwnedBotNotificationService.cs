@@ -15,7 +15,7 @@ using Telegram.Bot.Types.Enums;
 /// </remarks>
 public class OwnedBotNotificationService
 {
-    private readonly UserDbContext _userDbContext;
+    private readonly UserDbContextFactory _contextFactory;
     private readonly BotRegistry _botRegistry;
     private readonly BotClientProvider _botClientProvider;
     private readonly ILogger<OwnedBotNotificationService> _logger;
@@ -23,17 +23,18 @@ public class OwnedBotNotificationService
     /// <summary>
     /// Creates the owned-bot notification service.
     /// </summary>
-    /// <param name="userDbContext">users.db context used to discover which owned bots the user has interacted with.</param>
+    /// <param name="userDbContext">Factory for detached users.db audience reads; no live context survives into delivery.</param>
     /// <param name="botRegistry">Runtime registry containing owned, tenant, and assistant bot definitions.</param>
     /// <param name="botClientProvider">Provider used to send Telegram messages through each resolved owned bot.</param>
     /// <param name="logger">Logger used for best-effort delivery failures.</param>
+    /// <remarks>Audience discovery disposes its read context before any Telegram delivery; one bot failure does not change the other recipients.</remarks>
     public OwnedBotNotificationService(
-        UserDbContext userDbContext,
+        UserDbContextFactory userDbContext,
         BotRegistry botRegistry,
         BotClientProvider botClientProvider,
         ILogger<OwnedBotNotificationService> logger)
     {
-        _userDbContext = userDbContext;
+        _contextFactory = userDbContext;
         _botRegistry = botRegistry;
         _botClientProvider = botClientProvider;
         _logger = logger;
@@ -50,6 +51,7 @@ public class OwnedBotNotificationService
     /// Delivery is best-effort. If one owned bot is blocked, not started, or cannot send to the user, the error is logged
     /// and the service continues with the remaining owned bots.
     /// </remarks>
+    /// <returns>A task completing after all relevant owned bots have been attempted; delivery failures are logged individually.</returns>
     public async Task NotifyUserAcrossOwnedBotsAsync(
         long telegramUserId,
         string text,
@@ -61,11 +63,11 @@ public class OwnedBotNotificationService
             .Select(x => x.Id)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var botIds = await _userDbContext.BotUserStates
-            .Where(x => x.TelegramUserId == telegramUserId && ownedBotIds.Contains(x.BotId))
-            .Select(x => x.BotId)
-            .Distinct()
-            .ToListAsync(cancellationToken);
+        List<string> botIds;
+        await using (var context = _contextFactory.CreateDbContext())
+            botIds = await context.BotUserStates.AsNoTracking()
+                .Where(x => x.TelegramUserId == telegramUserId && ownedBotIds.Contains(x.BotId))
+                .Select(x => x.BotId).Distinct().ToListAsync(cancellationToken);
 
         if (botIds.Count == 0 && _botRegistry.DefaultBot != null)
             botIds.Add(_botRegistry.DefaultBot.Id);

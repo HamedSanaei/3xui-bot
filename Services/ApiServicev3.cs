@@ -127,11 +127,69 @@ public class ApiServicev3
     /// Creates a v3 client and attaches it to one or more inbounds.
     /// The inbound IDs must be supplied explicitly through options.InboundIds.
     /// </summary>
+    /// <param name="accountDto">Required detached account request and panel descriptor; never log its credentials.</param>
+    /// <param name="configuration">Runtime transport configuration containing private panel authentication.</param>
+    /// <param name="options">Creation options; durable business keys make repeated calls GET-only recovery.</param>
+    /// <param name="cancellationToken">Cancellation of reservation, the single POST, and read-back calls.</param>
+    /// <returns>A verified creation result or a safe failure. Ambiguous results never authorize another POST.</returns>
+    /// <remarks>Client identity is persisted before POST when a durable operation key is supplied. No SQLite transaction spans HTTP.</remarks>
     public static async Task<XuiV3AccountCreationResult> CreateUserAccountAsync(
         AccountDto accountDto,
         IConfiguration configuration,
         XuiV3CreateAccountOptions options = null,
         CancellationToken cancellationToken = default)
+    {
+        options ??= new XuiV3CreateAccountOptions();
+        var client = BuildClientPayload(accountDto, options);
+        if (string.IsNullOrWhiteSpace(options.OperationKey))
+            return await CreateUserAccountCoreAsync(accountDto, configuration, options, client, cancellationToken);
+        if (options.OperationStore == null) throw new InvalidOperationException("Durable creation requires its operation store.");
+        var inbounds = options.InboundIds?.Distinct().Order().ToList() ?? new List<int>();
+        if (inbounds.Count == 0) throw new InvalidOperationException("No inbound IDs were provided for the v3 account.");
+        var reservation = await options.OperationStore.ReserveAsync(new XuiV3CreationOperation
+        {
+            OperationKey = options.OperationKey,
+            TelegramUserId = accountDto.TelegramUserId,
+            PanelKey = XuiV3LinkChangeOperationStore.BuildPanelKey(accountDto.ServerInfo),
+            ClientJson = JsonConvert.SerializeObject(client), InboundIdsJson = JsonConvert.SerializeObject(inbounds),
+            BusinessParametersJson = JsonConvert.SerializeObject(new
+            {
+                accountDto.TotoalGB, accountDto.SelectedPeriod, options.TrafficGb, options.TrafficBytes,
+                options.DurationDays, options.LimitIp, options.UseVisionFlow, options.StartExpiryAfterFirstUse, options.PriceToman
+            }),
+            CreatedAtUtc = DateTime.UtcNow
+        }, cancellationToken);
+        client = JsonConvert.DeserializeObject<XuiV3ClientPayload>(reservation.Operation.ClientJson);
+        XuiV3AccountCreationResult result;
+        if (reservation.MayCreate)
+            result = await CreateUserAccountCoreAsync(accountDto, configuration, options, client, cancellationToken);
+        else
+        {
+            // Absence after a timeout does not prove that a previous POST will never commit. Never issue another add.
+            var trafficGb = options.TrafficGb > 0 ? options.TrafficGb : Convert.ToInt32(accountDto.TotoalGB);
+            var trafficBytes = options.TrafficBytes > 0 ? options.TrafficBytes : ApiService.ConvertGBToBytes(trafficGb);
+            result = await TryRecoverCreatedClientAsync(accountDto, configuration, client, inbounds, trafficGb,
+                trafficBytes, options, null, cancellationToken) ?? new XuiV3AccountCreationResult
+                {
+                    Success = false, ApiVersion = XuiPanelApiVersion.V3, Email = client.Email,
+                    Message = XuiV3UserSafeError.ForAccountCreation("creation result requires reconciliation")
+                };
+        }
+        if (result.Success) await options.OperationStore.MarkAppliedAsync(options.OperationKey, cancellationToken);
+        return result;
+    }
+
+    /// <summary>Performs the single authorized addClient and the existing safe read-back recovery sequence.</summary>
+    /// <param name="accountDto">Detached account request and authenticated panel descriptor.</param>
+    /// <param name="configuration">Private transport configuration.</param>
+    /// <param name="options">Validated creation options.</param>
+    /// <param name="client">Exact generated or durably reserved client identity, never regenerated during recovery.</param>
+    /// <param name="cancellationToken">Cancellation of external calls and local state persistence.</param>
+    /// <returns>Verified creation or safe ambiguous/failed result; callers must not blindly retry creation.</returns>
+    /// <remarks>NoAutomaticRetry remains the addClient transport boundary; only GETs resolve uncertain outcomes.</remarks>
+    private static async Task<XuiV3AccountCreationResult> CreateUserAccountCoreAsync(
+        AccountDto accountDto, IConfiguration configuration, XuiV3CreateAccountOptions options,
+        XuiV3ClientPayload client, CancellationToken cancellationToken)
     {
         options ??= new XuiV3CreateAccountOptions();
 
@@ -141,7 +199,6 @@ public class ApiServicev3
 
         var trafficGb = options.TrafficGb > 0 ? options.TrafficGb : Convert.ToInt32(accountDto.TotoalGB);
         var trafficBytes = options.TrafficBytes > 0 ? options.TrafficBytes : ApiService.ConvertGBToBytes(trafficGb);
-        var client = BuildClientPayload(accountDto, options);
         XuiV3ApiResponse<JToken> response;
         try
         {
@@ -349,8 +406,8 @@ public class ApiServicev3
 
         if (options.SaveUserStatus)
         {
-            var userDbContext = new UserDbContext();
-            await userDbContext.SaveUserStatus(new User
+            var userStateStore = UserStateStore.ForConfiguredDatabase();
+            await userStateStore.SaveUserStatus(new User
             {
                 Id = accountDto.TelegramUserId,
                 ConfigLink = configLink,
@@ -362,7 +419,6 @@ public class ApiServicev3
                 Type = accountDto.AccType,
                 AccountCounter = accountDto.AccountCounter
             });
-            await userDbContext.SaveChangesAsync(cancellationToken);
         }
 
         return new XuiV3AccountCreationResult
@@ -2920,18 +2976,38 @@ public class XuiV3ApiException : Exception
     }
 }
 
+/// <summary>Resolved provisioning inputs and private persistence dependencies for one XUI v3 account.</summary>
+/// <remarks>OperationKey identifies the business intent. Mutable display identifiers never replace its durable reservation.</remarks>
 public class XuiV3CreateAccountOptions
 {
+    /// <summary>Optional stable purchase/order-account key; repeated invocations become GET-only recovery.</summary>
+    public string OperationKey { get; set; }
+    /// <summary>Required durable reservation store when OperationKey is provided; never serialized or logged.</summary>
+    [JsonIgnore]
+    public XuiV3CreationOperationStore OperationStore { get; set; }
+    /// <summary>Optional nonnegative confirmed catalog price in toman, included in immutable intent comparison; no debit is performed here.</summary>
+    public long? PriceToman { get; set; }
+    /// <summary>Required positive x-ui inbound identifiers belonging to the selected panel.</summary>
     public IEnumerable<int> InboundIds { get; set; }
+    /// <summary>Whether to persist delivery state for the active bot and Telegram owner after creation.</summary>
     public bool SaveUserStatus { get; set; } = true;
+    /// <summary>Display quota in GB; zero uses the account request fallback.</summary>
     public int TrafficGb { get; set; }
+    /// <summary>Authoritative quota in bytes when positive; otherwise derived from GB.</summary>
     public long TrafficBytes { get; set; }
+    /// <summary>Lifetime in whole days; null uses the legacy selected-period value, and zero means unlimited.</summary>
     public int? DurationDays { get; set; }
+    /// <summary>Panel IP/device limit; zero leaves the panel's unlimited convention.</summary>
     public int LimitIp { get; set; }
+    /// <summary>Optional exact account email; a generated name is durably reserved when absent.</summary>
     public string Email { get; set; }
+    /// <summary>Optional private subscription identifier; never log it or include it in diagnostic metadata.</summary>
     public string SubId { get; set; }
+    /// <summary>Private ownership and plan JSON sent as the panel comment.</summary>
     public string Comment { get; set; }
+    /// <summary>Whether to request the Vision flow for the created client.</summary>
     public bool UseVisionFlow { get; set; }
+    /// <summary>Whether the panel should start the duration on first use using its negative-millisecond convention.</summary>
     public bool StartExpiryAfterFirstUse { get; set; }
 }
 

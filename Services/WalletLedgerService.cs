@@ -15,6 +15,7 @@ namespace Adminbot.Domain
         private const string GozargahSiteWalletProvider = "gozargah_site_wallet";
         /// <summary>Creates independent users.db contexts so concurrent financial writers do not share EF tracking state.</summary>
         private readonly UserDbContextFactory _userDbContextFactory;
+        private readonly CredentialsStore _credentials;
 
         /// <summary>
         /// Creates a wallet ledger service backed by the runtime users database.
@@ -23,9 +24,23 @@ namespace Adminbot.Domain
         /// Per-operation EF Core context factory for <c>users.db</c>. A fresh context prevents concurrent Telegram
         /// receivers from sharing one non-thread-safe change tracker.
         /// </param>
-        public WalletLedgerService(UserDbContextFactory userDbContextFactory)
+        /// <param name="credentials">Factory-backed global wallet receipt reader; no financial mutations are made here.</param>
+        /// <remarks>Returned entries are detached from the disposed context. A matching wallet receipt supplies authoritative balances; this service never changes wallet balances.</remarks>
+        public WalletLedgerService(UserDbContextFactory userDbContextFactory, CredentialsStore credentials)
         {
             _userDbContextFactory = userDbContextFactory;
+            _credentials = credentials;
+        }
+
+        /// <summary>Reads an existing financial audit entry by its unique operation identity.</summary>
+        /// <param name="key">Required non-secret ledger idempotency key.</param>
+        /// <param name="token">Cancellation of the local read.</param>
+        /// <returns>A detached audit entry or null. Historical entries alone do not prove a credentials.db mutation.</returns>
+        /// <remarks>Returned entries are detached from the disposed context. A matching wallet receipt supplies authoritative balances; this service never changes wallet balances.</remarks>
+        public async Task<WalletLedgerEntry> GetByKeyAsync(string key, CancellationToken token = default)
+        {
+            await using var db = _userDbContextFactory.CreateDbContext();
+            return await db.WalletLedgerEntries.AsNoTracking().SingleOrDefaultAsync(x => x.IdempotencyKey == key, token);
         }
 
         /// <summary>
@@ -58,6 +73,8 @@ namespace Adminbot.Domain
         /// index is the final duplicate protection, while legacy call sites that omit the key retain append-only
         /// behavior until they are migrated. When an older row has the same provider/reference identity but no key,
         /// the service backfills the key on that row instead of appending a duplicate audit entry.
+        /// The lookup and insert share a short users.db transaction, retried on SQLite BUSY/LOCKED at most three
+        /// times with fresh contexts. No external request or credentials balance mutation is repeated.
         /// </remarks>
         public async Task<WalletLedgerEntry> RecordAsync(
             long telegramUserId,
@@ -88,72 +105,83 @@ namespace Adminbot.Domain
             if (normalizedIdempotencyKey?.Length > 240)
                 throw new ArgumentException("Wallet ledger idempotency key cannot exceed 240 characters.", nameof(idempotencyKey));
 
-            await using var context = _userDbContextFactory.CreateDbContext();
+            WalletOperation walletReceipt = null;
             if (normalizedIdempotencyKey != null)
             {
-                var existing = await context.WalletLedgerEntries
-                    .FirstOrDefaultAsync(x => x.IdempotencyKey == normalizedIdempotencyKey, cancellationToken);
-                if (existing != null)
-                    return existing;
-
-                if (!string.IsNullOrWhiteSpace(referenceType) && !string.IsNullOrWhiteSpace(referenceId))
+                var receipt = await _credentials.GetWalletOperationAsync(normalizedIdempotencyKey, cancellationToken);
+                walletReceipt = receipt;
+                if (receipt != null)
                 {
-                    var legacyEntry = await context.WalletLedgerEntries.FirstOrDefaultAsync(
-                        x => x.TelegramUserId == telegramUserId &&
-                             x.Reason == reason &&
-                             x.Provider == provider &&
-                             x.ReferenceType == referenceType &&
-                             x.ReferenceId == referenceId,
-                        cancellationToken);
-                    if (legacyEntry != null)
-                    {
-                        // Backfill the new key on a pre-referral ledger row instead of creating a duplicate audit row.
-                        legacyEntry.IdempotencyKey ??= normalizedIdempotencyKey;
-                        await context.SaveChangesAsync(cancellationToken);
-                        return legacyEntry;
-                    }
+                    var signedAmount = direction == WalletLedgerDirections.Debit ? -amountToman : amountToman;
+                    if (receipt.TelegramUserId != telegramUserId || receipt.AmountToman != signedAmount)
+                        throw new InvalidOperationException("Ledger parameters conflict with the durable wallet receipt.");
+                    beforeBalance = receipt.BeforeBalance;
+                    afterBalance = receipt.AfterBalance;
                 }
             }
 
-            var entry = new WalletLedgerEntry
+            return await SqliteOperation.RunAsync(async cancellationToken =>
             {
-                BotId = string.IsNullOrWhiteSpace(botId) ? BotContextAccessor.CurrentBotId : botId,
-                BotUsername = string.IsNullOrWhiteSpace(botUsername) ? BotContextAccessor.CurrentBotUsername : botUsername,
-                BotType = string.IsNullOrWhiteSpace(botType) ? BotContextAccessor.CurrentBotType : botType,
-                OwnerTelegramUserId = ownerTelegramUserId,
-                TelegramUserId = telegramUserId,
-                CounterpartyTelegramUserId = counterpartyTelegramUserId,
-                Direction = direction,
-                AmountToman = amountToman,
-                BalanceBefore = beforeBalance,
-                BalanceAfter = afterBalance,
-                Reason = reason,
-                Provider = provider,
-                ReferenceType = referenceType,
-                ReferenceId = referenceId,
-                OrderId = orderId,
-                Description = description,
-                IdempotencyKey = normalizedIdempotencyKey,
-                CreatedAtUtc = DateTime.UtcNow
-            };
+                await using var context = _userDbContextFactory.CreateDbContext();
+                await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+                if (normalizedIdempotencyKey != null)
+                {
+                    var existing = await context.WalletLedgerEntries
+                        .FirstOrDefaultAsync(x => x.IdempotencyKey == normalizedIdempotencyKey, cancellationToken);
+                    if (existing != null)
+                    {
+                        if (existing.TelegramUserId != telegramUserId || existing.AmountToman != amountToman || existing.Direction != direction)
+                            throw new InvalidOperationException("Ledger operation key conflicts with its committed financial parameters.");
+                        return existing;
+                    }
 
-            context.WalletLedgerEntries.Add(entry);
-            try
-            {
+                    if (!string.IsNullOrWhiteSpace(referenceType) && !string.IsNullOrWhiteSpace(referenceId))
+                    {
+                        var legacyEntry = await context.WalletLedgerEntries.FirstOrDefaultAsync(
+                            x => (x.IdempotencyKey == null || walletReceipt == null) && x.TelegramUserId == telegramUserId &&
+                                 x.Reason == reason &&
+                                 x.Provider == provider &&
+                                 x.ReferenceType == referenceType &&
+                                 x.ReferenceId == referenceId,
+                            cancellationToken);
+                        if (legacyEntry != null)
+                        {
+                            // Backfill the new key on a pre-referral ledger row instead of creating a duplicate audit row.
+                            legacyEntry.IdempotencyKey ??= normalizedIdempotencyKey;
+                            await context.SaveChangesAsync(cancellationToken);
+                            await transaction.CommitAsync(cancellationToken);
+                            return legacyEntry;
+                        }
+                    }
+                }
+
+                var entry = new WalletLedgerEntry
+                {
+                    BotId = string.IsNullOrWhiteSpace(botId) ? BotContextAccessor.CurrentBotId : botId,
+                    BotUsername = string.IsNullOrWhiteSpace(botUsername) ? BotContextAccessor.CurrentBotUsername : botUsername,
+                    BotType = string.IsNullOrWhiteSpace(botType) ? BotContextAccessor.CurrentBotType : botType,
+                    OwnerTelegramUserId = ownerTelegramUserId,
+                    TelegramUserId = telegramUserId,
+                    CounterpartyTelegramUserId = counterpartyTelegramUserId,
+                    Direction = direction,
+                    AmountToman = amountToman,
+                    BalanceBefore = beforeBalance,
+                    BalanceAfter = afterBalance,
+                    Reason = reason,
+                    Provider = provider,
+                    ReferenceType = referenceType,
+                    ReferenceId = referenceId,
+                    OrderId = orderId,
+                    Description = description,
+                    IdempotencyKey = normalizedIdempotencyKey,
+                    CreatedAtUtc = DateTime.UtcNow
+                };
+
+                context.WalletLedgerEntries.Add(entry);
                 await context.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
                 return entry;
-            }
-            catch (DbUpdateException) when (normalizedIdempotencyKey != null)
-            {
-                // A concurrent settlement may have inserted the same unique key after our initial lookup.
-                context.ChangeTracker.Clear();
-                var concurrent = await context.WalletLedgerEntries
-                    .AsNoTracking()
-                    .FirstOrDefaultAsync(x => x.IdempotencyKey == normalizedIdempotencyKey, cancellationToken);
-                if (concurrent != null)
-                    return concurrent;
-                throw;
-            }
+            }, cancellationToken);
         }
 
         /// <summary>
@@ -179,7 +207,7 @@ namespace Adminbot.Domain
             page = Math.Max(0, page);
             pageSize = Math.Clamp(pageSize, 1, 20);
             await using var context = _userDbContextFactory.CreateDbContext();
-            var query = context.WalletLedgerEntries
+            var query = context.WalletLedgerEntries.AsNoTracking()
                 .Where(x => x.TelegramUserId == telegramUserId &&
                             (x.Provider == null ||
                              x.Provider != GozargahSiteWalletProvider ||

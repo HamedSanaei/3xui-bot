@@ -29,7 +29,7 @@ public class TenantBotService
     /// The order is reloaded after this gate is acquired so a stale tracked <c>IsFulfilled=false</c> value cannot
     /// create another XUI account or owner wallet mutation while a concurrent path completes the same order.
     /// </remarks>
-    private static readonly SemaphoreSlim TenantFulfillmentGate = new(1, 1);
+    private static readonly AsyncKeyedGate TenantFulfillmentGate = new();
     /// <summary>
     /// Serializes the local claim that precedes a Tetraminator tenant invoice creation request.
     /// </summary>
@@ -37,11 +37,11 @@ public class TenantBotService
     /// The gate is held only while users.db is checked and the pending payment row is inserted. It prevents two
     /// callbacks for the same tenant order from issuing two non-idempotent provider create requests.
     /// </remarks>
-    private static readonly SemaphoreSlim TenantTetraminatorInvoiceCreationGate = new(1, 1);
+    private static readonly AsyncKeyedGate TenantTetraminatorInvoiceCreationGate = new();
     /// <summary>
     /// Serializes the local claim before UniquePay's non-retried invoice creation request.
     /// </summary>
-    private static readonly SemaphoreSlim TenantUniquePayInvoiceCreationGate = new(1, 1);
+    private static readonly AsyncKeyedGate TenantUniquePayInvoiceCreationGate = new();
     public const string OwnerMenuButton = "🛒 فعالسازی ربات فروشگاهی";
 
     private const string OWNERCALLBACKPREFIX = "TBM:";
@@ -71,8 +71,10 @@ public class TenantBotService
     private const string TENANTRENEWSTEPUNLIMITEDPLAN = "renew-unlimited-plan";
     private const string TENANTRENEWSTEPCONFIRM = "renew-confirm";
 
-    private readonly UserDbContext _userDbcontext;
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly UserWorkflowStore _workflow;
+    /// <summary>Independent bot/user state operations; no EF context is retained by the store.</summary>
+    private readonly UserStateStore _state;
+    private readonly CredentialsStore _credentialsDbContext;
     private readonly IConfiguration _configuration;
     private readonly AppConfig _appConfig;
     private readonly XuiV3PurchaseService _purchaseService;
@@ -100,6 +102,7 @@ public class TenantBotService
     /// <summary>
     /// creates the tenant Bot service with all dependencies needed for owner setup, customer storefronts, payments, and xui account creation.
     /// </summary>
+    /// <param name="stateStore">Factory-backed state reader/writer isolated by runtime bot id and Telegram user id.</param>
     /// <param name="UserDbContext">users.db context for Bot instances, orders, payments, and ledger rows.</param>
     /// <param name="CredentialsDbContext">credentials.db context for Shared User profiles and owner wallet balances.</param>
     /// <param name="Configuration">Application Configuration.</param>
@@ -150,9 +153,11 @@ public class TenantBotService
     /// Durable users.db store that makes each tenant renewal mutation exactly-once: unique-key creation keyed by the
     /// tenant order, lease-bound claims, atomic applied transition, and read-only timeout recovery.
     /// </param>
+    /// <remarks>The order is scoped to its tenant and reloaded under an order-specific gate. Wallet receipt keys are derived from that durable order identity.</remarks>
     public TenantBotService(
-        UserDbContext UserDbContext,
-        CredentialsDbContext CredentialsDbContext,
+        UserWorkflowStore UserDbContext,
+        UserStateStore stateStore,
+        CredentialsStore CredentialsDbContext,
         IConfiguration Configuration,
         XuiV3PurchaseService purchaseService,
         HooshPay HooshPay,
@@ -174,7 +179,8 @@ public class TenantBotService
         XuiV3VolumeReminderStateStore VolumeReminderStateStore,
         XuiV3RenewalOperationStore RenewalOperationStore)
     {
-        _userDbcontext = UserDbContext;
+        _workflow = UserDbContext;
+        _state = stateStore;
         _credentialsDbContext = CredentialsDbContext;
         _configuration = Configuration;
         _appConfig = Configuration.Get<AppConfig>() ?? new AppConfig();
@@ -259,7 +265,7 @@ public class TenantBotService
                 return true;
             }
 
-            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await _state.ClearUserStatus(new User { Id = Message.From.Id });
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, CredUser, null, CancellationToken);
             return true;
         }
@@ -269,7 +275,7 @@ public class TenantBotService
 
         if (CredUser?.IsColleague != true)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await _state.ClearUserStatus(new User { Id = Message.From.Id });
             await botClient.SendTextMessageAsync(
                 chatId: Message.Chat.Id,
                 text: "این بخش فقط برای همکاران فعال است.",
@@ -281,7 +287,7 @@ public class TenantBotService
         var step = User.LastStep ?? string.Empty;
         if (string.Equals(Message.Text.Trim(), "بازگشت به پنل", StringComparison.Ordinal))
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await _state.ClearUserStatus(new User { Id = Message.From.Id });
             await botClient.SendTextMessageAsync(
                 Message.Chat.Id,
                 "به پنل ربات فروشگاهی برگشتید.",
@@ -838,8 +844,8 @@ public class TenantBotService
             return;
         }
 
-        await _userDbcontext.ClearUserStatus(new User { Id = customer.TelegramUserId });
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = customer.TelegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = customer.TelegramUserId,
             Flow = TENANTRENEWFLOW,
@@ -932,7 +938,7 @@ public class TenantBotService
         bool allowSearchRestart,
         CancellationToken cancellationToken)
     {
-        await _userDbcontext.ClearUserStatus(new User { Id = telegramUserId });
+        await _state.ClearUserStatus(new User { Id = telegramUserId });
         var rows = new List<InlineKeyboardButton[]>();
         if (allowSearchRestart)
         {
@@ -978,20 +984,20 @@ public class TenantBotService
         if (tenant == null || string.IsNullOrWhiteSpace(tenant.Id) || telegramUserId <= 0)
             return;
 
-        var existing = await _userDbcontext.BotUserStates.FirstOrDefaultAsync(
+        var existing = await _workflow.ReadAsync(async db => await db.BotUserStates.FirstOrDefaultAsync(
             x => x.BotId == tenant.Id && x.TelegramUserId == telegramUserId,
-            cancellationToken);
+            cancellationToken));
 
         if (existing == null)
         {
-            _userDbcontext.BotUserStates.Add(BotUserState.FromUser(tenant.Id, new User { Id = telegramUserId }));
+            _workflow.Add(BotUserState.FromUser(tenant.Id, new User { Id = telegramUserId }));
         }
         else
         {
             existing.UpdatedAtUtc = DateTime.UtcNow;
         }
 
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
     }
 
     /// <summary>
@@ -1385,7 +1391,7 @@ public class TenantBotService
         await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
 
         ResetTenantStorefrontSettings(tenant, clearAllStorefrontSettings: true);
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
         _botRegistry.Upsert(tenant);
         _botClientProvider.Invalidate(tenant.Id);
 
@@ -1452,7 +1458,7 @@ public class TenantBotService
             if (changed)
             {
                 tenant.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
                 _botRegistry.Upsert(tenant);
                 _botClientProvider.Invalidate(tenant.Id);
             }
@@ -1464,7 +1470,7 @@ public class TenantBotService
             await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
 
             ResetTenantStorefrontSettings(tenant, clearAllStorefrontSettings: false);
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
             _botRegistry.Upsert(tenant);
             _botClientProvider.Invalidate(tenant.Id);
 
@@ -1653,6 +1659,7 @@ public class TenantBotService
     /// <c>@BotFather</c> link. The support prompt includes a reply-keyboard back button because owners often
     /// need to inspect the current support id before deciding whether to change it.
     /// </remarks>
+    /// <returns>A task completing after the owner input step is saved and its prompt is sent.</returns>
     private async Task STARTOWNERINPUTASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -1677,7 +1684,7 @@ public class TenantBotService
             return;
         }
 
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = CallbackQuery.From.Id,
             Flow = OWNERFLOW,
@@ -1726,6 +1733,8 @@ public class TenantBotService
     /// <param name="Message">owner Message containing the Token.</param>
     /// <param name="owner">colleague owner profile.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <returns>A task completing after token validation, tenant persistence, runtime refresh and the owner response.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task SAVETENANTBOTTOKENASYNC(
         ITelegramBotClient botClient,
         Message Message,
@@ -1798,8 +1807,8 @@ public class TenantBotService
         if (string.IsNullOrWhiteSpace(tenant.SupportAccount) && !string.IsNullOrWhiteSpace(owner.Username))
             tenant.SupportAccount = "@" + owner.Username.TrimStart('@');
 
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
-        await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+        await _workflow.SaveAsync(CancellationToken);
+        await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
         _botClientProvider.Invalidate(tenant.Id);
 
@@ -1843,9 +1852,9 @@ public class TenantBotService
         CancellationToken cancellationToken)
     {
         var normalizedUsername = TelegramBotTokenIdentity.NormalizeUsername(username);
-        var tenants = await _userDbcontext.BotInstances
+        var tenants = await _workflow.ReadAsync(async db => await db.BotInstances
             .Where(x => x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId != ownerTelegramUserId)
-            .ToListAsync(cancellationToken);
+            .ToListAsync(cancellationToken));
 
         foreach (var tenant in tenants)
         {
@@ -1887,6 +1896,8 @@ public class TenantBotService
     /// <param name="Message">owner Message containing A numeric percent.</param>
     /// <param name="owner">colleague owner profile.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <returns>A task completing after the validated 0 through 500 percent markup is saved and confirmed.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task SAVETENANTMARKUPASYNC(ITelegramBotClient botClient, Message Message, CredUser owner, CancellationToken CancellationToken)
     {
         if (!int.TryParse(Message.Text?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var markup) || markup < 0 || markup > 500)
@@ -1898,8 +1909,8 @@ public class TenantBotService
         var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
         tenant.TenantPriceMarkupPercent = markup;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
-        await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+        await _workflow.SaveAsync(CancellationToken);
+        await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
         await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ درصد سود ذخیره شد.", cancellationToken: CancellationToken);
@@ -1928,6 +1939,7 @@ public class TenantBotService
     /// colleague's storefront support flow. Public <c>t.me</c> links are converted to their username segment
     /// so customers never see values like <c>@https://t.me/name</c>.
     /// </remarks>
+    /// <returns>A task completing after a valid support account is saved, or an invalid-input reply is sent.</returns>
     private async Task SAVETENANTSUPPORTASYNC(ITelegramBotClient botClient, Message Message, CredUser owner, CancellationToken CancellationToken)
     {
         var support = NormalizeTenantSupportAccount(Message.Text);
@@ -1940,8 +1952,8 @@ public class TenantBotService
         var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
         tenant.SupportAccount = support;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
-        await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+        await _workflow.SaveAsync(CancellationToken);
+        await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
         await botClient.SendTextMessageAsync(
@@ -1959,6 +1971,8 @@ public class TenantBotService
     /// <param name="Message">owner Message containing WELCOME Text.</param>
     /// <param name="owner">colleague owner profile.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <returns>A task completing after the tenant welcome message is saved and the owner panel is restored.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task SAVETENANTWELCOMEASYNC(ITelegramBotClient botClient, Message Message, CredUser owner, CancellationToken CancellationToken)
     {
         var WELCOME = Message.Text?.Trim();
@@ -1971,8 +1985,8 @@ public class TenantBotService
         var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
         tenant.TenantWelcomeText = WELCOME;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
-        await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+        await _workflow.SaveAsync(CancellationToken);
+        await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
         await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ متن خوشامد ذخیره شد.", cancellationToken: CancellationToken);
@@ -1990,6 +2004,7 @@ public class TenantBotService
     /// the card number is tenant-scoped and is shown only to customers of this tenant Bot when the owner
     /// Enables card-to-card payment. the value is stored in users.db because credentials.db schema must STAY UNCHANGED.
     /// </remarks>
+    /// <returns>A task completing after the validated tenant card number is saved or a validation reply is sent.</returns>
     private async Task SAVETENANTCARDNUMBERASYNC(ITelegramBotClient botClient, Message Message, CredUser owner, CancellationToken CancellationToken)
     {
         var cardNumber = Message.Text?.Trim();
@@ -2002,8 +2017,8 @@ public class TenantBotService
         var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
         tenant.TenantCardNumber = cardNumber;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
-        await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+        await _workflow.SaveAsync(CancellationToken);
+        await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
         await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ شماره کارت فروشگاه ذخیره شد.", cancellationToken: CancellationToken);
@@ -2021,6 +2036,7 @@ public class TenantBotService
     /// this method does not VALIDATE the name AGAINST A BANK; it only stores the exact owner-provided
     /// Text after TRIMMING so the customer can match the card TRANSFER DESTINATION.
     /// </remarks>
+    /// <returns>A task completing after the tenant card-holder label is saved and confirmed.</returns>
     private async Task SAVETENANTCARDHOLDERASYNC(ITelegramBotClient botClient, Message Message, CredUser owner, CancellationToken CancellationToken)
     {
         var CARDHOLDER = Message.Text?.Trim();
@@ -2033,8 +2049,8 @@ public class TenantBotService
         var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
         tenant.TenantCardHolderName = CARDHOLDER;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
-        await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+        await _workflow.SaveAsync(CancellationToken);
+        await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
         await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ نام صاحب کارت ذخیره شد.", cancellationToken: CancellationToken);
@@ -2052,6 +2068,7 @@ public class TenantBotService
     /// the value is normalized to A single channel Id/Username List in <see cref="BotInstance.TenantChannelIdsJson" />.
     /// the Bot Access ITSELF is checked when forced join is enabled or when the storefront is TURNED on.
     /// </remarks>
+    /// <returns>A task completing after channel validation and tenant settings persistence or its failure response.</returns>
     private async Task SAVETENANTMANDATORYCHANNELASYNC(ITelegramBotClient botClient, Message Message, CredUser owner, CancellationToken CancellationToken)
     {
         var channel = NORMALIZETELEGRAMCHANNEL(Message.Text);
@@ -2064,8 +2081,8 @@ public class TenantBotService
         var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
         tenant.TenantChannelIdsJson = JsonConvert.SerializeObject(new[] { channel });
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
-        await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+        await _workflow.SaveAsync(CancellationToken);
+        await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
         await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ کانال جوین اجباری ذخیره شد.", cancellationToken: CancellationToken);
@@ -2190,7 +2207,7 @@ public class TenantBotService
             {
                 tenant.Enabled = false;
                 tenant.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
                 _botRegistry.Upsert(tenant);
 
                 await botClient.SendTextMessageAsync(
@@ -2209,7 +2226,7 @@ public class TenantBotService
 
         tenant.Enabled = desiredEnabled;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
         _botRegistry.Upsert(tenant);
         _botClientProvider.Invalidate(tenant.Id);
 
@@ -2223,7 +2240,7 @@ public class TenantBotService
                 {
                     tenant.Enabled = false;
                     tenant.UpdatedAtUtc = DateTime.UtcNow;
-                    await _userDbcontext.SaveChangesAsync(CancellationToken);
+                    await _workflow.SaveAsync(CancellationToken);
                     _botRegistry.Upsert(tenant);
                     _botClientProvider.Invalidate(tenant.Id);
 
@@ -2410,7 +2427,7 @@ public class TenantBotService
             if (!validation.ISVALID)
             {
                 tenant.TenantMandatoryJoinEnabled = false;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
                 await botClient.SendTextMessageAsync(
                     CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
                     $"⚠️ {validation.ErrorMessage}",
@@ -2442,7 +2459,7 @@ public class TenantBotService
         }
 
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
         _botRegistry.Upsert(tenant);
 
         await SHOWOWNERPANELASYNC(
@@ -2475,15 +2492,15 @@ public class TenantBotService
         const int pageSize = 10;
         var orders = tenant == null
             ? new List<TenantBotOrder>()
-            : await _userDbcontext.TenantBotOrders
+            : await _workflow.ReadAsync(async db => await db.TenantBotOrders
                 .Where(x => x.TenantBotId == tenant.Id)
                 .OrderByDescending(x => x.CreatedAtUtc)
                 .Skip(page * pageSize)
                 .Take(pageSize)
-                .ToListAsync(CancellationToken);
+                .ToListAsync(CancellationToken));
         var totalCount = tenant == null
             ? 0
-            : await _userDbcontext.TenantBotOrders.CountAsync(x => x.TenantBotId == tenant.Id, CancellationToken);
+            : await _workflow.ReadAsync(async db => await db.TenantBotOrders.CountAsync(x => x.TenantBotId == tenant.Id, CancellationToken));
         var totalPages = Math.Max(1, (int)Math.Ceiling(totalCount / (double)pageSize));
 
         var Builder = new System.Text.StringBuilder();
@@ -2552,9 +2569,9 @@ public class TenantBotService
         var page = parts.Length > 1 && int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedPage)
             ? Math.Max(0, parsedPage)
             : 0;
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == orderId && x.OwnerTelegramUserId == owner.TelegramUserId,
-            cancellationToken);
+            cancellationToken));
         if (order == null)
         {
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
@@ -2660,13 +2677,15 @@ public class TenantBotService
     /// <param name="botClient">Owned bot client used to prompt the owner.</param>
     /// <param name="callbackQuery">Owner callback that requested tutorial creation.</param>
     /// <param name="cancellationToken">Cancellation token for state and Telegram operations.</param>
+    /// <returns>A task completing after the bot-scoped tutorial input step and prompt are saved and sent.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task STARTTENANTTUTORIALADDASYNC(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
         CancellationToken cancellationToken)
     {
         await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = callbackQuery.From.Id,
             Flow = OWNERFLOW,
@@ -2686,6 +2705,8 @@ public class TenantBotService
     /// <param name="owner">Colleague owner whose tenant tutorial list is updated.</param>
     /// <param name="state">Current owner state row.</param>
     /// <param name="cancellationToken">Cancellation token for database and Telegram operations.</param>
+    /// <returns>A task completing after the tutorial draft advances or the completed tutorial is saved.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task SAVETENANTTUTORIALSTEPASYNC(
         ITelegramBotClient botClient,
         Message message,
@@ -2709,7 +2730,7 @@ public class TenantBotService
             state.Flow = OWNERFLOW;
             state.LastStep = STEPTUTORIALURL;
             state.SubLink = text;
-            await _userDbcontext.SaveUserStatus(state);
+            await _state.SaveUserStatus(state);
             await botClient.SendTextMessageAsync(message.Chat.Id, "حالا لینک آموزش را ارسال کنید.", cancellationToken: cancellationToken);
             return;
         }
@@ -2724,8 +2745,8 @@ public class TenantBotService
         tutorials.Add(new TenantTutorialLink { Title = state.SubLink, Url = text });
         tenant.TenantTutorialsJson = JsonConvert.SerializeObject(tutorials);
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
-        await _userDbcontext.ClearUserStatus(state);
+        await _workflow.SaveAsync(cancellationToken);
+        await _state.ClearUserStatus(state);
         await botClient.SendTextMessageAsync(message.Chat.Id, "✅ آموزش ثبت شد.", replyMarkup: BUILDOWNERPANELKEYBOARD(tenant), cancellationToken: cancellationToken);
     }
 
@@ -2756,7 +2777,7 @@ public class TenantBotService
         tutorials.RemoveAt(index);
         tenant.TenantTutorialsJson = JsonConvert.SerializeObject(tutorials);
         tenant.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
         await SHOWTENANTTUTORIALMANAGERASYNC(
             botClient,
             callbackQuery,
@@ -2771,12 +2792,14 @@ public class TenantBotService
     /// <param name="botClient">Owned bot client used to prompt the owner.</param>
     /// <param name="callbackQuery">Owner callback that opened broadcast.</param>
     /// <param name="cancellationToken">Cancellation token for state and Telegram operations.</param>
+    /// <returns>A task completing after the owner broadcast input step and prompt are prepared.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task STARTTENANTBROADCASTASYNC(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
         CancellationToken cancellationToken)
     {
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = callbackQuery.From.Id,
             Flow = OWNERFLOW,
@@ -2796,6 +2819,8 @@ public class TenantBotService
     /// <param name="message">Owner message containing text or a Telegram post URL.</param>
     /// <param name="owner">Colleague owner who owns the tenant broadcast audience.</param>
     /// <param name="cancellationToken">Cancellation token for state and Telegram operations.</param>
+    /// <returns>A task completing after the broadcast draft is stored and its confirmation preview is sent.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task PREPARETENANTBROADCASTASYNC(
         ITelegramBotClient botClient,
         Message message,
@@ -2816,7 +2841,7 @@ public class TenantBotService
         }
 
         var token = Guid.NewGuid().ToString("N")[..10];
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = OWNERFLOW,
@@ -2855,6 +2880,7 @@ public class TenantBotService
     /// edited by the owned bot that received the owner callback, while each recipient receives the message
     /// from the tenant bot configured by the colleague.
     /// </remarks>
+    /// <returns>A task completing after broadcast submission to the tracked sender and its owner response.</returns>
     private async Task SENDTENANTBROADCASTASYNC(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -2863,7 +2889,7 @@ public class TenantBotService
         CancellationToken cancellationToken)
     {
         var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, cancellationToken);
-        var state = await _userDbcontext.GetUserStatus(owner.TelegramUserId);
+        var state = await _state.GetUserStatus(owner.TelegramUserId);
         if (tenant == null || state?.ConfigLink != token || string.IsNullOrWhiteSpace(state.SubLink))
         {
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "پیش‌نویس پیام عمومی پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
@@ -2891,7 +2917,7 @@ public class TenantBotService
             cancellationToken,
             senderBotId: tenant.Id);
 
-        await _userDbcontext.ClearUserStatus(state);
+        await _state.ClearUserStatus(state);
         await _broadcastManager.RefreshStatusMessageAsync(job.Id, cancellationToken);
         await botClient.SendTextMessageAsync(
             callbackQuery.Message.Chat.Id,
@@ -2958,12 +2984,12 @@ public class TenantBotService
         if (tenant == null || string.IsNullOrWhiteSpace(tenant.Id))
             return new List<long>();
 
-        return await _userDbcontext.BotUserStates
+        return await _workflow.ReadAsync(async db => await db.BotUserStates
             .Where(x => x.BotId == tenant.Id && x.TelegramUserId > 0)
             .Select(x => x.TelegramUserId)
             .Distinct()
             .OrderBy(x => x)
-            .ToListAsync(cancellationToken);
+            .ToListAsync(cancellationToken));
     }
 
     /// <summary>
@@ -3155,12 +3181,13 @@ public class TenantBotService
     /// The next owner text message is interpreted as an exact tenant <c>OrderId</c>. The final approval still
     /// runs through the shared idempotent fulfillment path so duplicate approvals cannot create duplicate accounts.
     /// </remarks>
+    /// <returns>A task completing after the bot-scoped order-id prompt is saved and sent.</returns>
     private async Task STARTMANUALCARDORDERCONFIRMASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
         CancellationToken CancellationToken)
     {
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = CallbackQuery.From.Id,
             Flow = OWNERFLOW,
@@ -3263,14 +3290,14 @@ public class TenantBotService
 
         if (Text == "خرید اکانت" || Text == "💳 خرید اکانت")
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await _state.ClearUserStatus(new User { Id = Message.From.Id });
             await SendServiceSelectionAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
             return;
         }
 
         if (Text == "تعرفه‌ها" || Text == "📋 تعرفه‌ها")
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await _state.ClearUserStatus(new User { Id = Message.From.Id });
             await botClient.SendTextMessageAsync(
                 Message.Chat.Id,
                 BUILDTENANTTARIFFSTEXT(tenant),
@@ -3282,7 +3309,7 @@ public class TenantBotService
 
         if (Text == "پشتیبانی" || Text == "💬 پشتیبانی")
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await _state.ClearUserStatus(new User { Id = Message.From.Id });
             var support = BuildTenantSupportContactHtml(tenant.SupportAccount);
             await botClient.SendTextMessageAsync(
                 Message.Chat.Id,
@@ -3295,7 +3322,7 @@ public class TenantBotService
 
         if (IsTenantTutorialCommand(Text))
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = Message.From.Id });
+            await _state.ClearUserStatus(new User { Id = Message.From.Id });
             await SendTenantTutorialsAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
             return;
         }
@@ -3392,7 +3419,7 @@ public class TenantBotService
         var text = message.Text?.Trim() ?? string.Empty;
         if (IsCancelText(text))
         {
-            await _userDbcontext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 message.Chat.Id,
                 "فرایند خرید لغو شد.",
@@ -3405,7 +3432,7 @@ public class TenantBotService
             .FirstOrDefault(x => string.Equals(x.Key, user.SelectedCountry, StringComparison.OrdinalIgnoreCase));
         if (service == null || service.IsUnlimited)
         {
-            await _userDbcontext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 message.Chat.Id,
                 "سرویس انتخاب‌شده قبلی دیگر فعال نیست. لطفاً سرویس جدید را انتخاب کنید.",
@@ -3426,7 +3453,7 @@ public class TenantBotService
                 return true;
             }
 
-            await _userDbcontext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = TENANTPURCHASEFLOW,
@@ -3458,7 +3485,7 @@ public class TenantBotService
                     out var trafficGb) ||
                 !XuiV3PurchaseService.MeetsMinimumTraffic(service, trafficGb))
             {
-                await _userDbcontext.ResetUserStatus(new User
+                await _state.ResetUserStatus(new User
                 {
                     Id = message.From.Id,
                     Flow = TENANTPURCHASEFLOW,
@@ -3497,7 +3524,7 @@ public class TenantBotService
                 TrafficGb = trafficGb,
                 DurationKey = duration.Key
             };
-            await _userDbcontext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await SHOWCUSTOMERCONFIRMASYNC(
                 botClient,
                 message.Chat.Id,
@@ -3592,8 +3619,8 @@ public class TenantBotService
         if (!IsTenantRenewCommand(text))
             return false;
 
-        await _userDbcontext.ClearUserStatus(new User { Id = message.From.Id });
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = message.From.Id });
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = TENANTRENEWFLOW,
@@ -3659,7 +3686,7 @@ public class TenantBotService
         var text = message.Text?.Trim() ?? string.Empty;
         if (IsCancelText(text))
         {
-            await _userDbcontext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(message.Chat.Id, "فرایند تمدید لغو شد.", replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
             return;
         }
@@ -3724,7 +3751,7 @@ public class TenantBotService
                 user.TotoalGB = string.Empty;
                 user.SelectedPeriod = string.Empty;
                 user.Type = string.Empty;
-                await _userDbcontext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     message.Chat.Id,
                     selectedService.IsUnlimited
@@ -3796,7 +3823,7 @@ public class TenantBotService
                 StringComparison.Ordinal))
         {
             user.RenewalServiceResolutionMode = effectiveResolutionMode;
-            await _userDbcontext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
         }
 
         if (user.LastStep == TENANTRENEWSTEPTRAFFIC)
@@ -3810,7 +3837,7 @@ public class TenantBotService
             user.Flow = TENANTRENEWFLOW;
             user.LastStep = TENANTRENEWSTEPDURATION;
             user.TotoalGB = trafficGb.ToString(CultureInfo.InvariantCulture);
-            await _userDbcontext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
             await botClient.SendTextMessageAsync(
                 message.Chat.Id,
                 XuiV3PurchaseService.BuildDurationSelectionText(service, "مدت تمدید را انتخاب کنید:"),
@@ -3837,7 +3864,7 @@ public class TenantBotService
             user.Flow = TENANTRENEWFLOW;
             user.LastStep = TENANTRENEWSTEPCONFIRM;
             user.SelectedPeriod = duration.Key;
-            await _userDbcontext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
             await SendTenantRenewSummaryAsync(botClient, message.Chat.Id, tenant, customer, user, cancellationToken);
             return;
         }
@@ -3854,7 +3881,7 @@ public class TenantBotService
             user.Flow = TENANTRENEWFLOW;
             user.LastStep = TENANTRENEWSTEPCONFIRM;
             user.Type = plan.Key;
-            await _userDbcontext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
             await SendTenantRenewSummaryAsync(botClient, message.Chat.Id, tenant, customer, user, cancellationToken);
             return;
         }
@@ -3872,7 +3899,7 @@ public class TenantBotService
             {
                 user.LastStep = TENANTRENEWSTEPDURATION;
                 user.SelectedPeriod = string.Empty;
-                await _userDbcontext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     message.Chat.Id,
                     XuiV3PurchaseService.BuildDurationSelectionText(
@@ -3892,7 +3919,7 @@ public class TenantBotService
             {
                 user.LastStep = TENANTRENEWSTEPUNLIMITEDPLAN;
                 user.Type = string.Empty;
-                await _userDbcontext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     message.Chat.Id,
                     "پلن نامحدود انتخاب‌شده دیگر فعال نیست. پلن جدید را انتخاب کنید.",
@@ -4102,8 +4129,8 @@ public class TenantBotService
         CancellationToken cancellationToken)
     {
         // Persist the sensitive target only in this tenant bot's conversation row; the confirmation callback is fixed.
-        await _userDbcontext.ClearUserStatus(new User { Id = customerTelegramUserId });
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = customerTelegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = customerTelegramUserId,
             Flow = TENANTRENEWFLOW,
@@ -4193,8 +4220,8 @@ public class TenantBotService
             return;
         }
 
-        await _userDbcontext.ClearUserStatus(new User { Id = customerTelegramUserId });
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = customerTelegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = customerTelegramUserId,
             Flow = TENANTRENEWFLOW,
@@ -4271,8 +4298,8 @@ public class TenantBotService
         CancellationToken cancellationToken)
     {
         // Replace the warning/search state before showing prices so a stale tenant callback cannot swap the target.
-        await _userDbcontext.ClearUserStatus(new User { Id = customerTelegramUserId });
-        await _userDbcontext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = customerTelegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = customerTelegramUserId,
             Flow = TENANTRENEWFLOW,
@@ -4367,7 +4394,7 @@ public class TenantBotService
         user.SelectedPeriod = string.Empty;
         user.Type = string.Empty;
         user.PendingUserComment = string.Empty;
-        await _userDbcontext.SaveUserStatus(user);
+        await _state.SaveUserStatus(user);
 
         await botClient.SendTextMessageAsync(
             chatId,
@@ -4626,7 +4653,7 @@ public class TenantBotService
         if (!string.Equals(user.RenewalServiceResolutionMode, resolutionMode, StringComparison.Ordinal))
         {
             user.RenewalServiceResolutionMode = resolutionMode;
-            await _userDbcontext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
         }
 
         var selection = BuildTenantRenewSelectionFromState(user);
@@ -4783,7 +4810,7 @@ public class TenantBotService
         if (!string.Equals(user.RenewalServiceResolutionMode, resolutionMode, StringComparison.Ordinal))
         {
             user.RenewalServiceResolutionMode = resolutionMode;
-            await _userDbcontext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
         }
 
         if (await _renewalOperationStore.FindBlockingOperationAsync(
@@ -4813,9 +4840,9 @@ public class TenantBotService
         order.PaymentStatus = TenantBotOrderStatuses.Pending;
         order.UpdatedAtUtc = DateTime.UtcNow;
 
-        _userDbcontext.TenantBotOrders.Add(order);
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
-        await _userDbcontext.ClearUserStatus(user);
+        _workflow.Add(order);
+        await _workflow.SaveAsync(cancellationToken);
+        await _state.ClearUserStatus(user);
 
         await botClient.SendTextMessageAsync(
             chatId,
@@ -5298,7 +5325,7 @@ public class TenantBotService
 
         if (action == "home")
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+            await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
             await SendTenantHomeAsync(botClient, ChatId, tenant, CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
             return;
@@ -5306,7 +5333,7 @@ public class TenantBotService
 
         if (action == "services")
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+            await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
             await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
             return;
@@ -5327,12 +5354,12 @@ public class TenantBotService
                 var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => string.Equals(x.Key, parts[1], StringComparison.OrdinalIgnoreCase));
                 if (service == null || service.IsUnlimited)
                 {
-                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                     await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
                 }
                 else if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, GB))
                 {
-                    await _userDbcontext.ResetUserStatus(new User
+                    await _state.ResetUserStatus(new User
                     {
                         Id = CallbackQuery.From.Id,
                         Flow = TENANTPURCHASEFLOW,
@@ -5353,7 +5380,7 @@ public class TenantBotService
                 }
                 else
                 {
-                    await _userDbcontext.ResetUserStatus(new User
+                    await _state.ResetUserStatus(new User
                     {
                         Id = CallbackQuery.From.Id,
                         Flow = TENANTPURCHASEFLOW,
@@ -5380,7 +5407,7 @@ public class TenantBotService
                 var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => string.Equals(x.Key, parts[1], StringComparison.OrdinalIgnoreCase));
                 if (service == null || service.IsUnlimited)
                 {
-                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                     await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
                     await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
                     return;
@@ -5388,7 +5415,7 @@ public class TenantBotService
 
                 if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, GB))
                 {
-                    await _userDbcontext.ResetUserStatus(new User
+                    await _state.ResetUserStatus(new User
                     {
                         Id = CallbackQuery.From.Id,
                         Flow = TENANTPURCHASEFLOW,
@@ -5414,7 +5441,7 @@ public class TenantBotService
                 {
                     // Tenant callback messages can remain clickable after an operator disables a duration. Refresh
                     // the current choices before order creation so no tenant balance or gateway flow can be reached.
-                    await _userDbcontext.ResetUserStatus(new User
+                    await _state.ResetUserStatus(new User
                     {
                         Id = CallbackQuery.From.Id,
                         Flow = TENANTPURCHASEFLOW,
@@ -5436,7 +5463,7 @@ public class TenantBotService
                 }
 
                 var selection = new XuiV3PurchaseSelection { ServiceKey = parts[1], TrafficGb = GB, DurationKey = parts[3] };
-                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, MessageId, tenant, selection, CancellationToken);
             }
 
@@ -5456,12 +5483,12 @@ public class TenantBotService
                     string.Equals(candidate.Key, parts[2], StringComparison.OrdinalIgnoreCase));
                 if (service == null)
                 {
-                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                     await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
                 }
                 else if (plan == null)
                 {
-                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                     await SHOWSERVICEOPTIONSASYNC(
                         botClient,
                         ChatId,
@@ -5481,7 +5508,7 @@ public class TenantBotService
                 else
                 {
                     var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
-                    await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                    await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                     await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, MessageId, tenant, selection, CancellationToken);
                 }
             }
@@ -5509,7 +5536,7 @@ public class TenantBotService
                 return;
             }
 
-            await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+            await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
             await CreateTenantOrderINVOICEASYNC(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             return;
         }
@@ -5541,27 +5568,27 @@ public class TenantBotService
 
             if (Provider == "PAYHP")
             {
-                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantOrderINVOICEASYNC(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             }
             else if (Provider == "PAYTM")
             {
-                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantTetraminatorInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             }
             else if (Provider == "PAYUP")
             {
-                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantUniquePayInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             }
             else if (Provider == "PAYNP")
             {
-                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantNowPaymentsInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             }
             else
             {
-                await _userDbcontext.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantCardOrderAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             }
             return;
@@ -5834,14 +5861,14 @@ public class TenantBotService
         var service = _purchaseService.GetEnabledServices().FirstOrDefault(x => x.Key == ServiceKey);
         if (service == null)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = CustomerTelegramUserId });
+            await _state.ClearUserStatus(new User { Id = CustomerTelegramUserId });
             await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             return;
         }
 
         if (service.IsUnlimited)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = CustomerTelegramUserId });
+            await _state.ClearUserStatus(new User { Id = CustomerTelegramUserId });
             var rows = XuiV3PurchaseService.GetUnlimitedPlansForTenant(service)
                 .Select(plan =>
                 {
@@ -5861,7 +5888,7 @@ public class TenantBotService
             return;
         }
 
-        await _userDbcontext.ResetUserStatus(new User
+        await _state.ResetUserStatus(new User
         {
             Id = CustomerTelegramUserId,
             Flow = TENANTPURCHASEFLOW,
@@ -6014,7 +6041,7 @@ public class TenantBotService
             string.Equals(candidate.Key, selection?.ServiceKey, StringComparison.OrdinalIgnoreCase));
         if (service == null)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = callbackQuery.From.Id });
+            await _state.ClearUserStatus(new User { Id = callbackQuery.From.Id });
             await SendServiceSelectionAsync(
                 botClient,
                 callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
@@ -6037,7 +6064,7 @@ public class TenantBotService
         {
             if (selection.TrafficGb.HasValue && XuiV3PurchaseService.MeetsMinimumTraffic(service, selection.TrafficGb.Value))
             {
-                await _userDbcontext.ResetUserStatus(new User
+                await _state.ResetUserStatus(new User
                 {
                     Id = callbackQuery.From.Id,
                     Flow = TENANTPURCHASEFLOW,
@@ -6060,7 +6087,7 @@ public class TenantBotService
             }
             else
             {
-                await _userDbcontext.ResetUserStatus(new User
+                await _state.ResetUserStatus(new User
                 {
                     Id = callbackQuery.From.Id,
                     Flow = TENANTPURCHASEFLOW,
@@ -6095,7 +6122,7 @@ public class TenantBotService
                 string.Equals(plan.Key, selection.UnlimitedPlanKey, StringComparison.OrdinalIgnoreCase));
             if (!XuiV3PurchaseService.IsUnlimitedPlanAvailableForTenant(selectedPlan))
             {
-                await _userDbcontext.ClearUserStatus(new User { Id = callbackQuery.From.Id });
+                await _state.ClearUserStatus(new User { Id = callbackQuery.From.Id });
                 await SHOWSERVICEOPTIONSASYNC(
                     botClient,
                     callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
@@ -6263,8 +6290,8 @@ public class TenantBotService
             CreatedAtUtc = DateTime.UtcNow
         };
 
-        _userDbcontext.TenantBotOrders.Add(order);
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        _workflow.Add(order);
+        await _workflow.SaveAsync(CancellationToken);
 
         var payment = new HooshPayPaymentInfo
         {
@@ -6285,8 +6312,8 @@ public class TenantBotService
         };
 
         // Purpose marks this HooshPay row as A direct sale, not A wallet top-Up.
-        _userDbcontext.HooshPayPaymentInfos.Add(payment);
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        _workflow.Add(payment);
+        await _workflow.SaveAsync(CancellationToken);
 
         order.HooshPayPaymentInfoId = payment.Id;
         payment.RawRequestJson = JsonConvert.SerializeObject(new
@@ -6314,7 +6341,7 @@ public class TenantBotService
             order.HooshPayInvoiceUid = payment.InvoiceUid;
             order.PaymentUrl = payment.PaymentUrl;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
 
             await botClient.SendTextMessageAsync(
                 chatId: ChatId,
@@ -6331,7 +6358,7 @@ public class TenantBotService
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "ساخت فاکتور ناموفق بود.", showAlert: true, cancellationToken: CancellationToken);
             await botClient.SendTextMessageAsync(ChatId, "ساخت فاکتور پرداخت ناموفق بود. لطفاً بعداً دوباره تلاش کنید.", cancellationToken: CancellationToken);
         }
@@ -6374,8 +6401,8 @@ public class TenantBotService
         var Price = CalculateTenantPrice(tenant, selection);
         var order = CreateTenantOrder(tenant, customer, ChatId, selection, Price, "NowPayments");
 
-        _userDbcontext.TenantBotOrders.Add(order);
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        _workflow.Add(order);
+        await _workflow.SaveAsync(CancellationToken);
 
         var payment = SwapinoPaymentInfo.CreateCryptoCharge(
             customer.TelegramUserId,
@@ -6392,8 +6419,8 @@ public class TenantBotService
         payment.TenantBotOrderId = order.Id;
         payment.TenantOwnerTelegramUserId = tenant.OwnerTelegramUserId;
 
-        _userDbcontext.SwapinoPaymentInfos.Add(payment);
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        _workflow.Add(payment);
+        await _workflow.SaveAsync(CancellationToken);
 
         try
         {
@@ -6410,7 +6437,7 @@ public class TenantBotService
             order.NowPaymentsPaymentInfoId = payment.Id;
             order.PaymentUrl = payment.InvoiceUrl;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
 
             await botClient.SendTextMessageAsync(
                 ChatId,
@@ -6426,7 +6453,7 @@ public class TenantBotService
             order.ErrorMessage = ex.Message;
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "ساخت فاکتور ناموفق بود.", showAlert: true, cancellationToken: CancellationToken);
         }
     }
@@ -6467,8 +6494,8 @@ public class TenantBotService
         }
 
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "Tetraminator");
-        _userDbcontext.TenantBotOrders.Add(order);
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        _workflow.Add(order);
+        await _workflow.SaveAsync(cancellationToken);
         await CreateTenantTetraminatorInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
     }
 
@@ -6499,8 +6526,8 @@ public class TenantBotService
         order.PaymentStatus = TenantBotOrderStatuses.AwaitingReceipt;
         order.UpdatedAtUtc = DateTime.UtcNow;
 
-        _userDbcontext.TenantBotOrders.Add(order);
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        _workflow.Add(order);
+        await _workflow.SaveAsync(CancellationToken);
 
         await botClient.SendTextMessageAsync(
             ChatId,
@@ -6576,8 +6603,8 @@ public class TenantBotService
             CreatedAtUtc = DateTime.UtcNow
         };
 
-        _userDbcontext.HooshPayPaymentInfos.Add(payment);
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        _workflow.Add(payment);
+        await _workflow.SaveAsync(cancellationToken);
 
         order.HooshPayPaymentInfoId = payment.Id;
         payment.RawRequestJson = JsonConvert.SerializeObject(new
@@ -6605,7 +6632,7 @@ public class TenantBotService
             order.HooshPayInvoiceUid = payment.InvoiceUid;
             order.PaymentUrl = payment.PaymentUrl;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await botClient.SendTextMessageAsync(
                 chatId,
@@ -6622,7 +6649,7 @@ public class TenantBotService
             payment.ErrorMessage = ex.Message;
             order.UpdatedAtUtc = DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "ساخت فاکتور ناموفق بود.", showAlert: true, cancellationToken: cancellationToken);
         }
     }
@@ -6680,8 +6707,8 @@ public class TenantBotService
         payment.PaymentPurpose = TenantBotPaymentPurposes.TenantOrder;
         payment.TenantBotOrderId = order.Id;
         payment.TenantOwnerTelegramUserId = tenant.OwnerTelegramUserId;
-        _userDbcontext.SwapinoPaymentInfos.Add(payment);
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        _workflow.Add(payment);
+        await _workflow.SaveAsync(cancellationToken);
 
         try
         {
@@ -6698,7 +6725,7 @@ public class TenantBotService
             order.NowPaymentsPaymentInfoId = payment.Id;
             order.PaymentUrl = payment.InvoiceUrl;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await botClient.SendTextMessageAsync(
                 chatId,
@@ -6715,7 +6742,7 @@ public class TenantBotService
             payment.ErrorMessage = ex.Message;
             order.UpdatedAtUtc = DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "ساخت فاکتور ناموفق بود.", showAlert: true, cancellationToken: cancellationToken);
         }
     }
@@ -6756,8 +6783,8 @@ public class TenantBotService
 
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "UniquePay");
-        _userDbcontext.TenantBotOrders.Add(order);
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        _workflow.Add(order);
+        await _workflow.SaveAsync(cancellationToken);
         await CreateTenantUniquePayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
     }
 
@@ -6807,7 +6834,7 @@ public class TenantBotService
 
         order.PaymentProvider = "UniquePay";
         order.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
         await CreateTenantUniquePayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
     }
 
@@ -6828,6 +6855,7 @@ public class TenantBotService
     /// recovery polling verifies either the provider's
     /// <c>user</c>/<c>buyer</c>-paid or owner-paid amount contract when notification delivery is lost.
     /// </remarks>
+    /// <returns>A task completing after the invoice is durably reserved and its known link or safe failure is presented.</returns>
     private async Task CreateTenantUniquePayInvoiceCoreAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -6853,12 +6881,12 @@ public class TenantBotService
         string blockedCreationState = null;
         var existingMutationBlocked = false;
 
-        await TenantUniquePayInvoiceCreationGate.WaitAsync(cancellationToken);
+        using var tenantUniquePayInvoiceCreationGateLease = await TenantUniquePayInvoiceCreationGate.EnterAsync(order.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
         try
         {
-            payment = await _userDbcontext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+            payment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.FirstOrDefaultAsync(
                 x => x.TenantBotOrderId == order.Id || x.HashId == order.OrderId,
-                cancellationToken);
+                cancellationToken));
             if (payment != null)
             {
                 order.UniquePayPaymentInfoId = payment.Id;
@@ -6875,7 +6903,7 @@ public class TenantBotService
                     blockedCreationState = payment.CreationState;
                     existingMutationBlocked = true;
                 }
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
             }
             else
             {
@@ -6904,18 +6932,18 @@ public class TenantBotService
                     redirectUrl = BuildUniquePayReturnUrl(payment.HashId),
                     callbackUrl = BuildUniquePayCallbackUrl(payment.HashId)
                 });
-                _userDbcontext.UniquePayPaymentInfos.Add(payment);
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                _workflow.Add(payment);
+                await _workflow.SaveAsync(cancellationToken);
 
                 // The tenant-order relationship must survive even when the one create POST times out or returns 5xx.
                 order.UniquePayPaymentInfoId = payment.Id;
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
             }
         }
         finally
         {
-            TenantUniquePayInvoiceCreationGate.Release();
+            tenantUniquePayInvoiceCreationGateLease.Dispose();
         }
 
         if (!string.IsNullOrWhiteSpace(existingPaymentLink))
@@ -6964,7 +6992,7 @@ public class TenantBotService
             order.UniquePayPaymentInfoId = payment.Id;
             order.PaymentUrl = payment.PaymentLink;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await botClient.SendTextMessageAsync(
                 chatId,
@@ -7002,7 +7030,7 @@ public class TenantBotService
                     3600));
             order.UpdatedAtUtc = DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             _logger.LogError(
                 ex,
                 "UniquePay tenant invoice creation failed. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, amountToman={AmountToman}, providerCode={ProviderCode}",
@@ -7103,7 +7131,7 @@ public class TenantBotService
 
         order.PaymentProvider = "Tetraminator";
         order.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
         await CreateTenantTetraminatorInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
     }
 
@@ -7122,6 +7150,7 @@ public class TenantBotService
     /// callbacks reuse the persisted invoice when its link is known; an ambiguous prior create remains blocked for
     /// manual review instead of sending another provider mutation.
     /// </remarks>
+    /// <returns>A task completing after the order's invoice attempt and customer response; uncertain attempts stay reserved.</returns>
     private async Task CreateTenantTetraminatorInvoiceCoreAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -7135,12 +7164,12 @@ public class TenantBotService
         string existingPaymentLink = null;
         var hasAmbiguousExistingPayment = false;
 
-        await TenantTetraminatorInvoiceCreationGate.WaitAsync(cancellationToken);
+        using var tenantTetraminatorInvoiceCreationGateLease = await TenantTetraminatorInvoiceCreationGate.EnterAsync(order.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
         try
         {
-            payment = await _userDbcontext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+            payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.FirstOrDefaultAsync(
                 x => x.OrderId == order.OrderId || x.TenantBotOrderId == order.Id,
-                cancellationToken);
+                cancellationToken));
             if (payment != null)
             {
                 if (!string.IsNullOrWhiteSpace(payment.PayId) && !string.IsNullOrWhiteSpace(payment.PaymentLink))
@@ -7148,7 +7177,7 @@ public class TenantBotService
                     order.TetraminatorPaymentInfoId = payment.Id;
                     order.PaymentUrl = payment.PaymentLink;
                     order.UpdatedAtUtc = DateTime.UtcNow;
-                    await _userDbcontext.SaveChangesAsync(cancellationToken);
+                    await _workflow.SaveAsync(cancellationToken);
                     existingPaymentLink = payment.PaymentLink;
                 }
                 else
@@ -7181,13 +7210,13 @@ public class TenantBotService
                     callback_url = payment.CallbackUrl,
                     order_id = payment.OrderId
                 });
-                _userDbcontext.TetraminatorPaymentInfos.Add(payment);
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                _workflow.Add(payment);
+                await _workflow.SaveAsync(cancellationToken);
             }
         }
         finally
         {
-            TenantTetraminatorInvoiceCreationGate.Release();
+            tenantTetraminatorInvoiceCreationGateLease.Dispose();
         }
 
         if (!string.IsNullOrWhiteSpace(existingPaymentLink))
@@ -7226,7 +7255,7 @@ public class TenantBotService
             order.PaymentStatus = TenantBotOrderStatuses.Pending;
             order.ErrorMessage = null;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await botClient.SendTextMessageAsync(
                 chatId,
@@ -7247,7 +7276,7 @@ public class TenantBotService
             payment.ErrorMessage = ex.Message;
             payment.RawResponseJson = ex is TetraminatorApiException providerError ? providerError.ResponseBody : null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             _logger.LogError(
                 ex,
                 "Tenant Tetraminator invoice creation failed. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, amountToman={AmountToman}",
@@ -7286,7 +7315,7 @@ public class TenantBotService
         order.PaymentProvider = "tenant_card";
         order.PaymentStatus = TenantBotOrderStatuses.AwaitingReceipt;
         order.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
 
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
         await botClient.SendTextMessageAsync(
@@ -7329,14 +7358,14 @@ public class TenantBotService
         CredUser customer,
         CancellationToken cancellationToken)
     {
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == orderDbId &&
                  x.TenantBotId == tenant.Id &&
                  x.CustomerTelegramUserId == customer.TelegramUserId &&
                  x.OrderKind == TenantBotOrderKinds.Renew &&
                   !x.IsFulfilled &&
                   (x.PaymentStatus == TenantBotOrderStatuses.Pending || x.PaymentStatus == TenantBotOrderStatuses.Failed),
-            cancellationToken);
+            cancellationToken));
         if (order == null)
             return null;
 
@@ -7388,7 +7417,7 @@ public class TenantBotService
             {
                 order.RenewalServiceResolutionMode = effectiveResolutionMode;
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -7477,9 +7506,12 @@ public class TenantBotService
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.SingleAsync(x => x.Id == payment.Id, CancellationToken));
+        await _workflow.ReloadAsync(payment, CancellationToken);
+
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == payment.TenantBotOrderId || x.OrderId == payment.OrderId,
-            CancellationToken);
+            CancellationToken));
         if (order == null)
             return NowPaymentsSettlementResult.NotFound();
 
@@ -7520,11 +7552,14 @@ public class TenantBotService
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
 
-        payment = await _userDbcontext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+        payment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.FirstOrDefaultAsync(
             x => x.Id == payment.Id,
-            CancellationToken);
+            CancellationToken));
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
+
+        payment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.SingleAsync(x => x.Id == payment.Id, CancellationToken));
+        await _workflow.ReloadAsync(payment, CancellationToken);
         if (payment.IsAddedToBalance ||
             string.Equals(payment.SettlementState, UniquePaySettlementStates.Settled, StringComparison.Ordinal))
         {
@@ -7533,9 +7568,9 @@ public class TenantBotService
         if (await RejectActiveOrAmbiguousUniquePayTenantClaimAsync(payment, CancellationToken))
             return NowPaymentsSettlementResult.ProviderNotPaid();
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == payment.TenantBotOrderId || x.OrderId == payment.HashId,
-            CancellationToken);
+            CancellationToken));
         if (order == null)
         {
             payment.SettlementState = UniquePaySettlementStates.ManualReview;
@@ -7543,7 +7578,7 @@ public class TenantBotService
             payment.ErrorMessage = "The paid UniquePay row is not linked to a tenant order.";
             payment.NextInquiryAtUtc = null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
             _logger.LogError(
                 "Paid UniquePay tenant row has no order and requires manual review. paymentId={PaymentId}, hashId={HashId}, tenantOrderId={TenantOrderId}",
                 payment.Id,
@@ -7554,7 +7589,7 @@ public class TenantBotService
 
         var attemptId = Guid.NewGuid().ToString("N");
         var claimedAtUtc = DateTime.UtcNow;
-        var claimed = await _userDbcontext.UniquePayPaymentInfos
+        var claimed = await _workflow.WriteAsync(async db => await db.UniquePayPaymentInfos
             .Where(x => x.Id == payment.Id &&
                         !x.IsAddedToBalance &&
                         (x.SettlementState == null || x.SettlementState == UniquePaySettlementStates.Pending))
@@ -7564,11 +7599,11 @@ public class TenantBotService
                     .SetProperty(x => x.SettlementAttemptId, attemptId)
                     .SetProperty(x => x.SettlementStartedAtUtc, claimedAtUtc)
                     .SetProperty(x => x.UpdatedAtUtc, claimedAtUtc),
-                CancellationToken);
+                CancellationToken));
         if (claimed != 1)
             return NowPaymentsSettlementResult.ProviderNotPaid();
 
-        await _userDbcontext.Entry(payment).ReloadAsync(CancellationToken);
+        await _workflow.ReloadAsync(payment, CancellationToken);
         NowPaymentsSettlementResult settlement;
         try
         {
@@ -7581,7 +7616,7 @@ public class TenantBotService
             payment.ErrorMessage = ex.Message;
             payment.NextInquiryAtUtc = null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
             _logger.LogError(
                 ex,
                 "UniquePay tenant fulfillment became ambiguous and stopped for manual review. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, attemptId={AttemptId}",
@@ -7606,7 +7641,7 @@ public class TenantBotService
             payment.ErrorMessage = null;
             payment.SuccessLoggedAtUtc ??= DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
 
             if (shouldLogProviderSuccess)
             {
@@ -7637,7 +7672,7 @@ public class TenantBotService
             payment.ErrorCode = "tenant_fulfillment_prerequisite_failed";
             payment.ErrorMessage = order.ErrorMessage;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
         }
         else
         {
@@ -7648,7 +7683,7 @@ public class TenantBotService
             payment.ErrorMessage = order.ErrorMessage;
             payment.NextInquiryAtUtc = null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
             _logger.LogError(
                 "UniquePay tenant fulfillment stopped for manual review. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, attemptId={AttemptId}, settlementStatus={SettlementStatus}",
                 order.TenantBotId,
@@ -7690,7 +7725,7 @@ public class TenantBotService
         payment.ErrorMessage = "A previous UniquePay tenant fulfillment claim became stale and requires manual review.";
         payment.NextInquiryAtUtc = null;
         payment.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
         _logger.LogError(
             "UniquePay stale tenant fulfillment claim stopped for manual review. tenantOrderId={TenantOrderId}, paymentId={PaymentId}, attemptId={AttemptId}",
             payment.TenantBotOrderId,
@@ -7722,6 +7757,9 @@ public class TenantBotService
         string Source,
         CancellationToken CancellationToken = default)
     {
+        if (payment == null) return NowPaymentsSettlementResult.NotFound();
+        payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.SingleAsync(x => x.Id == payment.Id, CancellationToken));
+        await _workflow.ReloadAsync(payment, CancellationToken);
         if (payment == null ||
             !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) ||
             !TetraminatorStatuses.IsPaid(payment.PaymentStatus) ||
@@ -7732,9 +7770,9 @@ public class TenantBotService
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == payment.TenantBotOrderId || x.OrderId == payment.OrderId,
-            CancellationToken);
+            CancellationToken));
         if (order == null)
             return NowPaymentsSettlementResult.NotFound();
 
@@ -7746,7 +7784,7 @@ public class TenantBotService
             payment.ErrorCode = null;
             payment.ErrorMessage = null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
         }
 
         return settlement;
@@ -7773,6 +7811,11 @@ public class TenantBotService
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
 
+        payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.SingleAsync(x => x.Id == payment.Id, CancellationToken));
+        await _workflow.ReloadAsync(payment, CancellationToken);
+
+
+
         var data = payment.GetNowPaymentsData();
         var requiresProviderRefresh = Source?.IndexOf("manual", StringComparison.OrdinalIgnoreCase) >= 0;
         if (requiresProviderRefresh || !NowPaymentsStatuses.IsPaid(data.PaymentStatus ?? payment.PaymentStatus))
@@ -7786,7 +7829,7 @@ public class TenantBotService
             {
                 payment.ErrorCode = "nowpayments_provider_check_failed";
                 payment.ErrorMessage = $"NOWPayments provider check failed before tenant fulfillment. {ex.Message}";
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
@@ -7794,7 +7837,7 @@ public class TenantBotService
             {
                 data.Apply(remoteStatus);
                 payment.SetNowPaymentsData(data);
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
             }
 
             var providerReportedPaid = remoteStatus != null &&
@@ -7803,9 +7846,9 @@ public class TenantBotService
                 return NowPaymentsSettlementResult.ProviderNotPaid();
         }
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == payment.TenantBotOrderId || x.OrderId == payment.OrderId,
-            CancellationToken);
+            CancellationToken));
         if (order == null)
             return NowPaymentsSettlementResult.NotFound();
 
@@ -7862,7 +7905,7 @@ public class TenantBotService
     /// <returns>A settlement result with owner-wallet before/after balances when fulfillment succeeds.</returns>
     /// <remarks>
     /// Idempotency:
-    /// callback, customer check, and manual paths share a process-wide gate and reload the order before checking
+    /// callback, customer check, and manual paths share a gate for the same tenant order and reload the order before checking
     /// <see cref="TenantBotOrder.IsFulfilled" />. Renewal orders are routed to the durable renewal saga before the
     /// account-creation branch. A completed order returns without creating/updating XUI, mutating an owner wallet, or
     /// appending another ledger entry. Before a paid purchase mutates XUI, its unlimited plan must still be enabled and
@@ -7878,14 +7921,15 @@ public class TenantBotService
         bool DEBITOWNERBASECOST,
         CancellationToken CancellationToken)
     {
-        await TenantFulfillmentGate.WaitAsync(CancellationToken);
+        using var tenantFulfillmentGateLease = await TenantFulfillmentGate.EnterAsync(order.Id.ToString(CultureInfo.InvariantCulture), CancellationToken);
         try
         {
-            // Reload under the process-wide gate so callback, manual check, and IPN cannot all act on stale
+            // Reload under the order-keyed gate so callback, manual check, and IPN cannot all act on stale
             // IsFulfilled values captured before another path completed the same tenant order.
-            order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(x => x.Id == order.Id, CancellationToken);
+            order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(x => x.Id == order.Id, CancellationToken));
             if (order == null)
                 return NowPaymentsSettlementResult.NotFound();
+            await _workflow.ReloadAsync(order, CancellationToken);
             if (order.IsFulfilled)
                 return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
 
@@ -7904,17 +7948,17 @@ public class TenantBotService
             NOWPAYMENTSPAYMENT.PaidAtUtc ??= DateTime.UtcNow;
         }
 
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
 
         var TENANTCONFIG = _botRegistry.GetById(order.TenantBotId);
-        var tenant = await _userDbcontext.BotInstances.FirstOrDefaultAsync(x => x.Id == order.TenantBotId, CancellationToken);
+        var tenant = await _workflow.ReadAsync(async db => await db.BotInstances.FirstOrDefaultAsync(x => x.Id == order.TenantBotId, CancellationToken));
         var owner = await _credentialsDbContext.GetUserStatusWithId(order.OwnerTelegramUserId);
         var customer = await _credentialsDbContext.GetUserStatusWithId(order.CustomerTelegramUserId);
         if (owner == null || customer == null || tenant == null)
         {
             order.PaymentStatus = TenantBotOrderStatuses.Failed;
             order.ErrorMessage = "tenant owner or customer was not found.";
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
             return NowPaymentsSettlementResult.UserNotFound();
         }
 
@@ -7958,7 +8002,7 @@ public class TenantBotService
             order.PaymentStatus = TenantBotOrderStatuses.Failed;
             order.ErrorMessage = "Tenant purchase plan is no longer available for fulfillment.";
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
             _logger.LogWarning(
                 ex,
                 "Paid tenant purchase fulfillment rejected by current plan audience. tenantBotId={TenantBotId}, orderId={OrderId}, serviceKey={ServiceKey}",
@@ -7989,6 +8033,7 @@ public class TenantBotService
                     CancellationToken,
                     new XuiV3AccountMetadataOptions
                     {
+                        OperationKey = $"tenant-create:{order.Id}",
                         UserComment = $"tenant sale VIA @{tenant.Username}; Buyer={order.CustomerTelegramUserId}; tenant={order.TenantBotId}",
                         PriceTomanOverride = order.SalePriceToman,
                         CreatedByBotId = order.TenantBotId,
@@ -8004,7 +8049,7 @@ public class TenantBotService
                     order.PaymentStatus = TenantBotOrderStatuses.Failed;
                     order.ErrorMessage = created.Message;
                     order.UpdatedAtUtc = DateTime.UtcNow;
-                    await _userDbcontext.SaveChangesAsync(CancellationToken);
+                    await _workflow.SaveAsync(CancellationToken);
                     await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, created.Message, CancellationToken);
                     LOGTENANTORDER(order, owner, customer, Source, "account-Create-failed", timing: operationTiming.Snapshot());
                     return NowPaymentsSettlementResult.InvalidAmount();
@@ -8030,7 +8075,7 @@ public class TenantBotService
                 order.FulfilledAtUtc = DateTime.UtcNow;
                 order.UpdatedAtUtc = DateTime.UtcNow;
 
-                _userDbcontext.TenantBotLedgerEntries.Add(new TenantBotLedgerEntry
+                _workflow.Add(new TenantBotLedgerEntry
                 {
                     TenantBotId = order.TenantBotId,
                     TenantBotUsername = order.TenantBotUsername,
@@ -8047,7 +8092,7 @@ public class TenantBotService
                     CreatedAtUtc = DateTime.UtcNow
                 });
 
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
 
                 await QueueGozargahSyncBestEffortAsync(
                     "tenant-create",
@@ -8070,7 +8115,7 @@ public class TenantBotService
                 order.PaymentStatus = TenantBotOrderStatuses.Failed;
                 order.ErrorMessage = ex.Message;
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
                 await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, ex.Message, CancellationToken);
                 LOGTENANTORDER(order, owner, customer, Source, $"Exception ({ex.GetType().Name})", timing: operationTiming.Snapshot());
                 return NowPaymentsSettlementResult.InvalidAmount();
@@ -8079,7 +8124,7 @@ public class TenantBotService
     }
         finally
         {
-            TenantFulfillmentGate.Release();
+            tenantFulfillmentGateLease.Dispose();
         }
     }
 
@@ -8110,7 +8155,7 @@ public class TenantBotService
 
         try
         {
-            await _userDbcontext.Entry(order).ReloadAsync(cancellationToken);
+            await _workflow.ReloadAsync(order, cancellationToken);
         }
         catch (InvalidOperationException ex)
         {
@@ -8120,9 +8165,9 @@ public class TenantBotService
         if (order.IsFulfilled)
             return true;
 
-        return await _userDbcontext.TenantBotLedgerEntries
+        return await _workflow.ReadAsync(async db => await db.TenantBotLedgerEntries
             .AsNoTracking()
-            .AnyAsync(x => x.TenantBotOrderId == order.Id, cancellationToken);
+            .AnyAsync(x => x.TenantBotOrderId == order.Id, cancellationToken));
     }
 
     /// <summary>
@@ -8144,12 +8189,12 @@ public class TenantBotService
         long CustomerTelegramUserId,
         CancellationToken CancellationToken)
     {
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == ORDERDBID &&
                  x.CustomerTelegramUserId == CustomerTelegramUserId &&
                  x.PaymentProvider == "tenant_card" &&
                  !x.IsFulfilled,
-            CancellationToken);
+            CancellationToken));
 
         if (order == null)
         {
@@ -8159,7 +8204,7 @@ public class TenantBotService
 
         order.PaymentStatus = TenantBotOrderStatuses.AwaitingReceipt;
         order.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
 
         await botClient.SendTextMessageAsync(
             ChatId,
@@ -8191,7 +8236,7 @@ public class TenantBotService
         CredUser customer,
         CancellationToken CancellationToken)
     {
-        var order = await _userDbcontext.TenantBotOrders
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders
             .Where(x => x.TenantBotId == tenant.Id &&
                         x.CustomerTelegramUserId == customer.TelegramUserId &&
                         x.PaymentProvider == "tenant_card" &&
@@ -8200,7 +8245,7 @@ public class TenantBotService
                          x.PaymentStatus == TenantBotOrderStatuses.ReceiptSubmitted ||
                          x.PaymentStatus == TenantBotOrderStatuses.ReceiptRejected))
             .OrderByDescending(x => x.CreatedAtUtc)
-            .FirstOrDefaultAsync(CancellationToken);
+            .FirstOrDefaultAsync(CancellationToken));
 
         if (order == null)
         {
@@ -8216,8 +8261,8 @@ public class TenantBotService
         }
 
         var receipt = order.ManualReceiptId.HasValue
-            ? await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, CancellationToken)
-            : await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, CancellationToken);
+            ? await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, CancellationToken))
+            : await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, CancellationToken));
 
         if (receipt == null)
         {
@@ -8233,7 +8278,7 @@ public class TenantBotService
                 AmountToman = order.SalePriceToman,
                 CreatedAtUtc = DateTime.UtcNow
             };
-            _userDbcontext.TenantManualPaymentReceipts.Add(receipt);
+            _workflow.Add(receipt);
         }
 
         receipt.PhotoFileId = photo.FileId;
@@ -8245,10 +8290,10 @@ public class TenantBotService
         receipt.UpdatedAtUtc = DateTime.UtcNow;
         order.PaymentStatus = TenantBotOrderStatuses.ReceiptSubmitted;
         order.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
 
         order.ManualReceiptId = receipt.Id;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
 
         await _salesAssistantService.NOTIFYMANUALRECEIPTASYNC(receipt, CancellationToken);
         await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ رسید شما ثبت شد و برای تایید همکار ارسال شد.", cancellationToken: CancellationToken);
@@ -8277,16 +8322,16 @@ public class TenantBotService
     /// </remarks>
     public async Task<string> APPROVEMANUALRECEIPTASYNC(int RECEIPTID, long ReviewerTelegramUserId, CancellationToken CancellationToken)
     {
-        var receipt = await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == RECEIPTID, CancellationToken);
+        var receipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == RECEIPTID, CancellationToken));
         if (receipt == null)
             return "رسید پیدا نشد.";
 
         if (receipt.OwnerTelegramUserId != ReviewerTelegramUserId)
             return "فقط صاحب همین ربات فروشگاهی می‌تواند این رسید را تایید کند.";
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId,
-            CancellationToken);
+            CancellationToken));
         if (order == null)
             return "سفارش مرتبط با رسید پیدا نشد.";
 
@@ -8303,7 +8348,7 @@ public class TenantBotService
         receipt.UpdatedAtUtc = DateTime.UtcNow;
         order.PaymentStatus = TenantBotOrderStatuses.ReceiptApproved;
         order.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
 
         var settlement = await FULFILLPAIDTENANTORDERASYNC(order, "assistant-final", null, null, true, CancellationToken);
         if (settlement.Status == NowPaymentsSettlementStatus.Applied || settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded)
@@ -8331,6 +8376,7 @@ public class TenantBotService
     /// method used by assistant final confirmation. If the order was already fulfilled, the method does not
     /// create another account or ledger entry and only resends existing account details to the tenant owner.
     /// </remarks>
+    /// <returns>A task completing after owner/order validation, authorized fulfillment and its result response.</returns>
     private async Task CONFIRMMANUALCARDORDERBYORDERIDASYNC(
         ITelegramBotClient botClient,
         Message Message,
@@ -8344,13 +8390,13 @@ public class TenantBotService
             return;
         }
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.OwnerTelegramUserId == owner.TelegramUserId && x.OrderId == orderId,
-            CancellationToken);
+            CancellationToken));
 
         if (order == null)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+            await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
             await botClient.SendTextMessageAsync(Message.Chat.Id, "سفارشی با این OrderId برای ربات فروشگاهی شما پیدا نشد.", cancellationToken: CancellationToken);
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
             return;
@@ -8358,7 +8404,7 @@ public class TenantBotService
 
         if (!string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+            await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
             await botClient.SendTextMessageAsync(Message.Chat.Id, "این سفارش مربوط به پرداخت کارت‌به‌کارت همکار نیست و از این مسیر قابل تایید دستی نیست.", cancellationToken: CancellationToken);
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
             return;
@@ -8367,7 +8413,7 @@ public class TenantBotService
         var receipt = await ENSUREMANUALRECEIPTASYNC(order, owner.TelegramUserId, CancellationToken);
         if (order.IsFulfilled)
         {
-            await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+            await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
             await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
             await botClient.SendTextMessageAsync(Message.Chat.Id, "این سفارش قبلاً تایید شده بود. مشخصات اکانت فقط برای شما دوباره ارسال شد.", cancellationToken: CancellationToken);
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
@@ -8382,10 +8428,10 @@ public class TenantBotService
         order.PaymentStatus = TenantBotOrderStatuses.ReceiptApproved;
         order.ManualReceiptId = receipt.Id;
         order.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
 
         var settlement = await FULFILLPAIDTENANTORDERASYNC(order, "owner-orderid-manual", null, null, true, CancellationToken);
-        await _userDbcontext.ClearUserStatus(new User { Id = owner.TelegramUserId });
+        await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         if (settlement.Status == NowPaymentsSettlementStatus.Applied || settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded)
         {
             await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
@@ -8429,7 +8475,7 @@ public class TenantBotService
         if (string.IsNullOrWhiteSpace(orderId))
             return null;
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(x => x.OrderId == orderId, CancellationToken);
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(x => x.OrderId == orderId, CancellationToken));
         if (order == null)
             return null;
 
@@ -8451,24 +8497,24 @@ public class TenantBotService
             order.PaymentStatus = TenantBotOrderStatuses.ReceiptApproved;
             order.ManualReceiptId = receipt.Id;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
 
             settlement = await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, true, CancellationToken);
         }
         else
         {
-            var hooshPay = await _userDbcontext.HooshPayPaymentInfos.FirstOrDefaultAsync(
+            var hooshPay = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.FirstOrDefaultAsync(
                 x => x.TenantBotOrderId == order.Id || x.OrderId == order.OrderId,
-                CancellationToken);
+                CancellationToken));
             if (hooshPay != null)
             {
                 settlement = await ApplyPaidTenantOrderAsync(hooshPay, "super-admin-orderid-manual", CancellationToken);
             }
             else
             {
-                var uniquePay = await _userDbcontext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+                var uniquePay = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.FirstOrDefaultAsync(
                     x => x.TenantBotOrderId == order.Id || x.HashId == order.OrderId,
-                    CancellationToken);
+                    CancellationToken));
                 if (uniquePay != null)
                 {
                     var inquiry = await _uniquePay.CheckInvoiceAsync(uniquePay.HashId, CancellationToken);
@@ -8503,14 +8549,14 @@ public class TenantBotService
                             uniquePay.NextInquiryAtUtc = null;
                         }
                     }
-                    await _userDbcontext.SaveChangesAsync(CancellationToken);
+                    await _workflow.SaveAsync(CancellationToken);
                     settlement = await ApplyPaidTenantOrderAsync(uniquePay, "super-admin-orderid-manual", CancellationToken);
                 }
                 else
                 {
-                var nowPayments = await _userDbcontext.SwapinoPaymentInfos.FirstOrDefaultAsync(
+                var nowPayments = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.FirstOrDefaultAsync(
                     x => x.TenantBotOrderId == order.Id || x.OrderId == order.OrderId,
-                    CancellationToken);
+                    CancellationToken));
                 settlement = nowPayments != null
                     ? await ApplyPaidTenantOrderAsync(nowPayments, "super-admin-orderid-manual", CancellationToken)
                     : await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, false, CancellationToken);
@@ -8576,8 +8622,8 @@ public class TenantBotService
         CancellationToken CancellationToken)
     {
         var receipt = order.ManualReceiptId.HasValue
-            ? await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, CancellationToken)
-            : await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, CancellationToken);
+            ? await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, CancellationToken))
+            : await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, CancellationToken));
 
         if (receipt != null)
             return receipt;
@@ -8598,8 +8644,8 @@ public class TenantBotService
             UpdatedAtUtc = DateTime.UtcNow
         };
 
-        _userDbcontext.TenantManualPaymentReceipts.Add(receipt);
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        _workflow.Add(receipt);
+        await _workflow.SaveAsync(CancellationToken);
         order.ManualReceiptId = receipt.Id;
         return receipt;
     }
@@ -8613,16 +8659,16 @@ public class TenantBotService
     /// <returns>Human-readable Persian result shown in the Sales Assistant callback alert.</returns>
     public async Task<string> RESENDMANUALRECEIPTACCOUNTASYNC(int RECEIPTID, long ReviewerTelegramUserId, CancellationToken CancellationToken)
     {
-        var receipt = await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == RECEIPTID, CancellationToken);
+        var receipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == RECEIPTID, CancellationToken));
         if (receipt == null)
             return "رسید پیدا نشد.";
 
         if (receipt.OwnerTelegramUserId != ReviewerTelegramUserId)
             return "فقط صاحب همین ربات فروشگاهی می‌تواند مشخصات این سفارش را دریافت کند.";
 
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId,
-            CancellationToken);
+            CancellationToken));
         if (order == null)
             return "سفارش مرتبط با رسید پیدا نشد.";
 
@@ -8642,10 +8688,10 @@ public class TenantBotService
     /// <param name="CancellationToken">Cancellation Token for database and Telegram calls.</param>
     private async Task CHECKLATESTCUSTOMERORDERASYNC(ITelegramBotClient botClient, ChatId ChatId, long CustomerTelegramUserId, CancellationToken CancellationToken)
     {
-        var order = await _userDbcontext.TenantBotOrders
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders
             .Where(x => x.TenantBotId == BotContextAccessor.CurrentBotId && x.CustomerTelegramUserId == CustomerTelegramUserId)
             .OrderByDescending(x => x.CreatedAtUtc)
-            .FirstOrDefaultAsync(CancellationToken);
+            .FirstOrDefaultAsync(CancellationToken));
 
         if (order == null)
         {
@@ -8674,11 +8720,11 @@ public class TenantBotService
     /// </remarks>
     private async Task CheckTenantOrderAsync(ITelegramBotClient botClient, ChatId ChatId, int ORDERDBID, long CustomerTelegramUserId, CancellationToken CancellationToken)
     {
-        var order = await _userDbcontext.TenantBotOrders.FirstOrDefaultAsync(
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == ORDERDBID &&
                  x.TenantBotId == BotContextAccessor.CurrentBotId &&
                  x.CustomerTelegramUserId == CustomerTelegramUserId,
-            CancellationToken);
+            CancellationToken));
         if (order == null)
         {
             await botClient.SendTextMessageAsync(ChatId, "سفارش پیدا نشد.", cancellationToken: CancellationToken);
@@ -8713,9 +8759,9 @@ public class TenantBotService
         if (order.UniquePayPaymentInfoId.HasValue ||
             string.Equals(order.PaymentProvider, "UniquePay", StringComparison.OrdinalIgnoreCase))
         {
-            var uniquePayment = await _userDbcontext.UniquePayPaymentInfos.FirstOrDefaultAsync(
+            var uniquePayment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.FirstOrDefaultAsync(
                 x => x.Id == order.UniquePayPaymentInfoId || x.TenantBotOrderId == order.Id,
-                CancellationToken);
+                CancellationToken));
             if (uniquePayment == null)
             {
                 await botClient.SendTextMessageAsync(ChatId, "فاکتور یونیک‌پی این سفارش پیدا نشد.", cancellationToken: CancellationToken);
@@ -8736,7 +8782,7 @@ public class TenantBotService
                     uniquePayment.ErrorMessage = "UniquePay reported a terminal unpaid invoice state.";
                     uniquePayment.NextInquiryAtUtc = null;
                     uniquePayment.UpdatedAtUtc = DateTime.UtcNow;
-                    await _userDbcontext.SaveChangesAsync(CancellationToken);
+                    await _workflow.SaveAsync(CancellationToken);
                     await botClient.SendTextMessageAsync(
                         ChatId,
                         string.Equals(providerTerminalStatus, UniquePayStatuses.Expired, StringComparison.Ordinal)
@@ -8764,7 +8810,7 @@ public class TenantBotService
                     uniquePayment.PaymentStatus = UniquePayStatuses.Failed;
                     uniquePayment.NextInquiryAtUtc = null;
                 }
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
 
                 if (verified)
                 {
@@ -8793,7 +8839,7 @@ public class TenantBotService
                     10,
                     3600));
                 uniquePayment.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
                 _logger.LogWarning(
                     ex,
                     "Tenant UniquePay customer inquiry failed. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}",
@@ -8812,9 +8858,9 @@ public class TenantBotService
         if (order.TetraminatorPaymentInfoId.HasValue ||
             string.Equals(order.PaymentProvider, "Tetraminator", StringComparison.OrdinalIgnoreCase))
         {
-            var tetraminatorPayment = await _userDbcontext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+            var tetraminatorPayment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.FirstOrDefaultAsync(
                 x => x.Id == order.TetraminatorPaymentInfoId || x.TenantBotOrderId == order.Id,
-                CancellationToken);
+                CancellationToken));
             if (tetraminatorPayment == null || string.IsNullOrWhiteSpace(tetraminatorPayment.PayId))
             {
                 await botClient.SendTextMessageAsync(ChatId, "فاکتور تترامیناتور این سفارش پیدا نشد.", cancellationToken: CancellationToken);
@@ -8836,7 +8882,7 @@ public class TenantBotService
                     order.PaymentStatus = TenantBotOrderStatuses.Paid;
                     order.UpdatedAtUtc = DateTime.UtcNow;
                 }
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
 
                 if (verified)
                 {
@@ -8860,7 +8906,7 @@ public class TenantBotService
                 tetraminatorPayment.ErrorCode = "provider_inquiry_failed";
                 tetraminatorPayment.ErrorMessage = ex.Message;
                 tetraminatorPayment.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
                 _logger.LogWarning(
                     ex,
                     "Tenant Tetraminator customer inquiry failed. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}",
@@ -8876,14 +8922,14 @@ public class TenantBotService
             }
         }
 
-        var payment = await _userDbcontext.HooshPayPaymentInfos.FirstOrDefaultAsync(
+        var payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.FirstOrDefaultAsync(
             x => x.Id == order.HooshPayPaymentInfoId || x.TenantBotOrderId == order.Id,
-            CancellationToken);
+            CancellationToken));
         if (payment == null && order.NowPaymentsPaymentInfoId.HasValue)
         {
-            var CRYPTOPAYMENT = await _userDbcontext.SwapinoPaymentInfos.FirstOrDefaultAsync(
+            var CRYPTOPAYMENT = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.FirstOrDefaultAsync(
                 x => x.Id == order.NowPaymentsPaymentInfoId.Value || x.TenantBotOrderId == order.Id,
-                CancellationToken);
+                CancellationToken));
             if (CRYPTOPAYMENT == null)
             {
                 await botClient.SendTextMessageAsync(ChatId, "فاکتور پرداخت این سفارش پیدا نشد.", cancellationToken: CancellationToken);
@@ -8903,7 +8949,7 @@ public class TenantBotService
                     ? TenantBotOrderStatuses.Paid
                     : TenantBotOrderStatuses.Pending;
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken);
+                await _workflow.SaveAsync(CancellationToken);
             }
 
             if (NowPaymentsStatuses.IsPaid(CRYPTOPAYMENT.PaymentStatus))
@@ -8935,7 +8981,7 @@ public class TenantBotService
             ? TenantBotOrderStatuses.Paid
             : TenantBotOrderStatuses.Pending;
         order.UpdatedAtUtc = DateTime.UtcNow;
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        await _workflow.SaveAsync(CancellationToken);
 
         if (Verify?.paid == true || HooshPayStatuses.IsPaid(payment.PaymentStatus))
         {
@@ -9064,18 +9110,18 @@ public class TenantBotService
     /// <param name="CancellationToken">Cancellation Token for database and Telegram work.</param>
     private async Task MARKLATESTCUSTOMERORDERCANCELLEDASYNC(ITelegramBotClient botClient, ChatId ChatId, long CustomerTelegramUserId, CancellationToken CancellationToken)
     {
-        var order = await _userDbcontext.TenantBotOrders
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders
             .Where(x => x.TenantBotId == BotContextAccessor.CurrentBotId &&
                         x.CustomerTelegramUserId == CustomerTelegramUserId &&
                         !x.IsFulfilled)
             .OrderByDescending(x => x.CreatedAtUtc)
-            .FirstOrDefaultAsync(CancellationToken);
+            .FirstOrDefaultAsync(CancellationToken));
 
         if (order != null)
         {
             order.PaymentStatus = "cancelled_by_user";
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(CancellationToken);
+            await _workflow.SaveAsync(CancellationToken);
         }
 
         await botClient.SendTextMessageAsync(ChatId, "پرداخت توسط کاربر کنسل شد و سفارش بسته شد.", cancellationToken: CancellationToken);
@@ -9351,7 +9397,7 @@ public class TenantBotService
         {
             var ownerDelta = order.ProfitToman;
             if (ownerDelta > 0)
-                await _credentialsDbContext.AddFund(order.OwnerTelegramUserId, ownerDelta);
+                await _credentialsDbContext.AddFund(order.OwnerTelegramUserId, ownerDelta, $"tenant:{order.Id}:profit");
 
             var botAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
             owner.AccountBalance = botAfter;
@@ -9380,7 +9426,7 @@ public class TenantBotService
 
         if (botBefore >= order.BaseCostToman)
         {
-            await _credentialsDbContext.Pay(owner, order.BaseCostToman);
+            await _credentialsDbContext.Pay(owner, order.BaseCostToman, $"tenant:{order.Id}:base-cost");
             var botAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
             owner.AccountBalance = botAfter;
             var siteAfter = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
@@ -9448,7 +9494,7 @@ public class TenantBotService
             }
         }
 
-        await _credentialsDbContext.Pay(owner, order.BaseCostToman);
+        await _credentialsDbContext.Pay(owner, order.BaseCostToman, $"tenant:{order.Id}:base-cost");
         var negativeBotAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
         owner.AccountBalance = negativeBotAfter;
         var negativeSiteAfter = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
@@ -9492,6 +9538,7 @@ public class TenantBotService
     /// <param name="description">Human-readable audit description.</param>
     /// <param name="cancellationToken">Cancellation token for users.db insert.</param>
     /// <returns>A task that completes after the ledger row is saved or skipped for a zero amount.</returns>
+    /// <remarks>The order is scoped to its tenant and reloaded under an order-specific gate. Wallet receipt keys are derived from that durable order identity.</remarks>
     private Task RECORDTENANTOWNERWALLETLEDGERASYNC(
         TenantBotOrder order,
         string direction,
@@ -9521,6 +9568,8 @@ public class TenantBotService
             botId: order.TenantBotId,
             botUsername: order.TenantBotUsername,
             botType: BotInstanceTypes.Tenant,
+            idempotencyKey: provider == "gozargah_site_wallet" ? $"tenant:{order.Id}:site-base-cost"
+                : direction == WalletLedgerDirections.Credit ? $"tenant:{order.Id}:profit" : $"tenant:{order.Id}:base-cost",
             cancellationToken: cancellationToken);
     }
 
@@ -9770,12 +9819,12 @@ public class TenantBotService
         order.ErrorMessage = null;
 
         var receipt = order.ManualReceiptId.HasValue
-            ? await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(
+            ? await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(
                 x => x.Id == order.ManualReceiptId.Value,
-                CancellationToken)
-            : await _userDbcontext.TenantManualPaymentReceipts.FirstOrDefaultAsync(
+                CancellationToken))
+            : await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(
                 x => x.TenantBotOrderId == order.Id || x.OrderId == order.OrderId,
-                CancellationToken);
+                CancellationToken));
 
         if (receipt != null)
             receipt.ErrorMessage = null;
@@ -10489,8 +10538,8 @@ public class TenantBotService
     /// total is rounded only by <see cref="CalculateTenantPrice" />. The result does not expose the raw colleague rate.
     /// </returns>
     /// <remarks>
-    /// With no positive markup, the normal-customer daily tariff is returned. With markup, the colleague daily rate
-    /// is multiplied by <c>1 + markup / 100</c>. Final order totals continue to use
+    /// With no positive markup, the selected public per-GB or per-day tariff is returned. With markup, the corresponding
+    /// colleague rate is multiplied by <c>1 + markup / 100</c>. Final order totals continue to use
     /// <see cref="CalculateTenantPrice" /> so combined rounding and traffic pricing remain authoritative.
     /// This method has no persistence, wallet, Telegram, gateway, ledger, or XUI side effects.
     /// </remarks>
@@ -10631,7 +10680,7 @@ public class TenantBotService
     /// <returns>tenant Bot row for the current Bot Id, or null when the update is not from A tenant Bot.</returns>
     private async Task<BotInstance> GetCurrentTenantBotAsync(CancellationToken CancellationToken)
     {
-        return await _userDbcontext.BotInstances.FirstOrDefaultAsync(x => x.Id == BotContextAccessor.CurrentBotId, CancellationToken);
+        return await _workflow.ReadAsync(async db => await db.BotInstances.FirstOrDefaultAsync(x => x.Id == BotContextAccessor.CurrentBotId, CancellationToken));
     }
 
     /// <summary>
@@ -10642,9 +10691,9 @@ public class TenantBotService
     /// <returns>the owner's tenant Bot row, or null if the owner has not created one yet.</returns>
     private async Task<BotInstance> GETTENANTBOTBYOWNERASYNC(long OwnerTelegramUserId, CancellationToken CancellationToken)
     {
-        return await _userDbcontext.BotInstances.FirstOrDefaultAsync(
+        return await _workflow.ReadAsync(async db => await db.BotInstances.FirstOrDefaultAsync(
             x => x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId == OwnerTelegramUserId,
-            CancellationToken);
+            CancellationToken));
     }
 
     /// <summary>
@@ -10656,7 +10705,7 @@ public class TenantBotService
     private async Task<BotInstance> GETORCREATETENANTBOTASYNC(CredUser owner, CancellationToken CancellationToken)
     {
         var Id = BUILDTENANTBOTID(owner.TelegramUserId);
-        var tenant = await _userDbcontext.BotInstances.FirstOrDefaultAsync(x => x.Id == Id, CancellationToken);
+        var tenant = await _workflow.ReadAsync(async db => await db.BotInstances.FirstOrDefaultAsync(x => x.Id == Id, CancellationToken));
         if (tenant != null)
             return tenant;
 
@@ -10681,8 +10730,8 @@ public class TenantBotService
             CreatedAtUtc = DateTime.UtcNow
         };
 
-        _userDbcontext.BotInstances.Add(tenant);
-        await _userDbcontext.SaveChangesAsync(CancellationToken);
+        _workflow.Add(tenant);
+        await _workflow.SaveAsync(CancellationToken);
         return tenant;
     }
 
@@ -10792,16 +10841,19 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// checks whether A tenant customer SATISFIES the storefront forced-join RULE before CONTINUING the Flow.
+    /// Checks whether a tenant customer satisfies the storefront forced-join rule before continuing the flow.
     /// </summary>
-    /// <param name="botClient">tenant Bot client used to call Telegram and Send the join PROMPT.</param>
-    /// <param name="Message">Incoming customer Message that identifies the Telegram User and chat.</param>
-    /// <param name="tenant">current tenant Bot whose channel List owns the forced-join RULE.</param>
-    /// <param name="CancellationToken">Cancellation Token for Telegram API calls.</param>
-    /// <returns>true when forced join is Disabled or the User is A channel member; false after sending A join PROMPT.</returns>
+    /// <param name="botClient">Tenant bot client used to query Telegram and send the join prompt.</param>
+    /// <param name="Message">Incoming customer message containing the tenant-scoped Telegram user and private chat ids.</param>
+    /// <param name="tenant">Current tenant bot whose configured channel list owns the forced-join rule.</param>
+    /// <param name="CancellationToken">Token that cancels Telegram membership checks and prompt delivery.</param>
+    /// <returns>
+    /// <c>true</c> when forced join is disabled or the customer belongs to every configured channel; otherwise
+    /// <c>false</c> after the join or verification-failure prompt has been sent.
+    /// </returns>
     /// <remarks>
-    /// Telegram may return "member List is inaccessible" when the Bot is not an admin in the tenant channel.
-    /// that Error is handled as A failed check so the tenant storefront does not CRASH the whole receiver.
+    /// This overload extracts the customer identity from the incoming update and delegates to the common
+    /// message/callback implementation. Telegram failures remain fail-closed and never grant storefront access.
     /// </remarks>
     private async Task<bool> EnsureTenantCustomerJoinAsync(
         ITelegramBotClient botClient,
@@ -10844,8 +10896,9 @@ public class TenantBotService
     /// <remarks>
     /// This method is intentionally used before every tenant customer message and callback action. It prevents
     /// old inline buttons, payment checks, receipt uploads, and menu callbacks from bypassing mandatory join.
-    /// Telegram access errors are treated as a failed check so the storefront remains closed instead of
-    /// crashing or silently allowing the customer through.
+    /// Telegram access errors are treated as a failed check so the storefront remains closed instead of silently
+    /// allowing the customer through. Only error 400 containing <c>PARTICIPANT_ID_INVALID</c> is retried, exactly
+    /// once after a bounded delay; permission errors and unrelated validation failures are never retried.
     /// </remarks>
     private async Task<bool> EnsureTenantCustomerJoinAsync(
         ITelegramBotClient botClient,
@@ -10866,8 +10919,16 @@ public class TenantBotService
         {
             try
             {
-                var member = await botClient.GetChatMemberAsync(channel, telegramUserId, CancellationToken);
-                if (member.Status is ChatMemberStatus.Member or ChatMemberStatus.Administrator or ChatMemberStatus.Creator)
+                var member = await ExecuteTenantParticipantLookupWithRetryAsync(
+                    token => botClient.GetChatMemberAsync(channel, telegramUserId, token),
+                    CancellationToken,
+                    ex => _logger.LogDebug(
+                        ex,
+                        "Tenant forced-join participant lookup will be retried once. TenantBotId={TenantBotId}, channel={channel}, telegramError={TelegramError}",
+                        tenant.Id,
+                        channel,
+                        ex.Message));
+                if (IsAcceptedTenantJoinStatus(member.Status))
                     continue;
 
                 await SENDTENANTJOINPROMPTASYNC(
@@ -10877,6 +10938,10 @@ public class TenantBotService
                     CancellationToken,
                     isJoinRetry ? "هنوز عضو کانال نشده‌اید. بعد از عضویت دوباره روی «عضو شدم» بزنید." : null);
                 return false;
+            }
+            catch (OperationCanceledException) when (CancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -10895,14 +10960,100 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Verifies that the tenant Bot can read members of its configured forced-join Channels.
+    /// Executes one customer membership lookup and retries only Telegram's narrow participant-id race once.
     /// </summary>
-    /// <param name="tenant">tenant Bot whose Token and channel List should be VALIDATED.</param>
-    /// <param name="CancellationToken">Cancellation Token for Telegram API calls.</param>
-    /// <returns>A validation result containing an ACTIONABLE owner-FACING Error when Access is missing.</returns>
+    /// <typeparam name="TResult">The Telegram membership result type returned by the supplied lookup.</typeparam>
+    /// <param name="lookupAsync">
+    /// Required tenant-scoped Telegram lookup. The delegate must query the same channel and numeric customer id
+    /// on every invocation and must not suppress Telegram exceptions.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels both Telegram calls and the bounded retry delay.</param>
+    /// <param name="onTransientRetry">
+    /// Optional local diagnostic callback invoked once before retrying. It must not log bot tokens or credentials.
+    /// </param>
+    /// <returns>The result of the first successful lookup, including a successful single retry.</returns>
     /// <remarks>
-    /// the check uses the tenant Bot Token, not the default owned Bot. this GUARANTEES the same Bot that SERVES
-    /// customers can LATER call GETCHATMEMBER for the configured channel.
+    /// The first error is retried only when <see cref="IsParticipantIdInvalid" /> matches. A second failure is
+    /// returned to the caller as an exception, so the storefront remains fail-closed. Permission errors, arbitrary
+    /// HTTP 400 responses, and all other failures are never retried.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var member = await ExecuteTenantParticipantLookupWithRetryAsync(
+    ///     token => botClient.GetChatMemberAsync(channel, telegramUserId, token),
+    ///     cancellationToken);
+    /// </code>
+    /// </example>
+    private static async Task<TResult> ExecuteTenantParticipantLookupWithRetryAsync<TResult>(
+        Func<CancellationToken, Task<TResult>> lookupAsync,
+        CancellationToken cancellationToken,
+        Action<ApiRequestException> onTransientRetry = null)
+    {
+        ArgumentNullException.ThrowIfNull(lookupAsync);
+
+        try
+        {
+            return await lookupAsync(cancellationToken);
+        }
+        catch (ApiRequestException ex) when (IsParticipantIdInvalid(ex))
+        {
+            onTransientRetry?.Invoke(ex);
+            await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+            return await lookupAsync(cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Determines whether Telegram reported the transient participant-id lookup condition eligible for one retry.
+    /// </summary>
+    /// <param name="exception">Telegram API exception raised by an actual customer <c>GetChatMember</c> request.</param>
+    /// <returns>
+    /// <c>true</c> only for error code 400 whose message contains <c>PARTICIPANT_ID_INVALID</c>, case-insensitively;
+    /// otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// This classifier intentionally excludes other HTTP 400 responses and every permission error. It contains no
+    /// tenant, token, channel, or customer identifiers and has no side effects.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// if (IsParticipantIdInvalid(exception))
+    /// {
+    ///     // Retry the same customer lookup once after a bounded delay.
+    /// }
+    /// </code>
+    /// </example>
+    private static bool IsParticipantIdInvalid(ApiRequestException exception)
+    {
+        return exception?.ErrorCode == 400 &&
+               exception.Message?.Contains("PARTICIPANT_ID_INVALID", StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    /// <summary>
+    /// Determines whether a Telegram membership status satisfies tenant storefront forced join.
+    /// </summary>
+    /// <param name="status">Status returned by Telegram for the actual tenant customer and configured channel.</param>
+    /// <returns>
+    /// <c>true</c> for <see cref="ChatMemberStatus.Member" />, <see cref="ChatMemberStatus.Administrator" />, or
+    /// <see cref="ChatMemberStatus.Creator" />; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>This policy is tenant-agnostic, side-effect-free, and does not weaken runtime membership checks.</remarks>
+    private static bool IsAcceptedTenantJoinStatus(ChatMemberStatus status)
+    {
+        return status is ChatMemberStatus.Member or ChatMemberStatus.Administrator or ChatMemberStatus.Creator;
+    }
+
+    /// <summary>
+    /// Verifies that the tenant bot can access and administer its configured forced-join channels.
+    /// </summary>
+    /// <param name="tenant">Tenant bot whose token identity and tenant-scoped channel list are validated.</param>
+    /// <param name="CancellationToken">Token that cancels the bounded Telegram capability probe.</param>
+    /// <returns>An activation result containing an actionable Persian owner-facing error when validation fails.</returns>
+    /// <remarks>
+    /// The check uses the tenant bot token, not the default owned bot. It verifies bot identity, channel access,
+    /// administrator-list access, and that the tenant bot itself is an administrator. It deliberately never probes
+    /// <c>OwnerTelegramUserId</c>: owner membership is unrelated to the bot capability used later for customers.
+    /// Successful and failed outcomes retain the existing tenant/token/channel-scoped cache lifetimes.
     /// </remarks>
     private async Task<(bool ISVALID, string ErrorMessage)> VALIDATETENANTMANDATORYJOINASYNC(BotInstance tenant, CancellationToken CancellationToken)
     {
@@ -10917,6 +11068,7 @@ public class TenantBotService
         if (TryGetTenantJoinCapabilityCache(cacheKey, out var cachedResult))
             return cachedResult;
 
+        string activeChannel = null;
         try
         {
             var client = _botClientProvider.GetClient(tenant.Id);
@@ -10924,6 +11076,7 @@ public class TenantBotService
             var me = await client.GetMeAsync(probeCts.Token);
             foreach (var channel in Channels)
             {
+                activeChannel = channel;
                 await client.GetChatAsync(channel, probeCts.Token);
                 var administrators = await client.GetChatAdministratorsAsync(channel, probeCts.Token);
                 if (!administrators.Any(member => member.User.Id == me.Id))
@@ -10932,36 +11085,74 @@ public class TenantBotService
                     SetTenantJoinCapabilityCache(cacheKey, notAdmin, TimeSpan.FromSeconds(15));
                     return notAdmin;
                 }
-
-                // A successful lookup for the owner proves the bot has the exact member-list capability used later
-                // by customer forced-join checks; the returned membership status itself is irrelevant here.
-                await client.GetChatMemberAsync(
-                    channel,
-                    tenant.OwnerTelegramUserId ?? me.Id,
-                    probeCts.Token);
             }
 
             var valid = (true, (string)null);
             SetTenantJoinCapabilityCache(cacheKey, valid, TimeSpan.FromMinutes(1));
             return valid;
         }
-        catch (ApiRequestException ex) when (ex.ErrorCode is 400 or 403)
+        catch (ApiRequestException ex) when (IsTenantJoinCapabilityPermissionFailure(ex))
         {
             var permissionFailure = (
                 false,
                 "ربات فروشگاهی امکان خواندن اعضای کانال را ندارد. ربات را در کانال admin کنید و دوباره تلاش کنید.");
             SetTenantJoinCapabilityCache(cacheKey, permissionFailure, TimeSpan.FromSeconds(15));
             _logger.LogInformation(
-                "Tenant forced-join capability validation rejected the current channel access. tenantBotId={TenantBotId}, telegramError={TelegramError}",
+                "Tenant forced-join capability validation rejected channel permissions. TenantBotId={TenantBotId}, channel={channel}, telegramError={TelegramError}",
                 tenant.Id,
+                activeChannel,
                 ex.Message);
             return permissionFailure;
         }
+        catch (ApiRequestException ex)
+        {
+            var telegramValidationFailure = (
+                false,
+                "تلگرام کانال ثبت‌شده را نپذیرفت یا موقتاً نتوانست آن را بررسی کند. نام کاربری یا شناسه کانال را بررسی و دوباره تلاش کنید.");
+            SetTenantJoinCapabilityCache(cacheKey, telegramValidationFailure, TimeSpan.FromSeconds(15));
+            _logger.LogInformation(
+                "Tenant forced-join capability validation failed without a proven permission error. TenantBotId={TenantBotId}, channel={channel}, telegramError={TelegramError}",
+                tenant.Id,
+                activeChannel,
+                ex.Message);
+            return telegramValidationFailure;
+        }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "tenant forced-join validation failed. TenantBotId={TenantBotId}", tenant.Id);
-            return (false, "ربات فروشگاهی به member List کانال دسترسی ندارد. ربات را به کانال اضافه و admin کنید.");
+            _logger.LogWarning(
+                ex,
+                "tenant forced-join validation failed. TenantBotId={TenantBotId}, channel={channel}",
+                tenant.Id,
+                activeChannel);
+            return (false, "امکان بررسی کانال جوین اجباری وجود ندارد. تنظیمات کانال و دسترسی ربات را بررسی و دوباره تلاش کنید.");
         }
+    }
+
+    /// <summary>
+    /// Determines whether a Telegram capability-probe failure proves missing channel access or administrator rights.
+    /// </summary>
+    /// <param name="exception">Telegram API exception raised while reading the channel or administrator list.</param>
+    /// <returns>
+    /// <c>true</c> for Telegram 403 or a narrowly recognized Telegram 400 administrator/member-access message;
+    /// otherwise <c>false</c> so arbitrary validation failures are not mislabeled as permission problems.
+    /// </returns>
+    /// <remarks>
+    /// This method is used only by activation-time capability validation. It does not classify customer
+    /// <c>GetChatMember</c> results and never grants storefront access.
+    /// </remarks>
+    private static bool IsTenantJoinCapabilityPermissionFailure(ApiRequestException exception)
+    {
+        if (exception?.ErrorCode == 403)
+            return true;
+
+        if (exception?.ErrorCode != 400 || string.IsNullOrWhiteSpace(exception.Message))
+            return false;
+
+        return exception.Message.Contains("CHAT_ADMIN_REQUIRED", StringComparison.OrdinalIgnoreCase) ||
+               exception.Message.Contains("bot is not a member", StringComparison.OrdinalIgnoreCase) ||
+               exception.Message.Contains("not enough rights", StringComparison.OrdinalIgnoreCase) ||
+               exception.Message.Contains("need administrator rights", StringComparison.OrdinalIgnoreCase) ||
+               exception.Message.Contains("member list is inaccessible", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -11151,9 +11342,9 @@ public class TenantBotService
             return false;
         }
 
-        var order = await _userDbcontext.TenantBotOrders
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders
             .AsNoTracking()
-            .FirstOrDefaultAsync(x => x.OrderId == operation.TenantBotOrderId, cancellationToken);
+            .FirstOrDefaultAsync(x => x.OrderId == operation.TenantBotOrderId, cancellationToken));
         if (order == null)
             return false;
 
@@ -11170,9 +11361,9 @@ public class TenantBotService
             null,
             order.ManualReceiptId.HasValue,
             cancellationToken);
-        var refreshed = await _userDbcontext.TenantBotOrders
+        var refreshed = await _workflow.ReadAsync(async db => await db.TenantBotOrders
             .AsNoTracking()
-            .FirstOrDefaultAsync(x => x.Id == order.Id, cancellationToken);
+            .FirstOrDefaultAsync(x => x.Id == order.Id, cancellationToken));
         return refreshed?.IsFulfilled == true;
     }
 
@@ -11244,7 +11435,7 @@ public class TenantBotService
                 ? "Target account was not found or its exact identity lock no longer matches."
                 : "Target account was not found or does not belong to this tenant customer.";
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, "اکانت هدف تمدید پیدا نشد یا اطلاعات هویتی آن تغییر کرده است.", cancellationToken);
             LOGTENANTORDER(order, owner, customer, source, "renew-target-authorization-failed", timing: operationTiming.Snapshot());
             return NowPaymentsSettlementResult.NotFound();
@@ -11277,7 +11468,7 @@ public class TenantBotService
                 ? "Paid legacy renewal has no durable service-category evidence and requires support review."
                 : "Tenant renewal target service does not match the paid order service.";
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             _logger.LogError(
                 "Paid tenant renewal rejected before XUI mutation because the live account service differed. tenantBotId={TenantBotId}, orderId={OrderId}, storedServiceKey={StoredServiceKey}, resolutionStatus={ResolutionStatus}, liveServiceKey={LiveServiceKey}",
                 order.TenantBotId,
@@ -11299,7 +11490,7 @@ public class TenantBotService
         {
             order.RenewalServiceResolutionMode = effectiveResolutionMode;
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
         }
 
         XuiV3ResolvedPurchase resolved;
@@ -11312,7 +11503,7 @@ public class TenantBotService
             order.PaymentStatus = TenantBotOrderStatuses.Failed;
             order.ErrorMessage = "Tenant renewal plan is no longer available for fulfillment.";
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             _logger.LogWarning(
                 ex,
                 "Paid tenant renewal fulfillment rejected by current plan audience. tenantBotId={TenantBotId}, orderId={OrderId}, serviceKey={ServiceKey}",
@@ -11338,7 +11529,7 @@ public class TenantBotService
             order.PaymentStatus = TenantBotOrderStatuses.Pending;
             order.ErrorMessage = "تمدید قبلی این اکانت در حال بررسی خودکار است و تمدید جدید موقتاً قفل شده است.";
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, order.ErrorMessage, cancellationToken);
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
@@ -11371,7 +11562,7 @@ public class TenantBotService
             order.PaymentStatus = TenantBotOrderStatuses.Pending;
             order.ErrorMessage = "تمدید قبلی این اکانت در حال بررسی خودکار است و تمدید جدید موقتاً قفل شده است.";
             order.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, order.ErrorMessage, cancellationToken);
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
@@ -11423,7 +11614,7 @@ public class TenantBotService
                 order.PaymentStatus = TenantBotOrderStatuses.Failed;
                 order.ErrorMessage = "Panel renewal update was rejected.";
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 await NOTIFYTENANTCUSTOMERFAILUREASYNC(
                     order,
                     "تمدید در پنل انجام نشد. لطفاً کمی بعد وضعیت سفارش را دوباره بررسی کنید.",
@@ -11454,7 +11645,7 @@ public class TenantBotService
                 order.PaymentStatus = TenantBotOrderStatuses.Pending;
                 order.ErrorMessage = "نتیجه تمدید در پنل هنوز قطعی نیست؛ درخواست خودکار بررسی می‌شود و تمدید جدید این اکانت موقتاً قفل است.";
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 _logger.LogWarning(
                     ex,
                     "Tenant renewal outcome is ambiguous; the mutation will not be replayed. renewalOperationId={RenewalOperationId}, orderId={OrderId}",
@@ -11601,14 +11792,14 @@ public class TenantBotService
                 order.PaymentStatus = TenantBotOrderStatuses.Pending;
                 order.ErrorMessage = "نتیجه تمدید برای بررسی دستی ثبت شده و تمدید جدید این اکانت همچنان قفل است.";
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
 
             default:
                 order.PaymentStatus = TenantBotOrderStatuses.Pending;
                 order.ErrorMessage = "تمدید در حال انجام یا بررسی خودکار است و برای جلوگیری از تکرار موقتاً قفل شده است.";
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
         }
 
@@ -11790,7 +11981,7 @@ public class TenantBotService
         order.UpdatedAtUtc = DateTime.UtcNow;
         await CLEARTENANTORDERFULFILLMENTERRORASYNC(order, cancellationToken);
 
-        _userDbcontext.TenantBotLedgerEntries.Add(new TenantBotLedgerEntry
+        _workflow.Add(new TenantBotLedgerEntry
         {
             TenantBotId = order.TenantBotId,
             TenantBotUsername = order.TenantBotUsername,
@@ -11807,7 +11998,7 @@ public class TenantBotService
             CreatedAtUtc = DateTime.UtcNow
         });
 
-        await _userDbcontext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
 
         // Tenant order and ledger are now durable. Releasing the operation lock before this point could allow a
         // second renewal while the first panel mutation was applied but its owner settlement was still incomplete.

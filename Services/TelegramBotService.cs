@@ -1,4 +1,4 @@
-﻿using System.Text.RegularExpressions;
+using System.Text.RegularExpressions;
 using Adminbot.Domain;
 using Adminbot.Utils;
 
@@ -26,7 +26,7 @@ using Newtonsoft.Json.Linq;
 /// <see cref="DispatchUpdateAsync"/> with a <see cref="BotRuntimeContext"/>. The current bot context selects the
 /// correct token, brand config, mandatory-join channels, support account, payment return URLs, and bot-scoped user state.
 /// </remarks>
-public class TelegramBotService : IHostedService
+public class TelegramBotService
 {
     private const string BroadcastAudienceAll = "all";
     private const string BroadcastAudienceCustomers = "customers";
@@ -99,8 +99,10 @@ public class TelegramBotService : IHostedService
     internal const string WalletChargeShortcutLabel = "💰 افزایش موجودی کیف پول";
 
     private readonly ITelegramBotClient _botClient;
-    private readonly UserDbContext _userDbContext;
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly UserWorkflowStore _workflow;
+    /// <summary>Independent bot/user state operations; no EF context is retained by the store.</summary>
+    private readonly UserStateStore _state;
+    private readonly CredentialsStore _credentialsDbContext;
     private readonly IConfiguration _configuration;
     private readonly AppConfig _appConfig;
     private readonly ILogger<TelegramBotService> _logger;
@@ -182,6 +184,7 @@ public class TelegramBotService : IHostedService
     /// Creates the shared Telegram service and wires all existing bot flows plus the tenant storefront flow.
     /// </summary>
     /// <param name="botClient">Default bot client kept for legacy single-bot hosted-service compatibility.</param>
+    /// <param name="stateStore">Factory-backed state reader/writer isolated by runtime bot id and Telegram user id.</param>
     /// <param name="dbContext">Runtime database that stores bot-scoped conversation state and payment metadata.</param>
     /// <param name="credentialsDb">Shared credentials database that stores profiles, wallet balances, and roles.</param>
     /// <param name="configuration">Application configuration.</param>
@@ -233,14 +236,15 @@ public class TelegramBotService : IHostedService
     /// Global owned-bot referral service used by start payloads, user reporting, and final legacy Zibal settlement.
     /// </param>
     /// <remarks>
-    /// The service itself is singleton-backed, while usage analytics and newer financial operations create independent
+    /// The service belongs to one execution/request scope. Conversation and financial stores create independent
     /// users.db contexts through their factories. Runtime bot identity always comes from <see cref="BotContextAccessor"/>
     /// so support, activity attribution, and Telegram delivery remain scoped to the active owned or tenant bot.
     /// </remarks>
     public TelegramBotService(
         ITelegramBotClient botClient,
-        UserDbContext dbContext,
-        CredentialsDbContext credentialsDb,
+        UserWorkflowStore dbContext,
+        UserStateStore stateStore,
+        CredentialsStore credentialsDb,
         IConfiguration configuration,
         ILogger<TelegramBotService> logger,
         BroadcastManager broadcastManager,
@@ -272,7 +276,8 @@ public class TelegramBotService : IHostedService
         ReferralService referralService)
     {
         _botClient = botClient;
-        _userDbContext = dbContext;
+        _workflow = dbContext;
+        _state = stateStore;
         _credentialsDbContext = credentialsDb;
         _configuration = configuration;
         _appConfig = _configuration.Get<AppConfig>();
@@ -327,58 +332,12 @@ public class TelegramBotService : IHostedService
     }
 
     /// <summary>
-    /// Starts legacy single-bot polling when this service is used directly as an <see cref="IHostedService"/>.
-    /// </summary>
-    /// <remarks>
-    /// In the multi-instance setup, <see cref="MultiBotHostedService"/> is the normal entry point and calls
-    /// <see cref="DispatchUpdateAsync"/> for each enabled bot instead.
-    /// </remarks>
-    /// <param name="cancellationToken">Cancellation token supplied by the host.</param>
-    /// <returns>A task that completes after polling is started.</returns>
-    public async Task StartAsync(CancellationToken cancellationToken)
-    {
-
-        var me = await ActiveBotClient.GetMeAsync();
-        Console.WriteLine($"Start listening for @{me.Username}");
-
-
-        // StartReceiving does not block the caller thread. Receiving is done on the ThreadPool.
-        ReceiverOptions receiverOptions = new()
-        {
-            AllowedUpdates = Array.Empty<UpdateType>() // receive all update types except ChatMember related updates
-        };
-
-        // PeriodicTaskRunner._credentialsDbContext = _credentialsDbContext;
-        // PeriodicTaskRunner.Start();
-
-        ActiveBotClient.StartReceiving(
-            updateHandler: HandleUpdateAsync,
-            pollingErrorHandler: HandlePollingErrorAsync,
-            receiverOptions: receiverOptions,
-            cancellationToken: cancellationToken
-        );
-
-        // Start your bot logic here
-        //ActiveBotClient.StartReceiving(HandleUpdateAsync, HandlePollingErrorAsync, cancellationToken);
-    }
-
-    /// <summary>
-    /// Stops legacy hosted-service mode.
-    /// </summary>
-    /// <param name="cancellationToken">Cancellation token supplied by the host.</param>
-    /// <returns>A completed task; receiver lifetime is controlled by the host cancellation token.</returns>
-    public Task StopAsync(CancellationToken cancellationToken)
-    {
-        // Add your cleanup code here
-        return Task.CompletedTask;
-    }
-
-    /// <summary>
     /// Wraps core update handling with activity-log error capture and non-fatal delivery handling.
     /// </summary>
     /// <param name="botClient">Telegram client that should answer the update.</param>
     /// <param name="update">Telegram update being processed.</param>
     /// <param name="cancellationToken">Cancellation token from polling.</param>
+    /// <returns>A task completing after handling; uncertain timeouts and non-delivery failures propagate to the durable scheduler.</returns>
     /// <remarks>
     /// Telegram can throw per-user delivery errors when a customer blocks an owned bot, tenant bot, or assistant bot.
     /// It can also raise transient request timeouts while sending a reply. Those errors are logged as skipped
@@ -386,7 +345,7 @@ public class TelegramBotService : IHostedService
     /// request as a receiver failure. A Telegram 429 rate limit is likewise swallowed after backing off for
     /// Telegram's <c>RetryAfter</c> window; rethrowing it would terminate the receiver, and reporting it back through
     /// the Telegram logger channel would amplify the rate-limit storm. All other exceptions are still logged and
-    /// rethrown for the polling error pipeline.
+    /// rethrown for durable quarantine. External timeouts remain uncertain after the best-effort customer notice.
     /// </remarks>
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
@@ -394,6 +353,7 @@ public class TelegramBotService : IHostedService
         {
             await HandleUpdateCoreAsync(botClient, update, cancellationToken);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             var credUser = GetCreduserFromUpdate(update);
@@ -476,7 +436,7 @@ public class TelegramBotService : IHostedService
                     update?.Message?.Chat.Id ?? update?.CallbackQuery?.Message?.Chat.Id);
 
                 await SendBestEffortTimeoutMessageAsync(botClient, update, cancellationToken);
-                return;
+                throw;
             }
 
             await _userActivityLog.LogErrorAsync(
@@ -530,7 +490,7 @@ public class TelegramBotService : IHostedService
             throw new ArgumentOutOfRangeException(nameof(telegramUserId), "A positive Telegram user id is required.");
 
         cancellationToken.ThrowIfCancellationRequested();
-        await _userDbContext.ClearUserStatus(new User { Id = telegramUserId });
+        await _state.ClearUserStatus(new User { Id = telegramUserId });
         _xuiV3PurchaseSessionStore.Clear(telegramUserId);
     }
 
@@ -588,7 +548,7 @@ public class TelegramBotService : IHostedService
                 return;
             }
 
-            var callbackUserState = await _userDbContext.GetUserStatus(callbackQuery.From.Id);
+            var callbackUserState = await _state.GetUserStatus(callbackQuery.From.Id);
             // Tenant storefront callbacks are isolated from the main bot purchase/account flows.
             if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
             {
@@ -677,7 +637,7 @@ public class TelegramBotService : IHostedService
         // Tenant bots answer as storefronts only; they do not expose the main brand menus.
         if (isTenantBot)
         {
-            var tenantUserState = await _userDbContext.GetUserStatus(message.From.Id);
+            var tenantUserState = await _state.GetUserStatus(message.From.Id);
             await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, messageCredUser, tenantUserState, cancellationToken);
             return;
         }
@@ -740,7 +700,7 @@ public class TelegramBotService : IHostedService
         // 888197418 admin hamed
 
         //        List<long> allowedValues = _configuration.GetSection("adminsUserIds").Get<List<long>>();
-        var currentUser = await _userDbContext.GetUserStatus(message.From.Id);
+        var currentUser = await _state.GetUserStatus(message.From.Id);
         //_userDbContext.Users.Attach(currentUser);
 
         if (message.Text == "🤖 وضعیت ربات‌ها")
@@ -784,14 +744,14 @@ public class TelegramBotService : IHostedService
                 replyMarkup: createAccountKeyboard);
 
             // Save the user's context (selected country)
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
 
         }
 
         else if (GetLocations().Contains(message.Text))
         {
             // Update the user's context with the selected country
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, SelectedCountry = message.Text });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, SelectedCountry = message.Text });
 
 
             var periodKeyboard = new ReplyKeyboardMarkup(new[]
@@ -823,7 +783,7 @@ public class TelegramBotService : IHostedService
         else if (message.Text == "0 Month" || message.Text == "1 Month" || message.Text == "2 Months" || message.Text == "3 Months" || message.Text == "6 Months")
         {
             // Handle the selected period
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, SelectedPeriod = message.Text });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, SelectedPeriod = message.Text });
 
             // user does not go throw the actual flow
             var user = currentUser;
@@ -843,7 +803,7 @@ public class TelegramBotService : IHostedService
             // get trafic for renew
             if (currentUser.Flow == "update")
             {
-                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "get_traffic" });
+                await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "get_traffic" });
                 await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "Type Traffic in GB and send! \n" + "For example if you send 20, the account will have 20GB traffic",
@@ -864,7 +824,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "Reality Ipv6")
         {
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, Type = "realityv6", TotoalGB = "500" });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, Type = "realityv6", TotoalGB = "500" });
 
             var user = currentUser;
             if (string.IsNullOrEmpty(user.SelectedCountry) || string.IsNullOrEmpty(user.SelectedPeriod))
@@ -902,7 +862,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "All operators")
         {
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, Type = "tunnel", LastStep = "get_traffic" });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, Type = "tunnel", LastStep = "get_traffic" });
 
             var user = currentUser;
             if (string.IsNullOrEmpty(user.SelectedCountry) || string.IsNullOrEmpty(user.SelectedPeriod))
@@ -929,7 +889,7 @@ public class TelegramBotService : IHostedService
                         replyMarkup: new ReplyKeyboardRemove());
 
 
-            var ready = await _userDbContext.IsUserReadyToCreate(message.From.Id);
+            var ready = await _state.IsUserReadyToCreate(message.From.Id);
             if (!ready) await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "Your information is not complete. please go throw steps correctly.",
@@ -954,7 +914,7 @@ public class TelegramBotService : IHostedService
                 // For example, create the account, send a request to the server, etc.
                 if (result)
                 {
-                    user = await _userDbContext.GetUserStatus(currentUser.Id);
+                    user = await _state.GetUserStatus(currentUser.Id);
 
                     var msg = CaptionForAccountCreation(user, language: "en", showTraffic: false);
 
@@ -972,7 +932,7 @@ public class TelegramBotService : IHostedService
                        text: "Main menu",
                         replyMarkup: GetMainMenuKeyboard());
 
-                    await _userDbContext.ClearUserStatus(new User { Id = user.Id });
+                    await _state.ClearUserStatus(new User { Id = user.Id });
 
                 }
             }
@@ -988,7 +948,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "No Don't Create!")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             // Handle rejection or provide other options
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -998,7 +958,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "ℹ️ Get Account Info")
         {
-            await _userDbContext.SaveUserStatus(new User { Id = Convert.ToInt64(message.From.Id), LastStep = "Get Account Info", Flow = "read" });
+            await _state.SaveUserStatus(new User { Id = Convert.ToInt64(message.From.Id), LastStep = "Get Account Info", Flow = "read" });
 
             // Handle "Get Account Info" button click
             // You can implement the logic for this button here
@@ -1014,7 +974,7 @@ public class TelegramBotService : IHostedService
         {
 
             ClientExtend client = await TryGetClient(message.Text);
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
 
             // Handle "Get Account Info" button click
             // You can implement the logic for this button here
@@ -1063,7 +1023,7 @@ public class TelegramBotService : IHostedService
         {
             var user = currentUser;
             user.ConfigLink = message.Text;
-            await _userDbContext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
 
 
             var periodKeyboard = new ReplyKeyboardMarkup(new[]
@@ -1098,7 +1058,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "🔄 Renew Existing Account")
         {
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
             await botClient.CustomSendTextMessageAsync(
                                chatId: message.Chat.Id,
                                text: "Send your Vmess or Vless link:",
@@ -1111,7 +1071,7 @@ public class TelegramBotService : IHostedService
                 chatId: message.Chat.Id,
                 text: "Main Menu:",
                 replyMarkup: GetMainMenuKeyboard());
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
 
             // Handle "Menu" button click
             // You can implement the logic for this button here
@@ -1127,7 +1087,7 @@ public class TelegramBotService : IHostedService
                         replyMarkup: new ReplyKeyboardRemove());
 
 
-            var ready = await _userDbContext.IsUserReadyToUpdate(message.From.Id);
+            var ready = await _state.IsUserReadyToUpdate(message.From.Id);
             if (!ready) await botClient.CustomSendTextMessageAsync(
                        chatId: message.Chat.Id,
                        text: "Your information is not complete. please go throw steps correctly.",
@@ -1139,7 +1099,7 @@ public class TelegramBotService : IHostedService
             ClientExtend client = await TryGetClient(user.ConfigLink);
             if (client == null)
             {
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
 
                 await botClient.CustomSendTextMessageAsync(
                               chatId: message.Chat.Id,
@@ -1165,7 +1125,7 @@ public class TelegramBotService : IHostedService
                     foreach (var kvp in servers)
                     {
                         var country = kvp.Key;
-                        ServerInfo serverInfo = kvp.Value;
+                        ServerInfo serverInfo = RuntimeSnapshot.Copy(kvp.Value);
                         if (serverInfo.Vless.Domain == vless.Domain)
                         {
                             findedServer = serverInfo;
@@ -1183,7 +1143,7 @@ public class TelegramBotService : IHostedService
                     foreach (var kvp in servers)
                     {
                         string country = kvp.Key;
-                        ServerInfo serverInfo = kvp.Value;
+                        ServerInfo serverInfo = RuntimeSnapshot.Copy(kvp.Value);
                         if (serverInfo.VmessTemplate.Add == vmess.Add)
                         {
                             serverInfo.Inbounds = new List<Inbound> { serverInfo.Inbounds.FirstOrDefault(i => i.Port.ToString() == vmess.Port) };
@@ -1195,13 +1155,13 @@ public class TelegramBotService : IHostedService
 
                     accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB, ConfigLink = user.ConfigLink };
                 }
-                await _userDbContext.SaveUserStatus(new User { Id = currentUser.Id, SelectedCountry = findedcountry });
+                await _state.SaveUserStatus(new User { Id = currentUser.Id, SelectedCountry = findedcountry });
                 var result = await UpdateAccount(accountDto);
 
 
                 if (result)
                 {
-                    user = await _userDbContext.GetUserStatus(user.Id);
+                    user = await _state.GetUserStatus(user.Id);
 
                     user.TotoalGB = (Convert.ToInt64(user.TotoalGB) + (client.TotalGB / 1073741824L)).ToString();
                     var msg = $"✅ Account details: \n";
@@ -1222,7 +1182,7 @@ public class TelegramBotService : IHostedService
                     await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
                     // .GetAwaiter()
                     // .GetResult();
-                    await _userDbContext.ClearUserStatus(new User { Id = user.Id });
+                    await _state.ClearUserStatus(new User { Id = user.Id });
                 }
 
                 await botClient.CustomSendTextMessageAsync(
@@ -1248,7 +1208,7 @@ public class TelegramBotService : IHostedService
 
             if (currentUser.Flow == "update")
             {
-                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = res.ToString() });
+                await _state.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = res.ToString() });
 
                 // The user entered a valid number
                 var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
@@ -1274,7 +1234,7 @@ public class TelegramBotService : IHostedService
             {
                 if (int.TryParse(message.Text, out int userTraffic))
                 {
-                    await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = userTraffic.ToString() });
+                    await _state.SaveUserStatus(new User { Id = message.From.Id, TotoalGB = userTraffic.ToString() });
 
                     // The user entered a valid number
                     var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
@@ -1315,7 +1275,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "🗽 Admin")
         {
-            await _userDbContext.ClearUserStatus(currentUser);
+            await _state.ClearUserStatus(currentUser);
 
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -1329,7 +1289,7 @@ public class TelegramBotService : IHostedService
 
             currentUser.ConfigLink = message.Text;
             currentUser.LastStep = "confirm-public-message";
-            await _userDbContext.SaveUserStatus(currentUser);
+            await _state.SaveUserStatus(currentUser);
 
             var audienceLabel = GetBroadcastAudienceLabel(currentUser.SubLink);
             await botClient.CustomSendTextMessageAsync(
@@ -1364,7 +1324,7 @@ public class TelegramBotService : IHostedService
 
             currentUser.ConfigLink = message.Text;
             currentUser.LastStep = "confirm-zibal-trackid";
-            await _userDbContext.SaveUserStatus(currentUser);
+            await _state.SaveUserStatus(currentUser);
 
 
             var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
@@ -1390,7 +1350,7 @@ public class TelegramBotService : IHostedService
         {
             currentUser.LastStep = currentUser.LastStep.Replace("get-money-amount", "confirm-admin-action");
             currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
-            await _userDbContext.SaveUserStatus(currentUser);
+            await _state.SaveUserStatus(currentUser);
 
             var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
                                {
@@ -1422,7 +1382,7 @@ public class TelegramBotService : IHostedService
                     // var userid = Convert.ToInt64(message.Text.Split('|').ElementAt(2));
                     var userid = Convert.ToInt64(message.Text);
                     if (userid == 0) throw new Exception("user id is null");
-                    var findedClient = _credentialsDbContext.Users.Any(c => c.TelegramUserId == userid);
+                    var findedClient = await _credentialsDbContext.GetUserStatusWithId(userid) != null;
                     // if (!findedClient) await _credentialsDbContext.AddEmptyUser(userid);
                     // else { }
                     if (findedClient)
@@ -1444,7 +1404,7 @@ public class TelegramBotService : IHostedService
 
 
                     }
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
 
                 }
 
@@ -1470,7 +1430,7 @@ public class TelegramBotService : IHostedService
                                        chatId: message.Chat.Id,
                                        text: errorMessage,
                                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
 
                 }
             }
@@ -1481,7 +1441,7 @@ public class TelegramBotService : IHostedService
                     // var userid = Convert.ToInt64(message.Text.Split('|').ElementAt(2));
                     var userid = Convert.ToInt64(message.Text);
                     if (userid == 0) throw new Exception("user id is null");
-                    var findedClient = _credentialsDbContext.Users.Any(c => c.TelegramUserId == userid);
+                    var findedClient = await _credentialsDbContext.GetUserStatusWithId(userid) != null;
                     // if (!findedClient) await _credentialsDbContext.AddEmptyUser(userid);
                     // else { }
                     if (findedClient)
@@ -1513,7 +1473,7 @@ public class TelegramBotService : IHostedService
                             text: "Main Menu",
                             replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
 
-                        await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                        await _state.ClearUserStatus(new User { Id = message.From.Id });
                         return;
 
                     }
@@ -1524,7 +1484,7 @@ public class TelegramBotService : IHostedService
                                                     text: "User doesn't run the bot yet!. Ask him to first run the bot.",
                                                     replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
                     }
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
 
                 }
 
@@ -1550,7 +1510,7 @@ public class TelegramBotService : IHostedService
                                        chatId: message.Chat.Id,
                                        text: errorMessage,
                                        replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
 
                 }
             }
@@ -1560,7 +1520,7 @@ public class TelegramBotService : IHostedService
                 // get confirmation
                 currentUser.LastStep = currentUser.LastStep.Replace("get-tel-user-id", "confirm-admin-action");
                 currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
-                await _userDbContext.SaveUserStatus(currentUser);
+                await _state.SaveUserStatus(currentUser);
 
 
                 await botClient.CustomSendTextMessageAsync(
@@ -1574,7 +1534,7 @@ public class TelegramBotService : IHostedService
                 // get confirmation
                 currentUser.LastStep = currentUser.LastStep.Replace("get-tel-user-id", "get-money-amount");
                 currentUser.LastStep = currentUser.LastStep + "|" + (message.Text ?? "0");
-                await _userDbContext.SaveUserStatus(currentUser);
+                await _state.SaveUserStatus(currentUser);
 
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -1590,7 +1550,7 @@ public class TelegramBotService : IHostedService
 
             if (message.Text == "No Don't Confirm!")
             {
-                await _userDbContext.ClearUserStatus(currentUser);
+                await _state.ClearUserStatus(currentUser);
                 if (message.Text == "No Don't Confirm!")
                     await botClient.CustomSendTextMessageAsync(
                          chatId: message.Chat.Id,
@@ -1613,7 +1573,7 @@ public class TelegramBotService : IHostedService
             var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
             try
             {
-                var zpi = _userDbContext.ZibalPaymentInfos.SingleOrDefault(x => x.TrackId == trackId);
+                var zpi = await _workflow.ReadAsync(db => Task.FromResult(db.ZibalPaymentInfos.SingleOrDefault(x => x.TrackId == trackId)));
                 var inq_respnse = await ZibalAPI.Inquiry(zpi.TrackId, _appConfig.ZibalMerchantCode);
                 var msg = await ZibalAPI.VerifyAndGetMessage(trackId, _appConfig.ZibalMerchantCode);
                 if (msg == "your payment was successfully confirmed!")
@@ -1623,7 +1583,7 @@ public class TelegramBotService : IHostedService
 
                     await ZibalAddtoBalance(zpi, _appConfig, credUser, chatId, true);
                     zpi.IsAddedToBallance = true;
-                    await _userDbContext.SaveChangesAsync();
+                    await _workflow.SaveAsync();
 
                 }
 
@@ -1688,7 +1648,7 @@ public class TelegramBotService : IHostedService
 
             if (message.Text == "No Don't Confirm!" || !isuseridValid)
             {
-                await _userDbContext.ClearUserStatus(currentUser);
+                await _state.ClearUserStatus(currentUser);
                 if (message.Text == "No Don't Confirm!")
                     await botClient.CustomSendTextMessageAsync(
                          chatId: message.Chat.Id,
@@ -1720,10 +1680,11 @@ public class TelegramBotService : IHostedService
 
                     if (isCreditAmountValid)
                     {
-                        var beforeBalance = findedUser.AccountBalance;
-                        findedUser.AccountBalance += amount;
-                        await _credentialsDbContext.SaveChangesAsync();
-                        var afterBalance = findedUser.AccountBalance;
+                        var receipt = await _credentialsDbContext.MutateWalletAsync(findedUser.TelegramUserId, amount,
+                            $"admin:{BotContextAccessor.CurrentBotId}:{message.Chat.Id}:{message.MessageId}:credit");
+                        var beforeBalance = receipt.BeforeBalance;
+                        var afterBalance = receipt.AfterBalance;
+                        findedUser.AccountBalance = afterBalance;
                         await _walletLedgerService.RecordAsync(
                             findedUser.TelegramUserId,
                             WalletLedgerDirections.Credit,
@@ -1735,6 +1696,7 @@ public class TelegramBotService : IHostedService
                             referenceType: "admin-adjustment",
                             referenceId: message.From.Id.ToString(CultureInfo.InvariantCulture),
                             description: "Admin wallet credit",
+                            idempotencyKey: receipt.OperationKey,
                             cancellationToken: cancellationToken);
 
                         LogAdminWalletAdjustment(
@@ -1769,22 +1731,23 @@ public class TelegramBotService : IHostedService
 
                     else
                     {
-                        await _userDbContext.ClearUserStatus(currentUser);
+                        await _state.ClearUserStatus(currentUser);
                         await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "The credit amount you have just entered is not correct! go through steps again! ",
                         replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
                     }
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
                 }
                 else if (action == "➖ Reduce credit")
                 {
                     if (isCreditAmountValid)
                     {
-                        var beforeBalance = findedUser.AccountBalance;
-                        findedUser.AccountBalance -= amount;
-                        await _credentialsDbContext.SaveChangesAsync();
-                        var afterBalance = findedUser.AccountBalance;
+                        var receipt = await _credentialsDbContext.MutateWalletAsync(findedUser.TelegramUserId, -amount,
+                            $"admin:{BotContextAccessor.CurrentBotId}:{message.Chat.Id}:{message.MessageId}:debit");
+                        var beforeBalance = receipt.BeforeBalance;
+                        var afterBalance = receipt.AfterBalance;
+                        findedUser.AccountBalance = afterBalance;
                         await _walletLedgerService.RecordAsync(
                             findedUser.TelegramUserId,
                             WalletLedgerDirections.Debit,
@@ -1796,6 +1759,7 @@ public class TelegramBotService : IHostedService
                             referenceType: "admin-adjustment",
                             referenceId: message.From.Id.ToString(CultureInfo.InvariantCulture),
                             description: "Admin wallet debit",
+                            idempotencyKey: receipt.OperationKey,
                             cancellationToken: cancellationToken);
 
                         LogAdminWalletAdjustment(
@@ -1829,14 +1793,14 @@ public class TelegramBotService : IHostedService
 
                     else
                     {
-                        await _userDbContext.ClearUserStatus(currentUser);
+                        await _state.ClearUserStatus(currentUser);
                         await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "The credit amount you have just entered is not correct! go through steps again! ",
                         replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
                     }
 
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
 
                 }
                 else if (action == "🚀 Promote as admin")
@@ -1858,7 +1822,7 @@ public class TelegramBotService : IHostedService
                         text: "تبریک! \n شما اکنون همکار مجموعه ما هستید. \n" + await GetUserProfileMessage(findedUser),
                         replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
 
                 }
                 else if (action == "❌ Demote as admin")
@@ -1880,13 +1844,13 @@ public class TelegramBotService : IHostedService
                    text: "شما اکنون کاربر عادی مجموعه ما هستید.\n" + await GetUserProfileMessage(findedUser),
                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
 
                 }
 
                 else
                 {
-                    await _userDbContext.ClearUserStatus(currentUser);
+                    await _state.ClearUserStatus(currentUser);
                     await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "Something went wrong! Go through the steps correctly",
@@ -1924,13 +1888,13 @@ public class TelegramBotService : IHostedService
 
                 //         else
                 //         {
-                //             await _userDbContext.ClearUserStatus(currentUser);
+                //             await _state.ClearUserStatus(currentUser);
                 //             await botClient.CustomSendTextMessageAsync(
                 //             chatId: message.Chat.Id,
                 //             text: "The credit amount you have just entered is not correct! go through steps again! ",
                 //             replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
                 //         }
-                //         await _userDbContext.ClearUserStatus(currentUser);
+                //         await _state.ClearUserStatus(currentUser);
                 //         break;
                 //     case "➖ Reduce credit":
 
@@ -1950,7 +1914,7 @@ public class TelegramBotService : IHostedService
                 //             text: "تبریک! \n شما اکنون همکار مجموعه ما هستید. \n" + await GetUserProfileMessage(findedUser),
                 //             replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-                //         await _userDbContext.ClearUserStatus(currentUser);
+                //         await _state.ClearUserStatus(currentUser);
 
                 //         break;
                 //     case "❌ Demote as admin":
@@ -1968,7 +1932,7 @@ public class TelegramBotService : IHostedService
                 //        text: "شما اکنون کاربر عادی مجموعه ما هستید.\n" + await GetUserProfileMessage(findedUser),
                 //        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-                //         await _userDbContext.ClearUserStatus(currentUser);
+                //         await _state.ClearUserStatus(currentUser);
 
                 //         break;
                 //     case "ℹ️ See User Account":
@@ -1977,7 +1941,7 @@ public class TelegramBotService : IHostedService
                 //         break;
 
                 //     default:
-                //         await _userDbContext.ClearUserStatus(currentUser);
+                //         await _state.ClearUserStatus(currentUser);
                 //         await botClient.CustomSendTextMessageAsync(
                 //         chatId: message.Chat.Id,
                 //         text: "Something went wrong! Go through the steps correctly",
@@ -2012,7 +1976,7 @@ public class TelegramBotService : IHostedService
                         message.Chat.Id,
                         $"هیچ گیرنده‌ای برای ارسال پیام عمومی به «{audienceLabel}» پیدا نشد.",
                         replyMarkup: GetMainMenuKeyboard());
-                    await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                    await _state.ClearUserStatus(new User { Id = message.From.Id });
                     return;
                 }
 
@@ -2038,7 +2002,7 @@ public class TelegramBotService : IHostedService
                     await StartBroadcastJobAsync(botClient, message, allUsers, template, cancellationToken);
                 }
 
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
 
 
 
@@ -2073,7 +2037,7 @@ public class TelegramBotService : IHostedService
                 //         }
 
                 //     }
-                //     await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                //     await _state.ClearUserStatus(new User { Id = message.From.Id });
                 //     await botClient.CustomSendTextMessageAsync(
 
             }
@@ -2097,7 +2061,7 @@ public class TelegramBotService : IHostedService
             }
             else if (message.Text == "No Don't Send!")
             {
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
                 await botClient.CustomSendTextMessageAsync(
                                            chatId: message.Chat.Id,
                                            text: "The Operation(send message) has been cancelled.",
@@ -2106,7 +2070,7 @@ public class TelegramBotService : IHostedService
             }
             else
             {
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
                 await botClient.CustomSendTextMessageAsync(
                                            chatId: message.Chat.Id,
                                            text: "Oops! Start Again",
@@ -2118,11 +2082,11 @@ public class TelegramBotService : IHostedService
         {
             currentUser.Flow = "admin";
             currentUser.LastStep += "|" + message.Text;
-            await _userDbContext.SaveUserStatus(currentUser);
+            await _state.SaveUserStatus(currentUser);
 
             if (message.Text == "📑 Menu")
             {
-                await _userDbContext.ClearUserStatus(currentUser);
+                await _state.ClearUserStatus(currentUser);
                 return;
             }
             else if (message.Text == "📨 Send message to all")
@@ -2130,7 +2094,7 @@ public class TelegramBotService : IHostedService
                 currentUser.Flow = "admin";
                 currentUser.LastStep = "select-public-message-audience";
                 currentUser.SubLink = string.Empty;
-                await _userDbContext.SaveUserStatus(currentUser);
+                await _state.SaveUserStatus(currentUser);
 
                 await botClient.CustomSendTextMessageAsync(
                                 chatId: message.Chat.Id,
@@ -2144,7 +2108,7 @@ public class TelegramBotService : IHostedService
             {
                 currentUser.Flow = "admin";
                 currentUser.LastStep = "Get-trackid";
-                await _userDbContext.SaveUserStatus(currentUser);
+                await _state.SaveUserStatus(currentUser);
 
                 await botClient.CustomSendTextMessageAsync(
                                 chatId: message.Chat.Id,
@@ -2156,7 +2120,7 @@ public class TelegramBotService : IHostedService
             {
                 currentUser.Flow = "admin";
                 currentUser.LastStep = "get-tel-user-id" + "|" + message.Text;
-                await _userDbContext.SaveUserStatus(currentUser);
+                await _state.SaveUserStatus(currentUser);
 
                 // baraye ersal payam ya ertegha be admin
                 await botClient.CustomSendTextMessageAsync(
@@ -2170,7 +2134,7 @@ public class TelegramBotService : IHostedService
 
         else
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             await botClient.CustomSendTextMessageAsync(
                                        chatId: message.Chat.Id,
                                        text: "Oops! Start Again",
@@ -2252,9 +2216,9 @@ public class TelegramBotService : IHostedService
         int? sourceMessageId,
         CancellationToken cancellationToken)
     {
-        await _userDbContext.ClearUserStatus(new User { Id = telegramUserId });
+        await _state.ClearUserStatus(new User { Id = telegramUserId });
         _xuiV3PurchaseSessionStore.Clear(telegramUserId);
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = telegramUserId,
             LastStep = "enter charge amount",
@@ -2430,6 +2394,11 @@ public class TelegramBotService : IHostedService
         }
     }
 
+    /// <summary>Validates an administrator audience choice and persists the next bot-scoped broadcast step.</summary>
+    /// <param name="callbackQuery">Incoming Telegram callback; authorization uses its sender rather than the source message author.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task ProcessBroadcastAudienceCallback(CallbackQuery callbackQuery, CancellationToken cancellationToken)
     {
         if (!IsSuperAdminUser(callbackQuery.From.Id))
@@ -2448,7 +2417,7 @@ public class TelegramBotService : IHostedService
 
         if (string.Equals(selected, "back", StringComparison.OrdinalIgnoreCase))
         {
-            await _userDbContext.ClearUserStatus(new User { Id = callbackQuery.From.Id });
+            await _state.ClearUserStatus(new User { Id = callbackQuery.From.Id });
 
             if (messageId.HasValue)
             {
@@ -2470,11 +2439,11 @@ public class TelegramBotService : IHostedService
         }
 
         var audience = NormalizeBroadcastAudience(selected);
-        var currentUser = await _userDbContext.GetUserStatus(callbackQuery.From.Id);
+        var currentUser = await _state.GetUserStatus(callbackQuery.From.Id);
         currentUser.Flow = "admin";
         currentUser.LastStep = "Get-public-message";
         currentUser.SubLink = audience;
-        await _userDbContext.SaveUserStatus(currentUser);
+        await _state.SaveUserStatus(currentUser);
 
         var audienceLabel = GetBroadcastAudienceLabel(audience);
         if (messageId.HasValue)
@@ -2721,7 +2690,7 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-        var zpi = await _userDbContext.ZibalPaymentInfos.FindAsync(new object[] { zpiId }, cancellationToken);
+        var zpi = await _workflow.ReadAsync(async db => await db.ZibalPaymentInfos.FindAsync(new object[] { zpiId }, cancellationToken));
         if (zpi == null)
         {
             await ActiveBotClient.CustomSendTextMessageAsync(
@@ -2759,7 +2728,7 @@ public class TelegramBotService : IHostedService
         }
 
         zpi.Result = BuildZibalStatusText(inquiry);
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
 
         Console.WriteLine(
             $"[Zibal] inquiry paymentId={zpi.Id}, trackId={zpi.TrackId}, user={zpi.TelegramUserId}, status={inquiry.Status}, result={inquiry.Result}, message={inquiry.Message}");
@@ -2768,7 +2737,7 @@ public class TelegramBotService : IHostedService
         {
             var verify = await ZibalAPI.Verify(zpi.TrackId, _appConfig.ZibalMerchantCode);
             zpi.Result = BuildZibalStatusText(inquiry, verify);
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             Console.WriteLine(
                 $"[Zibal] verify paymentId={zpi.Id}, trackId={zpi.TrackId}, result={verify?.Result}, status={verify?.Status}, message={verify?.Message}");
@@ -2812,7 +2781,7 @@ public class TelegramBotService : IHostedService
         }
 
         zpi.IsExpired = IsFinalUnsuccessfulZibalStatus(inquiry.Status);
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
 
         await _userActivityLog.LogWarningAsync(
             "zibal_payment_not_successful",
@@ -2844,9 +2813,9 @@ public class TelegramBotService : IHostedService
         var orderId = callbackQuery.Data.Replace("check_crypto_payment_", "");
         Console.WriteLine($"[NOWPayments ManualCheck] start user={callbackQuery.From.Id}, chat={chatId}, orderId={orderId}");
 
-        var payment = await _userDbContext.SwapinoPaymentInfos.FirstOrDefaultAsync(
+        var payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.FirstOrDefaultAsync(
             p => p.OrderId == orderId,
-            cancellationToken);
+            cancellationToken));
         if (payment == null)
         {
             Console.WriteLine($"[NOWPayments ManualCheck] payment not found. orderId={orderId}");
@@ -2931,7 +2900,7 @@ public class TelegramBotService : IHostedService
         payment.SetNowPaymentsData(data);
         payment.OutcomeAmount = data.PayAmount == 0 ? payment.OutcomeAmount : data.PayAmount;
         payment.BaseAmount = data.PriceAmount == 0 ? payment.BaseAmount : data.PriceAmount;
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
         Console.WriteLine($"[NOWPayments ManualCheck] local payment updated. orderId={payment.OrderId}, paymentId={payment.PaymentId}, status={payment.PaymentStatus}, added={payment.IsAddedToBalance}");
 
         if (NowPaymentsStatuses.IsPaid(data.PaymentStatus))
@@ -2999,12 +2968,12 @@ public class TelegramBotService : IHostedService
         HooshPayPaymentInfo payment = null;
         if (int.TryParse(lookupValue, out var paymentId))
         {
-            payment = await _userDbContext.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken);
+            payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.FindAsync(new object[] { paymentId }, cancellationToken));
         }
 
-        payment ??= await _userDbContext.HooshPayPaymentInfos.FirstOrDefaultAsync(
+        payment ??= await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.FirstOrDefaultAsync(
             p => p.OrderId == lookupValue,
-            cancellationToken);
+            cancellationToken));
         if (payment == null)
         {
             Console.WriteLine($"[HooshPay ManualCheck] payment not found. lookup={lookupValue}");
@@ -3063,7 +3032,7 @@ public class TelegramBotService : IHostedService
                 verify
             });
 
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             Console.WriteLine($"[HooshPay ManualCheck] remote status received. orderId={payment.OrderId}, invoiceUid={payment.InvoiceUid}, status={payment.PaymentStatus}, paid={verify?.paid}");
         }
         catch (Exception ex)
@@ -3071,7 +3040,7 @@ public class TelegramBotService : IHostedService
             Console.WriteLine($"[HooshPay ManualCheck] remote status failed. orderId={payment.OrderId}, invoiceUid={payment.InvoiceUid}, error={ex.Message}");
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await ActiveBotClient.CustomSendTextMessageAsync(
                 chatId: chatId,
@@ -3277,12 +3246,12 @@ public class TelegramBotService : IHostedService
         var telegramUserId = message.From?.Id ?? credUser?.TelegramUserId ?? 0;
         Console.WriteLine($"[NOWPayments ReturnUrl] received start. user={telegramUserId}, chat={message.Chat.Id}, text={message.Text}, success={isSuccess}, cancel={isCancel}");
 
-        var payment = await _userDbContext.SwapinoPaymentInfos
+        var payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos
             .Where(p => p.TelegramUserId == telegramUserId &&
                         !p.IsAddedToBalance &&
                         (p.BotId == BotContextAccessor.CurrentBotId || string.IsNullOrWhiteSpace(p.BotId)))
             .OrderByDescending(p => p.Id)
-            .FirstOrDefaultAsync(cancellationToken);
+            .FirstOrDefaultAsync(cancellationToken));
 
         if (payment == null)
         {
@@ -3301,7 +3270,7 @@ public class TelegramBotService : IHostedService
         {
             payment.PaymentStatus = "cancelled_by_user";
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -3469,7 +3438,7 @@ public class TelegramBotService : IHostedService
         payment.SetNowPaymentsData(data);
         payment.OutcomeAmount = data.PayAmount == 0 ? payment.OutcomeAmount : data.PayAmount;
         payment.BaseAmount = data.PriceAmount == 0 ? payment.BaseAmount : data.PriceAmount;
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
         Console.WriteLine($"[NOWPayments ManualCheck] local payment updated. source={source}, orderId={payment.OrderId}, paymentId={payment.PaymentId}, status={payment.PaymentStatus}, added={payment.IsAddedToBalance}");
 
         if (NowPaymentsStatuses.IsPaid(data.PaymentStatus))
@@ -3541,9 +3510,9 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-        var payment = await _userDbContext.SwapinoPaymentInfos.FirstOrDefaultAsync(
+        var payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.FirstOrDefaultAsync(
             p => p.Id == paymentDbId,
-            cancellationToken);
+            cancellationToken));
 
         if (payment == null)
         {
@@ -3590,7 +3559,7 @@ public class TelegramBotService : IHostedService
             payment.SetNowPaymentsData(data);
             payment.OutcomeAmount = data.PayAmount == 0 ? payment.OutcomeAmount : data.PayAmount;
             payment.BaseAmount = data.PriceAmount == 0 ? payment.BaseAmount : data.PriceAmount;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
         }
         catch (Exception ex)
         {
@@ -3878,7 +3847,11 @@ public class TelegramBotService : IHostedService
     /// </remarks>
     public async Task ZibalAddtoBalance(ZibalPaymentInfo zpi, AppConfig appConfig, CredUser credUser, long chatid, bool isAdmin)
     {
-        if (zpi == null || !zpi.IsPaid)
+        if (zpi == null)
+            return;
+        zpi = await _workflow.ReadAsync(async db => await db.ZibalPaymentInfos.SingleAsync(x => x.Id == zpi.Id));
+        await _workflow.ReloadAsync(zpi);
+        if (!zpi.IsPaid)
             return;
 
         var findedUser = await _credentialsDbContext.GetUserStatusWithId(zpi.TelegramUserId);
@@ -3906,7 +3879,7 @@ public class TelegramBotService : IHostedService
                 botId: zpi.BotId,
                 botUsername: zpi.BotUsername,
                 botType: BotInstanceTypes.Owned,
-                idempotencyKey: zibalMutationKey,
+                idempotencyKey: $"payment:zibal:{zpi.Id}:credit",
                 cancellationToken: CancellationToken.None);
             if (zpi.IsPaid)
             {
@@ -3931,14 +3904,16 @@ public class TelegramBotService : IHostedService
         var beforeBalance = findedUser.AccountBalance;
         var credited = await _credentialsDbContext.AddFund(
             zpi.TelegramUserId,
-            zpi.Amount / 10);
+            zpi.Amount / 10, $"payment:zibal:{zpi.Id}:credit", botId: zpi.BotId);
         if (!credited)
             return;
-        var afterBalance = checked(beforeBalance + (zpi.Amount / 10));
+        var walletReceipt = await _credentialsDbContext.GetWalletOperationAsync($"payment:zibal:{zpi.Id}:credit");
+        beforeBalance = walletReceipt.BeforeBalance;
+        var afterBalance = walletReceipt.AfterBalance;
 
         zpi.IsAddedToBallance = true;
 
-        await _userDbContext.SaveChangesAsync();
+        await _workflow.SaveAsync();
         await _walletLedgerService.RecordAsync(
             zpi.TelegramUserId,
             WalletLedgerDirections.Credit,
@@ -3954,7 +3929,7 @@ public class TelegramBotService : IHostedService
             botId: zpi.BotId,
             botUsername: zpi.BotUsername,
             botType: BotInstanceTypes.Owned,
-            idempotencyKey: zibalMutationKey,
+            idempotencyKey: $"payment:zibal:{zpi.Id}:credit",
             cancellationToken: CancellationToken.None);
 
         if (zpi.IsPaid)
@@ -4272,25 +4247,17 @@ public class TelegramBotService : IHostedService
     {
         var normalizedAudience = NormalizeBroadcastAudience(audience);
         var botId = BotContextAccessor.CurrentBotId;
-        var scopedTelegramUserIds = await _userDbContext.BotUserStates
+        var scopedTelegramUserIds = await _workflow.ReadAsync(async db => await db.BotUserStates
             .AsNoTracking()
             .Where(x => x.BotId == botId && x.TelegramUserId > 0)
             .Select(x => x.TelegramUserId)
             .Distinct()
-            .ToListAsync(cancellationToken);
+            .ToListAsync(cancellationToken));
 
         if (scopedTelegramUserIds.Count == 0)
             return new List<long>();
 
-        var credentialRows = await _credentialsDbContext.Users
-            .AsNoTracking()
-            .Select(x => new
-            {
-                x.TelegramUserId,
-                x.ChatID,
-                x.IsColleague
-            })
-            .ToListAsync(cancellationToken);
+        var credentialRows = await _credentialsDbContext.ReadAudienceAsync(cancellationToken);
 
         var credentialsByKnownId = new Dictionary<long, (long TelegramUserId, long ChatId, bool IsColleague)>();
         foreach (var credential in credentialRows)
@@ -4758,14 +4725,14 @@ public class TelegramBotService : IHostedService
         if (string.Equals(text, AdminVerifyPhoneAction, StringComparison.Ordinal))
         {
             // Clear stale admin-flow data before starting this sensitive identity operation.
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             currentUser = new User
             {
                 Id = message.From.Id,
                 Flow = "admin",
                 LastStep = AdminPhoneUserIdStep
             };
-            await _userDbContext.SaveUserStatus(currentUser);
+            await _state.SaveUserStatus(currentUser);
 
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -4801,7 +4768,7 @@ public class TelegramBotService : IHostedService
             }
 
             currentUser.LastStep = $"{AdminPhoneNumberStep}|{targetUserId.ToString(CultureInfo.InvariantCulture)}";
-            await _userDbContext.SaveUserStatus(currentUser);
+            await _state.SaveUserStatus(currentUser);
 
             var existingPhone = string.IsNullOrWhiteSpace(target.PhoneNumber)
                 ? "ثبت نشده"
@@ -4841,7 +4808,7 @@ public class TelegramBotService : IHostedService
 
             currentUser.ConfigLink = normalizedPhone;
             currentUser.LastStep = $"{AdminPhoneConfirmationStep}|{targetUserId.ToString(CultureInfo.InvariantCulture)}";
-            await _userDbContext.SaveUserStatus(currentUser);
+            await _state.SaveUserStatus(currentUser);
 
             var target = await _credentialsDbContext.GetUserStatusWithId(targetUserId);
             if (target == null)
@@ -4867,7 +4834,7 @@ public class TelegramBotService : IHostedService
         {
             if (string.Equals(text, CancelAdminPhoneButton, StringComparison.Ordinal))
             {
-                await _userDbContext.ClearUserStatus(currentUser);
+                await _state.ClearUserStatus(currentUser);
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "عملیات تأیید شماره تلفن لغو شد.",
@@ -4901,7 +4868,7 @@ public class TelegramBotService : IHostedService
             var previousPhone = target.PhoneNumber;
             await _credentialsDbContext.SavePhoneNumber(targetUserId, normalizedPhone);
             target.PhoneNumber = normalizedPhone;
-            await _userDbContext.ClearUserStatus(currentUser);
+            await _state.ClearUserStatus(currentUser);
 
             LogAdminPhoneVerification(message.From, target, previousPhone, normalizedPhone);
 
@@ -5063,7 +5030,7 @@ public class TelegramBotService : IHostedService
         long chatId,
         User currentUser)
     {
-        await _userDbContext.ClearUserStatus(currentUser);
+        await _state.ClearUserStatus(currentUser);
         await botClient.CustomSendTextMessageAsync(
             chatId: chatId,
             text: "اطلاعات این مرحله ناقص یا منقضی شده بود. لطفاً تأیید شماره تلفن را از پنل ادمین دوباره شروع کنید.",
@@ -5160,7 +5127,7 @@ public class TelegramBotService : IHostedService
 
         try
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             var yesterdayIran = _usageAnalyticsService.GetIranNow().Date.AddDays(-1);
             var startIran = yesterdayIran.AddDays(-(dayCount - 1));
             var report = await _usageAnalyticsService.GetReportAsync(
@@ -5508,7 +5475,7 @@ public class TelegramBotService : IHostedService
 
 
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
-        var user = await _userDbContext.GetUserStatus(message.From.Id);
+        var user = await _state.GetUserStatus(message.From.Id);
         var hasNavigationCommand = TelegramNavigationCommandParser.TryParse(
             message.Text,
             CurrentBot?.Username ?? BotContextAccessor.CurrentBotUsername,
@@ -5549,7 +5516,7 @@ public class TelegramBotService : IHostedService
                 rows.Add(new[] { InlineKeyboardButton.WithUrl(channel.Label, channel.Url) });
             }
 
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             if (rows.Count > 0)
             {
                 InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows.ToArray());
@@ -5593,7 +5560,7 @@ public class TelegramBotService : IHostedService
         }
         else if (message.Text == "عضو شدم!")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "به ربات خوش آمدید!",
@@ -5613,13 +5580,13 @@ public class TelegramBotService : IHostedService
                 replyMarkup: MainReplyMarkupKeyboardFa());
 
             // Save the user's context
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
 
         }
 
         else if (message.Text == "🏠منو" || message.Text == "لغو" || message.Text == "منوی اصلی")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
 
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -5629,7 +5596,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "📌 قابلیت‌های ربات" || message.Text == "قابلیت‌های ربات")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
 
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -5641,7 +5608,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "📋 تعرفه‌ها" || message.Text == "تعرفه‌ها")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
 
             await botClient.CustomSendTextMessageAsync(
@@ -5654,7 +5621,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "📒 تراکنش‌های من" || message.Text == "تراکنش‌های من")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             await SendWalletLedgerAsync(botClient, message.Chat.Id, message.From.Id, 0, cancellationToken);
             return;
         }
@@ -5677,7 +5644,7 @@ public class TelegramBotService : IHostedService
             MainReplyMarkupKeyboardFa(),
             cancellationToken))
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return;
         }
         else if (await _xuiV3BotFlowService.TryHandleDeleteExpiredAccountsAsync(
@@ -5795,7 +5762,7 @@ public class TelegramBotService : IHostedService
                                 replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
             }
 
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return;
         }
 
@@ -5832,7 +5799,7 @@ public class TelegramBotService : IHostedService
                 user.PaymentMethod = "credit";
                 user.SelectedPeriod = "1 Day";
                 user.ConfigPrice = 0;
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
 
                 await botClient.CustomSendTextMessageAsync(
                                     chatId: message.Chat.Id,
@@ -5876,7 +5843,7 @@ public class TelegramBotService : IHostedService
                     user.PaymentMethod = "credit";
                     user.SelectedPeriod = "1 Day";
                     user.ConfigPrice = 0;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                                     chatId: message.Chat.Id,
                                     text: $"✅ شما امکان ساخت اکانت مورد نظر را دارید. \n" + " ❕ برای دریافت اکانت، گزینه تایید نهایی را بزنید در غیر این صورت انصراف را انتخاب نمایید.\n",
@@ -5890,7 +5857,7 @@ public class TelegramBotService : IHostedService
 
         else if (message.Text == "شارژ حساب کاربری")
         {
-            // await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            // await _state.ClearUserStatus(new User { Id = message.From.Id });
 
             // var text = "درحال حاضر شارژ حساب فقط از طریق ادمین امکان پذیر می‌باشد.برای شارژ حساب خود به ادمین پیام دهید و پیام زیر را برای ایشان فوروارد کنید: /n @vpsnetiran_vpn /n به زودی پرداخت ریالی و ترونی به ربات اضافه خواهد شد.";
             // await botClient.CustomSendTextMessageAsync(
@@ -5904,14 +5871,14 @@ public class TelegramBotService : IHostedService
             //     text: text,
             //     replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
 
 
 
             user.PaymentMethod = "crypto";
             user.Flow = "charge";
             user.LastStep = "payment_method_selection";
-            await _userDbContext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
 
 
 
@@ -5921,14 +5888,14 @@ public class TelegramBotService : IHostedService
         {
             if (string.Equals(_appConfig.XuiApiVersionMode, "v3", StringComparison.OrdinalIgnoreCase))
             {
-                var xuiUser = await _userDbContext.GetUserStatus(message.From.Id);
+                var xuiUser = await _state.GetUserStatus(message.From.Id);
                 if (await _xuiV3BotFlowService.TryStartPurchaseAsync(botClient, message, credUser, xuiUser, cancellationToken))
                     return;
             }
 
             var replyKeboard = PriceReplyMarkupKeyboardFa(credUser.IsColleague, false);
 
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Create New Account", Flow = "create" });
 
             await botClient.CustomSendTextMessageAsync(
                chatId: message.Chat.Id,
@@ -5940,7 +5907,7 @@ public class TelegramBotService : IHostedService
         else if (message.Text.Contains("راهنما"))
         {
 
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             var rkm = new ReplyKeyboardMarkup(new[]
                 {
                     new KeyboardButton[] { "راهنمای اپل 📱" },
@@ -6082,7 +6049,7 @@ public class TelegramBotService : IHostedService
         }
         else if (user.LastStep == "confirmation" && user.Flow == "charge")
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             if (message.Text == "انصراف")
             {
                 await botClient.CustomSendTextMessageAsync(
@@ -6107,7 +6074,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
 
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
@@ -6124,7 +6091,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
 
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
@@ -6142,7 +6109,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "درگاه تترامیناتور در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
@@ -6158,7 +6125,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay)
@@ -6175,7 +6142,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "درگاه ارز دیجیتال در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
@@ -6223,8 +6190,8 @@ public class TelegramBotService : IHostedService
                     zpi.Result = x.Result;
                     zpi.CreatedAt = DateTime.UtcNow;
 
-                    _userDbContext.ZibalPaymentInfos.Add(zpi);
-                    await _userDbContext.SaveChangesAsync();
+                    _workflow.Add(zpi);
+                    await _workflow.SaveAsync();
 
                     var msg = await GetZipalPaymentMessage(credUser, false, zpi, x.PayLink);
 
@@ -6252,7 +6219,7 @@ public class TelegramBotService : IHostedService
 
                     zpi.TelMsgId = latestMsg.MessageId;
 
-                    await _userDbContext.SaveChangesAsync();
+                    await _workflow.SaveAsync();
 
                 }
 
@@ -6350,8 +6317,8 @@ public class TelegramBotService : IHostedService
                         chatId: message.Chat.Id,
                         baseCurrency: _appConfig.NowpaymentPriceCurrency);
 
-                    _userDbContext.SwapinoPaymentInfos.Add(payment);
-                    await _userDbContext.SaveChangesAsync();
+                    _workflow.Add(payment);
+                    await _workflow.SaveAsync();
 
                     try
                     {
@@ -6395,7 +6362,7 @@ public class TelegramBotService : IHostedService
                         payment.SetNowPaymentsData(data);
                         payment.BaseAmount = nowPayment.price_amount;
                         payment.BaseCurrency = nowPayment.price_currency;
-                        await _userDbContext.SaveChangesAsync();
+                        await _workflow.SaveAsync();
 
                         var msg = await GetNowPaymentsPaymentMessage(credUser, payment);
                         var inlineKeyboardMarkup = new InlineKeyboardMarkup(new[]
@@ -6441,7 +6408,7 @@ public class TelegramBotService : IHostedService
                         if (latestMsg != null)
                             payment.TelMsgId = latestMsg.MessageId;
 
-                        await _userDbContext.SaveChangesAsync();
+                        await _workflow.SaveAsync();
                     }
                     catch (NowPaymentsApiException ex)
                     {
@@ -6459,7 +6426,7 @@ public class TelegramBotService : IHostedService
                             orderId = payment.OrderId,
                             createdAt = DateTime.UtcNow
                         });
-                        await _userDbContext.SaveChangesAsync();
+                        await _workflow.SaveAsync();
 
                         await botClient.CustomSendTextMessageAsync(
                             chatId: message.Chat.Id,
@@ -6478,7 +6445,7 @@ public class TelegramBotService : IHostedService
                             orderId = payment.OrderId,
                             createdAt = DateTime.UtcNow
                         });
-                        await _userDbContext.SaveChangesAsync();
+                        await _workflow.SaveAsync();
 
                         await botClient.CustomSendTextMessageAsync(
                             chatId: message.Chat.Id,
@@ -6497,7 +6464,7 @@ public class TelegramBotService : IHostedService
                             orderId = payment.OrderId,
                             createdAt = DateTime.UtcNow
                         });
-                        await _userDbContext.SaveChangesAsync();
+                        await _workflow.SaveAsync();
 
                         await botClient.CustomSendTextMessageAsync(
                             chatId: message.Chat.Id,
@@ -6534,7 +6501,7 @@ public class TelegramBotService : IHostedService
                 user.LastStep = "payment_method_selection";
                 user.Flow = "charge";
                 user.PaymentMethod = string.Empty;
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
 
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -6554,7 +6521,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay)
@@ -6576,7 +6543,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         message.Chat.Id,
                         amount < _appConfig.TetraminatorMinimumAmountToman
@@ -6599,7 +6566,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay)
@@ -6617,7 +6584,7 @@ public class TelegramBotService : IHostedService
                 user.LastStep = "payment_method_selection";
                 user.Flow = "charge";
                 user.PaymentMethod = string.Empty;
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
 
                 await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -6633,7 +6600,7 @@ public class TelegramBotService : IHostedService
                     user.LastStep = "payment_method_selection";
                     user.Flow = "charge";
                     user.PaymentMethod = string.Empty;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "درگاه ارز دیجیتال در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
@@ -6646,7 +6613,7 @@ public class TelegramBotService : IHostedService
 
             user.LastStep = "confirmation";
             user.Flow = "charge";
-            await _userDbContext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
 
 
             var gatewayName = user.PaymentMethod == "crypto"
@@ -6694,7 +6661,7 @@ public class TelegramBotService : IHostedService
                 user.ConfigLink = longValue.ToString();
                 user.LastStep = "payment_method_selection";
                 user.Flow = "charge";
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
 
 
                 // The user entered a valid number
@@ -6715,7 +6682,7 @@ public class TelegramBotService : IHostedService
             else
             {
                 // handle the case where it's not a valid long
-                await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
+                await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "enter charge amount", Flow = "charge" });
                 var msg = "عدد وارد شده صحیح نمیباشد. لطفاً مبلغ را به تومان و به عدد وارد کنید و گزینه ارسال را بزنید.";
                 msg += "\n  در صورتی که میخواهید به منوی اصلی  برگردید روی استارت کلیک کنید /start";
                 await botClient.CustomSendTextMessageAsync(
@@ -6745,7 +6712,7 @@ public class TelegramBotService : IHostedService
                 MainReplyMarkupKeyboardFa(),
                 cancellationToken))
             {
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
                 return;
             }
 
@@ -6772,12 +6739,12 @@ public class TelegramBotService : IHostedService
                text: "منوی اصلی",
                replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
 
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             return;
         }
         else if (message.Text == "تمدید اکانت")
         {
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "لطفاً لینک Vmess یا نام اکانت خود را برای ربات ارسال کنید:",
@@ -6793,7 +6760,7 @@ public class TelegramBotService : IHostedService
                         chatId: message.Chat.Id,
                         text: "خطا! \n ترافیک را به گیگابایت و با اعداد انگلیسی تایپ کنید \n" + "به عنوان مثال 20 معادل بیست گیگابایت خواهد بود \n روی /start برای شروع مجدد کلیک کنید.",
                         replyMarkup: new ReplyKeyboardRemove());
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
                 return;
             }
 
@@ -6809,7 +6776,7 @@ public class TelegramBotService : IHostedService
                 user.SelectedPeriod = "0 Month";
 
 
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
 
 
                 // The user entered a valid number
@@ -6839,7 +6806,7 @@ public class TelegramBotService : IHostedService
                     chatId: message.Chat.Id,
                     text: BuildOwnedInsufficientBalanceText(price, credUser.AccountBalance),
                     replyMarkup: BuildWalletChargeShortcutKeyboard());
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
 
                 return;
             }
@@ -6849,7 +6816,7 @@ public class TelegramBotService : IHostedService
         else if (message.Text == "تمدید حجمی" && user.Flow == "update")
         {
             user.LastStep = "get-traffic";
-            await _userDbContext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
 
             await botClient.CustomSendTextMessageAsync(
                                 chatId: message.Chat.Id,
@@ -6871,7 +6838,7 @@ public class TelegramBotService : IHostedService
                                     chatId: message.Chat.Id,
                                     text: "خطا",
                                     replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
                 return;
             }
 
@@ -6881,7 +6848,7 @@ public class TelegramBotService : IHostedService
                     chatId: message.Chat.Id,
                     text: "خطا",
                     replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
                 return;
             }
 
@@ -6892,7 +6859,7 @@ public class TelegramBotService : IHostedService
                 user.Flow = "update";
                 user.LastStep = "ask_confirmation";
                 user._ConfigPrice = price.ToString();
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
 
 
                 // The user entered a valid number
@@ -6922,7 +6889,7 @@ public class TelegramBotService : IHostedService
                     chatId: message.Chat.Id,
                     text: BuildOwnedInsufficientBalanceText(price, credUser.AccountBalance),
                     replyMarkup: BuildWalletChargeShortcutKeyboard());
-                await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
 
                 return;
             }
@@ -6941,7 +6908,7 @@ public class TelegramBotService : IHostedService
             if (StartsWithVMessOrVLess(message.Text))
             {
                 user.ConfigLink = message.Text;
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
             }
             else // if (message.Text.StartsWith("/renew_", StringComparison.OrdinalIgnoreCase))
             {
@@ -6957,13 +6924,13 @@ public class TelegramBotService : IHostedService
                                     chatId: message.Chat.Id,
                                     text: "اکانت مورد نظر پیدا نشد.",
                                     replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                    await _userDbContext.ClearUserStatus(user);
+                    await _state.ClearUserStatus(user);
                     return;
 
                 }
             }
 
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastStep = "set-renew-type", Flow = "update" });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "set-renew-type", Flow = "update" });
 
             await botClient.CustomSendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -6981,7 +6948,7 @@ public class TelegramBotService : IHostedService
                                     chatId: message.Chat.Id,
                                     text: "خطا",
                                     replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
                 return;
             }
 
@@ -6991,7 +6958,7 @@ public class TelegramBotService : IHostedService
                     chatId: message.Chat.Id,
                     text: "خطا",
                     replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
                 return;
             }
 
@@ -7001,7 +6968,7 @@ public class TelegramBotService : IHostedService
                 user.Flow = "create";
                 user.LastStep = "ask_confirmation";
                 user._ConfigPrice = price.ToString();
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
 
 
                 // The user entered a valid number
@@ -7041,7 +7008,7 @@ public class TelegramBotService : IHostedService
 
         else
         {
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
             await botClient.CustomSendTextMessageAsync(
                                        chatId: message.Chat.Id,
                                        text: "مشکلی به وجود امد. لطفاً از اول تلاش کنید.",
@@ -7131,7 +7098,7 @@ public class TelegramBotService : IHostedService
     {
         if (message.Text == "انصراف")
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return;
         }
         await botClient.CustomSendTextMessageAsync(
@@ -7140,7 +7107,7 @@ public class TelegramBotService : IHostedService
                             replyMarkup: new ReplyKeyboardRemove());
 
 
-        var ready = await _userDbContext.IsUserReadyToCreate(message.From.Id);
+        var ready = await _state.IsUserReadyToCreate(message.From.Id);
 
         if (!ready)
         {
@@ -7148,7 +7115,7 @@ public class TelegramBotService : IHostedService
                    chatId: message.Chat.Id,
                    text: "مشخصات اکانت کامل نیست. لطفاً مراحل دریافت اکانت را به طور کامل طی کنید..",
                     replyMarkup: MainReplyMarkupKeyboardFa());
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return;
         }
 
@@ -7161,7 +7128,7 @@ public class TelegramBotService : IHostedService
                 credUser.TelegramUserId,
                 XuiOperationTiming.Format(operationTiming.PanelApiElapsed),
                 XuiOperationTiming.Format(operationTiming.TotalElapsed));
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
 
             await botClient.CustomSendTextMessageAsync(
                           chatId: message.Chat.Id,
@@ -7186,7 +7153,7 @@ public class TelegramBotService : IHostedService
                 foreach (var kvp in servers)
                 {
                     string country = kvp.Key;
-                    ServerInfo serverInfo = kvp.Value;
+                    ServerInfo serverInfo = RuntimeSnapshot.Copy(kvp.Value);
                     if (serverInfo.VmessTemplate.Add == vmess.Add)
                     {
                         serverInfo.Inbounds = new List<Inbound> { serverInfo.Inbounds.FirstOrDefault(i => i.Port.ToString() == vmess.Port) };
@@ -7198,12 +7165,12 @@ public class TelegramBotService : IHostedService
 
                 accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB, ConfigLink = user.ConfigLink };
             }
-            await _userDbContext.SaveUserStatus(new User { Id = user.Id, SelectedCountry = findedcountry });
+            await _state.SaveUserStatus(new User { Id = user.Id, SelectedCountry = findedcountry });
             var result = await operationTiming.MeasureLegacyPanelCallAsync(() => UpdateAccount(accountDto));
 
             if (result)
             {
-                user = await _userDbContext.GetUserStatus(user.Id);
+                user = await _state.GetUserStatus(user.Id);
 
                 if (client == null)
                 {
@@ -7211,7 +7178,7 @@ public class TelegramBotService : IHostedService
                                   chatId: message.Chat.Id,
                                   text: "متاسفانه مشکلی در ساخت اکانت شما به وجود آمد. مجدداً دقایقی دیگر تلاش کنید",
                                    replyMarkup: MainReplyMarkupKeyboardFa());
-                    await _userDbContext.ClearUserStatus(user);
+                    await _state.ClearUserStatus(user);
                     return;
                 }
 
@@ -7227,7 +7194,8 @@ public class TelegramBotService : IHostedService
                     replyMarkup: MainReplyMarkupKeyboardFa());
 
                 long beforeBalance = credUser.AccountBalance;
-                await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice));
+                await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice),
+                    $"legacy-renew:{BotContextAccessor.CurrentBotId}:{message.Chat.Id}:{message.MessageId}:debit");
                 long afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
                 await _walletLedgerService.RecordAsync(
                     credUser.TelegramUserId,
@@ -7240,6 +7208,7 @@ public class TelegramBotService : IHostedService
                     referenceType: "legacy-renew",
                     referenceId: user.ConfigLink,
                     description: "Legacy account renewal",
+                    idempotencyKey: $"legacy-renew:{BotContextAccessor.CurrentBotId}:{message.Chat.Id}:{message.MessageId}:debit",
                     cancellationToken: CancellationToken.None);
                 await _userActivityLog.LogBotActionAsync(
                     "legacy_account_renewed",
@@ -7267,7 +7236,7 @@ public class TelegramBotService : IHostedService
                 if (user.SelectedPeriod == "1 Day")
                 {
                     user.LastFreeAcc = DateTime.Now;
-                    await _userDbContext.SaveUserStatus(user);
+                    await _state.SaveUserStatus(user);
                 }
 
             }
@@ -7287,11 +7256,11 @@ public class TelegramBotService : IHostedService
                 chatId: message.Chat.Id,
                 text: "مشکلی در بازیابی اطاعات اکانت ارسالی شما برای عملیات تمدید وجود دارد.",
                 replyMarkup: MainReplyMarkupKeyboardFa());
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
 
         }
 
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
 
     }
     /// <summary>
@@ -7312,7 +7281,7 @@ public class TelegramBotService : IHostedService
     {
         if (message.Text == "انصراف")
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return;
         }
 
@@ -7322,7 +7291,7 @@ public class TelegramBotService : IHostedService
                             replyMarkup: new ReplyKeyboardRemove());
 
 
-        var ready = await _userDbContext.IsUserReadyToCreate(message.From.Id);
+        var ready = await _state.IsUserReadyToCreate(message.From.Id);
         if (!ready) await botClient.CustomSendTextMessageAsync(
                    chatId: message.Chat.Id,
                    text: "مشخصات اکانت کامل نیست. لطفاً مراحل دریافت اکانت را به طور کامل طی کنید..",
@@ -7330,7 +7299,7 @@ public class TelegramBotService : IHostedService
 
         if (!ready)
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return;
         }
 
@@ -7349,7 +7318,7 @@ public class TelegramBotService : IHostedService
 
             if (result)
             {
-                user = await _userDbContext.GetUserStatus(user.Id);
+                user = await _state.GetUserStatus(user.Id);
 
                 ClientExtend client = await operationTiming.MeasureLegacyPanelCallAsync(() => TryGetClient(user.ConfigLink));
 
@@ -7364,7 +7333,7 @@ public class TelegramBotService : IHostedService
                                   chatId: message.Chat.Id,
                                   text: "متاسفانه مشکلی در ساخت اکانت شما به وجود آمد. مجدداً دقایقی دیگر تلاش کنید",
                                    replyMarkup: MainReplyMarkupKeyboardFa());
-                    await _userDbContext.ClearUserStatus(user);
+                    await _state.ClearUserStatus(user);
                     return;
                 }
 
@@ -7381,7 +7350,8 @@ public class TelegramBotService : IHostedService
                     replyMarkup: MainReplyMarkupKeyboardFa());
 
                 long beforeBalance = credUser.AccountBalance;
-                await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice));
+                await _credentialsDbContext.Pay(credUser, Convert.ToInt64(user._ConfigPrice),
+                    $"legacy-purchase:{BotContextAccessor.CurrentBotId}:{message.Chat.Id}:{message.MessageId}:debit");
                 long afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
                 await _walletLedgerService.RecordAsync(
                     credUser.TelegramUserId,
@@ -7394,6 +7364,7 @@ public class TelegramBotService : IHostedService
                     referenceType: "legacy-purchase",
                     referenceId: user.Email,
                     description: "Legacy account purchase",
+                    idempotencyKey: $"legacy-purchase:{BotContextAccessor.CurrentBotId}:{message.Chat.Id}:{message.MessageId}:debit",
                     cancellationToken: CancellationToken.None);
                 await _userActivityLog.LogBotActionAsync(
                     "legacy_account_purchased",
@@ -7422,13 +7393,13 @@ public class TelegramBotService : IHostedService
                 {
                     user.LastFreeAcc = DateTime.Now;
 
-                    await _userDbContext.SaveChangesAsync();
+                    await _workflow.SaveAsync();
                 }
                 else
                 {
                     user.AccountCounter = user.AccountCounter + 1;
-                    await _userDbContext.SaveUserStatus(user);
-                    await _userDbContext.ClearUserStatus(new User { Id = user.Id });
+                    await _state.SaveUserStatus(user);
+                    await _state.ClearUserStatus(new User { Id = user.Id });
                 }
 
             }
@@ -7452,10 +7423,10 @@ public class TelegramBotService : IHostedService
                 chatId: message.Chat.Id,
                 text: $"اطلاعات سرور مورد نظر پیدا نشد.",
                 replyMarkup: MainReplyMarkupKeyboardFa());
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
 
         }
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
 
     }
     /// <summary>
@@ -7606,6 +7577,13 @@ public class TelegramBotService : IHostedService
                (message.Contains("member list is inaccessible", StringComparison.OrdinalIgnoreCase) ||
                 message.Contains("chat not found", StringComparison.OrdinalIgnoreCase));
     }
+    /// <summary>Resolves legacy pricing and panel selection and saves the pending purchase or renewal values for this bot/user.</summary>
+    /// <param name="messageText">Required incoming plan label used to resolve the configured legacy price and account limits.</param>
+    /// <param name="credUser">Detached global credentials profile for the actor; wallet balances and personal fields must not enter diagnostics.</param>
+    /// <param name="user">Detached current bot/user state; explicit store writes reload their targets and never attach this snapshot.</param>
+    /// <param name="isForRenew">True selects renewal pricing; false selects creation pricing. This method does not debit the wallet.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>Reads configured legacy plans and saves only conversation selection. It does not provision an account or mutate a wallet.</remarks>
     private async Task PrepareAccount(string messageText, CredUser credUser, User user, bool isForRenew)
     {
 
@@ -7624,7 +7602,7 @@ public class TelegramBotService : IHostedService
         user.TotoalGB = priceConfig.Traffic.ToString();
         user.SelectedPeriod = priceConfig.Duration;
         user.SelectedCountry = pair.Key;
-        await _userDbContext.SaveUserStatus(user);
+        await _state.SaveUserStatus(user);
 
         // AccountDto accountDto = new AccountDto { TelegramUserId = user.Id, ServerInfo = serverInfo, SelectedCountry = pair.Key, SelectedPeriod = priceConfig.Duration, AccType = user.Type, TotoalGB = priceConfig.Traffic.ToString() };
 
@@ -8400,6 +8378,7 @@ public class TelegramBotService : IHostedService
     /// local payment row or calling the provider. Invalid persisted or crafted state returns to payment-method
     /// selection without provider contact. Disabling new invoices does not affect existing inquiry or settlement.
     /// </remarks>
+    /// <returns>A task completing after invoice creation and its payment link, or a validation/provider failure reply.</returns>
     private async Task CreateHooshPayWalletChargeAsync(
         Message message,
         CredUser credUser,
@@ -8424,7 +8403,7 @@ public class TelegramBotService : IHostedService
             user.LastStep = "payment_method_selection";
             user.Flow = "charge";
             user.PaymentMethod = string.Empty;
-            await _userDbContext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
             await ActiveBotClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: HooshPayAmountPolicy.BuildUserMessage(),
@@ -8440,8 +8419,8 @@ public class TelegramBotService : IHostedService
             CurrentHooshPayReturnUrl,
             message.Chat.Id);
 
-        _userDbContext.HooshPayPaymentInfos.Add(payment);
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        _workflow.Add(payment);
+        await _workflow.SaveAsync(cancellationToken);
 
         try
         {
@@ -8469,7 +8448,7 @@ public class TelegramBotService : IHostedService
                 throw new InvalidOperationException("HooshPay invoice response did not contain data.");
 
             payment.Apply(invoice.data);
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             var msg = await GetHooshPayPaymentMessage(credUser, payment);
             var inlineKeyboardMarkup = new InlineKeyboardMarkup(new[]
@@ -8515,7 +8494,7 @@ public class TelegramBotService : IHostedService
             if (latestMsg != null)
                 payment.TelMsgId = latestMsg.MessageId;
 
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
         }
         catch (HooshPayApiException ex)
         {
@@ -8536,7 +8515,7 @@ public class TelegramBotService : IHostedService
             payment.ErrorMessage = ex.Message;
             payment.RawResponseJson = ex.ResponseBody;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await ActiveBotClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -8561,7 +8540,7 @@ public class TelegramBotService : IHostedService
 
             payment.ErrorMessage = ex.Message;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await ActiveBotClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
@@ -8587,6 +8566,7 @@ public class TelegramBotService : IHostedService
     /// trigger authoritative inquiry. The displayed 12% is the gateway fee; UniquePay decides whether the
     /// <c>user</c>/<c>buyer</c> or owner bears it, while only the immutable local base amount can be credited.
     /// </remarks>
+    /// <returns>A task completing after durable invoice preparation and the non-retried provider request and customer response.</returns>
     private async Task CreateUniquePayWalletChargeAsync(
         Message message,
         CredUser credUser,
@@ -8611,7 +8591,7 @@ public class TelegramBotService : IHostedService
             user.LastStep = "payment_method_selection";
             user.Flow = "charge";
             user.PaymentMethod = string.Empty;
-            await _userDbContext.SaveUserStatus(user);
+            await _state.SaveUserStatus(user);
             await ActiveBotClient.SendTextMessageAsync(
                 message.Chat.Id,
                 UniquePayAmountPolicy.BuildUserMessage(),
@@ -8620,7 +8600,7 @@ public class TelegramBotService : IHostedService
             return;
         }
 
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
         var payment = UniquePayPaymentInfo.CreateWalletCharge(
             credUser.TelegramUserId,
             message.Chat.Id,
@@ -8636,8 +8616,8 @@ public class TelegramBotService : IHostedService
             redirectUrl = returnUrl,
             callbackUrl
         });
-        _userDbContext.UniquePayPaymentInfos.Add(payment);
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        _workflow.Add(payment);
+        await _workflow.SaveAsync(cancellationToken);
 
         try
         {
@@ -8652,7 +8632,7 @@ public class TelegramBotService : IHostedService
                 _appConfig.UniquePayReconciliationIntervalSeconds,
                 10,
                 3600));
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             var text = "✅ <b>فاکتور یونیک‌پی ساخته شد</b>\n\n" +
                        $"💰 مبلغ شارژ کیف پول: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
@@ -8672,7 +8652,7 @@ public class TelegramBotService : IHostedService
                 replyMarkup: keyboard,
                 cancellationToken: cancellationToken);
             payment.TelMsgId = sent.MessageId;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             await ActiveBotClient.SendTextMessageAsync(
                 message.Chat.Id,
                 "منوی اصلی",
@@ -8702,7 +8682,7 @@ public class TelegramBotService : IHostedService
                     10,
                     3600));
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             // Merchant hashes, response bodies, tokens, and request headers are excluded from this operational event.
             _logger.LogError(
@@ -8740,13 +8720,13 @@ public class TelegramBotService : IHostedService
         var value = callbackQuery.Data?["upchk_".Length..];
         if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var paymentId))
             return;
-        var payment = await _userDbContext.UniquePayPaymentInfos
+        var payment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos
             .AsNoTracking()
             .FirstOrDefaultAsync(
                 x => x.Id == paymentId &&
                      x.TelegramUserId == callbackQuery.From.Id &&
                      x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge,
-                cancellationToken);
+                cancellationToken));
         if (payment == null)
         {
             await ActiveBotClient.AnswerCallbackQueryAsync(
@@ -8765,9 +8745,9 @@ public class TelegramBotService : IHostedService
             payment.Id,
             "customer-check",
             cancellationToken);
-        var latest = await _userDbContext.UniquePayPaymentInfos
+        var latest = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos
             .AsNoTracking()
-            .FirstOrDefaultAsync(x => x.Id == payment.Id, cancellationToken);
+            .FirstOrDefaultAsync(x => x.Id == payment.Id, cancellationToken));
         var text = settlement.Status == NowPaymentsSettlementStatus.Applied
             ? "✅ پرداخت یونیک‌پی تایید و کیف پول شما شارژ شد."
             : settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded
@@ -8850,6 +8830,7 @@ public class TelegramBotService : IHostedService
     /// confirmation state is cleared before the provider request so tapping the old reply-keyboard command again does
     /// not create another invoice from the same owned-bot charge flow.
     /// </remarks>
+    /// <returns>A task completing after durable invoice preparation, provider creation, and the customer response.</returns>
     private async Task CreateTetraminatorWalletChargeAsync(
         Message message,
         CredUser credUser,
@@ -8872,7 +8853,7 @@ public class TelegramBotService : IHostedService
 
         // Consume the confirmed charge flow before the non-idempotent provider mutation. A failed or ambiguous create
         // remains auditable by its local payment row and cannot be silently repeated through the stale keyboard.
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
 
         var payment = TetraminatorPaymentInfo.CreateWalletCharge(
             credUser.TelegramUserId,
@@ -8886,15 +8867,15 @@ public class TelegramBotService : IHostedService
             callback_url = payment.CallbackUrl,
             order_id = payment.OrderId
         });
-        _userDbContext.TetraminatorPaymentInfos.Add(payment);
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        _workflow.Add(payment);
+        await _workflow.SaveAsync(cancellationToken);
 
         try
         {
             var invoice = await _tetraminator.CreateInvoiceAsync(amount, payment.CallbackUrl, cancellationToken);
             payment.RawResponseJson = JsonConvert.SerializeObject(invoice);
             payment.Apply(invoice);
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             var text = "✅ <b>فاکتور تترامیناتور ساخته شد</b>\n\n" +
                        $"💰 مبلغ: <code>{Html(amount.FormatCurrency())}</code>\n" +
@@ -8912,7 +8893,7 @@ public class TelegramBotService : IHostedService
                 replyMarkup: keyboard,
                 cancellationToken: cancellationToken);
             payment.TelMsgId = sent.MessageId;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             await ActiveBotClient.SendTextMessageAsync(
                 message.Chat.Id,
                 "منوی اصلی",
@@ -8927,7 +8908,7 @@ public class TelegramBotService : IHostedService
             payment.ErrorMessage = ex.Message;
             payment.RawResponseJson = ex is TetraminatorApiException providerError ? providerError.ResponseBody : null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             _logger.LogError(
                 ex,
                 "Tetraminator invoice creation failed. botId={BotId}, userId={UserId}, paymentId={PaymentId}, amountToman={AmountToman}",
@@ -8959,9 +8940,9 @@ public class TelegramBotService : IHostedService
         var value = callbackQuery.Data?["tmchk_".Length..];
         if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var paymentId))
             return;
-        var payment = await _userDbContext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+        var payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.FirstOrDefaultAsync(
             x => x.Id == paymentId && x.TelegramUserId == callbackQuery.From.Id,
-            cancellationToken);
+            cancellationToken));
         if (payment == null)
         {
             await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
@@ -9033,7 +9014,7 @@ public class TelegramBotService : IHostedService
             payment.PaymentStatus = TetraminatorStatuses.Paid;
             payment.PaidAtUtc ??= DateTime.UtcNow;
         }
-        await _userDbContext.SaveChangesAsync(cancellationToken);
+        await _workflow.SaveAsync(cancellationToken);
         return verified;
     }
 
@@ -9533,13 +9514,13 @@ public class TelegramBotService : IHostedService
 
         try
         {
-            var currentState = user ?? await _userDbContext.GetUserStatus(telegramUserId);
+            var currentState = user ?? await _state.GetUserStatus(telegramUserId);
             previousFlow = currentState?.Flow ?? string.Empty;
             previousLastStep = currentState?.LastStep ?? string.Empty;
 
             // Both stores are bot-scoped. Clearing them prevents a stale arbitrary-text handler or purchase selection
             // from resuming after the user deliberately returned to the referral main-menu screen.
-            await _userDbContext.ClearUserStatus(currentState ?? new User { Id = telegramUserId });
+            await _state.ClearUserStatus(currentState ?? new User { Id = telegramUserId });
             _xuiV3PurchaseSessionStore.Clear(telegramUserId);
 
             var dashboardMessage = await SendReferralDashboardAsync(botClient, message, cancellationToken);
@@ -9832,6 +9813,11 @@ public class TelegramBotService : IHostedService
             || value.StartsWith("/enable_", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>Resolves a private panel copy for a parsed legacy VMess link.</summary>
+    /// <param name="vmess">Required parsed customer link, including host and port; credentials must not be logged.</param>
+    /// <returns>A detached panel descriptor narrowed to the matching inbound.</returns>
+    /// <remarks>Mutating the returned template cannot affect concurrent customers or global configuration.</remarks>
+    /// <exception cref="Exception">The link is incomplete or no configured panel owns its host.</exception>
     static ServerInfo GetConfigServer(VMessConfiguration vmess)
     {
 
@@ -9845,7 +9831,7 @@ public class TelegramBotService : IHostedService
             foreach (var kvp in servers)
             {
                 string country = kvp.Key;
-                ServerInfo serverInfo = kvp.Value;
+                ServerInfo serverInfo = RuntimeSnapshot.Copy(kvp.Value);
                 if (serverInfo.VmessTemplate.Add == vmess.Add)
                 {
                     serverInfo.Inbounds = new List<Inbound> { serverInfo.Inbounds.FirstOrDefault(i => i.Port.ToString() == vmess.Port) };
@@ -9866,6 +9852,11 @@ public class TelegramBotService : IHostedService
 
     }
 
+    /// <summary>Resolves a private panel copy for a parsed legacy VLESS link.</summary>
+    /// <param name="vless">Required parsed customer link with a configured panel domain; never log its client credentials.</param>
+    /// <returns>A detached panel descriptor matching the link's domain.</returns>
+    /// <remarks>The returned descriptor belongs only to the caller's lookup operation.</remarks>
+    /// <exception cref="Exception">The link has no domain or its domain is absent from configuration.</exception>
     static ServerInfo GetConfigServerFromVless(Vless vless)
     {
 
@@ -9879,7 +9870,7 @@ public class TelegramBotService : IHostedService
             foreach (var kvp in servers)
             {
                 string country = kvp.Key;
-                ServerInfo serverInfo = kvp.Value;
+                ServerInfo serverInfo = RuntimeSnapshot.Copy(kvp.Value);
                 if (serverInfo.Vless.Domain == vless.Domain)
                 {
                     return serverInfo;
