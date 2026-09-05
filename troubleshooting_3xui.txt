@@ -1,0 +1,345 @@
+OUT="/root/3xui-debug-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$OUT"
+
+echo "Collecting 3x-ui diagnostics into: $OUT"
+
+# ============================================================
+# BASIC SYSTEM INFO
+# ============================================================
+
+{
+    echo "===== DATE ====="
+    date
+    date -u
+
+    echo
+    echo "===== UPTIME ====="
+    uptime
+
+    echo
+    echo "===== OS ====="
+    cat /etc/os-release 2>/dev/null
+
+    echo
+    echo "===== KERNEL ====="
+    uname -a
+
+    echo
+    echo "===== MEMORY ====="
+    free -h
+
+    echo
+    echo "===== DISK ====="
+    df -h
+    df -i
+
+    echo
+    echo "===== LOAD ====="
+    cat /proc/loadavg
+
+} > "$OUT/system.txt" 2>&1
+
+
+# ============================================================
+# X-UI SERVICE STATUS
+# ============================================================
+
+systemctl status x-ui --no-pager -l \
+    > "$OUT/x-ui-status.txt" 2>&1
+
+systemctl show x-ui \
+    > "$OUT/x-ui-systemd-show.txt" 2>&1
+
+systemctl cat x-ui \
+    > "$OUT/x-ui-service-unit.txt" 2>&1
+
+
+# ============================================================
+# COMPLETE X-UI JOURNAL - LAST 2 DAYS
+# ============================================================
+
+journalctl -u x-ui \
+    --since "2 days ago" \
+    --no-pager \
+    -o short-precise \
+    > "$OUT/x-ui-journal-2days.log" 2>&1
+
+
+# ============================================================
+# WARNINGS + ERRORS
+# ============================================================
+
+journalctl -u x-ui \
+    --since "2 days ago" \
+    --no-pager \
+    -p warning \
+    -o short-precise \
+    > "$OUT/x-ui-warning-error.log" 2>&1
+
+
+# ============================================================
+# IMPORTANT ERROR PATTERNS
+# ============================================================
+
+journalctl -u x-ui \
+    --since "2 days ago" \
+    --no-pager \
+    -o short-precise |
+grep -iE \
+'error|failed|failure|timeout|deadline|refused|reset|broken pipe|too many open|cannot assign|address already|bind|listen|dial|probe|outbound|testOutbounds|xray|panic|fatal|killed|oom|segfault|grpc|connection|temporary|resource|socket|port' \
+    > "$OUT/x-ui-interesting-errors.log" 2>&1 || true
+
+
+# ============================================================
+# RESTART / CRASH HISTORY
+# ============================================================
+
+journalctl -u x-ui \
+    --since "2 days ago" \
+    --no-pager \
+    -o short-precise |
+grep -iE \
+'start|stop|restart|exited|failed|killed|signal|panic|xray-core|SIGTERM|SIGKILL' \
+    > "$OUT/x-ui-restart-crash.log" 2>&1 || true
+
+
+# ============================================================
+# XRAY LOG DIRECTORY
+# ============================================================
+
+{
+    echo "===== /var/log/x-ui ====="
+    ls -lah /var/log/x-ui 2>/dev/null
+
+    echo
+    echo "===== FILE SIZES ====="
+    du -ah /var/log/x-ui 2>/dev/null | sort -h
+
+} > "$OUT/xray-log-files.txt" 2>&1
+
+
+# ============================================================
+# COPY XRAY LOG FILES
+# ============================================================
+
+mkdir -p "$OUT/xray-logs"
+
+find /var/log/x-ui \
+    -maxdepth 1 \
+    -type f \
+    -mtime -3 \
+    -exec cp -a {} "$OUT/xray-logs/" \; \
+    2>/dev/null || true
+
+
+# ============================================================
+# CURRENT PROCESSES
+# ============================================================
+
+{
+    echo "===== XRAY / X-UI PROCESSES ====="
+    ps auxww | grep -Ei '[x]-ui|[x]ray'
+
+    echo
+    echo "===== PROCESS TREE ====="
+    pstree -ap 2>/dev/null | grep -Ei 'x-ui|xray' || true
+
+} > "$OUT/processes.txt" 2>&1
+
+
+# ============================================================
+# SOCKETS / PORTS
+# ============================================================
+
+{
+    echo "===== LISTENING ====="
+    ss -lntup
+
+    echo
+    echo "===== SOCKET SUMMARY ====="
+    ss -s
+
+    echo
+    echo "===== TCP STATES ====="
+    ss -tan | awk '{print $1}' | sort | uniq -c | sort -nr
+
+} > "$OUT/network-sockets.txt" 2>&1
+
+
+# ============================================================
+# FILE DESCRIPTORS
+# ============================================================
+
+{
+    echo "===== SYSTEM FILE LIMIT ====="
+    cat /proc/sys/fs/file-nr
+    cat /proc/sys/fs/file-max
+
+    echo
+    echo "===== SHELL ULIMIT ====="
+    ulimit -a
+
+    echo
+    echo "===== X-UI FD COUNT ====="
+
+    for pid in $(pgrep -f '/x-ui|x-ui' 2>/dev/null); do
+        echo
+        echo "PID: $pid"
+        echo -n "FD count: "
+        ls "/proc/$pid/fd" 2>/dev/null | wc -l
+        grep -E 'Max open files|Max processes' "/proc/$pid/limits" 2>/dev/null
+    done
+
+    echo
+    echo "===== XRAY FD COUNT ====="
+
+    for pid in $(pgrep -f '[x]ray' 2>/dev/null); do
+        echo
+        echo "PID: $pid"
+        echo -n "FD count: "
+        ls "/proc/$pid/fd" 2>/dev/null | wc -l
+        grep -E 'Max open files|Max processes' "/proc/$pid/limits" 2>/dev/null
+    done
+
+} > "$OUT/file-descriptors.txt" 2>&1
+
+
+# ============================================================
+# KERNEL / OOM / NETWORK ERRORS
+# ============================================================
+
+journalctl -k \
+    --since "2 days ago" \
+    --no-pager \
+    -o short-precise \
+    > "$OUT/kernel-2days.log" 2>&1
+
+journalctl -k \
+    --since "2 days ago" \
+    --no-pager |
+grep -iE \
+'oom|out of memory|killed process|segfault|conntrack|nf_conntrack|table full|TCP|socket|memory|hung|blocked' \
+    > "$OUT/kernel-important.log" 2>&1 || true
+
+
+# ============================================================
+# NETWORK LIMITS
+# ============================================================
+
+{
+    echo "===== EPHEMERAL PORT RANGE ====="
+    cat /proc/sys/net/ipv4/ip_local_port_range
+
+    echo
+    echo "===== TIME WAIT ====="
+    ss -tan state time-wait | wc -l
+
+    echo
+    echo "===== ESTABLISHED ====="
+    ss -tan state established | wc -l
+
+    echo
+    echo "===== SYN SENT ====="
+    ss -tan state syn-sent | wc -l
+
+    echo
+    echo "===== CONNTRACK ====="
+    sysctl net.netfilter.nf_conntrack_count 2>/dev/null
+    sysctl net.netfilter.nf_conntrack_max 2>/dev/null
+
+} > "$OUT/network-limits.txt" 2>&1
+
+
+# ============================================================
+# CURRENT 3X-UI VERSION
+# ============================================================
+
+{
+    echo "===== x-ui command ====="
+    command -v x-ui
+    x-ui version 2>&1 || true
+
+    echo
+    echo "===== installed files ====="
+    ls -lah /usr/local/x-ui 2>/dev/null
+
+} > "$OUT/version.txt" 2>&1
+
+
+# ============================================================
+# PACKAGE EVERYTHING
+# ============================================================
+
+tar -czf "${OUT}.tar.gz" -C "$(dirname "$OUT")" "$(basename "$OUT")"
+
+echo
+echo "========================================"
+echo "DONE"
+echo "========================================"
+echo
+echo "Send me this file:"
+echo
+echo "${OUT}.tar.gz"
+echo
+ls -lh "${OUT}.tar.gz"
+
+
+
+
+
+
+
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+
+echo "===== DATE ====="
+date
+
+echo
+echo "===== XRAY PROCESSES ====="
+ps auxww | grep -Ei '[x]ray|[x]-ui'
+
+echo
+echo "===== SOCKET SUMMARY ====="
+ss -s
+
+echo
+echo "===== TCP STATES ====="
+ss -tan | awk '{print $1}' | sort | uniq -c | sort -nr
+
+echo
+echo "===== TIME_WAIT ====="
+ss -tan state time-wait | wc -l
+
+echo
+echo "===== SYN_SENT ====="
+ss -tan state syn-sent | wc -l
+
+echo
+echo "===== X-UI LAST 300 LOGS ====="
+journalctl -u x-ui -n 300 --no-pager -o short-precise
+
+echo
+echo "===== RELEVANT ERRORS ====="
+journalctl -u x-ui --since "-15 min" --no-pager -o short-precise |
+grep -iE 'probe|outbound|testOutbounds|xray|error|fail|timeout|deadline|dial|bind|socket|port|refused|too many open|cannot assign|resource'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

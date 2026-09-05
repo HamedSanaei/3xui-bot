@@ -639,7 +639,7 @@ public class MultiBotHostedService : IHostedService
 {
     private readonly BotRegistry _registry;
     private readonly BotClientProvider _clientProvider;
-    private readonly TelegramBotService _dispatcher;
+    private readonly ITelegramUpdateScheduler _scheduler;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly BotContextAccessor _botContextAccessor;
     private readonly BotRuntimeStatusStore _runtimeStatusStore;
@@ -647,6 +647,10 @@ public class MultiBotHostedService : IHostedService
     private readonly TimeSpan _startupProbeTimeout;
     private CancellationTokenSource _receivingCts;
     private readonly Dictionary<string, CancellationTokenSource> _botReceivers = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Tracked receiver generations; a replacement waits for its predecessor to exit.</summary>
+    private readonly Dictionary<string, Task> _receiverTasks = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Live receiver, initialization, and recovery tasks observed through host shutdown.</summary>
+    private readonly HashSet<Task> _backgroundTasks = new();
     private readonly Dictionary<string, SemaphoreSlim> _lifecycleGates = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>
     /// Process-local deduplication set ensuring repeated callbacks from one webhook-conflicted receiver schedule only
@@ -670,7 +674,7 @@ public class MultiBotHostedService : IHostedService
     /// </summary>
     /// <param name="registry">Registry of owned and tenant bots.</param>
     /// <param name="clientProvider">Telegram client provider.</param>
-    /// <param name="dispatcher">Shared update dispatcher.</param>
+    /// <param name="scheduler">Durable bounded scheduler; callbacks await admission rather than full dispatch.</param>
     /// <param name="scopeFactory">
     /// Factory used to create short-lived scopes for users.db cleanup when a tenant token is revoked or duplicated.
     /// </param>
@@ -685,10 +689,11 @@ public class MultiBotHostedService : IHostedService
     /// through <paramref name="registry" /> and are never read or logged by this constructor.
     /// </param>
     /// <param name="logger">Logger for receiver lifecycle events.</param>
+    /// <remarks>The host tracks receiver, initialization, and recovery lifetimes; each replacement waits for the previous receiver generation to terminate.</remarks>
     public MultiBotHostedService(
         BotRegistry registry,
         BotClientProvider clientProvider,
-        TelegramBotService dispatcher,
+        ITelegramUpdateScheduler scheduler,
         IServiceScopeFactory scopeFactory,
         BotContextAccessor botContextAccessor,
         BotRuntimeStatusStore runtimeStatusStore,
@@ -697,7 +702,7 @@ public class MultiBotHostedService : IHostedService
     {
         _registry = registry;
         _clientProvider = clientProvider;
-        _dispatcher = dispatcher;
+        _scheduler = scheduler;
         _scopeFactory = scopeFactory;
         _botContextAccessor = botContextAccessor;
         _runtimeStatusStore = runtimeStatusStore;
@@ -730,9 +735,9 @@ public class MultiBotHostedService : IHostedService
                 nonRetryableBotIds.Add(bot.Id);
         }
 
-        _ = Task.Run(
+        TrackBackgroundTask(Task.Run(
             () => RecoverMissingStartupReceiversAsync(nonRetryableBotIds, _receivingCts.Token),
-            CancellationToken.None);
+            CancellationToken.None));
     }
 
     /// <summary>
@@ -912,14 +917,21 @@ public class MultiBotHostedService : IHostedService
                 Client = client
             };
 
-            client.StartReceiving(
-                updateHandler: (_, update, token) => _dispatcher.DispatchUpdateAsync(client, update, context, token),
+            Task previousReceiver;
+            lock (_syncRoot) _receiverTasks.TryGetValue(bot.Id, out previousReceiver);
+            await TelegramReceiverLifetime.ObservePreviousAsync(previousReceiver, cancellationToken);
+
+            var receiverTask = client.ReceiveAsync(
+                updateHandler: (_, update, token) => _scheduler.EnqueueAsync(bot.Id, update, token),
                 pollingErrorHandler: (_, exception, token) => HandleBotPollingErrorAsync(bot.Id, exception, token),
                 receiverOptions: new ReceiverOptions
                 {
                     AllowedUpdates = Array.Empty<UpdateType>()
                 },
                 cancellationToken: botCts.Token);
+
+            lock (_syncRoot) _receiverTasks[bot.Id] = receiverTask;
+            TrackBackgroundTask(receiverTask);
 
             lock (_syncRoot)
                 _botReceivers[bot.Id] = botCts;
@@ -948,12 +960,12 @@ public class MultiBotHostedService : IHostedService
                     transientProbeError == null ? "روشن شد" : "روشن شد؛ در حال تکمیل اتصال",
                     null);
 
-            _ = Task.Run(
+            TrackBackgroundTask(Task.Run(
                 () => CompleteBotInitializationAsync(
                     bot.Id,
                     TelegramBotTokenIdentity.ExtractBotId(bot.Token),
                     parentToken),
-                CancellationToken.None);
+                CancellationToken.None));
 
             return BotStartupResult.Started;
         }
@@ -1464,7 +1476,8 @@ public class MultiBotHostedService : IHostedService
             };
             using (_botContextAccessor.Push(context))
             {
-                await _dispatcher.HandlePollingErrorAsync(client, exception, cancellationToken);
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                await scope.ServiceProvider.GetRequiredService<TelegramBotService>().HandlePollingErrorAsync(client, exception, cancellationToken);
             }
         }
         catch (Exception logException)
@@ -1496,7 +1509,7 @@ public class MultiBotHostedService : IHostedService
                 return;
         }
 
-        _ = Task.Run(
+        TrackBackgroundTask(Task.Run(
             async () =>
             {
                 try
@@ -1528,7 +1541,7 @@ public class MultiBotHostedService : IHostedService
                         _webhookConflictRecoveries.Remove(bot.Id);
                 }
             },
-            CancellationToken.None);
+            CancellationToken.None));
     }
 
     /// <summary>
@@ -2225,8 +2238,10 @@ public class MultiBotHostedService : IHostedService
     /// </summary>
     /// <param name="cancellationToken">Host shutdown token.</param>
     /// <returns>A completed task after cancellation tokens are disposed.</returns>
-    public Task StopAsync(CancellationToken cancellationToken)
+    /// <remarks>The host tracks receiver, initialization, and recovery lifetimes; each replacement waits for the previous receiver generation to terminate.</remarks>
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
+        _scheduler.StopAdmission();
         lock (_syncRoot)
         {
             foreach (var receiver in _botReceivers.ToList())
@@ -2239,8 +2254,26 @@ public class MultiBotHostedService : IHostedService
         }
 
         _receivingCts?.Cancel();
+        Task[] pending;
+        lock (_syncRoot) pending = _backgroundTasks.ToArray();
+        try { await Task.WhenAll(pending).WaitAsync(cancellationToken); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (Exception ex) { _logger.LogWarning("Receiver task ended during shutdown. ErrorType={ErrorType}", ex.GetType().Name); }
         _receivingCts?.Dispose();
-        return Task.CompletedTask;
+    }
+
+    /// <summary>Tracks a bot-lifecycle task and observes failures without keeping completed task history.</summary>
+    /// <param name="task">Required receiver or bot-scoped initialization/recovery lifetime.</param>
+    /// <remarks>The completion callback is synchronous and never dispatches work; all live tasks are awaited on shutdown.</remarks>
+    private void TrackBackgroundTask(Task task)
+    {
+        lock (_syncRoot) _backgroundTasks.Add(task);
+        task.GetAwaiter().OnCompleted(() =>
+        {
+            if (task.IsFaulted)
+                _logger.LogError("Bot lifecycle task failed. ErrorType={ErrorType}", task.Exception?.GetBaseException().GetType().Name);
+            lock (_syncRoot) _backgroundTasks.Remove(task);
+        });
     }
 
     /// <summary>

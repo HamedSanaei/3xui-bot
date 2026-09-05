@@ -337,16 +337,16 @@ public sealed class ReferralService
         "zibal"
     };
     /// <summary>
-    /// Process-local planner gate that reduces SQLite contention; database unique constraints remain the final
-    /// cross-process protection.
+    /// Coordinates planning and recovery per referred Telegram user across owned bots. Different users proceed
+    /// independently; durable uniqueness and wallet receipts remain the financial correctness boundary.
     /// </summary>
-    private static readonly SemaphoreSlim ProcessingGate = new(1, 1);
+    private static readonly AsyncKeyedGate ProcessingGate = new();
     /// <summary>Validated global referral pricing and eligibility snapshot used for newly planned events.</summary>
     private readonly ReferralOptions _options;
     /// <summary>Factory for independent users.db event, reward, and notification contexts.</summary>
     private readonly UserDbContextFactory _userDbContextFactory;
     /// <summary>Unchanged shared credentials wallet/profile store.</summary>
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly CredentialsStore _credentialsDbContext;
     /// <summary>Idempotent users.db ledger writer required for every referral wallet mutation.</summary>
     private readonly WalletLedgerService _walletLedgerService;
     /// <summary>Fail-soft owned-bot notification boundary.</summary>
@@ -363,10 +363,11 @@ public sealed class ReferralService
     /// <param name="walletLedgerService">Idempotent users.db wallet-ledger writer.</param>
     /// <param name="notificationSender">Fail-soft owned-bot notification sender.</param>
     /// <param name="logger">Operational logger for retryable reward failures.</param>
+    /// <remarks>Planning is coordinated by referred Telegram user across bots. Database uniqueness resolves races using fresh contexts; committed wallet receipts repair the separate ledger commit.</remarks>
     public ReferralService(
         IConfiguration configuration,
         UserDbContextFactory userDbContextFactory,
-        CredentialsDbContext credentialsDbContext,
+        CredentialsStore credentialsDbContext,
         WalletLedgerService walletLedgerService,
         IReferralNotificationSender notificationSender,
         ILogger<ReferralService> logger)
@@ -465,8 +466,8 @@ public sealed class ReferralService
         catch (DbUpdateException)
         {
             // A different owned bot or process may have inserted the immutable relationship after our lookup.
-            context.ChangeTracker.Clear();
-            existing = await context.ReferralRelationships
+            await using var recovery = _userDbContextFactory.CreateDbContext();
+            existing = await recovery.ReferralRelationships
                 .AsNoTracking()
                 .FirstOrDefaultAsync(x => x.ReferredTelegramUserId == referredTelegramUserId, cancellationToken);
             if (existing != null)
@@ -505,9 +506,10 @@ public sealed class ReferralService
             return;
         }
 
+        IDisposable processingLease;
         try
         {
-            await ProcessingGate.WaitAsync(cancellationToken);
+            processingLease = await ProcessingGate.EnterAsync(source.TelegramUserId.ToString(CultureInfo.InvariantCulture), cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -536,7 +538,7 @@ public sealed class ReferralService
         }
         finally
         {
-            ProcessingGate.Release();
+            processingLease.Dispose();
         }
     }
 
@@ -569,15 +571,12 @@ public sealed class ReferralService
 
         foreach (var eventId in eventIds)
         {
-            await ProcessingGate.WaitAsync(cancellationToken);
-            try
-            {
-                await ApplyEventRewardsAsync(eventId, cancellationToken);
-            }
-            finally
-            {
-                ProcessingGate.Release();
-            }
+            long referredUserId;
+            await using (var context = _userDbContextFactory.CreateDbContext())
+                referredUserId = await context.ReferralPaymentEvents.Where(x => x.Id == eventId)
+                    .Select(x => x.ReferredTelegramUserId).SingleAsync(cancellationToken);
+            using var processingLease = await ProcessingGate.EnterAsync(referredUserId.ToString(CultureInfo.InvariantCulture), cancellationToken);
+            await ApplyEventRewardsAsync(eventId, cancellationToken);
         }
 
         return eventIds.Count;
@@ -684,6 +683,7 @@ public sealed class ReferralService
     /// <param name="source">Validated final owned-bot wallet payment.</param>
     /// <param name="cancellationToken">Cancellation token for users.db planning work.</param>
     /// <returns>The event id, or <c>null</c> when no prior referral relationship is eligible.</returns>
+    /// <remarks>Planning is coordinated by referred Telegram user across bots. Database uniqueness resolves races using fresh contexts; committed wallet receipts repair the separate ledger commit.</remarks>
     private async Task<long?> EnsureEventAndRewardsAsync(
         ReferralPaymentSource source,
         CancellationToken cancellationToken)
@@ -714,19 +714,21 @@ public sealed class ReferralService
         }
         catch (DbUpdateException)
         {
-            context.ChangeTracker.Clear();
-            existingEvent = await context.ReferralPaymentEvents
+            await using var recovery = _userDbContextFactory.CreateDbContext();
+            existingEvent = await recovery.ReferralPaymentEvents
                 .FirstOrDefaultAsync(x => x.SourcePaymentKey == sourceKey, cancellationToken);
             if (existingEvent != null)
             {
-                await EnsureRewardRowsAsync(context, existingEvent, cancellationToken);
+                await EnsureRewardRowsAsync(recovery, existingEvent, cancellationToken);
                 return existingEvent.Id;
             }
 
             // Another process consumed the global first-payment slot; this eligible source becomes recurring.
             referralEvent = CreatePaymentEvent(source, sourceKey, relationship, isFirstEligible: false);
-            context.ReferralPaymentEvents.Add(referralEvent);
-            await context.SaveChangesAsync(cancellationToken);
+            recovery.ReferralPaymentEvents.Add(referralEvent);
+            await recovery.SaveChangesAsync(cancellationToken);
+            await EnsureRewardRowsAsync(recovery, referralEvent, cancellationToken);
+            return referralEvent.Id;
         }
 
         await EnsureRewardRowsAsync(context, referralEvent, cancellationToken);
@@ -772,6 +774,7 @@ public sealed class ReferralService
     /// <param name="referralEvent">Persisted event whose reward plan may be absent after an interrupted process.</param>
     /// <param name="cancellationToken">Cancellation token for reward lookup and insertion.</param>
     /// <returns>A task that completes after the idempotent reward plan is present.</returns>
+    /// <remarks>Planning is coordinated by referred Telegram user across bots. Database uniqueness resolves races using fresh contexts; committed wallet receipts repair the separate ledger commit.</remarks>
     private async Task EnsureRewardRowsAsync(
         UserDbContext context,
         ReferralPaymentEvent referralEvent,
@@ -798,8 +801,8 @@ public sealed class ReferralService
         catch (DbUpdateException)
         {
             // Composite reward uniqueness handles concurrent planning; the winning rows are loaded during apply.
-            context.ChangeTracker.Clear();
-            if (!await context.ReferralRewards.AnyAsync(x => x.ReferralPaymentEventId == referralEvent.Id, cancellationToken))
+            await using var recovery = _userDbContextFactory.CreateDbContext();
+            if (!await recovery.ReferralRewards.AnyAsync(x => x.ReferralPaymentEventId == referralEvent.Id, cancellationToken))
                 throw;
         }
     }
@@ -950,7 +953,7 @@ public sealed class ReferralService
     }
 
     /// <summary>
-    /// Applies one reward with a users.db state barrier while leaving the credentials database schema unchanged.
+    /// Applies one reward using its immutable credentials.db receipt and a separately reconciled users.db state.
     /// </summary>
     /// <param name="rewardId">Internal users.db reward id.</param>
     /// <param name="cancellationToken">Cancellation token for both databases.</param>
@@ -959,8 +962,8 @@ public sealed class ReferralService
     /// The reward is marked <c>crediting</c> in users.db before calling the existing credentials wallet API and
     /// <c>credited</c> immediately after that API succeeds. A <c>credited</c> reward can safely repair a missing
     /// ledger row without changing the wallet again. A process interruption that leaves <c>crediting</c> is treated
-    /// as financially ambiguous and is never retried automatically, because credentials.db intentionally has no
-    /// referral/idempotency table. This fail-closed rule prefers manual review over a duplicate wallet credit.
+    /// as financially ambiguous when no durable wallet receipt exists. The receipt reconciler repairs new committed
+    /// rewards without another credit; ambiguous historical records remain for manual review.
     /// </remarks>
     private async Task ApplyRewardAsync(long rewardId, CancellationToken cancellationToken)
     {
@@ -1014,13 +1017,16 @@ public sealed class ReferralService
                 reward.UpdatedAtUtc = DateTime.UtcNow;
                 await using (var intentContext = _userDbContextFactory.CreateDbContext())
                 {
-                    intentContext.ReferralRewards.Update(reward);
+                    var intent = await intentContext.ReferralRewards.SingleAsync(x => x.Id == rewardId, cancellationToken);
+                    intent.BalanceBefore = reward.BalanceBefore; intent.BalanceAfter = reward.BalanceAfter;
+                    intent.Status = reward.Status; intent.AttemptCount = reward.AttemptCount;
+                    intent.LastError = null; intent.UpdatedAtUtc = reward.UpdatedAtUtc;
                     await intentContext.SaveChangesAsync(cancellationToken);
                 }
 
                 var credited = await _credentialsDbContext.AddFund(
                     reward.BeneficiaryTelegramUserId,
-                    reward.RewardAmountToman);
+                    reward.RewardAmountToman, reward.WalletMutationKey);
                 if (!credited)
                 {
                     await using var missingUserContext = _userDbContextFactory.CreateDbContext();
@@ -1035,6 +1041,10 @@ public sealed class ReferralService
                     await missingUserContext.SaveChangesAsync(cancellationToken);
                     return;
                 }
+
+                var walletReceipt = await _credentialsDbContext.GetWalletOperationAsync(reward.WalletMutationKey, cancellationToken);
+                reward.BalanceBefore = walletReceipt.BeforeBalance;
+                reward.BalanceAfter = walletReceipt.AfterBalance;
 
                 // Once this durable state is written, reconciliation can repair ledger/state without another credit.
                 await using (var creditedContext = _userDbContextFactory.CreateDbContext())

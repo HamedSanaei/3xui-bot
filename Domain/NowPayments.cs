@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
@@ -674,9 +675,9 @@ namespace Adminbot.Domain
         /// <summary>
         /// Serializes local NOWPayments wallet settlement while database uniqueness remains the cross-process guard.
         /// </summary>
-        private static readonly SemaphoreSlim WalletSettlementGate = new(1, 1);
-        private readonly UserDbContext _userDbContext;
-        private readonly CredentialsDbContext _credentialsDbContext;
+        private static readonly AsyncKeyedGate WalletSettlementGate = new();
+        private readonly UserDbContextFactory _userDbContextFactory;
+        private readonly CredentialsStore _credentialsDbContext;
         private readonly BotClientProvider _botClientProvider;
         private readonly BotRegistry _botRegistry;
         private readonly BotContextAccessor _botContextAccessor;
@@ -689,7 +690,7 @@ namespace Adminbot.Domain
         /// <summary>
         /// Creates the settlement service that applies verified NOWPayments wallet charges.
         /// </summary>
-        /// <param name="userDbContext">users.db context containing NOWPayments rows and settlement metadata.</param>
+        /// <param name="userDbContext">Factory for operation-owned users.db contexts. Detached input rows are reloaded before writes.</param>
         /// <param name="credentialsDbContext">credentials.db context that owns shared wallet balances.</param>
         /// <param name="botClientProvider">Resolves the originating bot client used only for central log attribution.</param>
         /// <param name="botRegistry">Runtime bot registry used to resolve the payment's bot context for logging.</param>
@@ -704,8 +705,8 @@ namespace Adminbot.Domain
         /// NOWPayments reports a paid status.
         /// </remarks>
         public NowPaymentsSettlementService(
-            UserDbContext userDbContext,
-            CredentialsDbContext credentialsDbContext,
+            UserDbContextFactory userDbContext,
+            CredentialsStore credentialsDbContext,
             BotClientProvider botClientProvider,
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
@@ -714,7 +715,7 @@ namespace Adminbot.Domain
             NowPayments nowPayments,
             ILogger<NowPaymentsSettlementService> logger)
         {
-            _userDbContext = userDbContext;
+            _userDbContextFactory = userDbContext;
             _credentialsDbContext = credentialsDbContext;
             _botClientProvider = botClientProvider;
             _botRegistry = botRegistry;
@@ -749,6 +750,7 @@ namespace Adminbot.Domain
             long? notifyChatId = null,
             CancellationToken cancellationToken = default)
         {
+            var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (payment == null)
                 return NowPaymentsSettlementResult.NotFound();
 
@@ -758,9 +760,14 @@ namespace Adminbot.Domain
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
-            await WalletSettlementGate.WaitAsync(cancellationToken);
+            using var walletSettlementGateLease = await WalletSettlementGate.EnterAsync(payment.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
             try
             {
+                // Reload after the payment-keyed gate: another bot or webhook may have committed while this caller waited.
+                payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
+                await _workflow.ReloadAsync(payment, cancellationToken);
+                if (!string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.WalletCharge, StringComparison.OrdinalIgnoreCase) || !NowPaymentsStatuses.IsPaid(payment.PaymentStatus))
+                    return NowPaymentsSettlementResult.ProviderNotPaid();
                 var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
                 if (credUser == null)
                     return NowPaymentsSettlementResult.UserNotFound();
@@ -779,10 +786,12 @@ namespace Adminbot.Domain
                 var beforeBalance = credUser.AccountBalance;
                 var credited = await _credentialsDbContext.AddFund(
                     payment.TelegramUserId,
-                    payment.AmountToman);
+                    payment.AmountToman, $"payment:nowpayments:{payment.Id}:credit", botId: payment.BotId);
                 if (!credited)
                     return NowPaymentsSettlementResult.UserNotFound();
-                var afterBalance = checked(beforeBalance + payment.AmountToman);
+                var walletReceipt = await _credentialsDbContext.GetWalletOperationAsync($"payment:nowpayments:{payment.Id}:credit");
+                beforeBalance = walletReceipt.BeforeBalance;
+                var afterBalance = walletReceipt.AfterBalance;
 
                 payment.IsAddedToBalance = true;
                 payment.BalanceBefore = beforeBalance;
@@ -790,7 +799,7 @@ namespace Adminbot.Domain
                 payment.SettledAtUtc ??= DateTime.UtcNow;
                 // Persist delivery with the first-credit marker; retries never call this financial service.
                 var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
-                _userDbContext.PaymentSettlementNotifications.Add(
+                _workflow.Add(
                     PaymentSettlementNotification.CreateOwnedWalletCredit(
                         provider: "nowpayments",
                         providerPaymentId: payment.Id,
@@ -801,7 +810,7 @@ namespace Adminbot.Domain
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
                                      "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
                         createdAtUtc: payment.SettledAtUtc.Value));
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
 
                 await EnsureOriginalLedgerAsync(
                     payment,
@@ -827,7 +836,7 @@ namespace Adminbot.Domain
             }
             finally
             {
-                WalletSettlementGate.Release();
+                walletSettlementGateLease.Dispose();
             }
         }
 
@@ -841,7 +850,7 @@ namespace Adminbot.Domain
         /// <param name="cancellationToken">Cancellation token for wallet, payment row, ledger, and outbox work.</param>
         /// <returns>Applied/AlreadyAdded/missing-user/invalid-amount settlement status.</returns>
         /// <remarks>
-        /// Partial payments use a dedicated wallet and ledger idempotency key. They never call the referral service
+        /// Partial payments share the invoice's wallet and ledger key with final settlement and preserve partial approval evidence. They never call the referral service
         /// and therefore cannot consume first eligible payment status. Its one customer notification is enqueued with
         /// the first-credit marker and delivered independently.
         /// </remarks>
@@ -852,11 +861,16 @@ namespace Adminbot.Domain
             long? notifyChatId = null,
             CancellationToken cancellationToken = default)
         {
+            var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (payment == null)
                 return NowPaymentsSettlementResult.NotFound();
 
             if (creditedAmountToman <= 0)
                 return NowPaymentsSettlementResult.InvalidAmount();
+
+            using var paymentLease = await WalletSettlementGate.EnterAsync(payment.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
+            payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
+            await _workflow.ReloadAsync(payment, cancellationToken);
 
             var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
             if (credUser == null)
@@ -871,10 +885,12 @@ namespace Adminbot.Domain
             var beforeBalance = credUser.AccountBalance;
             var credited = await _credentialsDbContext.AddFund(
                 payment.TelegramUserId,
-                creditedAmountToman);
+                creditedAmountToman, $"payment:nowpayments:{payment.Id}:credit", botId: payment.BotId, approvalKind: "partial");
             if (!credited)
                 return NowPaymentsSettlementResult.UserNotFound();
-            var afterBalance = checked(beforeBalance + creditedAmountToman);
+            var walletReceipt = await _credentialsDbContext.GetWalletOperationAsync($"payment:nowpayments:{payment.Id}:credit");
+            beforeBalance = walletReceipt.BeforeBalance;
+            var afterBalance = walletReceipt.AfterBalance;
 
             payment.AmountToman = creditedAmountToman;
             payment.IsAddedToBalance = true;
@@ -898,7 +914,7 @@ namespace Adminbot.Domain
 
             // Partial settlement is still a one-time wallet credit and owns exactly one durable customer message.
             var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
-            _userDbContext.PaymentSettlementNotifications.Add(
+            _workflow.Add(
                 PaymentSettlementNotification.CreateOwnedWalletCredit(
                     provider: "nowpayments",
                     providerPaymentId: payment.Id,
@@ -910,7 +926,7 @@ namespace Adminbot.Domain
                                  "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
                     createdAtUtc: payment.SettledAtUtc.Value));
 
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             await _walletLedgerService.RecordAsync(
                 payment.TelegramUserId,
@@ -927,7 +943,7 @@ namespace Adminbot.Domain
                 botId: payment.BotId,
                 botUsername: payment.BotUsername,
                 botType: BotInstanceTypes.Owned,
-                idempotencyKey: partialMutationKey,
+                idempotencyKey: $"payment:nowpayments:{payment.Id}:credit",
                 cancellationToken: cancellationToken);
             using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
             {
@@ -1002,7 +1018,7 @@ namespace Adminbot.Domain
                 botId: payment.BotId,
                 botUsername: payment.BotUsername,
                 botType: BotInstanceTypes.Owned,
-                idempotencyKey: $"wallet-credit:{sourcePaymentKey}",
+                idempotencyKey: $"payment:nowpayments:{payment.Id}:credit",
                 cancellationToken: cancellationToken);
         }
 
@@ -1057,8 +1073,11 @@ namespace Adminbot.Domain
             long? notifyChatId = null,
             CancellationToken cancellationToken = default)
         {
+            var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (payment == null)
                 return NowPaymentsSettlementResult.NotFound();
+
+            payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
 
             if (payment.IsAddedToBalance)
                 return await ApplyFinishedPaymentAsync(payment, source, notifyChatId, cancellationToken);
@@ -1077,7 +1096,7 @@ namespace Adminbot.Domain
             {
                 payment.ErrorCode = "nowpayments_provider_check_failed";
                 payment.ErrorMessage = $"NOWPayments provider check failed; no balance was added. {ex.Message}";
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
@@ -1104,7 +1123,7 @@ namespace Adminbot.Domain
             {
                 payment.ErrorCode = "nowpayments_provider_not_paid";
                 payment.ErrorMessage = BuildProviderNotPaidMessage(payment, data, remoteStatus);
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
 
@@ -1113,7 +1132,7 @@ namespace Adminbot.Domain
             payment.ErrorMessage = null;
             payment.SetNowPaymentsData(data);
 
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             return await ApplyFinishedPaymentAsync(payment, source, notifyChatId, cancellationToken);
         }
 

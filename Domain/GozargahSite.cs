@@ -799,8 +799,10 @@ namespace Adminbot.Domain
         private const int NormalPlanId = 2;
         private const int UnlimitedPlanId = 5;
         private static readonly TimeSpan OptionalWebsiteLookupTimeout = TimeSpan.FromSeconds(4);
-        private readonly UserDbContext _userDbContext;
-        private readonly CredentialsDbContext _credentialsDbContext;
+        private readonly UserDbContextFactory _userDbContextFactory;
+        /// <summary>Prevents immediate send and recovery from sending the same outbox event concurrently; idle ids are removed.</summary>
+        private static readonly AsyncKeyedGate EventGate = new();
+        private readonly CredentialsStore _credentialsDbContext;
         private readonly GozargahSiteApiClient _apiClient;
         private readonly AppConfig _appConfig;
         private readonly ILogger<GozargahSiteSyncService> _logger;
@@ -808,19 +810,20 @@ namespace Adminbot.Domain
         /// <summary>
         /// Creates the sync service that owns mapping, outbox creation, immediate send, and site-wallet debits.
         /// </summary>
-        /// <param name="userDbContext">users.db context that stores sync outbox rows.</param>
+        /// <param name="userDbContext">Factory for operation-owned users.db contexts. Detached input rows are reloaded before writes.</param>
         /// <param name="credentialsDbContext">credentials.db context used only for reading bot-side block status and balances.</param>
         /// <param name="apiClient">Gozargah website API client.</param>
         /// <param name="configuration">Application configuration containing sync flags.</param>
         /// <param name="logger">Logger used for diagnostics.</param>
+        /// <remarks>Each retry execution resolves its own scope. Website requests occur outside local write transactions and retain their existing operation keys.</remarks>
         public GozargahSiteSyncService(
-            UserDbContext userDbContext,
-            CredentialsDbContext credentialsDbContext,
+            UserDbContextFactory userDbContext,
+            CredentialsStore credentialsDbContext,
             GozargahSiteApiClient apiClient,
             IConfiguration configuration,
             ILogger<GozargahSiteSyncService> logger)
         {
-            _userDbContext = userDbContext;
+            _userDbContextFactory = userDbContext;
             _credentialsDbContext = credentialsDbContext;
             _apiClient = apiClient;
             _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -1223,18 +1226,24 @@ namespace Adminbot.Domain
         /// <summary>
         /// Sends one pending outbox row to the website API.
         /// </summary>
-        /// <param name="syncEvent">Tracked outbox row to process.</param>
+        /// <param name="syncEvent">Detached persisted outbox row; its internal id is reloaded under the per-event gate before sending.</param>
         /// <param name="cancellationToken">Cancellation token for API and database work.</param>
         /// <returns><c>true</c> when the event reached a terminal succeeded or skipped state.</returns>
+        /// <remarks>The saved row is reloaded under a per-event gate. Website I/O holds no write transaction; terminal rows return without another send.</remarks>
         public async Task<bool> TrySendEventAsync(GozargahSiteSyncEvent syncEvent, CancellationToken cancellationToken = default)
         {
+            var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (syncEvent == null)
                 return false;
+
+            using var eventLease = await EventGate.EnterAsync(syncEvent.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
+            syncEvent = await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.SingleAsync(x => x.Id == syncEvent.Id, cancellationToken));
+            if (syncEvent.Status is GozargahSiteSyncStatuses.Succeeded or GozargahSiteSyncStatuses.Skipped) return true;
 
             if (!_apiClient.IsConfigured())
             {
                 MarkSkipped(syncEvent, "Gozargah site sync is disabled or not configured.");
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 return true;
             }
 
@@ -1243,7 +1252,7 @@ namespace Adminbot.Domain
                 if (syncEvent.TelegramUserId <= 0)
                 {
                     MarkSkipped(syncEvent, "Telegram user id is missing.");
-                    await _userDbContext.SaveChangesAsync(cancellationToken);
+                    await _workflow.SaveAsync(cancellationToken);
                     return true;
                 }
 
@@ -1251,14 +1260,14 @@ namespace Adminbot.Domain
                 if (!siteUser.Success || siteUser.Data == null)
                 {
                     MarkSkipped(syncEvent, siteUser.Message ?? "Gozargah site user was not found.");
-                    await _userDbContext.SaveChangesAsync(cancellationToken);
+                    await _workflow.SaveAsync(cancellationToken);
                     return true;
                 }
 
                 if (siteUser.Data.IsBanned)
                 {
                     MarkSkipped(syncEvent, "Gozargah site user is banned.");
-                    await _userDbContext.SaveChangesAsync(cancellationToken);
+                    await _workflow.SaveAsync(cancellationToken);
                     return true;
                 }
 
@@ -1269,7 +1278,7 @@ namespace Adminbot.Domain
                 if (RequiresUuid(syncEvent.Operation) && string.IsNullOrWhiteSpace(payload.Uuid))
                 {
                     MarkSkipped(syncEvent, "XUI UUID is missing. Re-run the super-admin sync so the account is read fresh from the 3x-ui panel.");
-                    await _userDbContext.SaveChangesAsync(cancellationToken);
+                    await _workflow.SaveAsync(cancellationToken);
                     return true;
                 }
 
@@ -1284,7 +1293,7 @@ namespace Adminbot.Domain
                     if (!response.Success && LooksLikeMissingOrder(response.Message))
                     {
                         MarkSkipped(syncEvent, "Gozargah site order was already absent; delete treated as completed.");
-                        await _userDbContext.SaveChangesAsync(cancellationToken);
+                        await _workflow.SaveAsync(cancellationToken);
                         return true;
                     }
                 }
@@ -1308,7 +1317,7 @@ namespace Adminbot.Domain
                     syncEvent.SiteOrderId = response.Id?.ToString(CultureInfo.InvariantCulture) ?? syncEvent.SiteOrderId;
                     syncEvent.SucceededAtUtc = DateTime.UtcNow;
                     syncEvent.LastError = null;
-                    await _userDbContext.SaveChangesAsync(cancellationToken);
+                    await _workflow.SaveAsync(cancellationToken);
                     return true;
                 }
 
@@ -1319,7 +1328,7 @@ namespace Adminbot.Domain
                     syncEvent.Status = GozargahSiteSyncStatuses.Failed;
                     syncEvent.LastError = response.Message;
                 }
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 return false;
             }
             catch (Exception ex)
@@ -1328,7 +1337,7 @@ namespace Adminbot.Domain
                 syncEvent.RetryCount++;
                 syncEvent.LastError = ex.Message;
                 syncEvent.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 _logger.LogWarning(ex, "Gozargah site sync event failed. eventId={EventId}", syncEvent.Id);
                 return false;
             }
@@ -1368,6 +1377,7 @@ namespace Adminbot.Domain
             string tenantBotId,
             CancellationToken cancellationToken)
         {
+            var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (!_appConfig.GozargahSiteSyncEnabled || payload == null)
                 return null;
 
@@ -1378,7 +1388,7 @@ namespace Adminbot.Domain
             if (ownership.SiteOwnerTelegramUserId <= 0)
                 return null;
 
-            var existing = await _userDbContext.GozargahSiteSyncEvents.FirstOrDefaultAsync(
+            var existing = await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.FirstOrDefaultAsync(
                 x => x.Operation == operation &&
                      x.TelegramUserId == ownership.SiteOwnerTelegramUserId &&
                      x.TenantBotId == ownership.TenantBotId &&
@@ -1387,7 +1397,7 @@ namespace Adminbot.Domain
                      x.Uuid == uuid &&
                      x.SubId == subId &&
                      x.Status == GozargahSiteSyncStatuses.Succeeded,
-                cancellationToken);
+                cancellationToken));
             if (existing != null)
                 return existing;
 
@@ -1408,8 +1418,8 @@ namespace Adminbot.Domain
                 Status = GozargahSiteSyncStatuses.Pending,
                 CreatedAtUtc = DateTime.UtcNow
             };
-            _userDbContext.GozargahSiteSyncEvents.Add(syncEvent);
-            await _userDbContext.SaveChangesAsync(cancellationToken);
+            _workflow.Add(syncEvent);
+            await _workflow.SaveAsync(cancellationToken);
             await TrySendEventAsync(syncEvent, cancellationToken);
             return syncEvent;
         }
@@ -1916,6 +1926,7 @@ namespace Adminbot.Domain
         /// </summary>
         /// <param name="stoppingToken">Cancellation token triggered when the host is shutting down.</param>
         /// <returns>A task that completes when the background worker stops.</returns>
+        /// <remarks>Each retry execution resolves its own scope. Website requests occur outside local write transactions and retain their existing operation keys.</remarks>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             using var timer = new PeriodicTimer(TimeSpan.FromMinutes(2));
@@ -1923,8 +1934,9 @@ namespace Adminbot.Domain
             {
                 try
                 {
-                    var db = _serviceProvider.GetRequiredService<UserDbContext>();
-                    var syncService = _serviceProvider.GetRequiredService<GozargahSiteSyncService>();
+                    await using var scope = _serviceProvider.CreateAsyncScope();
+                    var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+                    var syncService = scope.ServiceProvider.GetRequiredService<GozargahSiteSyncService>();
                     var events = await db.GozargahSiteSyncEvents
                         .Where(x => x.Status == GozargahSiteSyncStatuses.Pending || x.Status == GozargahSiteSyncStatuses.Failed)
                         .OrderBy(x => x.CreatedAtUtc)

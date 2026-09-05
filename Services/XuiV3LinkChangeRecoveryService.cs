@@ -14,11 +14,11 @@ using Telegram.Bot;
 public sealed class XuiV3LinkChangeRecoveryService : BackgroundService
 {
     private readonly XuiV3LinkChangeOperationStore _operationStore;
-    private readonly XuiV3BotFlowService _flowService;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly BotRegistry _botRegistry;
     private readonly BotClientProvider _botClientProvider;
     private readonly BotContextAccessor _botContextAccessor;
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly CredentialsStore _credentialsDbContext;
     private readonly ILogger<XuiV3LinkChangeRecoveryService> _logger;
     private readonly AppConfig _appConfig;
 
@@ -26,25 +26,26 @@ public sealed class XuiV3LinkChangeRecoveryService : BackgroundService
     /// Creates the recovery worker and its dependencies.
     /// </summary>
     /// <param name="operationStore">Durable users.db operation and lease store.</param>
-    /// <param name="flowService">Shared owned/tenant account processor used for safe read-back and reconciliation.</param>
+    /// <param name="scopeFactory">Creates an independent owned/tenant execution scope for each recovered account operation.</param>
     /// <param name="botRegistry">Registry used to resolve the exact bot that created each operation.</param>
     /// <param name="botClientProvider">Provider of the matching Telegram client for progress notifications.</param>
     /// <param name="botContextAccessor">Accessor used to restore bot and tenant attribution during recovery.</param>
     /// <param name="credentialsDbContext">Shared credentials store used only to load the original account owner.</param>
     /// <param name="logger">Operational logger for recovery failures and missing runtime dependencies.</param>
     /// <param name="configuration">Runtime configuration containing the recovery polling interval.</param>
+    /// <remarks>Each recovery attempt owns a disposable handler scope and performs only the existing saga-authorized read-back or mutation steps.</remarks>
     public XuiV3LinkChangeRecoveryService(
         XuiV3LinkChangeOperationStore operationStore,
-        XuiV3BotFlowService flowService,
+        IServiceScopeFactory scopeFactory,
         BotRegistry botRegistry,
         BotClientProvider botClientProvider,
         BotContextAccessor botContextAccessor,
-        CredentialsDbContext credentialsDbContext,
+        CredentialsStore credentialsDbContext,
         ILogger<XuiV3LinkChangeRecoveryService> logger,
         IConfiguration configuration)
     {
         _operationStore = operationStore;
-        _flowService = flowService;
+        _scopeFactory = scopeFactory;
         _botRegistry = botRegistry;
         _botClientProvider = botClientProvider;
         _botContextAccessor = botContextAccessor;
@@ -92,6 +93,7 @@ public sealed class XuiV3LinkChangeRecoveryService : BackgroundService
     /// <param name="operation">Claimed operation whose lease prevents concurrent processing.</param>
     /// <param name="cancellationToken">Application shutdown token.</param>
     /// <returns>A task that completes after processing or durable rescheduling.</returns>
+    /// <remarks>Each recovery attempt owns a disposable handler scope and performs only the existing saga-authorized read-back or mutation steps.</remarks>
     private async Task RecoverOneAsync(
         XuiV3LinkChangeOperation operation,
         CancellationToken cancellationToken)
@@ -124,7 +126,8 @@ public sealed class XuiV3LinkChangeRecoveryService : BackgroundService
             var botClient = _botClientProvider.GetClient(bot.Id);
             using (_botContextAccessor.Push(new BotRuntimeContext { Config = bot, Client = botClient }))
             {
-                await _flowService.RecoverAccountChangeLinkAsync(
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                await scope.ServiceProvider.GetRequiredService<XuiV3BotFlowService>().RecoverAccountChangeLinkAsync(
                     botClient,
                     operation,
                     credUser,

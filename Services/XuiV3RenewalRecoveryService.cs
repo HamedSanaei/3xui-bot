@@ -17,8 +17,7 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(15);
 
     private readonly XuiV3RenewalOperationStore _operationStore;
-    private readonly XuiV3BotFlowService _ownedFlowService;
-    private readonly TenantBotService _tenantBotService;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly BotRegistry _botRegistry;
     private readonly BotClientProvider _botClientProvider;
     private readonly BotContextAccessor _botContextAccessor;
@@ -30,17 +29,16 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
     /// Creates the renewal reconciliation worker.
     /// </summary>
     /// <param name="operationStore">Durable users.db operation, account-lock, lease, and backoff store.</param>
-    /// <param name="ownedFlowService">Owned-bot settlement entry point that reuses wallet idempotency guards.</param>
-    /// <param name="tenantBotService">Tenant settlement entry point that reuses the tenant fulfillment gate.</param>
+    /// <param name="scopeFactory">Creates an isolated service graph for each recovered settlement.</param>
     /// <param name="botRegistry">Runtime registry used to restore the operation's originating owned bot.</param>
     /// <param name="botClientProvider">Provider used to notify the payer after recovered owned settlement.</param>
     /// <param name="botContextAccessor">Accessor that scopes recovered logs and ledger metadata to the original bot.</param>
     /// <param name="configuration">Runtime XUI base URL, root path, token, and request timeout configuration.</param>
     /// <param name="logger">Local operational logger; UUID, normalized email, token, payload, and response body are omitted.</param>
+    /// <remarks>Each recovered renewal resolves a scoped owned or tenant settlement handler. Existing durable leases and GET-only recovery rules remain authoritative.</remarks>
     public XuiV3RenewalRecoveryService(
         XuiV3RenewalOperationStore operationStore,
-        XuiV3BotFlowService ownedFlowService,
-        TenantBotService tenantBotService,
+        IServiceScopeFactory scopeFactory,
         BotRegistry botRegistry,
         BotClientProvider botClientProvider,
         BotContextAccessor botContextAccessor,
@@ -48,8 +46,7 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
         ILogger<XuiV3RenewalRecoveryService> logger)
     {
         _operationStore = operationStore;
-        _ownedFlowService = ownedFlowService;
-        _tenantBotService = tenantBotService;
+        _scopeFactory = scopeFactory;
         _botRegistry = botRegistry;
         _botClientProvider = botClientProvider;
         _botContextAccessor = botContextAccessor;
@@ -207,8 +204,9 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
         XuiV3RenewalOperation operation,
         CancellationToken cancellationToken)
     {
+        await using var scope = _scopeFactory.CreateAsyncScope();
         if (!string.IsNullOrWhiteSpace(operation.TenantBotOrderId))
-            return await _tenantBotService.SettleRecoveredTenantRenewalAsync(operation, cancellationToken);
+            return await scope.ServiceProvider.GetRequiredService<TenantBotService>().SettleRecoveredTenantRenewalAsync(operation, cancellationToken);
 
         var bot = _botRegistry.Bots.FirstOrDefault(x =>
             string.Equals(x.Id, operation.BotId, StringComparison.OrdinalIgnoreCase));
@@ -218,7 +216,7 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
         var botClient = _botClientProvider.GetClient(bot.Id);
         using (_botContextAccessor.Push(new BotRuntimeContext { Config = bot, Client = botClient }))
         {
-            return await _ownedFlowService.SettleRecoveredOwnedRenewalAsync(
+            return await scope.ServiceProvider.GetRequiredService<XuiV3BotFlowService>().SettleRecoveredOwnedRenewalAsync(
                 botClient,
                 operation,
                 cancellationToken);

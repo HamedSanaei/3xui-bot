@@ -11,6 +11,8 @@ using Microsoft.EntityFrameworkCore;
 using Telegram.Bot.Types;
 using Microsoft.Extensions.Configuration; // Assuming ZibalPaymentInfo is here
 
+/// <summary>Checks queued Zibal payments using fresh execution scopes and durable wallet operation keys.</summary>
+/// <remarks>The legacy worker is retained for explicitly configured deployments; HTTP calls never share a database write transaction.</remarks>
 public class ZibalPaymentCheckerService : BackgroundService
 {
     private readonly IServiceProvider _serviceProvider;
@@ -21,6 +23,10 @@ public class ZibalPaymentCheckerService : BackgroundService
 
 
 
+    /// <summary>Creates a checker that resolves database and settlement services in disposable scopes.</summary>
+    /// <param name="serviceProvider">Root provider used only to create scopes.</param>
+    /// <param name="logger">Operational logger; provider credentials must not be logged.</param>
+    /// <param name="configuration">Private Zibal runtime settings.</param>
     public ZibalPaymentCheckerService(IServiceProvider serviceProvider, ILogger<ZibalPaymentCheckerService> logger, IConfiguration configuration)
     {
         _serviceProvider = serviceProvider;
@@ -59,6 +65,11 @@ public class ZibalPaymentCheckerService : BackgroundService
         //_logger.LogInformation("Loaded {Count} pending payments.", _paymentQueue.Count);
     }
 
+    /// <summary>Verifies queued payments and persists authoritative provider facts before invoking wallet settlement.</summary>
+    /// <param name="stoppingToken">Host cancellation for local reads and writes.</param>
+    /// <returns>A task completing when the current queue has been inspected.</returns>
+    /// <remarks>Settlement reloads its own payment row. Save provider facts first, then avoid attaching the old snapshot
+    /// over fields written by settlement. The unique credentials receipt prevents duplicate credits across callers.</remarks>
     private async Task ProcessPendingPaymentsAsync(CancellationToken stoppingToken)
     {
         while (_paymentQueue.TryDequeue(out var paymentInfo))
@@ -90,6 +101,7 @@ public class ZibalPaymentCheckerService : BackgroundService
                     // _logger.LogInformation("Payment with ID {Id} has been marked as paid.", paymentInfo.Id);
 
                     // Update user's balance or perform any other logic here
+                    await dbContext.SaveChangesAsync(stoppingToken);
                     await UpdateUserBalance(payment);
                 }
                 else if (inq.Status == 1)
@@ -111,20 +123,23 @@ public class ZibalPaymentCheckerService : BackgroundService
                     }
                 }
 
-                dbContext.ZibalPaymentInfos.Update(payment);
                 await dbContext.SaveChangesAsync(stoppingToken);
             }
         }
     }
 
+    /// <summary>Delegates one verified Zibal payment to durable wallet settlement in an independent scope.</summary>
+    /// <param name="paymentInfo">Detached or caller-tracked payment identity; settlement reloads the persisted target.</param>
+    /// <returns>A task completing after settlement and its notification attempt.</returns>
+    /// <remarks>No live context crosses the scope boundary and duplicate callers reuse the same wallet receipt key.</remarks>
     private async Task UpdateUserBalance(ZibalPaymentInfo paymentInfo)
     {
         CredUser credUser;
 
         using (var scope = _serviceProvider.CreateScope())
         {
-            var _credDbContext = scope.ServiceProvider.GetRequiredService<CredentialsDbContext>();
-            credUser = await _credDbContext.Users.FindAsync(paymentInfo.TelegramUserId);
+            var _credDbContext = scope.ServiceProvider.GetRequiredService<CredentialsStore>();
+            credUser = await _credDbContext.GetUserStatusWithId(paymentInfo.TelegramUserId);
         }
 
         using (var scope = _serviceProvider.CreateScope())

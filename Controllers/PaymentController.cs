@@ -18,13 +18,12 @@ using Newtonsoft.Json;
 [Route("nowpayments-ipn")]
 public class PaymentController : ControllerBase
 {
-    private static readonly SemaphoreSlim IpnLock = new SemaphoreSlim(1, 1);
-    private static readonly SemaphoreSlim HooshPayIpnLock = new SemaphoreSlim(1, 1);
-    private static readonly SemaphoreSlim TetraminatorCallbackLock = new(1, 1);
+    private static readonly AsyncKeyedGate IpnLock = new();
+    private static readonly AsyncKeyedGate HooshPayIpnLock = new();
+    private static readonly AsyncKeyedGate TetraminatorCallbackLock = new();
     /// <summary>Serializes UniquePay callback and browser-return triggers before authoritative inquiry.</summary>
-    private static readonly SemaphoreSlim UniquePayTriggerLock = new(1, 1);
+    private static readonly AsyncKeyedGate UniquePayTriggerLock = new();
 
-    private readonly UserDbContext _userDbcontext;
     /// <summary>Creates isolated users.db contexts for concurrent UniquePay HTTP triggers.</summary>
     private readonly UserDbContextFactory _userDbContextFactory;
     private readonly AppConfig _appConfig;
@@ -39,9 +38,8 @@ public class PaymentController : ControllerBase
     /// <summary>
     /// Creates the payment controller with all settlement services required by the IPN endpoints.
     /// </summary>
-    /// <param name="userDbContext">Runtime database containing local payment records.</param>
     /// <param name="userDbContextFactory">
-    /// Factory used by concurrent UniquePay callback and return requests so they never share an EF Core context.
+    /// Factory used by every callback and lookup. Read helpers return detached snapshots; action writes reload their targets in the saving context.
     /// </param>
     /// <param name="config">Application configuration containing gateway secrets.</param>
     /// <param name="settlementService">NOWPayments wallet settlement service.</param>
@@ -54,7 +52,6 @@ public class PaymentController : ControllerBase
     /// <param name="tenantBotService">Tenant storefront fulfillment service for direct HooshPay orders.</param>
     /// <param name="logger">Controller logger.</param>
     public PaymentController(
-        UserDbContext userDbContext,
         UserDbContextFactory userDbContextFactory,
         IConfiguration config,
         NowPaymentsSettlementService settlementService,
@@ -65,7 +62,6 @@ public class PaymentController : ControllerBase
         TenantBotService tenantBotService,
         ILogger<PaymentController> logger)
     {
-        _userDbcontext = userDbContext;
         _userDbContextFactory = userDbContextFactory ?? throw new ArgumentNullException(nameof(userDbContextFactory));
         _appConfig = config.Get<AppConfig>();
         _settlementService = settlementService;
@@ -95,15 +91,16 @@ public class PaymentController : ControllerBase
         [FromQuery(Name = "order_id")] string orderId,
         CancellationToken cancellationToken)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         if (string.IsNullOrWhiteSpace(orderId))
             return BadRequest(new { status = false, message = "order_id is required" });
 
-        await TetraminatorCallbackLock.WaitAsync(cancellationToken);
+        using var callbackLease = await TetraminatorCallbackLock.EnterAsync(orderId, cancellationToken);
         try
         {
-            var payment = await _userDbcontext.TetraminatorPaymentInfos.FirstOrDefaultAsync(
+            var payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.FirstOrDefaultAsync(
                 x => x.OrderId == orderId,
-                cancellationToken);
+                cancellationToken));
             if (payment == null)
                 return NotFound(new { status = false, message = "payment not found" });
 
@@ -119,7 +116,7 @@ public class PaymentController : ControllerBase
                 payment.ErrorMessage = verified ? null : errorCode;
                 if (!verified)
                 {
-                    await _userDbcontext.SaveChangesAsync(cancellationToken);
+                    await _workflow.SaveAsync(cancellationToken);
                     if (string.Equals(errorCode, "provider_not_paid", StringComparison.Ordinal))
                         return Accepted(new { status = true, settled = false, providerStatus = payment.PaymentStatus });
 
@@ -135,7 +132,7 @@ public class PaymentController : ControllerBase
 
                 payment.PaymentStatus = TetraminatorStatuses.Paid;
                 payment.PaidAtUtc ??= DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
                 var settlement = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase)
                     ? await _tenantBotService.ApplyPaidTenantOrderAsync(payment, "tetraminator-callback", cancellationToken)
                     : await _tetraminatorSettlementService.ApplyOfficialPaymentAsync(payment, "callback", cancellationToken: cancellationToken);
@@ -146,14 +143,14 @@ public class PaymentController : ControllerBase
                 payment.ErrorCode = "provider_inquiry_failed";
                 payment.ErrorMessage = ex.Message;
                 payment.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbcontext.SaveChangesAsync(CancellationToken.None);
+                await _workflow.SaveAsync(CancellationToken.None);
                 _logger.LogWarning(ex, "Tetraminator callback inquiry failed. paymentId={PaymentId}, orderId={OrderId}", payment.Id, payment.OrderId);
                 return StatusCode(StatusCodes.Status503ServiceUnavailable, new { status = false, message = "provider inquiry unavailable" });
             }
         }
         finally
         {
-            TetraminatorCallbackLock.Release();
+            callbackLease.Dispose();
         }
     }
 
@@ -234,7 +231,7 @@ public class PaymentController : ControllerBase
         string source,
         CancellationToken cancellationToken)
     {
-        await UniquePayTriggerLock.WaitAsync(cancellationToken);
+        using var callbackLease = await UniquePayTriggerLock.EnterAsync(hashId, cancellationToken);
         try
         {
             await using var context = _userDbContextFactory.CreateDbContext();
@@ -265,7 +262,7 @@ public class PaymentController : ControllerBase
         }
         finally
         {
-            UniquePayTriggerLock.Release();
+            callbackLease.Dispose();
         }
     }
 
@@ -301,9 +298,11 @@ public class PaymentController : ControllerBase
     /// HTTP 200 when the callback is accepted, 401 for invalid signatures, 400 for invalid JSON,
     /// or 404 when no local payment row can be matched.
     /// </returns>
+    /// <remarks>Lookups own factory contexts and return detached data. Callback writes reload payment rows under invoice-specific gates; provider and Telegram calls remain outside write transactions.</remarks>
     [HttpPost]
     public async Task<IActionResult> Receive(CancellationToken cancellationToken)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         var requestId = Guid.NewGuid().ToString("N")[..8];
         using var reader = new StreamReader(Request.Body);
         var body = await reader.ReadToEndAsync(cancellationToken);
@@ -388,7 +387,8 @@ public class PaymentController : ControllerBase
             body: body,
             signatureIsValid: true);
 
-        await IpnLock.WaitAsync(cancellationToken);
+        var matchedPayment = await FindPaymentAsync(ipn, cancellationToken);
+        using var callbackLease = await IpnLock.EnterAsync(matchedPayment?.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown", cancellationToken);
         try
         {
             var payment = await FindPaymentAsync(ipn, cancellationToken);
@@ -412,9 +412,10 @@ public class PaymentController : ControllerBase
                 return NotFound(new { message = "Payment was not found." });
             }
 
+            payment = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
             ApplyIpnToPayment(payment, ipn);
             payment.RawIpnJson = body;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
             LogIpnResult(
                 requestId,
                 stage: "payment-updated",
@@ -474,7 +475,7 @@ public class PaymentController : ControllerBase
         }
         finally
         {
-            IpnLock.Release();
+            callbackLease.Dispose();
         }
     }
 
@@ -510,9 +511,11 @@ public class PaymentController : ControllerBase
     /// HTTP 200 when the callback is accepted, 401 for invalid signatures, 400 for invalid JSON,
     /// or 404 when no local payment row can be matched.
     /// </returns>
+    /// <remarks>Lookups own factory contexts and return detached data. Callback writes reload payment rows under invoice-specific gates; provider and Telegram calls remain outside write transactions.</remarks>
     [HttpPost("/hooshpay-ipn")]
     public async Task<IActionResult> ReceiveHooshPay(CancellationToken cancellationToken)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         var requestId = Guid.NewGuid().ToString("N")[..8];
         using var reader = new StreamReader(Request.Body);
         var body = await reader.ReadToEndAsync(cancellationToken);
@@ -588,7 +591,8 @@ public class PaymentController : ControllerBase
             return BadRequest(new { message = "Empty IPN payload." });
         }
 
-        await HooshPayIpnLock.WaitAsync(cancellationToken);
+        var matchedPayment = await FindHooshPayPaymentAsync(ipn, cancellationToken);
+        using var callbackLease = await HooshPayIpnLock.EnterAsync(matchedPayment?.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown", cancellationToken);
         try
         {
             var payment = await FindHooshPayPaymentAsync(ipn, cancellationToken);
@@ -606,9 +610,10 @@ public class PaymentController : ControllerBase
                 return NotFound(new { message = "Payment was not found." });
             }
 
+            payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
             payment.Apply(ipn);
             payment.RawIpnJson = body;
-            await _userDbcontext.SaveChangesAsync(cancellationToken);
+            await _workflow.SaveAsync(cancellationToken);
 
             LogHooshPayIpnResult(
                 requestId,
@@ -675,7 +680,7 @@ public class PaymentController : ControllerBase
         }
         finally
         {
-            HooshPayIpnLock.Release();
+            callbackLease.Dispose();
         }
     }
 
@@ -787,20 +792,22 @@ public class PaymentController : ControllerBase
     /// <param name="ipn">Verified HooshPay IPN payload.</param>
     /// <param name="cancellationToken">Cancellation token for the database lookup.</param>
     /// <returns>Matched payment row, or null when the callback cannot be matched.</returns>
+    /// <remarks>Lookups own factory contexts and return detached data. Callback writes reload payment rows under invoice-specific gates; provider and Telegram calls remain outside write transactions.</remarks>
     private async Task<HooshPayPaymentInfo> FindHooshPayPaymentAsync(HooshPayIpn ipn, CancellationToken cancellationToken)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         if (!string.IsNullOrWhiteSpace(ipn.order_id))
         {
-            var byOrderId = await _userDbcontext.HooshPayPaymentInfos
-                .FirstOrDefaultAsync(p => p.OrderId == ipn.order_id, cancellationToken);
+            var byOrderId = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos
+                .FirstOrDefaultAsync(p => p.OrderId == ipn.order_id, cancellationToken));
             if (byOrderId != null)
                 return byOrderId;
         }
 
         if (!string.IsNullOrWhiteSpace(ipn.invoice))
         {
-            var byInvoiceUid = await _userDbcontext.HooshPayPaymentInfos
-                .FirstOrDefaultAsync(p => p.InvoiceUid == ipn.invoice, cancellationToken);
+            var byInvoiceUid = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos
+                .FirstOrDefaultAsync(p => p.InvoiceUid == ipn.invoice, cancellationToken));
             if (byInvoiceUid != null)
                 return byInvoiceUid;
         }
@@ -813,10 +820,13 @@ public class PaymentController : ControllerBase
     /// </summary>
     /// <param name="ipn">Incoming IPN that failed lookup.</param>
     /// <param name="cancellationToken">Cancellation token for diagnostic database queries.</param>
+    /// <returns>A task completing after redacted local lookup diagnostics have been written.</returns>
+    /// <remarks>Lookups own factory contexts and return detached data. Callback writes reload payment rows under invoice-specific gates; provider and Telegram calls remain outside write transactions.</remarks>
     private async Task LogHooshPayPaymentLookupMissAsync(HooshPayIpn ipn, CancellationToken cancellationToken)
     {
-        var totalCount = await _userDbcontext.HooshPayPaymentInfos.CountAsync(cancellationToken);
-        var latestPayments = await _userDbcontext.HooshPayPaymentInfos
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
+        var totalCount = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.CountAsync(cancellationToken));
+        var latestPayments = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos
             .OrderByDescending(p => p.Id)
             .Take(5)
             .Select(p => new
@@ -828,7 +838,7 @@ public class PaymentController : ControllerBase
                 p.CreatedAtUtc,
                 p.PaymentStatus
             })
-            .ToListAsync(cancellationToken);
+            .ToListAsync(cancellationToken));
 
         Console.WriteLine(
             $"[HooshPay IPN] lookup miss diagnostics: db=./Data/users.db, totalPayments={totalCount}, incomingOrderId={ipn?.order_id}, incomingInvoice={ipn?.invoice}");
@@ -846,36 +856,38 @@ public class PaymentController : ControllerBase
     /// <param name="ipn">Verified NOWPayments IPN payload.</param>
     /// <param name="cancellationToken">Cancellation token for database lookup.</param>
     /// <returns>Matched payment row, or null when the callback cannot be matched.</returns>
+    /// <remarks>Lookups own factory contexts and return detached data. Callback writes reload payment rows under invoice-specific gates; provider and Telegram calls remain outside write transactions.</remarks>
     private async Task<SwapinoPaymentInfo> FindPaymentAsync(NowPaymentsIpn ipn, CancellationToken cancellationToken)
     {
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
         if (!string.IsNullOrWhiteSpace(ipn.order_id))
         {
-            var byOrderId = await _userDbcontext.SwapinoPaymentInfos
-                .FirstOrDefaultAsync(p => p.OrderId == ipn.order_id, cancellationToken);
+            var byOrderId = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos
+                .FirstOrDefaultAsync(p => p.OrderId == ipn.order_id, cancellationToken));
             if (byOrderId != null)
                 return byOrderId;
         }
 
         if (!string.IsNullOrWhiteSpace(ipn.invoice_id))
         {
-            var byInvoiceId = await _userDbcontext.SwapinoPaymentInfos
-                .FirstOrDefaultAsync(p => p.InvoiceId == ipn.invoice_id, cancellationToken);
+            var byInvoiceId = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos
+                .FirstOrDefaultAsync(p => p.InvoiceId == ipn.invoice_id, cancellationToken));
             if (byInvoiceId != null)
                 return byInvoiceId;
         }
 
         if (!string.IsNullOrWhiteSpace(ipn.payment_id))
         {
-            var byPaymentId = await _userDbcontext.SwapinoPaymentInfos
-                .FirstOrDefaultAsync(p => p.PaymentId == ipn.payment_id, cancellationToken);
+            var byPaymentId = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos
+                .FirstOrDefaultAsync(p => p.PaymentId == ipn.payment_id, cancellationToken));
             if (byPaymentId != null)
                 return byPaymentId;
         }
 
-        var recentPayments = await _userDbcontext.SwapinoPaymentInfos
+        var recentPayments = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos
             .OrderByDescending(p => p.Id)
             .Take(200)
-            .ToListAsync(cancellationToken);
+            .ToListAsync(cancellationToken));
 
         return recentPayments.FirstOrDefault(p =>
         {
@@ -894,10 +906,13 @@ public class PaymentController : ControllerBase
     /// </summary>
     /// <param name="ipn">Incoming IPN that failed lookup.</param>
     /// <param name="cancellationToken">Cancellation token for diagnostic database queries.</param>
+    /// <returns>A task completing after redacted local lookup diagnostics have been written.</returns>
+    /// <remarks>Lookups own factory contexts and return detached data. Callback writes reload payment rows under invoice-specific gates; provider and Telegram calls remain outside write transactions.</remarks>
     private async Task LogPaymentLookupMissAsync(NowPaymentsIpn ipn, CancellationToken cancellationToken)
     {
-        var totalCount = await _userDbcontext.SwapinoPaymentInfos.CountAsync(cancellationToken);
-        var latestPayments = await _userDbcontext.SwapinoPaymentInfos
+        var _workflow = new UserWorkflowStore(_userDbContextFactory);
+        var totalCount = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.CountAsync(cancellationToken));
+        var latestPayments = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos
             .OrderByDescending(p => p.Id)
             .Take(5)
             .Select(p => new
@@ -910,7 +925,7 @@ public class PaymentController : ControllerBase
                 p.CreatedAtUtc,
                 p.PaymentStatus
             })
-            .ToListAsync(cancellationToken);
+            .ToListAsync(cancellationToken));
 
         Console.WriteLine(
             $"[NOWPayments IPN] lookup miss diagnostics: db=./Data/users.db, totalPayments={totalCount}, incomingOrderId={ipn?.order_id}, incomingInvoiceId={ipn?.invoice_id}, incomingPaymentId={ipn?.payment_id}");

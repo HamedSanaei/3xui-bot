@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.Security.Cryptography;
@@ -375,15 +376,15 @@ namespace Adminbot.Domain
     public class HooshPaySettlementService
     {
         /// <summary>
-        /// Serializes local HooshPay wallet settlement because the runtime currently uses shared singleton contexts.
+        /// Coordinates official and provisional settlement per payment while independent invoices proceed concurrently.
         /// </summary>
         /// <remarks>
         /// The gate covers official and provisional wallet credits so an IPN and a super-admin confirmation cannot
         /// observe the same unpaid row and create duplicate balance or ledger mutations.
         /// </remarks>
-        private static readonly SemaphoreSlim WalletSettlementGate = new(1, 1);
-        private readonly UserDbContext _userDbContext;
-        private readonly CredentialsDbContext _credentialsDbContext;
+        private static readonly AsyncKeyedGate WalletSettlementGate = new();
+        private readonly UserDbContextFactory _userDbContextFactory;
+        private readonly CredentialsStore _credentialsDbContext;
         private readonly BotClientProvider _botClientProvider;
         private readonly BotRegistry _botRegistry;
         private readonly BotContextAccessor _botContextAccessor;
@@ -395,7 +396,7 @@ namespace Adminbot.Domain
         /// <summary>
         /// Creates the wallet-charge settlement service.
         /// </summary>
-        /// <param name="userDbContext">Runtime database containing HooshPay rows.</param>
+        /// <param name="userDbContext">Factory for operation-owned users.db contexts. Detached input rows are reloaded before writes.</param>
         /// <param name="credentialsDbContext">Shared wallet/profile database.</param>
         /// <param name="botClientProvider">Resolves the originating bot client used only for central log attribution.</param>
         /// <param name="botRegistry">Runtime bot registry used to resolve payment bot metadata.</param>
@@ -403,9 +404,10 @@ namespace Adminbot.Domain
         /// <param name="walletLedgerService">Idempotent users.db ledger writer for every wallet mutation.</param>
         /// <param name="referralService">Global owned-bot referral engine invoked only after official final credits.</param>
         /// <param name="logger">Application logger.</param>
+        /// <remarks>Register settlement as scoped. The payment is reloaded after its invoice-specific gate; global wallet mutations use independent atomic receipt transactions.</remarks>
         public HooshPaySettlementService(
-            UserDbContext userDbContext,
-            CredentialsDbContext credentialsDbContext,
+            UserDbContextFactory userDbContext,
+            CredentialsStore credentialsDbContext,
             BotClientProvider botClientProvider,
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
@@ -413,7 +415,7 @@ namespace Adminbot.Domain
             ReferralService referralService,
             ILogger<HooshPaySettlementService> logger)
         {
-            _userDbContext = userDbContext;
+            _userDbContextFactory = userDbContext;
             _credentialsDbContext = credentialsDbContext;
             _botClientProvider = botClientProvider;
             _botRegistry = botRegistry;
@@ -432,7 +434,7 @@ namespace Adminbot.Domain
         /// <param name="cancellationToken">Cancellation token for wallet, users.db, ledger, referral, and outbox work.</param>
         /// <returns>Settlement result describing applied, duplicate, or missing-user state.</returns>
         /// <remarks>
-        /// Official and provisional wallet settlement share one process-wide gate so concurrent IPN and super-admin
+        /// Official and provisional wallet settlement share one payment-keyed gate so concurrent IPN and super-admin
         /// work cannot credit the same invoice twice. When a prior provisional credit exists, this method returns
         /// <c>AlreadyAdded</c>; official reconciliation is recorded separately before this method is called. The first
         /// credit enqueues one notification in the same users.db save as <c>IsAddedToBalance</c>; Telegram delivery is
@@ -444,15 +446,21 @@ namespace Adminbot.Domain
             long? notifyChatId = null,
             CancellationToken cancellationToken = default)
         {
+            var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (payment == null)
                 return NowPaymentsSettlementResult.NotFound();
 
             if (!IsWalletChargePayment(payment) || !HooshPayStatuses.IsPaid(payment.PaymentStatus))
                 return NowPaymentsSettlementResult.ProviderNotPaid();
 
-            await WalletSettlementGate.WaitAsync(cancellationToken);
+            using var walletSettlementGateLease = await WalletSettlementGate.EnterAsync(payment.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
             try
             {
+                // Reload after the payment-keyed gate: another bot or webhook may have committed while this caller waited.
+                payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
+                await _workflow.ReloadAsync(payment, cancellationToken);
+                if (!IsWalletChargePayment(payment) || !HooshPayStatuses.IsPaid(payment.PaymentStatus))
+                    return NowPaymentsSettlementResult.ProviderNotPaid();
                 var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
                 if (credUser == null)
                     return NowPaymentsSettlementResult.UserNotFound();
@@ -474,10 +482,12 @@ namespace Adminbot.Domain
                 var beforeBalance = credUser.AccountBalance;
                 var credited = await _credentialsDbContext.AddFund(
                     payment.TelegramUserId,
-                    payment.AmountToman);
+                    payment.AmountToman, $"payment:hooshpay:{payment.Id}:credit", botId: payment.BotId);
                 if (!credited)
                     return NowPaymentsSettlementResult.UserNotFound();
-                var afterBalance = checked(beforeBalance + payment.AmountToman);
+                var walletReceipt = await _credentialsDbContext.GetWalletOperationAsync($"payment:hooshpay:{payment.Id}:credit");
+                beforeBalance = walletReceipt.BeforeBalance;
+                var afterBalance = walletReceipt.AfterBalance;
 
                 payment.IsAddedToBalance = true;
                 payment.BalanceBefore = beforeBalance;
@@ -485,7 +495,7 @@ namespace Adminbot.Domain
                 payment.SettledAtUtc ??= DateTime.UtcNow;
                 // Persist delivery with the first-credit marker; the delivery-only worker cannot re-enter settlement.
                 var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
-                _userDbContext.PaymentSettlementNotifications.Add(
+                _workflow.Add(
                     PaymentSettlementNotification.CreateOwnedWalletCredit(
                         provider: "hooshpay",
                         providerPaymentId: payment.Id,
@@ -496,7 +506,7 @@ namespace Adminbot.Domain
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
                                      "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
                         createdAtUtc: payment.SettledAtUtc.Value));
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
 
                 await EnsureOriginalLedgerAsync(
                     payment,
@@ -521,7 +531,7 @@ namespace Adminbot.Domain
             }
             finally
             {
-                WalletSettlementGate.Release();
+                walletSettlementGateLease.Dispose();
             }
         }
 
@@ -553,15 +563,19 @@ namespace Adminbot.Domain
             long? notifyChatId = null,
             CancellationToken cancellationToken = default)
         {
+            var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (payment == null)
                 return NowPaymentsSettlementResult.NotFound();
 
             if (!IsWalletChargePayment(payment))
                 return NowPaymentsSettlementResult.InvalidAmount();
 
-            await WalletSettlementGate.WaitAsync(cancellationToken);
+            using var walletSettlementGateLease = await WalletSettlementGate.EnterAsync(payment.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
             try
             {
+                // Reload after the payment-keyed gate: another bot or webhook may have committed while this caller waited.
+                payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
+                await _workflow.ReloadAsync(payment, cancellationToken);
                 var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
                 if (credUser == null)
                     return NowPaymentsSettlementResult.UserNotFound();
@@ -573,10 +587,12 @@ namespace Adminbot.Domain
                 var beforeBalance = credUser.AccountBalance;
                 var credited = await _credentialsDbContext.AddFund(
                     payment.TelegramUserId,
-                    payment.AmountToman);
+                    payment.AmountToman, $"payment:hooshpay:{payment.Id}:credit", botId: payment.BotId, approvalKind: "provisional", approvedByTelegramUserId: approvedByTelegramUserId);
                 if (!credited)
                     return NowPaymentsSettlementResult.UserNotFound();
-                var afterBalance = checked(beforeBalance + payment.AmountToman);
+                var walletReceipt = await _credentialsDbContext.GetWalletOperationAsync($"payment:hooshpay:{payment.Id}:credit");
+                beforeBalance = walletReceipt.BeforeBalance;
+                var afterBalance = walletReceipt.AfterBalance;
 
                 // Keep provider status intact: this flag records a financial exception, not a fake HooshPay confirmation.
                 payment.IsAddedToBalance = true;
@@ -588,7 +604,7 @@ namespace Adminbot.Domain
                 payment.SettledAtUtc = DateTime.UtcNow;
                 // A later official confirmation reuses this credit and must not enqueue a second customer message.
                 var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
-                _userDbContext.PaymentSettlementNotifications.Add(
+                _workflow.Add(
                     PaymentSettlementNotification.CreateOwnedWalletCredit(
                         provider: "hooshpay",
                         providerPaymentId: payment.Id,
@@ -599,7 +615,7 @@ namespace Adminbot.Domain
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر تایید و افزایش یافت.\n" +
                                      "پس از تایید نهایی HooshPay، وضعیت درگاه نیز ثبت می‌شود.",
                         createdAtUtc: payment.SettledAtUtc.Value));
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
 
                 await _walletLedgerService.RecordAsync(
                     payment.TelegramUserId,
@@ -616,7 +632,7 @@ namespace Adminbot.Domain
                     botId: payment.BotId,
                     botUsername: payment.BotUsername,
                     botType: BotInstanceTypes.Owned,
-                    idempotencyKey: provisionalMutationKey,
+                    idempotencyKey: $"payment:hooshpay:{payment.Id}:credit",
                     cancellationToken: cancellationToken);
                 using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
                 {
@@ -634,7 +650,7 @@ namespace Adminbot.Domain
             }
             finally
             {
-                WalletSettlementGate.Release();
+                walletSettlementGateLease.Dispose();
             }
         }
 
@@ -699,7 +715,7 @@ namespace Adminbot.Domain
                 botId: payment.BotId,
                 botUsername: payment.BotUsername,
                 botType: BotInstanceTypes.Owned,
-                idempotencyKey: $"wallet-credit:{sourcePaymentKey}",
+                idempotencyKey: $"payment:hooshpay:{payment.Id}:credit",
                 cancellationToken: cancellationToken);
         }
 
@@ -739,6 +755,7 @@ namespace Adminbot.Domain
             string source,
             CancellationToken cancellationToken = default)
         {
+            var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (payment == null ||
                 !payment.IsProvisionallyApproved ||
                 !payment.IsAddedToBalance ||
@@ -748,15 +765,18 @@ namespace Adminbot.Domain
                 return false;
             }
 
-            await WalletSettlementGate.WaitAsync(cancellationToken);
+            using var walletSettlementGateLease = await WalletSettlementGate.EnterAsync(payment.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
             try
             {
+                // Reload after the payment-keyed gate: another bot or webhook may have committed while this caller waited.
+                payment = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.SingleAsync(x => x.Id == payment.Id, cancellationToken));
+                await _workflow.ReloadAsync(payment, cancellationToken);
                 if (payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue)
                     return false;
 
                 payment.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
                 payment.UpdatedAtUtc = DateTime.UtcNow;
-                await _userDbContext.SaveChangesAsync(cancellationToken);
+                await _workflow.SaveAsync(cancellationToken);
 
                 var credUser = await _credentialsDbContext.GetUserStatusWithId(payment.TelegramUserId);
                 using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
@@ -768,7 +788,7 @@ namespace Adminbot.Domain
             }
             finally
             {
-                WalletSettlementGate.Release();
+                walletSettlementGateLease.Dispose();
             }
         }
 

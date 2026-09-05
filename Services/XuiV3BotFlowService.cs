@@ -82,8 +82,8 @@ public class XuiV3BotFlowService
 
     private readonly XuiV3PurchaseService _purchaseService;
     private readonly XuiV3PurchaseSessionStore _sessionStore;
-    private readonly UserDbContext _userDbContext;
-    private readonly CredentialsDbContext _credentialsDbContext;
+    private readonly UserStateStore _state;
+    private readonly CredentialsStore _credentialsDbContext;
     private readonly IConfiguration _configuration;
     private readonly AppConfig _appConfig;
     private readonly ILogger<XuiV3BotFlowService> _logger;
@@ -102,15 +102,14 @@ public class XuiV3BotFlowService
     /// Resolves XUI v3 service plans, prices, and account-creation payloads from the configured plan file.
     /// </param>
     /// <param name="sessionStore">
-    /// Stores temporary purchase selections keyed by the Telegram user id while a customer moves through
+    /// Stores temporary purchase selections keyed by bot id and Telegram user id while a customer moves through
     /// the multi-step purchase flow.
     /// </param>
     /// <param name="userDbContext">
-    /// The users database context that stores bot-scoped conversation state and temporary flow values.
+    /// Factory-backed conversation store that reloads bot/user state for each explicit write.
     /// </param>
     /// <param name="credentialsDbContext">
-    /// The shared credentials database context that owns wallet balances and credential user profiles.
-    /// The schema of this database is not changed by this service.
+    /// Factory-backed global profile and wallet receipt store. Financial mutations commit a unique business key with the balance.
     /// </param>
     /// <param name="configuration">Application configuration used for XUI panel and plan settings.</param>
     /// <param name="logger">Logger used for operational diagnostics that are not customer-facing.</param>
@@ -149,8 +148,8 @@ public class XuiV3BotFlowService
     public XuiV3BotFlowService(
         XuiV3PurchaseService purchaseService,
         XuiV3PurchaseSessionStore sessionStore,
-        UserDbContext userDbContext,
-        CredentialsDbContext credentialsDbContext,
+        UserStateStore userDbContext,
+        CredentialsStore credentialsDbContext,
         IConfiguration configuration,
         ILogger<XuiV3BotFlowService> logger,
         UserActivityLogService activityLog,
@@ -163,7 +162,7 @@ public class XuiV3BotFlowService
     {
         _purchaseService = purchaseService;
         _sessionStore = sessionStore;
-        _userDbContext = userDbContext;
+        _state = userDbContext;
         _credentialsDbContext = credentialsDbContext;
         _configuration = configuration;
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -395,6 +394,15 @@ public class XuiV3BotFlowService
         return true;
     }
 
+    /// <summary>Consumes account-search input only when the current bot/user is in the account-search flow.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="credUser">Detached global credentials profile for the actor; wallet balances and personal fields must not enter diagnostics.</param>
+    /// <param name="user">Detached current bot/user state; explicit store writes reload their targets and never attach this snapshot.</param>
+    /// <param name="mainReplyMarkup">Reply markup selected for the current bot and user role, or null when no keyboard is required.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>True when this flow consumed the input, including handled validation or cancellation; false lets another route try it.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     public async Task<bool> TryHandleAccountSearchAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -414,7 +422,7 @@ public class XuiV3BotFlowService
 
         if (IsCancel(text))
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "جستجوی اکانت لغو شد.",
@@ -442,7 +450,7 @@ public class XuiV3BotFlowService
             return true;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = message.From.Id,
             Flow = AccountSearchFlowName,
@@ -461,6 +469,15 @@ public class XuiV3BotFlowService
         return true;
     }
 
+    /// <summary>Validates a pending account comment and applies it through the owner-checked XUI flow.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="credUser">Detached global credentials profile for the actor; wallet balances and personal fields must not enter diagnostics.</param>
+    /// <param name="user">Detached current bot/user state; explicit store writes reload their targets and never attach this snapshot.</param>
+    /// <param name="mainReplyMarkup">Reply markup selected for the current bot and user role, or null when no keyboard is required.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>True when this flow consumed the input, including handled validation or cancellation; false lets another route try it.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     public async Task<bool> TryHandleAccountCommentTextAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -477,7 +494,7 @@ public class XuiV3BotFlowService
         var text = message.Text.Trim();
         if (IsCancel(text))
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "تغییر کامنت لغو شد.",
@@ -500,7 +517,7 @@ public class XuiV3BotFlowService
 
         if (!int.TryParse(user.ConfigLink, out var clientId) || clientId <= 0)
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "شناسه اکانت برای تغییر کامنت معتبر نیست. لطفاً دوباره از لیست اکانت‌ها اقدام کنید.",
@@ -523,7 +540,7 @@ public class XuiV3BotFlowService
             mainReplyMarkup,
             cancellationToken);
 
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
         return true;
     }
 
@@ -716,7 +733,7 @@ public class XuiV3BotFlowService
             {
                 if (IsCancel(text))
                 {
-                    await _userDbContext.ClearUserStatus(user);
+                    await _state.ClearUserStatus(user);
                     await botClient.SendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "تمدید لغو شد.",
@@ -754,8 +771,8 @@ public class XuiV3BotFlowService
             if (!await EnsurePhoneVerifiedAsync(botClient, message.Chat.Id, credUser, cancellationToken))
                 return true;
 
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await _userDbContext.SaveUserStatus(new User
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = RenewFlowName,
@@ -998,8 +1015,8 @@ public class XuiV3BotFlowService
         CancellationToken cancellationToken)
     {
         // Keep the sensitive email/UUID pair only in this bot-scoped row; x3:rgo carries no reusable target identity.
-        await _userDbContext.ClearUserStatus(new User { Id = telegramUserId });
-        await _userDbContext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = telegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = telegramUserId,
             Flow = RenewFlowName,
@@ -1053,8 +1070,8 @@ public class XuiV3BotFlowService
         CancellationToken cancellationToken)
     {
         // Replace the warning/search state atomically at the conversation level so stale callbacks cannot change target.
-        await _userDbContext.ClearUserStatus(new User { Id = telegramUserId });
-        await _userDbContext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = telegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = telegramUserId,
             Flow = RenewFlowName,
@@ -1185,7 +1202,7 @@ public class XuiV3BotFlowService
         string text,
         CancellationToken cancellationToken)
     {
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
         await botClient.SendTextMessageAsync(
             chatId: chatId,
             text: text,
@@ -1236,7 +1253,7 @@ public class XuiV3BotFlowService
         {
             if (IsCancel(text) || string.Equals(text, "انصراف", StringComparison.OrdinalIgnoreCase))
             {
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "عملیات حذف اکانت‌های منقضی لغو شد.",
@@ -1267,7 +1284,7 @@ public class XuiV3BotFlowService
                 var emails = DeserializeEmailList(user.SubLink);
                 if (emails.Count == 0)
                 {
-                    await _userDbContext.ClearUserStatus(user);
+                    await _state.ClearUserStatus(user);
                     await botClient.SendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "لیست اکانت‌های منقضی خالی است. دوباره از منوی مدیریت اکانت اقدام کنید.",
@@ -1286,7 +1303,7 @@ public class XuiV3BotFlowService
                         credUser,
                         operationTiming,
                         source: "owned-expired-delete");
-                    await _userDbContext.ClearUserStatus(user);
+                    await _state.ClearUserStatus(user);
                     await botClient.SendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: $"دریافت اطلاعات اکانت‌ها ناموفق بود.\n{clientsResponse.Msg}",
@@ -1304,7 +1321,7 @@ public class XuiV3BotFlowService
 
                 if (eligibleClients.Count == 0)
                 {
-                    await _userDbContext.ClearUserStatus(user);
+                    await _state.ClearUserStatus(user);
                     await botClient.SendTextMessageAsync(
                         chatId: message.Chat.Id,
                         text: "اکانت منقضی قابل حذفی برای شما پیدا نشد.",
@@ -1318,7 +1335,7 @@ public class XuiV3BotFlowService
                 var deleted = bulkDeleteResponse.Success ? eligibleEmails : new List<string>();
                 var failed = bulkDeleteResponse.Success ? new List<string>() : eligibleEmails;
 
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
 
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
@@ -1387,7 +1404,7 @@ public class XuiV3BotFlowService
                     credUser,
                     operationTiming,
                     source: "owned-expired-delete");
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "در حذف اکانت‌های منقضی خطا رخ داد. جزئیات در لاگ ثبت شد.",
@@ -1436,8 +1453,8 @@ public class XuiV3BotFlowService
                 return true;
             }
 
-            await _userDbContext.ClearUserStatus(new User { Id = message.From.Id });
-            await _userDbContext.SaveUserStatus(new User
+            await _state.ClearUserStatus(new User { Id = message.From.Id });
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = DeleteExpiredFlowName,
@@ -1525,7 +1542,7 @@ public class XuiV3BotFlowService
     {
         if (IsCancel(message.Text))
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "تمدید لغو شد.",
@@ -1568,7 +1585,7 @@ public class XuiV3BotFlowService
                 return;
             }
 
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = RenewFlowName,
@@ -1599,7 +1616,7 @@ public class XuiV3BotFlowService
                 return;
             }
 
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = RenewFlowName,
@@ -1610,7 +1627,7 @@ public class XuiV3BotFlowService
                 RenewalSessionId = Guid.NewGuid().ToString("N")
             });
 
-            var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
+            var refreshedUser = await _state.GetUserStatus(message.From.Id);
             var previewClient = await GetAuthorizedRenewClientAsync(
                 BuildConfiguredPanelServerInfo(),
                 refreshedUser,
@@ -1668,7 +1685,7 @@ public class XuiV3BotFlowService
                 return;
             }
 
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = RenewFlowName,
@@ -1678,7 +1695,7 @@ public class XuiV3BotFlowService
                 RenewalSessionId = Guid.NewGuid().ToString("N")
             });
 
-            var refreshedUser = await _userDbContext.GetUserStatus(message.From.Id);
+            var refreshedUser = await _state.GetUserStatus(message.From.Id);
             var previewClient = await GetAuthorizedRenewClientAsync(
                 BuildConfiguredPanelServerInfo(),
                 refreshedUser,
@@ -1741,7 +1758,7 @@ public class XuiV3BotFlowService
             {
                 user.LastStep = RenewStepDuration;
                 user.SelectedPeriod = string.Empty;
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: XuiV3PurchaseService.BuildDurationSelectionText(
@@ -1763,7 +1780,7 @@ public class XuiV3BotFlowService
             {
                 user.LastStep = RenewStepUnlimitedPlan;
                 user.Type = string.Empty;
-                await _userDbContext.SaveUserStatus(user);
+                await _state.SaveUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: "پلن نامحدود انتخاب‌شده دیگر فعال نیست. پلن جدید را انتخاب کنید.",
@@ -1861,7 +1878,7 @@ public class XuiV3BotFlowService
                 },
                 cancellationToken);
 
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "⛔️ موجودی کیف پول شما برای تمدید کافی نیست.\n" +
@@ -1882,7 +1899,7 @@ public class XuiV3BotFlowService
                 cancellationToken);
             if (!siteWalletEligibility.CanUse && siteWalletEligibility.IsBlocked)
             {
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
                     text: $"پرداخت تمدید با کیف پول سایت گذرگاه ممکن نیست.\n{siteWalletEligibility.Message}",
@@ -2696,7 +2713,7 @@ public class XuiV3BotFlowService
 
         if (settlement.InProgress)
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "✅ تمدید با موفقیت انجام شد. پرداخت در حال انجام است و به‌زودی تکمیل می‌شود.",
@@ -2707,7 +2724,7 @@ public class XuiV3BotFlowService
 
         if (settlement.ManualReview)
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "✅ تمدید انجام شد؛ پرداخت در انتظار بررسی دستی است. لطفاً با پشتیبانی تماس بگیرید.",
@@ -2716,7 +2733,7 @@ public class XuiV3BotFlowService
             return;
         }
 
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
 
         client.TotalGB = payload.TotalGB;
         client.ExpiryTime = payload.ExpiryTime;
@@ -3093,22 +3110,21 @@ public class XuiV3BotFlowService
     }
 
     /// <summary>
-    /// Debits the bot wallet exactly once for a renewal using a pre-inserted final-form ledger row.
+    /// Debits the bot wallet exactly once for a renewal using an atomic durable wallet receipt.
     /// </summary>
     /// <param name="renewalOperation">Renewal operation whose operation id keys the ledger idempotency.</param>
     /// <param name="credUser">Payer whose bot wallet is debited; negative balances are allowed by business rules.</param>
     /// <param name="amountToman">Positive debit amount in Iranian toman.</param>
-    /// <param name="beforeBalance">Wallet balance in toman immediately before the debit.</param>
+    /// <param name="beforeBalance">Legacy caller's display snapshot in toman; deliberately ignored because only the committed receipt proves the balance.</param>
     /// <param name="clientEmail">XUI client email used as the ledger reference.</param>
     /// <param name="provider">Ledger provider such as <c>wallet</c> or the site-wallet fallback key.</param>
     /// <param name="description">Human-readable ledger description.</param>
     /// <param name="cancellationToken">Token that cancels the users.db ledger operations.</param>
     /// <returns>The persisted wallet balance after the single debit.</returns>
     /// <remarks>
-    /// The final-form ledger row (before and predicted after values) is written before <c>Pay</c>. A later executor
-    /// that finds the row reconciles by comparing the current balance with the predicted after value: an exact match
-    /// means the debit already happened and must never be repeated; otherwise the crashed executor never debited and
-    /// this call performs the single debit.
+    /// The credentials.db receipt and balance commit together before the users.db ledger is appended. Retries
+    /// recover the original receipt even if other bots changed this wallet afterward. A historical ledger without
+    /// a receipt requires manual review; current balance comparisons never authorize a second debit.
     /// </remarks>
     private async Task<long> DebitBotWalletExactlyOnceAsync(
         XuiV3RenewalOperation renewalOperation,
@@ -3120,34 +3136,19 @@ public class XuiV3BotFlowService
         string description,
         CancellationToken cancellationToken)
     {
-        var predictedAfter = beforeBalance - amountToman;
-        var (ledgerRow, existed) = await _renewalOperationStore.EnsureSettlementLedgerAsync(
-            renewalOperation,
-            credUser.TelegramUserId,
-            amountToman,
-            provider,
-            clientEmail,
-            description,
-            beforeBalance,
-            predictedAfter,
-            cancellationToken);
-
-        if (existed)
-        {
-            // A previous executor already wrote the final-form ledger row. Reconcile: if the balance already
-            // reflects the debit, the wallet was charged and must never be charged again.
-            var current = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
-            if (current == predictedAfter)
-                return current;
-
-            // The previous executor crashed before the debit completed; perform the single debit now.
-        }
-
-        await _credentialsDbContext.Pay(credUser, amountToman);
-        var afterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
-        if (!existed)
-            await _renewalOperationStore.FinalizeSettlementLedgerAsync(ledgerRow.Id, afterBalance, cancellationToken);
-        return afterBalance;
+        var key = XuiV3RenewalOperationStore.BuildSettlementLedgerKey(renewalOperation);
+        var receipt = await _credentialsDbContext.GetWalletOperationAsync(key, cancellationToken);
+        var ledgerKey = XuiV3RenewalOperationStore.BuildSettlementLedgerKey(renewalOperation);
+        if (receipt == null && await _walletLedgerService.GetByKeyAsync(ledgerKey, cancellationToken) != null)
+            throw new InvalidOperationException("Historical renewal debit requires manual review; no durable wallet receipt exists.");
+        receipt ??= await _credentialsDbContext.MutateWalletAsync(credUser.TelegramUserId, -amountToman, key, cancellationToken);
+        if (receipt == null) throw new InvalidOperationException("Renewal wallet owner does not exist.");
+        credUser.AccountBalance = receipt.AfterBalance;
+        await _walletLedgerService.RecordAsync(credUser.TelegramUserId, WalletLedgerDirections.Debit,
+            amountToman, receipt.BeforeBalance, receipt.AfterBalance, WalletLedgerReasons.AccountRenew,
+            provider: provider, referenceType: "xui-v3-client", referenceId: clientEmail,
+            description: description, idempotencyKey: ledgerKey, cancellationToken: cancellationToken);
+        return receipt.AfterBalance;
     }
 
     /// <summary>
@@ -3215,13 +3216,13 @@ public class XuiV3BotFlowService
 
         if (!await EnsurePhoneVerifiedAsync(botClient, message.Chat.Id, credUser, cancellationToken))
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return true;
         }
 
         await RefreshOwnedBotColleagueRoleFromGozargahAsync(credUser, cancellationToken);
 
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
         var selection = new XuiV3PurchaseSelection();
         _sessionStore.Set(credUser.TelegramUserId, selection);
 
@@ -3239,6 +3240,7 @@ public class XuiV3BotFlowService
 
         user.Flow = PurchaseFlowName;
         user.LastStep = PurchaseStepSelectService;
+        user.PurchaseSessionId = Guid.NewGuid().ToString("N");
         user.SelectedCountry = null;
         user.SelectedPeriod = null;
         user.Type = null;
@@ -3248,7 +3250,7 @@ public class XuiV3BotFlowService
         user._ConfigPrice = null;
         user.PendingAccountCount = 0;
         user.PendingUserComment = "";
-        await _userDbContext.SaveUserStatus(user);
+        await _state.SaveUserStatus(user);
         return true;
     }
 
@@ -3311,7 +3313,7 @@ public class XuiV3BotFlowService
         if (IsCancel(message.Text))
         {
             _sessionStore.Clear(credUser.TelegramUserId);
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "فرایند خرید لغو شد.",
@@ -3386,7 +3388,7 @@ public class XuiV3BotFlowService
             selection.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = PurchaseFlowName,
@@ -3422,7 +3424,7 @@ public class XuiV3BotFlowService
             selection.AccountCount = accountCount;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = PurchaseFlowName,
@@ -3462,7 +3464,7 @@ public class XuiV3BotFlowService
             selection.UserComment = userComment;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
-            await _userDbContext.SaveUserStatus(new User
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = PurchaseFlowName,
@@ -3517,7 +3519,7 @@ public class XuiV3BotFlowService
             selection.UnlimitedPlanKey = null;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = PurchaseFlowName,
@@ -3607,7 +3609,7 @@ public class XuiV3BotFlowService
 
         if (IsCancel(text))
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "فرایند دریافت اکانت تست لغو شد.",
@@ -3631,8 +3633,8 @@ public class XuiV3BotFlowService
 
         if (user?.Flow != TrialFlowName)
         {
-            await _userDbContext.ClearUserStatus(user);
-            await _userDbContext.SaveUserStatus(new User
+            await _state.ClearUserStatus(user);
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = TrialFlowName,
@@ -3671,7 +3673,7 @@ public class XuiV3BotFlowService
                 text: $"شما تست این سرویس را در ۳۰ روز گذشته دریافت کرده‌اید. لطفاً {remainingDays} روز دیگر دوباره تلاش کنید.",
                 replyMarkup: mainReplyMarkup,
                 cancellationToken: cancellationToken);
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return true;
         }
 
@@ -3694,6 +3696,7 @@ public class XuiV3BotFlowService
             trafficBytes,
             TrialDays,
             trialKey,
+            $"trial:{BotContextAccessor.CurrentBotId}:{credUser.TelegramUserId}:{serviceKey}:{lastTrial.Ticks}",
             cancellationToken);
 
         if (!creation.Success)
@@ -3723,14 +3726,14 @@ public class XuiV3BotFlowService
                 text: $"ساخت اکانت تست ناموفق بود.\n{XuiV3UserSafeError.ForAccountCreation(creation.Message)}",
                 replyMarkup: mainReplyMarkup,
                 cancellationToken: cancellationToken);
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             return true;
         }
 
         if (serviceKey == "national")
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastFreeNationalAcc = now });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, LastFreeNationalAcc = now });
         else
-            await _userDbContext.SaveUserStatus(new User { Id = message.From.Id, LastFreeNormalAcc = now });
+            await _state.SaveUserStatus(new User { Id = message.From.Id, LastFreeNormalAcc = now });
 
         var accountText = _purchaseService.BuildCreatedAccountText(creation);
         if (!string.IsNullOrWhiteSpace(creation.SubLink))
@@ -3754,7 +3757,7 @@ public class XuiV3BotFlowService
                 cancellationToken: cancellationToken);
         }
 
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
         LogXuiOperationOutcome(
             "ساخت اکانت تست نسخه ۳",
             "موفق",
@@ -3767,6 +3770,15 @@ public class XuiV3BotFlowService
         return true;
     }
 
+    /// <summary>Routes a pending colleague-role request using this bot/user conversation state.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="message">Incoming Telegram message from the current actor; required unless the route explicitly declines missing text.</param>
+    /// <param name="credUser">Detached global credentials profile for the actor; wallet balances and personal fields must not enter diagnostics.</param>
+    /// <param name="user">Detached current bot/user state; explicit store writes reload their targets and never attach this snapshot.</param>
+    /// <param name="mainReplyMarkup">Reply markup selected for the current bot and user role, or null when no keyboard is required.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>True when this flow consumed the input, including handled validation or cancellation; false lets another route try it.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     public async Task<bool> TryHandleColleagueRequestAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -3787,7 +3799,7 @@ public class XuiV3BotFlowService
 
         if (IsCancel(text))
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "درخواست همکاری لغو شد.",
@@ -3798,7 +3810,7 @@ public class XuiV3BotFlowService
 
         if (credUser?.IsColleague == true)
         {
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "حساب شما هم‌اکنون از نوع همکار است و نیازی به ثبت درخواست جدید نیست.",
@@ -3809,8 +3821,8 @@ public class XuiV3BotFlowService
 
         if (user?.Flow != ColleagueRequestFlowName)
         {
-            await _userDbContext.ClearUserStatus(user);
-            await _userDbContext.SaveUserStatus(new User
+            await _state.ClearUserStatus(user);
+            await _state.SaveUserStatus(new User
             {
                 Id = message.From.Id,
                 Flow = ColleagueRequestFlowName,
@@ -3853,7 +3865,7 @@ public class XuiV3BotFlowService
             },
             cancellationToken);
 
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
         await botClient.SendTextMessageAsync(
             chatId: message.Chat.Id,
             text: "درخواست همکاری شما ثبت شد و برای بررسی به سوپرادمین‌ها ارسال شد.\nبعد از بررسی، نتیجه از طریق پشتیبانی یا همین ربات به شما اطلاع داده می‌شود.",
@@ -4264,7 +4276,7 @@ public class XuiV3BotFlowService
             user.Type = null;
             user.TotoalGB = null;
             user._ConfigPrice = null;
-            await _userDbContext.ClearUserStatus(user);
+            await _state.ClearUserStatus(user);
 
             if (messageId != 0)
             {
@@ -4298,7 +4310,7 @@ public class XuiV3BotFlowService
             selection.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selection);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = credUser.TelegramUserId,
                 Flow = PurchaseFlowName,
@@ -4360,7 +4372,7 @@ public class XuiV3BotFlowService
             selectionState.AccountCount = count;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = credUser.TelegramUserId,
                 Flow = PurchaseFlowName,
@@ -4416,7 +4428,7 @@ public class XuiV3BotFlowService
             selectionState.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = credUser.TelegramUserId,
                 Flow = PurchaseFlowName,
@@ -4477,7 +4489,7 @@ public class XuiV3BotFlowService
             selectionState.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = credUser.TelegramUserId,
                 Flow = PurchaseFlowName,
@@ -4556,7 +4568,7 @@ public class XuiV3BotFlowService
             selectionState.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = credUser.TelegramUserId,
                 Flow = PurchaseFlowName,
@@ -4631,7 +4643,7 @@ public class XuiV3BotFlowService
             selectionState.UserComment = null;
             _sessionStore.Set(credUser.TelegramUserId, selectionState);
 
-            await _userDbContext.ResetUserStatus(new User
+            await _state.ResetUserStatus(new User
             {
                 Id = credUser.TelegramUserId,
                 Flow = PurchaseFlowName,
@@ -4809,6 +4821,12 @@ public class XuiV3BotFlowService
                 var serverInfo = BuildConfiguredPanelServerInfo();
                 Console.WriteLine($"[XUIv3] using configured panel url={serverInfo.Url}, rootPath={serverInfo.RootPath}, token={(string.IsNullOrWhiteSpace(serverInfo.ApiToken) ? "missing" : "set")}");
 
+                if (string.IsNullOrWhiteSpace(user.PurchaseSessionId))
+                {
+                    user.PurchaseSessionId = Guid.NewGuid().ToString("N");
+                    await _state.SaveUserStatus(user);
+                }
+
                 var bulkResult = await _purchaseService.CreateBulkAccountsAsync(
                     credUser,
                     serverInfo,
@@ -4816,6 +4834,7 @@ public class XuiV3BotFlowService
                     serverInfo.Url,
                     new XuiV3BulkCreateOptions
                     {
+                        BulkOrderId = $"purchase:{BotContextAccessor.CurrentBotId}:{user.PurchaseSessionId}",
                         AccountCount = accountCount,
                         UserComment = selection.UserComment,
                         CreatedByTelegramUserId = credUser.TelegramUserId,
@@ -4920,6 +4939,35 @@ public class XuiV3BotFlowService
                     siteWalletDebitResult = debitResult;
                 }
 
+                var bulkBeforeBalance = useSiteWallet && siteWalletDebitResult?.Success == true
+                    ? siteWalletDebitResult.BeforeWallet
+                    : credUser.AccountBalance;
+                var bulkAfterBalance = useSiteWallet && siteWalletDebitResult?.Success == true
+                    ? siteWalletDebitResult.AfterWallet
+                    : bulkBeforeBalance;
+                if (!useSiteWallet)
+                {
+                    if (bulkResult.TotalSuccessfulPriceToman > 0)
+                        await _credentialsDbContext.Pay(credUser, bulkResult.TotalSuccessfulPriceToman, $"purchase:{bulkResult.BulkOrderId}:debit");
+                    bulkAfterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
+                    // One ledger row represents the whole successful bulk purchase so the order can be
+                    // audited without creating a noisy transaction per generated account.
+                    await _walletLedgerService.RecordAsync(
+                        credUser.TelegramUserId,
+                        WalletLedgerDirections.Debit,
+                        bulkResult.TotalSuccessfulPriceToman,
+                        bulkBeforeBalance,
+                        bulkAfterBalance,
+                        WalletLedgerReasons.AccountPurchase,
+                        provider: "wallet",
+                        referenceType: "xui-v3-bulk",
+                        referenceId: bulkResult.BulkOrderId,
+                        orderId: bulkResult.BulkOrderId,
+                        description: string.Join(", ", bulkResult.CreatedAccounts.Select(x => x.Email).Take(10)),
+                        idempotencyKey: $"purchase:{bulkResult.BulkOrderId}:debit",
+                        cancellationToken: cancellationToken);
+                }
+
                 if (messageId != 0)
                 {
                     await SafeEditMessageTextAsync(
@@ -4977,34 +5025,6 @@ public class XuiV3BotFlowService
                         cancellationToken: cancellationToken);
                 }
 
-                var bulkBeforeBalance = useSiteWallet && siteWalletDebitResult?.Success == true
-                    ? siteWalletDebitResult.BeforeWallet
-                    : credUser.AccountBalance;
-                var bulkAfterBalance = useSiteWallet && siteWalletDebitResult?.Success == true
-                    ? siteWalletDebitResult.AfterWallet
-                    : bulkBeforeBalance;
-                if (!useSiteWallet)
-                {
-                    if (bulkResult.TotalSuccessfulPriceToman > 0)
-                        await _credentialsDbContext.Pay(credUser, bulkResult.TotalSuccessfulPriceToman);
-                    bulkAfterBalance = await _credentialsDbContext.GetAccountBalance(credUser.TelegramUserId);
-                    // One ledger row represents the whole successful bulk purchase so the order can be
-                    // audited without creating a noisy transaction per generated account.
-                    await _walletLedgerService.RecordAsync(
-                        credUser.TelegramUserId,
-                        WalletLedgerDirections.Debit,
-                        bulkResult.TotalSuccessfulPriceToman,
-                        bulkBeforeBalance,
-                        bulkAfterBalance,
-                        WalletLedgerReasons.AccountPurchase,
-                        provider: "wallet",
-                        referenceType: "xui-v3-bulk",
-                        referenceId: bulkResult.BulkOrderId,
-                        orderId: bulkResult.BulkOrderId,
-                        description: string.Join(", ", bulkResult.CreatedAccounts.Select(x => x.Email).Take(10)),
-                        cancellationToken: cancellationToken);
-                }
-
                 LogV3Purchase(
                     title: accountCount > 1 ? "ساخت انبوه اکانت نسخه ۳" : "ساخت اکانت نسخه ۳",
                     credUser: credUser,
@@ -5050,7 +5070,7 @@ public class XuiV3BotFlowService
                     cancellationToken);
 
                 _sessionStore.Clear(credUser.TelegramUserId);
-                await _userDbContext.ClearUserStatus(user);
+                await _state.ClearUserStatus(user);
                 await botClient.SendTextMessageAsync(
                     chatId: chatId,
                     text: "✅ خرید با موفقیت انجام شد.\n\n" +
@@ -5100,6 +5120,14 @@ public class XuiV3BotFlowService
         return false;
     }
 
+    /// <summary>Starts an account-search conversation for the specified user in the active bot.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="chatId">Telegram destination chat id in the active bot, not an internal user or tenant database id.</param>
+    /// <param name="telegramUserId">Positive Telegram actor id owning the conversation in the active bot.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <param name="messageId">Telegram message id to edit; zero or null, as allowed by the signature, requests a new message.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task StartAccountSearchAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -5107,8 +5135,8 @@ public class XuiV3BotFlowService
         CancellationToken cancellationToken,
         int messageId = 0)
     {
-        await _userDbContext.ClearUserStatus(new User { Id = telegramUserId });
-        await _userDbContext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = telegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = telegramUserId,
             Flow = AccountSearchFlowName,
@@ -5139,6 +5167,16 @@ public class XuiV3BotFlowService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>Clears the current conversation and displays the applicable customer main menu.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="chatId">Telegram destination chat id in the active bot, not an internal user or tenant database id.</param>
+    /// <param name="messageId">Telegram message id to edit; zero or null, as allowed by the signature, requests a new message.</param>
+    /// <param name="credUser">Detached global credentials profile for the actor; wallet balances and personal fields must not enter diagnostics.</param>
+    /// <param name="user">Detached current bot/user state; explicit store writes reload their targets and never attach this snapshot.</param>
+    /// <param name="mainReplyMarkup">Reply markup selected for the current bot and user role, or null when no keyboard is required.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task ReturnToMainMenuAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -5153,7 +5191,7 @@ public class XuiV3BotFlowService
 
         var userId = user?.Id ?? credUser?.TelegramUserId ?? 0;
         if (userId > 0)
-            await _userDbContext.ClearUserStatus(user ?? new User { Id = userId });
+            await _state.ClearUserStatus(user ?? new User { Id = userId });
 
         if (messageId != 0)
         {
@@ -5223,7 +5261,7 @@ public class XuiV3BotFlowService
         }
 
         var allClients = response.Obj ?? new List<XuiV3Client>();
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = credUser.TelegramUserId,
             Flow = AccountSearchFlowName,
@@ -5546,8 +5584,8 @@ public class XuiV3BotFlowService
             ? normalizedTargetUuid
             : string.Empty;
 
-        await _userDbContext.ClearUserStatus(new User { Id = credUser.TelegramUserId });
-        await _userDbContext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = credUser.TelegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = credUser.TelegramUserId,
             Flow = RenewFlowName,
@@ -6785,8 +6823,8 @@ public class XuiV3BotFlowService
             return;
         }
 
-        await _userDbContext.ClearUserStatus(new User { Id = credUser.TelegramUserId });
-        await _userDbContext.SaveUserStatus(new User
+        await _state.ClearUserStatus(new User { Id = credUser.TelegramUserId });
+        await _state.SaveUserStatus(new User
         {
             Id = credUser.TelegramUserId,
             Flow = RenewFlowName,
@@ -7079,6 +7117,17 @@ public class XuiV3BotFlowService
             source: "search");
     }
 
+    /// <summary>Verifies the selected account and prepares this user's bot-scoped comment-entry step.</summary>
+    /// <param name="botClient">Client for the active owned or tenant bot; required and never persisted in conversation state.</param>
+    /// <param name="chatId">Telegram destination chat id in the active bot, not an internal user or tenant database id.</param>
+    /// <param name="messageId">Telegram message id to edit; zero or null, as allowed by the signature, requests a new message.</param>
+    /// <param name="credUser">Detached global credentials profile for the actor; wallet balances and personal fields must not enter diagnostics.</param>
+    /// <param name="clientId">Positive external XUI client id selected by the account callback; ownership is checked before allowing edits.</param>
+    /// <param name="page">Zero-based account-list page used when returning from comment entry.</param>
+    /// <param name="fromSearch">True restores account-search navigation; false restores the paged account list.</param>
+    /// <param name="cancellationToken">Cancellation of state persistence, panel lookups or mutations, and Telegram delivery for this execution.</param>
+    /// <returns>A task completing after the documented state transition and any required Telegram or panel work.</returns>
+    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
     private async Task HandleAccountCommentStartCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -7099,7 +7148,7 @@ public class XuiV3BotFlowService
             return;
         }
 
-        await _userDbContext.SaveUserStatus(new User
+        await _state.SaveUserStatus(new User
         {
             Id = credUser.TelegramUserId,
             Flow = AccountCommentFlowName,
@@ -7450,7 +7499,7 @@ public class XuiV3BotFlowService
         string text,
         CancellationToken cancellationToken)
     {
-        await _userDbContext.ClearUserStatus(user);
+        await _state.ClearUserStatus(user);
 
         await botClient.SendTextMessageAsync(
             chatId,
@@ -9099,7 +9148,7 @@ public class XuiV3BotFlowService
         }
 
         _sessionStore.Set(credUser.TelegramUserId, selection);
-        await _userDbContext.ResetUserStatus(replacement);
+        await _state.ResetUserStatus(replacement);
         await _activityLog.LogWarningAsync(
             "xui_v3_purchase_state_recovered",
             credUser,

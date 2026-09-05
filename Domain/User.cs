@@ -62,6 +62,8 @@ public class User
     /// </remarks>
     [NotMapped]
     public string RenewalSessionId { get; set; }
+    /// <summary>Durable owned purchase session identity, reused for creation and wallet debit after duplicate confirmation.</summary>
+    public string PurchaseSessionId { get; set; }
     /// <summary>
     /// Gets or sets the persisted evidence mode for a tenant renewal service-category decision.
     /// </summary>

@@ -75,6 +75,12 @@ namespace Adminbot.Domain
         /// to protect normal Telegram latency, and values above sixty seconds are capped to keep owner callbacks responsive.
         /// </remarks>
         public int TelegramBotStartupProbeTimeoutSeconds { get; set; } = 12;
+        /// <summary>Global maximum simultaneously executing Telegram updates, from 1 to 256.</summary>
+        public int TelegramUpdateMaxConcurrency { get; set; } = 16;
+        /// <summary>Maximum unfinished durable inbox rows, from 1 to 100000; full admission applies backpressure.</summary>
+        public int TelegramUpdateQueueCapacity { get; set; } = 1000;
+        /// <summary>Shutdown drain deadline in seconds, from 1 to 600, before cooperative handler cancellation.</summary>
+        public int TelegramUpdateShutdownDrainSeconds { get; set; } = 90;
         public bool HttpsEnabled { get; set; } = true;
         public int HttpsPort { get; set; } = 443;
         public int HttpPort { get; set; } = 80;
