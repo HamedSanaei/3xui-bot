@@ -28,12 +28,24 @@ public class Program
     /// <param name="args">Command-line arguments passed by the hosting environment.</param>
     /// <returns>A task that completes when the host shuts down.</returns>
     /// <remarks>
+    /// <c>--migration-check</c> exits before host construction and validates both real EF migration models against
+    /// isolated temporary databases. Normal startup prints the embedded commit/configuration before loading private
+    /// configuration, then preserves the existing migrate-before-receiver ordering.
+    ///
     /// In addition to the Telegram operational logger, startup registers a fail-soft daily diagnostic file logger for
     /// warning/error/critical entries. This keeps full exception chains on disk even when channel-noise suppression
     /// intentionally keeps transient delivery and framework traffic out of the private Telegram logger channel.
     /// </remarks>
     static async Task Main(string[] args)
     {
+        Console.WriteLine($"[Build] Commit={BuildInfo.Commit}");
+        Console.WriteLine($"[Build] Configuration={BuildInfo.Configuration}");
+
+        if (MigrationPreflight.IsRequested(args))
+        {
+            Environment.ExitCode = await MigrationPreflight.RunAsync(args, Console.Out, CancellationToken.None);
+            return;
+        }
 
         // var ucontext = new UserDbContext();
         // ucontext.Database.Migrate();

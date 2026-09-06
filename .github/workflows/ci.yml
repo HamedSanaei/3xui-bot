@@ -14,14 +14,19 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+      - run: dotnet tool restore
       - run: dotnet restore Adminbot.sln
-      - run: dotnet build Adminbot.sln -c Release --no-restore
+      - run: dotnet build Adminbot.sln -c Release --no-restore /p:SourceRevisionId=${{ github.sha }}
       - run: dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build --logger trx --results-directory artifacts/tests
-      - run: dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained false
+      - run: dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context UserDbContext --configuration Release
+      - run: dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context CredentialsDbContext --configuration Release
+      - run: bash scripts/deploy-release.tests.sh
+      - run: dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false -o artifacts/final-publish /p:SourceRevisionId=${{ github.sha }}
+      - run: ./artifacts/final-publish/Adminbot --migration-check
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: concurrency-test-results
+          name: verification-results
           path: artifacts/tests
   secrets:
     runs-on: ubuntu-latest

@@ -37,8 +37,20 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 ## Build and Publish
 
-- Restore/build: `dotnet restore`, then `dotnet build Adminbot.sln --configuration Release --no-restore`.
-- Server publish: `dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained false` from the repository root.
+- Restore/build: `dotnet tool restore`, `dotnet restore`, then
+  `dotnet build Adminbot.sln --configuration Release --no-restore`. The repo-local manifest pins `dotnet-ef` to the
+  same 10.0.8 release as EF runtime/design packages.
+- Before publish, CI and deployment run `dotnet ef migrations has-pending-model-changes` independently for
+  `UserDbContext` and `CredentialsDbContext`. Publish then targets a new directory and the exact published `Adminbot
+  --migration-check` executable validates fresh databases and SQLite online-backup copies; this mode starts no host,
+  HTTP listener, Telegram receiver, hosted worker, or remote logger.
+- Production deployment uses immutable `/opt/vpnetiran/releases/<commit>/` directories, shared persistent Data,
+  atomic `current`/`previous` symlinks, and rollback-aware systemd activation through `scripts/deploy-release.sh`.
+  See `docs/deployment.md`. A dirty or SHA-mismatched checkout is rejected before build, and systemd is untouched until
+  every build/test/EF/artifact check succeeds. Release assemblies log their embedded commit and build configuration.
+- Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
+  `Data/**` is excluded because databases, production configuration, certificates, and the runtime plan catalog are
+  shared state rather than release artifacts.
 - The solution contains the production `Adminbot` project plus `Adminbot.Tests` (xunit, added explicitly for the
   Telegram concurrency/reliability task). Tests never ship: `Adminbot.Tests` is `IsPublishable=false`, the app does not
   reference it, and the Release publish output contains no test assemblies.
