@@ -1957,7 +1957,7 @@ public class MultiBotHostedService : IHostedService
     }
 
     /// <summary>
-    /// Writes a tenant runtime lifecycle event using already extracted tenant settings.
+    /// Writes a tenant runtime lifecycle event as durable operational HTML using extracted tenant settings.
     /// </summary>
     /// <param name="tenantId">Internal tenant bot id.</param>
     /// <param name="tenantUsername">Last known public tenant bot username.</param>
@@ -1966,6 +1966,7 @@ public class MultiBotHostedService : IHostedService
     /// <param name="supportAccount">Tenant support username or contact text.</param>
     /// <param name="status">Lifecycle status shown in the private log channel.</param>
     /// <param name="error">Optional non-secret error text shown in the private log channel.</param>
+    /// <remarks>Preserves the current bot context and central logger routing. This operational event never creates financial backup intent.</remarks>
     private void LogTenantRuntimeEvent(
         string tenantId,
         string tenantUsername,
@@ -1993,7 +1994,7 @@ public class MultiBotHostedService : IHostedService
             $"پشتیبانی: {FormatTelegramReference(supportAccount)}" +
             (string.IsNullOrWhiteSpace(error) ? string.Empty : $"\nخطا: <code>{Html(error)}</code>");
 
-        _logger.LogPayment(message);
+        _logger.LogTelegramHtml(message);
     }
 
     /// <summary>

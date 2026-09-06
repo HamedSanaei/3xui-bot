@@ -39,3 +39,33 @@ after recovery. Existing delivery priorities, leases, 429 handling, fairness and
 Deployment: preserve the outbox database, deploy one polling process, and monitor requested/covered generations,
 backupRuns, backupRequestsCoalesced and backupFollowUps. Do not remove the new watermark table during rollback.
 No production deployment or Git history rewrite is part of this change.
+
+## Focused logging cleanup
+
+Tenant runtime lifecycle events now use `LogTelegramHtml` (durable `Html`, EventId 1001/TelegramHtml), preserving
+HTML, tenant identifiers, escaped errors, ambient bot attribution and the central logger route. Twenty lifecycle
+events request zero backup generations; a genuine `LogPayment` still increments Requested once.
+
+The backup worker reads durable state immediately on startup. A capacity-one semaphore wakes it only after
+Payment insertion and Requested commit successfully. Idle waits use a ten-second recovery timeout, covering
+crash-before-signal and direct durable writes. Debounce also waits on signals or its remaining quiet/max window;
+it no longer polls every 25ms. Coalesced/lost/stale signals never replace the SQLite watermark.
+
+Channel precedence is nonblank global `backupChannel`, then nonblank default-owned `BackupChannel`, then persisted
+`ChannelId`. Sender precedence is the registry's default-owned id, then persisted `BotId`; no separate global
+backup-bot setting currently exists. Blank means null, empty or whitespace. A missing sender or channel sends no
+document, preserves pending intent, emits a destination-free warning, and waits ten seconds before retrying even
+if producers keep signaling. Existing partial-upload/crash duplicate windows described above remain unchanged.
+
+Focused tests cover lifecycle HTML and twenty-event generation isolation, financial intent, controlled idle
+wait/read counts, timeout recovery after direct commit without a signal, startup recovery, all three blank global
+channel forms, owned versus persisted destinations, and missing-destination pending/warning/no-send behavior.
+
+Audit exceptions outside this three-issue cleanup (left unchanged to respect the excluded flows):
+- `TelegramBotService.LogAdminPhoneVerification` and `LogAdminRoleChange` still use Payment for non-financial audits.
+- `XuiV3BotFlowService` still uses Payment for colleague requests, link changes and account deletion.
+  These operational calls can still request backups. Purchase/renewal financial logging also uses Payment intentionally.
+- Gateway confirmation after provisional settlement is a financial audit even though it does not credit twice;
+  those Payment calls remain intentional, as do wallet adjustments and tenant order settlement logs.
+
+No wallet, settlement, provisioning, update scheduler, inbox, context-lifetime or catalog changes are included.

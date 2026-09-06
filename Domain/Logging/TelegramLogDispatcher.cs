@@ -131,15 +131,35 @@ namespace Adminbot.Domain.Logging
 
         /// <summary>
         /// Hard cap on how long a backup may wait for the burst to settle. Under continuous payment traffic the
-        /// debounce would otherwise be restarted forever and backups would starve; this cap guarantees at least one
-        /// backup every five seconds.
+        /// debounce would otherwise be restarted forever. This caps the wait before the next snapshot attempt;
+        /// network duration is not part of this cap.
         /// </summary>
         public TimeSpan BackupMaxDelay { get; init; } = TimeSpan.FromSeconds(5);
 
-        /// <summary>Authoritative global backup sender; null uses the initial durable intent destination.</summary>
+        /// <summary>Recovery scan interval for durable backup intent when no wake signal arrives; must be positive.</summary>
+        public TimeSpan BackupRecoveryInterval { get; init; } = TimeSpan.FromSeconds(10);
+
+        /// <summary>Sanitized local warning sink; never route this back through the Telegram logger.</summary>
+        internal Action<string> BackupWarning { get; init; } = Console.WriteLine;
+
+        /// <summary>Async wake wait seam for deterministic recovery tests; production uses the bounded semaphore timeout.</summary>
+        internal Func<SemaphoreSlim, TimeSpan, CancellationToken, Task<bool>> BackupWaitAsync { get; init; }
+            = (signal, timeout, token) => signal.WaitAsync(timeout, token);
+
+        /// <summary>Authoritative global backup sender, normally the default owned bot; blank uses durable intent.</summary>
         public string BackupBotId { get; init; }
-        /// <summary>Authoritative global backup channel; all bots coalesce into this destination.</summary>
+        /// <summary>Nonblank global channel, resolved ahead of the default owned channel; blank uses durable intent.</summary>
         public string BackupChannelId { get; init; }
+
+        /// <summary>Selects the first nonblank destination in precedence order without changing its contents.</summary>
+        /// <param name="configured">Optional global Telegram channel or validated internal bot id; never a bot token.</param>
+        /// <param name="fallback">Optional default-owned or persisted destination of the same identifier type.</param>
+        /// <returns>The configured identifier, otherwise the fallback, or an empty string when neither exists.</returns>
+        /// <remarks>Program resolves global channel then default-owned channel; the worker applies persisted fallback.
+        /// Bot ids passed here must already be resolved by the runtime registry; this helper does not validate bots.</remarks>
+        /// <example><code>var channel = SelectDestination(globalChannel, defaultBot.BackupChannel);</code></example>
+        internal static string SelectDestination(string configured, string fallback) =>
+            !string.IsNullOrWhiteSpace(configured) ? configured : !string.IsNullOrWhiteSpace(fallback) ? fallback : string.Empty;
 
         /// <summary>When false startup does not force-reset Sending rows; used by lease-recovery harness scenarios.</summary>
         public bool ResetSendingOnStartup { get; init; } = true;
@@ -217,6 +237,12 @@ namespace Adminbot.Domain.Logging
         private readonly Func<string, ITelegramLogSender> _senderFactory;
         private readonly Channel<TelegramLogItem> _normalQueue = CreateNormalQueue();
         private readonly SemaphoreSlim _wakeSignal = new(0, 1);
+        /// <summary>Coalesced post-commit backup wakeups; durable generations remain authoritative.</summary>
+        private readonly SemaphoreSlim _backupWakeSignal = new(0, 1);
+        /// <summary>Atomic coordinator read counter used to verify idle connection churn.</summary>
+        private long _backupStateReads;
+        /// <summary>Number of coordinator state reads, excluding shutdown, for bounded-idle diagnostics and tests.</summary>
+        internal long BackupStateReads => Interlocked.Read(ref _backupStateReads);
         private readonly CancellationTokenSource _shutdown = new();
         private readonly Task _worker;
         private readonly object _normalGate = new();
@@ -256,12 +282,16 @@ namespace Adminbot.Domain.Logging
         /// <param name="senderFactory">Resolves a fresh sender for a bot id at delivery time; never cached here.</param>
         /// <param name="options">Dispatcher configuration; production callers use <see cref="TelegramLogDispatcherOptions.CreateDefault"/>.</param>
         /// <exception cref="ArgumentNullException">When <paramref name="senderFactory"/> or <paramref name="options"/> is null.</exception>
+        /// <exception cref="ArgumentException">The required outbox database path is blank.</exception>
+        /// <exception cref="ArgumentOutOfRangeException">The backup recovery interval is not positive.</exception>
         public TelegramLogDispatcher(Func<string, ITelegramLogSender> senderFactory, TelegramLogDispatcherOptions options)
         {
             _senderFactory = senderFactory ?? throw new ArgumentNullException(nameof(senderFactory));
             _options = options ?? throw new ArgumentNullException(nameof(options));
             if (string.IsNullOrWhiteSpace(_options.OutboxDatabasePath))
                 throw new ArgumentException("OutboxDatabasePath is required.", nameof(options));
+            if (_options.BackupRecoveryInterval <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(options), "BackupRecoveryInterval must be positive.");
             _outbox = new TelegramLogOutbox(_options.OutboxDatabasePath);
             _worker = Task.Run(WorkerAsync);
             _backupWorker = Task.Run(RunBackupLoopAsync);
@@ -298,6 +328,8 @@ namespace Adminbot.Domain.Logging
                 if (item.Kind == TelegramLogDeliveryKind.Payment && !string.IsNullOrWhiteSpace(_options.BackupChannelId)
                     && !string.IsNullOrWhiteSpace(item.BackupChannelId) && item.BackupChannelId != _options.BackupChannelId)
                     Console.WriteLine("[DatabaseBackup] conflicting requested destination; using configured global destination.");
+                // The payment row and Requested watermark have committed before either worker is signaled.
+                if (item.Kind == TelegramLogDeliveryKind.Payment) SignalBackupWorker();
                 WakeWorker();
                 return true;
             }
@@ -638,35 +670,70 @@ namespace Adminbot.Domain.Logging
             }
         }
 
-        /// <summary>Consumes durable global backup generations without coupling them to log-send attempts.</summary>
+        /// <summary>Coalesces backup notifications after durable payment commit without blocking producers.</summary>
+        /// <remarks>A missed signal is harmless: startup and the ten-second default recovery scan read SQLite.</remarks>
+        private void SignalBackupWorker()
+        {
+            try { _backupWakeSignal.Release(); }
+            catch (SemaphoreFullException) { } // A pending wake already covers every committed generation.
+        }
+
+        /// <summary>Reads the authoritative backup watermarks and counts coordinator database accesses.</summary>
+        /// <returns>Global requested/covered generations and the persisted non-secret destination fallback.</returns>
+        /// <remarks>No network operation runs inside this short SQLite read.</remarks>
+        private async Task<(long Requested, long Covered, string BotId, string ChannelId)> ReadBackupStateAsync()
+        {
+            Interlocked.Increment(ref _backupStateReads);
+            return await _outbox.ReadBackupAsync();
+        }
+
+        /// <summary>Consumes durable global backup generations, waking on committed payment intent or recovery timeout.</summary>
         /// <returns>The tracked backup lifetime, stopped and awaited by dispatcher disposal.</returns>
-        /// <remarks>All requests observed before snapshot start are covered together. A later request causes one
-        /// coalesced follow-up. Failure leaves the watermark pending; restart never expands it into per-log work.</remarks>
+        /// <remarks>Startup reads SQLite immediately. Idle waits default to ten seconds; signals only improve latency.
+        /// All requests observed before snapshot start are covered together. Later requests cause a coalesced follow-up.
+        /// Failure or a missing destination leaves the watermark pending. Neither log retry nor ACK creates intent.</remarks>
         private async Task RunBackupLoopAsync()
         {
             var token = _shutdown.Token;
-            var startup = await _outbox.ReadBackupAsync();
-            Console.WriteLine($"[DatabaseBackup] startup requestedGeneration={startup.Requested} coveredGeneration={startup.Covered} pendingRequests={startup.Requested - startup.Covered}");
+            var startup = true;
             while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    var state = await _outbox.ReadBackupAsync();
-                    if (state.Requested <= state.Covered) { await Task.Delay(25, token); continue; }
+                    var state = await ReadBackupStateAsync();
+                    if (startup)
+                    {
+                        Console.WriteLine($"[DatabaseBackup] startup requestedGeneration={state.Requested} coveredGeneration={state.Covered} pendingRequests={state.Requested - state.Covered}");
+                        startup = false;
+                    }
+                    if (state.Requested <= state.Covered)
+                    {
+                        await _options.BackupWaitAsync(_backupWakeSignal, _options.BackupRecoveryInterval, token);
+                        continue;
+                    }
                     var first = _options.UtcNow(); var quiet = first; var observed = state.Requested;
                     while (true)
                     {
-                        await Task.Delay(25, token);
-                        state = await _outbox.ReadBackupAsync();
                         var now = _options.UtcNow();
-                        if (state.Requested != observed) { observed = state.Requested; quiet = now; }
-                        if (now - quiet >= _options.BackupDebounce || now - first >= _options.BackupMaxDelay) break;
+                        var remaining = TimeSpan.FromTicks(Math.Min(
+                            (_options.BackupDebounce - (now - quiet)).Ticks,
+                            (_options.BackupMaxDelay - (now - first)).Ticks));
+                        if (remaining <= TimeSpan.Zero) break;
+                        await _options.BackupWaitAsync(_backupWakeSignal, remaining, token);
+                        state = await ReadBackupStateAsync();
+                        if (state.Requested != observed) { observed = state.Requested; quiet = _options.UtcNow(); }
                     }
                     // This read is the snapshot boundary: any later durable request remains above Covered.
-                    state = await _outbox.ReadBackupAsync();
-                    _backupBotId = _options.BackupBotId ?? state.BotId;
-                    _backupChannelId = _options.BackupChannelId ?? state.ChannelId;
-                    if (string.IsNullOrWhiteSpace(_backupChannelId)) { await Task.Delay(1000, token); continue; }
+                    state = await ReadBackupStateAsync();
+                    _backupBotId = TelegramLogDispatcherOptions.SelectDestination(_options.BackupBotId, state.BotId);
+                    _backupChannelId = TelegramLogDispatcherOptions.SelectDestination(_options.BackupChannelId, state.ChannelId);
+                    if (string.IsNullOrWhiteSpace(_backupBotId) || string.IsNullOrWhiteSpace(_backupChannelId))
+                    {
+                        _options.BackupWarning("[DatabaseBackup] destination unavailable; durable generation remains pending.");
+                        // Ignore producer wakes during configuration failure to bound warnings and database activity.
+                        await Task.Delay(_options.BackupRecoveryInterval, token);
+                        continue;
+                    }
                     var generation = state.Requested;
                     Interlocked.Exchange(ref _backupRequests, generation);
                     Interlocked.Add(ref _backupRequestsCoalesced, Math.Max(0, generation - state.Covered - 1));
@@ -674,7 +741,7 @@ namespace Adminbot.Domain.Logging
                     Console.WriteLine($"[DatabaseBackup] started generation={generation} previouslyCovered={state.Covered}");
                     await BackupDatabasesOnceAsync();
                     await _outbox.CoverBackupAsync(generation);
-                    state = await _outbox.ReadBackupAsync();
+                    state = await ReadBackupStateAsync();
                     if (state.Requested > generation) Interlocked.Increment(ref _backupFollowUps);
                     Console.WriteLine($"[DatabaseBackup] completed coveredGeneration={generation} requestedGeneration={state.Requested} followUp={state.Requested > generation}");
                 }
@@ -751,7 +818,7 @@ namespace Adminbot.Domain.Logging
             {
                 var state = await _outbox.ReadBackupAsync();
                 if (state.Requested <= state.Covered) break;
-                await Task.Delay(25);
+                await Task.Delay(250);
             }
             _shutdown.Cancel();
             try { await _backupWorker.WaitAsync(TimeSpan.FromSeconds(5)); } catch (TimeoutException) { }

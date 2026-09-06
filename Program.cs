@@ -86,7 +86,8 @@ public class Program
     /// <param name="configuration">Runtime configuration; private values must never be written to logs or test output.</param>
     /// <param name="appConfig">Validated application options with resolved absolute database paths.</param>
     /// <param name="contentRootPath">Application content root for local configuration and logging outbox paths.</param>
-    /// <remarks>Singletons retain factories only. Legacy coordinated handler graphs are scoped to one execution; state and wallet stores own shorter contexts.</remarks>
+    /// <remarks>Singletons retain factories only. Legacy coordinated handler graphs are scoped to one execution; state and wallet stores own shorter contexts.
+    /// Backup channels resolve nonblank global configuration before the default-owned channel; the dispatcher supplies durable fallback.</remarks>
     public static void RegisterApplicationServices(IServiceCollection services, IConfiguration configuration, AppConfig appConfig, string contentRootPath)
     {
         var telegramOutboxDatabasePath = Path.Combine(contentRootPath, "Data", "telegram-log-outbox.db");
@@ -121,7 +122,7 @@ public class Program
                     appConfig.CredentialsDatabasePath) with
                 {
                     BackupBotId = sp.GetRequiredService<BotRegistry>().DefaultBot?.Id,
-                    BackupChannelId = configuration["backupChannel"] ?? sp.GetRequiredService<BotRegistry>().DefaultBot?.BackupChannel
+                    BackupChannelId = TelegramLogDispatcherOptions.SelectDestination(configuration["backupChannel"], sp.GetRequiredService<BotRegistry>().DefaultBot?.BackupChannel)
                 });
         });
         services.AddSingleton<BotRuntimeStatusStore>();

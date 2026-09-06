@@ -12,6 +12,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   Covered only after both SQLite online backups upload. Historical rows bootstrap one generation once, and
   requests arriving during upload coalesce into one follow-up. Production uses the configured central backup
   destination. See `docs/backup-recovery.md` and `Adminbot.Tests/BackupRecoveryTests.cs`.
+  Backup wakeups occur only after durable Payment commit; idle recovery scans default to ten seconds.
+  Blank global destinations fall through to default-owned then persisted fallback. Tenant lifecycle logs use
+  durable HTML audit without backup intent. Other non-financial Payment call sites remain listed in the runbook.
 
 - `Program.cs`: ASP.NET host, DI registration, EF migration startup, controller mapping, bot runtime registration, hosted services.
 - `Services/BotRuntimeServices.cs`: bot registry, bot context accessor, bot client provider, and multi-bot receiver startup.
