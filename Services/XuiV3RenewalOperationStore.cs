@@ -513,6 +513,7 @@ public class XuiV3RenewalOperationStore
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Processing)
+                    .SetProperty(x => x.InboxSequence, TelegramUpdateExecutionScope.CurrentSequence)
                     .SetProperty(x => x.LeaseUntilUtc, leaseUntil)
                     .SetProperty(x => x.ClaimToken, claimToken)
                     .SetProperty(x => x.UpdatedAtUtc, DateTime.UtcNow),

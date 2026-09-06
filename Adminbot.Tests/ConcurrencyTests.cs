@@ -6,6 +6,7 @@ using Xunit;
 using Xunit.Abstractions;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Threading.Channels;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -64,7 +65,9 @@ public sealed partial class ConcurrencyTests
             OperationKey = "purchase:example:1", TelegramUserId = 123, PanelKey = "panel-hash",
             ClientJson = "private-test-identity-" + i, InboundIdsJson = "[1]", CreatedAtUtc = DateTime.UtcNow
         }, default))));
-        Assert.Single(claims, x => x.MayCreate);
+        Assert.All(claims, x => Assert.True(x.MayCreate));
+        var grants = await Task.WhenAll(claims.Select(x => store.TryStartPostAsync(x.Operation.OperationKey, default)));
+        Assert.Single(grants, x => x);
         Assert.Single(claims.Select(x => x.Operation.ClientJson).Distinct());
         var restarted = new XuiV3CreationOperationStore(databases.Users);
         var recovered = await restarted.ReserveAsync(new XuiV3CreationOperation
@@ -374,6 +377,17 @@ public sealed partial class ConcurrencyTests
     /// <returns>A complete private-message update accepted by the real Telegram JSON serializer.</returns>
     /// <remarks>Test callers own all barriers and lifetimes; dispose database fixtures only after every asynchronous operation has stopped.</remarks>
     private static Update Update(int id, long user) => new() { Id = id, Message = new Message { Date = DateTime.UtcNow, Chat = new Chat { Id = user, Type = Telegram.Bot.Types.Enums.ChatType.Private }, From = new Telegram.Bot.Types.User { Id = user, FirstName = "test" } } };
+    /// <summary>Creates a scheduler whose wait seam records every wake or timeout for deterministic wake assertions.</summary>
+    /// <param name="db">Temporary database fixture owned by this test.</param>
+    /// <param name="executor">Handler delegate that owns the test's external-I/O barriers.</param>
+    /// <param name="wakes">Unbounded record of wait outcomes; a false outcome is a periodic-scan timeout.</param>
+    /// <param name="concurrency">Positive active-handler limit.</param>
+    /// <returns>An unstarted scheduler with a sixty-second wait bound; the test must stop it before disposing its databases.</returns>
+    /// <remarks>Test callers own all barriers and lifetimes; dispose database fixtures only after every asynchronous operation has stopped.</remarks>
+    private static TelegramUpdateScheduler Create(Databases db, Executor executor, Channel<bool> wakes, int concurrency = 4) =>
+        new(db.Inbox, executor, new AppConfig { TelegramUpdateMaxConcurrency = concurrency, TelegramUpdateQueueCapacity = 1000, TelegramUpdateShutdownDrainSeconds = 10 }, NullLogger<TelegramUpdateScheduler>.Instance)
+        { WaitAsync = (signal, _, token) => RecordWakeAsync(signal, wakes, token) };
+
     /// <summary>Creates the actual scheduler with isolated persistence and controlled handlers.</summary>
     /// <param name="db">Temporary database fixture owned by this test.</param>
     /// <param name="executor">Handler delegate that owns the test's external-I/O barriers.</param>
@@ -406,10 +420,11 @@ public sealed partial class ConcurrencyTests
 
     /// <summary>Routes scheduled work into a controlled asynchronous test handler.</summary>
     /// <param name="execute">Required handler delegate; cancellation and failure behavior belong to the scenario.</param>
-    private sealed class Executor(Func<TelegramUpdateWorkItem, CancellationToken, Task> execute) : ITelegramUpdateExecutor
+    /// <param name="available">Optional per-bot availability predicate; defaults to always available.</param>
+    private sealed class Executor(Func<TelegramUpdateWorkItem, CancellationToken, Task> execute, Func<string, bool>? available = null) : ITelegramUpdateExecutor
     {
         /// <inheritdoc />
-        public bool IsAvailable(string botId) => true;
+        public bool IsAvailable(string botId) => available?.Invoke(botId) ?? true;
         /// <inheritdoc />
         public Task ExecuteAsync(TelegramUpdateWorkItem item, CancellationToken cancellationToken) => execute(item, cancellationToken);
     }
@@ -437,7 +452,7 @@ public sealed partial class ConcurrencyTests
             using var users = Users.CreateDbContext(); using var credentials = Credentials.CreateDbContext();
             if (initialize) { users.Database.EnsureCreated(); credentials.Database.EnsureCreated(); }
             users.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL;"); credentials.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL;");
-            Inbox = new(Users);
+            Inbox = new(Users, Credentials);
         }
         /// <summary>Closes SQLite pools and removes only this fixture's validated temporary directory.</summary>
         /// <remarks>Test callers own all barriers and lifetimes; dispose database fixtures only after every asynchronous operation has stopped.</remarks>

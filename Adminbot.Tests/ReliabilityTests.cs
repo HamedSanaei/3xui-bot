@@ -219,6 +219,7 @@ public sealed partial class ConcurrencyTests
         {
             await creations.ReserveAsync(new XuiV3CreationOperation
             { OperationKey = "purchase:review:1", TelegramUserId = 123, PanelKey = "test-panel", ClientJson = "private", InboundIdsJson = "[1]" }, token);
+            Assert.True(await creations.TryStartPostAsync("purchase:review:1", token));
         }));
         await scheduler.EnqueueAsync("a", Update(1, 123), default);
         await scheduler.EnqueueAsync("a", Update(2, 123), default);
@@ -228,6 +229,8 @@ public sealed partial class ConcurrencyTests
         Assert.Equal("uncertain", row.Status);
         Assert.Equal(row.Sequence, (await context.XuiV3CreationOperations.SingleAsync()).InboxSequence);
         Assert.Empty(await databases.Inbox.ReadReadyAsync(10, default));
+        Assert.False(await databases.Inbox.ResolveReviewedAsync(row.Sequence, 456, "review-001", default));
+        await creations.MarkAppliedAsync("purchase:review:1", default);
         Assert.True(await databases.Inbox.ResolveReviewedAsync(row.Sequence, 456, "review-001", default));
         Assert.False(await databases.Inbox.ResolveReviewedAsync(row.Sequence, 456, "review-001", default));
         Assert.Equal(2, (await databases.Inbox.ReadReadyAsync(10, default)).Single().UpdateId);

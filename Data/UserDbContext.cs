@@ -138,6 +138,9 @@ public class UserDbContext : DbContext
     /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        // Exact inbox links complement the existing bot/user fallback for historical recovery records.
+        modelBuilder.Entity<XuiV3RenewalOperation>().HasIndex(x => x.InboxSequence);
+        modelBuilder.Entity<XuiV3LinkChangeOperation>().HasIndex(x => x.InboxSequence);
         modelBuilder.Entity<XuiV3CreationOperation>(entity =>
         {
             entity.HasKey(x => x.OperationKey);

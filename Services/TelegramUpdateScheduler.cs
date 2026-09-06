@@ -46,6 +46,26 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     private static readonly Histogram<double> Duration = Meter.CreateHistogram<double>("telegram.update.handler.duration", "ms");
     private static readonly Histogram<int> QueueDepth = Meter.CreateHistogram<int>("telegram.update.queue.depth", "updates");
     private readonly TelegramUpdateInboxStore _store;
+    /// <summary>Coalesced readiness optimization; the durable ready query remains authoritative.</summary>
+    private readonly SemaphoreSlim _wake = new(0, 1);
+    private static readonly Counter<long> Wakeups = Meter.CreateCounter<long>("telegram.update.scheduler.wakeups");
+    private static readonly Counter<long> RecoveryScans = Meter.CreateCounter<long>("telegram.update.scheduler.recovery_scans");
+    private static readonly Counter<long> ReadyQueries = Meter.CreateCounter<long>("telegram.update.scheduler.ready_queries");
+    private long _readyQueryCount;
+    /// <summary>Total durable ready queries for diagnostics and deterministic idle tests.</summary>
+    public long ReadyQueryCount => Interlocked.Read(ref _readyQueryCount);
+    /// <summary>Recovery timeout used only when no post-commit/runtime wake arrives.</summary>
+    internal TimeSpan RecoveryInterval { get; init; } = TimeSpan.FromSeconds(2);
+    /// <summary>Deterministic wait seam; production waits on the coalesced signal or the recovery timeout.</summary>
+    internal Func<SemaphoreSlim, TimeSpan, CancellationToken, Task<bool>> WaitAsync { get; init; }
+        = (signal, interval, token) => signal.WaitAsync(interval, token);
+
+    /// <summary>Wakes the coordinator after durable state or bot availability changes.</summary>
+    /// <remarks>One queued token covers every committed change. A lost wake is recovered within the scan interval.</remarks>
+    private void Wake()
+    {
+        try { _wake.Release(); } catch (SemaphoreFullException) { }
+    }
     private readonly ITelegramUpdateExecutor _executor;
     private readonly ILogger<TelegramUpdateScheduler> _logger;
     private readonly int _concurrency;
@@ -71,6 +91,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     {
         ValidateConfiguration(config);
         _store = store; _executor = executor; _logger = logger;
+        _store.ReadyChanged += Wake;
         _concurrency = config.TelegramUpdateMaxConcurrency;
         _capacity = config.TelegramUpdateQueueCapacity;
         _drainTimeout = TimeSpan.FromSeconds(config.TelegramUpdateShutdownDrainSeconds);
@@ -101,7 +122,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         var uncertain = await _store.RecoverAsync(cancellationToken);
-        if (uncertain > 0) _logger.LogWarning("Telegram inbox recovered {UncertainCount} uncertain updates requiring reconciliation or review", uncertain);
+        await ReportUncertainAsync(cancellationToken);
         _loop = RunAsync(_coordinator.Token);
     }
 
@@ -144,6 +165,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                 }
                 try
                 {
+                    Interlocked.Increment(ref _readyQueryCount);
+                    ReadyQueries.Add(1);
                     var ready = await _store.ReadReadyAsync(_capacity, token);
                     foreach (var idleBot in userCursors.Keys.Where(bot => !ready.Any(x => x.BotId == bot)).ToArray())
                         userCursors.Remove(idleBot);
@@ -156,6 +179,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     {
                         var depth = await _store.CountPendingAsync(token);
                         QueueDepth.Record(depth);
+                        await ReportUncertainAsync(token);
                         if (depth >= _capacity * 0.8)
                             _logger.LogWarning("Telegram queue pressure. QueueDepth={QueueDepth} Capacity={Capacity} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}", depth, _capacity, ActiveHandlerCount, _concurrency);
                         nextPressureSample = DateTime.UtcNow.AddSeconds(10);
@@ -172,7 +196,10 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                         userCursors[bot] = head.TelegramUserId;
                         eligible.Remove(head);
                         _lastBot = bot;
-                        active.Add(head.Sequence, ProcessAsync(head.Sequence, _handlers.Token));
+                        var execution = ProcessAsync(head.Sequence, _handlers.Token);
+                        active.Add(head.Sequence, execution);
+                        // Notify after task completion, not merely after its final DB write, so slot reaping cannot miss a wake.
+                        execution.GetAwaiter().OnCompleted(Wake);
                     }
                     if (_draining && active.Count == 0 && eligible.Count == 0) break;
                 }
@@ -183,7 +210,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     _logger.LogError("Telegram scheduler persistence failure. ErrorType={ErrorType}", ex.GetType().Name);
                     await Task.Delay(500, token);
                 }
-                await Task.Delay(25, token);
+                if (await WaitAsync(_wake, RecoveryInterval, token)) Wakeups.Add(1);
+                else RecoveryScans.Add(1);
             }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
@@ -200,6 +228,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
     private async Task ProcessAsync(long sequence, CancellationToken token)
     {
+        _store.Executing.TryAdd(sequence, 0);
         TelegramUpdateWorkItem item = null;
         var started = Stopwatch.GetTimestamp();
         string failure = null;
@@ -235,8 +264,26 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             try { if (item != null || failure != null) await _store.FinishAsync(sequence, failure, persistence.Token); }
             catch (Exception ex) { _logger.LogError("Telegram completion persistence failed; claim remains recoverable. Sequence={Sequence} ErrorType={ErrorType}", sequence, ex.GetType().Name); }
+            _store.Executing.TryRemove(sequence, out _);
+            Wake(); // Completion also releases an active-task slot even when final persistence failed.
             _logger.LogDebug("Telegram update finished. Sequence={Sequence} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome}", sequence, duration, failure ?? "completed");
         }
+    }
+
+    private static readonly Histogram<int> Uncertain = Meter.CreateHistogram<int>("telegram.update.inbox.uncertain");
+    private static readonly Histogram<int> BlockedLanes = Meter.CreateHistogram<int>("telegram.update.inbox.blocked_lanes");
+    private static readonly Histogram<double> OldestUncertain = Meter.CreateHistogram<double>("telegram.update.inbox.oldest_uncertain_age", "s");
+
+    /// <summary>Reports existing and newly recovered quarantine pressure without reading private payloads.</summary>
+    /// <param name="token">Startup or coordinator cancellation for metadata queries.</param>
+    /// <returns>A task completing after count/age instruments and sanitized warnings are emitted.</returns>
+    /// <remarks>Called at startup and at most once per ten-second pressure sample. Uncertain rows still consume capacity.</remarks>
+    private async Task ReportUncertainAsync(CancellationToken token)
+    {
+        var summary = await _store.ReadUncertainSummaryAsync(token);
+        Uncertain.Record(summary.Count); BlockedLanes.Record(summary.Lanes); OldestUncertain.Record(summary.AgeSeconds);
+        if (summary.Count > 0) _logger.LogWarning("Telegram inbox quarantine. telegramInboxUncertainCount={Count} telegramInboxBlockedLaneCount={Lanes} telegramInboxOldestUncertainAge={AgeSeconds} Capacity={Capacity} SignificantPressure={Pressure}",
+            summary.Count, summary.Lanes, summary.AgeSeconds, _capacity, summary.Count >= _capacity * 0.2);
     }
 
     /// <summary>Closes admission, drains runnable work, then cooperatively cancels unfinished handlers.</summary>
@@ -249,6 +296,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     {
         StopAdmission();
         _draining = true;
+        Wake();
         if (_loop == null) return;
         try { await _loop.WaitAsync(_drainTimeout, cancellationToken); }
         catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
@@ -271,6 +319,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _store.ReadyChanged -= Wake;
         _admission.Dispose(); _handlers.Dispose(); _coordinator.Dispose();
     }
 }

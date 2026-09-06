@@ -58,6 +58,10 @@ public static class XuiV3LinkChangeStatuses
 /// </remarks>
 public sealed class XuiV3LinkChangeOperation
 {
+        /// <summary>Inbox sequence that won the initial mutation claim; null for legacy/background operations.</summary>
+        /// <remarks>Exact reconciliation link only; business operation keys and existing recovery semantics remain unchanged.</remarks>
+        public long? InboxSequence { get; set; }
+
     /// <summary>Database-generated primary key in <c>users.db</c>.</summary>
     public int Id { get; set; }
 

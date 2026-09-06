@@ -49,6 +49,8 @@ public class BotRegistry
     }
 
     public BotInstanceConfig DefaultBot => _defaultBot;
+    /// <summary>Raised after runtime upsert so deferred durable work can resume promptly.</summary>
+    public event Action AvailabilityChanged;
 
     /// <summary>
     /// Looks up a bot by internal BotId.
@@ -95,6 +97,7 @@ public class BotRegistry
 
         lock (_syncRoot)
             _bots[instance.Id] = ToConfig(instance);
+        AvailabilityChanged?.Invoke();
     }
 
     /// <summary>
@@ -922,7 +925,16 @@ public class MultiBotHostedService : IHostedService
             await TelegramReceiverLifetime.ObservePreviousAsync(previousReceiver, cancellationToken);
 
             var receiverTask = client.ReceiveAsync(
-                updateHandler: (_, update, token) => _scheduler.EnqueueAsync(bot.Id, update, token),
+                updateHandler: async (_, update, token) =>
+                {
+                    // The tracked receiver owns this bounded super-admin control path, which must remain usable
+                    // when durable customer capacity is full. It never replays a quarantined handler.
+                    var admin = _scopeFactory.CreateScope();
+                    using (admin)
+                        if (await admin.ServiceProvider.GetRequiredService<TelegramInboxAdminService>()
+                            .TryHandleAsync(bot.Id, client, update, token)) return;
+                    await _scheduler.EnqueueAsync(bot.Id, update, token);
+                },
                 pollingErrorHandler: (_, exception, token) => HandleBotPollingErrorAsync(bot.Id, exception, token),
                 receiverOptions: new ReceiverOptions
                 {

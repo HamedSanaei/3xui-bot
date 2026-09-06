@@ -303,8 +303,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   eligible (`ReadReadyAsync` excludes rows whose lane has an earlier non-completed row), so one user's updates are
   strict FIFO while different users and different bots run concurrently. Round-robin across bots with per-bot user
   cursors prevents starvation; global active-handler concurrency is bounded by `telegramUpdateMaxConcurrency`
-  (default 16). Idle keyed state is removed; no per-user workers or in-memory queue is required for correctness — the
-  DB scan (25ms loop, 500ms error backoff) is the source of truth and lost wake-ups cannot lose updates.
+  (  default 16). Idle keyed state is removed; no per-user workers or in-memory queue is required for correctness.
+- Wake model: the coordinator waits on a coalesced `SemaphoreSlim` signal (released after durable admission commits,
+  handler completion, admin resolution, and bot availability changes) OR a 2s recovery scan (`RecoveryInterval`),
+  whichever fires first; `Task.Delay(25)` is gone. SQLite durable state remains the source of truth: a lost signal is
+  harmless because the periodic scan re-queries `ReadReadyAsync`. Ready-query, wake, and recovery-scan counters plus
+  uncertain/blocked-lane/oldest-age instruments are exposed as metrics; tests prove ~0.5 ready queries/second idle
+  (was ~40/s) and that direct durable admission without any signal still executes.
 - Execution and BotContext: `TelegramUpdateExecutor` resolves the EXACT bot by the stored `BotId` (never the default
   bot), refuses disabled/unavailable bots (their queued work stays deferred), pushes the bot runtime context through
   `BotContextAccessor` inside `using` semantics (restored even on exceptions), and runs each update in its own DI
@@ -341,17 +346,38 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   completes payment/referral metadata, and only then marks `ReconciledAtUtc`. It never changes balances, never calls
   providers, and never infers history from current balances. A receipt whose payment target is missing stays pending
   for operator review (never falsely reconciled). There is deliberately NO distributed transaction between the two
-  databases.
-
-## XUI Creation Reservations
+  databases.## XUI Creation Reservations
 
 - `Services/XuiV3CreationOperationStore.cs` + `Domain/XuiV3CreationOperation.cs`: before the non-idempotent XUI
   `addClient` POST, the first caller persists a stable client identity and requested plan parameters in users.db
-  (`OperationKey`, owner, `PanelKey`, inbound ids, business parameters JSON). Exactly one claimant receives
-  `MayCreate`; after a timeout/ambiguous response the operation is resolved by read-back (GET by generated email) —
-  never by a second POST. `AppliedAtUtc` is written only after proven creation. Reusing a reservation with conflicting
-  plan parameters fails loudly. A handled-but-unproven creation leaves the linked inbox row `uncertain` for operator
-  review, and later work for the same lane cannot overtake it.
+  (`OperationKey`, owner, `PanelKey`, inbound ids, business parameters JSON). A reservation alone NEVER authorizes
+  POST: the caller must also win the atomic `TryStartPostAsync` (`Reserved -> PostStarted`, exactly one concurrent
+  winner; a crash after this commit is uncertain even if HTTP was never sent). After a timeout/ambiguous response the
+  operation is resolved by read-back only (GET by generated email; `MatchesReservedCreation` requires exact email,
+  subscription id, Telegram owner, and UUID when present). `AppliedAtUtc` is written only after proven creation or
+  identity-safe read-back. Reusing a reservation with conflicting plan parameters fails loudly. A handled-but-unproven
+  creation leaves the linked inbox row `uncertain` for operator review, and later work for the same lane cannot
+  overtake it.
+- Creation outcome state machine (`XuiV3CreationOutcome` on `XuiV3CreationOperations`): `Reserved` (identity
+  persisted, no POST) -> `PostStarted` (the ONLY durable claim that authorizes POST; atomic conditional
+  `Reserved->PostStarted` update, affected-rows == 1 wins) -> `Applied` (authoritative success or identity-safe
+  read-back), `DefinitiveRejected` (only explicit pre-mutation validation errors such as "empty payload"/"client
+  email is required"/"at least one inbound is required"; terminal, retry needs a new business key), or `Ambiguous`
+  (transport timeout/lost response/unknown failure; GET-only recovery, never a second POST). `PostStarted` and
+  `Ambiguous` quarantine their inbox lane; `Reserved`/`Applied`/`DefinitiveRejected` do not. Migration
+  `20260906040843_AddCreationOutcomesAndInboxReview` maps historical `AppliedAtUtc != null` to `Applied` and NULL to
+  `Ambiguous` (never `DefinitiveRejected`).
+- Operator control plane (`Services/TelegramInboxAdminService.cs`, `Services/TelegramInboxReviewStore.cs`):
+  private-chat global super-admins only (default-owned non-tenant bot; tenant owners/customers get fixed "Denied."),
+  handled by the receiver BEFORE normal admission so it stays reachable when customer capacity is full.
+  `/inbox_uncertain [SEQUENCE|page N]` lists sanitized metadata (sequence, bot, user, update type, coarse failure
+  code, ages; never payloads/keys/links); `/inbox_reconcile SEQUENCE` performs identity-safe GET read-back of linked
+  creation reservations against the configured panel (never a POST, never the original handler) and persists positive
+  proof; `/inbox_resolve SEQUENCE review-N` closes an uncertain row ONLY when the conservative evidence evaluator
+  (`CanResolveAsync`) finds no unresolved creation, unreconciled wallet receipts, pending renewal/link/order/settlement
+  evidence — ordinary non-financial handler failures resolve without fake financial evidence. Resolution erases the
+  payload, retains the review reference and operator id, and wakes the scheduler so later same-lane work runs
+  immediately. Uncertain rows count toward admission capacity and emit pressure warnings.
 
 ## Gozargah Site Sync
 

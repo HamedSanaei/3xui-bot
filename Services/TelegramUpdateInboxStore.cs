@@ -5,13 +5,20 @@ using Telegram.Bot.Types;
 
 /// <summary>Persists bounded Telegram admission, claims, and payload-free terminal receipts in users.db.</summary>
 /// <remarks>All transactions are local and short. No receiver or handler executes while a write transaction is held.</remarks>
-public sealed class TelegramUpdateInboxStore
+public sealed partial class TelegramUpdateInboxStore
 {
     private readonly UserDbContextFactory _factory;
+    /// <summary>Post-commit readiness notification; subscribers must never throw or treat signals as durable work.</summary>
+    public event Action ReadyChanged;
+    /// <summary>Notifies the coordinator that persisted work or runtime availability may now permit execution.</summary>
+    /// <remarks>Signals coalesce in the scheduler; startup and periodic scans cover missing process-local notifications.</remarks>
+    public void NotifyReady() => ReadyChanged?.Invoke();
     /// <summary>Creates an inbox sharing only immutable database options.</summary>
     /// <param name="factory">Required users.db context factory.</param>
+    /// <param name="credentials">Global wallet receipt factory; missing configuration refuses reviewed resolution.</param>
     /// <remarks>Queries return detached metadata without loading payloads. Uncertain lane heads remain unresolved and prevent later work from overtaking them.</remarks>
-    public TelegramUpdateInboxStore(UserDbContextFactory factory) => _factory = factory;
+    public TelegramUpdateInboxStore(UserDbContextFactory factory, CredentialsDbContextFactory credentials = null)
+    { _factory = factory; _credentials = credentials; }
 
     /// <summary>Attempts durable admission without exceeding the configured unfinished-work limit.</summary>
     /// <param name="botId">Required canonical runtime bot id; never a token.</param>
@@ -19,14 +26,14 @@ public sealed class TelegramUpdateInboxStore
     /// <param name="capacity">Positive maximum unfinished rows, including running and uncertain rows.</param>
     /// <param name="token">Receiver cancellation before acceptance.</param>
     /// <returns>True when committed or already accepted; false when admission must wait for capacity.</returns>
-    /// <remarks>Duplicate delivery succeeds even when full. Cancellation after commit is resolved by durable deduplication.</remarks>
+    /// <remarks>Duplicate delivery succeeds even when full. The count stops at capacity inside the admission transaction. Cancellation after commit is resolved by durable deduplication.</remarks>
     /// <example><code>while (!await store.TryAcceptAsync(botId, update, capacity, token)) await Task.Delay(100, token);</code></example>
     public Task<bool> TryAcceptAsync(string botId, Update update, int capacity, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
         if (await db.TelegramUpdateInbox.AnyAsync(x => x.BotId == botId && x.UpdateId == update.Id, ct)) return true;
-        if (await db.TelegramUpdateInbox.CountAsync(x => x.Status != "completed", ct) >= capacity) return false;
+        if (await db.TelegramUpdateInbox.Where(x => x.Status != "completed").Select(x => x.Sequence).Take(capacity).CountAsync(ct) >= capacity) return false;
         db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry
         {
             BotId = botId, UpdateId = update.Id, TelegramUserId = TelegramUpdateIdentity.ResolveUserId(update),
@@ -34,6 +41,7 @@ public sealed class TelegramUpdateInboxStore
         });
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
+        NotifyReady();
         return true;
     }, token);
 
@@ -91,6 +99,7 @@ public sealed class TelegramUpdateInboxStore
                 : await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "running")
                     .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "uncertain").SetProperty(x => x.FailureCode, failureCode), ct);
         }, token);
+        NotifyReady();
     }
 
     /// <summary>Quarantines claims left by the previous process and expires completed deduplication receipts.</summary>
@@ -131,18 +140,18 @@ public sealed class TelegramUpdateInboxStore
     /// <summary>Detects linked XUI attempts whose outcome is still ambiguous despite a handled user-facing failure.</summary>
     /// <param name="sequence">Internal inbox sequence of the handler that just returned.</param>
     /// <param name="token">Cancellation of the metadata-only lookup.</param>
-    /// <returns>True when at least one linked creation lacks proof; the scheduler must quarantine that update.</returns>
+    /// <returns>True only when a linked creation is PostStarted, Ambiguous or unknown; Applied, DefinitiveRejected and unused Reserved do not quarantine.</returns>
     /// <remarks>This query never replays provisioning and never loads private client payloads.</remarks>
     public async Task<bool> HasUnresolvedCreationAsync(long sequence, CancellationToken token)
     {
         await using var db = _factory.CreateDbContext();
-        return await db.XuiV3CreationOperations.AnyAsync(x => x.InboxSequence == sequence && x.AppliedAtUtc == null, token);
+        return await db.XuiV3CreationOperations.AnyAsync(x => x.InboxSequence == sequence && (x.Outcome != XuiV3CreationOutcome.Reserved && x.Outcome != XuiV3CreationOutcome.Applied && x.Outcome != XuiV3CreationOutcome.DefinitiveRejected), token);
     }
 
     /// <summary>Releases a quarantined lane only after an authorized operator has reconciled its business effects.</summary>
     /// <param name="sequence">Internal uncertain inbox sequence, never the Telegram update id.</param>
     /// <param name="operatorTelegramUserId">Positive authenticated operator Telegram id; the caller must enforce admin authority.</param>
-    /// <param name="reviewReference">Required non-secret audit reference of at most 64 letters, digits, dots, underscores or hyphens.</param>
+    /// <param name="reviewReference">Required numeric ticket reference in review-N format with one to twelve digits; no free text.</param>
     /// <param name="token">Cancellation of the explicit review write.</param>
     /// <returns>True if the uncertain row was closed and its payload erased; false when it was already resolved or absent.</returns>
     /// <remarks>No Telegram handler is replayed. Resolve wallet receipts, tenant orders and XUI reservations before calling;
@@ -150,16 +159,9 @@ public sealed class TelegramUpdateInboxStore
     /// <exception cref="ArgumentException">An operator id or audit reference is invalid.</exception>
     public Task<bool> ResolveReviewedAsync(long sequence, long operatorTelegramUserId, string reviewReference, CancellationToken token)
     {
-        if (sequence <= 0 || operatorTelegramUserId <= 0 || string.IsNullOrWhiteSpace(reviewReference) || reviewReference.Length > 64
-            || reviewReference.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not '.' and not '_' and not '-'))
-            throw new ArgumentException("A positive identity and non-secret operator review reference are required.");
-        return SqliteOperation.RunAsync(async ct =>
-        {
-            await using var db = _factory.CreateDbContext();
-            return await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "uncertain")
-                .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "completed").SetProperty(x => x.Payload, (string)null)
-                    .SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow)
-                    .SetProperty(x => x.FailureCode, $"reviewed:{operatorTelegramUserId}:{reviewReference}"), ct) == 1;
-        }, token);
+        if (sequence <= 0 || operatorTelegramUserId <= 0 || reviewReference == null
+            || !System.Text.RegularExpressions.Regex.IsMatch(reviewReference, @"\Areview-[0-9]{1,12}\z"))
+            throw new ArgumentException("A positive identity and review-N numeric ticket are required.");
+        return ResolveGuardedAsync(sequence, operatorTelegramUserId, reviewReference, token);
     }
 }

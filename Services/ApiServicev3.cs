@@ -161,8 +161,31 @@ public class ApiServicev3
         }, cancellationToken);
         client = JsonConvert.DeserializeObject<XuiV3ClientPayload>(reservation.Operation.ClientJson);
         XuiV3AccountCreationResult result;
-        if (reservation.MayCreate)
-            result = await CreateUserAccountCoreAsync(accountDto, configuration, options, client, cancellationToken);
+        if (reservation.Operation.Outcome == XuiV3CreationOutcome.Applied)
+        {
+            // Durable positive proof survives an unavailable follow-up GET; return the reserved known account.
+            var knownGb = options.TrafficGb > 0 ? options.TrafficGb : Convert.ToInt32(accountDto.TotoalGB);
+            var knownBytes = options.TrafficBytes > 0 ? options.TrafficBytes : ApiService.ConvertGBToBytes(knownGb);
+            return await BuildAccountCreationResultFromKnownClientAsync(accountDto, configuration, client, null,
+                inbounds, knownGb, knownBytes, options, null, cancellationToken);
+        }
+        if (reservation.Operation.Outcome == XuiV3CreationOutcome.DefinitiveRejected)
+            return new XuiV3AccountCreationResult { Success = false, ApiVersion = XuiPanelApiVersion.V3,
+                Message = XuiV3UserSafeError.ForAccountCreation("creation definitively rejected") };
+        if (reservation.MayCreate && await options.OperationStore.TryStartPostAsync(options.OperationKey, cancellationToken))
+        {
+            try
+            {
+                result = await CreateUserAccountCoreAsync(accountDto, configuration, options, client, cancellationToken);
+            }
+            finally
+            {
+                // If no authoritative outcome was committed, every interruption stays GET-only. This token is
+                // independent of a cancelled HTTP request, and a failed save still leaves PostStarted safely blocking.
+                using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                await options.OperationStore.MarkFailureAsync(options.OperationKey, XuiV3CreationOutcome.Ambiguous, persistence.Token);
+            }
+        }
         else
         {
             // Absence after a timeout does not prove that a previous POST will never commit. Never issue another add.
@@ -244,6 +267,10 @@ public class ApiServicev3
 
         if (!response.Success)
         {
+            // Only explicit validation failures known to precede mutation are terminal. Arbitrary success=false
+            // messages (including duplicate and internal errors) are not proof that no partial commit occurred.
+            if (IsDefinitiveCreationRejection(response.Msg) && options.OperationStore != null && !string.IsNullOrWhiteSpace(options.OperationKey))
+                await options.OperationStore.MarkFailureAsync(options.OperationKey, XuiV3CreationOutcome.DefinitiveRejected, cancellationToken);
             if (CouldIndicateExistingClient(response.Msg))
             {
                 var recovered = await TryRecoverCreatedClientAsync(
@@ -270,6 +297,9 @@ public class ApiServicev3
             };
         }
 
+        // Authoritative add success proves application even when subsequent GET/link retrieval fails.
+        if (options.OperationStore != null && !string.IsNullOrWhiteSpace(options.OperationKey))
+            await options.OperationStore.MarkAppliedAsync(options.OperationKey, cancellationToken);
         try
         {
             return await BuildAccountCreationResultAsync(
@@ -283,20 +313,11 @@ public class ApiServicev3
                 response.Obj,
                 cancellationToken);
         }
-        catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken))
+        catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken) || ex is XuiV3ApiException)
         {
-            var recovered = await TryRecoverCreatedClientAsync(
-                accountDto,
-                configuration,
-                client,
-                inboundIds,
-                trafficGb,
-                trafficBytes,
-                options,
-                response.Obj,
-                cancellationToken);
-
-            return recovered ?? BuildTransientCreationFailure(configuration, client.Email, ex);
+            // POST success is authoritative; optional read-back failure cannot turn it into failed provisioning.
+            return await BuildAccountCreationResultFromKnownClientAsync(accountDto, configuration, client, null,
+                inboundIds, trafficGb, trafficBytes, options, response.Obj, cancellationToken);
         }
     }
 
@@ -389,15 +410,9 @@ public class ApiServicev3
         {
             links = await GetClientLinksAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
         }
-        catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken))
+        catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken) || ex is XuiV3ApiException)
         {
-            Console.WriteLine($"[XUIv3] Link lookup failed after account creation. email={client.Email}, error={ex.Message}");
-            DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
-                configuration,
-                LogLevel.Warning,
-                nameof(ApiServicev3),
-                $"XUI v3 link lookup failed after account creation. email={client.Email}",
-                ex);
+            Console.WriteLine($"[XUIv3] Optional creation link lookup failed. ErrorType={ex.GetType().Name}");
         }
 
         var configLink = links?.Obj?.FirstOrDefault();
@@ -446,7 +461,7 @@ public class ApiServicev3
     /// Resolves the effective expiry value for a newly created XUI v3 client from all panel response shapes.
     /// </summary>
     /// <param name="panelClient">
-    /// Client row read back from 3x-ui after creation. Version 3.4.x may expose its effective expiry in nested traffic
+    /// Nullable client row read back after creation; null uses the submitted expiry after authoritative POST success. Version 3.4.x may expose its effective expiry in nested traffic
     /// or extension data while leaving the inherited top-level value at zero.
     /// </param>
     /// <param name="submittedClient">
@@ -462,7 +477,7 @@ public class ApiServicev3
     /// </remarks>
     private static long ResolveCreatedClientExpiryTime(XuiV3Client panelClient, XuiV3ClientPayload submittedClient)
     {
-        if (panelClient?.ExpiryTime != 0)
+        if (panelClient != null && panelClient.ExpiryTime != 0)
             return panelClient.ExpiryTime;
 
         var trafficExpiryTime = panelClient?.Traffic?.ExpiryTime ?? 0;
@@ -539,10 +554,12 @@ public class ApiServicev3
         try
         {
             var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
-            if (!panelClientResponse.Success || panelClientResponse.Obj == null)
+            if (!panelClientResponse.Success || !MatchesReservedCreation(client, panelClientResponse.Obj)
+                || !inboundIds.All(id => panelClientResponse.Obj.InboundIds.Contains(id)))
                 return null;
-
-            Console.WriteLine($"[XUIv3] Recovered created client after transient failure. email={client.Email}");
+            if (options.OperationStore != null && !string.IsNullOrWhiteSpace(options.OperationKey))
+                await options.OperationStore.MarkAppliedAsync(options.OperationKey, cancellationToken);
+            Console.WriteLine("[XUIv3] Creation recovered by identity-safe read-back.");
             return await BuildAccountCreationResultFromKnownClientAsync(
                 accountDto,
                 configuration,
@@ -557,7 +574,7 @@ public class ApiServicev3
         }
         catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken) || ex is XuiV3ApiException)
         {
-            Console.WriteLine($"[XUIv3] Could not recover created client after transient failure. email={client.Email}, error={ex.Message}");
+            Console.WriteLine($"[XUIv3] Creation read-back inconclusive. ErrorType={ex.GetType().Name}");
             return null;
         }
     }
@@ -585,13 +602,7 @@ public class ApiServicev3
         string email,
         Exception exception)
     {
-        Console.WriteLine($"[XUIv3] Account creation failed with transient panel transport error. email={email}, error={exception.Message}");
-        DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
-            configuration,
-            LogLevel.Error,
-            nameof(ApiServicev3),
-            $"XUI v3 account creation ended with a transient transport failure. email={email}",
-            exception);
+        Console.WriteLine($"[XUIv3] Creation transport outcome uncertain. ErrorType={exception.GetType().Name}");
         return new XuiV3AccountCreationResult
         {
             Success = false,
@@ -637,6 +648,26 @@ public class ApiServicev3
                message.Contains("重复", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("تکراری", StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>Recognizes only explicit pre-mutation validation failures, never duplicate or arbitrary API failure text.</summary>
+    /// <param name="message">Private provider response used only for classification; never logged.</param>
+    /// <returns>True for the narrowly supported validation responses; all unrecognized errors stay ambiguous.</returns>
+    /// <remarks>Transport status alone, absence, timeout and elapsed time are never proof of rejection.</remarks>
+    internal static bool IsDefinitiveCreationRejection(string message) => message != null && new[] { "empty payload", "client email is required", "at least one inbound is required" }
+            .Any(validation => message.Trim().Equals(validation, StringComparison.Ordinal)
+                || message.Trim().EndsWith(": " + validation, StringComparison.Ordinal));
+
+    /// <summary>Verifies recovered identity without treating an unrelated same-email client as this creation.</summary>
+    /// <param name="reserved">Required private identity persisted before POST.</param>
+    /// <param name="found">Nullable panel read-back; credentials must not be displayed or logged.</param>
+    /// <returns>True only for exact email, subscription identity and Telegram owner matches; a reserved UUID must also match.</returns>
+    /// <remarks>Missing or conflicting identity leaves the reservation unresolved; no replacement POST is allowed.</remarks>
+    internal static bool MatchesReservedCreation(XuiV3ClientPayload reserved, XuiV3Client found) => found != null
+        && !string.IsNullOrWhiteSpace(reserved.Email) && !string.IsNullOrWhiteSpace(reserved.SubId)
+        && string.Equals(reserved.Email, found.Email, StringComparison.Ordinal)
+        && (string.IsNullOrWhiteSpace(reserved.Uuid) || string.Equals(reserved.Uuid, found.Uuid, StringComparison.Ordinal))
+        && reserved.TgId == found.TgId
+        && string.Equals(reserved.SubId, found.SubId, StringComparison.Ordinal);
 
     /// <summary>POST /login. Cookie-based UI login. Bearer-token callers do not need this method.</summary>
     public static Task<XuiV3ApiResponse<JToken>> LoginAsync(

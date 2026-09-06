@@ -28,6 +28,12 @@ public sealed class TelegramUpdateInboxEntry
     public DateTime? StartedAtUtc { get; set; }
     /// <summary>UTC terminal completion or review time; completed receipts expire after seven days.</summary>
     public DateTime? CompletedAtUtc { get; set; }
+    /// <summary>Authenticated super-admin Telegram id that explicitly reviewed this row; null until reviewed.</summary>
+    public long? ReviewedByTelegramUserId { get; set; }
+    /// <summary>UTC explicit resolution time; retained with deduplication metadata for seven days.</summary>
+    public DateTime? ReviewedAtUtc { get; set; }
+    /// <summary>Restricted review-N numeric ticket reference; never arbitrary operator text.</summary>
+    public string ReviewReference { get; set; }
     /// <summary>Coarse failure classification only; never an exception message or customer payload.</summary>
     public string FailureCode { get; set; }
 }

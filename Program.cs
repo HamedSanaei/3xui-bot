@@ -162,8 +162,14 @@ public class Program
         TelegramUpdateScheduler.ValidateConfiguration(appConfig);
         services.Configure<HostOptions>(options => options.ShutdownTimeout =
             TimeSpan.FromSeconds(appConfig.TelegramUpdateShutdownDrainSeconds + 30));
-        services.AddSingleton<TelegramUpdateInboxStore>();
+        services.AddSingleton<TelegramUpdateInboxStore>(sp =>
+        {
+            var store = new TelegramUpdateInboxStore(sp.GetRequiredService<UserDbContextFactory>(), sp.GetRequiredService<CredentialsDbContextFactory>());
+            sp.GetRequiredService<BotRegistry>().AvailabilityChanged += store.NotifyReady;
+            return store;
+        });
         services.AddSingleton<ITelegramUpdateExecutor, TelegramUpdateExecutor>();
+        services.AddSingleton<TelegramInboxAdminService>();
         services.AddSingleton<TelegramUpdateScheduler>();
         services.AddSingleton<ITelegramUpdateScheduler>(sp => sp.GetRequiredService<TelegramUpdateScheduler>());
         // Hosted services stop in reverse registration order: receivers stop before the scheduler drains accepted work.

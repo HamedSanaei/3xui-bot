@@ -172,6 +172,7 @@ public sealed class XuiV3LinkChangeOperationStore
                         x.ConfirmationExpiresAtUtc > now)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, XuiV3LinkChangeStatuses.Processing)
+                    .SetProperty(x => x.InboxSequence, TelegramUpdateExecutionScope.CurrentSequence)
                 .SetProperty(x => x.Stage, "confirmed")
                 .SetProperty(x => x.ConfirmedAtUtc, now)
                 .SetProperty(x => x.UpdatedAtUtc, now)
