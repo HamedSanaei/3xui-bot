@@ -399,10 +399,32 @@ and the main menu.
   SEQUENCE review-N` proves only the exact persisted reserved email is absent through an authenticated XUI v3 GET
   whose successful envelope is exactly `success=false,msg=Obtain (record not found)`; it atomically transitions only
   exact linked `PostStarted`/`Ambiguous` rows to `DefinitiveRejected` and records reviewer audit fields. `/inbox_retry_tenant_order
-  SEQUENCE review-N` is a generic paid/unfulfilled purchase recovery: it requires the original exact creation key to be
-  terminally rejected and reuses one derived `tenant-create:{orderId}:retry:1` key, never creates a payment or repeats a
-  POST after `PostStarted`. Legacy nullable renewal/link rows correlate only within a bounded window (five minutes
-  before inbox acceptance through two hours after start/acceptance); modern rows require exact `InboxSequence`.
+  SEQUENCE review-N` is a generic paid/unfulfilled purchase recovery that calls the central attempt coordinator with a
+  durable `ReviewedRecovery` authorization (it no longer hardcodes `retry:1`). Legacy nullable renewal/link rows
+  correlate only within a bounded window (five minutes before inbox acceptance through two hours after start/acceptance);
+  modern rows require exact `InboxSequence`.
+
+## Tenant purchase provisioning attempts (generational)
+
+- A `TenantBotOrder` is the COMMERCIAL transaction (owner, customer, service, traffic, duration, prices, paid evidence).
+  An `XuiV3CreationOperation` row is one IMMUTABLE PROVISIONING ATTEMPT for that order: `tenant-create:{orderId}` for
+  the first attempt and `tenant-create:{orderId}:retry:N` for explicit retries. Attempts are never rewritten or reused
+  with changed parameters, and the historical row is never copied into a retry.
+- `Services/TenantProvisioningAttemptCoordinator.cs` is the single attempt-resolution engine used by every tenant
+  purchase fulfillment path (all flow through `FULFILLPAIDTENANTORDERASYNC`). State rules: no attempt allocates the
+  base key; `Reserved` reuses and may compete for its one POST; `PostStarted`/`Ambiguous` reuse for GET-only
+  read-back/reconciliation only; `Applied` resumes idempotent settlement (no addClient, no retry:N) so a crash before
+  `IsFulfilled=true` continues from the same account; only `DefinitiveRejected` PLUS a NEW explicit durable retry
+  authorization allocates `retry:(highest+1)` with the CURRENT operational inbound/panel topology.
+- Explicit retry authorization is typed (`OwnerExplicit`, `SuperAdminExplicit`, `ReviewedRecovery`) with a durable
+  restricted key (`tenant-retry:{orderId}:tg:{inboxSequence}` or `tenant-retry:{orderId}:review:{reviewReference}`)
+  persisted as `XuiV3CreationOperation.AuthorizedByKey` (migration `20260906081225_AddTenantCreationAttemptRetryAuthorization`).
+  Automatic paths (duplicate provider callbacks, reconciliation workers, startup, customer checks, ordinary re-entry)
+  pass no authorization and can never advance a generation; one authorization event grants at most one generation, so
+  replaying the same key after its attempt is rejected never allocates the next one.
+- The routine owner flows that authorize retries: Sales Assistant final confirmation, owner OrderId re-entry, and the
+  super-admin OrderId confirm flow (including the gateway `ApplyPaidTenantOrderAsync` overloads). `/inbox_retry_tenant_order`
+  supplies the reviewed-recovery authorization. No retry creates a payment, invoice, order, or price change.
 
 ## Gozargah Site Sync
 
@@ -579,6 +601,13 @@ and the main menu.
   and active bot context to the configurable daily `Data/Logs/errors-{shamsiDate}.log` file. It masks common token,
   authorization, cookie, API-key, and secret representations and is fail-soft if disk logging is unavailable.
 - In owned customer routing, XUI v3 free-trial messages must be handled before purchase text flow. The trial start clears any half-built purchase session so metered purchases cannot reach summary without `TrafficGb`.
+- "🗽 Admin" is privileged high-priority owned-bot navigation for configured super-admins (`AppConfig.AdminsUserIds`):
+  `HandleUpdateCoreAsync` evaluates `TryHandleSuperAdminPanelEntryAsync` (then the "📑 Menu" exit) BEFORE every stateful
+  XUI/customer/renewal/colleague handler and any service-plan/panel dependency. It authorizes against the admin list
+  only (never `CredUser.IsColleague` or tenant ownership), refuses outside owned bots, clears only the current
+  BotId/user conversation plus the in-memory XUI purchase session, and sends the fixed `پنل مدیریت` keyboard. Panel
+  labels `🤝 همکار کردن کاربر` / `👤 لغو همکاری کاربر` toggle only `CredUser.IsColleague` (shared seam
+  `ApplyColleagueRoleChangeAsync`) and never mutate the configuration-controlled admin allow-list.
 - Bot token duplication between owned and tenant bots must be rejected or disabled at runtime.
 - `MultiBotHostedService` serializes start/stop/cleanup per `BotId`; never register a receiver outside that lifecycle
   gate or overwrite its CTS. A transient bounded `GetMe` probe starts one optimistic receiver and completes identity/

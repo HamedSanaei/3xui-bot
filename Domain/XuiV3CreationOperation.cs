@@ -26,6 +26,18 @@ public sealed class XuiV3CreationOperation
     public DateTime CreatedAtUtc { get; set; }
     /// <summary>UTC time a successful read-back/result proved creation; Outcome determines whether an unproven result requires recovery.</summary>
     public DateTime? AppliedAtUtc { get; set; }
+
+    /// <summary>
+    /// Durable identity of the explicit business event that authorized this retry generation, or null for an
+    /// automatic first attempt (<c>tenant-create:{orderId}</c>).
+    /// </summary>
+    /// <remarks>
+    /// One authorization event may grant at most one generation: a replayed event whose key already appears on a
+    /// terminal attempt never allocates the next generation. The value is a restricted non-secret internal key such
+    /// as <c>tenant-retry:{orderId}:tg:{inboxSequence}</c> or <c>tenant-retry:{orderId}:review:{reviewReference}</c>
+    /// and is never derived from Telegram command text or logged.
+    /// </remarks>
+    public string AuthorizedByKey { get; set; }
 }
 
 /// <summary>Durable creation boundary states; terminal rejection never grants another attempt for the same business key.</summary>

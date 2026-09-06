@@ -96,6 +96,7 @@ public class TenantBotService
     private readonly ILogger<TenantBotService> _logger;
     private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
     private readonly XuiV3RenewalOperationStore _renewalOperationStore;
+    private readonly TenantProvisioningAttemptCoordinator _tenantProvisioningCoordinator;
     private readonly Dictionary<string, TenantJoinCapabilityCacheEntry> _tenantJoinCapabilityCache = new(StringComparer.Ordinal);
     private readonly object _tenantJoinCapabilitySync = new();
 
@@ -153,6 +154,11 @@ public class TenantBotService
     /// Durable users.db store that makes each tenant renewal mutation exactly-once: unique-key creation keyed by the
     /// tenant order, lease-bound claims, atomic applied transition, and read-only timeout recovery.
     /// </param>
+    /// <param name="TenantProvisioningCoordinator">
+    /// Central attempt-resolution engine that maps one paid tenant purchase order to its current immutable
+    /// <c>tenant-create:</c> operation, allocating a new <c>:retry:N</c> generation only under a new explicit durable
+    /// retry authorization after a definitive rejection.
+    /// </param>
     /// <remarks>The order is scoped to its tenant and reloaded under an order-specific gate. Wallet receipt keys are derived from that durable order identity.</remarks>
     public TenantBotService(
         UserWorkflowStore UserDbContext,
@@ -177,7 +183,8 @@ public class TenantBotService
         IServiceProvider ServiceProvider,
         ILogger<TenantBotService> Logger,
         XuiV3VolumeReminderStateStore VolumeReminderStateStore,
-        XuiV3RenewalOperationStore RenewalOperationStore)
+        XuiV3RenewalOperationStore RenewalOperationStore,
+        TenantProvisioningAttemptCoordinator TenantProvisioningCoordinator)
     {
         _workflow = UserDbContext;
         _state = stateStore;
@@ -203,6 +210,7 @@ public class TenantBotService
         _logger = Logger;
         _volumeReminderStateStore = VolumeReminderStateStore;
         _renewalOperationStore = RenewalOperationStore;
+        _tenantProvisioningCoordinator = TenantProvisioningCoordinator;
     }
 
     /// <summary>
@@ -7498,10 +7506,15 @@ public class TenantBotService
     ///     cancellationToken);
     /// </code>
     /// </example>
+    /// <param name="retryAuthorization">
+    /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
+    /// provider-driven settlement, which can never allocate a new retry generation.
+    /// </param>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         HooshPayPaymentInfo payment,
         string Source,
-        CancellationToken CancellationToken = default)
+        CancellationToken CancellationToken = default,
+        TenantProvisioningRetryAuthorization retryAuthorization = null)
     {
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
@@ -7515,7 +7528,7 @@ public class TenantBotService
         if (order == null)
             return NowPaymentsSettlementResult.NotFound();
 
-        return await FULFILLPAIDTENANTORDERASYNC(order, Source, payment, null, false, CancellationToken);
+        return await FULFILLPAIDTENANTORDERASYNC(order, Source, payment, null, false, CancellationToken, retryAuthorization);
     }
 
     /// <summary>
@@ -7538,10 +7551,15 @@ public class TenantBotService
     /// Successful fulfillment records the effective currency, fee payer, stored base amount, and provider-reported
     /// fee once in the protected payment channel; repeated fulfillment checks do not emit another provider-success log.
     /// </remarks>
+    /// <param name="retryAuthorization">
+    /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
+    /// provider-driven settlement, which can never allocate a new retry generation.
+    /// </param>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         UniquePayPaymentInfo payment,
         string Source,
-        CancellationToken CancellationToken = default)
+        CancellationToken CancellationToken = default,
+        TenantProvisioningRetryAuthorization retryAuthorization = null)
     {
         if (payment == null ||
             !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) ||
@@ -7607,7 +7625,7 @@ public class TenantBotService
         NowPaymentsSettlementResult settlement;
         try
         {
-            settlement = await FULFILLPAIDTENANTORDERASYNC(order, Source, null, null, false, CancellationToken);
+            settlement = await FULFILLPAIDTENANTORDERASYNC(order, Source, null, null, false, CancellationToken, retryAuthorization);
         }
         catch (Exception ex)
         {
@@ -7752,10 +7770,15 @@ public class TenantBotService
     /// callers handling unsigned callbacks must perform <see cref="TetraminatorPaymentVerifier.IsVerifiedPaid" />
     /// immediately before invoking it.
     /// </remarks>
+    /// <param name="retryAuthorization">
+    /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
+    /// provider-driven settlement, which can never allocate a new retry generation.
+    /// </param>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         TetraminatorPaymentInfo payment,
         string Source,
-        CancellationToken CancellationToken = default)
+        CancellationToken CancellationToken = default,
+        TenantProvisioningRetryAuthorization retryAuthorization = null)
     {
         if (payment == null) return NowPaymentsSettlementResult.NotFound();
         payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.SingleAsync(x => x.Id == payment.Id, CancellationToken));
@@ -7776,7 +7799,7 @@ public class TenantBotService
         if (order == null)
             return NowPaymentsSettlementResult.NotFound();
 
-        var settlement = await FULFILLPAIDTENANTORDERASYNC(order, Source, null, null, false, CancellationToken);
+        var settlement = await FULFILLPAIDTENANTORDERASYNC(order, Source, null, null, false, CancellationToken, retryAuthorization);
         if (settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded)
         {
             payment.IsAddedToBalance = true;
@@ -7803,10 +7826,15 @@ public class TenantBotService
     /// super-admin sources force a fresh NOWPayments provider lookup and return
     /// <see cref="NowPaymentsSettlementStatus.ProviderNotPaid"/> unless the provider reports a paid status.
     /// </remarks>
+    /// <param name="retryAuthorization">
+    /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
+    /// provider-driven settlement, which can never allocate a new retry generation.
+    /// </param>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         SwapinoPaymentInfo payment,
         string Source,
-        CancellationToken CancellationToken = default)
+        CancellationToken CancellationToken = default,
+        TenantProvisioningRetryAuthorization retryAuthorization = null)
     {
         if (payment == null)
             return NowPaymentsSettlementResult.NotFound();
@@ -7852,7 +7880,7 @@ public class TenantBotService
         if (order == null)
             return NowPaymentsSettlementResult.NotFound();
 
-        return await FULFILLPAIDTENANTORDERASYNC(order, Source, null, payment, false, CancellationToken);
+        return await FULFILLPAIDTENANTORDERASYNC(order, Source, null, payment, false, CancellationToken, retryAuthorization);
     }
 
     /// <summary>
@@ -7891,8 +7919,7 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Retries fulfillment of one proven-paid, unfulfilled tenant purchase after its original creation was reviewed
-    /// as definitively absent.
+    /// Retries fulfillment of one proven-paid, unfulfilled tenant purchase after an operator-reviewed absence.
     /// </summary>
     /// <param name="inboxSequence">
     /// Internal terminal-recovery inbox sequence selected by the operator. The sequence, rather than Telegram text, must link
@@ -7905,11 +7932,13 @@ public class TenantBotService
     /// <param name="cancellationToken">Bounded operator-command token for database, XUI, wallet, and notification work.</param>
     /// <returns>A sanitized operator result that contains no account identity, panel response, token, or payload.</returns>
     /// <remarks>
-    /// This recovery accepts purchase orders only. It requires durable paid-provider evidence, no fulfillment or tenant
-    /// ledger row, and an exact original operation in <c>DefinitiveRejected</c>. The retry key is derived internally as
-    /// <c>tenant-create:{orderId}:retry:1</c>. Repeated commands reuse that key; Reserved may grant one POST, while
-    /// PostStarted/Ambiguous can only use normal exact read-back and Applied proceeds to one-time settlement. A rejected
-    /// retry requires a separate future recovery design and is refused. No invoice or payment is created here.
+    /// This recovery accepts purchase orders only and requires durable paid-provider evidence, no fulfillment or tenant
+    /// ledger row, and an exact persisted creation link for the order. Attempt selection is delegated to the central
+    /// <see cref="TenantProvisioningAttemptCoordinator" />: the reviewed action is carried as a durable
+    /// <see cref="TenantProvisioningRetryAuthorizationKind.ReviewedRecovery" /> authorization, so a terminal attempt
+    /// advances to the next <c>tenant-create:{orderId}:retry:N</c> generation, while Reserved/PostStarted/Ambiguous/
+    /// Applied attempts are reused without any new account or second POST. Replaying the same review reference after it
+    /// already granted a generation never allocates another one. No invoice or payment is created here.
     /// </remarks>
     /// <exception cref="ArgumentException">The sequence, authenticated operator, or review reference is invalid.</exception>
     /// <example><code>await tenantService.RetryPaidUnfulfilledPurchaseAsync(sequence, adminId, "review-205", token);</code></example>
@@ -7940,10 +7969,6 @@ public class TenantBotService
             return "Tenant retry refused: exact_order_link_required.";
 
         var orderId = orderIds[0];
-        var originalKey = $"tenant-create:{orderId}";
-        if (!linkedKeys.Any(x => x.OperationKey == originalKey && x.Outcome == XuiV3CreationOutcome.DefinitiveRejected))
-            return "Tenant retry refused: original_creation_not_definitively_rejected.";
-
         var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.AsNoTracking()
             .SingleOrDefaultAsync(x => x.Id == orderId, cancellationToken));
         if (order == null || !string.Equals(order.OrderKind, TenantBotOrderKinds.Purchase, StringComparison.OrdinalIgnoreCase))
@@ -7959,11 +7984,13 @@ public class TenantBotService
         if (!await HasDurablePaidTenantOrderEvidenceAsync(order, cancellationToken))
             return "Tenant retry refused: durable_paid_evidence_required.";
 
-        var retryKey = $"tenant-create:{order.Id}:retry:1";
-        var retryOutcome = linkedKeys.Where(x => x.OperationKey == retryKey).Select(x => (XuiV3CreationOutcome?)x.Outcome).SingleOrDefault();
-        if (retryOutcome == XuiV3CreationOutcome.DefinitiveRejected)
-            return "Tenant retry refused: retry_creation_definitively_rejected.";
-
+        // The reviewed command becomes the durable retry authorization. The coordinator reuses non-terminal attempts
+        // and opens the next retry:N generation only when the latest attempt is DefinitiveRejected and this exact
+        // review reference has not already granted an attempt.
+        var retryAuthorization = TenantProvisioningRetryAuthorization.ReviewedRecovery(
+            operatorTelegramUserId,
+            orderId,
+            reviewReference);
         await FULFILLPAIDTENANTORDERASYNC(
             order,
             $"inbox-reviewed-{reviewReference}",
@@ -7971,7 +7998,7 @@ public class TenantBotService
             null,
             string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase),
             cancellationToken,
-            retryKey);
+            retryAuthorization);
 
         var completed = await _workflow.ReadAsync(async db => await db.TenantBotOrders.AsNoTracking()
             .Where(x => x.Id == order.Id).Select(x => x.IsFulfilled).SingleAsync(cancellationToken));
@@ -8056,9 +8083,10 @@ public class TenantBotService
     /// the bot wallet; <c>false</c> for platform gateways where only owner profit is credited.
     /// </param>
     /// <param name="CancellationToken">Token that cancels users.db, credentials.db, Telegram, and XUI operations.</param>
-    /// <param name="CreationOperationKey">
-    /// Optional internally derived durable creation key for an explicitly reviewed purchase retry. Null uses the
-    /// original <c>tenant-create:{orderId}</c> key. Callers must never derive this value from customer input.
+    /// <param name="retryAuthorization">
+    /// Typed explicit retry authorization supplied only by owner, super-admin, or reviewed-recovery callers. Null
+    /// marks automatic fulfillment, which can reuse non-terminal attempts but can never allocate a new retry
+    /// generation after a definitive rejection. Callers must never pass customer text here.
     /// </param>
     /// <returns>A settlement result with owner-wallet before/after balances when fulfillment succeeds.</returns>
     /// <remarks>
@@ -8068,6 +8096,9 @@ public class TenantBotService
     /// account-creation branch. A completed order returns without creating/updating XUI, mutating an owner wallet, or
     /// appending another ledger entry. Before a paid purchase mutates XUI, its unlimited plan must still be enabled and
     /// tenant-visible; a hidden or removed plan fails the order without creating an account or settling owner funds.
+    /// Purchase fulfillment delegates attempt selection to <see cref="TenantProvisioningAttemptCoordinator" /> so the
+    /// original <c>tenant-create:{orderId}</c> operation is never reused with changed parameters after a definitive
+    /// rejection and no automatic callback can silently advance the attempt generation.
     /// Timing begins only after the paid order, tenant, owner, customer, and plan are ready for execution. The central
     /// audit reports accumulated panel API time and total fulfillment time and never includes gateway waiting time.
     /// </remarks>
@@ -8078,7 +8109,7 @@ public class TenantBotService
         SwapinoPaymentInfo NOWPAYMENTSPAYMENT,
         bool DEBITOWNERBASECOST,
         CancellationToken CancellationToken,
-        string CreationOperationKey = null)
+        TenantProvisioningRetryAuthorization retryAuthorization = null)
     {
         using var tenantFulfillmentGateLease = await TenantFulfillmentGate.EnterAsync(order.Id.ToString(CultureInfo.InvariantCulture), CancellationToken);
         try
@@ -8184,6 +8215,29 @@ public class TenantBotService
         {
             try
             {
+                // The coordinator maps the paid order to its current immutable attempt: it reuses Reserved,
+                // PostStarted, Ambiguous, and Applied attempts and opens retry:(highest+1) only when the latest
+                // attempt is DefinitiveRejected AND this call carries a new explicit durable authorization.
+                var attempt = await _tenantProvisioningCoordinator.ResolvePurchaseAttemptAsync(
+                    order.Id,
+                    retryAuthorization,
+                    CancellationToken);
+                if (!attempt.Allowed)
+                {
+                    // Automatic callbacks and checks never allocate another generation after a definitive
+                    // rejection. A fixed safe reason is recorded instead of the raw reservation exception.
+                    order.PaymentStatus = TenantBotOrderStatuses.Failed;
+                    order.ErrorMessage = attempt.Refusal;
+                    order.UpdatedAtUtc = DateTime.UtcNow;
+                    await _workflow.SaveAsync(CancellationToken);
+                    _logger.LogWarning(
+                        "Paid tenant purchase cannot start a new provisioning attempt without a fresh explicit confirmation. tenantBotId={TenantBotId}, orderId={OrderId}, serviceKey={ServiceKey}",
+                        order.TenantBotId,
+                        order.OrderId,
+                        order.ServiceKey);
+                    return NowPaymentsSettlementResult.InvalidAmount();
+                }
+
                 var created = await _purchaseService.CreateAccountAsync(
                     customer,
                     BuildConfiguredPanelServerInfo(),
@@ -8192,7 +8246,8 @@ public class TenantBotService
                     CancellationToken,
                     new XuiV3AccountMetadataOptions
                     {
-                        OperationKey = CreationOperationKey ?? $"tenant-create:{order.Id}",
+                        OperationKey = attempt.OperationKey,
+                        AuthorizedByKey = attempt.AuthorizedByKey,
                         UserComment = $"tenant sale VIA @{tenant.Username}; Buyer={order.CustomerTelegramUserId}; tenant={order.TenantBotId}",
                         PriceTomanOverride = order.SalePriceToman,
                         CreatedByBotId = order.TenantBotId,
@@ -8509,7 +8564,13 @@ public class TenantBotService
         order.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
 
-        var settlement = await FULFILLPAIDTENANTORDERASYNC(order, "assistant-final", null, null, true, CancellationToken);
+        // The owner's final confirmation is an explicit recovery action: it authorizes the next retry generation
+        // under a durable per-update identity when the latest attempt was definitively rejected.
+        var retryAuthorization = TenantProvisioningRetryAuthorization.TryTelegramConfirmation(
+            TenantProvisioningRetryAuthorizationKind.OwnerExplicit,
+            ReviewerTelegramUserId,
+            order.Id);
+        var settlement = await FULFILLPAIDTENANTORDERASYNC(order, "assistant-final", null, null, true, CancellationToken, retryAuthorization);
         if (settlement.Status == NowPaymentsSettlementStatus.Applied || settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded)
         {
             await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
@@ -8589,7 +8650,12 @@ public class TenantBotService
         order.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
 
-        var settlement = await FULFILLPAIDTENANTORDERASYNC(order, "owner-orderid-manual", null, null, true, CancellationToken);
+        // The owner's explicit OrderId re-confirmation authorizes the next retry generation after a rejection.
+        var retryAuthorization = TenantProvisioningRetryAuthorization.TryTelegramConfirmation(
+            TenantProvisioningRetryAuthorizationKind.OwnerExplicit,
+            owner.TelegramUserId,
+            order.Id);
+        var settlement = await FULFILLPAIDTENANTORDERASYNC(order, "owner-orderid-manual", null, null, true, CancellationToken, retryAuthorization);
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         if (settlement.Status == NowPaymentsSettlementStatus.Applied || settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded)
         {
@@ -8645,6 +8711,12 @@ public class TenantBotService
         }
 
         NowPaymentsSettlementResult settlement;
+        // This super-admin command is an explicit recovery action, so fulfillment may advance a definitively
+        // rejected attempt to the next generation under a durable per-update authorization.
+        var retryAuthorization = TenantProvisioningRetryAuthorization.TryTelegramConfirmation(
+            TenantProvisioningRetryAuthorizationKind.SuperAdminExplicit,
+            superAdminTelegramUserId,
+            order.Id);
         if (string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
         {
             var receipt = await ENSUREMANUALRECEIPTASYNC(order, superAdminTelegramUserId, CancellationToken);
@@ -8658,7 +8730,7 @@ public class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(CancellationToken);
 
-            settlement = await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, true, CancellationToken);
+            settlement = await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, true, CancellationToken, retryAuthorization);
         }
         else
         {
@@ -8667,7 +8739,7 @@ public class TenantBotService
                 CancellationToken));
             if (hooshPay != null)
             {
-                settlement = await ApplyPaidTenantOrderAsync(hooshPay, "super-admin-orderid-manual", CancellationToken);
+                settlement = await ApplyPaidTenantOrderAsync(hooshPay, "super-admin-orderid-manual", CancellationToken, retryAuthorization);
             }
             else
             {
@@ -8709,7 +8781,7 @@ public class TenantBotService
                         }
                     }
                     await _workflow.SaveAsync(CancellationToken);
-                    settlement = await ApplyPaidTenantOrderAsync(uniquePay, "super-admin-orderid-manual", CancellationToken);
+                    settlement = await ApplyPaidTenantOrderAsync(uniquePay, "super-admin-orderid-manual", CancellationToken, retryAuthorization);
                 }
                 else
                 {
@@ -8717,8 +8789,8 @@ public class TenantBotService
                     x => x.TenantBotOrderId == order.Id || x.OrderId == order.OrderId,
                     CancellationToken));
                 settlement = nowPayments != null
-                    ? await ApplyPaidTenantOrderAsync(nowPayments, "super-admin-orderid-manual", CancellationToken)
-                    : await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, false, CancellationToken);
+                    ? await ApplyPaidTenantOrderAsync(nowPayments, "super-admin-orderid-manual", CancellationToken, retryAuthorization)
+                    : await FULFILLPAIDTENANTORDERASYNC(order, "super-admin-orderid-manual", null, null, false, CancellationToken, retryAuthorization);
                 }
             }
         }

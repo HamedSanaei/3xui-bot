@@ -34,6 +34,38 @@ public class TelegramBotService
     private const int MaxAccountInfoMessagesPerRequest = 5;
 
     /// <summary>
+    /// Reply-keyboard entry that opens the global super-admin panel inside an owned bot.
+    /// </summary>
+    /// <remarks>
+    /// This is privileged high-priority navigation: it must be routed before every stale XUI/customer/renewal/
+    /// colleague sub-flow and never depends on service plans, panels, payments, or other stateful handlers.
+    /// </remarks>
+    private const string AdminPanelEntryAction = "🗽 Admin";
+
+    /// <summary>Fixed Persian greeting shown when the super-admin panel opens.</summary>
+    private const string AdminPanelGreetingText = "پنل مدیریت";
+
+    /// <summary>
+    /// Reply-keyboard escape that returns a super-admin from any owned-bot admin panel back to the main menu.
+    /// </summary>
+    private const string AdminMenuExitAction = "📑 Menu";
+
+    /// <summary>Legacy English greeting shown when the owned-bot main menu is returned to.</summary>
+    private const string MainMenuGreetingText = "Main Menu:";
+
+    /// <summary>
+    /// Panel label that promotes a user to colleague (modifies only <c>CredUser.IsColleague</c>).
+    /// </summary>
+    /// <remarks>The action never changes the configuration-controlled <c>AdminsUserIds</c> allow-list.</remarks>
+    private const string PromoteColleagueAction = "🤝 همکار کردن کاربر";
+
+    /// <summary>
+    /// Panel label that demotes a colleague back to a normal customer (modifies only <c>CredUser.IsColleague</c>).
+    /// </summary>
+    /// <remarks>The action never changes the configuration-controlled <c>AdminsUserIds</c> allow-list.</remarks>
+    private const string DemoteColleagueAction = "👤 لغو همکاری کاربر";
+
+    /// <summary>
     /// Reply-keyboard action that starts the super-admin manual phone verification flow for an owned-bot user.
     /// </summary>
     private const string AdminVerifyPhoneAction = "📱 تایید دستی شماره تلفن";
@@ -496,6 +528,187 @@ public class TelegramBotService
     }
 
     /// <summary>
+    /// Persists a colleague-role change for one profile and emits the durable role-change audit.
+    /// </summary>
+    /// <param name="target">
+    /// Target profile whose <c>CredUser.IsColleague</c> the caller already updated in memory; only its
+    /// <c>TelegramUserId</c> is used for the shared-profile store write.
+    /// </param>
+    /// <param name="makeColleague">
+    /// <c>true</c> to promote the target to colleague; <c>false</c> to demote back to a normal customer.
+    /// </param>
+    /// <param name="actor">
+    /// Configured super-admin performing the change; used only as the audit sender identity. Never the target when
+    /// the two differ.
+    /// </param>
+    /// <param name="wasColleague">Prior stored role value captured before the change, used by the audit message.</param>
+    /// <returns>A task completing after the shared-profile write and the durable audit emit finish.</returns>
+    /// <remarks>
+    /// This is the single role-toggle path behind the <c>🤝 همکار کردن کاربر</c> and <c>👤 لغو همکاری کاربر</c> panel
+    /// actions. It writes only <c>CredUser.IsColleague</c> through the shared credentials store; the
+    /// configuration-controlled <see cref="AppConfig.AdminsUserIds"/> allow-list is never read or written here, so a
+    /// colleague toggle can never grant or revoke global super-admin authority.
+    /// </remarks>
+    private async Task ApplyColleagueRoleChangeAsync(
+        CredUser target,
+        bool makeColleague,
+        Telegram.Bot.Types.User actor,
+        bool wasColleague)
+    {
+        var roleChanged = await _credentialsDbContext.PromotOrDemote(target.TelegramUserId, makeColleague);
+        if (roleChanged)
+            LogAdminRoleChange(actor, target, wasColleague, isColleagueAfter: makeColleague);
+    }
+
+    /// <summary>
+    /// Opens the global super-admin panel as privileged high-priority owned-bot navigation.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram client of the active owned bot that received the message. Only the panel sender uses it; no XUI,
+    /// service-plan, payment, or website dependency is touched by this route.
+    /// </param>
+    /// <param name="message">
+    /// Incoming owned-bot message whose text must be exactly <see cref="AdminPanelEntryAction"/> and whose sender is
+    /// a configured global super-admin.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for the bot-scoped state reset and the Telegram send.</param>
+    /// <returns>
+    /// <c>true</c> only when the message was the Admin entry and the actor is a configured super-admin inside an
+    /// owned bot (the panel was opened and state cleared); otherwise <c>false</c> so normal routing continues.
+    /// </returns>
+    /// <remarks>
+    /// Called from the message router BEFORE <see cref="XuiV3AdminFlowService.TryHandleMessageAsync"/> and every other
+    /// stateful customer/XUI/renewal/colleague handler. The route authorizes against the configuration-controlled
+    /// <c>adminsUserIds</c> list only (a colleague or tenant owner is never enough), verifies the current bot is owned
+    /// (tenant bots never expose this panel), clears the current BotId/user conversation (abandoning stale
+    /// <c>xui-v3-admin</c>, purchase, renewal, and legacy sub-flow state for that bot only), and then sends the panel.
+    /// A missing service-plan file or unavailable XUI panel cannot prevent the panel from opening because nothing
+    /// outside this local route is evaluated. Role precedence is super-admin first: a super-admin who is also a
+    /// colleague still receives only the super-admin keyboard, and <c>CredUser.IsColleague</c> is never modified.
+    /// </remarks>
+    /// <example><code>if (await TryHandleSuperAdminPanelEntryAsync(botClient, message, token)) return;</code></example>
+    private async Task<bool> TryHandleSuperAdminPanelEntryAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CancellationToken cancellationToken)
+    {
+        if (message?.From == null ||
+            !string.Equals(message.Text, AdminPanelEntryAction, StringComparison.Ordinal))
+            return false;
+
+        // Authorization is configuration-controlled. CredUser.IsColleague and tenant ownership confer no admin power.
+        if (!IsSuperAdminUser(message.From.Id))
+            return false;
+
+        // The global platform panel exists only inside owned bots; tenant and assistant contexts must not reach it.
+        var botType = CurrentBot?.Type ?? BotContextAccessor.CurrentBotType;
+        if (string.IsNullOrWhiteSpace(botType))
+            botType = BotInstanceTypes.Owned;
+        if (!string.Equals(botType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // High-priority navigation: abandon any stale bot-scoped conversation (XUI admin/customer/renewal/purchase/
+        // colleague sub-flow) for THIS bot+user before sending the panel. Zero service-plan/panel/payment work happens.
+        await ResetCurrentBotConversationAsync(message.From.Id, cancellationToken);
+        await SendAdminPanelAsync(botClient, message.Chat.Id, cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Builds the exact super-admin panel greeting text and reply keyboard.
+    /// </summary>
+    /// <returns>
+    /// The fixed Persian greeting and the full <see cref="GetAdminKeyboard"/> keyboard. The method performs zero
+    /// service-plan, panel, payment, or website work and never throws when the plans file is missing.
+    /// </returns>
+    /// <remarks>
+    /// Virtual so tests can capture the real production content without opening a Telegram network client.
+    /// </remarks>
+    internal virtual (string Text, ReplyKeyboardMarkup Markup) BuildAdminPanelContent() =>
+        (AdminPanelGreetingText, GetAdminKeyboard());
+
+    /// <summary>
+    /// Sends the super-admin panel greeting with the full admin keyboard.
+    /// </summary>
+    /// <param name="botClient">
+    /// Telegram client of the active owned bot. The caller guarantees an owned-bot context; the default implementation
+    /// only sends one local Telegram message and performs no external panel or catalog work.
+    /// </param>
+    /// <param name="chatId">Target private chat id of the configured super-admin.</param>
+    /// <param name="cancellationToken">Cancellation token for the Telegram send.</param>
+    /// <returns>A task completing after the greeting is sent.</returns>
+    /// <remarks>
+    /// Virtual so tests can capture sends without opening a network client. Production behavior is the one-line send
+    /// below and must never grow panel, catalog, or payment dependencies.
+    /// </remarks>
+    internal virtual Task<Message> SendAdminPanelAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        CancellationToken cancellationToken)
+    {
+        var content = BuildAdminPanelContent();
+        return botClient.CustomSendTextMessageAsync(
+            chatId: chatId,
+            text: content.Text,
+            replyMarkup: content.Markup,
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Returns a configured super-admin from the admin panel back to the normal owned-bot main menu.
+    /// </summary>
+    /// <param name="botClient">Telegram client of the active owned bot; only the main-menu sender uses it.</param>
+    /// <param name="message">Incoming owned-bot message whose text must be exactly <see cref="AdminMenuExitAction"/>.</param>
+    /// <param name="cancellationToken">Cancellation token for the bot-scoped state reset and the Telegram send.</param>
+    /// <returns>
+    /// <c>true</c> only when the message was the panel menu exit and the actor is a configured super-admin inside an
+    /// owned bot (state was cleared and the owned-bot main menu was shown); otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Evaluated at the same high-priority layer as the Admin entry, before any XUI/admin sub-flow can consume the
+    /// text. The route clears only the current BotId/user conversation state; super-admin authorization (the
+    /// configuration-controlled <c>adminsUserIds</c> list) is untouched.
+    /// </remarks>
+    private async Task<bool> TryHandleSuperAdminMenuExitAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CancellationToken cancellationToken)
+    {
+        if (message?.From == null ||
+            !string.Equals(message.Text, AdminMenuExitAction, StringComparison.Ordinal))
+            return false;
+        if (!IsSuperAdminUser(message.From.Id))
+            return false;
+        var botType = CurrentBot?.Type ?? BotContextAccessor.CurrentBotType;
+        if (string.IsNullOrWhiteSpace(botType))
+            botType = BotInstanceTypes.Owned;
+        if (!string.Equals(botType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        await ResetCurrentBotConversationAsync(message.From.Id, cancellationToken);
+        await SendMainMenuAsync(botClient, message.Chat.Id, cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Sends the owned-bot main menu that a super-admin returns to after leaving the admin panel.
+    /// </summary>
+    /// <param name="botClient">Telegram client of the active owned bot.</param>
+    /// <param name="chatId">Target private chat id of the configured super-admin.</param>
+    /// <param name="cancellationToken">Cancellation token for the Telegram send.</param>
+    /// <returns>A task completing after the main menu is sent.</returns>
+    /// <remarks>Virtual so tests can capture the send without opening a network client.</remarks>
+    internal virtual Task<Message> SendMainMenuAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        CancellationToken cancellationToken) =>
+        botClient.CustomSendTextMessageAsync(
+            chatId: chatId,
+            text: MainMenuGreetingText,
+            replyMarkup: GetMainMenuKeyboard(),
+            cancellationToken: cancellationToken);
+
+    /// <summary>
     /// Routes callbacks and messages to tenant storefront flows, owned-wallet shortcuts, owner tenant configuration,
     /// user XuiV3 flows, super-admin flows, payment return handlers, and legacy menus while giving navigation reset
     /// commands priority over every conversation state machine.
@@ -634,6 +847,16 @@ public class TelegramBotService
             await SendBlockedUserMessageAsync(botClient, message.Chat.Id, cancellationToken);
             return;
         }
+
+        // "🗽 Admin" is privileged high-priority navigation for configured super-admins in owned bots only. It must
+        // preempt every stale XUI/customer/renewal/colleague sub-flow BEFORE any stateful handler or service-plan/
+        // panel dependency is evaluated, and it never runs inside tenant or assistant bots.
+        if (isOwnedBot && await TryHandleSuperAdminPanelEntryAsync(botClient, message, cancellationToken))
+            return;
+        // The same precedence applies to "📑 Menu": while the super-admin panel is open it must abandon any stale
+        // admin sub-flow and return to the owned-bot main menu without touching super-admin authorization.
+        if (isOwnedBot && await TryHandleSuperAdminMenuExitAsync(botClient, message, cancellationToken))
+            return;
 
         // Tenant bots answer as storefronts only; they do not expose the main brand menus.
         if (isTenantBot)
@@ -1274,15 +1497,9 @@ public class TelegramBotService
         }
 
 
-        else if (message.Text == "🗽 Admin")
-        {
-            await _state.ClearUserStatus(currentUser);
-
-            await botClient.CustomSendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: "Admin:",
-                replyMarkup: GetAdminKeyboard());
-        }
+        // The single authoritative Admin entry is TryHandleSuperAdminPanelEntryAsync, evaluated at the top of the
+        // message router before any stateful handler. This legacy branch was removed so no second competing route
+        // can let stale XUI/customer state consume the privileged navigation action.
 
         //get public message:
         else if (currentUser.Flow == "admin" && currentUser.LastStep == "Get-public-message")
@@ -1516,7 +1733,7 @@ public class TelegramBotService
                 }
             }
             //promote demote
-            else if (action == "🚀 Promote as admin" || action == "❌ Demote as admin")
+            else if (action == PromoteColleagueAction || action == DemoteColleagueAction)
             {
                 // get confirmation
                 currentUser.LastStep = currentUser.LastStep.Replace("get-tel-user-id", "confirm-admin-action");
@@ -1804,13 +2021,11 @@ public class TelegramBotService
                     await _state.ClearUserStatus(currentUser);
 
                 }
-                else if (action == "🚀 Promote as admin")
+                else if (action == PromoteColleagueAction)
                 {
                     var wasColleague = findedUser.IsColleague;
                     findedUser.IsColleague = true;
-                    var roleChanged = await _credentialsDbContext.PromotOrDemote(findedUser.TelegramUserId, true);
-                    if (roleChanged)
-                        LogAdminRoleChange(message.From, findedUser, wasColleague, isColleagueAfter: true);
+                    await ApplyColleagueRoleChangeAsync(findedUser, makeColleague: true, message.From, wasColleague);
 
 
                     await botClient.CustomSendTextMessageAsync(
@@ -1826,14 +2041,12 @@ public class TelegramBotService
                     await _state.ClearUserStatus(currentUser);
 
                 }
-                else if (action == "❌ Demote as admin")
+                else if (action == DemoteColleagueAction)
                 {
-                    // Demote as admin logic here
+                    // The action below only toggles CredUser.IsColleague; configured AdminsUserIds stay unchanged.
                     var wasColleague = findedUser.IsColleague;
                     findedUser.IsColleague = false;
-                    var roleChanged = await _credentialsDbContext.PromotOrDemote(findedUser.TelegramUserId, false);
-                    if (roleChanged)
-                        LogAdminRoleChange(message.From, findedUser, wasColleague, isColleagueAfter: false);
+                    await ApplyColleagueRoleChangeAsync(findedUser, makeColleague: false, message.From, wasColleague);
 
                     await botClient.CustomSendTextMessageAsync(
                         chatId: message.Chat.Id,
@@ -5235,8 +5448,8 @@ public class TelegramBotService
             "✅ Unban user",
             "➕ Add credit",
             "➖ Reduce credit",
-            "🚀 Promote as admin",
-            "❌ Demote as admin",
+            PromoteColleagueAction,
+            DemoteColleagueAction,
             "ℹ️ See User Account",
             "📨 Send message to all",
             "✉️ Send message to user",

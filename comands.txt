@@ -5,13 +5,11 @@ dotnet ef migrations add InitialmycredsDb --context CredentialsDbContext
 [Unit]
 Description=Your Telegram Bot Service
 After=network.target
-StartLimitIntervalSec=300
-StartLimitBurst=3
 
 [Service]
-WorkingDirectory=/opt/vpnetiran/current
-ExecStart=/opt/vpnetiran/current/Adminbot
-Restart=on-failure
+WorkingDirectory=/root/vpnetiran/bin/Release/net10.0/linux-x64/publish
+ExecStart=/root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Adminbot
+Restart=always
 User=root
 Environment=ASPNETCORE_ENVIRONMENT=Production
 RestartSec=10
@@ -24,4 +22,4 @@ WantedBy=multi-user.target
 
 journalctl -u vpnetiranbot.service --since "1 day ago" --until "now" -f
 
-bash scripts/deploy-release.sh /path/to/clean/clone COMMIT_SHA /opt/vpnetiran vpnetiranbot.service
+dotnet publish -c Release -f net10.0 -r linux-x64 --self-contained false

@@ -157,6 +157,7 @@ public class ApiServicev3
                 accountDto.TotoalGB, accountDto.SelectedPeriod, options.TrafficGb, options.TrafficBytes,
                 options.DurationDays, options.LimitIp, options.UseVisionFlow, options.StartExpiryAfterFirstUse, options.PriceToman
             }),
+            AuthorizedByKey = options.AuthorizedByKey,
             CreatedAtUtc = DateTime.UtcNow
         }, cancellationToken);
         client = JsonConvert.DeserializeObject<XuiV3ClientPayload>(reservation.Operation.ClientJson);
@@ -3016,6 +3017,11 @@ public class XuiV3CreateAccountOptions
     /// <summary>Required durable reservation store when OperationKey is provided; never serialized or logged.</summary>
     [JsonIgnore]
     public XuiV3CreationOperationStore OperationStore { get; set; }
+    /// <summary>
+    /// Optional durable identity of the explicit event that authorized a tenant retry generation; persisted on the
+    /// reservation and reused only for replay detection. Restricted non-secret value, never customer text.
+    /// </summary>
+    public string AuthorizedByKey { get; set; }
     /// <summary>Optional nonnegative confirmed catalog price in toman, included in immutable intent comparison; no debit is performed here.</summary>
     public long? PriceToman { get; set; }
     /// <summary>Required positive x-ui inbound identifiers belonging to the selected panel.</summary>

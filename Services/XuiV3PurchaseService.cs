@@ -1237,6 +1237,7 @@ public class XuiV3PurchaseService
             {
                 OperationKey = metadataOptions.OperationKey,
                 OperationStore = _creationOperations,
+                AuthorizedByKey = metadataOptions.AuthorizedByKey,
                 PriceToman = priceToman,
                 InboundIds = inboundIds,
                 TrafficGb = resolved.TrafficGb,
@@ -1854,6 +1855,11 @@ public class XuiV3AccountMetadataOptions
 {
     /// <summary>Stable order/account creation key; repeated invocation can only recover the original client by GET.</summary>
     public string OperationKey { get; set; }
+    /// <summary>
+    /// Durable identity of the explicit business event that authorized this retry generation, when the key is a
+    /// tenant retry attempt. Null for automatic first attempts. The value is restricted and never customer text.
+    /// </summary>
+    public string AuthorizedByKey { get; set; }
     public string UserComment { get; set; }
     public string BulkOrderId { get; set; }
     public int? BulkIndex { get; set; }
