@@ -15,6 +15,7 @@ public sealed class TelegramInboxAdminService
     private readonly AppConfig _config;
     private readonly IConfiguration _configuration;
     private readonly BotRegistry _bots;
+    private readonly IServiceScopeFactory _services;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     /// <summary>Creates the operator service using factories and trusted global authorization settings.</summary>
@@ -23,9 +24,16 @@ public sealed class TelegramInboxAdminService
     /// <param name="config">Global super-admin Telegram id allowlist, never tenant admin ids.</param>
     /// <param name="configuration">Private panel transport configuration, never returned in command responses.</param>
     /// <param name="bots">Runtime registry identifying the default-owned control bot.</param>
+    /// <param name="services">
+    /// Scope factory used only for the explicit tenant-order recovery command. Tests that exercise inspection only may
+    /// omit it; production dependency injection always supplies it.
+    /// </param>
     public TelegramInboxAdminService(TelegramUpdateInboxStore inbox, UserDbContextFactory users, AppConfig config,
-        IConfiguration configuration, BotRegistry bots)
-    { _inbox = inbox; _users = users; _config = config; _configuration = configuration; _bots = bots; }
+        IConfiguration configuration, BotRegistry bots, IServiceScopeFactory services = null)
+    {
+        _inbox = inbox; _users = users; _config = config; _configuration = configuration; _bots = bots;
+        _services = services;
+    }
 
     /// <summary>Authorizes only global super-admins in a private chat through the default-owned bot.</summary>
     /// <param name="botId">Internal receiving bot id, supplied by its receiver runtime.</param>
@@ -50,7 +58,8 @@ public sealed class TelegramInboxAdminService
         var message = update.Message;
         var parts = message?.Text?.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var command = parts?.FirstOrDefault()?.Split('@')[0];
-        if (command is not ("/inbox_uncertain" or "/inbox_resolve" or "/inbox_reconcile")) return false;
+        if (command is not ("/inbox_uncertain" or "/inbox_resolve" or "/inbox_reconcile" or
+            "/inbox_reject_creation" or "/inbox_retry_tenant_order")) return false;
         if (!IsAuthorized(botId, message.From?.Id ?? 0, message.Chat.Type == ChatType.Private)) return true;
         if (!await _gate.WaitAsync(0, token)) return true;
         try
@@ -59,7 +68,7 @@ public sealed class TelegramInboxAdminService
             deadline.CancelAfter(TimeSpan.FromSeconds(30));
             string response;
             try { response = await ExecuteAuthorizedAsync(botId, message.From.Id, true, parts, deadline.Token); }
-            catch (ArgumentException) { response = "Invalid arguments. Use /inbox_resolve SEQUENCE review-N."; }
+            catch (ArgumentException) { response = "Invalid arguments. Use /inbox_resolve, /inbox_reject_creation, or /inbox_retry_tenant_order SEQUENCE review-N."; }
             catch (Exception) when (!token.IsCancellationRequested) { response = "Review unavailable; no unsafe resolution was authorized. Inspect again."; }
             await client.SendTextMessageAsync(message.Chat.Id, response, cancellationToken: deadline.Token);
         }
@@ -107,12 +116,136 @@ public sealed class TelegramInboxAdminService
             return await _inbox.ResolveReviewedAsync(sequence, actor, parts[2], token)
                 ? "Reviewed and completed; original handler was not replayed." : "Resolution refused; inspect current evidence.";
         }
+        if (command == "/inbox_reject_creation")
+        {
+            if (parts.Length != 3)
+                throw new ArgumentException();
+            return await RejectAbsentCreationsAsync(sequence, actor, parts[2], token);
+        }
+        if (command == "/inbox_retry_tenant_order")
+        {
+            if (parts.Length != 3)
+                throw new ArgumentException();
+            if (_services == null)
+                return "Tenant retry unavailable.";
+            ValidateReviewReference(parts[2]);
+            using (TelegramUpdateExecutionScope.Push(sequence))
+            {
+                await using var scope = _services.CreateAsyncScope();
+                var result = await scope.ServiceProvider.GetRequiredService<TenantBotService>()
+                    .RetryPaidUnfulfilledPurchaseAsync(sequence, actor, parts[2], token);
+                return result;
+            }
+        }
         if (parts.Length != 2) throw new ArgumentException();
         if (command == "/inbox_reconcile") await ReconcileCreationsAsync(sequence, token);
         var row = (await _inbox.ListUncertainAsync(sequence - 1, token)).FirstOrDefault(x => x.Sequence == sequence);
         if (row == null) return "Not uncertain.";
         var check = await _inbox.CanResolveAsync(sequence, token);
         return Format(row) + "\n" + check.Evidence + $"\nEligibleForExplicitReview={check.Allowed}";
+    }
+
+    /// <summary>
+    /// Proves exact reserved identities absent through authenticated XUI GET responses and records reviewed rejection.
+    /// </summary>
+    /// <param name="sequence">Internal uncertain inbox sequence supplied by the operator command.</param>
+    /// <param name="actor">Authenticated global super-admin Telegram id.</param>
+    /// <param name="reviewReference">Restricted <c>review-N</c> audit reference.</param>
+    /// <param name="token">Bounded command cancellation for reads and short local writes.</param>
+    /// <returns>A sanitized count of rejected creation rows, or a fixed inconclusive/refusal reason.</returns>
+    /// <remarks>
+    /// Emails come only from persisted ClientJson and never from command text. The method uses only exact GET and
+    /// changes state only for an authenticated HTTP response whose API envelope says <c>Obtain (record not found)</c>.
+    /// Timeout, authentication failure, malformed data, 5xx, and unknown provider messages leave state unchanged.
+    /// </remarks>
+    private async Task<string> RejectAbsentCreationsAsync(
+        long sequence,
+        long actor,
+        string reviewReference,
+        CancellationToken token)
+    {
+        ValidateReviewReference(reviewReference);
+        if (_inbox.Executing.ContainsKey(sequence))
+            return "Creation rejection refused: handler_still_active.";
+
+        TelegramUpdateInboxEntry inbox;
+        List<XuiV3CreationOperation> rows;
+        await using (var db = _users.CreateDbContext())
+        {
+            inbox = await db.TelegramUpdateInbox.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.Sequence == sequence && x.Status == "uncertain", token);
+            if (inbox == null)
+                return "Creation rejection refused: not_uncertain.";
+            rows = await db.XuiV3CreationOperations.AsNoTracking()
+                .Where(x => x.InboxSequence == sequence &&
+                    (x.Outcome == XuiV3CreationOutcome.Ambiguous || x.Outcome == XuiV3CreationOutcome.PostStarted))
+                .Take(20).ToListAsync(token);
+        }
+        if (rows.Count == 0)
+            return "Creation rejection refused: no_unresolved_creation.";
+
+        var panel = BuildConfiguredPanel();
+        var panelKey = XuiV3LinkChangeOperationStore.BuildPanelKey(panel);
+        if (rows.Any(x => x.PanelKey != panelKey))
+            return "Creation rejection refused: configured_panel_mismatch.";
+
+        var store = new XuiV3CreationOperationStore(_users);
+        var rejected = 0;
+        foreach (var row in rows)
+        {
+            XuiV3ClientPayload reserved;
+            try { reserved = JsonConvert.DeserializeObject<XuiV3ClientPayload>(row.ClientJson); }
+            catch (JsonException) { return "Creation rejection inconclusive: invalid_reserved_identity."; }
+            if (string.IsNullOrWhiteSpace(reserved?.Email))
+                return "Creation rejection inconclusive: invalid_reserved_identity.";
+
+            XuiV3ApiResponse<XuiV3Client> response;
+            try { response = await ApiServicev3.GetClientAsync(panel, _configuration, reserved.Email, token); }
+            catch (Exception) when (!token.IsCancellationRequested)
+            {
+                return "Creation rejection inconclusive: panel_read_failed.";
+            }
+            if (!IsAuthoritativeExactNotFound(response))
+                return response.Success
+                    ? "Creation rejection refused: reserved_identity_exists. Use /inbox_reconcile."
+                    : "Creation rejection inconclusive: panel_response_not_authoritative.";
+
+            if (await store.MarkOperatorProvenAbsentAsync(
+                sequence, row.OperationKey, actor, reviewReference, token))
+                rejected++;
+        }
+        return rejected == rows.Count
+            ? $"Creation absence reviewed; definitiveRejected={rejected}. Original handler was not replayed."
+            : "Creation rejection changed concurrently; inspect current evidence.";
+    }
+
+    /// <summary>Builds the single configured XUI v3 descriptor without exposing its credentials.</summary>
+    /// <returns>Authenticated panel descriptor used only by read-only reconciliation requests.</returns>
+    /// <exception cref="InvalidOperationException">The global XUI v3 endpoint is not configured.</exception>
+    private ServerInfo BuildConfiguredPanel()
+    {
+        if (string.IsNullOrWhiteSpace(_config.XuiV3ApiBaseUrl))
+            throw new InvalidOperationException("Configured XUI v3 panel is unavailable.");
+        return new ServerInfo { ApiVersion = "v3", Url = _config.XuiV3ApiBaseUrl,
+            RootPath = _config.XuiV3ApiRootPath, ApiToken = _config.XuiV3ApiToken };
+    }
+
+    /// <summary>Recognizes the authenticated XUI v3 exact-detail absence contract.</summary>
+    /// <param name="response">Parsed HTTP-success API envelope returned by exact client-detail GET.</param>
+    /// <returns>True only for <c>success=false</c> and the exact documented record-not-found message.</returns>
+    /// <remarks>HTTP exceptions never reach this method and therefore cannot prove absence.</remarks>
+    internal static bool IsAuthoritativeExactNotFound(XuiV3ApiResponse<XuiV3Client> response) =>
+        response != null && !response.Success && response.Obj == null &&
+        string.Equals(response.Msg?.Trim(), "Obtain (record not found)", StringComparison.Ordinal);
+
+    /// <summary>Validates a non-secret operator review ticket before any panel request.</summary>
+    /// <param name="reference">Required <c>review-N</c> reference with one to twelve digits.</param>
+    /// <exception cref="ArgumentException">The reference permits arbitrary or oversized input.</exception>
+    private static void ValidateReviewReference(string reference)
+    {
+        if (reference == null ||
+            !System.Text.RegularExpressions.Regex.IsMatch(reference, @"\Areview-[0-9]{1,12}\z"))
+            throw new ArgumentException("A review-N reference is required.");
     }
 
     /// <summary>Builds safe operational metadata without reading or displaying the update payload.</summary>

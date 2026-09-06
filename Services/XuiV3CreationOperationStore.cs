@@ -81,4 +81,63 @@ public sealed class XuiV3CreationOperationStore
                 .ExecuteUpdateAsync(set => set.SetProperty(x => x.Outcome, outcome), ct);
         }, token);
     }
+
+    /// <summary>
+    /// Records an operator-reviewed authoritative absence for one creation linked to an uncertain inbox row.
+    /// </summary>
+    /// <param name="sequence">Internal uncertain inbox sequence loaded by the authenticated review workflow.</param>
+    /// <param name="operationKey">
+    /// Exact durable operation key loaded from the row linked by <paramref name="sequence" />. This value must never
+    /// come from Telegram command text.
+    /// </param>
+    /// <param name="operatorTelegramUserId">Positive global super-admin Telegram id authenticated by the receiver.</param>
+    /// <param name="reviewReference">Restricted non-secret reference in <c>review-N</c> form.</param>
+    /// <param name="token">Cancellation of the short users.db transaction after all panel reads have completed.</param>
+    /// <returns>
+    /// <c>true</c> when an exact linked <c>PostStarted</c>/<c>Ambiguous</c> operation became
+    /// <c>DefinitiveRejected</c>; otherwise <c>false</c>. Applied and unrelated operations are never changed.
+    /// </returns>
+    /// <remarks>
+    /// The caller must first prove absence through an authenticated, successful read-only panel request. This method
+    /// performs no network I/O, never resets an operation to Reserved, and never grants another POST. The same local
+    /// transaction also records the reviewer, UTC time, and reference on the still-uncertain inbox row.
+    /// </remarks>
+    /// <example><code>var changed = await store.MarkOperatorProvenAbsentAsync(sequence, persistedKey, adminId, "review-205", token);</code></example>
+    internal Task<bool> MarkOperatorProvenAbsentAsync(
+        long sequence,
+        string operationKey,
+        long operatorTelegramUserId,
+        string reviewReference,
+        CancellationToken token)
+    {
+        if (sequence <= 0 || string.IsNullOrWhiteSpace(operationKey) || operatorTelegramUserId <= 0 ||
+            reviewReference == null ||
+            !System.Text.RegularExpressions.Regex.IsMatch(reviewReference, @"\Areview-[0-9]{1,12}\z"))
+            throw new ArgumentException("A linked operation, authenticated operator, and review-N reference are required.");
+
+        return SqliteOperation.RunAsync(async ct =>
+        {
+            await using var db = _factory.CreateDbContext();
+            await using var transaction = await db.Database.BeginTransactionAsync(ct);
+            var changed = await db.XuiV3CreationOperations
+                .Where(x => x.OperationKey == operationKey && x.InboxSequence == sequence &&
+                    (x.Outcome == XuiV3CreationOutcome.PostStarted || x.Outcome == XuiV3CreationOutcome.Ambiguous))
+                .ExecuteUpdateAsync(set => set.SetProperty(x => x.Outcome, XuiV3CreationOutcome.DefinitiveRejected), ct);
+            if (changed != 1)
+                return false;
+
+            var reviewedAtUtc = DateTime.UtcNow;
+            var inboxChanged = await db.TelegramUpdateInbox
+                .Where(x => x.Sequence == sequence && x.Status == "uncertain")
+                .ExecuteUpdateAsync(set => set
+                    .SetProperty(x => x.ReviewedByTelegramUserId, operatorTelegramUserId)
+                    .SetProperty(x => x.ReviewedAtUtc, reviewedAtUtc)
+                    .SetProperty(x => x.ReviewReference, reviewReference), ct);
+            if (inboxChanged != 1)
+                throw new InvalidOperationException("The linked uncertain inbox row was not available for review.");
+
+            await transaction.CommitAsync(ct);
+            return true;
+        }, token);
+    }
 }

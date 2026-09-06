@@ -7891,6 +7891,159 @@ public class TenantBotService
     }
 
     /// <summary>
+    /// Retries fulfillment of one proven-paid, unfulfilled tenant purchase after its original creation was reviewed
+    /// as definitively absent.
+    /// </summary>
+    /// <param name="inboxSequence">
+    /// Internal uncertain-inbox sequence selected by the operator. The sequence, rather than Telegram text, must link
+    /// the original <c>tenant-create:{orderId}</c> operation to the paid tenant order.
+    /// </param>
+    /// <param name="operatorTelegramUserId">Authenticated positive Telegram id of the global super-admin reviewer.</param>
+    /// <param name="reviewReference">
+    /// Existing <c>review-N</c> reference stored by the authoritative-absence review for this inbox sequence.
+    /// </param>
+    /// <param name="cancellationToken">Bounded operator-command token for database, XUI, wallet, and notification work.</param>
+    /// <returns>A sanitized operator result that contains no account identity, panel response, token, or payload.</returns>
+    /// <remarks>
+    /// This recovery accepts purchase orders only. It requires durable paid-provider evidence, no fulfillment or tenant
+    /// ledger row, and an exact original operation in <c>DefinitiveRejected</c>. The retry key is derived internally as
+    /// <c>tenant-create:{orderId}:retry:1</c>. Repeated commands reuse that key; Reserved may grant one POST, while
+    /// PostStarted/Ambiguous can only use normal exact read-back and Applied proceeds to one-time settlement. A rejected
+    /// retry requires a separate future recovery design and is refused. No invoice or payment is created here.
+    /// </remarks>
+    /// <exception cref="ArgumentException">The sequence, authenticated operator, or review reference is invalid.</exception>
+    /// <example><code>await tenantService.RetryPaidUnfulfilledPurchaseAsync(sequence, adminId, "review-205", token);</code></example>
+    public async Task<string> RetryPaidUnfulfilledPurchaseAsync(
+        long inboxSequence,
+        long operatorTelegramUserId,
+        string reviewReference,
+        CancellationToken cancellationToken)
+    {
+        if (inboxSequence <= 0 || operatorTelegramUserId <= 0 || reviewReference == null ||
+            !System.Text.RegularExpressions.Regex.IsMatch(reviewReference, @"\Areview-[0-9]{1,12}\z"))
+            throw new ArgumentException("A reviewed uncertain sequence and review-N reference are required.");
+
+        var review = await _workflow.ReadAsync(async db => await db.TelegramUpdateInbox.AsNoTracking()
+            .Where(x => x.Sequence == inboxSequence && x.Status == "uncertain" &&
+                x.ReviewedByTelegramUserId == operatorTelegramUserId && x.ReviewReference == reviewReference)
+            .Select(x => new { x.Sequence }).SingleOrDefaultAsync(cancellationToken));
+        if (review == null)
+            return "Tenant retry refused: reviewed_uncertain_inbox_required.";
+
+        var linkedKeys = await _workflow.ReadAsync(async db => await db.XuiV3CreationOperations.AsNoTracking()
+            .Where(x => x.InboxSequence == inboxSequence && x.OperationKey.StartsWith("tenant-create:"))
+            .Select(x => new { x.OperationKey, x.Outcome }).ToListAsync(cancellationToken));
+        var orderIds = linkedKeys.Select(x => TryParseTenantCreationOrderId(x.OperationKey))
+            .Where(x => x.HasValue).Select(x => x.Value).Distinct().ToArray();
+        if (orderIds.Length != 1)
+            return "Tenant retry refused: exact_order_link_required.";
+
+        var orderId = orderIds[0];
+        var originalKey = $"tenant-create:{orderId}";
+        if (!linkedKeys.Any(x => x.OperationKey == originalKey && x.Outcome == XuiV3CreationOutcome.DefinitiveRejected))
+            return "Tenant retry refused: original_creation_not_definitively_rejected.";
+
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.AsNoTracking()
+            .SingleOrDefaultAsync(x => x.Id == orderId, cancellationToken));
+        if (order == null || !string.Equals(order.OrderKind, TenantBotOrderKinds.Purchase, StringComparison.OrdinalIgnoreCase))
+            return "Tenant retry refused: unsupported_or_missing_order.";
+        if (order.IsFulfilled)
+            return "Tenant retry already completed.";
+
+        var ledgerExists = await _workflow.ReadAsync(async db => await db.TenantBotLedgerEntries.AsNoTracking()
+            .AnyAsync(x => x.TenantBotOrderId == order.Id, cancellationToken));
+        if (ledgerExists || !string.IsNullOrWhiteSpace(order.CreatedAccountEmail) ||
+            !string.IsNullOrWhiteSpace(order.CreatedAccountJson))
+            return "Tenant retry refused: existing_fulfillment_evidence.";
+        if (!await HasDurablePaidTenantOrderEvidenceAsync(order, cancellationToken))
+            return "Tenant retry refused: durable_paid_evidence_required.";
+
+        var retryKey = $"tenant-create:{order.Id}:retry:1";
+        var retryOutcome = linkedKeys.Where(x => x.OperationKey == retryKey).Select(x => (XuiV3CreationOutcome?)x.Outcome).SingleOrDefault();
+        if (retryOutcome == XuiV3CreationOutcome.DefinitiveRejected)
+            return "Tenant retry refused: retry_creation_definitively_rejected.";
+
+        await FULFILLPAIDTENANTORDERASYNC(
+            order,
+            $"inbox-reviewed-{reviewReference}",
+            null,
+            null,
+            string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase),
+            cancellationToken,
+            retryKey);
+
+        var completed = await _workflow.ReadAsync(async db => await db.TenantBotOrders.AsNoTracking()
+            .Where(x => x.Id == order.Id).Select(x => x.IsFulfilled).SingleAsync(cancellationToken));
+        return completed ? "Tenant paid order fulfilled through the reviewed retry." :
+            "Tenant retry remains incomplete; inspect the durable creation outcome before any further action.";
+    }
+
+    /// <summary>Checks immutable local provider evidence before an operator recovery can reuse a paid tenant order.</summary>
+    /// <param name="order">Detached purchase order whose provider and linked payment ids identify users.db evidence.</param>
+    /// <param name="cancellationToken">Cancellation token for read-only users.db queries.</param>
+    /// <returns>
+    /// <c>true</c> only when the order has a paid timestamp and its linked provider row (or approved manual receipt)
+    /// independently records a final paid state; otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>No provider request or write occurs. Unknown providers fail closed.</remarks>
+    private async Task<bool> HasDurablePaidTenantOrderEvidenceAsync(
+        TenantBotOrder order,
+        CancellationToken cancellationToken)
+    {
+        if (!order.PaidAtUtc.HasValue)
+            return false;
+
+        if (string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
+            return await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.AsNoTracking().AnyAsync(x =>
+                x.TenantBotOrderId == order.Id && x.Status == TenantManualPaymentReceiptStatuses.Approved &&
+                x.ApprovedAtUtc != null && x.FinalConfirmedAtUtc != null, cancellationToken));
+        if (string.Equals(order.PaymentProvider, "hooshpay", StringComparison.OrdinalIgnoreCase))
+        {
+            var evidence = await _workflow.ReadAsync(async db => await db.HooshPayPaymentInfos.AsNoTracking()
+                .Where(x => x.TenantBotOrderId == order.Id).Select(x => new { x.PaidAtUtc, x.PaymentStatus })
+                .SingleOrDefaultAsync(cancellationToken));
+            return evidence?.PaidAtUtc != null && HooshPayStatuses.IsPaid(evidence.PaymentStatus);
+        }
+        if (string.Equals(order.PaymentProvider, "nowpayments", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(order.PaymentProvider, "swapino", StringComparison.OrdinalIgnoreCase))
+        {
+            var evidence = await _workflow.ReadAsync(async db => await db.SwapinoPaymentInfos.AsNoTracking()
+                .Where(x => x.TenantBotOrderId == order.Id).Select(x => new { x.PaidAtUtc, x.PaymentStatus })
+                .SingleOrDefaultAsync(cancellationToken));
+            return evidence?.PaidAtUtc != null && NowPaymentsStatuses.IsPaid(evidence.PaymentStatus);
+        }
+        if (string.Equals(order.PaymentProvider, "tetraminator", StringComparison.OrdinalIgnoreCase))
+        {
+            var evidence = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.AsNoTracking()
+                .Where(x => x.TenantBotOrderId == order.Id).Select(x => new { x.PaidAtUtc, x.PaymentStatus })
+                .SingleOrDefaultAsync(cancellationToken));
+            return evidence?.PaidAtUtc != null && TetraminatorStatuses.IsPaid(evidence.PaymentStatus);
+        }
+        if (string.Equals(order.PaymentProvider, "uniquepay", StringComparison.OrdinalIgnoreCase))
+        {
+            var evidence = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.AsNoTracking()
+                .Where(x => x.TenantBotOrderId == order.Id).Select(x => new { x.PaidAtUtc, x.PaymentStatus })
+                .SingleOrDefaultAsync(cancellationToken));
+            return evidence?.PaidAtUtc != null && UniquePayStatuses.IsPaid(evidence.PaymentStatus);
+        }
+        return false;
+    }
+
+    /// <summary>Parses the internal order id from an exact persisted tenant creation business key.</summary>
+    /// <param name="operationKey">Persisted operation key; command text is never accepted by the caller.</param>
+    /// <returns>The positive users.db tenant-order id, or null when the key is malformed or belongs to another flow.</returns>
+    private static int? TryParseTenantCreationOrderId(string operationKey)
+    {
+        const string prefix = "tenant-create:";
+        if (operationKey?.StartsWith(prefix, StringComparison.Ordinal) != true)
+            return null;
+        var value = operationKey[prefix.Length..].Split(':')[0];
+        return int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var orderId) && orderId > 0
+            ? orderId
+            : null;
+    }
+
+    /// <summary>
     /// Performs shared one-time purchase or renewal fulfillment for a paid tenant storefront order.
     /// </summary>
     /// <param name="order">Tenant-scoped order linking the customer, owner, payment provider, and selected plan.</param>
@@ -7902,6 +8055,10 @@ public class TenantBotService
     /// the bot wallet; <c>false</c> for platform gateways where only owner profit is credited.
     /// </param>
     /// <param name="CancellationToken">Token that cancels users.db, credentials.db, Telegram, and XUI operations.</param>
+    /// <param name="CreationOperationKey">
+    /// Optional internally derived durable creation key for an explicitly reviewed purchase retry. Null uses the
+    /// original <c>tenant-create:{orderId}</c> key. Callers must never derive this value from customer input.
+    /// </param>
     /// <returns>A settlement result with owner-wallet before/after balances when fulfillment succeeds.</returns>
     /// <remarks>
     /// Idempotency:
@@ -7919,7 +8076,8 @@ public class TenantBotService
         HooshPayPaymentInfo HOOSHPAYPAYMENT,
         SwapinoPaymentInfo NOWPAYMENTSPAYMENT,
         bool DEBITOWNERBASECOST,
-        CancellationToken CancellationToken)
+        CancellationToken CancellationToken,
+        string CreationOperationKey = null)
     {
         using var tenantFulfillmentGateLease = await TenantFulfillmentGate.EnterAsync(order.Id.ToString(CultureInfo.InvariantCulture), CancellationToken);
         try
@@ -8033,7 +8191,7 @@ public class TenantBotService
                     CancellationToken,
                     new XuiV3AccountMetadataOptions
                     {
-                        OperationKey = $"tenant-create:{order.Id}",
+                        OperationKey = CreationOperationKey ?? $"tenant-create:{order.Id}",
                         UserComment = $"tenant sale VIA @{tenant.Username}; Buyer={order.CustomerTelegramUserId}; tenant={order.TenantBotId}",
                         PriceTomanOverride = order.SalePriceToman,
                         CreatedByBotId = order.TenantBotId,

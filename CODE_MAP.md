@@ -377,7 +377,14 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   (`CanResolveAsync`) finds no unresolved creation, unreconciled wallet receipts, pending renewal/link/order/settlement
   evidence — ordinary non-financial handler failures resolve without fake financial evidence. Resolution erases the
   payload, retains the review reference and operator id, and wakes the scheduler so later same-lane work runs
-  immediately. Uncertain rows count toward admission capacity and emit pressure warnings.
+  immediately. Uncertain rows count toward admission capacity and emit pressure warnings. `/inbox_reject_creation
+  SEQUENCE review-N` proves only the exact persisted reserved email is absent through an authenticated XUI v3 GET
+  whose successful envelope is exactly `success=false,msg=Obtain (record not found)`; it atomically transitions only
+  exact linked `PostStarted`/`Ambiguous` rows to `DefinitiveRejected` and records reviewer audit fields. `/inbox_retry_tenant_order
+  SEQUENCE review-N` is a generic paid/unfulfilled purchase recovery: it requires the original exact creation key to be
+  terminally rejected and reuses one derived `tenant-create:{orderId}:retry:1` key, never creates a payment or repeats a
+  POST after `PostStarted`. Legacy nullable renewal/link rows correlate only within a bounded window (five minutes
+  before inbox acceptance through two hours after start/acceptance); modern rows require exact `InboxSequence`.
 
 ## Gozargah Site Sync
 

@@ -3,8 +3,10 @@ using Microsoft.EntityFrameworkCore;
 using System.Collections.Concurrent;
 
 /// <summary>Sanitized uncertain-inbox inspection and conservative resolution preconditions.</summary>
-/// <remarks>Never returns update/client payloads or financial keys. Legacy sagas are conservatively correlated by
-/// bot/user when no exact inbox link exists; unrelated unresolved operations can require additional review.</remarks>
+/// <remarks>Never returns update/client payloads or financial keys. Exact inbox links are authoritative. A legacy
+/// operation without an inbox link is correlated only when its bot/user matches and its creation time falls from five
+/// minutes before acceptance through two hours after execution started; older history remains untouched and does not
+/// block a newer lane.</remarks>
 public sealed partial class TelegramUpdateInboxStore
 {
     private readonly CredentialsDbContextFactory _credentials;
@@ -50,19 +52,43 @@ public sealed partial class TelegramUpdateInboxStore
     {
         await using var db = _factory.CreateDbContext();
         var row = await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "uncertain")
-            .Select(x => new { x.BotId, x.TelegramUserId }).SingleOrDefaultAsync(token);
+            .Select(x => new { x.BotId, x.TelegramUserId, x.AcceptedAtUtc, x.StartedAtUtc }).SingleOrDefaultAsync(token);
         if (row == null) return (false, "not_uncertain");
         if (Executing.ContainsKey(sequence)) return (false, "handler_still_active");
         var states = await db.XuiV3CreationOperations.Where(x => x.InboxSequence == sequence)
             .Select(x => x.Outcome).ToListAsync(token);
         var ambiguous = states.Any(x => x is not (XuiV3CreationOutcome.Reserved or XuiV3CreationOutcome.Applied or XuiV3CreationOutcome.DefinitiveRejected));
-        var renewals = await db.XuiV3RenewalOperations.CountAsync(x => (x.InboxSequence == sequence || x.BotId == row.BotId && x.TelegramUserId == row.TelegramUserId)
-            && x.Status != "failed" && (x.Status != "applied" || x.SettlementStatus != "settled"), token);
-        var links = await db.XuiV3LinkChangeOperations.CountAsync(x => (x.InboxSequence == sequence || x.BotId == row.BotId && x.TelegramUserId == row.TelegramUserId)
-            && x.Status != "succeeded" && x.Status != "failed_before_mutation" && x.Status != "cancelled" && x.Status != "expired", token);
-        var orders = await db.TenantBotOrders.CountAsync(x => x.TenantBotId == row.BotId
-            && (x.CustomerTelegramUserId == row.TelegramUserId || x.OwnerTelegramUserId == row.TelegramUserId)
-            && !x.IsFulfilled && x.PaymentStatus != "receipt_rejected", token);
+        var legacyFromUtc = row.AcceptedAtUtc.AddMinutes(-5);
+        var legacyThroughUtc = (row.StartedAtUtc ?? row.AcceptedAtUtc).AddHours(2);
+        var exactRenewals = await db.XuiV3RenewalOperations.AsNoTracking()
+            .Where(x => x.InboxSequence == sequence && x.Status != "failed" &&
+                (x.Status != "applied" || x.SettlementStatus != "settled"))
+            .Select(x => new { x.Id, x.Status }).Take(10).ToListAsync(token);
+        var legacyRenewals = await db.XuiV3RenewalOperations.AsNoTracking()
+            .Where(x => x.InboxSequence == null && x.BotId == row.BotId && x.TelegramUserId == row.TelegramUserId &&
+                x.CreatedAtUtc >= legacyFromUtc && x.CreatedAtUtc <= legacyThroughUtc && x.Status != "failed" &&
+                (x.Status != "applied" || x.SettlementStatus != "settled"))
+            .Select(x => new { x.Id, x.Status }).Take(10).ToListAsync(token);
+        var exactLinks = await db.XuiV3LinkChangeOperations.AsNoTracking()
+            .Where(x => x.InboxSequence == sequence && x.Status != "succeeded" && x.Status != "failed_before_mutation" &&
+                x.Status != "cancelled" && x.Status != "expired")
+            .Select(x => new { x.Id, x.Status }).Take(10).ToListAsync(token);
+        var legacyLinks = await db.XuiV3LinkChangeOperations.AsNoTracking()
+            .Where(x => x.InboxSequence == null && x.BotId == row.BotId && x.TelegramUserId == row.TelegramUserId &&
+                x.CreatedAtUtc >= legacyFromUtc && x.CreatedAtUtc <= legacyThroughUtc && x.Status != "succeeded" &&
+                x.Status != "failed_before_mutation" && x.Status != "cancelled" && x.Status != "expired")
+            .Select(x => new { x.Id, x.Status }).Take(10).ToListAsync(token);
+
+        // A tenant order is exactly related through its durable tenant-create:{orderId} business key, even when the
+        // uncertain Telegram actor is the Sales Assistant administrator rather than the customer or tenant owner.
+        var tenantOrderIds = states.Count == 0
+            ? new List<int>()
+            : (await db.XuiV3CreationOperations.AsNoTracking().Where(x => x.InboxSequence == sequence)
+                .Select(x => x.OperationKey).ToListAsync(token))
+                .Select(TryParseTenantOrderId).Where(x => x.HasValue).Select(x => x.Value).Distinct().ToList();
+        var orders = await db.TenantBotOrders.AsNoTracking()
+            .Where(x => tenantOrderIds.Contains(x.Id) && !x.IsFulfilled && x.PaymentStatus != "receipt_rejected")
+            .Select(x => x.Id).Take(10).ToListAsync(token);
         if (_credentials == null) return (false, "wallet_evidence_unavailable");
         await using var credentials = _credentials.CreateDbContext();
         // Exact inbox receipts also include mutations of another user's wallet by this operator.
@@ -86,15 +112,48 @@ public sealed partial class TelegramUpdateInboxStore
             + await db.SwapinoPaymentInfos.CountAsync(x => x.TelegramUserId == row.TelegramUserId && !x.IsAddedToBalance
                 && (x.PaidAtUtc != null || x.PaymentStatus == "finished"), token);
         settlements += await db.ZibalPaymentInfos.CountAsync(x => x.TelegramUserId == row.TelegramUserId && x.IsPaid && !x.IsAddedToBallance, token);
-        var renewalIds = await db.XuiV3RenewalOperations.Where(x => x.InboxSequence == sequence).OrderBy(x => x.Id).Select(x => x.Id).Take(10).ToListAsync(token);
-        var linkIds = await db.XuiV3LinkChangeOperations.Where(x => x.InboxSequence == sequence).OrderBy(x => x.Id).Select(x => x.Id).Take(10).ToListAsync(token);
-        var orderIds = await db.TenantBotOrders.Where(x => x.TenantBotId == row.BotId && (x.CustomerTelegramUserId == row.TelegramUserId || x.OwnerTelegramUserId == row.TelegramUserId))
-            .OrderByDescending(x => x.Id).Select(x => x.Id).Take(10).ToListAsync(token);
+        var renewalPending = exactRenewals.Count + legacyRenewals.Count;
+        var linkPending = exactLinks.Count + legacyLinks.Count;
         var evidence = $"creation=[{string.Join(',', states.GroupBy(x => Enum.IsDefined(x) ? x.ToString() : "Unknown").Select(x => x.Key + ":" + x.Count()))}] "
-            + $"walletReceipts={receipts.Count} walletBlocked={walletBlocked} renewalPending={renewals} linkPending={links} tenantOrdersPending={orders} settlementsPending={settlements}"
-            + $" renewalIds=[{string.Join(',',renewalIds)}] linkIds=[{string.Join(',',linkIds)}] recentTenantOrderIds=[{string.Join(',',orderIds)}]";
-        return (!ambiguous && !walletBlocked && renewals == 0 && links == 0 && orders == 0 && settlements == 0, evidence);
+            + $"walletReceipts={receipts.Count} walletBlocked={walletBlocked} renewalPending={renewalPending} "
+            + $"exactRenewalPending={exactRenewals.Count} legacyCorrelatedRenewalPending={legacyRenewals.Count} "
+            + $"linkPending={linkPending} exactLinkPending={exactLinks.Count} legacyCorrelatedLinkPending={legacyLinks.Count} "
+            + $"tenantOrdersPending={orders.Count} settlementsPending={settlements} "
+            + $"exactRenewals=[{FormatOperations(exactRenewals.Select(x => (x.Id, x.Status)))}] "
+            + $"legacyRenewals=[{FormatOperations(legacyRenewals.Select(x => (x.Id, x.Status)))}] "
+            + $"exactLinks=[{FormatOperations(exactLinks.Select(x => (x.Id, x.Status)))}] "
+            + $"legacyLinks=[{FormatOperations(legacyLinks.Select(x => (x.Id, x.Status)))}] "
+            + $"tenantOrderIds=[{string.Join(',', orders)}]";
+        return (!ambiguous && !walletBlocked && renewalPending == 0 && linkPending == 0 && orders.Count == 0 && settlements == 0, evidence);
     }
+
+    /// <summary>Parses only the documented tenant creation key prefix without accepting Telegram input.</summary>
+    /// <param name="operationKey">Persisted business key loaded from the exact inbox-linked creation row.</param>
+    /// <returns>The internal tenant order id, or null for non-tenant and malformed keys.</returns>
+    /// <remarks>Both the original and <c>:retry:N</c> keys map to the same paid order.</remarks>
+    private static int? TryParseTenantOrderId(string operationKey)
+    {
+        const string prefix = "tenant-create:";
+        if (operationKey?.StartsWith(prefix, StringComparison.Ordinal) != true)
+            return null;
+        var idText = operationKey[prefix.Length..].Split(':')[0];
+        return int.TryParse(idText, out var id) && id > 0 ? id : null;
+    }
+
+    /// <summary>Formats bounded numeric ids and fixed status categories for operator evidence.</summary>
+    /// <param name="operations">Detached numeric identifiers and known persisted status values.</param>
+    /// <returns>A comma-separated safe list; unknown categories are rendered as <c>other</c>.</returns>
+    /// <remarks>No operation key, account identity, panel value, or customer payload enters this output.</remarks>
+    private static string FormatOperations(IEnumerable<(int Id, string Status)> operations) => string.Join(',',
+        operations.Select(x => $"{x.Id}:{SanitizeStatus(x.Status)}"));
+
+    /// <summary>Restricts status evidence to non-sensitive ASCII state-machine categories.</summary>
+    /// <param name="status">Persisted status, potentially from a historical database.</param>
+    /// <returns>A bounded known-safe category or <c>other</c>.</returns>
+    private static string SanitizeStatus(string status) => status is
+        "pending" or "processing" or "applied" or "ambiguous" or "failed" or "manual_review" or
+        "awaiting_confirmation" or "recovery_pending" or "succeeded" or "failed_before_mutation" or
+        "cancelled" or "expired" ? status : "other";
 
     /// <summary>Closes an eligible uncertain row after explicit operator review and preserves its original failure category.</summary>
     /// <param name="sequence">Internal uncertain sequence.</param>

@@ -444,6 +444,205 @@ public sealed partial class ConcurrencyTests
         finally { await app.StopAsync(); }
     }
 
+    /// <summary>Only the exact authenticated not-found envelope permits reviewed rejection, and the command stays GET-only.</summary>
+    /// <param name="mode">Controlled panel behavior: authoritative absence, server failure, or unknown API refusal.</param>
+    /// <param name="rejected">Whether the linked ambiguous operation may become definitively rejected.</param>
+    /// <returns>A task completing after authorization, HTTP-method, audit, and state assertions.</returns>
+    /// <remarks>
+    /// Regression coverage for the production repair command: customers, tenant bots, and groups receive no evidence;
+    /// 5xx and unfamiliar provider messages preserve ambiguity and can never authorize another creation POST.
+    /// </remarks>
+    [Theory]
+    [InlineData("not-found", true)]
+    [InlineData("server", false)]
+    [InlineData("unknown", false)]
+    public async Task Reviewed_creation_rejection_requires_authoritative_absence_and_never_posts(string mode, bool rejected)
+    {
+        using var databases = new Databases();
+        var gets = 0; var posts = 0;
+        var builder = WebApplication.CreateBuilder(); builder.Logging.ClearProviders(); builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var app = builder.Build();
+        app.Run(async context =>
+        {
+            if (context.Request.Method == "POST") { Interlocked.Increment(ref posts); context.Response.StatusCode = 500; return; }
+            Interlocked.Increment(ref gets);
+            if (mode == "server") { context.Response.StatusCode = 503; return; }
+            await context.Response.WriteAsJsonAsync(mode == "not-found"
+                ? new { success = false, msg = "Obtain (record not found)" }
+                : new { success = false, msg = "unrecognized provider response" });
+        });
+        await app.StartAsync();
+        try
+        {
+            await databases.Inbox.TryAcceptAsync("owned", Update(1, 123), 10, default);
+            var sequence = (await databases.Inbox.ReadReadyAsync(10, default)).Single().Sequence;
+            await databases.Inbox.ClaimAsync(sequence, default); await databases.Inbox.RecoverAsync(default);
+            var panel = new ServerInfo { ApiVersion = "v3", Url = app.Urls.Single(), RootPath = "", ApiToken = "test-only" };
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                db.XuiV3CreationOperations.Add(new XuiV3CreationOperation
+                {
+                    OperationKey = "reviewed-absence:1", TelegramUserId = 123,
+                    PanelKey = XuiV3LinkChangeOperationStore.BuildPanelKey(panel),
+                    ClientJson = JsonConvert.SerializeObject(new XuiV3ClientPayload { Email = "persisted@example", TgId = 123 }),
+                    InboundIdsJson = "[1]", Outcome = XuiV3CreationOutcome.Ambiguous,
+                    InboxSequence = sequence, CreatedAtUtc = DateTime.UtcNow
+                });
+                await db.SaveChangesAsync();
+            }
+            var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+            { ["bots:0:id"] = "owned", ["bots:0:token"] = "12345:" + new string('a', 35), ["bots:0:isDefault"] = "true" }).Build();
+            var service = new TelegramInboxAdminService(databases.Inbox, databases.Users,
+                new AppConfig { AdminsUserIds = [456], XuiV3ApiBaseUrl = app.Urls.Single() }, configuration, new BotRegistry(configuration));
+
+            Assert.Equal("Denied.", await service.ExecuteAuthorizedAsync("owned", 123, true,
+                ["/inbox_reject_creation", sequence.ToString(), "review-7"], default));
+            Assert.Equal("Denied.", await service.ExecuteAuthorizedAsync("owned", 456, false,
+                ["/inbox_reject_creation", sequence.ToString(), "review-7"], default));
+            Assert.Equal("Denied.", await service.ExecuteAuthorizedAsync("tenant", 456, true,
+                ["/inbox_reject_creation", sequence.ToString(), "review-7"], default));
+
+            var result = await service.ExecuteAuthorizedAsync("owned", 456, true,
+                ["/inbox_reject_creation", sequence.ToString(), "review-7"], default);
+            await using var verify = databases.Users.CreateDbContext();
+            var operation = await verify.XuiV3CreationOperations.SingleAsync();
+            Assert.Equal(rejected ? XuiV3CreationOutcome.DefinitiveRejected : XuiV3CreationOutcome.Ambiguous, operation.Outcome);
+            Assert.Equal(0, posts); Assert.True(gets >= 1);
+            if (rejected)
+            {
+                Assert.Contains("definitiveRejected=1", result);
+                var inbox = await verify.TelegramUpdateInbox.SingleAsync();
+                Assert.Equal(456, inbox.ReviewedByTelegramUserId); Assert.Equal("review-7", inbox.ReviewReference);
+                Assert.True((await databases.Inbox.CanResolveAsync(sequence, default)).Allowed);
+                Assert.True(await databases.Inbox.ResolveReviewedAsync(sequence, 456, "review-7", default));
+                await verify.Entry(inbox).ReloadAsync(); Assert.Equal("completed", inbox.Status); Assert.Null(inbox.Payload);
+            }
+            else Assert.Contains("inconclusive", result);
+        }
+        finally { await app.StopAsync(); }
+    }
+
+    /// <summary>A timeout during the exact panel read preserves ambiguity and never reaches a POST endpoint.</summary>
+    /// <returns>A task completing after cooperative cancellation and durable-state verification.</returns>
+    /// <remarks>Elapsed time is never treated as evidence that the reserved client is absent.</remarks>
+    [Fact]
+    public async Task Reviewed_creation_rejection_timeout_remains_ambiguous()
+    {
+        using var databases = new Databases(); var posts = 0;
+        var builder = WebApplication.CreateBuilder(); builder.Logging.ClearProviders(); builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var app = builder.Build();
+        app.Run(async context =>
+        {
+            if (context.Request.Method == "POST") Interlocked.Increment(ref posts);
+            await Task.Delay(TimeSpan.FromSeconds(5), context.RequestAborted);
+        });
+        await app.StartAsync();
+        try
+        {
+            await databases.Inbox.TryAcceptAsync("owned", Update(1, 123), 10, default);
+            var sequence = (await databases.Inbox.ReadReadyAsync(10, default)).Single().Sequence;
+            await databases.Inbox.ClaimAsync(sequence, default); await databases.Inbox.RecoverAsync(default);
+            var panel = new ServerInfo { ApiVersion = "v3", Url = app.Urls.Single(), ApiToken = "test-only" };
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                db.XuiV3CreationOperations.Add(new XuiV3CreationOperation { OperationKey = "timeout:1", TelegramUserId = 123,
+                    PanelKey = XuiV3LinkChangeOperationStore.BuildPanelKey(panel), ClientJson = JsonConvert.SerializeObject(
+                        new XuiV3ClientPayload { Email = "persisted@example", TgId = 123 }), InboundIdsJson = "[1]",
+                    Outcome = XuiV3CreationOutcome.Ambiguous, InboxSequence = sequence, CreatedAtUtc = DateTime.UtcNow });
+                await db.SaveChangesAsync();
+            }
+            var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+            { ["bots:0:id"] = "owned", ["bots:0:token"] = "12345:" + new string('a', 35), ["bots:0:isDefault"] = "true" }).Build();
+            var service = new TelegramInboxAdminService(databases.Inbox, databases.Users,
+                new AppConfig { AdminsUserIds = [456], XuiV3ApiBaseUrl = app.Urls.Single() }, configuration, new BotRegistry(configuration));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.ExecuteAuthorizedAsync("owned", 456, true,
+                ["/inbox_reject_creation", sequence.ToString(), "review-8"], timeout.Token));
+            await using var verify = databases.Users.CreateDbContext();
+            Assert.Equal(XuiV3CreationOutcome.Ambiguous, (await verify.XuiV3CreationOperations.SingleAsync()).Outcome);
+            Assert.Equal(0, posts);
+        }
+        finally { await app.StopAsync(); }
+    }
+
+    /// <summary>The reviewed store transition is exact and monotonic, so Applied can never be downgraded.</summary>
+    /// <returns>A task completing after exact-sequence, exact-key, and terminal-state guards are verified.</returns>
+    [Fact]
+    public async Task Reviewed_absence_transition_cannot_modify_applied_or_unrelated_creation()
+    {
+        using var databases = new Databases();
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry { Sequence = 41, BotId = "owned", UpdateId = 1,
+                TelegramUserId = 123, Status = "uncertain", AcceptedAtUtc = DateTime.UtcNow });
+            db.XuiV3CreationOperations.AddRange(
+                new XuiV3CreationOperation { OperationKey = "applied", TelegramUserId = 123, PanelKey = "p", ClientJson = "{}",
+                    InboundIdsJson = "[]", InboxSequence = 41, Outcome = XuiV3CreationOutcome.Applied },
+                new XuiV3CreationOperation { OperationKey = "other", TelegramUserId = 123, PanelKey = "p", ClientJson = "{}",
+                    InboundIdsJson = "[]", InboxSequence = 42, Outcome = XuiV3CreationOutcome.Ambiguous });
+            await db.SaveChangesAsync();
+        }
+        var store = new XuiV3CreationOperationStore(databases.Users);
+        Assert.False(await store.MarkOperatorProvenAbsentAsync(41, "applied", 456, "review-9", default));
+        Assert.False(await store.MarkOperatorProvenAbsentAsync(41, "other", 456, "review-9", default));
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Equal(XuiV3CreationOutcome.Applied, (await verify.XuiV3CreationOperations.SingleAsync(x => x.OperationKey == "applied")).Outcome);
+        Assert.Equal(XuiV3CreationOutcome.Ambiguous, (await verify.XuiV3CreationOperations.SingleAsync(x => x.OperationKey == "other")).Outcome);
+    }
+
+    /// <summary>Legacy link fallback is time-bounded while an exact inbox sequence always remains authoritative.</summary>
+    /// <param name="ageMinutes">Age of a same-bot/user legacy row relative to inbox acceptance.</param>
+    /// <param name="exact">Whether the operation carries the exact modern inbox sequence.</param>
+    /// <param name="blocks">Expected conservative resolution result.</param>
+    /// <returns>A task completing after evidence and non-mutation assertions.</returns>
+    /// <remarks>A July manual-review row cannot block a September update; a recent nullable row still can.</remarks>
+    [Theory]
+    [InlineData(69120, false, false)]
+    [InlineData(1, false, true)]
+    [InlineData(69120, true, true)]
+    public async Task Inbox_link_correlation_bounds_legacy_history_but_preserves_exact_links(int ageMinutes, bool exact, bool blocks)
+    {
+        using var databases = new Databases(); var accepted = DateTime.UtcNow;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry { Sequence = 51, BotId = "owned", UpdateId = 1,
+                TelegramUserId = 123, Status = "uncertain", FailureCode = "process_interrupted", AcceptedAtUtc = accepted });
+            db.XuiV3LinkChangeOperations.Add(new XuiV3LinkChangeOperation { InboxSequence = exact ? 51 : null,
+                OperationKey = Guid.NewGuid().ToString("N"), PanelKey = "safe-panel-fingerprint", BotId = "owned",
+                TelegramUserId = 123, ClientId = 17, Status = XuiV3LinkChangeStatuses.ManualReview,
+                CreatedAtUtc = accepted.AddMinutes(-ageMinutes), UpdatedAtUtc = accepted.AddMinutes(-ageMinutes) });
+            await db.SaveChangesAsync();
+        }
+        var evidence = await databases.Inbox.CanResolveAsync(51, default);
+        Assert.Equal(!blocks, evidence.Allowed);
+        Assert.Contains(exact ? "exactLinkPending=1" : blocks ? "legacyCorrelatedLinkPending=1" : "legacyCorrelatedLinkPending=0", evidence.Evidence);
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Equal(XuiV3LinkChangeStatuses.ManualReview, (await verify.XuiV3LinkChangeOperations.SingleAsync()).Status);
+    }
+
+    /// <summary>Renewal fallback uses the same bounded legacy window as link changes.</summary>
+    /// <returns>A task completing after historical and recent nullable renewal evidence is classified.</returns>
+    /// <remarks>July manual-review renewals remain untouched and cannot block a September inbox lane.</remarks>
+    [Fact]
+    public async Task Inbox_renewal_correlation_does_not_block_old_nullable_history()
+    {
+        using var databases = new Databases(); var accepted = DateTime.UtcNow;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry { Sequence = 61, BotId = "owned", UpdateId = 1,
+                TelegramUserId = 123, Status = "uncertain", AcceptedAtUtc = accepted });
+            db.XuiV3RenewalOperations.Add(new XuiV3RenewalOperation { OperationKey = "legacy-renewal",
+                OperationId = "legacy-renewal", BotId = "owned", TelegramUserId = 123, TargetEmail = "old@example",
+                Status = XuiV3RenewalOperationStatuses.ManualReview, SettlementStatus = XuiV3RenewalSettlementStatuses.Pending,
+                CreatedAtUtc = accepted.AddDays(-48), UpdatedAtUtc = accepted.AddDays(-48) });
+            await db.SaveChangesAsync();
+        }
+        var evidence = await databases.Inbox.CanResolveAsync(61, default);
+        Assert.True(evidence.Allowed); Assert.Contains("legacyCorrelatedRenewalPending=0", evidence.Evidence);
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Equal(XuiV3RenewalOperationStatuses.ManualReview, (await verify.XuiV3RenewalOperations.SingleAsync()).Status);
+    }
+
     /// <summary>Polls an eventual durable condition with a bounded deadline.</summary>
     /// <param name="condition">Thread-safe condition expected to become true.</param>
     /// <returns>A task completing when the condition is true; throws after ten seconds.</returns>
