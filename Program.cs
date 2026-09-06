@@ -118,7 +118,11 @@ public class Program
                 TelegramLogDispatcherOptions.CreateDefault(
                     telegramOutboxDatabasePath,
                     appConfig.UserDatabasePath,
-                    appConfig.CredentialsDatabasePath));
+                    appConfig.CredentialsDatabasePath) with
+                {
+                    BackupBotId = sp.GetRequiredService<BotRegistry>().DefaultBot?.Id,
+                    BackupChannelId = configuration["backupChannel"] ?? sp.GetRequiredService<BotRegistry>().DefaultBot?.BackupChannel
+                });
         });
         services.AddSingleton<BotRuntimeStatusStore>();
         services.AddSingleton<XuiV3PurchaseService>();

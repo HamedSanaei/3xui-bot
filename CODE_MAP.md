@@ -6,6 +6,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 ## Entry Points
 
+- Payment-log backup intent is now a global `DatabaseBackupState` watermark in `telegram-log-outbox.db`.
+  `TelegramLogOutbox.EnqueueAsync` atomically increments it with Payment insertion; delivery/ACK/retry never
+  requests a backup. The tracked dispatcher backup worker captures Requested before snapshotting and advances
+  Covered only after both SQLite online backups upload. Historical rows bootstrap one generation once, and
+  requests arriving during upload coalesce into one follow-up. Production uses the configured central backup
+  destination. See `docs/backup-recovery.md` and `Adminbot.Tests/BackupRecoveryTests.cs`.
+
 - `Program.cs`: ASP.NET host, DI registration, EF migration startup, controller mapping, bot runtime registration, hosted services.
 - `Services/BotRuntimeServices.cs`: bot registry, bot context accessor, bot client provider, and multi-bot receiver startup.
   Every receiver generation first proves that no webhook remains. Transient webhook GET/delete/verification failures

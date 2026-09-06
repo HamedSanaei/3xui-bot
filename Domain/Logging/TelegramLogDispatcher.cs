@@ -136,6 +136,11 @@ namespace Adminbot.Domain.Logging
         /// </summary>
         public TimeSpan BackupMaxDelay { get; init; } = TimeSpan.FromSeconds(5);
 
+        /// <summary>Authoritative global backup sender; null uses the initial durable intent destination.</summary>
+        public string BackupBotId { get; init; }
+        /// <summary>Authoritative global backup channel; all bots coalesce into this destination.</summary>
+        public string BackupChannelId { get; init; }
+
         /// <summary>When false startup does not force-reset Sending rows; used by lease-recovery harness scenarios.</summary>
         public bool ResetSendingOnStartup { get; init; } = true;
 
@@ -176,9 +181,9 @@ namespace Adminbot.Domain.Logging
     /// state is the SQLite file itself.</description></item>
     /// </list>
     /// Telegram calls never execute inside an outbox transaction: claim commits, then the network send runs, then
-    /// ack/fail commits. Payment-triggered database backups are single-flight with a burst debounce, so a
-    /// 1000-payment replay collapses into one running backup (or one per 5s under continuous traffic), never a storm
-    /// and never two concurrent copies of <c>credentials_backup.db</c>/<c>users_backup.db</c>.
+    /// ack/fail commits. Backup generations are committed with payment enqueue, independently of delivery.
+    /// A recovered backlog is covered by one global snapshot even when log replay takes minutes.
+    /// New requests after snapshot start remain pending for a coalesced follow-up.
     /// </remarks>
     internal sealed class TelegramLogDispatcher : IAsyncDisposable
     {
@@ -231,8 +236,11 @@ namespace Adminbot.Domain.Logging
         private long _deadLetteredCount;
         private long _normalSentCount;
         private long _backupRuns;
-        private int _backupInFlight;
-        private int _backupPending;
+        private readonly Task _backupWorker;
+        private int _disposed;
+        private long _backupRequestsCoalesced;
+        private long _backupFollowUps;
+        private long _backupRequests;
         private string _backupBotId = string.Empty;
         private string _backupChannelId = string.Empty;
 
@@ -256,6 +264,7 @@ namespace Adminbot.Domain.Logging
                 throw new ArgumentException("OutboxDatabasePath is required.", nameof(options));
             _outbox = new TelegramLogOutbox(_options.OutboxDatabasePath);
             _worker = Task.Run(WorkerAsync);
+            _backupWorker = Task.Run(RunBackupLoopAsync);
         }
 
         /// <summary>
@@ -275,7 +284,7 @@ namespace Adminbot.Domain.Logging
         /// </remarks>
         public bool EnqueueDurable(TelegramLogItem item)
         {
-            if (item is null)
+            if (item is null || Volatile.Read(ref _disposed) != 0)
                 return false;
             try
             {
@@ -286,6 +295,9 @@ namespace Adminbot.Domain.Logging
                     item.BackupChannelId ?? string.Empty, item.Message ?? string.Empty,
                     0, now, null, TelegramLogOutboxStatus.Pending, null, null)).GetAwaiter().GetResult();
                 Interlocked.Increment(ref _enqueuedCount);
+                if (item.Kind == TelegramLogDeliveryKind.Payment && !string.IsNullOrWhiteSpace(_options.BackupChannelId)
+                    && !string.IsNullOrWhiteSpace(item.BackupChannelId) && item.BackupChannelId != _options.BackupChannelId)
+                    Console.WriteLine("[DatabaseBackup] conflicting requested destination; using configured global destination.");
                 WakeWorker();
                 return true;
             }
@@ -464,8 +476,7 @@ namespace Adminbot.Domain.Logging
                         row.LoggerChannelId, row.Message, parseMode, _shutdown.Token));
                 await _outbox.AcknowledgeAsync(row.Id);
                 Interlocked.Increment(ref _deliveredCount);
-                if (row.DeliveryKind == TelegramLogDeliveryKind.Payment)
-                    RequestBackup(row.BotId, row.BackupChannelId);
+                // Backup intent was committed with enqueue; replaying delivery never requests another snapshot.
             }
             catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
             {
@@ -627,71 +638,63 @@ namespace Adminbot.Domain.Logging
             }
         }
 
-        /// <summary>
-        /// Requests one coalesced database backup after a Payment delivery succeeds. At most one backup runs at a
-        /// time; additional requests while one is running only mark a retry, so a 20-payment burst produces one
-        /// running backup plus at most one follow-up, never concurrent writes to the backup files.
-        /// </summary>
-        /// <param name="botId">Bot id used to resolve the sender for the backup upload.</param>
-        /// <param name="backupChannelId">Telegram chat id receiving the backup documents.</param>
-        private void RequestBackup(string botId, string backupChannelId)
-        {
-            Volatile.Write(ref _backupBotId, botId ?? string.Empty);
-            Volatile.Write(ref _backupChannelId, backupChannelId ?? string.Empty);
-            Interlocked.Exchange(ref _backupPending, 1);
-            if (Interlocked.CompareExchange(ref _backupInFlight, 1, 0) != 0)
-                return;
-            _ = RunBackupLoopAsync();
-        }
-
+        /// <summary>Consumes durable global backup generations without coupling them to log-send attempts.</summary>
+        /// <returns>The tracked backup lifetime, stopped and awaited by dispatcher disposal.</returns>
+        /// <remarks>All requests observed before snapshot start are covered together. A later request causes one
+        /// coalesced follow-up. Failure leaves the watermark pending; restart never expands it into per-log work.</remarks>
         private async Task RunBackupLoopAsync()
         {
-            try
+            var token = _shutdown.Token;
+            var startup = await _outbox.ReadBackupAsync();
+            Console.WriteLine($"[DatabaseBackup] startup requestedGeneration={startup.Requested} coveredGeneration={startup.Covered} pendingRequests={startup.Requested - startup.Covered}");
+            while (!token.IsCancellationRequested)
             {
-                while (true)
+                try
                 {
-                    if (Interlocked.Exchange(ref _backupPending, 0) != 1)
-                        break; // nothing pending; hand back ownership of the loop
-
-                    // Debounce: wait until either the payment burst goes quiet or the hard cap is reached, so a
-                    // burst of N payments produces one backup run (capturing the latest databases) instead of N.
-                    var loopStart = _options.UtcNow();
-                    var quietSince = loopStart;
+                    var state = await _outbox.ReadBackupAsync();
+                    if (state.Requested <= state.Covered) { await Task.Delay(25, token); continue; }
+                    var first = _options.UtcNow(); var quiet = first; var observed = state.Requested;
                     while (true)
                     {
+                        await Task.Delay(25, token);
+                        state = await _outbox.ReadBackupAsync();
                         var now = _options.UtcNow();
-                        if (now - quietSince >= _options.BackupDebounce) break;
-                        if (now - loopStart >= _options.BackupMaxDelay) break;
-                        await Task.Delay(25, _shutdown.Token);
-                        if (Volatile.Read(ref _backupPending) == 1)
-                            quietSince = _options.UtcNow();
+                        if (state.Requested != observed) { observed = state.Requested; quiet = now; }
+                        if (now - quiet >= _options.BackupDebounce || now - first >= _options.BackupMaxDelay) break;
                     }
-
+                    // This read is the snapshot boundary: any later durable request remains above Covered.
+                    state = await _outbox.ReadBackupAsync();
+                    _backupBotId = _options.BackupBotId ?? state.BotId;
+                    _backupChannelId = _options.BackupChannelId ?? state.ChannelId;
+                    if (string.IsNullOrWhiteSpace(_backupChannelId)) { await Task.Delay(1000, token); continue; }
+                    var generation = state.Requested;
+                    Interlocked.Exchange(ref _backupRequests, generation);
+                    Interlocked.Add(ref _backupRequestsCoalesced, Math.Max(0, generation - state.Covered - 1));
                     Interlocked.Increment(ref _backupRuns);
+                    Console.WriteLine($"[DatabaseBackup] started generation={generation} previouslyCovered={state.Covered}");
                     await BackupDatabasesOnceAsync();
+                    await _outbox.CoverBackupAsync(generation);
+                    state = await _outbox.ReadBackupAsync();
+                    if (state.Requested > generation) Interlocked.Increment(ref _backupFollowUps);
+                    Console.WriteLine($"[DatabaseBackup] completed coveredGeneration={generation} requestedGeneration={state.Requested} followUp={state.Requested > generation}");
                 }
-            }
-            catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[TelegramOutbox] backup loop failed: {ex.Message}");
-            }
-            finally
-            {
-                Volatile.Write(ref _backupInFlight, 0);
-                // Drain a request that arrived while the loop was exiting so no backup is silently lost — but
-                // never restart the loop after shutdown has been requested.
-                if (!_shutdown.IsCancellationRequested &&
-                    Volatile.Read(ref _backupPending) == 1 &&
-                    Interlocked.CompareExchange(ref _backupInFlight, 1, 0) == 0)
-                    _ = RunBackupLoopAsync();
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[DatabaseBackup] pending retry errorType={ex.GetType().Name}");
+                    try { await Task.Delay(TimeSpan.FromSeconds(30), token); }
+                    catch (OperationCanceledException) { break; }
+                }
             }
         }
 
         /// <summary>
-        /// Copies users.db and credentials.db to temp files and uploads them to the backup channel. Failures are
-        /// per-database, isolated, and never retried internally: the next Payment delivery requests a fresh backup.
+        /// Creates SQLite-consistent copies and uploads both database documents to the authoritative channel.
+        /// A failure leaves the generation pending; the tracked worker retries the complete pair after backoff.
         /// </summary>
+        /// <returns>A task completing only after every configured database document has uploaded successfully.</returns>
+        /// <remarks>Each SQLite backup is consistent individually. There is no atomic snapshot across both databases
+        /// or atomic Telegram upload of the pair; partial failure may repeat the first document on retry.</remarks>
         private async Task BackupDatabasesOnceAsync()
         {
             var botId = Volatile.Read(ref _backupBotId);
@@ -703,20 +706,16 @@ namespace Adminbot.Domain.Logging
                     // The temp file is fully flushed and CLOSED before the upload handle opens it, so the write
                     // handle (which cannot share) never conflicts with the read handle on any OS. The upload
                     // stream must stay open only for the duration of the document request.
-                    await using (var input = new FileStream(target.Source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                    await using (var output = new FileStream(target.Temp, FileMode.Create, FileAccess.Write, FileShare.Read))
+                    // SQLite online backup includes committed WAL pages; raw file copying does not.
+                    using (var source = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={target.Source};Mode=ReadOnly"))
+                    using (var destination = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={target.Temp}"))
                     {
-                        await input.CopyToAsync(output);
-                        await output.FlushAsync();
+                        source.Open(); destination.Open(); source.BackupDatabase(destination);
                     }
                     await using var upload = new FileStream(target.Temp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                     await _senderFactory(botId).SendDocumentAsync(channelId, target.FileName, upload, _shutdown.Token);
                 }
-                catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[TelegramOutbox] backup failed for {target.FileName}: {ex.Message}");
-                }
+                catch { throw; }
             }
         }
 
@@ -739,23 +738,40 @@ namespace Adminbot.Domain.Logging
         }
 
         /// <summary>Stops the worker, releases resources, and prints the final delivery statistics.</summary>
-        /// <returns>A task completing after the worker exits and the outbox is released.</returns>
+        /// <returns>A task completing after log shutdown and bounded backup draining.</returns>
+        /// <remarks>New durable admission closes first. Backup work receives ten seconds to drain and five seconds
+        /// for cooperative cancellation. Pending durable generations survive forced process termination.</remarks>
         public async ValueTask DisposeAsync()
         {
-            _shutdown.Cancel();
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
             _normalQueue.Writer.TryComplete();
+            // Give an active/pending backup a bounded opportunity to cover its durable generation.
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < deadline)
+            {
+                var state = await _outbox.ReadBackupAsync();
+                if (state.Requested <= state.Covered) break;
+                await Task.Delay(25);
+            }
+            _shutdown.Cancel();
+            try { await _backupWorker.WaitAsync(TimeSpan.FromSeconds(5)); } catch (TimeoutException) { }
             try { await _worker; }
             catch (OperationCanceledException) { }
             catch (Exception) { }
-            _shutdown.Dispose();
-            await _outbox.DisposeAsync();
+            // A cancellation-ignoring transport remains observed by its tracked task. Keep its resources alive
+            // until it returns rather than disposing the outbox beneath a late backup acknowledgement.
+            if (_backupWorker.IsCompleted)
+            {
+                _shutdown.Dispose();
+                await _outbox.DisposeAsync();
+            }
             var dropped = Interlocked.Exchange(ref _droppedNormalCount, 0);
             Console.WriteLine(
                 $"[TelegramOutbox] shutdown: enqueued={Interlocked.Read(ref _enqueuedCount)} enqueueFailures={Interlocked.Read(ref _enqueueFailureCount)} " +
                 $"delivered={Interlocked.Read(ref _deliveredCount)} rateLimited={Interlocked.Read(ref _rateLimitedCount)} " +
                 $"transient={Interlocked.Read(ref _transientFailureCount)} permanentRetries={Interlocked.Read(ref _permanentRetryCount)} " +
                 $"deadLettered={Interlocked.Read(ref _deadLetteredCount)} normalSent={Interlocked.Read(ref _normalSentCount)} " +
-                $"backupRuns={Interlocked.Read(ref _backupRuns)} droppedNormal={dropped}");
+                $"backupRequests={Interlocked.Read(ref _backupRequests)} backupRuns={Interlocked.Read(ref _backupRuns)} backupRequestsCoalesced={Interlocked.Read(ref _backupRequestsCoalesced)} backupFollowUps={Interlocked.Read(ref _backupFollowUps)} droppedNormal={dropped}");
         }
     }
 }

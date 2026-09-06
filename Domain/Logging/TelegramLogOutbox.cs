@@ -123,6 +123,8 @@ namespace Adminbot.Domain.Logging
         /// This is the durability barrier of the logger pipeline: the caller must not return from the logger
         /// operation until this method completes. The insert is serialized by an in-process gate and runs on a
         /// WAL database, so concurrent producers never see <c>SQLITE_BUSY</c> under normal load.
+        /// Payment rows increment the global backup generation in this same transaction. Log ACK, delivery retries,
+        /// and lease recovery never change that generation, so backup freshness survives independently of log delivery.
         /// </remarks>
         public async Task<long> EnqueueAsync(TelegramLogOutboxItem item)
         {
@@ -131,13 +133,22 @@ namespace Adminbot.Domain.Logging
             {
                 await using var connection = Open();
                 await connection.OpenAsync();
+                using var transaction = connection.BeginTransaction();
                 await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
                 command.CommandText = @"INSERT INTO TelegramLogOutbox
                     (CreatedAtUtc, Priority, DeliveryKind, BotId, LoggerChannelId, BackupChannelId, Message, AttemptCount, NextAttemptAtUtc, LastError, Status)
                     VALUES ($created, $priority, $kind, $bot, $logger, $backup, $message, $attempt, $next, $error, $status);
                     SELECT last_insert_rowid();";
                 Bind(command, item);
-                return (long)(await command.ExecuteScalarAsync() ?? 0L);
+                var id = (long)(await command.ExecuteScalarAsync() ?? 0L);
+                if (item.DeliveryKind == TelegramLogDeliveryKind.Payment)
+                {
+                    command.CommandText = "UPDATE DatabaseBackupState SET Requested=Requested+1, BotId=CASE WHEN BotId='' THEN $bot ELSE BotId END, ChannelId=CASE WHEN ChannelId='' THEN $backup ELSE ChannelId END WHERE Id=1";
+                    await command.ExecuteNonQueryAsync();
+                }
+                transaction.Commit();
+                return id;
             }
             finally { _writeGate.Release(); }
         }
@@ -367,6 +378,9 @@ namespace Adminbot.Domain.Logging
             return Convert.ToInt32(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
         }
 
+        /// <summary>Creates the additive outbox schema and bootstraps historical payment backup intent once.</summary>
+        /// <remarks>The singleton global watermark has no foreign key to disposable log rows. It is retained after
+        /// delivery and across restarts; existing payment rows contribute one initial generation without replaying effects.</remarks>
         private void Initialize()
         {
             using var connection = Open();
@@ -392,6 +406,42 @@ namespace Adminbot.Domain.Logging
             command.ExecuteNonQuery();
             EnsureColumn(connection, "LeaseUntilUtc");
             EnsureColumn(connection, "LastAttemptAtUtc");
+            // One-time bootstrap covers all pre-upgrade payment rows, including uncertain sends, in one generation.
+            command.CommandText = @"CREATE TABLE IF NOT EXISTS DatabaseBackupState (
+                Id INTEGER PRIMARY KEY CHECK(Id=1), Requested INTEGER NOT NULL, Covered INTEGER NOT NULL,
+                BotId TEXT NOT NULL, ChannelId TEXT NOT NULL);
+                INSERT OR IGNORE INTO DatabaseBackupState
+                SELECT 1, CASE WHEN EXISTS(SELECT 1 FROM TelegramLogOutbox WHERE DeliveryKind=2) THEN 1 ELSE 0 END, 0,
+                COALESCE((SELECT BotId FROM TelegramLogOutbox WHERE DeliveryKind=2 ORDER BY Id LIMIT 1),''),
+                COALESCE((SELECT BackupChannelId FROM TelegramLogOutbox WHERE DeliveryKind=2 ORDER BY Id LIMIT 1),'');";
+            command.ExecuteNonQuery();
+        }
+
+        /// <summary>Reads the global durable backup watermark independently of log delivery and retry state.</summary>
+        /// <returns>Requested and covered generations plus the initial fallback destination; no payload is loaded.</returns>
+        /// <remarks>Only the process-owned backup worker consumes these global counters; log delivery is independent.</remarks>
+        internal async Task<(long Requested, long Covered, string BotId, string ChannelId)> ReadBackupAsync()
+        {
+            await using var connection = Open();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT Requested,Covered,BotId,ChannelId FROM DatabaseBackupState WHERE Id=1";
+            await using var reader = await command.ExecuteReaderAsync();
+            await reader.ReadAsync();
+            return (reader.GetInt64(0), reader.GetInt64(1), reader.GetString(2), reader.GetString(3));
+        }
+
+        /// <summary>Acknowledges only the generation captured before a successful complete snapshot upload.</summary>
+        /// <param name="generation">Global covered generation; newer requests remain pending.</param>
+        /// <returns>A task completing after the independent durable acknowledgement.</returns>
+        /// <remarks>Call only after both document uploads succeed. Failure before this commit permits one extra pair
+        /// after restart; a newer Requested generation is never cleared by an older snapshot acknowledgement.</remarks>
+        internal async Task CoverBackupAsync(long generation)
+        {
+            await using var connection = Open();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE DatabaseBackupState SET Covered=MAX(Covered,$generation) WHERE Id=1";
+            command.Parameters.AddWithValue("$generation", generation);
+            await command.ExecuteNonQueryAsync();
         }
 
         private static void EnsureColumn(SqliteConnection connection, string columnName)

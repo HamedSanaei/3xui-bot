@@ -36,7 +36,7 @@ namespace Adminbot.Domain.Logging
         /// <param name="fallbackBackupChannelId">Fallback backup channel id used when the current bot has no backup channel.</param>
         /// <param name="dispatcher">Shared durable outbox dispatcher; must not be null.</param>
         /// <remarks>
-        /// Payment logs are routed to the logger channel while database backups are requested through the same bot.
+        /// Payment logs retain their logger destination; backup intents coalesce into the configured global destination.
         /// Both operations are best-effort at the Telegram layer and durable for Payment/Html at the outbox layer;
         /// they must never fail payment settlement or Telegram update handling.
         /// </remarks>
