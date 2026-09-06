@@ -5064,6 +5064,8 @@ public class TelegramBotService
     /// <remarks>
     /// Phone values are masked because the central logger channel is an operational audit surface. The target and actor
     /// remain clickable by numeric Telegram id, and no bot token or other credential is included.
+    /// The audit is committed to the durable Telegram outbox as HTML (EventId 1001/TelegramHtml) and never requests
+    /// a database backup, because no financial state changed.
     /// </remarks>
     private void LogAdminPhoneVerification(
         Telegram.Bot.Types.User actor,
@@ -5083,7 +5085,7 @@ public class TelegramBotService
             $"شماره جدید: <code>{Html(MaskPhoneNumber(verifiedPhone))}</code>\n" +
             $"نوع حساب: <code>{Html(target.IsColleague ? "همکار" : "کاربر عادی")}</code>";
 
-        _logger.LogPayment(message);
+        _logger.LogTelegramHtml(message);
     }
 
     /// <summary>
@@ -8122,7 +8124,9 @@ public class TelegramBotService
     /// <param name="isColleagueAfter">Role flag after the admin operation was persisted.</param>
     /// <remarks>
     /// Role changes affect pricing and tenant-bot access, so both promotion and demotion are logged. The caller
-    /// performs the database update first; this method has no side effects except the private audit log.
+    /// performs the database update first; this method has no side effects except the private audit log, which is
+    /// committed to the durable Telegram outbox as HTML (EventId 1001/TelegramHtml) without any database backup
+    /// intent because the role change itself does not mutate wallet or payment state.
     /// </remarks>
     private void LogAdminRoleChange(
         Telegram.Bot.Types.User actor,
@@ -8142,7 +8146,7 @@ public class TelegramBotService
             $"نقش قبل: <code>{Html(wasColleague ? "همکار" : "کاربر عادی")}</code>\n" +
             $"نقش بعد: <code>{Html(isColleagueAfter ? "همکار" : "کاربر عادی")}</code>";
 
-        _logger.LogPayment(message);
+        _logger.LogTelegramHtml(message);
     }
 
     /// <summary>

@@ -61,11 +61,18 @@ Focused tests cover lifecycle HTML and twenty-event generation isolation, financ
 wait/read counts, timeout recovery after direct commit without a signal, startup recovery, all three blank global
 channel forms, owned versus persisted destinations, and missing-destination pending/warning/no-send behavior.
 
-Audit exceptions outside this three-issue cleanup (left unchanged to respect the excluded flows):
-- `TelegramBotService.LogAdminPhoneVerification` and `LogAdminRoleChange` still use Payment for non-financial audits.
-- `XuiV3BotFlowService` still uses Payment for colleague requests, link changes and account deletion.
-  These operational calls can still request backups. Purchase/renewal financial logging also uses Payment intentionally.
-- Gateway confirmation after provisional settlement is a financial audit even though it does not credit twice;
-  those Payment calls remain intentional, as do wallet adjustments and tenant order settlement logs.
+Logging classification contract (all call sites audited):
+- `LogPayment` (EventId 1000/Payment) = financial audit only: gateway settlement and official confirmation after
+  provisional credit (HooshPay, NOWPayments, Tetraminator, UniquePay, Zibal wallet charge, UniquePay tenant
+  fulfillment), admin wallet adjustment, and the owned-bot v3 purchase/renewal log. Each one either mutates or
+  confirms money/balance/payment state, so requesting a database backup is appropriate.
+- `LogTelegramHtml` (EventId 1001/TelegramHtml) = important non-financial operational/security/admin audit:
+  tenant lifecycle, admin phone verification, admin role changes, colleague/cooperation requests, XUI link
+  changes, account deletion, and XUI operation outcomes. All are committed to the durable outbox and reach the
+  private logger channel with HTML formatting, but none increments the backup generation.
+- `LogInformation`/ordinary logger = ordinary operational logging, bounded memory-only best-effort behavior.
+
+The former exceptions are fixed: the five non-financial admin/colleague/link/delete call sites were converted
+from `LogPayment` to `LogTelegramHtml` with their message content preserved verbatim.
 
 No wallet, settlement, provisioning, update scheduler, inbox, context-lifetime or catalog changes are included.

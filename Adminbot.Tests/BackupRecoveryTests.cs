@@ -279,11 +279,11 @@ public sealed class BackupRecoveryTests
         "a", "log", "backup", "test" + id, 0, DateTime.UtcNow, null, TelegramLogOutboxStatus.Pending, null, null);
 
     /// <summary>Waits for a controlled observable boundary with a finite failure deadline.</summary>
-    private static async Task Until(Func<bool> ready)
+    internal static async Task Until(Func<bool> ready)
     { using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)); while (!ready()) await Task.Delay(10, timeout.Token); }
 
     /// <summary>Controls Telegram completion without making external requests.</summary>
-    private sealed class Sender : ITelegramLogSender
+    internal sealed class Sender : ITelegramLogSender
     {
         public int Texts; public int Documents; public bool FailFirst;
         public Task TextBarrier = Task.CompletedTask; public Task DocumentBarrier = Task.CompletedTask;
@@ -304,7 +304,7 @@ public sealed class BackupRecoveryTests
     }
 
     /// <summary>Owns isolated real SQLite backup sources and the durable log outbox.</summary>
-    private sealed class Fixture : IAsyncDisposable
+    internal sealed class Fixture : IAsyncDisposable
     {
         private readonly string _path = Path.Combine(Path.GetTempPath(), "AdminbotBackup-" + Guid.NewGuid().ToString("N"));
         public TelegramLogDispatcherOptions Options { get; }

@@ -13,8 +13,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   requests arriving during upload coalesce into one follow-up. Production uses the configured central backup
   destination. See `docs/backup-recovery.md` and `Adminbot.Tests/BackupRecoveryTests.cs`.
   Backup wakeups occur only after durable Payment commit; idle recovery scans default to ten seconds.
-  Blank global destinations fall through to default-owned then persisted fallback. Tenant lifecycle logs use
-  durable HTML audit without backup intent. Other non-financial Payment call sites remain listed in the runbook.
+  Blank global destinations fall through to default-owned then persisted fallback. Logging classification is
+  explicit: `LogPayment` (EventId 1000/Payment) = financial audit only (settlement, wallet credit/debit/refund,
+  purchase, renewal, referral reward, admin wallet adjustment) = durable Telegram HTML + requests DB backup.
+  `LogTelegramHtml` (EventId 1001/TelegramHtml) = important non-financial operational/security/admin audit
+  (tenant lifecycle, admin phone verification, admin role changes, colleague/cooperation requests, XUI link
+  changes, account deletion, XUI operation outcomes) = durable Telegram HTML, no DB backup. Ordinary
+  `LogInformation` = plain memory-only best-effort logs. See `docs/backup-recovery.md`.
 
 - `Program.cs`: ASP.NET host, DI registration, EF migration startup, controller mapping, bot runtime registration, hosted services.
 - `Services/BotRuntimeServices.cs`: bot registry, bot context accessor, bot client provider, and multi-bot receiver startup.

@@ -3850,7 +3850,7 @@ public class XuiV3BotFlowService
             return true;
         }
 
-        _logger.LogPayment(BuildColleagueRequestLogMessage(credUser));
+        _logger.LogTelegramHtml(BuildColleagueRequestLogMessage(credUser));
 
         await _activityLog.LogBotActionAsync(
             "colleague_request_submitted",
@@ -6528,7 +6528,7 @@ public class XuiV3BotFlowService
                         },
                         cancellationToken);
 
-                    _logger.LogPayment(BuildChangeLinkLogMessage(
+                    _logger.LogTelegramHtml(BuildChangeLinkLogMessage(
                         credUser,
                         client,
                         oldEmail,
@@ -12195,6 +12195,8 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// The delete operation has already succeeded before this method is called. The log is best-effort and
     /// does not participate in the panel transaction, but it gives admins the same visibility as link changes.
+    /// It is committed to the durable Telegram outbox as HTML (EventId 1001/TelegramHtml) and never requests a
+    /// database backup, because deleting an account does not itself mutate wallet or payment state.
     /// </remarks>
     private void LogAccountDelete(
         XuiV3Client client,
@@ -12217,7 +12219,7 @@ public class XuiV3BotFlowService
         builder.AppendLine($"زمان: <code>{Html(DateTime.UtcNow.AddMinutes(210).ConvertToHijriShamsi())}</code>");
         builder.AppendLine();
         builder.Append(XuiOperationTiming.BuildHtmlLines(timing));
-        _logger.LogPayment(builder.ToString());
+        _logger.LogTelegramHtml(builder.ToString());
     }
 
     private static long GetClientOwnerTelegramId(XuiV3Client client)

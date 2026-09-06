@@ -17,7 +17,13 @@ namespace Adminbot.Domain.Logging
         /// <param name="message">
         /// HTML-safe payment text. Every external or user-controlled value must be encoded before inclusion.
         /// </param>
-        /// <remarks>Use this only for financial events whose normal audit policy includes database backups.</remarks>
+        /// <remarks>
+        /// This is the only logger event that requests a database backup: the durable outbox increments the global
+        /// backup generation atomically with the Payment insertion. Use it only for financial events (settlement,
+        /// wallet credit/debit/refund, purchase, renewal, referral reward, admin wallet adjustment) and never for
+        /// operational audits such as phone verification, role changes, colleague requests, link changes, or account
+        /// deletion, which must use <see cref="LogTelegramHtml"/> instead.
+        /// </remarks>
         public static void LogPayment(this ILogger logger, string message)
         {
             logger.Log(LogLevel.Information, new EventId(1000, "Payment"), message, null, (msg, ex) => msg);
@@ -32,8 +38,11 @@ namespace Adminbot.Domain.Logging
         /// HTML elements such as <c>code</c>, <c>b</c>, and <c>a</c>.
         /// </param>
         /// <remarks>
-        /// Unlike <see cref="LogPayment"/>, this event does not send database backup documents. It exists for account,
-        /// admin, and operational audits where plain-text logging would expose markup characters instead of entities.
+        /// Unlike <see cref="LogPayment"/>, this event never sends database backup documents: it commits a durable
+        /// HTML row (EventId 1001/TelegramHtml) without touching the backup generation. It exists for account, admin,
+        /// colleague, link-change, delete, and other operational audits where plain-text logging would expose markup
+        /// characters instead of entities. The message is as durable as a payment log (SQLite outbox, retries, restart
+        /// recovery); only the backup side effect differs.
         /// </remarks>
         /// <example>
         /// <code>
