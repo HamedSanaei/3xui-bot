@@ -208,15 +208,18 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(20, entered);
     }
 
-    /// <summary>A handled ambiguous creation still quarantines its update; operator review releases later work without replay.</summary>
-    /// <returns>A task completing after linked-effect lookup and explicit lane resolution are verified.</returns>
+    /// <summary>A handled ambiguous creation freezes its operation while a later same-user update executes normally.</summary>
+    /// <returns>A task completing after linked-effect lookup, immediate user release, and explicit business resolution are verified.</returns>
     /// <remarks>The business key is independent of the inbox sequence, which exists only as an audit reference.</remarks>
     [Fact]
     public async Task Linked_ambiguous_creation_requires_review_and_cannot_be_replayed()
     {
         using var databases = new Databases(); var creations = new XuiV3CreationOperationStore(databases.Users);
-        using var scheduler = Create(databases, new Executor(async (_, token) =>
+        var seen = new ConcurrentQueue<int>();
+        using var scheduler = Create(databases, new Executor(async (item, token) =>
         {
+            seen.Enqueue(item.Update.Id);
+            if (item.Update.Id != 1) return;
             await creations.ReserveAsync(new XuiV3CreationOperation
             { OperationKey = "purchase:review:1", TelegramUserId = 123, PanelKey = "test-panel", ClientJson = "private", InboundIdsJson = "[1]" }, token);
             Assert.True(await creations.TryStartPostAsync("purchase:review:1", token));
@@ -226,22 +229,23 @@ public sealed partial class ConcurrencyTests
         await scheduler.StartAsync(default); await scheduler.StopAsync(default);
         await using var context = databases.Users.CreateDbContext();
         var row = await context.TelegramUpdateInbox.AsNoTracking().SingleAsync(x => x.UpdateId == 1);
-        Assert.Equal("uncertain", row.Status);
+        Assert.Equal("completed_with_review", row.Status);
+        Assert.Null(row.Payload);
         Assert.Equal(row.Sequence, (await context.XuiV3CreationOperations.SingleAsync()).InboxSequence);
+        Assert.Equal(new[] { 1, 2 }, seen);
         Assert.Empty(await databases.Inbox.ReadReadyAsync(10, default));
         Assert.False(await databases.Inbox.ResolveReviewedAsync(row.Sequence, 456, "review-001", default));
         await creations.MarkAppliedAsync("purchase:review:1", default);
         Assert.True(await databases.Inbox.ResolveReviewedAsync(row.Sequence, 456, "review-001", default));
         Assert.False(await databases.Inbox.ResolveReviewedAsync(row.Sequence, 456, "review-001", default));
-        Assert.Equal(2, (await databases.Inbox.ReadReadyAsync(10, default)).Single().UpdateId);
         Assert.Null(TelegramUpdateExecutionScope.CurrentSequence);
     }
 
-    /// <summary>A handler ignoring cancellation cannot keep a host deadline open or overwrite its uncertain status afterward.</summary>
+    /// <summary>A handler ignoring cancellation cannot keep a host deadline open or overwrite its terminal review receipt afterward.</summary>
     /// <returns>A task completing after the noncooperative handler is released and its tracked task is joined.</returns>
     /// <remarks>A cancelled host deadline shortens the final grace period; accepted payloads remain durable.</remarks>
     [Fact]
-    public async Task Host_deadline_quarantines_noncooperative_work_before_returning()
+    public async Task Host_deadline_terminalizes_noncooperative_work_before_returning()
     {
         using var databases = new Databases(); var entered = Signal(); var release = Signal();
         using var scheduler = Create(databases, new Executor(async (_, _) => { entered.TrySetResult(); await release.Task; }));
@@ -250,7 +254,9 @@ public sealed partial class ConcurrencyTests
         try { await scheduler.StopAsync(new CancellationToken(true)).WaitAsync(TimeSpan.FromSeconds(5)); }
         finally { release.TrySetResult(); await scheduler.StopAsync(default); }
         await using var context = databases.Users.CreateDbContext();
-        Assert.Equal("uncertain", (await context.TelegramUpdateInbox.SingleAsync()).Status);
+        var row = await context.TelegramUpdateInbox.SingleAsync();
+        Assert.Equal("completed_with_review", row.Status);
+        Assert.Null(row.Payload);
     }
 
     /// <summary>Runtime copies keep nested protocol templates private to a customer's execution.</summary>
@@ -391,11 +397,11 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(0, scheduler.ActiveHandlerCount);
     }
 
-    /// <summary>A failed lane is quarantined while unrelated lane heads continue on the same worker pool.</summary>
+    /// <summary>A failed handler releases its same-user successor while unrelated lane heads also continue.</summary>
     /// <returns>A task completing after the documented regression invariant has been verified.</returns>
-    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Exception_isolation_blocks_only_the_uncertain_lane"</code></example>
+    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Exception_isolation_releases_same_user_and_other_lanes"</code></example>
     [Fact]
-    public async Task Exception_isolation_blocks_only_the_uncertain_lane()
+    public async Task Exception_isolation_releases_same_user_and_other_lanes()
     {
         using var databases = new Databases();
         var seen = new ConcurrentQueue<int>();
@@ -408,8 +414,8 @@ public sealed partial class ConcurrencyTests
         await scheduler.EnqueueAsync("a", Update(2, 1), default);
         await scheduler.EnqueueAsync("a", Update(3, 2), default);
         await scheduler.StartAsync(default); await scheduler.StopAsync(default);
-        Assert.Equal(new[] { 3 }, seen);
-        Assert.Equal(2, await databases.Inbox.CountPendingAsync(default));
+        Assert.Equal(new[] { 2, 3 }, seen.Order());
+        Assert.Equal(0, await databases.Inbox.CountPendingAsync(default));
     }
 
     /// <summary>One heavily queued customer cannot consume every turn ahead of other ready bots and users.</summary>
@@ -428,11 +434,11 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(new[] { 1, 7, 6 }, seen.Take(3));
     }
 
-    /// <summary>Completed payloads disappear immediately, deduplication expires after seven days, and uncertain rows remain.</summary>
+    /// <summary>Success and failure payloads disappear immediately while terminal deduplication receipts expire after seven days.</summary>
     /// <returns>A task completing after the documented regression invariant has been verified.</returns>
-    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Retention_erases_completed_payloads_and_never_removes_uncertain_work"</code></example>
+    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Retention_erases_all_terminal_payloads_and_expires_receipts"</code></example>
     [Fact]
-    public async Task Retention_erases_completed_payloads_and_never_removes_uncertain_work()
+    public async Task Retention_erases_all_terminal_payloads_and_expires_receipts()
     {
         using var databases = new Databases();
         await databases.Inbox.TryAcceptAsync("a", Update(1, 1), 10, default);
@@ -444,9 +450,13 @@ public sealed partial class ConcurrencyTests
         await databases.Inbox.FinishAsync(heads[1].Sequence, "expected_test_failure", default);
         await using var context = databases.Users.CreateDbContext();
         Assert.Null((await context.TelegramUpdateInbox.AsNoTracking().SingleAsync(x => x.UpdateId == 1)).Payload);
-        await context.TelegramUpdateInbox.ExecuteUpdateAsync(set => set.SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow.AddDays(-8)));
+        var failed = await context.TelegramUpdateInbox.AsNoTracking().SingleAsync(x => x.UpdateId == 2);
+        Assert.Equal("completed_with_error", failed.Status);
+        Assert.Null(failed.Payload);
+        await context.TelegramUpdateInbox.Where(x => x.UpdateId == 1)
+            .ExecuteUpdateAsync(set => set.SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow.AddDays(-8)));
         Assert.Equal(1, await databases.Inbox.PruneAsync(default));
-        Assert.Equal("uncertain", (await context.TelegramUpdateInbox.SingleAsync()).Status);
+        Assert.Equal("completed_with_error", (await context.TelegramUpdateInbox.SingleAsync()).Status);
     }
 
     /// <summary>Cancelled and faulted receivers allow replacement only after termination; startup cancellation still wins.</summary>

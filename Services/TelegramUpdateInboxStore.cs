@@ -16,14 +16,14 @@ public sealed partial class TelegramUpdateInboxStore
     /// <summary>Creates an inbox sharing only immutable database options.</summary>
     /// <param name="factory">Required users.db context factory.</param>
     /// <param name="credentials">Global wallet receipt factory; missing configuration refuses reviewed resolution.</param>
-    /// <remarks>Queries return detached metadata without loading payloads. Uncertain lane heads remain unresolved and prevent later work from overtaking them.</remarks>
+    /// <remarks>Queries return detached metadata without loading payloads. Business recovery records never consume Telegram admission capacity.</remarks>
     public TelegramUpdateInboxStore(UserDbContextFactory factory, CredentialsDbContextFactory credentials = null)
     { _factory = factory; _credentials = credentials; }
 
     /// <summary>Attempts durable admission without exceeding the configured unfinished-work limit.</summary>
     /// <param name="botId">Required canonical runtime bot id; never a token.</param>
     /// <param name="update">Required private Telegram update.</param>
-    /// <param name="capacity">Positive maximum unfinished rows, including running and uncertain rows.</param>
+    /// <param name="capacity">Positive maximum queued or currently running Telegram executions.</param>
     /// <param name="token">Receiver cancellation before acceptance.</param>
     /// <returns>True when committed or already accepted; false when admission must wait for capacity.</returns>
     /// <remarks>Duplicate delivery succeeds even when full. The count stops at capacity inside the admission transaction. Cancellation after commit is resolved by durable deduplication.</remarks>
@@ -33,7 +33,8 @@ public sealed partial class TelegramUpdateInboxStore
         await using var db = _factory.CreateDbContext();
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
         if (await db.TelegramUpdateInbox.AnyAsync(x => x.BotId == botId && x.UpdateId == update.Id, ct)) return true;
-        if (await db.TelegramUpdateInbox.Where(x => x.Status != "completed").Select(x => x.Sequence).Take(capacity).CountAsync(ct) >= capacity) return false;
+        if (await db.TelegramUpdateInbox.Where(x => x.Status == "queued" || x.Status == "running")
+            .Select(x => x.Sequence).Take(capacity).CountAsync(ct) >= capacity) return false;
         db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry
         {
             BotId = botId, UpdateId = update.Id, TelegramUserId = TelegramUpdateIdentity.ResolveUserId(update),
@@ -45,17 +46,17 @@ public sealed partial class TelegramUpdateInboxStore
         return true;
     }, token);
 
-    /// <summary>Loads only the oldest unfinished row per bot/user lane, excluding blocked lanes.</summary>
+    /// <summary>Loads only the oldest queued row behind any currently queued or running work for its bot/user key.</summary>
     /// <param name="capacity">Maximum rows to materialize; equals the validated admission capacity.</param>
     /// <param name="token">Cancellation of the read.</param>
     /// <returns>Detached queued lane heads ordered by acceptance, possibly empty; payloads are not materialized.</returns>
-    /// <remarks>Queries return detached metadata without loading payloads. Uncertain lane heads remain unresolved and prevent later work from overtaking them.</remarks>
+    /// <remarks>Only live Telegram execution states participate in FIFO ordering. Terminal error/review receipts and linked business recovery records never block later user input.</remarks>
     public async Task<List<TelegramUpdateInboxEntry>> ReadReadyAsync(int capacity, CancellationToken token)
     {
         await using var db = _factory.CreateDbContext();
         return await db.TelegramUpdateInbox.AsNoTracking().Where(x => x.Status == "queued"
             && !db.TelegramUpdateInbox.Any(prior => prior.BotId == x.BotId && prior.TelegramUserId == x.TelegramUserId
-                && prior.Sequence < x.Sequence && prior.Status != "completed"))
+                && prior.Sequence < x.Sequence && (prior.Status == "queued" || prior.Status == "running")))
             .OrderBy(x => x.Sequence).Take(capacity).Select(x => new TelegramUpdateInboxEntry
             {
                 Sequence = x.Sequence, BotId = x.BotId, UpdateId = x.UpdateId, TelegramUserId = x.TelegramUserId,
@@ -67,7 +68,7 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="sequence">Internal inbox sequence selected by this scheduler.</param>
     /// <param name="token">Cancellation of the local claim.</param>
     /// <returns>A private work item, or null if another executor already claimed the row.</returns>
-    /// <remarks>A process crash after the claim creates uncertain work, never automatic redelivery.</remarks>
+    /// <remarks>A process crash after the claim creates a terminal review receipt at recovery; unsafe business mutations are protected by their own durable operation records.</remarks>
     public Task<TelegramUpdateWorkItem> ClaimAsync(long sequence, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
@@ -81,52 +82,56 @@ public sealed partial class TelegramUpdateInboxStore
             JsonConvert.DeserializeObject<Update>(row.Payload) ?? throw new InvalidOperationException("Invalid durable update payload."), row.AcceptedAtUtc);
     }, token);
 
-    /// <summary>Finalizes a claim or quarantines it when execution cannot be proven complete.</summary>
+    /// <summary>Finalizes a claim as a payload-free terminal receipt after the handler exits.</summary>
     /// <param name="sequence">Internal claimed inbox sequence.</param>
     /// <param name="failureCode">Null for success; otherwise a coarse non-secret failure code.</param>
     /// <param name="token">Independent persistence cancellation token, normally not the cancelled handler token.</param>
-    /// <returns>A task completing after the claim is terminal or uncertain.</returns>
-    /// <remarks>Successful completion erases customer payload; failures retain it and block later same-key execution.</remarks>
+    /// <returns>A task completing after the claim becomes terminal for Telegram scheduling.</returns>
+    /// <remarks>Every outcome erases the private payload. A failure requiring business reconciliation becomes <c>completed_with_review</c>; other failures become <c>completed_with_error</c>. Neither state blocks later updates.</remarks>
     public async Task FinishAsync(long sequence, string failureCode, CancellationToken token)
     {
         await SqliteOperation.RunAsync(async ct =>
         {
             await using var db = _factory.CreateDbContext();
-            return failureCode == null
-                ? await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "running")
-                    .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "completed").SetProperty(x => x.Payload, (string)null)
-                        .SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow), ct)
-                : await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "running")
-                    .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "uncertain").SetProperty(x => x.FailureCode, failureCode), ct);
+            var terminalStatus = failureCode == null ? "completed"
+                : failureCode is "creation_requires_review" or "process_interrupted" ? "completed_with_review"
+                : "completed_with_error";
+            return await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "running")
+                .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, terminalStatus)
+                    .SetProperty(x => x.Payload, (string)null).SetProperty(x => x.FailureCode, failureCode)
+                    .SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow), ct);
         }, token);
         NotifyReady();
     }
 
-    /// <summary>Quarantines claims left by the previous process and expires completed deduplication receipts.</summary>
+    /// <summary>Converts interrupted and legacy nonterminal claims to terminal review receipts and expires old deduplication receipts.</summary>
     /// <param name="token">Host startup cancellation; must finish before receiver admission begins.</param>
-    /// <returns>The number of interrupted claims quarantined for reconciliation or operator review.</returns>
-    /// <remarks>Requires the deployment's single polling process. Queued updates and uncertain payloads are retained.</remarks>
+    /// <returns>The number of interrupted or legacy uncertain receipts converted without replaying their handlers.</returns>
+    /// <remarks>Requires the deployment's single polling process. Queued updates remain runnable; business operations preserve any side-effect ambiguity independently. Private payloads are erased from every converted receipt.</remarks>
     public Task<int> RecoverAsync(CancellationToken token) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
-        var count = await db.TelegramUpdateInbox.Where(x => x.Status == "running")
-            .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "uncertain").SetProperty(x => x.FailureCode, "process_interrupted"), ct);
+        var now = DateTime.UtcNow;
+        var count = await db.TelegramUpdateInbox.Where(x => x.Status == "running" || x.Status == "uncertain")
+            .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "completed_with_review")
+                .SetProperty(x => x.Payload, (string)null).SetProperty(x => x.CompletedAtUtc, now)
+                .SetProperty(x => x.FailureCode, x => x.Status == "running" ? "process_interrupted" : x.FailureCode), ct);
         var cutoff = DateTime.UtcNow.AddDays(-7);
-        await db.TelegramUpdateInbox.Where(x => x.Status == "completed" && x.CompletedAtUtc < cutoff).ExecuteDeleteAsync(ct);
+        await db.TelegramUpdateInbox.Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff).ExecuteDeleteAsync(ct);
         return count;
     }, token);
 
     /// <summary>Measures unfinished admission pressure without loading private updates.</summary>
     /// <param name="token">Cancellation of the count.</param>
-    /// <returns>Unfinished rows, including quarantined work that continues to consume capacity.</returns>
-    /// <remarks>Queries return detached metadata without loading payloads. Uncertain lane heads remain unresolved and prevent later work from overtaking them.</remarks>
+    /// <returns>The number of queued and currently running Telegram executions.</returns>
+    /// <remarks>Terminal failure/review receipts and business recovery backlogs are deliberately excluded.</remarks>
     public async Task<int> CountPendingAsync(CancellationToken token)
     {
         await using var db = _factory.CreateDbContext();
-        return await db.TelegramUpdateInbox.CountAsync(x => x.Status != "completed", token);
+        return await db.TelegramUpdateInbox.CountAsync(x => x.Status == "queued" || x.Status == "running", token);
     }
 
-    /// <summary>Expires only completed receipts while leaving every unresolved lane intact.</summary>
+    /// <summary>Expires all terminal Telegram receipts after the seven-day deduplication window.</summary>
     /// <param name="token">Cancellation of the short maintenance write.</param>
     /// <returns>The number of completed deduplication records older than seven days removed.</returns>
     /// <remarks>Payloads have already been erased at completion; this runs periodically during long uptimes.</remarks>
@@ -134,13 +139,13 @@ public sealed partial class TelegramUpdateInboxStore
     {
         await using var db = _factory.CreateDbContext();
         var cutoff = DateTime.UtcNow.AddDays(-7);
-        return await db.TelegramUpdateInbox.Where(x => x.Status == "completed" && x.CompletedAtUtc < cutoff).ExecuteDeleteAsync(ct);
+        return await db.TelegramUpdateInbox.Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff).ExecuteDeleteAsync(ct);
     }, token);
 
     /// <summary>Detects linked XUI attempts whose outcome is still ambiguous despite a handled user-facing failure.</summary>
     /// <param name="sequence">Internal inbox sequence of the handler that just returned.</param>
     /// <param name="token">Cancellation of the metadata-only lookup.</param>
-    /// <returns>True only when a linked creation is PostStarted, Ambiguous or unknown; Applied, DefinitiveRejected and unused Reserved do not quarantine.</returns>
+    /// <returns>True only when a linked creation is PostStarted, Ambiguous or unknown; Applied, DefinitiveRejected and unused Reserved need no review classification.</returns>
     /// <remarks>This query never replays provisioning and never loads private client payloads.</remarks>
     public async Task<bool> HasUnresolvedCreationAsync(long sequence, CancellationToken token)
     {
@@ -148,12 +153,12 @@ public sealed partial class TelegramUpdateInboxStore
         return await db.XuiV3CreationOperations.AnyAsync(x => x.InboxSequence == sequence && (x.Outcome != XuiV3CreationOutcome.Reserved && x.Outcome != XuiV3CreationOutcome.Applied && x.Outcome != XuiV3CreationOutcome.DefinitiveRejected), token);
     }
 
-    /// <summary>Releases a quarantined lane only after an authorized operator has reconciled its business effects.</summary>
+    /// <summary>Records explicit operator resolution of a terminal review receipt after its business effects are reconciled.</summary>
     /// <param name="sequence">Internal uncertain inbox sequence, never the Telegram update id.</param>
     /// <param name="operatorTelegramUserId">Positive authenticated operator Telegram id; the caller must enforce admin authority.</param>
     /// <param name="reviewReference">Required numeric ticket reference in review-N format with one to twelve digits; no free text.</param>
     /// <param name="token">Cancellation of the explicit review write.</param>
-    /// <returns>True if the uncertain row was closed and its payload erased; false when it was already resolved or absent.</returns>
+    /// <returns>True if the review receipt was marked resolved; false when it was already resolved or absent.</returns>
     /// <remarks>No Telegram handler is replayed. Resolve wallet receipts, tenant orders and XUI reservations before calling;
     /// retain the review evidence in the operator's audit record. This method is not exposed to customer callbacks.</remarks>
     /// <exception cref="ArgumentException">An operator id or audit reference is invalid.</exception>

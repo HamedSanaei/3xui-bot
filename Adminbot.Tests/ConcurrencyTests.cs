@@ -186,7 +186,7 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(2, processed);
     }
 
-    /// <summary>Interrupted claims remain uncertain and block their own later work across restart.</summary>
+    /// <summary>An interrupted claim becomes terminal without replay and later same-user work resumes across restart.</summary>
     /// <returns>A task completing after the documented regression invariant has been verified.</returns>
     /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Restart_recovers_queued_work_but_never_replays_uncertain_execution"</code></example>
     [Fact]
@@ -202,10 +202,12 @@ public sealed partial class ConcurrencyTests
         using var scheduler = Create(databases, new Executor((item, _) => { seen.Add(item.Update.Id); return Task.CompletedTask; }));
         await scheduler.StartAsync(default);
         await scheduler.StopAsync(default);
-        Assert.Equal(new[] { 3 }, seen);
+        Assert.Equal(new[] { 2, 3 }, seen.Order());
         await using var db = databases.Users.CreateDbContext();
-        Assert.Equal("uncertain", (await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 1)).Status);
-        Assert.Equal("queued", (await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 2)).Status);
+        var interrupted = await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 1);
+        Assert.Equal("completed_with_review", interrupted.Status);
+        Assert.Null(interrupted.Payload);
+        Assert.Equal("completed", (await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 2)).Status);
         Assert.Null((await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 3)).Payload);
     }
 
@@ -226,7 +228,8 @@ public sealed partial class ConcurrencyTests
         await scheduler.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(10));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => scheduler.EnqueueAsync("a", Update(3, 2), default));
         await using var db = databases.Users.CreateDbContext();
-        Assert.Equal("uncertain", (await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 1)).Status);
+        Assert.Equal("completed_with_review", (await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 1)).Status);
+        Assert.Null((await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 1)).Payload);
         Assert.Equal("queued", (await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 2)).Status);
     }
 

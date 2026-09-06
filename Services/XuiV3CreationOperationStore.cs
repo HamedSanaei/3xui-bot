@@ -83,9 +83,9 @@ public sealed class XuiV3CreationOperationStore
     }
 
     /// <summary>
-    /// Records an operator-reviewed authoritative absence for one creation linked to an uncertain inbox row.
+    /// Records an operator-reviewed authoritative absence for one creation linked to a terminal recovery receipt.
     /// </summary>
-    /// <param name="sequence">Internal uncertain inbox sequence loaded by the authenticated review workflow.</param>
+    /// <param name="sequence">Internal terminal inbox sequence loaded by the authenticated review workflow.</param>
     /// <param name="operationKey">
     /// Exact durable operation key loaded from the row linked by <paramref name="sequence" />. This value must never
     /// come from Telegram command text.
@@ -100,7 +100,7 @@ public sealed class XuiV3CreationOperationStore
     /// <remarks>
     /// The caller must first prove absence through an authenticated, successful read-only panel request. This method
     /// performs no network I/O, never resets an operation to Reserved, and never grants another POST. The same local
-    /// transaction also records the reviewer, UTC time, and reference on the still-uncertain inbox row.
+    /// transaction also records the reviewer, UTC time, and reference on the terminal inbox receipt.
     /// </remarks>
     /// <example><code>var changed = await store.MarkOperatorProvenAbsentAsync(sequence, persistedKey, adminId, "review-205", token);</code></example>
     internal Task<bool> MarkOperatorProvenAbsentAsync(
@@ -128,13 +128,14 @@ public sealed class XuiV3CreationOperationStore
 
             var reviewedAtUtc = DateTime.UtcNow;
             var inboxChanged = await db.TelegramUpdateInbox
-                .Where(x => x.Sequence == sequence && x.Status == "uncertain")
+                .Where(x => x.Sequence == sequence &&
+                    (x.Status == "completed_with_review" || x.Status == "uncertain"))
                 .ExecuteUpdateAsync(set => set
                     .SetProperty(x => x.ReviewedByTelegramUserId, operatorTelegramUserId)
                     .SetProperty(x => x.ReviewedAtUtc, reviewedAtUtc)
                     .SetProperty(x => x.ReviewReference, reviewReference), ct);
             if (inboxChanged != 1)
-                throw new InvalidOperationException("The linked uncertain inbox row was not available for review.");
+                throw new InvalidOperationException("The linked recovery receipt was not available for review.");
 
             await transaction.CommitAsync(ct);
             return true;

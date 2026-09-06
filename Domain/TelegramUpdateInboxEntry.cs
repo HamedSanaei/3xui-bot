@@ -3,8 +3,8 @@ namespace Adminbot.Domain;
 /// <summary>Durable acceptance and execution receipt for one Telegram update.</summary>
 /// <remarks>
 /// BotId plus UpdateId deduplicates receiver redelivery. Sequence orders accepted work, including updates whose
-/// Telegram ids have gaps. Payload contains private customer data and is erased on completion. Uncertain rows
-/// block their own execution key until reviewed; they are never automatically dispatched again.
+/// Telegram ids have gaps. Payload contains private customer data and is erased on every terminal outcome. Business
+/// recovery may outlive this receipt, but it never blocks later updates for the same bot/user execution key.
 /// </remarks>
 public sealed class TelegramUpdateInboxEntry
 {
@@ -18,9 +18,9 @@ public sealed class TelegramUpdateInboxEntry
     public long TelegramUserId { get; set; }
     /// <summary>Telegram update type label for payload-free diagnostics.</summary>
     public string UpdateType { get; set; }
-    /// <summary>Private serialized Telegram update; null after successful completion or reviewed resolution.</summary>
+    /// <summary>Private serialized Telegram update; null after every success, failure, interruption, or review outcome.</summary>
     public string Payload { get; set; }
-    /// <summary>Execution state: queued, running, uncertain, or completed.</summary>
+    /// <summary>Execution state: queued, running, completed, completed_with_error, or completed_with_review.</summary>
     public string Status { get; set; } = "queued";
     /// <summary>UTC acceptance time used for queue latency and deduplication retention.</summary>
     public DateTime AcceptedAtUtc { get; set; }

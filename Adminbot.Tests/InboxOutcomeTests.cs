@@ -19,7 +19,7 @@ using Xunit;
 /// <summary>Regression coverage for explicit creation boundaries, reviewed inbox resolution and event-driven scheduling.</summary>
 public sealed partial class ConcurrencyTests
 {
-    /// <summary>Each durable creation state has an explicit authorization and quarantine policy after restart.</summary>
+    /// <summary>Each durable creation state has explicit POST authorization and recovery behavior after restart.</summary>
     /// <param name="outcome">Persisted creation outcome at the simulated crash boundary.</param>
     /// <param name="mayPost">Whether exactly one unused POST claim is permitted.</param>
     /// <param name="blocks">Whether the linked update requires XUI reconciliation.</param>
@@ -30,7 +30,7 @@ public sealed partial class ConcurrencyTests
     [InlineData(XuiV3CreationOutcome.Applied, false, false)]
     [InlineData(XuiV3CreationOutcome.DefinitiveRejected, false, false)]
     [InlineData(XuiV3CreationOutcome.Ambiguous, false, true)]
-    public async Task Creation_state_controls_post_and_lane_after_restart(XuiV3CreationOutcome outcome, bool mayPost, bool blocks)
+    public async Task Creation_state_controls_post_and_business_recovery_after_restart(XuiV3CreationOutcome outcome, bool mayPost, bool blocks)
     {
         using var databases = new Databases();
         await using (var db = databases.Users.CreateDbContext())
@@ -128,7 +128,7 @@ public sealed partial class ConcurrencyTests
     /// <summary>A handled definitive rejection completes its lane so the next accepted user update runs.</summary>
     /// <returns>A task completing after two FIFO handlers and the terminal durable receipt are verified.</returns>
     [Fact]
-    public async Task Definitive_rejection_does_not_quarantine_lane()
+    public async Task Definitive_rejection_keeps_user_lane_available()
     {
         using var databases = new Databases(); var seen = new ConcurrentQueue<int>(); var creations = new XuiV3CreationOperationStore(databases.Users);
         using var scheduler = Create(databases, new Executor(async (item, token) =>
@@ -259,9 +259,9 @@ public sealed partial class ConcurrencyTests
         _output.WriteLine($"totalUpdates=150 completed={effects.Count} uncertain={uncertain} duplicateEffects={150-effects.Count} fifoViolations={violations} maxObservedConcurrency={maximum} p50QueueWaitMs={sorted[74]:F1} p95QueueWaitMs={sorted[142]:F1} p99QueueWaitMs={sorted[148]:F1} readyQueryCount={scheduler.ReadyQueryCount} sqliteBusyRetryCount={retries}");
     }
 
-    /// <summary>An ordinary handler exception is reviewable without wallet, XUI, order or settlement evidence.</summary>
-    /// <returns>A task completing after quarantine, safe review and lane release.</returns>
-    /// <remarks>The evaluator must not require financial evidence for an update that never touched financial systems.</remarks>
+    /// <summary>An ordinary handler exception becomes terminal and releases the same user's next message automatically.</summary>
+    /// <returns>A task completing after the failure receipt and the next same-user execution are observed.</returns>
+    /// <remarks>No administrator action is required when a handler never created a durable business recovery incident.</remarks>
     [Fact]
     public async Task Ordinary_non_financial_exception_is_reviewable_without_wallet_or_xui_evidence()
     {
@@ -274,13 +274,13 @@ public sealed partial class ConcurrencyTests
         }));
         await scheduler.EnqueueAsync("a", Update(1, 123), default);
         await scheduler.EnqueueAsync("a", Update(2, 123), default);
-        var sequence = (await databases.Inbox.ReadReadyAsync(10, default)).Single().Sequence;
         await scheduler.StartAsync(default);
-        await WaitForAsync(async () => (await databases.Inbox.CanResolveAsync(sequence, default)).Allowed);
-        Assert.True(await databases.Inbox.ResolveReviewedAsync(sequence, 456, "review-4", default));
         await Until(() => seen.Contains(2));
         await scheduler.StopAsync(default);
         Assert.Equal(new[] { 2 }, seen);
+        await using var db = databases.Users.CreateDbContext();
+        var failure = await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 1);
+        Assert.Equal("completed_with_error", failure.Status); Assert.Null(failure.Payload);
     }
 
     /// <summary>Same-lane completion wakes the next update without waiting for the periodic scan.</summary>
@@ -307,26 +307,25 @@ public sealed partial class ConcurrencyTests
         Assert.DoesNotContain(false, Drain(wakes));
     }
 
-    /// <summary>An admin resolution commit wakes the blocked lane without waiting for the periodic scan.</summary>
-    /// <returns>A task completing after the resolved lane's next update ran on the resolution wake.</returns>
-    /// <remarks>Resolution is safe here because the quarantined update never touched wallet or XUI state.</remarks>
+    /// <summary>A terminal review receipt never delays a later same-user message or require an admin wake.</summary>
+    /// <returns>A task completing after the queued successor executes while review remains pending.</returns>
+    /// <remarks>This directly protects /start and main-menu navigation from historical recovery records.</remarks>
     [Fact]
-    public async Task Admin_resolution_wakes_blocked_lane_without_periodic_scan()
+    public async Task Terminal_review_receipt_never_requires_admin_resolution_for_progress()
     {
         using var databases = new Databases();
         var secondRan = Signal();
         var wakes = Channel.CreateUnbounded<bool>();
-        using var scheduler = Create(databases, new Executor((item, _) =>
+        await using (var db = databases.Users.CreateDbContext())
         {
-            if (item.Update.Id == 1) throw new InvalidOperationException("ordinary handler failure");
-            secondRan.TrySetResult(); return Task.CompletedTask;
-        }), wakes);
-        await scheduler.EnqueueAsync("a", Update(1, 123), default);
+            db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry { BotId = "a", UpdateId = 1, TelegramUserId = 123,
+                Status = "completed_with_review", FailureCode = "creation_requires_review", AcceptedAtUtc = DateTime.UtcNow,
+                CompletedAtUtc = DateTime.UtcNow });
+            await db.SaveChangesAsync();
+        }
+        using var scheduler = Create(databases, new Executor((_, _) => { secondRan.TrySetResult(); return Task.CompletedTask; }), wakes);
         await scheduler.EnqueueAsync("a", Update(2, 123), default);
-        var sequence = (await databases.Inbox.ReadReadyAsync(10, default)).Single().Sequence;
         await scheduler.StartAsync(default);
-        await WaitForAsync(async () => (await databases.Inbox.CanResolveAsync(sequence, default)).Allowed);
-        Assert.True(await databases.Inbox.ResolveReviewedAsync(sequence, 456, "review-5", default));
         await secondRan.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await scheduler.StopAsync(default);
         Assert.DoesNotContain(false, Drain(wakes));
@@ -357,11 +356,11 @@ public sealed partial class ConcurrencyTests
         Assert.DoesNotContain(false, Drain(wakes));
     }
 
-    /// <summary>Uncertain rows consume admission capacity, emit sanitized warnings, and the admin plane stays reachable.</summary>
-    /// <returns>A task completing after bounded admission, warning capture and an authorized listing.</returns>
-    /// <remarks>Quarantine pressure is observable but never exempt from capacity; the receiver-owned control path is independent of customer admission.</remarks>
+    /// <summary>Legacy recovery rows consume no admission capacity and unchanged scans emit no repeated alerts.</summary>
+    /// <returns>A task completing after legacy conversion, one recovery alert, one hundred scans, and authorized inspection.</returns>
+    /// <remarks>Recovery is observable while remaining independent of customer admission and Telegram execution.</remarks>
     [Fact]
-    public async Task Uncertain_rows_consume_capacity_and_admin_control_remains_reachable()
+    public async Task Recovery_rows_do_not_consume_capacity_or_repeat_scheduler_alerts()
     {
         using var databases = new Databases();
         await using (var db = databases.Users.CreateDbContext())
@@ -372,15 +371,19 @@ public sealed partial class ConcurrencyTests
             await db.SaveChangesAsync();
         }
         var logs = new ListLogger<TelegramUpdateScheduler>();
-        using (var scheduler = new TelegramUpdateScheduler(databases.Inbox, new Executor((_, _) => Task.CompletedTask),
-            new AppConfig { TelegramUpdateMaxConcurrency = 2, TelegramUpdateQueueCapacity = 10, TelegramUpdateShutdownDrainSeconds = 5 }, logs))
+        using (var scheduler = new TelegramUpdateScheduler(databases.Inbox,
+            new Executor((_, _) => Task.CompletedTask, _ => false),
+            new AppConfig { TelegramUpdateMaxConcurrency = 2, TelegramUpdateQueueCapacity = 10, TelegramUpdateShutdownDrainSeconds = 5 }, logs)
+            { RecoveryInterval = TimeSpan.FromMilliseconds(1) })
         {
             await scheduler.StartAsync(default);
-            Assert.Contains(logs.Messages, message => message.Contains("telegramInboxUncertainCount=8"));
+            Assert.Single(logs.Messages, message => message.Contains("telegramRecoveryIncidentCount=8"));
             Assert.True(await databases.Inbox.TryAcceptAsync("a", Update(1, 901), 10, default));
             Assert.True(await databases.Inbox.TryAcceptAsync("a", Update(2, 902), 10, default));
-            Assert.False(await databases.Inbox.TryAcceptAsync("a", Update(3, 903), 10, default));
-            Assert.Equal(10, await databases.Inbox.CountPendingAsync(default));
+            Assert.True(await databases.Inbox.TryAcceptAsync("a", Update(3, 903), 10, default));
+            Assert.Equal(3, await databases.Inbox.CountPendingAsync(default));
+            await Until(() => scheduler.ReadyQueryCount >= 100);
+            Assert.Single(logs.Messages);
             await scheduler.StopAsync(default);
         }
         var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
@@ -641,6 +644,73 @@ public sealed partial class ConcurrencyTests
         Assert.True(evidence.Allowed); Assert.Contains("legacyCorrelatedRenewalPending=0", evidence.Evidence);
         await using var verify = databases.Users.CreateDbContext();
         Assert.Equal(XuiV3RenewalOperationStatuses.ManualReview, (await verify.XuiV3RenewalOperations.SingleAsync()).Status);
+    }
+
+    /// <summary>Every supported business recovery category remains durable while a later same-user message executes.</summary>
+    /// <param name="incident">Recovery category representing creation, renewal, wallet settlement, link change, or tenant fulfillment.</param>
+    /// <returns>A task completing after the later update executes and the selected recovery record survives.</returns>
+    /// <remarks>
+    /// Regression invariant: recovery scopes one immutable business operation. It never scopes the customer's
+    /// <c>BotId + TelegramUserId</c> lane, so /start and ordinary navigation remain available.
+    /// </remarks>
+    [Theory]
+    [InlineData("creation_ambiguous")]
+    [InlineData("renewal_ambiguous")]
+    [InlineData("wallet_settlement_pending")]
+    [InlineData("link_manual_review")]
+    [InlineData("tenant_order_unfulfilled")]
+    public async Task Business_recovery_never_blocks_later_same_user_messages(string incident)
+    {
+        using var databases = new Databases();
+        long sequence;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var receipt = new TelegramUpdateInboxEntry { BotId = "a", UpdateId = 1, TelegramUserId = 123,
+                Status = "completed_with_review", FailureCode = "process_interrupted", AcceptedAtUtc = DateTime.UtcNow,
+                CompletedAtUtc = DateTime.UtcNow };
+            db.TelegramUpdateInbox.Add(receipt); await db.SaveChangesAsync(); sequence = receipt.Sequence;
+            switch (incident)
+            {
+                case "creation_ambiguous":
+                    db.XuiV3CreationOperations.Add(new XuiV3CreationOperation { OperationKey = "availability-create",
+                        PanelKey = "panel", TelegramUserId = 123, ClientJson = "private", InboundIdsJson = "[1]",
+                        Outcome = XuiV3CreationOutcome.Ambiguous, InboxSequence = sequence });
+                    break;
+                case "renewal_ambiguous":
+                    db.XuiV3RenewalOperations.Add(new XuiV3RenewalOperation { OperationKey = "availability-renew",
+                        OperationId = "availability-renew", BotId = "a", TelegramUserId = 123, TargetEmail = "private@example",
+                        Status = XuiV3RenewalOperationStatuses.Ambiguous,
+                        SettlementStatus = XuiV3RenewalSettlementStatuses.Pending, InboxSequence = sequence });
+                    break;
+                case "link_manual_review":
+                    db.XuiV3LinkChangeOperations.Add(new XuiV3LinkChangeOperation { OperationKey = "availability-link",
+                        PanelKey = "panel", BotId = "a", TelegramUserId = 123, ClientId = 7,
+                        Status = XuiV3LinkChangeStatuses.ManualReview, InboxSequence = sequence,
+                        CreatedAtUtc = DateTime.UtcNow, UpdatedAtUtc = DateTime.UtcNow });
+                    break;
+                case "tenant_order_unfulfilled":
+                    db.TenantBotOrders.Add(new TenantBotOrder { OrderId = "availability-order", TenantBotId = "a",
+                        OwnerTelegramUserId = 456, CustomerTelegramUserId = 123, CustomerChatId = 123,
+                        PaymentStatus = TenantBotOrderStatuses.Paid, IsFulfilled = false });
+                    break;
+            }
+            await db.SaveChangesAsync();
+        }
+        if (incident == "wallet_settlement_pending")
+        {
+            await using var credentials = databases.Credentials.CreateDbContext();
+            credentials.WalletOperations.Add(new WalletOperation { OperationKey = "availability-wallet", TelegramUserId = 123,
+                AmountToman = -10, BeforeBalance = 100, AfterBalance = 90, BotId = "a", InboxSequence = sequence,
+                CreatedAtUtc = DateTime.UtcNow, ReconciledAtUtc = null });
+            await credentials.SaveChangesAsync();
+        }
+
+        var ran = Signal();
+        using var scheduler = Create(databases, new Executor((item, _) => { ran.TrySetResult(); return Task.CompletedTask; }));
+        await scheduler.EnqueueAsync("a", Update(2, 123), default);
+        await scheduler.StartAsync(default); await ran.Task.WaitAsync(TimeSpan.FromSeconds(5)); await scheduler.StopAsync(default);
+        Assert.Equal(1, (await databases.Inbox.ReadUncertainSummaryAsync(default)).Count);
+        Assert.Equal(0, await databases.Inbox.CountPendingAsync(default));
     }
 
     /// <summary>Polls an eventual durable condition with a bounded deadline.</summary>

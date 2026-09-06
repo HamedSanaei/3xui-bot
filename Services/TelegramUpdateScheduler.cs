@@ -36,8 +36,8 @@ public interface ITelegramUpdateExecutor
 
 /// <summary>Runs bounded, fair, per-bot/user FIFO scheduling over the durable inbox.</summary>
 /// <remarks>
-/// Only the coordinator owns the active-task collection. A blocked lane occupies no worker, and historical users
-/// create no permanent locks. Shutdown drains runnable work; disabled and uncertain lanes remain durable.
+/// Only the coordinator owns the active-task collection. FIFO ordering applies only while work is queued or running.
+/// A terminal failure or business recovery incident never prevents the same user from executing a later update.
 /// </remarks>
 public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedService, IDisposable
 {
@@ -121,8 +121,9 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        var uncertain = await _store.RecoverAsync(cancellationToken);
-        await ReportUncertainAsync(cancellationToken);
+        var recovered = await _store.RecoverAsync(cancellationToken);
+        if (recovered > 0)
+            _logger.LogWarning("Telegram executions recovered without replay. telegramRecoveryIncidentCount={Count}", recovered);
         _loop = RunAsync(_coordinator.Token);
     }
 
@@ -147,7 +148,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <summary>Runs eligible lane heads while maintaining a fixed upper bound on tracked handler tasks.</summary>
     /// <param name="token">Coordinator cancellation after shutdown draining has ended.</param>
     /// <returns>The complete coordinator lifetime, including observation of every started handler.</returns>
-    /// <remarks>The ready query excludes lanes with earlier running or uncertain rows. Round-robin bots cannot reorder a lane.</remarks>
+    /// <remarks>The ready query excludes only earlier queued or running work. Round-robin bots cannot reorder live work in a lane.</remarks>
     private async Task RunAsync(CancellationToken token)
     {
         var active = new Dictionary<long, Task>();
@@ -179,7 +180,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     {
                         var depth = await _store.CountPendingAsync(token);
                         QueueDepth.Record(depth);
-                        await ReportUncertainAsync(token);
+                        await RecordRecoveryMetricsAsync(token);
                         if (depth >= _capacity * 0.8)
                             _logger.LogWarning("Telegram queue pressure. QueueDepth={QueueDepth} Capacity={Capacity} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}", depth, _capacity, ActiveHandlerCount, _concurrency);
                         nextPressureSample = DateTime.UtcNow.AddSeconds(10);
@@ -247,13 +248,18 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             using (TelegramUpdateExecutionScope.Push(sequence))
                 await _executor.ExecuteAsync(item, token);
             token.ThrowIfCancellationRequested();
-            if (await _store.HasUnresolvedCreationAsync(sequence, token)) failure = "creation_requires_review";
+            if (await _store.HasUnresolvedCreationAsync(sequence, token))
+            {
+                failure = "creation_requires_review";
+                _logger.LogWarning("Telegram execution completed with business recovery pending. Sequence={Sequence} RecoveryType={RecoveryType}",
+                    sequence, "xui_creation");
+            }
         }
         catch (OperationCanceledException) { failure = "execution_cancelled"; }
         catch (Exception ex)
         {
             failure = "execution_failed";
-            _logger.LogError("Telegram update quarantined. Sequence={Sequence} ErrorType={ErrorType}", sequence, ex.GetType().Name);
+            _logger.LogError("Telegram update failed and was released. Sequence={Sequence} ErrorType={ErrorType}", sequence, ex.GetType().Name);
         }
         finally
         {
@@ -270,28 +276,26 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         }
     }
 
-    private static readonly Histogram<int> Uncertain = Meter.CreateHistogram<int>("telegram.update.inbox.uncertain");
-    private static readonly Histogram<int> BlockedLanes = Meter.CreateHistogram<int>("telegram.update.inbox.blocked_lanes");
-    private static readonly Histogram<double> OldestUncertain = Meter.CreateHistogram<double>("telegram.update.inbox.oldest_uncertain_age", "s");
+    private static readonly Histogram<int> RecoveryPending = Meter.CreateHistogram<int>("telegram.update.recovery.pending");
+    private static readonly Histogram<double> OldestRecovery = Meter.CreateHistogram<double>("telegram.update.recovery.oldest_age", "s");
 
-    /// <summary>Reports existing and newly recovered quarantine pressure without reading private payloads.</summary>
-    /// <param name="token">Startup or coordinator cancellation for metadata queries.</param>
-    /// <returns>A task completing after count/age instruments and sanitized warnings are emitted.</returns>
-    /// <remarks>Called at startup and at most once per ten-second pressure sample. Uncertain rows still consume capacity.</remarks>
-    private async Task ReportUncertainAsync(CancellationToken token)
+    /// <summary>Records the business-review backlog without producing periodic alerts or affecting scheduling.</summary>
+    /// <param name="token">Coordinator cancellation for metadata-only queries.</param>
+    /// <returns>A task completing after local count and age instruments are updated.</returns>
+    /// <remarks>New incidents are logged once at creation or restart recovery. Unchanged backlog samples never generate Telegram logger traffic.</remarks>
+    private async Task RecordRecoveryMetricsAsync(CancellationToken token)
     {
         var summary = await _store.ReadUncertainSummaryAsync(token);
-        Uncertain.Record(summary.Count); BlockedLanes.Record(summary.Lanes); OldestUncertain.Record(summary.AgeSeconds);
-        if (summary.Count > 0) _logger.LogWarning("Telegram inbox quarantine. telegramInboxUncertainCount={Count} telegramInboxBlockedLaneCount={Lanes} telegramInboxOldestUncertainAge={AgeSeconds} Capacity={Capacity} SignificantPressure={Pressure}",
-            summary.Count, summary.Lanes, summary.AgeSeconds, _capacity, summary.Count >= _capacity * 0.2);
+        RecoveryPending.Record(summary.Count);
+        OldestRecovery.Record(summary.AgeSeconds);
     }
 
     /// <summary>Closes admission, drains runnable work, then cooperatively cancels unfinished handlers.</summary>
     /// <param name="cancellationToken">Host deadline; accepted queued updates remain stored if it expires.</param>
     /// <returns>A task completing after draining or a bounded cancellation grace period.</returns>
-    /// <remarks>After the configured drain, active work is quarantined before waiting up to fifteen seconds for cooperative
+    /// <remarks>After the configured drain, active Telegram receipts are made terminal before waiting up to fifteen seconds for cooperative
     /// cancellation. A handler ignoring cancellation is logged and remains tracked until process exit; it cannot mark its
-    /// quarantined row completed later. The deployment must terminate the old process before starting a replacement.</remarks>
+    /// terminal receipt later. The deployment must terminate the old process before starting a replacement.</remarks>
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         StopAdmission();
@@ -305,7 +309,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             _coordinator.Cancel();
             using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             try { await _store.RecoverAsync(persistence.Token); }
-            catch (Exception failure) { _logger.LogError("Shutdown quarantine failed; running claims will be recovered on restart. ErrorType={ErrorType}", failure.GetType().Name); }
+            catch (Exception failure) { _logger.LogError("Shutdown recovery persistence failed; running claims will be finalized on restart. ErrorType={ErrorType}", failure.GetType().Name); }
             try { await _loop.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken); }
             catch (Exception failure) when (failure is TimeoutException or OperationCanceledException)
             {

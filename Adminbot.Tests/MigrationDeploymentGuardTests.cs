@@ -77,6 +77,9 @@ public sealed class MigrationDeploymentGuardTests
         using var fixture = new MigrationFixture();
         await using (var users = fixture.CreateUsers()) await users.Database.MigrateAsync();
         await using (var credentials = fixture.CreateCredentials()) await credentials.Database.MigrateAsync();
+        // Close pooled migration connections before the timestamp baseline so a delayed WAL checkpoint from test
+        // setup cannot be mistaken for a write performed by the read-only production preflight.
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
         var usersWrite = File.GetLastWriteTimeUtc(fixture.UsersPath);
         var credentialsWrite = File.GetLastWriteTimeUtc(fixture.CredentialsPath);
         using var output = new StringWriter();

@@ -2,18 +2,18 @@ using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
 using System.Collections.Concurrent;
 
-/// <summary>Sanitized uncertain-inbox inspection and conservative resolution preconditions.</summary>
+/// <summary>Sanitized terminal-recovery inspection and conservative business-resolution preconditions.</summary>
 /// <remarks>Never returns update/client payloads or financial keys. Exact inbox links are authoritative. A legacy
 /// operation without an inbox link is correlated only when its bot/user matches and its creation time falls from five
 /// minutes before acceptance through two hours after execution started; older history remains untouched and does not
-/// block a newer lane.</remarks>
+/// affect a newer Telegram execution.</remarks>
 public sealed partial class TelegramUpdateInboxStore
 {
     private readonly CredentialsDbContextFactory _credentials;
     /// <summary>Live executions cannot be manually completed while a cancellation-ignoring handler still runs.</summary>
     internal readonly ConcurrentDictionary<long, byte> Executing = new();
 
-    /// <summary>Reads a bounded metadata-only page of uncertain updates.</summary>
+    /// <summary>Reads a bounded metadata-only page of terminal Telegram receipts that still need business review.</summary>
     /// <param name="after">Exclusive internal sequence cursor, zero for the first page.</param>
     /// <param name="token">Cancellation of this detached database read.</param>
     /// <returns>At most ten detached metadata rows without private payloads; an empty page means end of results.</returns>
@@ -21,21 +21,22 @@ public sealed partial class TelegramUpdateInboxStore
     public async Task<List<TelegramUpdateInboxEntry>> ListUncertainAsync(long after, CancellationToken token)
     {
         await using var db = _factory.CreateDbContext();
-        return await db.TelegramUpdateInbox.AsNoTracking().Where(x => x.Status == "uncertain" && x.Sequence > after)
+        return await db.TelegramUpdateInbox.AsNoTracking().Where(x =>
+                (x.Status == "completed_with_review" || x.Status == "uncertain") && x.Sequence > after)
             .OrderBy(x => x.Sequence).Take(10).Select(x => new TelegramUpdateInboxEntry
             { Sequence = x.Sequence, BotId = x.BotId, TelegramUserId = x.TelegramUserId, UpdateId = x.UpdateId,
                 UpdateType = x.UpdateType, Status = x.Status, FailureCode = x.FailureCode,
                 AcceptedAtUtc = x.AcceptedAtUtc, StartedAtUtc = x.StartedAtUtc }).ToListAsync(token);
     }
 
-    /// <summary>Measures all uncertain rows, blocked execution lanes and oldest acceptance without reading payloads.</summary>
+    /// <summary>Measures terminal recovery receipts and their oldest acceptance time without reading payloads.</summary>
     /// <param name="token">Cancellation of metadata queries.</param>
-    /// <returns>Uncertain count, distinct bot/user lane count, and oldest age in seconds, zero when none exist.</returns>
-    /// <remarks>Uncertain rows remain included in strict admission capacity.</remarks>
+    /// <returns>Recovery receipt count, distinct affected bot/user count, and oldest age in seconds, zero when none exist.</returns>
+    /// <remarks>The affected-user count is diagnostic only and never participates in admission or scheduling.</remarks>
     public async Task<(int Count, int Lanes, double AgeSeconds)> ReadUncertainSummaryAsync(CancellationToken token)
     {
         await using var db = _factory.CreateDbContext();
-        var query = db.TelegramUpdateInbox.Where(x => x.Status == "uncertain");
+        var query = db.TelegramUpdateInbox.Where(x => x.Status == "completed_with_review" || x.Status == "uncertain");
         var count = await query.CountAsync(token);
         var lanes = await query.Select(x => new { x.BotId, x.TelegramUserId }).Distinct().CountAsync(token);
         var oldest = await query.MinAsync(x => (DateTime?)x.AcceptedAtUtc, token);
@@ -51,7 +52,8 @@ public sealed partial class TelegramUpdateInboxStore
     public async Task<(bool Allowed, string Evidence)> CanResolveAsync(long sequence, CancellationToken token)
     {
         await using var db = _factory.CreateDbContext();
-        var row = await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "uncertain")
+        var row = await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence &&
+                (x.Status == "completed_with_review" || x.Status == "uncertain"))
             .Select(x => new { x.BotId, x.TelegramUserId, x.AcceptedAtUtc, x.StartedAtUtc }).SingleOrDefaultAsync(token);
         if (row == null) return (false, "not_uncertain");
         if (Executing.ContainsKey(sequence)) return (false, "handler_still_active");
@@ -155,21 +157,22 @@ public sealed partial class TelegramUpdateInboxStore
         "awaiting_confirmation" or "recovery_pending" or "succeeded" or "failed_before_mutation" or
         "cancelled" or "expired" ? status : "other";
 
-    /// <summary>Closes an eligible uncertain row after explicit operator review and preserves its original failure category.</summary>
+    /// <summary>Marks an eligible terminal recovery receipt resolved after explicit operator review.</summary>
     /// <param name="sequence">Internal uncertain sequence.</param>
     /// <param name="operatorId">Authenticated global super-admin Telegram id.</param>
     /// <param name="reference">Validated review-N ticket, never free text.</param>
     /// <param name="token">Cancellation of evidence checks and local commit.</param>
     /// <returns>True only if known effects were safe and the row was completed; no handler is replayed.</returns>
-    /// <remarks>Positive creation proof and reconciled receipts are monotonic. The single-process scheduler cannot
-    /// run this blocked lane during review. Cross-bot financial activity remains independently idempotent.</remarks>
+    /// <remarks>Positive creation proof and reconciled receipts are monotonic. Telegram scheduling does not consult
+    /// this review state. Cross-bot financial activity remains independently idempotent.</remarks>
     private async Task<bool> ResolveGuardedAsync(long sequence, long operatorId, string reference, CancellationToken token)
     {
         if (!(await CanResolveAsync(sequence, token)).Allowed) return false;
         var changed = await SqliteOperation.RunAsync(async ct =>
         {
             await using var db = _factory.CreateDbContext();
-            return await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "uncertain"
+            return await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence &&
+                (x.Status == "completed_with_review" || x.Status == "uncertain")
                 && !db.XuiV3CreationOperations.Any(c => c.InboxSequence == sequence
                     && c.Outcome != XuiV3CreationOutcome.Applied && c.Outcome != XuiV3CreationOutcome.DefinitiveRejected
                     && c.Outcome != XuiV3CreationOutcome.Reserved))

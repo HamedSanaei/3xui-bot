@@ -7895,7 +7895,7 @@ public class TenantBotService
     /// as definitively absent.
     /// </summary>
     /// <param name="inboxSequence">
-    /// Internal uncertain-inbox sequence selected by the operator. The sequence, rather than Telegram text, must link
+    /// Internal terminal-recovery inbox sequence selected by the operator. The sequence, rather than Telegram text, must link
     /// the original <c>tenant-create:{orderId}</c> operation to the paid tenant order.
     /// </param>
     /// <param name="operatorTelegramUserId">Authenticated positive Telegram id of the global super-admin reviewer.</param>
@@ -7924,7 +7924,8 @@ public class TenantBotService
             throw new ArgumentException("A reviewed uncertain sequence and review-N reference are required.");
 
         var review = await _workflow.ReadAsync(async db => await db.TelegramUpdateInbox.AsNoTracking()
-            .Where(x => x.Sequence == inboxSequence && x.Status == "uncertain" &&
+            .Where(x => x.Sequence == inboxSequence &&
+                (x.Status == "completed_with_review" || x.Status == "uncertain") &&
                 x.ReviewedByTelegramUserId == operatorTelegramUserId && x.ReviewReference == reviewReference)
             .Select(x => new { x.Sequence }).SingleOrDefaultAsync(cancellationToken));
         if (review == null)

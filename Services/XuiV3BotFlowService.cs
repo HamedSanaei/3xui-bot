@@ -3898,6 +3898,8 @@ public class XuiV3BotFlowService
     /// therefore returns the buyer to current duration choices without a wallet, ledger, website, or XUI side effect.
     /// Once final execution starts, create success, partial success, and terminal failure audits report accumulated
     /// panel API time plus total settlement/delivery time; time spent waiting for user confirmation is excluded.
+    /// A zero-account creation result or failed post-provision site-wallet settlement clears the purchase conversation
+    /// and sends the applicable main menu after the safe error, while the exact durable operation remains recoverable.
     /// Service, traffic, duration, unlimited-plan, account-count, and back callbacks replace durable transient state
     /// explicitly, so values cleared in memory cannot survive through partial-update null semantics.
     /// The read-only <c>acfg</c> route carries only a numeric client id; it reloads panel data and verifies Telegram
@@ -4886,6 +4888,8 @@ public class XuiV3BotFlowService
                             text: $"ساخت اکانت ناموفق بود.\n{failureMessage}",
                             cancellationToken: cancellationToken);
                     }
+                    await ReturnToMainMenuAsync(
+                        botClient, chatId, 0, credUser, user, mainReplyMarkup, cancellationToken);
                     return true;
                 }
 
@@ -4933,6 +4937,8 @@ public class XuiV3BotFlowService
                                 text: "ساخت اکانت روی پنل انجام شد، اما کسر کیف پول سایت گذرگاه ناموفق بود. اکانت‌های ساخته‌شده برای جلوگیری از تحویل بدون پرداخت حذف شدند و موضوع برای بررسی ثبت شد.",
                                 cancellationToken: cancellationToken);
                         }
+                        await ReturnToMainMenuAsync(
+                            botClient, chatId, 0, credUser, user, mainReplyMarkup, cancellationToken);
                         return true;
                     }
 

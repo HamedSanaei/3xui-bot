@@ -5,8 +5,8 @@ using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 
-/// <summary>Private-chat super-admin control plane for quarantined inbox work, independent of admission capacity.</summary>
-/// <remarks>Receivers await this bounded management path directly so full or blocked inboxes cannot hide the repair
+/// <summary>Private-chat super-admin control plane for business recovery linked to terminal inbox receipts.</summary>
+/// <remarks>Receivers await this bounded management path directly so full inboxes cannot hide the repair
 /// surface. Commands never replay customer handlers. One global gate bounds review I/O across every bot.</remarks>
 public sealed class TelegramInboxAdminService
 {
@@ -76,7 +76,7 @@ public sealed class TelegramInboxAdminService
         return true;
     }
 
-    /// <summary>Checks global super-admin authority before reading or resolving any uncertain evidence.</summary>
+    /// <summary>Checks global super-admin authority before reading or resolving any recovery evidence.</summary>
     /// <param name="botId">Trusted runtime bot id.</param>
     /// <param name="actor">Telegram-authenticated From.Id, never a command argument.</param>
     /// <param name="privateChat">Telegram private-chat flag; required for sensitive operational metadata.</param>
@@ -173,7 +173,8 @@ public sealed class TelegramInboxAdminService
         await using (var db = _users.CreateDbContext())
         {
             inbox = await db.TelegramUpdateInbox.AsNoTracking()
-                .SingleOrDefaultAsync(x => x.Sequence == sequence && x.Status == "uncertain", token);
+                .SingleOrDefaultAsync(x => x.Sequence == sequence &&
+                    (x.Status == "completed_with_review" || x.Status == "uncertain"), token);
             if (inbox == null)
                 return "Creation rejection refused: not_uncertain.";
             rows = await db.XuiV3CreationOperations.AsNoTracking()

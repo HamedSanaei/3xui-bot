@@ -337,7 +337,7 @@ public class TelegramBotService
     /// <param name="botClient">Telegram client that should answer the update.</param>
     /// <param name="update">Telegram update being processed.</param>
     /// <param name="cancellationToken">Cancellation token from polling.</param>
-    /// <returns>A task completing after handling; uncertain timeouts and non-delivery failures propagate to the durable scheduler.</returns>
+    /// <returns>A task completing after handling; timeouts and non-delivery failures propagate to a terminal scheduler receipt.</returns>
     /// <remarks>
     /// Telegram can throw per-user delivery errors when a customer blocks an owned bot, tenant bot, or assistant bot.
     /// It can also raise transient request timeouts while sending a reply. Those errors are logged as skipped
@@ -345,7 +345,7 @@ public class TelegramBotService
     /// request as a receiver failure. A Telegram 429 rate limit is likewise swallowed after backing off for
     /// Telegram's <c>RetryAfter</c> window; rethrowing it would terminate the receiver, and reporting it back through
     /// the Telegram logger channel would amplify the rate-limit storm. All other exceptions are still logged and
-    /// rethrown for durable quarantine. External timeouts remain uncertain after the best-effort customer notice.
+    /// rethrown for durable failure classification. External side-effect ambiguity remains in its business operation after the best-effort customer notice.
     /// </remarks>
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
@@ -449,6 +449,7 @@ public class TelegramBotService
                     ["updateType"] = update?.Type.ToString() ?? "unknown"
                 },
                 cancellationToken);
+            await SendBestEffortFailureMessageAsync(botClient, update, cancellationToken);
             throw;
         }
     }
@@ -7937,7 +7938,7 @@ public class TelegramBotService
     }
 
     /// <summary>
-    /// Sends a short best-effort timeout notice to the Telegram chat that triggered the update.
+    /// Sends a short best-effort timeout notice and normal customer menu to the Telegram chat that triggered the update.
     /// </summary>
     /// <param name="botClient">Telegram client for the active owned or tenant bot.</param>
     /// <param name="update">Update whose message or callback chat should receive the notice.</param>
@@ -7961,6 +7962,7 @@ public class TelegramBotService
             await botClient.SendTextMessageAsync(
                 chatId: chatId.Value,
                 text: "ارتباط با پنل یا تلگرام بیش از حد طول کشید. لطفاً چند دقیقه دیگر دوباره تلاش کنید.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
                 cancellationToken: cancellationToken);
         }
         catch (Exception ex) when (IsUserDeliveryPollingError(ex) || IsExternalOperationTimeout(ex, cancellationToken))
@@ -7970,6 +7972,45 @@ public class TelegramBotService
                 BotContextAccessor.CurrentBotId,
                 chatId.Value,
                 ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Sends a concise best-effort failure notice with the normal menu after an unhandled update error.
+    /// </summary>
+    /// <param name="botClient">Telegram client for the active owned or tenant runtime.</param>
+    /// <param name="update">Failed update whose message or callback chat identifies the customer destination.</param>
+    /// <param name="cancellationToken">Handler token used only to bound the Telegram send attempt.</param>
+    /// <returns>A task completing after the safe notice is delivered or a secondary delivery failure is suppressed.</returns>
+    /// <remarks>
+    /// This method performs no database, wallet, gateway, or XUI work. The original exception is rethrown after this
+    /// call so the durable scheduler records a terminal error receipt, while the menu lets the customer continue.
+    /// </remarks>
+    /// <example><code>await SendBestEffortFailureMessageAsync(botClient, update, cancellationToken);</code></example>
+    private async Task SendBestEffortFailureMessageAsync(
+        ITelegramBotClient botClient,
+        Update update,
+        CancellationToken cancellationToken)
+    {
+        var chatId = update?.Message?.Chat.Id ?? update?.CallbackQuery?.Message?.Chat.Id;
+        if (!chatId.HasValue)
+            return;
+
+        try
+        {
+            await botClient.SendTextMessageAsync(
+                chatId: chatId.Value,
+                text: "انجام درخواست با خطا روبه‌رو شد. لطفاً دوباره تلاش کنید یا از منوی اصلی ادامه دهید.",
+                replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception deliveryFailure)
+        {
+            _logger.LogWarning(
+                "Skipped failure notification because Telegram could not deliver it. botId={BotId}, chatId={ChatId}, errorType={ErrorType}",
+                BotContextAccessor.CurrentBotId,
+                chatId.Value,
+                deliveryFailure.GetType().Name);
         }
     }
 

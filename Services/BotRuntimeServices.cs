@@ -928,7 +928,7 @@ public class MultiBotHostedService : IHostedService
                 updateHandler: async (_, update, token) =>
                 {
                     // The tracked receiver owns this bounded super-admin control path, which must remain usable
-                    // when durable customer capacity is full. It never replays a quarantined handler.
+                    // when durable customer capacity is full. It never replays a terminal handler receipt.
                     var admin = _scopeFactory.CreateScope();
                     using (admin)
                         if (await admin.ServiceProvider.GetRequiredService<TelegramInboxAdminService>()
