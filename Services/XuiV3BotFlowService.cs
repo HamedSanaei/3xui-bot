@@ -3550,6 +3550,7 @@ public class XuiV3BotFlowService
     /// dispatcher can continue with purchase, renewal, search, or legacy handlers.
     /// </returns>
     /// <remarks>
+    /// Both menus display «اکانت تست»; the previous free-account label is accepted only as a legacy input alias.
     /// Owned and tenant menus share this policy: non-colleagues with verified phones, 100 MiB national or 1 GiB normal,
     /// three days, and a separate thirty-day cooldown per type in the current bot/user state. Creation is durable and
     /// free of order, wallet debit or partner-profit effects; no cross-bot quota is introduced.
@@ -3570,8 +3571,8 @@ public class XuiV3BotFlowService
             return false;
 
         var text = message.Text.Trim();
-        var isTrialStart = text.Contains("اکانت رایگان", StringComparison.OrdinalIgnoreCase) ||
-                           text.Equals("🌟اکانت رایگان", StringComparison.OrdinalIgnoreCase);
+        var isTrialStart = text.Contains("اکانت تست", StringComparison.OrdinalIgnoreCase) ||
+                           text.Contains("اکانت رایگان", StringComparison.OrdinalIgnoreCase);
 
         if (user?.Flow != TrialFlowName && !isTrialStart)
             return false;
@@ -3597,7 +3598,7 @@ public class XuiV3BotFlowService
         {
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "اکانت تست رایگان نسخه ۳ فقط برای کاربران عادی فعال است.",
+                text: "اکانت تست نسخه ۳ فقط برای کاربران عادی فعال است.",
                 replyMarkup: mainReplyMarkup,
                 cancellationToken: cancellationToken);
             return true;

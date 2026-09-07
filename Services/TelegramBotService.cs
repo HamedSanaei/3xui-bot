@@ -5647,6 +5647,7 @@ public class TelegramBotService
     /// this method still enforces mandatory-channel membership before displaying the owned main menu. Start referral
     /// payloads are registered after the reset and retain their existing immutable relationship rules. Legacy
     /// insufficient-wallet branches show an inline shortcut into the canonical main-keyboard charge flow.
+    /// Trial entry displays «اکانت تست» while accepting the previous free-account button as an input alias.
     /// </remarks>
     /// <example>
     /// <code>
@@ -5982,7 +5983,7 @@ public class TelegramBotService
             return;
         }
 
-        else if (message.Text == "🌟اکانت رایگان")
+        else if (message.Text is "🌟اکانت تست" or "🌟اکانت رایگان")
         {
             var confirmationKeyboard = new ReplyKeyboardMarkup(new[]
                            {
@@ -6031,7 +6032,7 @@ public class TelegramBotService
                 {
                     string text =
                         "برای تأیید خودکار، فقط شماره موبایل ایران پذیرفته می‌شود و شماره ارسالی باید متعلق به همین حساب تلگرام باشد.\n\n" +
-                        "لطفاً شماره خود را با دکمه زیر ارسال کنید و سپس دوباره روی دریافت اکانت رایگان بزنید. " +
+                        "لطفاً شماره خود را با دکمه زیر ارسال کنید و سپس دوباره روی دریافت اکانت تست بزنید. " +
                         "برای انصراف می‌توانید /start را ارسال کنید.";
                     await botClient.CustomSendTextMessageAsync(
                                 chatId: message.Chat.Id,
@@ -6042,7 +6043,7 @@ public class TelegramBotService
                 else if ((DateTime.Now - user.LastFreeAcc).Days <= 30)
                 {
                     var remainingDays = (TimeSpan.FromDays(31) - (DateTime.Now - user.LastFreeAcc)).Days.ToString();
-                    string text = $"شما در یک ماه گذشته اکانت رایگان خود را دریافت کرده اید. لطفاً {remainingDays} روز دیگر تلاش کنید. ";
+                    string text = $"شما در یک ماه گذشته اکانت تست خود را دریافت کرده اید. لطفاً {remainingDays} روز دیگر تلاش کنید. ";
                     await botClient.CustomSendTextMessageAsync(
                                 chatId: message.Chat.Id,
                                 text: text,
@@ -8428,7 +8429,7 @@ public class TelegramBotService
     }
 
     /// <summary>
-    /// Builds the owned-bot HTML help text describing available features and public Telegram commands.
+    /// Builds the owned-bot HTML help text describing available features, the account-test title and public Telegram commands.
     /// </summary>
     /// <param name="credUser">
     /// Shared credentials profile of the owned-bot user requesting help. A null or non-colleague profile receives the
@@ -8478,7 +8479,7 @@ public class TelegramBotService
         builder.AppendLine("💰 <b>شارژ حساب</b>");
         builder.AppendLine("شارژ کیف پول از درگاه ریالی HooshPay یا پرداخت ارز دیجیتال، با ثبت و بررسی وضعیت پرداخت.");
         builder.AppendLine();
-        builder.AppendLine("🌟 <b>اکانت تست رایگان</b>");
+        builder.AppendLine("🌟 <b>اکانت تست</b>");
         builder.AppendLine("دریافت تست دوره‌ای برای بررسی کیفیت سرویس‌ها، در صورت داشتن شرایط.");
 
         if (credUser?.IsColleague == true)
@@ -9561,7 +9562,7 @@ public class TelegramBotService
         return value;
     }
     /// <summary>
-    /// Builds the Persian owned-bot main reply keyboard including global referral access.
+    /// Builds the Persian owned-bot main reply keyboard including global referral access and the account-test label.
     /// </summary>
     /// <returns>A resized reply keyboard whose final row is the single full-width main-menu button.</returns>
     /// <remarks>
@@ -9576,7 +9577,7 @@ public class TelegramBotService
                     new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
                     new KeyboardButton[] { "📋 تعرفه‌ها", "📒 تراکنش‌های من" },
                     new KeyboardButton[] { "⚙️ مدیریت اکانت" },
-                    new KeyboardButton[] { "🌟اکانت رایگان", "💡راهنما نصب" },
+                    new KeyboardButton[] { "🌟اکانت تست", "💡راهنما نصب" },
                     new KeyboardButton[] { "🎁 دعوت از دوستان", "💻 ارتباط با ادمین" },
                     new KeyboardButton[] { "🏠منو" }})
         {
@@ -9587,7 +9588,7 @@ public class TelegramBotService
         // var buttons = new[]
         // {
         // new[] { "💳خرید اکانت جدید", "🏠منو","💻 ارتباط با ادمین" },
-        // new[] { "💡راهنما نصب", "🌟اکانت رایگان", "⚙️مدیریت اکانت ها" }
+        // new[] { "💡راهنما نصب", "🌟اکانت تست", "⚙️مدیریت اکانت ها" }
         // };
 
         // var keyboardButtons = buttons

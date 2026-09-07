@@ -1,5 +1,39 @@
 # Multiple storefronts with shared owner accounts
 
+## Owner suspension and automatic debt repayment
+
+All messages and callbacks are gated by the fresh shared owner profile. A blocked owner takes priority and produces
+`ربات به علت تخلف مسدود است. به پشتیبانی پیام دهید.` without a support id/link. Receivers stay alive to answer;
+manual store Enabled remains unchanged and therefore still applies after the owner is unblocked.
+
+For an unblocked owner, positive local wallet balance allows access. Otherwise a readable usable website wallet of
+at least 1,000,000 toman is required (exactly 1,000,000 qualifies). No connection or a failed read means local wallet
+balance alone decides. Restricted customers receive `ربات به علت بدهی غیرفعال است. به پشتیبانی پیام دهید.`
+Owned payment/charge flows and already-paid webhook/recovery work are not gated.
+
+On customer interaction, negative local balance triggers repayment of min(local debt, usable website funds), including
+partial repayment. The immutable owner-wide transfer is reserved before website I/O. Website admission rechecks funds
+and local debt; no SQLite transaction spans the network. Successful website receipts authorize a separate idempotent
+local credit, not a purchase or profit. The ledger reason is `owner_debt_settlement`.
+
+One pending transfer per owner prevents sibling stores from starting another. Missing/sending website receipts never
+authorize credit or an automatic retry. Review such transfers against website evidence; never mark applied based on
+current balances alone. Confirmed receipts resume local credit through the existing periodic wallet recovery worker,
+including after restart. A deposit arriving during remote I/O may make the resulting local wallet positive; confirmed
+transferred funds are still credited exactly once. This is not a distributed transaction with the website.
+
+Before deployment, stop the single polling process, take a coordinated backup of credentials.db and users.db using
+the procedure below, and apply migrations before receivers start. `20260907120000_TenantDebtTransfers` creates empty
+storage and does not replay historical debt. Its downgrade refuses to erase any transfer history. Monitor pending
+transfers, credit recovery warnings, and website contention. No automatic deployment is part of this change.
+
+Owned and tenant menus now display `🌟اکانت تست`; old free-account buttons remain input aliases only. Trial eligibility,
+volumes, duration and bot/user cooldown remain unchanged. This increment is reviewed statically and with one Release
+build only: no tests added/run, no executable migration validation, no publish, commit, push or deployment.
+This increment's `dotnet build Adminbot.csproj -c Release --no-restore -v q` passed: zero warnings and errors.
+Static diff/UTF-8 checks passed with no corruption markers. These checks do not establish runtime financial or
+migration behavior; the earlier test/publish results below predate the owner-access/debt-transfer change.
+
 `TenantMaxStoresPerOwner` is positive and defaults to 5. Every allocated row counts, even when disabled or reset.
 Lowering the limit never disables an existing store. Reuse a disabled store instead of deleting its history.
 The owner menu lists stores; every panel/prompt identifies its selected store. Gateway enable flags, support,
@@ -59,7 +93,7 @@ never restore only one database or replay historical financial effects to force 
 ## Verification coverage
 
 Tenant purchase and renewal audit messages display a fixed readable label from `PaymentProvider`, separately
-from owner settlement funding. Unknown provider values are never echoed. Storefronts expose `🌟اکانت رایگان`
+from owner settlement funding. Unknown provider values are never echoed. Storefronts expose `🌟اکانت تست`
 through the shared owned v3 trial handler: non-colleagues, verified sender-owned Iranian mobile, national 100 MiB
 or normal 1 GiB, three days, thirty days per trial type and bot/user. `TelegramPhoneVerification` is shared;
 rejection support and menus belong to the receiving store. Trials retain recipient, store and owner metadata

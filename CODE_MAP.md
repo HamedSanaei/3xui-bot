@@ -1,7 +1,16 @@
 # CODE_MAP.md
 
+- Owner access/debt: `TenantAccessService` gates every tenant message/callback before business actions, without stopping
+  receivers or changing manual Enabled. Owner IsBlocked takes priority; otherwise local balance >0 or readable usable
+  website balance >=1,000,000 toman allows access. Website unavailability uses local balance alone.
+  Negative local wallets trigger owner-wide partial/full website repayment through `TenantDebtTransfer` and existing
+  website debit receipts; only confirmed debit authorizes unique local credit. One pending transfer per owner, no
+  uncertain replay. `WalletOperationReconciliationService` recovers local credits after restart without remote calls.
+  Migration `20260907120000_TenantDebtTransfers` creates empty audit storage; never downgrade with transfers present.
+  Menus display `🌟اکانت تست`; the former label remains input-only for old keyboards. Trial policy is unchanged.
+
 - Tenant gateway/trial completion: `TenantBotService` logs readable customer gateways separately from owner funding
-  and routes `🌟اکانت رایگان` to `XuiV3BotFlowService.TryHandleFreeTrialAsync`. The shared v3 policy remains
+  and routes `🌟اکانت تست` to `XuiV3BotFlowService.TryHandleFreeTrialAsync`. The shared v3 policy remains
   non-colleagues/verified phone, 100 MiB national or 1 GiB normal, three days, thirty days per type and bot/user.
   `TelegramPhoneVerification` shares owned/tenant Contact validation with each bot's own support/menu.
   `XuiV3PurchaseService` retains store, owner and recipient in trial metadata; no wallet/order/profit effects.

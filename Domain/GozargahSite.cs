@@ -993,22 +993,31 @@ namespace Adminbot.Domain
         /// <remarks>
         /// This method intentionally validates the wallet again before calling <c>deduct_wallet</c> because the
         /// website endpoint can make balances negative. A successful debit mutates only the Gozargah website wallet;
-        /// it must not create a bot-wallet debit or change <c>credentials.db</c>, otherwise users see a double charge.
+        /// this method never changes <c>credentials.db</c>. Debt repayment callers separately credit the bot wallet
+        /// only after the persisted website receipt proves this transfer, using an idempotent linked credit key.
         /// Admission is keyed by owner across every bot. A users.db receipt pins the business event before POST;
         /// ambiguous results throw and must never trigger another debit or bot-wallet compensation.
         /// </remarks>
         /// <exception cref="SiteWalletDebitUncertainException">The persisted debit requires operator reconciliation.</exception>
+        /// <param name="authorizeDebit">Optional fresh business authorization inside website owner admission, before the sending marker. False makes no remote attempt.</param>
         public async Task<GozargahSiteWalletDebitResult> DeductSiteWalletAfterPanelSuccessAsync(
             long telegramUserId,
             long amountToman,
             string referenceType,
             string referenceId,
             string description,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            Func<CancellationToken, Task<bool>> authorizeDebit = null)
         {
             return await new SiteWalletDebitStore(_userDbContextFactory).ExecuteAsync(
                 $"site:{telegramUserId}:{referenceType}:{referenceId}", telegramUserId, amountToman,
-                ct => CheckSiteWalletEligibilityAsync(telegramUserId, amountToman, ct), async ct =>
+                async ct =>
+                {
+                    var eligibility = await CheckSiteWalletEligibilityAsync(telegramUserId, amountToman, ct);
+                    if (eligibility.CanUse && authorizeDebit != null && !await authorizeDebit(ct))
+                        return GozargahSiteWalletEligibility.Unavailable("Business authorization changed before debit.");
+                    return eligibility;
+                }, async ct =>
             {
                 var response = await _apiClient.DeductWalletAsync(telegramUserId, amountToman, ct);
                 if (!response.Success || response.Data == null)

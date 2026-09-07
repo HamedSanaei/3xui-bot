@@ -665,6 +665,8 @@ public class TenantBotService
     /// <param name="CancellationToken">Cancellation Token.</param>
     /// <returns>true when current Bot is A tenant Bot and update has been handled; otherwise false.</returns>
     /// <remarks>
+    /// Fresh shared-owner suspension and funding are checked before all message/callback actions. Receivers remain
+    /// active to report restrictions; existing paid webhook fulfillment does not enter this customer access gate.
     /// Account renewal callbacks are intercepted before the shared XUI dispatcher so tenant customers always create a
     /// tenant-priced order and never enter the owned-wallet flow. State cleanup and UUID target lock remain scoped to the
     /// current tenant bot plus Telegram user; no other bot's state is read or changed.
@@ -687,6 +689,25 @@ public class TenantBotService
             return false;
 
         // tenant bots expose A SMALL storefront only; they should not FALL through to the Main Bot Menu.
+        if (update.Message != null || update.CallbackQuery != null)
+        {
+            var storefront = await GetCurrentTenantBotAsync(CancellationToken);
+            var restriction = storefront?.OwnerTelegramUserId is long ownerId
+                ? await _serviceProvider.GetRequiredService<TenantAccessService>().EvaluateAsync(ownerId, CancellationToken)
+                : "فروشگاه در حال حاضر غیرفعال است.";
+            if (restriction == null && storefront?.Enabled != true)
+                restriction = "فروشگاه در حال حاضر غیرفعال است.";
+            if (restriction != null)
+            {
+                if (update.CallbackQuery is { } blockedCallback)
+                    await SafeAnswerCallbackQueryAsync(botClient, blockedCallback.Id, restriction,
+                        showAlert: true, cancellationToken: CancellationToken);
+                else
+                    await botClient.SendTextMessageAsync(update.Message.Chat.Id, restriction,
+                        replyMarkup: new ReplyKeyboardRemove(), cancellationToken: CancellationToken);
+                return true;
+            }
+        }
         if (update.CallbackQuery is { } CallbackQuery)
         {
             var tenant = await GetCurrentTenantBotAsync(CancellationToken);
@@ -2196,6 +2217,7 @@ public class TenantBotService
     /// The callback is acknowledged before channel validation or Telegram startup. This prevents callback expiry
     /// during network delays. Enabling is persisted only when <see cref="MultiBotHostedService.StartBotAsync" />
     /// registers a receiver; duplicate enable callbacks never invert the state or create a second receiver.
+    /// A fresh blocked owner cannot enable a store. Runtime access independently checks owner suspension on every update.
     /// </remarks>
     private async Task SETTENANTBOTENABLEDASYNC(
         ITelegramBotClient botClient,
@@ -2207,6 +2229,12 @@ public class TenantBotService
         CancellationToken CancellationToken)
     {
         var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, CancellationToken);
+        if (desiredEnabled && (await _credentialsDbContext.GetUserStatusWithId(owner.TelegramUserId))?.IsBlocked == true)
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, TenantAccessService.BlockedMessage,
+                showAlert: true, cancellationToken: CancellationToken);
+            return;
+        }
         if (tenant == null || string.IsNullOrWhiteSpace(tenant.Token) || string.IsNullOrWhiteSpace(tenant.Username))
         {
             await SafeAnswerCallbackQueryAsync(botClient, 
@@ -5780,7 +5808,7 @@ public class TenantBotService
     /// <summary>
     /// Builds the SMALL Reply keyboard shown to tenant customers.
     /// </summary>
-    /// <returns>Storefront menu including the shared owned-policy trial entry.</returns>
+    /// <returns>Storefront menu displaying «اکانت تست» for the shared owned-policy trial entry.</returns>
     /// <remarks>All actions execute under the current store; trial history remains bot/user scoped.</remarks>
     private static ReplyKeyboardMarkup BuildTenantReplyKeyboard()
     {
@@ -5789,7 +5817,7 @@ public class TenantBotService
             new KeyboardButton[] { "💳 خرید اکانت", "📋 تعرفه‌ها" },
             new KeyboardButton[] { "اکانت‌های من", "🔄 تمدید اکانت" },
             new KeyboardButton[] { "جستجوی اکانت", "راهنما نصب" },
-            new KeyboardButton[] { "🌟اکانت رایگان", "💬 پشتیبانی" }
+            new KeyboardButton[] { "🌟اکانت تست", "💬 پشتیبانی" }
         })
         {
             ResizeKeyboard = true

@@ -156,6 +156,7 @@ public class Program
         services.AddScoped<SalesAssistantService>();
         services.AddScoped<TenantBotService>();
         services.AddSingleton<TenantStoreStore>();
+        services.AddScoped<TenantAccessService>();
         services.AddScoped<TenantProvisioningAttemptCoordinator>();
         services.AddSingleton<XuiV3LinkChangeOperationStore>();
         services.AddScoped<XuiV3BotFlowService>();

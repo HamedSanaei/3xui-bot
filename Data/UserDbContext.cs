@@ -122,7 +122,8 @@ public class UserDbContext : DbContext
     /// Configures SQLite when the context was created without externally supplied options.
     /// </summary>
     /// <param name="optionsBuilder">EF Core options builder for this context instance.</param>
-    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.
+    /// Debt transfer intent is owner-global, retained for audit, and has a filtered unique index allowing only one pending transfer per owner.</remarks>
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
         if (!optionsBuilder.IsConfigured)
@@ -307,6 +308,9 @@ public class UserDbContext : DbContext
         });
 
         modelBuilder.Entity<SiteWalletDebitOperation>().HasKey(x => x.Id);
+        modelBuilder.Entity<TenantDebtTransfer>().HasKey(x => x.Id);
+        modelBuilder.Entity<TenantDebtTransfer>().HasIndex(x => x.OwnerTelegramUserId)
+            .IsUnique().HasFilter("\"Status\" = 'pending'");
         modelBuilder.Entity<SiteWalletDebitOperation>().HasIndex(x => new { x.OwnerTelegramUserId, x.Status });
         modelBuilder.Entity<TenantWalletRoute>().HasKey(x => x.Id);
         modelBuilder.Entity<TenantWalletRoute>().Property(x => x.Id).ValueGeneratedNever();

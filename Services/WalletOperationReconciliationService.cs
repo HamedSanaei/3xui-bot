@@ -41,10 +41,23 @@ public sealed class WalletOperationReconciliationService : BackgroundService
     /// <summary>Repairs one batch of wallet events whose normal caller had time to finish its second commit.</summary>
     /// <param name="token">Cancellation of database-only recovery.</param>
     /// <returns>Number of receipts whose ledger and supported settlement metadata were reconciled.</returns>
-    /// <remarks>Receipts younger than one minute remain with their active caller. No history is inferred from current balances.</remarks>
+    /// <remarks>Receipts younger than one minute remain with their active caller. No history is inferred from current balances.
+    /// Confirmed website debt transfers first repair their idempotent local credit; no website mutation is retried.</remarks>
     /// <example><code>var repaired = await reconciliation.ReconcileAsync(token);</code></example>
     public async Task<int> ReconcileAsync(CancellationToken token = default)
     {
+        List<TenantDebtTransfer> transfers;
+        await using (var db = _users.CreateDbContext())
+            transfers = await db.Set<TenantDebtTransfer>().AsNoTracking()
+                .Where(x => x.Status == "pending" && db.Set<SiteWalletDebitOperation>().Any(r =>
+                    r.Id == "site:" + x.OwnerTelegramUserId + ":tenant-debt:" + x.Id && r.Status == "applied"))
+                .OrderBy(x => x.CreatedAtUtc).Take(100).ToListAsync(token);
+        foreach (var transfer in transfers)
+        {
+            try { await TenantAccessService.RecoverAsync(_users, new CredentialsStore(_credentials), transfer, token); }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+            catch (Exception ex) { _logger.LogError("Debt transfer credit remains pending. ErrorType={ErrorType}", ex.GetType().Name); }
+        }
         List<WalletOperation> receipts;
         await using (var db = _credentials.CreateDbContext())
         {
@@ -82,8 +95,9 @@ public sealed class WalletOperationReconciliationService : BackgroundService
     /// <summary>Maps the business event key to the existing ledger reason vocabulary.</summary>
     /// <param name="key">Stable non-secret wallet event identity.</param>
     /// <returns>The audit reason; unknown future events use an explicit recovery label.</returns>
-    /// <remarks>Recovery reads committed wallet receipts, writes users.db idempotently, then marks credentials.db reconciled. These are separate local commits with no network calls.</remarks>
-    private static string ResolveReason(string key) => key.StartsWith("payment:", StringComparison.Ordinal) ? WalletLedgerReasons.WalletCharge
+    /// <remarks>Debt repayment is an owner wallet transfer, never purchase profit. Ledger recovery uses committed receipts only.</remarks>
+    private static string ResolveReason(string key) => key.StartsWith("tenant-debt:", StringComparison.Ordinal) ? "owner_debt_settlement"
+        : key.StartsWith("payment:", StringComparison.Ordinal) ? WalletLedgerReasons.WalletCharge
         : key.StartsWith("renew:", StringComparison.Ordinal) || key.StartsWith("legacy-renew:", StringComparison.Ordinal) ? WalletLedgerReasons.AccountRenew
         : key.StartsWith("purchase:", StringComparison.Ordinal) || key.StartsWith("legacy-purchase:", StringComparison.Ordinal) ? WalletLedgerReasons.AccountPurchase
         : key.StartsWith("admin:", StringComparison.Ordinal) ? WalletLedgerReasons.AdminAdjustment : "wallet_recovery";
