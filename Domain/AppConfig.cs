@@ -6,6 +6,8 @@ using Newtonsoft.Json;
 
 namespace Adminbot.Domain
 {
+    /// <summary>Global application settings shared by owned bots, storefronts and background services.</summary>
+    /// <remarks>Tenant settings live on BotInstance; global gateway credentials and storefront allocation limits are not copied between stores.</remarks>
     public class AppConfig
     {
         public AppConfig()
@@ -14,6 +16,9 @@ namespace Adminbot.Domain
         }
         public List<long> AdminsUserIds { get; set; }
         public List<BotInstanceConfig> Bots { get; set; } = new();
+        /// <summary>Maximum storefront rows per colleague, including disabled and reset stores. Must be positive.</summary>
+        /// <remarks>Lowering this limit prevents new allocation but never disables or deletes existing stores.</remarks>
+        public int TenantMaxStoresPerOwner { get; set; } = 5;
         public BotInstanceConfig SalesAssistantBot { get; set; } = new();
         public string BotToken { get; set; }
         public string IpnSecretKey { get; set; }

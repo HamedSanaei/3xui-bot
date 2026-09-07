@@ -20,8 +20,14 @@ using Telegram.Bot.Types.ReplyMarkups;
 /// 1) owner-side setup from the Main brand Bot, and
 /// 2) customer-side storefront purchase, payment, fulfillment, and ledger accounting inside tenant bots.
 /// </summary>
+/// <remarks>One execution scope owns one explicitly selected management store. Settings and customer state are per store;
+/// all sibling stores retain the same owner's global wallet and website account. Never reuse this scoped service concurrently.</remarks>
 public class TenantBotService
 {
+    /// <summary>Explicit owner-authorized selection for this execution scope, never inferred from the first owned store.</summary>
+    private BotInstance _selectedOwnerStore;
+    /// <summary>Coordinates funding-source selection and settlement across all storefronts of one owner; never held during provisioning.</summary>
+    private static readonly AsyncKeyedGate OwnerSettlementGate = new();
     /// <summary>
     /// Serializes tenant fulfillment across provider callbacks, customer checks, and manual admin retries.
     /// </summary>
@@ -244,7 +250,8 @@ public class TenantBotService
     /// <param name="CancellationToken">Cancellation Token for async Telegram/database calls.</param>
     /// <returns>true when this Message was handled by tenant setup; false when caller should continue normal routing.</returns>
     /// <remarks>
-    /// Owner setup state is scoped to the current owned bot through <see cref="UserDbContext"/>.
+    /// Owner setup state is scoped to the current owned bot and user. OwnerStoreId persists the exact target across restart;
+    /// ownership is rechecked before input is consumed. Opening the store list or selecting another store cancels pending input.
     /// The text button <c>بازگشت به پنل</c> is treated as a cancellation for any pending owner setting input,
     /// clears the temporary state, and returns the colleague to the tenant storefront panel without changing
     /// token, support, payment, card, or tutorial settings.
@@ -259,8 +266,9 @@ public class TenantBotService
     {
         if (Message?.From == null || string.IsNullOrWhiteSpace(Message.Text))
             return false;
+        if (CredUser != null && Message.From.Id != CredUser.TelegramUserId) return true;
 
-        // owner-side Flow Runs inside the Main brand Bot and Configures one tenant storefront.
+        // The current owned-bot/user conversation selects a store explicitly; wallets remain keyed by owner.
         if (Message.Text == OwnerMenuButton)
         {
             if (CredUser?.IsColleague != true)
@@ -274,7 +282,7 @@ public class TenantBotService
             }
 
             await _state.ClearUserStatus(new User { Id = Message.From.Id });
-            await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, CredUser, null, CancellationToken);
+            await ShowOwnerStoreListAsync(botClient, Message.Chat.Id, CredUser, CancellationToken);
             return true;
         }
 
@@ -292,6 +300,15 @@ public class TenantBotService
             return true;
         }
 
+        _selectedOwnerStore = await _workflow.ReadAsync(db => db.BotInstances.FirstOrDefaultAsync(
+            x => x.Id == User.OwnerStoreId && x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId == CredUser.TelegramUserId, CancellationToken));
+        if (_selectedOwnerStore == null)
+        {
+            await _state.ClearUserStatus(new User { Id = Message.From.Id });
+            await ShowOwnerStoreListAsync(botClient, Message.Chat.Id, CredUser, CancellationToken);
+            return true;
+        }
+        botClient = new TenantOwnerPanelClient(botClient, () => _selectedOwnerStore, Message.Chat.Id);
         var step = User.LastStep ?? string.Empty;
         if (string.Equals(Message.Text.Trim(), "بازگشت به پنل", StringComparison.Ordinal))
         {
@@ -377,6 +394,9 @@ public class TenantBotService
     /// <param name="User">current Bot-scoped conversation state.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
     /// <returns>true when the callback belongs to tenant owner management; otherwise false.</returns>
+    /// <remarks>Every store action requires its stable number, fresh revision and expiry, then an owner-scoped database lookup.
+    /// Legacy unaddressed buttons only display a new list. The response decorator labels the selected store and addresses every owner keyboard.
+    /// Selection clears pending input; the add button allocates a disabled independent row in a short transaction.</remarks>
     public async Task<bool> TryHandleOwnerCallbackAsync(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -397,9 +417,45 @@ public class TenantBotService
             return true;
         }
 
-        var action = CallbackQuery.Data[OWNERCALLBACKPREFIX.Length..];
         var ChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
         var MessageId = CallbackQuery.Message?.MessageId;
+
+        if (CallbackQuery.From.Id != CredUser.TelegramUserId) return true;
+        var stores = _serviceProvider.GetRequiredService<TenantStoreStore>();
+        var addParts = CallbackQuery.Data.Split(':');
+        if (addParts.Length == 4 && addParts[0] == "TBM" && addParts[1] == "add"
+            && long.TryParse(addParts[2], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var addIssued)
+            && addIssued >= DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 600 && addIssued <= DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 60
+            && Guid.TryParseExact(addParts[3], "N", out _))
+        {
+            var created = await stores.CreateAsync(CredUser.TelegramUserId, addParts[3], CancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id,
+                created == null ? "سقف تعداد فروشگاه‌ها تکمیل است؛ فروشگاه قبلی را دوباره تنظیم کنید." : "فروشگاه جدید ساخته شد.", cancellationToken: CancellationToken);
+            await _state.ClearUserStatus(new User { Id = CredUser.TelegramUserId });
+            await ShowOwnerStoreListAsync(botClient, ChatId, CredUser, CancellationToken);
+            return true;
+        }
+        if (!TenantOwnerCallback.TryDecode(CallbackQuery.Data, out var storeNumber, out var storeRevision, out var action))
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "فروشگاه را از فهرست تازه انتخاب کنید.", cancellationToken: CancellationToken);
+            await _state.ClearUserStatus(new User { Id = CredUser.TelegramUserId });
+            await ShowOwnerStoreListAsync(botClient, ChatId, CredUser, CancellationToken);
+            return true;
+        }
+        _selectedOwnerStore = await _workflow.ReadAsync(db => db.BotInstances.FirstOrDefaultAsync(
+            x => x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId == CredUser.TelegramUserId && x.TenantStoreNumber == storeNumber, CancellationToken));
+        if (_selectedOwnerStore == null || (_selectedOwnerStore.UpdatedAtUtc ?? _selectedOwnerStore.CreatedAtUtc).Ticks != storeRevision
+            || (action != "panel" && User?.OwnerStoreId != _selectedOwnerStore.Id))
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "این پنل قدیمی است؛ فروشگاه را دوباره انتخاب کنید.", cancellationToken: CancellationToken);
+            await _state.ClearUserStatus(new User { Id = CredUser.TelegramUserId });
+            await ShowOwnerStoreListAsync(botClient, ChatId, CredUser, CancellationToken);
+            return true;
+        }
+        if (action == "panel" || User?.OwnerStoreId != _selectedOwnerStore.Id)
+            await _state.ClearUserStatus(new User { Id = CredUser.TelegramUserId });
+        await _state.SaveUserStatus(new User { Id = CredUser.TelegramUserId, OwnerStoreId = _selectedOwnerStore.Id });
+        botClient = new TenantOwnerPanelClient(botClient, () => _selectedOwnerStore, ChatId);
 
         if (action == "panel")
         {
@@ -1034,8 +1090,9 @@ public class TenantBotService
         CancellationToken CancellationToken,
         Message CurrentMessage = null)
     {
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, CancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, CancellationToken);
         var tokenNotice = await VALIDATETENANTTOKENFORPANELASYNC(tenant, CancellationToken);
+        await _state.SaveUserStatus(new User { Id = owner.TelegramUserId, OwnerStoreId = tenant.Id });
         var Text = BUILDOWNERPANELTEXT(tenant, owner, tokenNotice);
         var keyboard = BUILDOWNERPANELKEYBOARD(tenant);
 
@@ -1090,6 +1147,7 @@ public class TenantBotService
         var WELCOME = string.IsNullOrWhiteSpace(tenant?.TenantWelcomeText) ? "ثبت نشده" : "ثبت شده";
 
         var text = "🛒 <b>ربات فروشگاهی همکار</b>\n\n" +
+                   "کیف پول ربات و حساب گذرگاه شما بین تمام فروشگاه‌ها مشترک است. تنظیمات این پنل فقط برای همین فروشگاه است.\n\n" +
                    "با این بخش می‌توانید ربات فروشگاهی خودتان را با توکن BotFather فعال کنید. مشتری‌ها داخل همان ربات خرید می‌کنند، بعد از پرداخت موفق اکانت ساخته می‌شود و سود سفارش به موجودی شما اضافه می‌شود.\n\n";
 
         if (!string.IsNullOrWhiteSpace(tokenNotice))
@@ -1193,6 +1251,7 @@ public class TenantBotService
             {
                 InlineKeyboardButton.WithCallbackData("🔄 بروزرسانی", OWNERCALLBACKPREFIX + "panel")
             },
+            new[] { InlineKeyboardButton.WithCallbackData("🏪 فهرست فروشگاه‌ها", "TBM:list") },
             new[]
             {
                 InlineKeyboardButton.WithCallbackData("♻️ بازنشانی تنظیمات ربات", OWNERCALLBACKPREFIX + "reset")
@@ -1395,7 +1454,7 @@ public class TenantBotService
         CredUser owner,
         CancellationToken CancellationToken)
     {
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
 
         ResetTenantStorefrontSettings(tenant, clearAllStorefrontSettings: true);
@@ -1563,6 +1622,7 @@ public class TenantBotService
     {
         tenant.Enabled = false;
         tenant.Token = null;
+        tenant.TelegramBotId = null;
         tenant.Username = null;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
 
@@ -1581,6 +1641,7 @@ public class TenantBotService
         tenant.TenantHooshPayEnabled = true;
         tenant.TenantTetraminatorEnabled = true;
         tenant.TenantNowPaymentsEnabled = true;
+        tenant.TenantUniquePayEnabled = true;
         tenant.TenantTutorialsJson = JsonConvert.SerializeObject(Array.Empty<TenantTutorialLink>());
     }
 
@@ -1699,7 +1760,7 @@ public class TenantBotService
             LastStep = step
         });
 
-        var tenant = await GETTENANTBOTBYOWNERASYNC(CallbackQuery.From.Id, CancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(CallbackQuery.From.Id, CancellationToken);
         var currentSupport = string.IsNullOrWhiteSpace(tenant?.SupportAccount)
             ? "ثبت نشده"
             : NormalizeTenantSupportAccount(tenant.SupportAccount) ?? tenant.SupportAccount;
@@ -1735,14 +1796,16 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Validates A BOTFATHER Token with Telegram GetMe and stores it as the owner's tenant Bot Token.
+    /// Validates a BotFather token with getMe and saves it only on the explicitly selected owner storefront.
     /// </summary>
     /// <param name="botClient">Main brand Bot client used to Reply to the owner.</param>
     /// <param name="Message">owner Message containing the Token.</param>
     /// <param name="owner">colleague owner profile.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
     /// <returns>A task completing after token validation, tenant persistence, runtime refresh and the owner response.</returns>
-    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
+    /// <remarks>The returned numeric identity must match the token and be unique across tenant, owned and assistant bots.
+    /// Stops only the selected receiver before replacement. The unique database identity closes concurrent registration races.
+    /// Raw tokens and probe exception text are never sent to logs or replies. All financial history is preserved.</remarks>
     private async Task SAVETENANTBOTTOKENASYNC(
         ITelegramBotClient botClient,
         Message Message,
@@ -1766,11 +1829,11 @@ public class TenantBotService
             using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
             me = await TENANTCLIENT.GetMeAsync(probeCts.Token);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             await botClient.SendTextMessageAsync(
                 Message.Chat.Id,
-                $"اعتبارسنجی توکن ناموفق بود:\n<code>{Html(ex.Message)}</code>",
+                "اعتبارسنجی توکن ناموفق بود. توکن و اتصال تلگرام را بررسی کنید.",
                 parseMode: ParseMode.Html,
                 cancellationToken: CancellationToken);
             return;
@@ -1786,6 +1849,11 @@ public class TenantBotService
             return;
         }
 
+        if (TelegramBotTokenIdentity.ExtractBotId(Token) != me.Id)
+        {
+            await botClient.SendTextMessageAsync(Message.Chat.Id, "هویت ربات با توکن مطابقت ندارد.", cancellationToken: CancellationToken);
+            return;
+        }
         var duplicate = await FindTenantTokenConflictAsync(Token, Username, owner.TelegramUserId, CancellationToken);
         if (duplicate.HasConflict)
         {
@@ -1802,8 +1870,10 @@ public class TenantBotService
             return;
         }
 
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
+        await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
         tenant.Token = Token;
+        tenant.TelegramBotId = me.Id;
         tenant.Username = Username;
         tenant.BrandName = string.IsNullOrWhiteSpace(me.FirstName) ? Username : me.FirstName;
         tenant.Type = BotInstanceTypes.Tenant;
@@ -1815,7 +1885,16 @@ public class TenantBotService
         if (string.IsNullOrWhiteSpace(tenant.SupportAccount) && !string.IsNullOrWhiteSpace(owner.Username))
             tenant.SupportAccount = "@" + owner.Username.TrimStart('@');
 
-        await _workflow.SaveAsync(CancellationToken);
+        try
+        {
+            await _workflow.SaveAsync(CancellationToken);
+        }
+        catch (DbUpdateException ex) when (ex.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 })
+        {
+            // A concurrent registration in another owned bot may win after getMe. The unique numeric identity is authoritative.
+            await botClient.SendTextMessageAsync(Message.Chat.Id, "این ربات هم‌زمان در فروشگاه دیگری ثبت شده است. توکن دیگری وارد کنید.", cancellationToken: CancellationToken);
+            return;
+        }
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
         _botClientProvider.Invalidate(tenant.Id);
@@ -1839,8 +1918,8 @@ public class TenantBotService
     /// Username returned by Telegram <c>GetMe</c> for the entered token, without a required leading <c>@</c>.
     /// </param>
     /// <param name="ownerTelegramUserId">
-    /// Numeric Telegram user id of the colleague who is saving the token. That owner's existing tenant bot is
-    /// excluded so the owner can re-save or rotate their own token.
+    /// Numeric Telegram user id of the authenticated colleague. Only the selected store is excluded;
+    /// other stores belonging to this same owner must also be rejected.
     /// </param>
     /// <param name="cancellationToken">
     /// Token used to cancel the users.db query when the update handler stops.
@@ -1859,14 +1938,16 @@ public class TenantBotService
         long ownerTelegramUserId,
         CancellationToken cancellationToken)
     {
+        if (_selectedOwnerStore?.OwnerTelegramUserId != ownerTelegramUserId)
+            throw new InvalidOperationException("Token registration requires an owner-authorized store.");
         var normalizedUsername = TelegramBotTokenIdentity.NormalizeUsername(username);
         var tenants = await _workflow.ReadAsync(async db => await db.BotInstances
-            .Where(x => x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId != ownerTelegramUserId)
+            .Where(x => x.Id != _selectedOwnerStore.Id)
             .ToListAsync(cancellationToken));
 
         foreach (var tenant in tenants)
         {
-            if (TelegramBotTokenIdentity.IsSameBotToken(token, tenant.Token))
+            if (tenant.TelegramBotId == TelegramBotTokenIdentity.ExtractBotId(token) || TelegramBotTokenIdentity.IsSameBotToken(token, tenant.Token))
                 return TenantTokenConflictResult.Conflict("tenant-token");
 
             if (!string.IsNullOrWhiteSpace(normalizedUsername) &&
@@ -1879,7 +1960,9 @@ public class TenantBotService
             }
         }
 
-        foreach (var bot in _botRegistry.Bots.Where(x => !string.Equals(x.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase)))
+        foreach (var bot in _botRegistry.Bots.Where(x => x.Id != _selectedOwnerStore.Id)
+            .Concat(_appConfig.Bots ?? new List<BotInstanceConfig>())
+            .Concat(new[] { _appConfig.SalesAssistantBot, new BotInstanceConfig { Token = _appConfig.BotToken } }).Where(x => x != null))
         {
             if (TelegramBotTokenIdentity.IsSameBotToken(token, bot.Token))
                 return TenantTokenConflictResult.Conflict("owned-token");
@@ -1898,7 +1981,7 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// stores the global markup percent used for tenant storefront prices.
+    /// Stores the markup percent for the explicitly selected storefront's prices.
     /// </summary>
     /// <param name="botClient">Main brand Bot client.</param>
     /// <param name="Message">owner Message containing A numeric percent.</param>
@@ -1914,7 +1997,7 @@ public class TenantBotService
             return;
         }
 
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         tenant.TenantPriceMarkupPercent = markup;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
@@ -1957,7 +2040,7 @@ public class TenantBotService
             return;
         }
 
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         tenant.SupportAccount = support;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
@@ -1990,7 +2073,7 @@ public class TenantBotService
             return;
         }
 
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         tenant.TenantWelcomeText = WELCOME;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
@@ -2022,7 +2105,7 @@ public class TenantBotService
             return;
         }
 
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         tenant.TenantCardNumber = cardNumber;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
@@ -2054,7 +2137,7 @@ public class TenantBotService
             return;
         }
 
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         tenant.TenantCardHolderName = CARDHOLDER;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
@@ -2086,7 +2169,7 @@ public class TenantBotService
             return;
         }
 
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         tenant.TenantChannelIdsJson = JsonConvert.SerializeObject(new[] { channel });
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
@@ -2123,7 +2206,7 @@ public class TenantBotService
         string issuedAt,
         CancellationToken CancellationToken)
     {
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, CancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, CancellationToken);
         if (tenant == null || string.IsNullOrWhiteSpace(tenant.Token) || string.IsNullOrWhiteSpace(tenant.Username))
         {
             await SafeAnswerCallbackQueryAsync(botClient, 
@@ -2306,7 +2389,7 @@ public class TenantBotService
         string issuedAt,
         CancellationToken CancellationToken)
     {
-        var tenant = await GETORCREATETENANTBOTASYNC(owner, CancellationToken);
+        var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         if (!IsTenantMutationCallbackFresh(issuedAt))
         {
             await SafeAnswerCallbackQueryAsync(
@@ -2496,7 +2579,7 @@ public class TenantBotService
         int page,
         CancellationToken CancellationToken)
     {
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, CancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, CancellationToken);
         const int pageSize = 10;
         var orders = tenant == null
             ? new List<TenantBotOrder>()
@@ -2578,7 +2661,7 @@ public class TenantBotService
             ? Math.Max(0, parsedPage)
             : 0;
         var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
-            x => x.Id == orderId && x.OwnerTelegramUserId == owner.TelegramUserId,
+            x => x.Id == orderId && x.OwnerTelegramUserId == owner.TelegramUserId && x.TenantBotId == _selectedOwnerStore.Id,
             cancellationToken));
         if (order == null)
         {
@@ -2648,7 +2731,7 @@ public class TenantBotService
     {
         if (answerCallback)
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, cancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, cancellationToken);
         var tutorials = ReadTenantTutorials(tenant).ToList();
         var text = new System.Text.StringBuilder();
         text.AppendLine("🎓 <b>آموزش‌های ربات فروشگاهی</b>");
@@ -2722,7 +2805,7 @@ public class TenantBotService
         User state,
         CancellationToken cancellationToken)
     {
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, cancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, cancellationToken);
         if (tenant == null)
             return;
 
@@ -2755,6 +2838,7 @@ public class TenantBotService
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(cancellationToken);
         await _state.ClearUserStatus(state);
+        await _state.SaveUserStatus(new User { Id = owner.TelegramUserId, OwnerStoreId = tenant.Id });
         await botClient.SendTextMessageAsync(message.Chat.Id, "✅ آموزش ثبت شد.", replyMarkup: BUILDOWNERPANELKEYBOARD(tenant), cancellationToken: cancellationToken);
     }
 
@@ -2773,7 +2857,7 @@ public class TenantBotService
         string indexText,
         CancellationToken cancellationToken)
     {
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, cancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, cancellationToken);
         var tutorials = ReadTenantTutorials(tenant).ToList();
         if (!int.TryParse(indexText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index) || index < 0 || index >= tutorials.Count)
         {
@@ -2835,7 +2919,7 @@ public class TenantBotService
         CredUser owner,
         CancellationToken cancellationToken)
     {
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, cancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, cancellationToken);
         if (tenant == null)
             return;
 
@@ -2896,7 +2980,7 @@ public class TenantBotService
         string token,
         CancellationToken cancellationToken)
     {
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, cancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, cancellationToken);
         var state = await _state.GetUserStatus(owner.TelegramUserId);
         if (tenant == null || state?.ConfigLink != token || string.IsNullOrWhiteSpace(state.SubLink))
         {
@@ -2926,6 +3010,7 @@ public class TenantBotService
             senderBotId: tenant.Id);
 
         await _state.ClearUserStatus(state);
+        await _state.SaveUserStatus(new User { Id = owner.TelegramUserId, OwnerStoreId = tenant.Id });
         await _broadcastManager.RefreshStatusMessageAsync(job.Id, cancellationToken);
         await botClient.SendTextMessageAsync(
             callbackQuery.Message.Chat.Id,
@@ -3018,7 +3103,7 @@ public class TenantBotService
         CredUser owner,
         CancellationToken cancellationToken)
     {
-        var tenant = await GETTENANTBOTBYOWNERASYNC(owner.TelegramUserId, cancellationToken);
+        var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, cancellationToken);
         if (tenant == null)
         {
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "ربات فروشگاهی پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
@@ -3234,7 +3319,9 @@ public class TenantBotService
     /// <returns>A task that completes after the tenant message is consumed.</returns>
     /// <remarks>
     /// This method handles tenant-only purchase and payment messages locally, but delegates account-management
-    /// commands to <see cref="XuiV3BotFlowService" />. The outer dispatcher clears persisted conversation state and the
+    /// commands and the unchanged bot/user-scoped free-trial policy to <see cref="XuiV3BotFlowService" />.
+    /// Contacts use the owned-bot verifier and save only the shared phone profile, without financial effects.
+    /// The outer dispatcher clears persisted conversation state and the
     /// in-memory XUI selection before every valid tenant <c>/start</c>, then this method preserves the storefront-enabled
     /// and mandatory-join gates before displaying home. Payment success/cancel payloads retain their existing order
     /// behavior after that reset. Tenant bots deliberately do not accept <c>/refresh</c>.
@@ -3270,6 +3357,20 @@ public class TenantBotService
         var Text = Message.Text?.Trim() ?? string.Empty;
         var tenantReplyKeyboard = BuildTenantReplyKeyboard();
 
+        if (Message.Contact != null)
+        {
+            var phone = await TelegramPhoneVerification.ValidateAsync(botClient, Message,
+                BuildTenantSupportContactHtml(tenant.SupportAccount), tenantReplyKeyboard, CancellationToken);
+            if (phone != null)
+            {
+                await _credentialsDbContext.SavePhoneNumber(Message.From.Id, phone);
+                await botClient.SendTextMessageAsync(Message.Chat.Id,
+                    "شماره شما با موفقیت تایید شد. حالا دوباره گزینه مورد نظرتان را انتخاب کنید.",
+                    replyMarkup: tenantReplyKeyboard, cancellationToken: CancellationToken);
+            }
+            return;
+        }
+
         var hasStartCommand = TelegramNavigationCommandParser.TryParse(
                                   Text,
                                   BotContextAccessor.CurrentBotUsername,
@@ -3295,6 +3396,11 @@ public class TenantBotService
             await SendTenantHomeAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
             return;
         }
+
+        // Reuse owned trial eligibility, per-type cooldown and durable creation under the current storefront context.
+        if (await _xuiV3BotFlowService.TryHandleFreeTrialAsync(
+                botClient, Message, customer, User, tenantReplyKeyboard, CancellationToken))
+            return;
 
         if (Text == "خرید اکانت" || Text == "💳 خرید اکانت")
         {
@@ -5674,7 +5780,8 @@ public class TenantBotService
     /// <summary>
     /// Builds the SMALL Reply keyboard shown to tenant customers.
     /// </summary>
-    /// <returns>Reply keyboard with purchase, TARIFFS, and support buttons.</returns>
+    /// <returns>Storefront menu including the shared owned-policy trial entry.</returns>
+    /// <remarks>All actions execute under the current store; trial history remains bot/user scoped.</remarks>
     private static ReplyKeyboardMarkup BuildTenantReplyKeyboard()
     {
         return new ReplyKeyboardMarkup(new[]
@@ -5682,7 +5789,7 @@ public class TenantBotService
             new KeyboardButton[] { "💳 خرید اکانت", "📋 تعرفه‌ها" },
             new KeyboardButton[] { "اکانت‌های من", "🔄 تمدید اکانت" },
             new KeyboardButton[] { "جستجوی اکانت", "راهنما نصب" },
-            new KeyboardButton[] { "💬 پشتیبانی" }
+            new KeyboardButton[] { "🌟اکانت رایگان", "💬 پشتیبانی" }
         })
         {
             ResizeKeyboard = true
@@ -8611,7 +8718,7 @@ public class TenantBotService
         }
 
         var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
-            x => x.OwnerTelegramUserId == owner.TelegramUserId && x.OrderId == orderId,
+            x => x.OwnerTelegramUserId == owner.TelegramUserId && x.OrderId == orderId && x.TenantBotId == _selectedOwnerStore.Id,
             CancellationToken));
 
         if (order == null)
@@ -9613,7 +9720,11 @@ public class TenantBotService
     /// cost, otherwise debit the Gozargah website wallet only when it is connected and sufficient, otherwise allow
     /// the owner's bot wallet to go negative and warn the owner. Platform-gateway settlement never debits the site
     /// wallet; it only credits tenant profit to the bot wallet and records a live site-wallet snapshot for audit logs.
+    /// A durable per-order route pins the funding source before any debit. Remote uncertainty never authorizes
+    /// compensation; owner admission covers only settlement, outside provisioning and SQLite transactions.
     /// </remarks>
+    /// <exception cref="SiteWalletDebitUncertainException">The website debit needs reconciliation; no second wallet may be charged.</exception>
+    /// <exception cref="InvalidOperationException">The owner, amount, funding intent or required local receipt does not match the order.</exception>
     private async Task<TenantOwnerWalletSettlementResult> SETTLETENANTOWNERWALLETASYNC(
         TenantBotOrder order,
         CredUser owner,
@@ -9621,7 +9732,11 @@ public class TenantBotService
         string referenceType,
         CancellationToken cancellationToken)
     {
-        var botBefore = owner.AccountBalance;
+        if (owner?.TelegramUserId != order.OwnerTelegramUserId)
+            throw new InvalidOperationException("Tenant settlement requires the order's shared wallet owner.");
+        using var ownerAdmission = await OwnerSettlementGate.EnterAsync(order.OwnerTelegramUserId.ToString(CultureInfo.InvariantCulture), cancellationToken);
+        var botBefore = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+        owner.AccountBalance = botBefore;
         var siteBefore = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
 
         if (!debitOwnerBaseCost)
@@ -9629,8 +9744,10 @@ public class TenantBotService
             var ownerDelta = order.ProfitToman;
             if (ownerDelta > 0)
                 await _credentialsDbContext.AddFund(order.OwnerTelegramUserId, ownerDelta, $"tenant:{order.Id}:profit");
-
-            var botAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+            var profitReceipt = await _credentialsDbContext.GetWalletOperationAsync($"tenant:{order.Id}:profit", cancellationToken);
+            if (ownerDelta > 0 && profitReceipt == null) throw new InvalidOperationException("Owner profit receipt is missing.");
+            botBefore = profitReceipt?.BeforeBalance ?? botBefore;
+            var botAfter = profitReceipt?.AfterBalance ?? botBefore;
             owner.AccountBalance = botAfter;
             var siteAfter = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
 
@@ -9655,10 +9772,43 @@ public class TenantBotService
                 siteAfter);
         }
 
-        if (botBefore >= order.BaseCostToman)
+        var route = await _workflow.ReadAsync(db => db.Set<TenantWalletRoute>().AsNoTracking().SingleOrDefaultAsync(x => x.Id == order.Id, cancellationToken));
+        if (route == null)
+        {
+            // A legacy committed local receipt takes priority over today's balance, preventing source switching on restart.
+            var receipt = await _credentialsDbContext.GetWalletOperationAsync($"tenant:{order.Id}:base-cost", cancellationToken);
+            var source = receipt != null || botBefore >= order.BaseCostToman ? "bot"
+                : (await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(order.OwnerTelegramUserId, order.BaseCostToman, cancellationToken)).CanUse ? "site" : "negative";
+            route = await _workflow.WriteAsync(async db =>
+            {
+                var row = new TenantWalletRoute { Id = order.Id, OwnerTelegramUserId = order.OwnerTelegramUserId, AmountToman = order.BaseCostToman, Source = source };
+                db.Add(row);
+                await db.SaveChangesAsync(cancellationToken);
+                return row;
+            }, cancellationToken);
+        }
+        if (route.OwnerTelegramUserId != order.OwnerTelegramUserId || route.AmountToman != order.BaseCostToman)
+            throw new InvalidOperationException("Tenant settlement identity conflicts with its funding intent.");
+        var routeSource = route.Source;
+        if (routeSource == "review")
+        {
+            var existingDebit = await _credentialsDbContext.GetWalletOperationAsync($"tenant:{order.Id}:base-cost", cancellationToken);
+            if (existingDebit == null) throw new SiteWalletDebitUncertainException($"legacy-tenant:{order.Id}");
+            if (existingDebit.TelegramUserId != order.OwnerTelegramUserId || existingDebit.AmountToman != -order.BaseCostToman)
+                throw new InvalidOperationException("Historical funding receipt conflicts with the tenant order.");
+            await _workflow.WriteAsync(db => db.Set<TenantWalletRoute>().Where(x => x.Id == order.Id && x.Source == "review")
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Source, "bot"), cancellationToken), cancellationToken);
+            routeSource = "bot";
+        }
+        if (routeSource is not ("bot" or "site" or "negative")) throw new InvalidOperationException("Unknown tenant funding source.");
+
+        if (routeSource == "bot")
         {
             await _credentialsDbContext.Pay(owner, order.BaseCostToman, $"tenant:{order.Id}:base-cost");
-            var botAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+            var debitReceipt = await _credentialsDbContext.GetWalletOperationAsync($"tenant:{order.Id}:base-cost", cancellationToken)
+                ?? throw new InvalidOperationException("Owner debit receipt is missing.");
+            botBefore = debitReceipt.BeforeBalance;
+            var botAfter = debitReceipt.AfterBalance;
             owner.AccountBalance = botAfter;
             var siteAfter = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
 
@@ -9683,17 +9833,13 @@ public class TenantBotService
                 siteAfter);
         }
 
-        var siteEligibility = await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
-            order.OwnerTelegramUserId,
-            order.BaseCostToman,
-            cancellationToken);
-        if (siteEligibility.CanUse)
+        if (routeSource == "site")
         {
             var siteDebit = await _gozargahSiteSyncService.DeductSiteWalletAfterPanelSuccessAsync(
                 order.OwnerTelegramUserId,
                 order.BaseCostToman,
-                referenceType,
-                order.OrderId,
+                "tenant-base-cost",
+                order.Id.ToString(CultureInfo.InvariantCulture),
                 $"Tenant card base cost: {order.OrderId}",
                 cancellationToken);
             if (siteDebit.Success)
@@ -9723,10 +9869,16 @@ public class TenantBotService
                     siteDebitBefore,
                     siteDebitAfter);
             }
+            // Failure here means the owner eligibility check prevented the POST. Attempted/ambiguous debits throw.
+            await _workflow.WriteAsync(db => db.Set<TenantWalletRoute>().Where(x => x.Id == order.Id && x.Source == "site")
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Source, "negative"), cancellationToken), cancellationToken);
         }
 
         await _credentialsDbContext.Pay(owner, order.BaseCostToman, $"tenant:{order.Id}:base-cost");
-        var negativeBotAfter = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
+        var negativeReceipt = await _credentialsDbContext.GetWalletOperationAsync($"tenant:{order.Id}:base-cost", cancellationToken)
+            ?? throw new InvalidOperationException("Owner overdraft receipt is missing.");
+        botBefore = negativeReceipt.BeforeBalance;
+        var negativeBotAfter = negativeReceipt.AfterBalance;
         owner.AccountBalance = negativeBotAfter;
         var negativeSiteAfter = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
         var warning =
@@ -9960,6 +10112,7 @@ public class TenantBotService
     /// </param>
     /// <remarks>
     /// The method sends an HTML audit and does not itself mutate the order, wallets, ledger, payment, or XUI panel.
+    /// The persisted customer payment provider is rendered separately from the owner's settlement source.
     /// UUID locks, subscription identifiers, configuration links, provider bodies, and tokens are excluded.
     /// </remarks>
     private void LOGTENANTORDER(
@@ -9985,6 +10138,7 @@ public class TenantBotService
         var Message = "📌 فروش ربات فروشگاهی\n\n" +
                       $"نتیجه: <code>{Html(result)}</code>\n" +
                       $"منبع تایید: <code>{Html(Source)}</code>\n" +
+                      $"روش پرداخت مشتری: <code>{TenantPaymentProviderLabel(order.PaymentProvider)}</code>\n" +
                       $"ربات tenant: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n\n" +
                       BuildTenantBotPurchaseLogContext(order) +
                       "📌 مالک فروشگاه\n" +
@@ -10004,6 +10158,21 @@ public class TenantBotService
 
         _logger.LogPayment(Message);
     }
+
+    /// <summary>Maps the persisted order gateway to a safe customer-payment label for purchase and renewal logs.</summary>
+    /// <param name="provider">Nullable provider key from the tenant order, never a credential.</param>
+    /// <returns>A fixed display label; unknown values are not echoed into logs.</returns>
+    /// <remarks>This is presentation only and does not identify or change the owner's funding source.</remarks>
+    /// <example><code>var label = TenantPaymentProviderLabel(order.PaymentProvider);</code></example>
+    private static string TenantPaymentProviderLabel(string provider) => provider?.Trim().ToLowerInvariant() switch
+    {
+        "tenant_card" => "کارت‌به‌کارت شخصی فروشگاه",
+        "hooshpay" => "هوش‌پی",
+        "tetraminator" => "تترامیناتور",
+        "nowpayments" or "swapino" => "NOWPayments",
+        "uniquepay" => "یونیک‌پی",
+        _ => "نامشخص"
+    };
 
     /// <summary>
     /// Formats a Gozargah website wallet snapshot for tenant owner messages and private audit logs.
@@ -10914,56 +11083,61 @@ public class TenantBotService
         return await _workflow.ReadAsync(async db => await db.BotInstances.FirstOrDefaultAsync(x => x.Id == BotContextAccessor.CurrentBotId, CancellationToken));
     }
 
-    /// <summary>
-    /// Loads the tenant storefront owned by A colleague.
-    /// </summary>
-    /// <param name="OwnerTelegramUserId">Telegram User Id of the colleague owner.</param>
-    /// <param name="CancellationToken">Cancellation Token for the database Query.</param>
-    /// <returns>the owner's tenant Bot row, or null if the owner has not created one yet.</returns>
-    private async Task<BotInstance> GETTENANTBOTBYOWNERASYNC(long OwnerTelegramUserId, CancellationToken CancellationToken)
+    /// <summary>Displays the authenticated owner's stores and a redelivery-safe add button.</summary>
+    /// <param name="client">Current owned-bot Telegram client.</param>
+    /// <param name="chatId">Owner panel Telegram chat id.</param>
+    /// <param name="owner">Authenticated colleague profile; shared wallet identity.</param>
+    /// <param name="token">Cancellation of reads and the Telegram response.</param>
+    /// <returns>A task completing after the store list is sent.</returns>
+    /// <remarks>Does not select a default store. Disabled/reset rows remain listed and count toward the global limit.</remarks>
+    private async Task ShowOwnerStoreListAsync(ITelegramBotClient client, long chatId, CredUser owner, CancellationToken token)
     {
-        return await _workflow.ReadAsync(async db => await db.BotInstances.FirstOrDefaultAsync(
-            x => x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId == OwnerTelegramUserId,
-            CancellationToken));
+        var stores = await _serviceProvider.GetRequiredService<TenantStoreStore>().ListAsync(owner.TelegramUserId, token);
+        var rows = stores.Select(store => new[] { InlineKeyboardButton.WithCallbackData(
+            $"{store.TenantStoreNumber}. {store.BrandName ?? "فروشگاه"} · @{store.Username ?? "ثبت‌نشده"} · {(store.Enabled ? "روشن" : "خاموش")}",
+            TenantOwnerCallback.Encode(store, "panel")) }).ToList();
+        if (stores.Count < _appConfig.TenantMaxStoresPerOwner)
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("➕ افزودن فروشگاه", $"TBM:add:{DateTimeOffset.UtcNow.ToUnixTimeSeconds():X}:" + Guid.NewGuid().ToString("N")) });
+        var balance = await _credentialsDbContext.GetAccountBalance(owner.TelegramUserId);
+        await client.SendTextMessageAsync(chatId,
+            $"🏪 فروشگاه‌های شما ({stores.Count}/{_appConfig.TenantMaxStoresPerOwner})\n\nکیف پول مشترک مالک: {balance.FormatCurrency()} تومان\nتمام فروشگاه‌ها از یک حساب گذرگاه متعلق به شما استفاده می‌کنند.\nفروشگاه مورد نظر را انتخاب کنید.",
+            replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: token);
     }
 
     /// <summary>
-    /// returns the colleague's tenant Bot row, creating A Disabled DRAFT row when it does not exist.
+    /// Reloads the explicitly selected storefront and rechecks its authenticated owner.
+    /// </summary>
+    /// <param name="OwnerTelegramUserId">Telegram User Id of the colleague owner.</param>
+    /// <param name="CancellationToken">Cancellation Token for the database Query.</param>
+    /// <returns>Detached selected store, or null when no authorized selection exists. Never selects another store.</returns>
+    /// <remarks>The execution selection comes only from an addressed callback or persisted owned-bot/user input state.</remarks>
+    /// <exception cref="DbUpdateConcurrencyException">Another owned-bot execution changed this store since selection; reopen its panel.</exception>
+    private async Task<BotInstance> GetSelectedOwnerStoreAsync(long OwnerTelegramUserId, CancellationToken CancellationToken)
+    {
+        if (_selectedOwnerStore?.OwnerTelegramUserId != OwnerTelegramUserId) return null;
+        var expectedRevision = (_selectedOwnerStore.UpdatedAtUtc ?? _selectedOwnerStore.CreatedAtUtc).Ticks;
+        var selectedId = _selectedOwnerStore.Id;
+        _selectedOwnerStore = await _workflow.ReadAsync(async db => await db.BotInstances.FirstOrDefaultAsync(
+            x => x.Id == selectedId && x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId == OwnerTelegramUserId,
+            CancellationToken));
+        // A second owned bot may edit after callback validation. Never silently advance the validated baseline before a write.
+        if (_selectedOwnerStore != null && (_selectedOwnerStore.UpdatedAtUtc ?? _selectedOwnerStore.CreatedAtUtc).Ticks != expectedRevision)
+            throw new DbUpdateConcurrencyException("The selected storefront changed; reopen its panel.");
+        return _selectedOwnerStore;
+    }
+
+    /// <summary>
+    /// Requires the selected colleague storefront before a settings write; allocation occurs only through the add button.
     /// </summary>
     /// <param name="owner">Credential User record for the colleague who owns the storefront.</param>
     /// <param name="CancellationToken">Cancellation Token for the database operation.</param>
-    /// <returns>existing or newly-created tenant Bot row.</returns>
-    private async Task<BotInstance> GETORCREATETENANTBOTASYNC(CredUser owner, CancellationToken CancellationToken)
+    /// <returns>Detached owner-authorized store tracked by the workflow's optimistic write baseline.</returns>
+    /// <exception cref="InvalidOperationException">The selection is missing or no longer belongs to this owner.</exception>
+    /// <remarks>Never creates an implicit first store, copies another store's settings or creates financial accounts.</remarks>
+    private async Task<BotInstance> RequireSelectedOwnerStoreAsync(CredUser owner, CancellationToken CancellationToken)
     {
-        var Id = BUILDTENANTBOTID(owner.TelegramUserId);
-        var tenant = await _workflow.ReadAsync(async db => await db.BotInstances.FirstOrDefaultAsync(x => x.Id == Id, CancellationToken));
-        if (tenant != null)
-            return tenant;
-
-        // stable tenant Id is DERIVED from owner Id so each colleague Gets exactly one storefront Bot.
-        var current = _botContextAccessor.Current?.Config;
-        tenant = new BotInstance
-        {
-            Id = Id,
-            Type = BotInstanceTypes.Tenant,
-            Enabled = false,
-            IsDefault = false,
-            OwnerTelegramUserId = owner.TelegramUserId,
-            BrandName = owner.Username ?? owner.TelegramUserId.ToString(),
-            SupportAccount = string.IsNullOrWhiteSpace(owner.Username) ? null : "@" + owner.Username.TrimStart('@'),
-            LoggerChannel = current?.LoggerChannel,
-            BackupChannel = current?.BackupChannel,
-            ChannelIdsJson = BotInstanceConfigExtensions.SerializeStringArray(Array.Empty<string>()),
-            IosTutorialJson = BotInstanceConfigExtensions.SerializeStringArray(Array.Empty<string>()),
-            AndroidTutorialJson = BotInstanceConfigExtensions.SerializeStringArray(Array.Empty<string>()),
-            WindowsTutorialJson = BotInstanceConfigExtensions.SerializeStringArray(Array.Empty<string>()),
-            TenantTutorialsJson = JsonConvert.SerializeObject(Array.Empty<TenantTutorialLink>()),
-            CreatedAtUtc = DateTime.UtcNow
-        };
-
-        _workflow.Add(tenant);
-        await _workflow.SaveAsync(CancellationToken);
-        return tenant;
+        return await GetSelectedOwnerStoreAsync(owner.TelegramUserId, CancellationToken)
+            ?? throw new InvalidOperationException("An owner-authorized storefront selection is required.");
     }
 
     /// <summary>
@@ -12927,16 +13101,6 @@ public class TenantBotService
                 : _appConfig.XuiV3SubLinkBaseUrl.TrimEnd('/'),
             Name = "configured v3 panel"
         };
-    }
-
-    /// <summary>
-    /// Builds the stable database Id for A colleague's tenant Bot from the owner's Telegram Id.
-    /// </summary>
-    /// <param name="OwnerTelegramUserId">Telegram User Id of the colleague owner.</param>
-    /// <returns>stable tenant Bot Id used in users.db and the runtime registry.</returns>
-    private static string BUILDTENANTBOTID(long OwnerTelegramUserId)
-    {
-        return $"tenant-{OwnerTelegramUserId}";
     }
 
     /// <summary>

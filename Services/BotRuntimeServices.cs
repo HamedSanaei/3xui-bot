@@ -747,8 +747,8 @@ public class MultiBotHostedService : IHostedService
     /// Starts receiving updates for one bot if it is enabled and has a usable token.
     /// </summary>
     /// <param name="botId">
-    /// Internal runtime bot id from the registry. For tenant storefronts this is the local <c>tenant-{ownerId}</c>
-    /// value, not the numeric Telegram bot id.
+    /// Internal runtime bot id from the registry. New storefronts use <c>tenant-{ownerId}-{storeNumber}</c>; legacy stores retain <c>tenant-{ownerId}</c>.
+    /// This is a database identity, not the numeric Telegram bot id.
     /// </param>
     /// <param name="cancellationToken">Token that cancels waiting for the per-bot lifecycle gate and startup work.</param>
     /// <returns>
@@ -1386,7 +1386,7 @@ public class MultiBotHostedService : IHostedService
     /// </summary>
     /// <param name="botId">
     /// Internal runtime bot id whose receiver produced the polling error. Tenant ids use the local
-    /// <c>tenant-{ownerId}</c> format.
+    /// <c>tenant-{ownerId}</c> or <c>tenant-{ownerId}-{storeNumber}</c> format. Owner wallet identity remains separate.
     /// </param>
     /// <param name="exception">Exception raised by the Telegram polling loop.</param>
     /// <param name="cancellationToken">Receiver cancellation token.</param>
@@ -1852,6 +1852,7 @@ public class MultiBotHostedService : IHostedService
 
         tenant.Enabled = false;
         tenant.Token = null;
+        tenant.TelegramBotId = null;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await db.SaveChangesAsync(cleanupToken);
 

@@ -301,7 +301,15 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantUniquePayEnabled).HasDefaultValue(true);
             entity.HasIndex(x => x.Username);
             entity.HasIndex(x => x.OwnerTelegramUserId);
+            // Existing tenant ids stay unchanged; the owner/number pair is the stable management identity.
+            entity.HasIndex(x => new { x.OwnerTelegramUserId, x.TenantStoreNumber }).IsUnique();
+            entity.HasIndex(x => x.TelegramBotId).IsUnique();
         });
+
+        modelBuilder.Entity<SiteWalletDebitOperation>().HasKey(x => x.Id);
+        modelBuilder.Entity<SiteWalletDebitOperation>().HasIndex(x => new { x.OwnerTelegramUserId, x.Status });
+        modelBuilder.Entity<TenantWalletRoute>().HasKey(x => x.Id);
+        modelBuilder.Entity<TenantWalletRoute>().Property(x => x.Id).ValueGeneratedNever();
 
         modelBuilder.Entity<TenantBotOrder>(entity =>
         {

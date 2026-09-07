@@ -6,8 +6,14 @@ using Adminbot.Utils;
 using Newtonsoft.Json;
 
 
+/// <summary>Legacy detached workflow shape, with bot-scoped transient fields persisted through BotUserState.</summary>
+/// <remarks>OwnerStoreId selects only a management conversation target; authorization and financial ownership must be rechecked by handlers.</remarks>
 public class User
 {
+    /// <summary>Detached selected storefront id persisted only in the owned-bot/user BotUserState row.</summary>
+    /// <remarks>Null preserves a partial update; empty clears the selection. Handlers must recheck owner access.</remarks>
+    [NotMapped]
+    public string OwnerStoreId { get; set; }
     public long Id { get; set; }
     public string SelectedCountry { get; set; }
     public string SelectedPeriod { get; set; }

@@ -2,12 +2,19 @@ using Newtonsoft.Json;
 
 namespace Adminbot.Domain
 {
+    /// <summary>Persisted XUI account description with recipient, originating bot and optional tenant trial ownership.</summary>
     public class XuiV3ClientMetadata
     {
         public int Version { get; set; } = 1;
         public string Source { get; set; } = "telegram-bot";
         public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
         public long TelegramUserId { get; set; }
+        /// <summary>Internal originating storefront id for tenant trials; null for other creation paths.</summary>
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+        public string TenantBotId { get; set; }
+        /// <summary>Store owner's Telegram id for trial attribution, without any wallet charge or profit.</summary>
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+        public long? OwnerTelegramUserId { get; set; }
         public string UserRole { get; set; }
         public string ServiceKey { get; set; }
         public string ServiceName { get; set; }

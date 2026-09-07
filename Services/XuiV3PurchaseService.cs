@@ -1626,6 +1626,16 @@ public class XuiV3PurchaseService
         return service?.InboundIds?.Distinct().ToList() ?? new List<int>();
     }
 
+    /// <summary>Serializes account metadata, retaining the recipient and originating storefront for free trials.</summary>
+    /// <param name="user">Detached recipient profile; its Telegram id remains the account recipient.</param>
+    /// <param name="resolved">Validated service and duration selection.</param>
+    /// <param name="inboundIds">Selected XUI inbound ids, or null for an empty list.</param>
+    /// <param name="serverInfo">Selected panel descriptor.</param>
+    /// <param name="metadataOptions">Required creation metadata and trial flags.</param>
+    /// <param name="trafficBytes">Actual account traffic limit in bytes.</param>
+    /// <param name="priceToman">Account price in toman; zero for free trials.</param>
+    /// <returns>Sensitive JSON account description for XUI storage, not operational logging.</returns>
+    /// <remarks>Tenant trial ownership comes from the execution context. Serialization has no wallet or order effects.</remarks>
     private static string BuildClientComment(
         CredUser user,
         XuiV3ResolvedPurchase resolved,
@@ -1638,6 +1648,10 @@ public class XuiV3PurchaseService
         var metadata = new XuiV3ClientMetadata
         {
             TelegramUserId = user.TelegramUserId,
+            TenantBotId = metadataOptions.IsTrial && BotContextAccessor.CurrentBotType == BotInstanceTypes.Tenant
+                ? BotContextAccessor.CurrentBotId : null,
+            OwnerTelegramUserId = metadataOptions.IsTrial && BotContextAccessor.CurrentBotType == BotInstanceTypes.Tenant
+                ? BotContextAccessor.CurrentBotOwnerTelegramUserId : null,
             UserRole = user.IsColleague ? "colleague" : "customer",
             ServiceKey = resolved.Service.Key,
             ServiceName = resolved.Service.DisplayName,

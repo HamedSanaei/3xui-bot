@@ -4,7 +4,7 @@ using System.Text;
 /// Normalizes Iranian mobile numbers submitted through Telegram contacts without accepting foreign numbers.
 /// </summary>
 /// <remarks>
-/// This helper is used only by automatic owned-bot contact verification. The separate super-admin manual
+/// This helper is shared by automatic owned-bot and tenant contact verification. The separate super-admin manual
 /// verification flow intentionally accepts international and virtual numbers and must not call this helper.
 /// </remarks>
 public static class IranianPhoneNumberNormalizer

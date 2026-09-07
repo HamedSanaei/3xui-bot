@@ -155,6 +155,7 @@ public class Program
         services.AddScoped<OwnedBotNotificationService>();
         services.AddScoped<SalesAssistantService>();
         services.AddScoped<TenantBotService>();
+        services.AddSingleton<TenantStoreStore>();
         services.AddScoped<TenantProvisioningAttemptCoordinator>();
         services.AddSingleton<XuiV3LinkChangeOperationStore>();
         services.AddScoped<XuiV3BotFlowService>();
@@ -173,6 +174,7 @@ public class Program
 
         services.AddScoped<TelegramBotService>();
         TelegramUpdateScheduler.ValidateConfiguration(appConfig);
+        TenantStoreStore.ValidateConfiguration(appConfig);
         services.Configure<HostOptions>(options => options.ShutdownTimeout =
             TimeSpan.FromSeconds(appConfig.TelegramUpdateShutdownDrainSeconds + 30));
         services.AddSingleton<TelegramUpdateInboxStore>(sp =>
@@ -280,6 +282,7 @@ public class Program
     /// </summary>
     /// <remarks>
     /// This keeps the database representation of first-party bots aligned with <c>configuration.json</c>.
+    /// Numeric bot identity is reserved by a unique index so a configured bot cannot reuse a storefront identity before receivers start.
     /// Runtime-created tenant bots are loaded separately by <see cref="BotRegistry.LoadTenantBotsFromDatabaseAsync"/>.
     /// </remarks>
     /// <param name="userDb">Runtime database context that owns the <c>BotInstances</c> table.</param>
@@ -298,6 +301,7 @@ public class Program
 
             existing.Username = bot.Username;
             existing.Token = bot.Token;
+            existing.TelegramBotId = TelegramBotTokenIdentity.ExtractBotId(bot.Token);
             existing.BrandName = bot.BrandName;
             existing.Type = string.IsNullOrWhiteSpace(bot.Type) ? BotInstanceTypes.Owned : bot.Type;
             existing.Enabled = bot.Enabled;

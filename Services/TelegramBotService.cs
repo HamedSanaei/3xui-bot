@@ -10249,8 +10249,8 @@ public class TelegramBotService
     /// otherwise <c>null</c>. A rejection message is sent before returning <c>null</c>.
     /// </returns>
     /// <remarks>
-    /// This automatic path is owned-bot scoped because tenant updates are routed away before reaching the regular-user
-    /// handler. Foreign or virtual numbers may still be approved through the separate super-admin manual flow. When an
+    /// This owned-bot wrapper delegates to the verifier also used by tenant handlers with their own menus and support.
+    /// Foreign or virtual numbers may still be approved through the separate super-admin manual flow. When an
     /// own foreign contact is rejected, support comes strictly from the current owned bot configuration.
     /// </remarks>
     /// <example>
@@ -10265,34 +10265,8 @@ public class TelegramBotService
         Message message,
         CancellationToken cancellationToken)
     {
-        var senderId = message?.From?.Id;
-        var contact = message?.Contact;
-        if (senderId == null || contact?.UserId == null || senderId != contact.UserId)
-        {
-            await botClient.SendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: "شماره ارسالی باید متعلق به همین حساب تلگرام باشد. لطفاً دوباره از دکمه «ارسال شماره تلفن» استفاده کنید.",
-                replyMarkup: GetPhoneNumber(),
-                cancellationToken: cancellationToken);
-            return null;
-        }
-
-        if (IranianPhoneNumberNormalizer.TryNormalize(contact.PhoneNumber, out var normalizedPhoneNumber))
-            return normalizedPhoneNumber;
-
-        var support = BuildOwnedBotSupportContactHtml(CurrentSupportAccount);
-        var supportText = string.IsNullOrWhiteSpace(support)
-            ? "پشتیبانی این ربات هنوز تنظیم نشده است."
-            : $"برای بررسی دستی به پشتیبانی همین ربات پیام بدهید: {support}";
-        await botClient.SendTextMessageAsync(
-            chatId: message.Chat.Id,
-            text:
-                "شماره‌های غیرایرانی به‌صورت خودکار تأیید نمی‌شوند. فقط شماره موبایل ایران قابل تأیید خودکار است.\n\n" +
-                supportText,
-            parseMode: ParseMode.Html,
-            replyMarkup: MainReplyMarkupKeyboardFa(),
-            cancellationToken: cancellationToken);
-        return null;
+        return await TelegramPhoneVerification.ValidateAsync(botClient, message,
+            BuildOwnedBotSupportContactHtml(CurrentSupportAccount), MainReplyMarkupKeyboardFa(), cancellationToken);
     }
 
 

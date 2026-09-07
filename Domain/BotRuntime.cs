@@ -67,6 +67,14 @@ namespace Adminbot.Domain
     /// </summary>
     public class BotInstance
     {
+        /// <summary>Stable one-based storefront number within OwnerTelegramUserId; null for non-tenant bots.</summary>
+        /// <remarks>Unique with the owner. Resetting a store retains its number, id, orders and financial history.</remarks>
+        public int? TenantStoreNumber { get; set; }
+        /// <summary>Original add-button nonce; retained on reset so Telegram redelivery cannot allocate another store.</summary>
+        public string TenantCreationKey { get; set; }
+        /// <summary>Unique numeric Telegram bot identity reserved for this token; tenant registration verifies it with getMe.</summary>
+        /// <remarks>Historical/configured rows derive it from the token prefix before receivers start. It is not a credential.</remarks>
+        public long? TelegramBotId { get; set; }
         public string Id { get; set; }
         public string Username { get; set; }
         public string Token { get; set; }
@@ -381,6 +389,9 @@ namespace Adminbot.Domain
     /// </summary>
     public class BotUserState
     {
+        /// <summary>Selected storefront database id for owner input in this owned-bot/user conversation.</summary>
+        /// <remarks>Not an authorization grant: every handler rechecks the owner. Switching stores clears pending input.</remarks>
+        public string OwnerStoreId { get; set; }
         public string BotId { get; set; }
         public long TelegramUserId { get; set; }
         public string SelectedCountry { get; set; }
@@ -441,7 +452,7 @@ namespace Adminbot.Domain
         /// <returns>A new BotUserState that can be inserted into users.db.</returns>
         /// <remarks>
         /// The conversion copies an optional renewal UUID target lock and tenant service-resolution evidence into the
-        /// specified bot scope. It performs no account, wallet, order, or panel operation and callers remain responsible
+        /// specified bot scope, along with the owner-selected store id. It performs no account, wallet, order, or panel operation and callers remain responsible
         /// for persisting the returned row.
         /// </remarks>
         public static BotUserState FromUser(string botId, User user)
@@ -450,6 +461,7 @@ namespace Adminbot.Domain
             {
                 BotId = string.IsNullOrWhiteSpace(botId) ? BotContextAccessor.DefaultBotId : botId,
                 TelegramUserId = user.Id,
+                OwnerStoreId = user.OwnerStoreId,
                 SelectedCountry = user.SelectedCountry,
                 SelectedPeriod = user.SelectedPeriod,
                 Type = user.Type,
@@ -481,13 +493,15 @@ namespace Adminbot.Domain
         /// <returns>A User object with the same conversation fields and Telegram user id.</returns>
         /// <remarks>
         /// The sensitive renewal UUID target lock and tenant service-resolution evidence are copied so later preview/payment
-        /// handlers can revalidate them; the returned compatibility DTO is detached and authorizes no action by itself.
+        /// handlers can revalidate them; the owner-selected store id is also restored for input after restart.
+        /// The returned compatibility DTO is detached and authorizes no action by itself.
         /// </remarks>
         public User ToUser()
         {
             return new User
             {
                 Id = TelegramUserId,
+                OwnerStoreId = OwnerStoreId,
                 SelectedCountry = SelectedCountry,
                 SelectedPeriod = SelectedPeriod,
                 Type = Type,
@@ -520,10 +534,11 @@ namespace Adminbot.Domain
         /// Null means "preserve the stored value" for all nullable legacy fields; an explicit empty string clears a
         /// string field. This distinction preserves the renewal UUID target lock and service-resolution evidence across
         /// payment-method and plan updates but means callers that must clear either value must pass an empty string or use
-        /// a full reset. Callers must save the tracked state after this in-memory merge.
+        /// a full reset. OwnerStoreId follows the same null-preserves/empty-clears rule. Callers must save the tracked state after this in-memory merge.
         /// </remarks>
         public void ApplyPartial(User user)
         {
+            if (user.OwnerStoreId != null) OwnerStoreId = user.OwnerStoreId;
             if (user.SelectedCountry != null) SelectedCountry = user.SelectedCountry;
             if (user.SelectedPeriod != null) SelectedPeriod = user.SelectedPeriod;
             if (user.Type != null) Type = user.Type;
@@ -554,10 +569,11 @@ namespace Adminbot.Domain
         /// <remarks>
         /// Renewal UUID target lock, tenant category evidence, and payment choice are cleared with the conversation so a
         /// later flow cannot inherit authorization. Wallets, tenant orders, account metadata, and state rows belonging to
-        /// other bots are untouched.
+        /// other bots are untouched. The owner-selected store is cleared too, cancelling pending settings input.
         /// </remarks>
         public void Clear()
         {
+            OwnerStoreId = "";
             SelectedCountry = "";
             SelectedPeriod = "";
             Type = "";

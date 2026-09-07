@@ -1,5 +1,6 @@
 {
   "adminsUserIds": [],
+  "tenantMaxStoresPerOwner": 5,
   "bots": [
     {
       "id": "owned-brand-bot",

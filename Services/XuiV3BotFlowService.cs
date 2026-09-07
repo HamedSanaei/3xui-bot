@@ -2659,7 +2659,7 @@ public class XuiV3BotFlowService
     /// <param name="renewal">Renewal calculation used for reset and display values.</param>
     /// <param name="payload">Absolute replacement payload that was applied to the panel.</param>
     /// <param name="siteWalletEligibility">
-    /// Optional pre-checked site-wallet eligibility; when null the settle step re-checks it.
+    /// Optional preview eligibility retained for call-site compatibility; settlement checks the durable receipt first and reads fresh eligibility.
     /// </param>
     /// <param name="operationTiming">Active operation timer used for audits.</param>
     /// <param name="cancellationToken">Token that cancels Telegram, users.db, ledger, and panel operations.</param>
@@ -2964,7 +2964,7 @@ public class XuiV3BotFlowService
     /// <param name="resolved">Resolved purchase containing the exact price in toman.</param>
     /// <param name="useSiteWallet">Whether the Gozargah site wallet was selected.</param>
     /// <param name="siteWalletEligibility">
-    /// Optional pre-checked site-wallet eligibility; when null the settle step re-checks it.
+    /// Optional preview eligibility retained for compatibility; settlement reads its durable receipt before a fresh eligibility check.
     /// </param>
     /// <param name="clientEmail">XUI client email used as the ledger reference.</param>
     /// <param name="cancellationToken">Token that cancels the wallet, ledger, and users.db operations.</param>
@@ -2975,9 +2975,10 @@ public class XuiV3BotFlowService
     /// <remarks>
     /// The settlement claim (<c>pending -> settling</c>) is atomic, and a stale claim is parked in manual review
     /// instead of being resumed, so the wallet is never debited twice for one renewal operation. The bot-wallet
-    /// ledger row is pre-inserted in final form before the debit so a crash between the ledger write and the debit
-    /// can be reconciled by balance comparison instead of charging again.
+    /// financial receipt is keyed by the renewal operation, not the reusable account email. Website admission is shared by owner
+    /// with tenant stores. Unknown debit outcomes remain operation-level review and never authorize local-wallet compensation.
     /// </remarks>
+    /// <exception cref="SiteWalletDebitUncertainException">The website request may have succeeded; reconcile its persisted receipt before settlement.</exception>
     private async Task<OwnedRenewalSettlementResult> SettleOwnedRenewalAsync(
         XuiV3RenewalOperation renewalOperation,
         CredUser credUser,
@@ -3016,40 +3017,11 @@ public class XuiV3BotFlowService
 
         if (useSiteWallet)
         {
-            siteWalletEligibility ??= await _gozargahSiteSyncService.CheckSiteWalletEligibilityAsync(
-                credUser.TelegramUserId,
-                resolved.PriceToman,
-                cancellationToken);
-
-            GozargahSiteWalletDebitResult debitResult;
-            if (siteWalletEligibility.CanUse)
-            {
-                try
-                {
-                    debitResult = await _gozargahSiteSyncService.DeductSiteWalletAfterPanelSuccessAsync(
-                        credUser.TelegramUserId,
-                        resolved.PriceToman,
-                        "xui-v3-client",
-                        clientEmail,
-                        $"XuiV3 renewal via Gozargah site wallet: {clientEmail}",
-                        cancellationToken);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(
-                        ex,
-                        "Gozargah site wallet debit threw after XUI renewal; bot-wallet fallback will be applied. renewalOperationId={RenewalOperationId}, telegramUserId={TelegramUserId}, amountToman={AmountToman}",
-                        renewalOperation.OperationId,
-                        credUser.TelegramUserId,
-                        resolved.PriceToman);
-                    debitResult = GozargahSiteWalletDebitResult.Failed("ارتباط با کیف پول سایت هنگام کسر مبلغ قطع شد.");
-                }
-            }
-            else
-            {
-                debitResult = GozargahSiteWalletDebitResult.Failed(
-                    siteWalletEligibility.Message ?? "کیف پول سایت در دسترس نبود.");
-            }
+            // Read the durable receipt before current eligibility: restart may follow an already applied debit.
+            // An uncertain or conflicting receipt propagates to operation recovery and never permits compensation.
+            var debitResult = await _gozargahSiteSyncService.DeductSiteWalletAfterPanelSuccessAsync(
+                credUser.TelegramUserId, resolved.PriceToman, "xui-v3-client", renewalOperation.OperationId,
+                $"XuiV3 renewal via Gozargah site wallet: {clientEmail}", cancellationToken);
 
             siteWalletDebitResult = debitResult;
             if (!debitResult.Success)
@@ -3578,6 +3550,9 @@ public class XuiV3BotFlowService
     /// dispatcher can continue with purchase, renewal, search, or legacy handlers.
     /// </returns>
     /// <remarks>
+    /// Owned and tenant menus share this policy: non-colleagues with verified phones, 100 MiB national or 1 GiB normal,
+    /// three days, and a separate thirty-day cooldown per type in the current bot/user state. Creation is durable and
+    /// free of order, wallet debit or partner-profit effects; no cross-bot quota is introduced.
     /// Starting a trial from the main keyboard intentionally clears any half-built purchase session for the same
     /// Telegram user. Without that reset, a metered purchase could later reach the summary step without
     /// <c>TrafficGb</c> and throw an exception. Once creation begins, accepted and rejected panel outcomes are audited

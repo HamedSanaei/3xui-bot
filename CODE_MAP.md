@@ -1,5 +1,12 @@
 # CODE_MAP.md
 
+- Tenant gateway/trial completion: `TenantBotService` logs readable customer gateways separately from owner funding
+  and routes `🌟اکانت رایگان` to `XuiV3BotFlowService.TryHandleFreeTrialAsync`. The shared v3 policy remains
+  non-colleagues/verified phone, 100 MiB national or 1 GiB normal, three days, thirty days per type and bot/user.
+  `TelegramPhoneVerification` shares owned/tenant Contact validation with each bot's own support/menu.
+  `XuiV3PurchaseService` retains store, owner and recipient in trial metadata; no wallet/order/profit effects.
+  Incremental verification is diff/UTF-8 plus Release build only; the prior 146-test result predates these changes.
+
 ## Purpose
 
 Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supports owned bots, colleague-owned tenant storefront bots, wallet payments, payment gateways, card-to-card tenant receipts, broadcast jobs, XUI v3 account management, and optional sync with `gozargah.network`.
@@ -172,7 +179,30 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 
 ## Tenant Bot Rules
 
-- Each tenant bot is a `BotInstance` with `Type = tenant` and id `tenant-{ownerTelegramUserId}`.
+- Each tenant bot is a `BotInstance` with `Type = tenant`. `TenantStoreStore` allocates up to
+  `TenantMaxStoresPerOwner` (positive, default 5) in an immediate SQLite transaction, including disabled/reset rows.
+  Existing ids remain unchanged and get owner-local store number 1; new ids are `tenant-{ownerId}-{storeNumber}`.
+  The unique owner/number pair and add-button nonce prevent concurrent owned bots or redelivery exceeding the limit.
+  Settings are independent defaults; no wallet or website account is created during allocation.
+- Owner management starts with a store list. `TenantOwnerCallback` wraps actions with store number/revision/expiry
+  (at most 64 UTF-8 bytes), and `TenantOwnerPanelClient` labels every owner text prompt and addresses every keyboard.
+  All reads/writes recheck the authenticated owner against the exact selection. `BotUserState.OwnerStoreId` persists
+  the input target per owned bot/user; changing stores cancels pending input. Legacy callbacks show the fresh list only.
+  Orders, manual confirmations, stats and broadcast audiences use that selected tenant id. Reset retains ids/history.
+  `TelegramBotId`, verified against getMe during registration, is unique across persisted bots; configured owned and
+  assistant tokens (including disabled configurations) are also checked. Runtime token removal releases only that identity.
+- Owner finances remain shared across stores. `TenantWalletRoute` pins each order's source before debit; local receipts
+  remain in credentials.db and reconcile ledger writes after a crash. Online payments credit owner profit; card base cost
+  prefers the local wallet, then sufficient website funds, then the existing local overdraft rule. `SiteWalletDebitStore`
+  gates fresh website eligibility/debit by owner across all callers, outside SQLite transactions and XUI provisioning.
+  Its users.db `SiteWalletDebitOperation` marker commits before POST; only an authoritative receipt marks it applied.
+  Sending/ambiguous results never repeat POST or authorize another wallet debit, even after a top-up/restart.
+  Uncertain financial operations require review, never block Telegram user lanes. Owned renewal site keys now use the
+  renewal operation id, not reusable account email. No cross-database/website transaction is claimed.
+  Migration `20260907031653_MultipleOwnerStorefronts` changes no balances; duplicate historical bot identities require review.
+  Unfinished historical card orders with panel-success evidence get funding source `review`; only a matching local wallet
+  receipt resumes automatically. Unknown website funding remains operation review without blocking Telegram lanes.
+  See `docs/multiple-storefronts.md` for rollout/reconciliation and `Adminbot.Tests/MultiStoreTests.cs` for regression coverage.
 - Tenant runtime state is scoped by `BotId + TelegramUserId` in `BotUserStates`; never key tenant customer flow only by Telegram user id.
 - Tenant customers reuse shared XUI account flows where possible, but tenant payments and fulfillment go through `TenantBotOrder`.
 - Unlimited sub-plans carry catalog-only storefront policies: `OwnedColleagueOnly` restricts owned customer purchase

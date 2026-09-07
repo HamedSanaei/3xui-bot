@@ -994,7 +994,10 @@ namespace Adminbot.Domain
         /// This method intentionally validates the wallet again before calling <c>deduct_wallet</c> because the
         /// website endpoint can make balances negative. A successful debit mutates only the Gozargah website wallet;
         /// it must not create a bot-wallet debit or change <c>credentials.db</c>, otherwise users see a double charge.
+        /// Admission is keyed by owner across every bot. A users.db receipt pins the business event before POST;
+        /// ambiguous results throw and must never trigger another debit or bot-wallet compensation.
         /// </remarks>
+        /// <exception cref="SiteWalletDebitUncertainException">The persisted debit requires operator reconciliation.</exception>
         public async Task<GozargahSiteWalletDebitResult> DeductSiteWalletAfterPanelSuccessAsync(
             long telegramUserId,
             long amountToman,
@@ -1003,25 +1006,26 @@ namespace Adminbot.Domain
             string description,
             CancellationToken cancellationToken = default)
         {
-            var eligibility = await CheckSiteWalletEligibilityAsync(telegramUserId, amountToman, cancellationToken);
-            if (!eligibility.CanUse)
-                return GozargahSiteWalletDebitResult.Failed(eligibility.Message);
+            return await new SiteWalletDebitStore(_userDbContextFactory).ExecuteAsync(
+                $"site:{telegramUserId}:{referenceType}:{referenceId}", telegramUserId, amountToman,
+                ct => CheckSiteWalletEligibilityAsync(telegramUserId, amountToman, ct), async ct =>
+            {
+                var response = await _apiClient.DeductWalletAsync(telegramUserId, amountToman, ct);
+                if (!response.Success || response.Data == null)
+                    return GozargahSiteWalletDebitResult.Failed(response.Message ?? "کسر کیف پول سایت ناموفق بود.");
 
-            var response = await _apiClient.DeductWalletAsync(telegramUserId, amountToman, cancellationToken);
-            if (!response.Success || response.Data == null)
-                return GozargahSiteWalletDebitResult.Failed(response.Message ?? "کسر کیف پول سایت ناموفق بود.");
+                _logger.LogInformation(
+                    "Gozargah site wallet debit response received. telegramUserId={TelegramUserId}, amountToman={AmountToman}, before={BeforeWallet}, after={AfterWallet}, referenceType={ReferenceType}, referenceId={ReferenceId}, description={Description}",
+                    telegramUserId,
+                    amountToman,
+                    response.Data.PreviousWallet,
+                    response.Data.CurrentWallet,
+                    referenceType,
+                    referenceId,
+                    description);
 
-            _logger.LogInformation(
-                "Gozargah site wallet debited without bot-wallet debit. telegramUserId={TelegramUserId}, amountToman={AmountToman}, before={BeforeWallet}, after={AfterWallet}, referenceType={ReferenceType}, referenceId={ReferenceId}, description={Description}",
-                telegramUserId,
-                amountToman,
-                response.Data.PreviousWallet,
-                response.Data.CurrentWallet,
-                referenceType,
-                referenceId,
-                description);
-
-            return GozargahSiteWalletDebitResult.Applied(response.Data.PreviousWallet, response.Data.CurrentWallet);
+                return GozargahSiteWalletDebitResult.Applied(response.Data.PreviousWallet, response.Data.CurrentWallet);
+            }, cancellationToken);
         }
 
         /// <summary>
