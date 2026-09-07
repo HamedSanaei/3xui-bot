@@ -138,7 +138,12 @@ namespace Adminbot.Domain
                     if (!string.IsNullOrWhiteSpace(referenceType) && !string.IsNullOrWhiteSpace(referenceId))
                     {
                         var legacyEntry = await context.WalletLedgerEntries.FirstOrDefaultAsync(
-                            x => (x.IdempotencyKey == null || walletReceipt == null) && x.TelegramUserId == telegramUserId &&
+                            x => (x.IdempotencyKey == null || walletReceipt == null) &&
+                                 x.TelegramUserId == telegramUserId &&
+                                 x.Direction == direction &&
+                                 x.AmountToman == amountToman &&
+                                 x.BalanceBefore == beforeBalance &&
+                                 x.BalanceAfter == afterBalance &&
                                  x.Reason == reason &&
                                  x.Provider == provider &&
                                  x.ReferenceType == referenceType &&

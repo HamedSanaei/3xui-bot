@@ -2,7 +2,8 @@
 
 - Owner access/debt: `TenantAccessService` gates every tenant message/callback before business actions, without stopping
   receivers or changing manual Enabled. Owner IsBlocked takes priority; otherwise local balance >0 or readable usable
-  website balance >=1,000,000 toman allows access. Website unavailability uses local balance alone.
+  website balance at or above the configurable `tenantMinimumSiteWalletToman` (default 200000) allows access.
+  Website unavailability uses local balance alone.
   Negative local wallets trigger owner-wide partial/full website repayment through `TenantDebtTransfer` and existing
   website debit receipts; only confirmed debit authorizes unique local credit. One pending transfer per owner, no
   uncertain replay. `WalletOperationReconciliationService` recovers local credits after restart without remote calls.

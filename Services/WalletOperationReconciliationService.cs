@@ -12,6 +12,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
     private readonly UserDbContextFactory _users;
     private readonly WalletLedgerService _ledger;
     private readonly ILogger<WalletOperationReconciliationService> _logger;
+    private readonly HashSet<string> _reportedPendingReceipts = new(StringComparer.Ordinal);
 
     /// <summary>Creates a recovery worker retaining factories and stateless services only.</summary>
     /// <param name="credentials">Global balance/receipt database factory.</param>
@@ -84,10 +85,23 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                     return await db.WalletOperations.Where(x => x.OperationKey == receipt.OperationKey && x.ReconciledAtUtc == null)
                         .ExecuteUpdateAsync(set => set.SetProperty(x => x.ReconciledAtUtc, DateTime.UtcNow), ct);
                 }, token);
+                _reportedPendingReceipts.Remove(receipt.OperationKey);
                 repaired++;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-            catch (Exception ex) { _logger.LogError("Wallet receipt remains pending. ErrorType={ErrorType}", ex.GetType().Name); }
+            catch (InvalidOperationException ex)
+            {
+                if (_reportedPendingReceipts.Add(receipt.OperationKey))
+                    _logger.LogError(
+                        "Wallet receipt remains pending. OperationKey={OperationKey} ErrorType={ErrorType} Error={Error}",
+                        receipt.OperationKey, ex.GetType().Name, ex.Message);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    "Wallet receipt remains pending. OperationKey={OperationKey} ErrorType={ErrorType}",
+                    receipt.OperationKey, ex.GetType().Name);
+            }
         }
         return repaired;
     }

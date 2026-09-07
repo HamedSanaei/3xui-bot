@@ -14,15 +14,24 @@ public sealed class TenantAccessService
     private readonly UserDbContextFactory _factory;
     private readonly CredentialsStore _credentials;
     private readonly GozargahSiteSyncService _site;
+    private readonly AppConfig _appConfig;
     private readonly ILogger<TenantAccessService> _logger;
 
     /// <summary>Creates a stateless evaluator using short-lived database contexts.</summary>
     /// <param name="factory">Shared users.db factory for transfer intent and website receipts.</param>
     /// <param name="credentials">Shared owner profile and atomic bot wallet receipt store.</param>
     /// <param name="site">Website integration using owner-wide debit admission.</param>
+    /// <param name="configuration">
+    /// Runtime configuration bound from <c>Data/configuration.json</c>; supplies the configurable minimum site-wallet
+    /// threshold (<c>tenantMinimumSiteWalletToman</c>) used by the storefront access gate.
+    /// </param>
     /// <param name="logger">Operational diagnostics containing operation ids, never credentials or payloads.</param>
-    public TenantAccessService(UserDbContextFactory factory, CredentialsStore credentials, GozargahSiteSyncService site, ILogger<TenantAccessService> logger)
-    { _factory = factory; _credentials = credentials; _site = site; _logger = logger; }
+    public TenantAccessService(UserDbContextFactory factory, CredentialsStore credentials, GozargahSiteSyncService site, IConfiguration configuration, ILogger<TenantAccessService> logger)
+    {
+        _factory = factory; _credentials = credentials; _site = site;
+        _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
+        _logger = logger;
+    }
 
     /// <summary>Repays available debt and returns the current customer access restriction.</summary>
     /// <param name="ownerId">Required storefront owner's Telegram id, never the customer's id.</param>
@@ -30,7 +39,8 @@ public sealed class TenantAccessService
     /// <returns>Null when allowed, otherwise the fixed violation or debt message.</returns>
     /// <exception cref="OperationCanceledException">The execution is cancelled; any reserved transfer remains recoverable.</exception>
     /// <remarks>Violation takes priority. Uncertain debits are not replayed. A positive local balance permits access;
-    /// otherwise a readable usable website balance of at least one million toman is required.</remarks>
+    /// otherwise a readable usable website balance at or above the configured minimum site-wallet threshold
+    /// (<see cref="AppConfig.TenantMinimumSiteWalletToman"/>, key <c>tenantMinimumSiteWalletToman</c>) is required.</remarks>
     /// <example><code>var restriction = await access.EvaluateAsync(tenant.OwnerTelegramUserId.Value, token);</code></example>
     public async Task<string> EvaluateAsync(long ownerId, CancellationToken token)
     {
@@ -90,7 +100,9 @@ public sealed class TenantAccessService
         }
         owner = await _credentials.GetUserStatusWithId(ownerId);
         if (owner.IsBlocked) return BlockedMessage;
-        return owner.AccountBalance > 0 || (site.CanUse && site.WalletToman >= 1_000_000) ? null : DebtMessage;
+        // The website threshold is configurable: tenantMinimumSiteWalletToman decides the minimum usable wallet
+        // that keeps a storefront active when the owner's local bot wallet is empty or negative.
+        return owner.AccountBalance > 0 || (site.CanUse && site.WalletToman >= _appConfig.TenantMinimumSiteWalletToman) ? null : DebtMessage;
     }
 
     /// <summary>Reads usable website funds without interpreting connectivity failures as credit.</summary>

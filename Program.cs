@@ -61,6 +61,7 @@ public class Program
         ValidateXuiV3LinkChangeConfiguration(appConfig);
         ValidateXuiV3VolumeReminderConfiguration(appConfig);
         ValidateTetraminatorConfiguration(appConfig);
+        ValidateTenantStorefrontConfiguration(appConfig);
 
         ConfigureDatabasePaths(builder.Environment.ContentRootPath, appConfig);
         // Telegrams logs use their own SQLite outbox next to the runtime databases. The path is resolved against
@@ -432,6 +433,29 @@ public class Program
             throw new InvalidOperationException("Tetraminator is enabled but 'tetraminatorApiBaseUrl' is not an absolute HTTP/HTTPS URL.");
         if (!IsAbsoluteHttpUrl(appConfig.TetraminatorCallbackUrl))
             throw new InvalidOperationException("Tetraminator is enabled but 'tetraminatorCallbackUrl' is not an absolute HTTP/HTTPS URL.");
+    }
+
+    /// <summary>
+    /// Validates tenant storefront access settings before any bot can gate customer messages.
+    /// </summary>
+    /// <param name="appConfig">
+    /// Application configuration bound from <c>Data/configuration.json</c>. The site-wallet threshold is measured in
+    /// Iranian toman and is validated even when no storefront is configured so a later storefront cannot activate an
+    /// unsafe value.
+    /// </param>
+    /// <remarks>
+    /// A negative threshold would make the website-based storefront debt gate pass for every wallet balance and is
+    /// therefore rejected rather than silently clamped to zero. Older configurations that omit the key keep the
+    /// documented default declared on <see cref="AppConfig.TenantMinimumSiteWalletToman"/>.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown before database migration and hosted-service startup when the configured threshold is below zero.
+    /// </exception>
+    private static void ValidateTenantStorefrontConfiguration(AppConfig appConfig)
+    {
+        ArgumentNullException.ThrowIfNull(appConfig);
+        if (appConfig.TenantMinimumSiteWalletToman < 0)
+            throw new InvalidOperationException("Configuration value 'tenantMinimumSiteWalletToman' cannot be negative.");
     }
 
     /// <summary>

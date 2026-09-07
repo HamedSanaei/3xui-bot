@@ -19,6 +19,15 @@ namespace Adminbot.Domain
         /// <summary>Maximum storefront rows per colleague, including disabled and reset stores. Must be positive.</summary>
         /// <remarks>Lowering this limit prevents new allocation but never disables or deletes existing stores.</remarks>
         public int TenantMaxStoresPerOwner { get; set; } = 5;
+        /// <summary>
+        /// Minimum readable usable Gozargah website wallet balance, in Iranian toman, required to keep a tenant
+        /// storefront active when the owner has no positive local bot wallet.
+        /// </summary>
+        /// <remarks>
+        /// Values below zero are rejected at startup because a negative threshold would silently allow every storefront
+        /// through the website-based debt gate. A missing configuration key keeps the documented default.
+        /// </remarks>
+        public long TenantMinimumSiteWalletToman { get; set; } = 200_000;
         public BotInstanceConfig SalesAssistantBot { get; set; } = new();
         public string BotToken { get; set; }
         public string IpnSecretKey { get; set; }

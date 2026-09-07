@@ -1,6 +1,7 @@
 {
   "adminsUserIds": [],
   "tenantMaxStoresPerOwner": 5,
+  "tenantMinimumSiteWalletToman": 200000,
   "bots": [
     {
       "id": "owned-brand-bot",
