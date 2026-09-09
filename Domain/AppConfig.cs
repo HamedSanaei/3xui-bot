@@ -318,6 +318,8 @@ namespace Adminbot.Domain
         /// Enables synchronization of XUI v3 account lifecycle events with the Gozargah website API.
         /// </summary>
         public bool GozargahSiteSyncEnabled { get; set; }
+        /// <summary>Days to retain terminal website outbox history; positive, default 30. Latest successful account state is always kept.</summary>
+        public int GozargahSiteSyncRetentionDays { get; set; } = 30;
         /// <summary>
         /// API endpoint used for all Gozargah website actions. The API expects the action name in the JSON body.
         /// </summary>

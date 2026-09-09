@@ -60,6 +60,8 @@ public class UserDbContext : DbContext
     /// <summary>Retryable referral reward rows linked to exactly-once wallet mutations and ledger entries.</summary>
     public DbSet<ReferralReward> ReferralRewards { get; set; }
     public DbSet<TenantManualPaymentReceipt> TenantManualPaymentReceipts { get; set; }
+    /// <summary>Durable outbox intents that relay tenant receipt photos to the Sales Assistant outside update lanes.</summary>
+    public DbSet<TenantManualReceiptNotification> TenantManualReceiptNotifications { get; set; }
     /// <summary>
     /// Outbox rows for synchronizing successful XUI operations from the bot to the Gozargah website.
     /// </summary>
@@ -455,6 +457,19 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.OwnerTelegramUserId);
             entity.HasIndex(x => x.CustomerTelegramUserId);
             entity.HasIndex(x => x.Status);
+        });
+
+        modelBuilder.Entity<TenantManualReceiptNotification>(entity =>
+        {
+            entity.ToTable("TenantManualReceiptNotifications");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.Status).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.ClaimToken).HasMaxLength(64);
+            entity.Property(x => x.LastError).HasMaxLength(256);
+            entity.HasIndex(x => x.ReceiptId).IsUnique();
+            entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc });
+            entity.HasIndex(x => x.LeaseUntilUtc);
         });
 
         modelBuilder.Entity<GozargahSiteSyncEvent>(entity =>

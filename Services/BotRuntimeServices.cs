@@ -257,6 +257,19 @@ public class BotRegistry
     }
 }
 
+/// <summary>Expected domain failure when the exact Telegram transport requested by historical work is unavailable.</summary>
+public sealed class BotTransportUnavailableException : InvalidOperationException
+{
+    public const string FailureCode = "bot_transport_unavailable";
+    public string ReasonCode { get; }
+
+    public BotTransportUnavailableException(string reasonCode)
+        : base("The requested Telegram bot transport is unavailable.")
+    {
+        ReasonCode = string.IsNullOrWhiteSpace(reasonCode) ? "unavailable" : reasonCode;
+    }
+}
+
 /// <summary>
 /// Lazily creates and caches TelegramBotClient instances per BotId.
 /// </summary>
@@ -324,9 +337,19 @@ public class BotClientProvider
     /// <exception cref="InvalidOperationException">Thrown when the bot has no configured token.</exception>
     public ITelegramBotClient GetClient(string botId)
     {
-        var bot = _registry.GetById(botId);
-        if (bot == null || string.IsNullOrWhiteSpace(bot.Token))
-            throw new InvalidOperationException("No Telegram bot token is configured.");
+        var requestedBotId = botId?.Trim();
+        var bot = _registry.GetById(requestedBotId);
+        if (!string.IsNullOrWhiteSpace(requestedBotId) &&
+            (bot == null || !string.Equals(bot.Id, requestedBotId, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new BotTransportUnavailableException("bot_not_found");
+        }
+
+        if (bot == null || string.IsNullOrWhiteSpace(bot.Token) ||
+            (string.Equals(bot.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) && !bot.Enabled))
+        {
+            throw new BotTransportUnavailableException("bot_disabled_or_token_missing");
+        }
 
         lock (_syncRoot)
         {

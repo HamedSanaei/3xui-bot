@@ -91,6 +91,9 @@ namespace Adminbot.Domain
     /// </remarks>
     public class GozargahSiteSyncEvent
     {
+        /// <summary>Transient result flag: an update matched saved successful state and made no insert or HTTP call.</summary>
+        [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+        public bool WasUnchanged { get; set; }
         /// <summary>
         /// Internal users.db id for this outbox row.
         /// </summary>
@@ -802,6 +805,8 @@ namespace Adminbot.Domain
         private readonly UserDbContextFactory _userDbContextFactory;
         /// <summary>Prevents immediate send and recovery from sending the same outbox event concurrently; idle ids are removed.</summary>
         private static readonly AsyncKeyedGate EventGate = new();
+        /// <summary>Serializes queue decisions and retry sends for one UUID (email fallback), removing idle keys.</summary>
+        private static readonly AsyncKeyedGate AccountGate = new();
         private readonly CredentialsStore _credentialsDbContext;
         private readonly GozargahSiteApiClient _apiClient;
         private readonly AppConfig _appConfig;
@@ -816,6 +821,7 @@ namespace Adminbot.Domain
         /// <param name="configuration">Application configuration containing sync flags.</param>
         /// <param name="logger">Logger used for diagnostics.</param>
         /// <remarks>Each retry execution resolves its own scope. Website requests occur outside local write transactions and retain their existing operation keys.</remarks>
+        /// <exception cref="InvalidOperationException">Terminal event retention days are not positive.</exception>
         public GozargahSiteSyncService(
             UserDbContextFactory userDbContext,
             CredentialsStore credentialsDbContext,
@@ -824,6 +830,8 @@ namespace Adminbot.Domain
             ILogger<GozargahSiteSyncService> logger)
         {
             _userDbContextFactory = userDbContext;
+            if ((configuration.Get<AppConfig>() ?? new AppConfig()).GozargahSiteSyncRetentionDays <= 0)
+                throw new InvalidOperationException("GozargahSiteSyncRetentionDays must be positive.");
             _credentialsDbContext = credentialsDbContext;
             _apiClient = apiClient;
             _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -1094,10 +1102,11 @@ namespace Adminbot.Domain
         /// <param name="buyerTelegramUserId">Actual Telegram buyer or actor.</param>
         /// <param name="client">Updated XUI client.</param>
         /// <param name="serverInfo">Panel descriptor used to build subscription links.</param>
-        /// <param name="trackingCode">Local operation id for audit.</param>
+        /// <param name="trackingCode">Optional local operation id for audit; blank generates an id only after a real mutation is required.</param>
         /// <param name="tenantBotId">Tenant bot id when applicable.</param>
         /// <param name="cancellationToken">Cancellation token for database and API work.</param>
-        /// <returns>The outbox event row, or null when update sync is disabled.</returns>
+        /// <returns>The sent/reused row, or the previous successful row with WasUnchanged when no mutation is needed; null when disabled.</returns>
+        /// <remarks>All semantic fields and ownership are compared under account admission; tracking code does not affect equality.</remarks>
         public async Task<GozargahSiteSyncEvent> QueueUpdateAsync(
             long siteOwnerTelegramUserId,
             long buyerTelegramUserId,
@@ -1242,16 +1251,46 @@ namespace Adminbot.Domain
         /// <param name="syncEvent">Detached persisted outbox row; its internal id is reloaded under the per-event gate before sending.</param>
         /// <param name="cancellationToken">Cancellation token for API and database work.</param>
         /// <returns><c>true</c> when the event reached a terminal succeeded or skipped state.</returns>
-        /// <remarks>The saved row is reloaded under a per-event gate. Website I/O holds no write transaction; terminal rows return without another send.</remarks>
+        /// <remarks>Account admission precedes the event gate. Equivalent queued updates are marked skipped before HTTP;
+        /// website I/O holds no write transaction and terminal rows return without another send.</remarks>
         public async Task<bool> TrySendEventAsync(GozargahSiteSyncEvent syncEvent, CancellationToken cancellationToken = default)
+        {
+            if (syncEvent == null) return false;
+            using var accountLease = await AccountGate.EnterAsync(AccountKey(syncEvent.Uuid, syncEvent.Email), cancellationToken);
+            return await SendEventCoreAsync(syncEvent, cancellationToken);
+        }
+
+        /// <summary>Sends or retries one event while the caller owns account admission.</summary>
+        /// <param name="syncEvent">Detached persisted event; reloaded under its event gate.</param>
+        /// <param name="cancellationToken">Cancellation for storage and website I/O.</param>
+        /// <returns>Whether the event reached a terminal state.</returns>
+        /// <remarks>Account gate precedes event gate. No write transaction spans HTTP.</remarks>
+        private async Task<bool> SendEventCoreAsync(GozargahSiteSyncEvent syncEvent, CancellationToken cancellationToken)
         {
             var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (syncEvent == null)
                 return false;
 
             using var eventLease = await EventGate.EnterAsync(syncEvent.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
-            syncEvent = await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.SingleAsync(x => x.Id == syncEvent.Id, cancellationToken));
+            syncEvent = await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.SingleOrDefaultAsync(x => x.Id == syncEvent.Id, cancellationToken));
+            if (syncEvent == null) return true; // A retained terminal event may have been compacted after the caller loaded it.
             if (syncEvent.Status is GozargahSiteSyncStatuses.Succeeded or GozargahSiteSyncStatuses.Skipped) return true;
+
+            if (syncEvent.Operation == GozargahSiteSyncOperations.Update)
+            {
+                await using var db = _userDbContextFactory.CreateDbContext();
+                var previous = await db.GozargahSiteSyncEvents.AsNoTracking().Where(x => (x.Status == GozargahSiteSyncStatuses.Succeeded
+                    || (x.Status == GozargahSiteSyncStatuses.Skipped && x.Operation == GozargahSiteSyncOperations.Delete))
+                    && (!string.IsNullOrEmpty(syncEvent.Uuid) ? x.Uuid == syncEvent.Uuid
+                        : (x.Uuid == null || x.Uuid == "") && x.Email == syncEvent.Email))
+                    .OrderByDescending(x => x.SucceededAtUtc ?? x.UpdatedAtUtc ?? x.CreatedAtUtc).ThenByDescending(x => x.Id).FirstOrDefaultAsync(cancellationToken);
+                if (previous != null && GozargahSyncSemantics.Equivalent(previous, syncEvent))
+                {
+                    MarkSkipped(syncEvent, "Unchanged semantic account state.");
+                    await _workflow.SaveAsync(cancellationToken);
+                    return true;
+                }
+            }
 
             if (!_apiClient.IsConfigured())
             {
@@ -1371,11 +1410,13 @@ namespace Adminbot.Domain
         /// <param name="tenantBotId">Tenant bot id when the event belongs to a colleague storefront; otherwise null.</param>
         /// <param name="cancellationToken">Cancellation token for users.db and API work.</param>
         /// <returns>
-        /// Existing succeeded event for the same idempotency key, the newly created event, or null when sync is disabled.
+        /// Detached reused or newly sent event, previous successful state with WasUnchanged for a no-op update, or null when disabled.
         /// </returns>
         /// <remarks>
         /// The database row is written before the first API attempt. This preserves the operation for retry if the
         /// website API is unavailable after a successful 3x-ui operation.
+        /// UUID/email admission covers semantic comparison and sending. Tracking identity is excluded; successful
+        /// create/rename state can suppress an unchanged update, while delete tombstones force a real subsequent update.
         /// </remarks>
         private async Task<GozargahSiteSyncEvent> QueueAndSendAsync(
             string operation,
@@ -1401,19 +1442,7 @@ namespace Adminbot.Domain
             if (ownership.SiteOwnerTelegramUserId <= 0)
                 return null;
 
-            var existing = await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.FirstOrDefaultAsync(
-                x => x.Operation == operation &&
-                     x.TelegramUserId == ownership.SiteOwnerTelegramUserId &&
-                     x.TenantBotId == ownership.TenantBotId &&
-                     x.Email == email &&
-                     x.PreviousEmail == previousEmail &&
-                     x.Uuid == uuid &&
-                     x.SubId == subId &&
-                     x.Status == GozargahSiteSyncStatuses.Succeeded,
-                cancellationToken));
-            if (existing != null)
-                return existing;
-
+            using var accountLease = await AccountGate.EnterAsync(AccountKey(uuid, email), cancellationToken);
             var syncEvent = new GozargahSiteSyncEvent
             {
                 BotId = BotContextAccessor.CurrentBotId,
@@ -1431,10 +1460,72 @@ namespace Adminbot.Domain
                 Status = GozargahSiteSyncStatuses.Pending,
                 CreatedAtUtc = DateTime.UtcNow
             };
+            // Compare successful state, not operation identity: creates and renames also establish account state.
+            await using (var db = _userDbContextFactory.CreateDbContext())
+            {
+                var account = db.GozargahSiteSyncEvents.AsNoTracking().Where(x =>
+                    !string.IsNullOrEmpty(uuid) ? x.Uuid == uuid : (x.Uuid == null || x.Uuid == "") && x.Email == email);
+                var unresolved = await account.Where(x => x.Status != GozargahSiteSyncStatuses.Succeeded
+                    && x.Status != GozargahSiteSyncStatuses.Skipped).OrderByDescending(x => x.Id).FirstOrDefaultAsync(cancellationToken);
+                var previous = await account.Where(x => x.Status == GozargahSiteSyncStatuses.Succeeded
+                    || (x.Status == GozargahSiteSyncStatuses.Skipped && x.Operation == GozargahSiteSyncOperations.Delete))
+                    .OrderByDescending(x => x.SucceededAtUtc ?? x.UpdatedAtUtc ?? x.CreatedAtUtc).ThenByDescending(x => x.Id).FirstOrDefaultAsync(cancellationToken);
+                if (unresolved == null && previous != null
+                    && (operation == GozargahSiteSyncOperations.Update || (previous.Operation == operation && previous.PreviousEmail == previousEmail))
+                    && GozargahSyncSemantics.Equivalent(previous, syncEvent))
+                {
+                    previous.WasUnchanged = operation == GozargahSiteSyncOperations.Update;
+                    return previous;
+                }
+                if (unresolved != null && unresolved.Operation == operation && unresolved.PreviousEmail == previousEmail
+                    && GozargahSyncSemantics.Equivalent(unresolved, syncEvent))
+                {
+                    await SendEventCoreAsync(unresolved, cancellationToken);
+                    return await db.GozargahSiteSyncEvents.AsNoTracking().SingleAsync(x => x.Id == unresolved.Id, cancellationToken);
+                }
+            }
+            if (string.IsNullOrWhiteSpace(payload.TrackingCode))
+                payload.TrackingCode = $"bot-sync-{Guid.NewGuid():N}";
+            syncEvent.RequestJson = JsonConvert.SerializeObject(payload);
             _workflow.Add(syncEvent);
             await _workflow.SaveAsync(cancellationToken);
-            await TrySendEventAsync(syncEvent, cancellationToken);
-            return syncEvent;
+            await SendEventCoreAsync(syncEvent, cancellationToken);
+            return await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.AsNoTracking()
+                .SingleAsync(x => x.Id == syncEvent.Id, cancellationToken));
+        }
+
+        /// <summary>Builds process-wide account admission identity independently from mutable ownership.</summary>
+        /// <param name="uuid">Preferred stable XUI account UUID, or empty when unavailable.</param>
+        /// <param name="email">Account name used only when UUID is unavailable.</param>
+        /// <returns>Internal gate key; never log it because it identifies a customer account.</returns>
+        private static string AccountKey(string uuid, string email) => !string.IsNullOrEmpty(uuid) ? "uuid:" + uuid : "email:" + email;
+
+        /// <summary>Compacts one bounded batch of expired terminal outbox events, retaining each account's latest successful state.</summary>
+        /// <param name="cancellationToken">Cancellation of the short SQLite cleanup statement.</param>
+        /// <returns>Number removed, at most 100. Pending, failed and other unresolved states are never candidates.</returns>
+        /// <remarks>UUID is preferred, email is the fallback. Successful deletes remain tombstones. No financial tables or VACUUM are touched.</remarks>
+        public async Task<int> CompactTerminalEventsAsync(CancellationToken cancellationToken)
+        {
+            if (_appConfig.GozargahSiteSyncRetentionDays <= 0)
+                throw new InvalidOperationException("GozargahSiteSyncRetentionDays must be positive.");
+            var cutoff = DateTime.UtcNow.AddDays(-Math.Min(_appConfig.GozargahSiteSyncRetentionDays, 36500));
+            return await SqliteOperation.RunAsync(async ct =>
+            {
+                await using var db = _userDbContextFactory.CreateDbContext();
+                // The candidate subquery and deletion share one statement; a newly completed state cannot be
+                // deleted based on an earlier read. Latest success is retained even for a deleted account.
+                var candidates = db.GozargahSiteSyncEvents.Where(x =>
+                    (x.UpdatedAtUtc ?? x.CreatedAtUtc) < cutoff &&
+                    ((x.Status == GozargahSiteSyncStatuses.Skipped && x.Operation != GozargahSiteSyncOperations.Delete) ||
+                     ((x.Status == GozargahSiteSyncStatuses.Succeeded || (x.Status == GozargahSiteSyncStatuses.Skipped && x.Operation == GozargahSiteSyncOperations.Delete))
+                      && db.GozargahSiteSyncEvents.Any(y =>
+                         (y.Status == GozargahSiteSyncStatuses.Succeeded || (x.Status == GozargahSiteSyncStatuses.Skipped && y.Status == GozargahSiteSyncStatuses.Skipped && y.Operation == GozargahSiteSyncOperations.Delete)) &&
+                         ((x.Uuid != null && x.Uuid != "") ? y.Uuid == x.Uuid : (y.Uuid == null || y.Uuid == "") && y.Email == x.Email) &&
+                         ((y.SucceededAtUtc ?? y.UpdatedAtUtc ?? y.CreatedAtUtc) > (x.SucceededAtUtc ?? x.UpdatedAtUtc ?? x.CreatedAtUtc) ||
+                          ((y.SucceededAtUtc ?? y.UpdatedAtUtc ?? y.CreatedAtUtc) == (x.SucceededAtUtc ?? x.UpdatedAtUtc ?? x.CreatedAtUtc) && y.Id > x.Id))))))
+                    .OrderBy(x => x.Id).Select(x => x.Id).Take(100);
+                return await db.GozargahSiteSyncEvents.Where(x => candidates.Contains(x.Id)).ExecuteDeleteAsync(ct);
+            }, cancellationToken);
         }
 
         /// <summary>
@@ -1582,6 +1673,7 @@ namespace Adminbot.Domain
         /// </returns>
         /// <remarks>
         /// Website ownership is resolved before queueing so missing or banned site users are skipped instead of being retried forever.
+        /// Blank tracking codes remain blank here; queue admission generates one only after semantic comparison requires a mutation.
         /// </remarks>
         private async Task<GozargahSiteOrderPayload> BuildPayloadAsync(
             long siteOwnerTelegramUserId,
@@ -1627,7 +1719,7 @@ namespace Adminbot.Domain
                 Volume = volumeGb,
                 Date = Math.Max(0, durationDays),
                 Username = siteUser.Data.Username,
-                TrackingCode = string.IsNullOrWhiteSpace(trackingCode) ? $"bot-sync-{name}" : trackingCode,
+                TrackingCode = trackingCode,
                 Sub = subLink,
                 Trial = metadata?.IsTrial == true ? 1 : 0,
                 Bot = 1
@@ -1939,7 +2031,8 @@ namespace Adminbot.Domain
         /// </summary>
         /// <param name="stoppingToken">Cancellation token triggered when the host is shutting down.</param>
         /// <returns>A task that completes when the background worker stops.</returns>
-        /// <remarks>Each retry execution resolves its own scope. Website requests occur outside local write transactions and retain their existing operation keys.</remarks>
+        /// <remarks>Each retry execution resolves its own scope. Website requests occur outside local write transactions and retain their existing operation keys.
+        /// Each cycle also compacts at most 100 expired terminal events, keeping latest successful state and deletion tombstones.</remarks>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             using var timer = new PeriodicTimer(TimeSpan.FromMinutes(2));
@@ -1958,6 +2051,8 @@ namespace Adminbot.Domain
 
                     foreach (var syncEvent in events)
                         await syncService.TrySendEventAsync(syncEvent, stoppingToken);
+                    var compacted = await syncService.CompactTerminalEventsAsync(stoppingToken);
+                    if (compacted > 0) _logger.LogInformation("Gozargah terminal outbox compacted. Deleted={Deleted}", compacted);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {

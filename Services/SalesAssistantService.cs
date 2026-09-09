@@ -144,12 +144,12 @@ public class SalesAssistantService
     /// through the sales assistant Bot because Telegram file IDENTIFIERS are not safely REUSABLE across bots.
     /// </remarks>
     /// <returns>A task completing after the owner receipt notification attempt; the receipt approval state is unchanged.</returns>
-    public async Task NOTIFYMANUALRECEIPTASYNC(TenantManualPaymentReceipt receipt, CancellationToken CancellationToken)
+    public async Task<int?> NOTIFYMANUALRECEIPTASYNC(TenantManualPaymentReceipt receipt, CancellationToken CancellationToken)
     {
         var _workflow = new UserWorkflowStore(_userDbContextFactory);
         var assistant = GetAssistantBot();
-        if (assistant == null || string.IsNullOrWhiteSpace(assistant.Token))
-            return;
+        if (assistant == null || !assistant.Enabled || string.IsNullOrWhiteSpace(assistant.Token))
+            return null;
 
         TenantBotOrder order = null;
         try
@@ -194,18 +194,19 @@ public class SalesAssistantService
             await TENANTCLIENT.DownloadFileAsync(TELEGRAMFILE.FilePath, PHOTOSTREAM, CancellationToken);
             PHOTOSTREAM.Position = 0;
 
-            await _botClientProvider.GetClient(assistant.Id).SendPhotoAsync(
+            var sent = await _botClientProvider.GetClient(assistant.Id).SendPhotoAsync(
                 chatId: receipt.OwnerTelegramUserId,
                 photo: InputFile.FromStream(PHOTOSTREAM, $"tenant-receipt-{receipt.Id}.JPG"),
                 caption: Text,
                 parseMode: ParseMode.Html,
                 replyMarkup: keyboard,
                 cancellationToken: CancellationToken);
+            return sent.MessageId;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "sales assistant receipt notification failed. RECEIPTID={RECEIPTID}", receipt.Id);
-            await SENDMANUALRECEIPTFALLBACKTEXTASYNC(receipt, Text, keyboard, CancellationToken);
+            return await SENDMANUALRECEIPTFALLBACKTEXTASYNC(receipt, Text, keyboard, CancellationToken);
         }
     }
 
@@ -232,15 +233,15 @@ public class SalesAssistantService
     /// re-uploaded by the Sales Assistant bot. It is intentionally best-effort: failure to send the fallback is
     /// logged but never thrown back into tenant order processing.
     /// </remarks>
-    private async Task SENDMANUALRECEIPTFALLBACKTEXTASYNC(
+    private async Task<int?> SENDMANUALRECEIPTFALLBACKTEXTASYNC(
         TenantManualPaymentReceipt receipt,
         string baseText,
         InlineKeyboardMarkup keyboard,
         CancellationToken CancellationToken)
     {
         var assistant = GetAssistantBot();
-        if (assistant == null || string.IsNullOrWhiteSpace(assistant.Token))
-            return;
+        if (assistant == null || !assistant.Enabled || string.IsNullOrWhiteSpace(assistant.Token))
+            return null;
 
         var fallbackText =
             baseText +
@@ -253,16 +254,18 @@ public class SalesAssistantService
 
         try
         {
-            await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
+            var sent = await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
                 chatId: receipt.OwnerTelegramUserId,
                 text: fallbackText,
                 parseMode: ParseMode.Html,
                 replyMarkup: keyboard,
                 cancellationToken: CancellationToken);
+            return sent.MessageId;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "sales assistant receipt fallback text failed. RECEIPTID={RECEIPTID}", receipt.Id);
+            return null;
         }
     }
 

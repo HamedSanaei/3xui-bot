@@ -1,5 +1,11 @@
 # CODE_MAP.md
 
+- Website outbox: `GozargahSyncSemantics` compares canonical payload plus ownership, excluding tracking_code.
+  `QueueAndSendAsync` and retries share UUID/email admission; unchanged updates create no event or HTTP mutation.
+  `Sync Gozargah Site` reports aggregate changed/unchanged counts. Retry cycles compact <=100 terminal rows older
+  than `GozargahSiteSyncRetentionDays` (30 default), retaining latest success/deletion state; unresolved rows never purge.
+  No schema/index change; see `docs/gozargah-sync-retention.md` for audit and optional manual VACUUM guidance.
+
 - Owner access/debt: `TenantAccessService` gates every tenant message/callback before business actions, without stopping
   receivers or changing manual Enabled. Owner IsBlocked takes priority; otherwise local balance >0 or readable usable
   website balance at or above the configurable `tenantMinimumSiteWalletToman` (default 200000) allows access.

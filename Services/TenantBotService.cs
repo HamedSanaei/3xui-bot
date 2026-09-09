@@ -8609,43 +8609,74 @@ public class TenantBotService
             return;
         }
 
-        var receipt = order.ManualReceiptId.HasValue
-            ? await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, CancellationToken))
-            : await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, CancellationToken));
+        await PERSISTTENANTMANUALRECEIPTASYNC(order.Id, photo.FileId, CancellationToken);
 
-        if (receipt == null)
+        await botClient.SendTextMessageAsync(
+            Message.Chat.Id,
+            "✅ رسید شما ثبت شد و برای تایید همکار در صف ارسال قرار گرفت.",
+            cancellationToken: CancellationToken);
+    }
+
+    /// <summary>Atomically saves the receipt state and its durable Sales Assistant relay intent in users.db.</summary>
+    private Task<int> PERSISTTENANTMANUALRECEIPTASYNC(int orderDbId, string photoFileId, CancellationToken cancellationToken)
+    {
+        return _workflow.WriteAsync(async db =>
         {
-            receipt = new TenantManualPaymentReceipt
+            await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+            var order = await db.TenantBotOrders.SingleAsync(x => x.Id == orderDbId, cancellationToken);
+            var receipt = order.ManualReceiptId.HasValue
+                ? await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, cancellationToken)
+                : await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, cancellationToken);
+
+            // A rejected receipt is an immutable review attempt. A legitimate customer resubmission gets a new
+            // receipt id/outbox key so the old assistant buttons remain historical while the new photo can be reviewed once.
+            if (receipt?.Status == TenantManualPaymentReceiptStatuses.Rejected)
+                receipt = null;
+
+            if (receipt == null)
             {
-                TenantBotOrderId = order.Id,
-                OrderId = order.OrderId,
-                TenantBotId = order.TenantBotId,
-                TenantBotUsername = order.TenantBotUsername,
-                OwnerTelegramUserId = order.OwnerTelegramUserId,
-                CustomerTelegramUserId = order.CustomerTelegramUserId,
-                CustomerChatId = order.CustomerChatId,
-                AmountToman = order.SalePriceToman,
-                CreatedAtUtc = DateTime.UtcNow
-            };
-            _workflow.Add(receipt);
-        }
+                receipt = new TenantManualPaymentReceipt
+                {
+                    TenantBotOrderId = order.Id,
+                    OrderId = order.OrderId,
+                    TenantBotId = order.TenantBotId,
+                    TenantBotUsername = order.TenantBotUsername,
+                    OwnerTelegramUserId = order.OwnerTelegramUserId,
+                    CustomerTelegramUserId = order.CustomerTelegramUserId,
+                    CustomerChatId = order.CustomerChatId,
+                    AmountToman = order.SalePriceToman,
+                    CreatedAtUtc = DateTime.UtcNow
+                };
+                db.TenantManualPaymentReceipts.Add(receipt);
+            }
 
-        receipt.PhotoFileId = photo.FileId;
-        receipt.Status = TenantManualPaymentReceiptStatuses.Pending;
-        receipt.ReviewerTelegramUserId = null;
-        receipt.ApprovedAtUtc = null;
-        receipt.RejectedAtUtc = null;
-        receipt.FinalConfirmedAtUtc = null;
-        receipt.UpdatedAtUtc = DateTime.UtcNow;
-        order.PaymentStatus = TenantBotOrderStatuses.ReceiptSubmitted;
-        order.UpdatedAtUtc = DateTime.UtcNow;
-        await _workflow.SaveAsync(CancellationToken);
+            receipt.PhotoFileId = photoFileId;
+            receipt.Status = TenantManualPaymentReceiptStatuses.Pending;
+            receipt.ReviewerTelegramUserId = null;
+            receipt.ApprovedAtUtc = null;
+            receipt.RejectedAtUtc = null;
+            receipt.FinalConfirmedAtUtc = null;
+            receipt.UpdatedAtUtc = DateTime.UtcNow;
+            order.PaymentStatus = TenantBotOrderStatuses.ReceiptSubmitted;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await db.SaveChangesAsync(cancellationToken);
 
-        order.ManualReceiptId = receipt.Id;
-        await _workflow.SaveAsync(CancellationToken);
+            order.ManualReceiptId = receipt.Id;
+            if (!await db.TenantManualReceiptNotifications.AnyAsync(x => x.ReceiptId == receipt.Id, cancellationToken))
+            {
+                db.TenantManualReceiptNotifications.Add(new TenantManualReceiptNotification
+                {
+                    ReceiptId = receipt.Id,
+                    Status = TenantManualReceiptNotificationStatuses.Pending,
+                    CreatedAtUtc = DateTime.UtcNow,
+                    UpdatedAtUtc = DateTime.UtcNow
+                });
+            }
 
-        await _salesAssistantService.NOTIFYMANUALRECEIPTASYNC(receipt, CancellationToken);
-        await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ رسید شما ثبت شد و برای تایید همکار ارسال شد.", cancellationToken: CancellationToken);
+            await db.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return receipt.Id;
+        }, cancellationToken);
     }
 
     /// <summary>
@@ -8687,7 +8718,12 @@ public class TenantBotService
         if (order.IsFulfilled)
         {
             await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
-            return "این سفارش قبلاً تایید و ساخته شده است.";
+            return "این سفارش قبلاً تایید و ساخته شده است؛ مشخصات ذخیره‌شده برای شما از دستیار فروش ارسال شد.";
+        }
+
+        if (!IsTenantTransportAvailable(order.TenantBotId))
+        {
+            return "فروشگاه این سفارش غیرفعال است یا توکن همان ربات در دسترس نیست. هیچ تغییر مالی یا ساخت اکانتی انجام نشد؛ ابتدا همان فروشگاه را دوباره فعال کنید و سپس تایید نهایی را تکرار کنید.";
         }
 
         receipt.Status = TenantManualPaymentReceiptStatuses.Approved;
@@ -9041,8 +9077,11 @@ public class TenantBotService
         if (!order.IsFulfilled)
             return "این سفارش هنوز ساخته نشده است و مشخصات اکانت برای ارسال مجدد وجود ندارد.";
 
-        await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: true, sendOwner: true, CancellationToken);
-        return "مشخصات اکانت دوباره برای شما و خریدار ارسال شد.";
+        var transportAvailable = IsTenantTransportAvailable(order.TenantBotId);
+        await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: transportAvailable, sendOwner: true, CancellationToken);
+        return transportAvailable
+            ? "مشخصات اکانت از دستیار فروش برای شما و از همان ربات فروشگاهی برای خریدار دوباره ارسال شد."
+            : "مشخصات ذخیره‌شده از دستیار فروش برای شما ارسال شد. فروشگاه غیرفعال است یا توکن همان ربات در دسترس نیست؛ ارسال به خریدار فقط پس از فعال‌سازی مجدد همان فروشگاه ممکن است.";
     }
 
     /// <summary>
@@ -9541,8 +9580,7 @@ public class TenantBotService
         if (created == null || string.IsNullOrWhiteSpace(created.Email) && string.IsNullOrWhiteSpace(created.SubLink))
             return false;
 
-        var tenantClient = _botClientProvider.GetClient(order.TenantBotId);
-        if (sendCustomer)
+        if (sendCustomer && TryGetUsableTenantClient(order.TenantBotId, out var tenantClient))
         {
             try
             {
@@ -9556,29 +9594,51 @@ public class TenantBotService
 
         if (sendOwner)
         {
-            try
+            var assistant = _botRegistry.Bots.FirstOrDefault(x =>
+                string.Equals(x.Type, BotInstanceTypes.SalesAssistant, StringComparison.OrdinalIgnoreCase));
+            if (assistant != null && assistant.Enabled && !string.IsNullOrWhiteSpace(assistant.Token))
             {
-                await SENDCREATEDACCOUNTDETAILSASYNC(tenantClient, order.OwnerTelegramUserId, created, CancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Tenant account resend to owner via tenant bot failed. orderId={OrderId}", order.OrderId);
                 try
                 {
-                    await _botClientProvider.GetClient(_botRegistry.DefaultBot.Id).SendTextMessageAsync(
+                    await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
                         order.OwnerTelegramUserId,
                         "مشخصات اکانت ساخته‌شده:\n\n" + _purchaseService.BuildCreatedAccountText(created),
                         parseMode: ParseMode.Html,
                         cancellationToken: CancellationToken);
                 }
-                catch (Exception fallbackEx)
+                catch (Exception ex)
                 {
-                    _logger.LogWarning(fallbackEx, "Tenant account resend fallback to owner failed. orderId={OrderId}", order.OrderId);
+                    _logger.LogWarning(ex, "Tenant account resend to owner through sales assistant failed. orderId={OrderId}", order.OrderId);
                 }
             }
         }
 
         return true;
+    }
+
+    private bool IsTenantTransportAvailable(string tenantBotId)
+    {
+        if (string.IsNullOrWhiteSpace(tenantBotId)) return false;
+        var bot = _botRegistry.GetById(tenantBotId);
+        return bot != null &&
+               string.Equals(bot.Id, tenantBotId, StringComparison.OrdinalIgnoreCase) &&
+               bot.Enabled &&
+               !string.IsNullOrWhiteSpace(bot.Token);
+    }
+
+    private bool TryGetUsableTenantClient(string tenantBotId, out ITelegramBotClient client)
+    {
+        client = null;
+        if (!IsTenantTransportAvailable(tenantBotId)) return false;
+        try
+        {
+            client = _botClientProvider.GetClient(tenantBotId);
+            return true;
+        }
+        catch (BotTransportUnavailableException)
+        {
+            return false;
+        }
     }
 
     /// <summary>

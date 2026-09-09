@@ -3624,6 +3624,7 @@ public class XuiV3AdminFlowService
     /// The command is intentionally manual and is not run at startup. Each eligible client is sent through the
     /// same outbox path used by realtime sync, so repeated historical runs are idempotent from the bot side and
     /// transient website API failures remain retryable in <c>GozargahSiteSyncEvents</c>.
+    /// Semantic no-ops do not create events or HTTP requests. One completion diagnostic covers the entire run.
     /// </remarks>
     private async Task HandleGozargahHistoricalSyncAsync(
         ITelegramBotClient botClient,
@@ -3653,6 +3654,8 @@ public class XuiV3AdminFlowService
         }
 
         var checkedCount = 0;
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        var unchangedCount = 0;
         var queuedCount = 0;
         var succeededCount = 0;
         var skippedCount = 0;
@@ -3684,7 +3687,7 @@ public class XuiV3AdminFlowService
                     ownership.BuyerTelegramUserId,
                     client,
                     serverInfo,
-                    $"historical-{client.Email}",
+                    null,
                     ownership.TenantBotId,
                     cancellationToken: cancellationToken));
 
@@ -3695,6 +3698,12 @@ public class XuiV3AdminFlowService
             }
 
             queuedCount++;
+            if (syncEvent.WasUnchanged)
+            {
+                queuedCount--;
+                unchangedCount++;
+                continue;
+            }
             if (string.Equals(syncEvent.Status, GozargahSiteSyncStatuses.Succeeded, StringComparison.OrdinalIgnoreCase))
                 succeededCount++;
             else if (string.Equals(syncEvent.Status, GozargahSiteSyncStatuses.Skipped, StringComparison.OrdinalIgnoreCase))
@@ -3705,12 +3714,15 @@ public class XuiV3AdminFlowService
 
         var summary =
             "<b>Gozargah historical sync finished</b>\n\n" +
+            $"Unchanged: <code>{unchangedCount}</code>\n" +
             $"Checked: <code>{checkedCount}</code>\n" +
             $"Queued: <code>{queuedCount}</code>\n" +
             $"Succeeded now: <code>{succeededCount}</code>\n" +
             $"Skipped: <code>{skippedCount}</code>\n" +
             $"Pending/failed for retry: <code>{failedCount}</code>";
 
+        _logger.LogInformation("Gozargah bulk sync completed. scanned={Scanned} changed={Changed} skippedUnchanged={SkippedUnchanged} succeeded={Succeeded} failed={Failed} skipped={Skipped} elapsedMs={ElapsedMs}",
+            checkedCount, queuedCount, unchangedCount, succeededCount, failedCount, skippedCount, elapsed.ElapsedMilliseconds);
         await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, summary, cancellationToken, ParseMode.Html);
     }
 

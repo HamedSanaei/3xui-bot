@@ -61,8 +61,10 @@ public sealed partial class ConcurrencyTests
         var wallet = new CredentialsStore(databases.Credentials);
         await wallet.AddEmptyUser(711);
         await wallet.MutateWalletAsync(711, 45000, "historical-fixture");
-        var previous = users.Database.GetMigrations().ToArray()[^2];
-        await users.GetService<IMigrator>().MigrateAsync(previous);
+        var migrations = users.Database.GetMigrations().ToArray();
+        var multiStoreIndex = Array.FindIndex(migrations, x => x.EndsWith("_MultipleOwnerStorefronts", StringComparison.Ordinal));
+        Assert.True(multiStoreIndex > 0);
+        await users.GetService<IMigrator>().MigrateAsync(migrations[multiStoreIndex - 1]);
         await users.Database.ExecuteSqlRawAsync("""
             INSERT INTO BotInstances (Id, Type, OwnerTelegramUserId, Enabled, IsDefault, TenantPriceMarkupPercent,
                 TenantMandatoryJoinEnabled, TenantCardPaymentEnabled, TenantHooshPayEnabled, TenantNowPaymentsEnabled, CreatedAtUtc)

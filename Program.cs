@@ -169,8 +169,9 @@ public class Program
         services.AddHostedService<GozargahSiteSyncRetryService>();
         services.AddHostedService<ReferralReconciliationHostedService>();
         services.AddHostedService<WeeklyUsageReportHostedService>();
-        // This delivery-only worker reads the users.db outbox and Telegram; it cannot repeat wallet settlement.
+        // Delivery-only workers read users.db outboxes and Telegram; they cannot repeat settlement or XUI mutations.
         services.AddHostedService<PaymentSettlementNotificationWorker>();
+        services.AddHostedService<TenantManualReceiptNotificationWorker>();
         services.AddSingleton<UniquePayReconciliationHostedService>();
         services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
 

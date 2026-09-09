@@ -256,10 +256,19 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             }
         }
         catch (OperationCanceledException) { failure = "execution_cancelled"; }
+        catch (BotTransportUnavailableException ex)
+        {
+            failure = BotTransportUnavailableException.FailureCode;
+            _logger.LogWarning(
+                "Telegram update ended with unavailable bot transport. Sequence={Sequence} FailureCode={FailureCode} ReasonCode={ReasonCode}",
+                sequence, failure, ex.ReasonCode);
+        }
         catch (Exception ex)
         {
             failure = "execution_failed";
-            _logger.LogError("Telegram update failed and was released. Sequence={Sequence} ErrorType={ErrorType}", sequence, ex.GetType().Name);
+            _logger.LogError(
+                "Telegram update failed and was released. Sequence={Sequence} FailureCode={FailureCode} ErrorType={ErrorType}",
+                sequence, failure, ex.GetType().Name);
         }
         finally
         {

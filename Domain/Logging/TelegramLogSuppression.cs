@@ -60,6 +60,7 @@ namespace Adminbot.Domain.Logging
                 return false;
 
             if (ContainsOrdinalIgnoreCase(combined, "Ignoring stale sales-assistant callback answer") ||
+                ContainsOrdinalIgnoreCase(combined, "IGNORING STALE Telegram callback answer") ||
                 ContainsOrdinalIgnoreCase(combined, "Ignoring unchanged sales-assistant reply markup") ||
                 ContainsOrdinalIgnoreCase(combined, "Ignoring unchanged sales-assistant receipt caption") ||
                 ContainsOrdinalIgnoreCase(combined, "sales assistant receipt notification failed") ||
