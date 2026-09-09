@@ -1061,12 +1061,18 @@ namespace Adminbot.Domain
             XuiV3AccountCreationResult created,
             string trackingCode,
             string tenantBotId = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            bool deferSend = false)
         {
             if (!_appConfig.GozargahSiteRealtimeCreateSyncEnabled)
                 return null;
 
-            var payload = await BuildPayloadAsync(
+            var payload = deferSend
+                ? BuildPayloadDraft(
+                    siteOwnerTelegramUserId, buyerTelegramUserId, created?.Email, null,
+                    ResolveSyncUuid(created?.Uuid, created?.ConfigLink, created?.SubLink), created?.SubId, created?.SubLink,
+                    created?.Comment, created?.TrafficBytes ?? 0, created?.TrafficGb ?? 0, created?.DurationDays ?? 0, trackingCode)
+                : await BuildPayloadAsync(
                 siteOwnerTelegramUserId,
                 buyerTelegramUserId,
                 created?.Email,
@@ -1092,7 +1098,8 @@ namespace Adminbot.Domain
                 created?.SubLink,
                 payload,
                 tenantBotId,
-                cancellationToken);
+                cancellationToken,
+                deferSend);
         }
 
         /// <summary>
@@ -1114,13 +1121,19 @@ namespace Adminbot.Domain
             ServerInfo serverInfo,
             string trackingCode,
             string tenantBotId = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            bool deferSend = false)
         {
             if (!_appConfig.GozargahSiteRealtimeUpdateSyncEnabled)
                 return null;
 
             var subId = string.IsNullOrWhiteSpace(client?.SubId) ? client?.Email : client.SubId;
-            var payload = await BuildPayloadAsync(
+            var payload = deferSend
+                ? BuildPayloadDraft(
+                    siteOwnerTelegramUserId, buyerTelegramUserId, client?.Email, null, client?.Uuid, subId,
+                    ApiServicev3.BuildSubscriptionLink(serverInfo, subId), client?.Comment, ReadTotalBytes(client), 0,
+                    CalculateDurationDays(client), trackingCode)
+                : await BuildPayloadAsync(
                 siteOwnerTelegramUserId,
                 buyerTelegramUserId,
                 client?.Email,
@@ -1146,7 +1159,8 @@ namespace Adminbot.Domain
                 payload?.Sub,
                 payload,
                 tenantBotId,
-                cancellationToken);
+                cancellationToken,
+                deferSend);
         }
 
         /// <summary>
@@ -1429,7 +1443,8 @@ namespace Adminbot.Domain
             string subLink,
             GozargahSiteOrderPayload payload,
             string tenantBotId,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool deferSend = false)
         {
             var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (!_appConfig.GozargahSiteSyncEnabled || payload == null)
@@ -1480,7 +1495,10 @@ namespace Adminbot.Domain
                 if (unresolved != null && unresolved.Operation == operation && unresolved.PreviousEmail == previousEmail
                     && GozargahSyncSemantics.Equivalent(unresolved, syncEvent))
                 {
-                    await SendEventCoreAsync(unresolved, cancellationToken);
+                    if (deferSend)
+                        GozargahSiteSyncRetryService.Wake();
+                    else
+                        await SendEventCoreAsync(unresolved, cancellationToken);
                     return await db.GozargahSiteSyncEvents.AsNoTracking().SingleAsync(x => x.Id == unresolved.Id, cancellationToken);
                 }
             }
@@ -1489,7 +1507,10 @@ namespace Adminbot.Domain
             syncEvent.RequestJson = JsonConvert.SerializeObject(payload);
             _workflow.Add(syncEvent);
             await _workflow.SaveAsync(cancellationToken);
-            await SendEventCoreAsync(syncEvent, cancellationToken);
+            if (deferSend)
+                GozargahSiteSyncRetryService.Wake();
+            else
+                await SendEventCoreAsync(syncEvent, cancellationToken);
             return await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.AsNoTracking()
                 .SingleAsync(x => x.Id == syncEvent.Id, cancellationToken));
         }
@@ -1675,6 +1696,30 @@ namespace Adminbot.Domain
         /// Website ownership is resolved before queueing so missing or banned site users are skipped instead of being retried forever.
         /// Blank tracking codes remain blank here; queue admission generates one only after semantic comparison requires a mutation.
         /// </remarks>
+        private static GozargahSiteOrderPayload BuildPayloadDraft(
+            long siteOwnerTelegramUserId, long buyerTelegramUserId, string name, string newName, string uuid,
+            string subId, string subLink, string comment, long trafficBytes, int fallbackTrafficGb,
+            int fallbackDurationDays, string trackingCode)
+        {
+            if (siteOwnerTelegramUserId <= 0 || string.IsNullOrWhiteSpace(name)) return null;
+            var metadata = TryReadMetadata(comment);
+            var map = MapPlan(metadata, fallbackTrafficGb);
+            var volumeGb = ResolveVolumeGb(metadata, trafficBytes, fallbackTrafficGb);
+            var durationDays = metadata?.DurationDays ?? fallbackDurationDays;
+            var priceToman = metadata?.PriceToman ?? 0;
+            var buyerText = buyerTelegramUserId > 0 && buyerTelegramUserId != siteOwnerTelegramUserId
+                ? $"; buyer={buyerTelegramUserId}" : string.Empty;
+            return new GozargahSiteOrderPayload
+            {
+                PlanId = map.PlanId, Inbound = map.Inbound, ArrangedPlanId = map.ArrangedPlanId,
+                Name = name, NewName = newName, Uuid = uuid,
+                Comment = $"Synced from Telegram bot; owner={siteOwnerTelegramUserId}{buyerText}; {comment}",
+                Price = priceToman.ToString(CultureInfo.InvariantCulture), Volume = volumeGb,
+                Date = Math.Max(0, durationDays), Username = null, TrackingCode = trackingCode, Sub = subLink,
+                Trial = metadata?.IsTrial == true ? 1 : 0, Bot = 1
+            };
+        }
+
         private async Task<GozargahSiteOrderPayload> BuildPayloadAsync(
             long siteOwnerTelegramUserId,
             long buyerTelegramUserId,
@@ -2012,8 +2057,15 @@ namespace Adminbot.Domain
     /// </summary>
     public class GozargahSiteSyncRetryService : BackgroundService
     {
+        private static readonly SemaphoreSlim WakeSignal = new(0, 1);
         private readonly IServiceProvider _serviceProvider;
         private readonly ILogger<GozargahSiteSyncRetryService> _logger;
+
+        internal static void Wake()
+        {
+            try { WakeSignal.Release(); }
+            catch (SemaphoreFullException) { }
+        }
 
         /// <summary>
         /// Creates the retry worker.
@@ -2035,8 +2087,7 @@ namespace Adminbot.Domain
         /// Each cycle also compacts at most 100 expired terminal events, keeping latest successful state and deletion tombstones.</remarks>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromMinutes(2));
-            while (await timer.WaitForNextTickAsync(stoppingToken))
+            while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
@@ -2045,23 +2096,16 @@ namespace Adminbot.Domain
                     var syncService = scope.ServiceProvider.GetRequiredService<GozargahSiteSyncService>();
                     var events = await db.GozargahSiteSyncEvents
                         .Where(x => x.Status == GozargahSiteSyncStatuses.Pending || x.Status == GozargahSiteSyncStatuses.Failed)
-                        .OrderBy(x => x.CreatedAtUtc)
-                        .Take(25)
-                        .ToListAsync(stoppingToken);
-
-                    foreach (var syncEvent in events)
-                        await syncService.TrySendEventAsync(syncEvent, stoppingToken);
+                        .OrderBy(x => x.CreatedAtUtc).Take(25).ToListAsync(stoppingToken);
+                    foreach (var syncEvent in events) await syncService.TrySendEventAsync(syncEvent, stoppingToken);
                     var compacted = await syncService.CompactTerminalEventsAsync(stoppingToken);
                     if (compacted > 0) _logger.LogInformation("Gozargah terminal outbox compacted. Deleted={Deleted}", compacted);
                 }
-                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Gozargah site sync retry loop failed.");
-                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+                catch (Exception ex) { _logger.LogWarning(ex, "Gozargah site sync retry loop failed."); }
+
+                try { await WakeSignal.WaitAsync(TimeSpan.FromMinutes(2), stoppingToken); }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
             }
         }
     }

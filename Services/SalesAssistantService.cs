@@ -102,34 +102,32 @@ public class SalesAssistantService
     /// </remarks>
     public async Task NOTIFYTENANTSALEASYNC(TenantBotOrder order, long beforeBalance, long afterBalance, CancellationToken CancellationToken)
     {
-        var assistant = GetAssistantBot();
-        if (assistant == null || string.IsNullOrWhiteSpace(assistant.Token))
-            return;
-
-        var Text =
-            "✅ <b>فروش موفق ربات همکار</b>\n\n" +
-            $"🤖 ربات: <code>{Html(order.TenantBotUsername)}</code>\n" +
-            $"🧾 سفارش: <code>{Html(order.OrderId)}</code>\n" +
-            $"👤 مشتری: <code>{order.CustomerTelegramUserId}</code>\n" +
-            $"💰 مبلغ فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
-            $"🏷 هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
-            $"📈 تغییر کیف پول: <code>{Html(order.OwnerWalletDelta.FormatCurrency())}</code>\n" +
-            $"💳 موجودی قبل: <code>{Html(beforeBalance.FormatCurrency())}</code>\n" +
-            $"💳 موجودی بعد: <code>{Html(afterBalance.FormatCurrency())}</code>\n" +
-            $"👤 اکانت: <code>{Html(order.CreatedAccountEmail)}</code>";
-
-        try
-        {
-            await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
-                order.OwnerTelegramUserId,
-                Text,
-                parseMode: ParseMode.Html,
-                cancellationToken: CancellationToken);
-        }
+        try { await SENDTENANTSALEASYNC(order, beforeBalance, afterBalance, CancellationToken); }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "sales assistant sale notification failed. OrderId={OrderId}", order.OrderId);
         }
+    }
+
+    /// <summary>Sends one tenant-sale notification and returns a concrete Telegram message id for durable outbox acknowledgement.</summary>
+    public async Task<int?> SENDTENANTSALEASYNC(TenantBotOrder order, long beforeBalance, long afterBalance, CancellationToken cancellationToken)
+    {
+        var assistant = GetAssistantBot();
+        if (assistant == null || !assistant.Enabled || string.IsNullOrWhiteSpace(assistant.Token)) return null;
+        var text =
+            "✅ <b>فروش ربات همکار انجام شد</b>\n\n" +
+            $"🤖 ربات: <code>{Html(order.TenantBotUsername)}</code>\n" +
+            $"🧾 سفارش: <code>{Html(order.OrderId)}</code>\n" +
+            $"👤 مشتری: <code>{order.CustomerTelegramUserId}</code>\n" +
+            $"💰 مبلغ فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
+            $"📌 هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
+            $"📈 تغییر موجودی: <code>{Html(order.OwnerWalletDelta.FormatCurrency())}</code>\n" +
+            $"💳 موجودی قبل: <code>{Html(beforeBalance.FormatCurrency())}</code>\n" +
+            $"💳 موجودی بعد: <code>{Html(afterBalance.FormatCurrency())}</code>\n" +
+            $"📦 اکانت: <code>{Html(order.CreatedAccountEmail)}</code>";
+        var sent = await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
+            order.OwnerTelegramUserId, text, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
+        return sent.MessageId;
     }
 
     /// <summary>
@@ -604,7 +602,7 @@ public class SalesAssistantService
         catch (ApiRequestException ex) when (ex.ErrorCode == 400 &&
                                             ex.Message.Contains("message is not modified", StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogWarning(ex, "Ignoring unchanged sales-assistant reply markup. messageId={MessageId}", messageId);
+            // Telegram confirms the requested markup is already present; this is a successful no-op.
         }
     }
 

@@ -69,7 +69,8 @@ namespace Adminbot.Domain.Logging
                 ContainsOrdinalIgnoreCase(combined, "UniquePay inquiry retry detail:") ||
                 ContainsOrdinalIgnoreCase(combined, "Tenant UniquePay customer inquiry failed") ||
                 ContainsOrdinalIgnoreCase(combined, "UniquePay HTTP trigger inquiry failed") ||
-                ContainsOrdinalIgnoreCase(combined, "XUI v3 volume reminder scan finished."))
+                ContainsOrdinalIgnoreCase(combined, "XUI v3 volume reminder scan finished.") ||
+                ContainsOrdinalIgnoreCase(combined, "Gozargah site wallet debit response received."))
             {
                 return true;
             }

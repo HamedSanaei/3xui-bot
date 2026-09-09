@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Text;
@@ -8372,6 +8373,7 @@ public class TenantBotService
         }
 
         using var operationTiming = XuiOperationTiming.Start();
+        var fulfillmentCommitted = false;
         using (_botContextAccessor.Push(new BotRuntimeContext
         {
             Config = TENANTCONFIG,
@@ -8471,7 +8473,14 @@ public class TenantBotService
                     CreatedAtUtc = DateTime.UtcNow
                 });
 
+                var notificationQueueStarted = Stopwatch.GetTimestamp();
+                ADDTENANTORDERNOTIFICATIONINTENTSFORCOMMIT(
+                    order,
+                    includeOwnerAccountDetails: string.Equals(Source, "assistant-final", StringComparison.OrdinalIgnoreCase));
                 await _workflow.SaveAsync(CancellationToken);
+                fulfillmentCommitted = true;
+                var notificationQueueElapsed = Stopwatch.GetElapsedTime(notificationQueueStarted);
+                var coreTiming = operationTiming.Snapshot();
 
                 await QueueGozargahSyncBestEffortAsync(
                     "tenant-create",
@@ -8481,16 +8490,21 @@ public class TenantBotService
                         created,
                         order.OrderId,
                         order.TenantBotId,
-                        CancellationToken));
+                        CancellationToken,
+                        deferSend: true));
 
-                await NOTIFYTENANTCUSTOMERSUCCESSASYNC(order, created, CancellationToken);
-                await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, CancellationToken, settlement);
-                await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, settlement.BotWalletBefore, settlement.BotWalletAfter, CancellationToken);
-                LOGTENANTORDER(order, owner, customer, Source, "fulfilled", settlement, operationTiming.Snapshot());
+                var callbackTotal = operationTiming.TotalElapsed;
+                LOGTENANTORDER(order, owner, customer, Source, "fulfilled", settlement, coreTiming, notificationQueueElapsed);
+                LOGTENANTFULFILLMENTTIMING(order, coreTiming, notificationQueueElapsed, callbackTotal);
                 return NowPaymentsSettlementResult.Applied(settlement.BotWalletBefore, settlement.BotWalletAfter);
             }
             catch (Exception ex)
             {
+                if (fulfillmentCommitted)
+                {
+                    _logger.LogWarning(ex, "Tenant post-commit work failed after durable fulfillment. orderId={OrderId} ErrorType={ErrorType}", order.OrderId, ex.GetType().Name);
+                    return NowPaymentsSettlementResult.Applied(order.OwnerBalanceBefore ?? 0, order.OwnerBalanceAfter ?? 0);
+                }
                 order.PaymentStatus = TenantBotOrderStatuses.Failed;
                 order.ErrorMessage = ex.Message;
                 order.UpdatedAtUtc = DateTime.UtcNow;
@@ -8747,8 +8761,8 @@ public class TenantBotService
 
         if (order.IsFulfilled)
         {
-            await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
-            return "این سفارش قبلاً تایید و ساخته شده است؛ مشخصات ذخیره‌شده برای شما از دستیار فروش ارسال شد.";
+            await ENSURETENANTORDERNOTIFICATIONINTENTASYNC(order.Id, TenantOrderNotificationKinds.OwnerAccountDetailsAfterAssistantFinal, CancellationToken);
+            return "این سفارش قبلاً تایید و ساخته شده است؛ ارسال مشخصات ذخیره‌شده برای شما در صف پایدار دستیار فروش قرار گرفت.";
         }
 
         if (!IsTenantTransportAvailable(order.TenantBotId))
@@ -8774,8 +8788,8 @@ public class TenantBotService
         var settlement = await FULFILLPAIDTENANTORDERASYNC(order, "assistant-final", null, null, true, CancellationToken, retryAuthorization);
         if (settlement.Status == NowPaymentsSettlementStatus.Applied || settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded)
         {
-            await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
-            return "رسید تایید شد و سفارش پردازش شد.";
+            await ENSURETENANTORDERNOTIFICATIONINTENTASYNC(order.Id, TenantOrderNotificationKinds.OwnerAccountDetailsAfterAssistantFinal, CancellationToken);
+            return "رسید تایید شد و سفارش پردازش شد؛ ارسال مشخصات برای شما در صف پایدار قرار گرفت.";
         }
 
         if (IsTenantFulfillmentTimeout(order.ErrorMessage))
@@ -10240,7 +10254,8 @@ public class TenantBotService
         string Source,
         string result,
         TenantOwnerWalletSettlementResult settlement = null,
-        XuiOperationTimingSnapshot? timing = null)
+        XuiOperationTimingSnapshot? timing = null,
+        TimeSpan? notificationQueueElapsed = null)
     {
         var settlementText = settlement == null
             ? string.Empty
@@ -10271,10 +10286,31 @@ public class TenantBotService
                       $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>" +
                       BuildTenantOrderErrorLine(order) +
                       (timing.HasValue
-                          ? "\n\n" + XuiOperationTiming.BuildHtmlLines(timing.Value)
+                          ? "\n\n" + (notificationQueueElapsed.HasValue
+                              ? BUILDTENANTFULFILLMENTTIMINGHTML(timing.Value, notificationQueueElapsed.Value)
+                              : XuiOperationTiming.BuildHtmlLines(timing.Value))
                           : string.Empty);
 
         _logger.LogPayment(Message);
+    }
+
+
+    internal static string BUILDTENANTFULFILLMENTTIMINGHTML(XuiOperationTimingSnapshot timing, TimeSpan notificationQueueElapsed)
+    {
+        return $"زمان API پنل: <code>{XuiOperationTiming.Format(timing.PanelApiElapsed)}</code>\n" +
+               $"زمان هسته عملیات تا ثبت پایدار: <code>{XuiOperationTiming.Format(timing.TotalElapsed)}</code>\n" +
+               $"زمان ثبت/صف اعلان‌ها: <code>{XuiOperationTiming.Format(notificationQueueElapsed)}</code>";
+    }
+
+    private void LOGTENANTFULFILLMENTTIMING(TenantBotOrder order, XuiOperationTimingSnapshot coreTiming, TimeSpan notificationQueueElapsed, TimeSpan callbackTotal)
+    {
+        _logger.LogInformation(
+            "Tenant fulfillment timing. orderId={OrderId} panelApiMs={PanelApiMs:0} coreFulfillmentMs={CoreFulfillmentMs:0} notificationQueueMs={NotificationQueueMs:0} callbackTotalMs={CallbackTotalMs:0}",
+            order.OrderId,
+            coreTiming.PanelApiElapsed.TotalMilliseconds,
+            coreTiming.TotalElapsed.TotalMilliseconds,
+            notificationQueueElapsed.TotalMilliseconds,
+            callbackTotal.TotalMilliseconds);
     }
 
     /// <summary>Maps the persisted order gateway to a safe customer-payment label for purchase and renewal logs.</summary>
@@ -10380,6 +10416,77 @@ public class TenantBotService
     /// API, timeout, or cancellation failure while recording the optional website mirror must therefore be isolated;
     /// the existing Gozargah retry worker can recover rows that were persisted successfully.
     /// </remarks>
+    private static IReadOnlyList<string> GETTENANTORDERNOTIFICATIONKINDS(bool includeOwnerAccountDetails)
+    {
+        var kinds = new List<string>
+        {
+            TenantOrderNotificationKinds.CustomerAccountDelivery,
+            TenantOrderNotificationKinds.OwnerSaleNotification,
+            TenantOrderNotificationKinds.SalesAssistantSaleNotification
+        };
+        if (includeOwnerAccountDetails) kinds.Add(TenantOrderNotificationKinds.OwnerAccountDetailsAfterAssistantFinal);
+        return kinds;
+    }
+
+    private void ADDTENANTORDERNOTIFICATIONINTENTSFORCOMMIT(TenantBotOrder order, bool includeOwnerAccountDetails)
+    {
+        var now = DateTime.UtcNow;
+        foreach (var kind in GETTENANTORDERNOTIFICATIONKINDS(includeOwnerAccountDetails))
+            _workflow.Add(new TenantOrderNotification
+            {
+                TenantBotOrderId = order.Id, Kind = kind, Status = TenantOrderNotificationStatuses.Pending,
+                CreatedAtUtc = now, UpdatedAtUtc = now
+            });
+    }
+
+    internal async Task<int> ENSURETENANTORDERNOTIFICATIONINTENTASYNC(int orderId, string kind, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(kind)) return 0;
+        try
+        {
+            return await _workflow.WriteAsync(async db =>
+            {
+                var fulfilled = await db.TenantBotOrders.AsNoTracking().AnyAsync(x => x.Id == orderId && x.IsFulfilled, cancellationToken);
+                if (!fulfilled || await db.TenantOrderNotifications.AsNoTracking().AnyAsync(x => x.TenantBotOrderId == orderId && x.Kind == kind, cancellationToken)) return 0;
+                var now = DateTime.UtcNow;
+                db.TenantOrderNotifications.Add(new TenantOrderNotification { TenantBotOrderId = orderId, Kind = kind, Status = TenantOrderNotificationStatuses.Pending, CreatedAtUtc = now, UpdatedAtUtc = now });
+                return await db.SaveChangesAsync(cancellationToken);
+            }, cancellationToken);
+        }
+        catch (DbUpdateException)
+        {
+            _logger.LogDebug("Tenant notification intent ensure raced with another callback. orderId={OrderId} kind={Kind}", orderId, kind);
+            return 0;
+        }
+    }
+
+    internal async Task<int> ENSURETENANTORDERNOTIFICATIONINTENTSASYNC(
+        int orderId, bool includeOwnerAccountDetails, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _workflow.WriteAsync(async db =>
+            {
+                var order = await db.TenantBotOrders.AsNoTracking().SingleOrDefaultAsync(x => x.Id == orderId, cancellationToken);
+                if (order?.IsFulfilled != true) return 0;
+                var required = GETTENANTORDERNOTIFICATIONKINDS(includeOwnerAccountDetails);
+                var existing = await db.TenantOrderNotifications.AsNoTracking()
+                    .Where(x => x.TenantBotOrderId == orderId).Select(x => x.Kind).ToListAsync(cancellationToken);
+                var missing = required.Except(existing, StringComparer.Ordinal).ToArray();
+                if (missing.Length == 0) return 0;
+                var now = DateTime.UtcNow;
+                db.TenantOrderNotifications.AddRange(missing.Select(kind => new TenantOrderNotification
+                { TenantBotOrderId = orderId, Kind = kind, Status = TenantOrderNotificationStatuses.Pending, CreatedAtUtc = now, UpdatedAtUtc = now }));
+                return await db.SaveChangesAsync(cancellationToken);
+            }, cancellationToken);
+        }
+        catch (DbUpdateException)
+        {
+            _logger.LogDebug("Tenant notification intent ensure raced with another callback. orderId={OrderId}", orderId);
+            return 0;
+        }
+    }
+
     private async Task QueueGozargahSyncBestEffortAsync(string operation, Func<Task> enqueue)
     {
         try
@@ -11324,6 +11431,12 @@ public class TenantBotService
     /// Telegram rejects edits when the new content and markup are IDENTICAL to the current Message.
     /// that is A no-OP from our Business PERSPECTIVE and must not break owned Bot or tenant Bot flows.
     /// </remarks>
+    internal static bool ISTELEGRAMMESSAGENOTMODIFIED(int errorCode, string message) =>
+        errorCode == 400 && message?.Contains("message is not modified", StringComparison.OrdinalIgnoreCase) == true;
+
+    internal static bool ISTELEGRAMEDITTARGETMISSING(int errorCode, string message) =>
+        errorCode == 400 && message?.Contains("message to edit not found", StringComparison.OrdinalIgnoreCase) == true;
+
     private async Task SafeEditMessageTextAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -11343,23 +11456,17 @@ public class TenantBotService
                 replyMarkup: replyMarkup,
                 cancellationToken: cancellationToken);
         }
-        catch (ApiRequestException ex) when (ex.ErrorCode == 400 &&
-                                            (ex.Message.Contains("Message is not modified", StringComparison.OrdinalIgnoreCase) ||
-                                             ex.Message.Contains("Message to edit not found", StringComparison.OrdinalIgnoreCase)))
+        catch (ApiRequestException ex) when (ISTELEGRAMMESSAGENOTMODIFIED(ex.ErrorCode, ex.Message))
         {
-            _logger.LogWarning(
-                ex,
-                "IGNORING non-CRITICAL Telegram edit failure. ChatId={ChatId}, MessageId={MessageId}",
-                chatId,
-                messageId);
+            // Telegram confirms the requested content and markup are already present: semantic success/no-op.
+        }
+        catch (ApiRequestException ex) when (ISTELEGRAMEDITTARGETMISSING(ex.ErrorCode, ex.Message))
+        {
+            _logger.LogWarning(ex, "Telegram message edit target was not found; edit was swallowed to keep the receiver alive. ChatId={ChatId}, MessageId={MessageId}", chatId, messageId);
         }
         catch (ApiRequestException ex)
         {
-            _logger.LogWarning(
-                ex,
-                "Telegram Message edit failed but was SWALLOWED to Keep the receiver ALIVE. ChatId={ChatId}, MessageId={MessageId}",
-                chatId,
-                messageId);
+            _logger.LogWarning(ex, "Telegram Message edit failed but was SWALLOWED to Keep the receiver ALIVE. ChatId={ChatId}, MessageId={MessageId}", chatId, messageId);
         }
     }
 
@@ -12521,11 +12628,17 @@ public class TenantBotService
             CreatedAtUtc = DateTime.UtcNow
         });
 
+        var notificationQueueStarted = Stopwatch.GetTimestamp();
+        ADDTENANTORDERNOTIFICATIONINTENTSFORCOMMIT(
+            order,
+            includeOwnerAccountDetails: string.Equals(source, "assistant-final", StringComparison.OrdinalIgnoreCase));
         await _workflow.SaveAsync(cancellationToken);
+        var notificationQueueElapsed = Stopwatch.GetElapsedTime(notificationQueueStarted);
 
         // Tenant order and ledger are now durable. Releasing the operation lock before this point could allow a
         // second renewal while the first panel mutation was applied but its owner settlement was still incomplete.
         await _renewalOperationStore.MarkSettledAsync(renewalOperation, cancellationToken);
+        var coreTiming = operationTiming.Snapshot();
 
         await QueueGozargahSyncBestEffortAsync(
             "tenant-renew",
@@ -12536,12 +12649,12 @@ public class TenantBotService
                 serverInfo,
                 order.OrderId,
                 order.TenantBotId,
-                cancellationToken));
+                cancellationToken,
+                deferSend: true));
 
-        await SENDTENANTRENEWSUCCESSASYNC(order, renewal, cancellationToken);
-        await NOTIFYTENANTOWNERSUCCESSASYNC(order, owner, customer, cancellationToken, settlement);
-        await _salesAssistantService.NOTIFYTENANTSALEASYNC(order, settlement.BotWalletBefore, settlement.BotWalletAfter, cancellationToken);
-        LOGTENANTORDER(order, owner, customer, source, "renew-fulfilled", settlement, operationTiming.Snapshot());
+        var callbackTotal = operationTiming.TotalElapsed;
+        LOGTENANTORDER(order, owner, customer, source, "renew-fulfilled", settlement, coreTiming, notificationQueueElapsed);
+        LOGTENANTFULFILLMENTTIMING(order, coreTiming, notificationQueueElapsed, callbackTotal);
         return NowPaymentsSettlementResult.Applied(settlement.BotWalletBefore, settlement.BotWalletAfter);
     }
 

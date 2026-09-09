@@ -31,6 +31,8 @@ internal static class GozargahSyncSemantics
     {
         var obj = JObject.Parse(json ?? "{}");
         obj.Remove("tracking_code");
+        // Username is website-owned transport enrichment resolved from get_user immediately before send.
+        obj.Remove("username");
         if (!string.IsNullOrEmpty((string)obj["new_name"])) obj["name"] = obj["new_name"].DeepClone();
         obj["new_name"] = JValue.CreateNull();
         if (obj["comment"]?.Type == JTokenType.String)

@@ -62,6 +62,8 @@ public class UserDbContext : DbContext
     public DbSet<TenantManualPaymentReceipt> TenantManualPaymentReceipts { get; set; }
     /// <summary>Durable outbox intents that relay tenant receipt photos to the Sales Assistant outside update lanes.</summary>
     public DbSet<TenantManualReceiptNotification> TenantManualReceiptNotifications { get; set; }
+    /// <summary>Durable post-fulfillment Telegram delivery intents keyed by tenant order and notification kind.</summary>
+    public DbSet<TenantOrderNotification> TenantOrderNotifications { get; set; }
     /// <summary>
     /// Outbox rows for synchronizing successful XUI operations from the bot to the Gozargah website.
     /// </summary>
@@ -468,6 +470,20 @@ public class UserDbContext : DbContext
             entity.Property(x => x.ClaimToken).HasMaxLength(64);
             entity.Property(x => x.LastError).HasMaxLength(256);
             entity.HasIndex(x => x.ReceiptId).IsUnique();
+            entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc });
+            entity.HasIndex(x => x.LeaseUntilUtc);
+        });
+
+        modelBuilder.Entity<TenantOrderNotification>(entity =>
+        {
+            entity.ToTable("TenantOrderNotifications");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.Kind).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.Status).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.ClaimToken).HasMaxLength(64);
+            entity.Property(x => x.LastError).HasMaxLength(256);
+            entity.HasIndex(x => new { x.TenantBotOrderId, x.Kind }).IsUnique();
             entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc });
             entity.HasIndex(x => x.LeaseUntilUtc);
         });

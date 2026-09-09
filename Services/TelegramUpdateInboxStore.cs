@@ -94,7 +94,7 @@ public sealed partial class TelegramUpdateInboxStore
         {
             await using var db = _factory.CreateDbContext();
             var terminalStatus = failureCode == null ? "completed"
-                : failureCode is "creation_requires_review" or "process_interrupted" ? "completed_with_review"
+                : failureCode is "creation_requires_review" or "process_interrupted" or "execution_cancelled" ? "completed_with_review"
                 : "completed_with_error";
             return await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "running")
                 .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, terminalStatus)

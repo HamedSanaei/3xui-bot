@@ -155,6 +155,7 @@ public class Program
         services.AddScoped<GozargahSiteSyncService>();
         services.AddScoped<OwnedBotNotificationService>();
         services.AddScoped<SalesAssistantService>();
+        services.AddScoped<TenantOrderNotificationDeliveryService>();
         services.AddScoped<TenantBotService>();
         services.AddSingleton<TenantStoreStore>();
         services.AddScoped<TenantAccessService>();
@@ -172,6 +173,7 @@ public class Program
         // Delivery-only workers read users.db outboxes and Telegram; they cannot repeat settlement or XUI mutations.
         services.AddHostedService<PaymentSettlementNotificationWorker>();
         services.AddHostedService<TenantManualReceiptNotificationWorker>();
+        services.AddHostedService<TenantOrderNotificationWorker>();
         services.AddSingleton<UniquePayReconciliationHostedService>();
         services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
 
