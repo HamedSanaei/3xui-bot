@@ -3,66 +3,86 @@ using System.Text.Json;
 
 namespace Adminbot.Utils
 {
-    public class DollarPriceHelper
+    /// <summary>Provides canonical USDT quotes expressed only as IRT/Toman per one USDT.</summary>
+    public interface IDollarPriceQuoteProvider
     {
-        private static readonly HttpClient Client = CreateHttpClient();
+        Task<DollarPriceQuote> NobitexUSDTIRTQuote(CancellationToken cancellationToken = default);
+    }
 
-        public async Task<long> NobitexUSDTIRTPrice()
+    public class DollarPriceHelper : IDollarPriceQuoteProvider
+    {
+        private const decimal MaximumConsensusRatio = 2m;
+        private static readonly HttpClient SharedClient = CreateHttpClient();
+        private readonly HttpClient _client;
+
+        private static readonly QuoteEndpoint[] IrtNativeEndpoints =
         {
-            return (await NobitexUSDTIRTQuote()).Price;
+            new("https://api.nobitex.ir/v3/orderbook/USDTIRT", "nobitex:v3-orderbook-USDTIRT", "USDTIRT", QuoteShape.OrderBook),
+            new("https://apiv2.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:apiv2-market-stats-usdt-irt", "usdt-irt", QuoteShape.Stats),
+            new("https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:market-stats-usdt-irt", "usdt-irt", QuoteShape.Stats)
+        };
+
+        public DollarPriceHelper() : this(SharedClient) { }
+
+        /// <summary>HTTP seam for deterministic tests; production uses the shared configured client.</summary>
+        public DollarPriceHelper(HttpClient client)
+        {
+            _client = client ?? throw new ArgumentNullException(nameof(client));
         }
 
-        public async Task<DollarPriceQuote> NobitexUSDTIRTQuote()
+        public async Task<long> NobitexUSDTIRTPrice(CancellationToken cancellationToken = default)
         {
-            var endpoints = new[]
-            {
-                ("https://apiv2.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=rls", "nobitex:apiv2-market-stats-usdt-rls"),
-                ("https://apiv2.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:apiv2-market-stats-usdt-irt"),
-                ("https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=rls", "nobitex:market-stats-usdt-rls"),
-                ("https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:market-stats-usdt-irt"),
-                ("https://api.nobitex.ir/v3/orderbook/USDTIRT", "nobitex:v3-orderbook-USDTIRT")
-            };
+            return (await NobitexUSDTIRTQuote(cancellationToken)).Price;
+        }
 
-            foreach (var (url, source) in endpoints)
-            {
-                var quote = await TryReadQuoteAsync(url, source);
-                if (quote.Price > 0)
-                    return quote;
-            }
-
-            return DollarPriceQuote.Empty;
+        /// <summary>
+        /// Reads only IRT-native Nobitex markets. DollarPriceQuote.Price always means Toman/IRT per one USDT.
+        /// Ambiguous RLS-labelled endpoints are intentionally excluded from this financial path.
+        /// </summary>
+        public async Task<DollarPriceQuote> NobitexUSDTIRTQuote(CancellationToken cancellationToken = default)
+        {
+            var tasks = IrtNativeEndpoints.Select(endpoint => TryReadIrtQuoteAsync(endpoint, cancellationToken)).ToArray();
+            var quotes = (await Task.WhenAll(tasks)).Where(quote => quote.Price > 0).ToList();
+            return SelectConsensus(quotes);
         }
 
         private static HttpClient CreateHttpClient()
         {
-            var client = new HttpClient
-            {
-                Timeout = TimeSpan.FromSeconds(10)
-            };
+            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
             client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Adminbot/1.1.0");
             client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
             return client;
         }
 
-        private static async Task<DollarPriceQuote> TryReadQuoteAsync(string url, string source)
+        private async Task<DollarPriceQuote> TryReadIrtQuoteAsync(QuoteEndpoint endpoint, CancellationToken cancellationToken)
         {
             try
             {
-                using var response = await Client.GetAsync(url);
+                using var response = await _client.GetAsync(endpoint.Url, cancellationToken);
                 response.EnsureSuccessStatusCode();
-
-                var responseBody = await response.Content.ReadAsStringAsync();
+                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
                 using var document = JsonDocument.Parse(responseBody);
-                var price = ExtractPrice(document.RootElement);
+                var rawPrice = endpoint.Shape == QuoteShape.OrderBook
+                    ? ExtractOrderBookTopPrice(document.RootElement)
+                    : ExtractStatsIrtPrice(document.RootElement);
 
-                if (price <= 0)
+                if (rawPrice <= 0)
                     return DollarPriceQuote.Empty;
 
                 return new DollarPriceQuote
                 {
-                    Price = price,
-                    Source = source
+                    Price = rawPrice,
+                    RawPrice = rawPrice,
+                    NormalizedPriceIrt = rawPrice,
+                    Source = endpoint.Source,
+                    SourcePair = endpoint.Pair,
+                    SourceUnit = "IRT",
+                    Normalization = "irt-native:none"
                 };
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch
             {
@@ -70,154 +90,149 @@ namespace Adminbot.Utils
             }
         }
 
-        private static long ExtractPrice(JsonElement root)
+        internal static DollarPriceQuote SelectConsensus(IReadOnlyList<DollarPriceQuote> input)
         {
-            var price = ExtractStatsPrice(root);
-            if (price > 0)
-                return price;
+            var quotes = input?.Where(quote => quote != null && quote.Price > 0 &&
+                string.Equals(quote.SourceUnit, "IRT", StringComparison.OrdinalIgnoreCase)).ToList()
+                ?? new List<DollarPriceQuote>();
 
-            price = ExtractOrderBookTopPrice(root);
-            if (price > 0)
-                return price;
+            if (quotes.Count == 0)
+                return DollarPriceQuote.Empty;
+            if (quotes.Count == 1)
+            {
+                quotes[0].ConsensusSourceCount = 1;
+                return quotes[0];
+            }
 
-            return FindFirstPriceByName(root);
+            List<DollarPriceQuote> bestCluster = null;
+            var bestIndex = int.MaxValue;
+            for (var index = 0; index < quotes.Count; index++)
+            {
+                var candidate = quotes[index];
+                var cluster = quotes.Where(other => IsSameScale(candidate.Price, other.Price)).ToList();
+                if (bestCluster == null || cluster.Count > bestCluster.Count ||
+                    cluster.Count == bestCluster.Count && index < bestIndex)
+                {
+                    bestCluster = cluster;
+                    bestIndex = index;
+                }
+            }
+
+            if (bestCluster == null || bestCluster.Count < 2)
+            {
+                foreach (var quote in quotes)
+                    LogRejectedQuote(quote, "no_cross_source_consensus");
+                return DollarPriceQuote.Empty;
+            }
+
+            foreach (var rejected in quotes.Except(bestCluster))
+                LogRejectedQuote(rejected, "factor_of_ten_or_scale_disagreement");
+
+            var sorted = bestCluster.Select(quote => quote.Price).OrderBy(price => price).ToArray();
+            var midpoint = sorted.Length % 2 == 1
+                ? sorted[sorted.Length / 2]
+                : (sorted[sorted.Length / 2 - 1] + sorted[sorted.Length / 2]) / 2m;
+            var chosen = bestCluster
+                .Select((quote, index) => new { Quote = quote, Index = index, Distance = Math.Abs(quote.Price - midpoint) })
+                .OrderBy(item => item.Distance)
+                .ThenBy(item => item.Index)
+                .First().Quote;
+            chosen.ConsensusSourceCount = bestCluster.Count;
+            return chosen;
         }
 
-        private static long ExtractStatsPrice(JsonElement root)
+        private static bool IsSameScale(long left, long right)
+        {
+            if (left <= 0 || right <= 0) return false;
+            var high = Math.Max(left, right);
+            var low = Math.Min(left, right);
+            return (decimal)high / low <= MaximumConsensusRatio;
+        }
+
+        private static void LogRejectedQuote(DollarPriceQuote quote, string reason)
+        {
+            Console.WriteLine(
+                $"[NobitexRate] rejected source={quote.Source ?? "unknown"}, raw={quote.RawPrice}, normalizedIrt={quote.Price}, reason={reason}");
+        }
+
+        private static long ExtractStatsIrtPrice(JsonElement root)
         {
             if (!root.TryGetProperty("stats", out var stats) || stats.ValueKind != JsonValueKind.Object)
                 return 0;
 
-            foreach (var pairKey in new[] { "usdt-rls", "usdt-irt", "USDT-RLS", "USDT-IRT" })
-            {
-                if (!stats.TryGetProperty(pairKey, out var pair) || pair.ValueKind != JsonValueKind.Object)
-                    continue;
+            var pair = stats.EnumerateObject()
+                .FirstOrDefault(property => property.Name.Equals("usdt-irt", StringComparison.OrdinalIgnoreCase));
+            if (pair.Value.ValueKind != JsonValueKind.Object)
+                return 0;
 
-                var isRialPair = pairKey.Contains("rls", StringComparison.OrdinalIgnoreCase);
-                foreach (var field in new[] { "latest", "dayClose", "bestSell", "bestBuy", "lastTradePrice" })
-                {
-                    if (pair.TryGetProperty(field, out var token) && TryReadLong(token, out var value))
-                        return isRialPair
-                            ? Math.Max(1, value / 10)
-                            : value;
-                }
-            }
-
+            foreach (var field in new[] { "latest", "dayClose", "bestSell", "bestBuy", "lastTradePrice" })
+                if (pair.Value.TryGetProperty(field, out var token) && TryReadLong(token, out var value))
+                    return value;
             return 0;
         }
 
         private static long ExtractOrderBookTopPrice(JsonElement root)
         {
             foreach (var field in new[] { "lastTradePrice", "last_trade_price", "latest", "lastPrice", "close" })
-            {
                 if (root.TryGetProperty(field, out var token) && TryReadLong(token, out var value))
                     return value;
-            }
 
             foreach (var bookField in new[] { "asks", "bids" })
             {
                 if (!root.TryGetProperty(bookField, out var book) || book.ValueKind != JsonValueKind.Array)
                     continue;
-
                 var firstRow = book.EnumerateArray().FirstOrDefault();
                 if (firstRow.ValueKind == JsonValueKind.Array)
                 {
                     var firstValue = firstRow.EnumerateArray().FirstOrDefault();
-                    if (TryReadLong(firstValue, out var value))
-                        return value;
+                    if (TryReadLong(firstValue, out var value)) return value;
                 }
                 else if (firstRow.ValueKind == JsonValueKind.Object)
                 {
                     foreach (var field in new[] { "price", "rate" })
-                    {
                         if (firstRow.TryGetProperty(field, out var token) && TryReadLong(token, out var value))
                             return value;
-                    }
                 }
             }
-
             return 0;
-        }
-
-        private static long FindFirstPriceByName(JsonElement element)
-        {
-            if (element.ValueKind == JsonValueKind.Object)
-            {
-                foreach (var property in element.EnumerateObject())
-                {
-                    if (IsPriceField(property.Name) && TryReadLong(property.Value, out var directValue))
-                        return directValue;
-
-                    var nestedValue = FindFirstPriceByName(property.Value);
-                    if (nestedValue > 0)
-                        return nestedValue;
-                }
-            }
-            else if (element.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var item in element.EnumerateArray())
-                {
-                    var nestedValue = FindFirstPriceByName(item);
-                    if (nestedValue > 0)
-                        return nestedValue;
-                }
-            }
-
-            return 0;
-        }
-
-        private static bool IsPriceField(string fieldName)
-        {
-            return fieldName.Equals("lastTradePrice", StringComparison.OrdinalIgnoreCase) ||
-                   fieldName.Equals("last_trade_price", StringComparison.OrdinalIgnoreCase) ||
-                   fieldName.Equals("latest", StringComparison.OrdinalIgnoreCase) ||
-                   fieldName.Equals("dayClose", StringComparison.OrdinalIgnoreCase) ||
-                   fieldName.Equals("bestSell", StringComparison.OrdinalIgnoreCase) ||
-                   fieldName.Equals("bestBuy", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool TryReadLong(JsonElement token, out long value)
         {
             value = 0;
-
             if (token.ValueKind == JsonValueKind.Number)
             {
-                if (token.TryGetInt64(out value))
-                    return value > 0;
-
+                if (token.TryGetInt64(out value)) return value > 0;
                 if (token.TryGetDecimal(out var decimalValue))
                 {
                     value = decimal.ToInt64(decimal.Round(decimalValue, 0, MidpointRounding.AwayFromZero));
                     return value > 0;
                 }
             }
-
-            if (token.ValueKind != JsonValueKind.String)
-                return false;
-
-            var text = token.GetString();
-            if (string.IsNullOrWhiteSpace(text))
-                return false;
-
-            text = text.Trim().Replace(",", string.Empty);
-            if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
-                return value > 0;
-
-            if (decimal.TryParse(text, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsedDecimal))
-            {
-                value = decimal.ToInt64(decimal.Round(parsedDecimal, 0, MidpointRounding.AwayFromZero));
-                return value > 0;
-            }
-
-            return false;
+            if (token.ValueKind != JsonValueKind.String) return false;
+            var text = token.GetString()?.Trim().Replace(",", string.Empty);
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value)) return value > 0;
+            if (!decimal.TryParse(text, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsed)) return false;
+            value = decimal.ToInt64(decimal.Round(parsed, 0, MidpointRounding.AwayFromZero));
+            return value > 0;
         }
+
+        private sealed record QuoteEndpoint(string Url, string Source, string Pair, QuoteShape Shape);
+        private enum QuoteShape { OrderBook, Stats }
     }
 
     public class DollarPriceQuote
     {
-        public static DollarPriceQuote Empty { get; } = new DollarPriceQuote();
-
+        public static DollarPriceQuote Empty => new();
+        /// <summary>Canonical price: IRT/Toman per one USDT. Never raw IRR/RLS.</summary>
         public long Price { get; set; }
+        public long RawPrice { get; set; }
+        public long NormalizedPriceIrt { get; set; }
         public string Source { get; set; }
+        public string SourcePair { get; set; }
+        public string SourceUnit { get; set; }
+        public string Normalization { get; set; }
+        public int ConsensusSourceCount { get; set; }
     }
 }

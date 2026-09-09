@@ -263,6 +263,12 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   payment row; invalid tenant renewal callbacks preserve the existing pending order but create no provider/payment row.
 - NOWPayments creation uses the same live global snapshot and, for tenant storefronts, `TenantNowPaymentsEnabled`;
   IPN validation and settlement of existing crypto invoices continue when new creation is disabled.
+- `Utils/DollarPriceHelper.cs` is the single market-unit normalization boundary for NOWPayments: every accepted quote is
+  **IRT/Toman per 1 USDT**. The active Nobitex priority is `v3/orderbook/USDTIRT`, then API v2 IRT stats, then API IRT
+  stats; ambiguous RLS-labelled markets are excluded. Multiple live IRT sources use scale consensus so a factor-of-ten
+  outlier is rejected. `Domain/NowPayments.cs` never infers Rial/Toman from numeric magnitude; legacy fallback values are
+  normalized once using explicit `nowpaymentUsdIrtFallbackPriceUnit` (missing unit remains backward-compatible `rial`).
+  If neither a canonical live quote nor a valid configured fallback exists, invoice/payment creation fails before HTTP POST.
 - Tetraminator is the second rial gateway for owned wallet charges and direct tenant purchase/renew orders. Its
   `TetraminatorPaymentInfos` rows live only in `users.db`; `OrderId` and non-null `PayId` are unique. The public GET
   callback is unsigned and therefore only triggers an authoritative `GET /payment/inquiry/{pay_id}`. Settlement

@@ -109,6 +109,11 @@ namespace Adminbot.Domain
         public string NowpaymentPriceCurrency { get; set; } = "usdtbsc";
         public string NowpaymentPayCurrency { get; set; } = "trx";
         public long NowpaymentUsdIrtFallbackPrice { get; set; } = 1800000;
+        /// <summary>
+        /// Explicit unit for the legacy NOWPayments USDT fallback. The default is Rial so an existing
+        /// configuration containing 1800000 without this new key retains its historical 180000 Toman meaning.
+        /// </summary>
+        public string NowpaymentUsdIrtFallbackPriceUnit { get; set; } = "rial";
         public string XuiApiVersionMode { get; set; } = "auto";
         public string XuiV3ApiBaseUrl { get; set; }
         public string XuiV3ApiRootPath { get; set; } = string.Empty;

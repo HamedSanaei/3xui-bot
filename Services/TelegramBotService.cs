@@ -6627,6 +6627,24 @@ public class TelegramBotService
 
                         await _workflow.SaveAsync();
                     }
+                    catch (NowPaymentsRateUnavailableException ex)
+                    {
+                        Console.WriteLine("[NOWPayments] Canonical exchange rate unavailable; create request was not sent.");
+                        payment.Result = JsonConvert.SerializeObject(new
+                        {
+                            error = "rate_unavailable",
+                            message = ex.Message,
+                            orderId = payment.OrderId,
+                            createdAt = DateTime.UtcNow
+                        });
+                        await _workflow.SaveAsync();
+
+                        await botClient.CustomSendTextMessageAsync(
+                            chatId: message.Chat.Id,
+                            text: "??? ??????? ??? ??????? ?????? ???? ????? ???? ? ??? ??????? ????? ???. ????? ??? ????? ???? ?????? ???? ????.",
+                            replyMarkup: MainReplyMarkupKeyboardFa(),
+                            cancellationToken: cancellationToken);
+                    }
                     catch (NowPaymentsApiException ex)
                     {
                         Console.WriteLine("[NOWPayments] API exception while creating payment:");

@@ -31,6 +31,8 @@
   "nowpaymentSuccessUrl": "https://example.com/payment-success",
   "nowpaymentCancelUrl": "https://example.com/payment-cancel",
   "nowpaymentIpnUrl": "https://example.com/nowpayments-ipn",
+  "nowpaymentUsdIrtFallbackPrice": 2350000,
+  "nowpaymentUsdIrtFallbackPriceUnit": "rial",
   "hooshPayEnabled": false,
   "hooshPayApiKey": "",
   "hooshPayIpnSecretKey": "",

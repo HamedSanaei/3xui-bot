@@ -202,17 +202,27 @@ namespace Adminbot.Domain
 
         private readonly AppConfig _appConfig;
         private readonly HttpClient _httpClient;
+        private readonly IDollarPriceQuoteProvider _dollarPriceQuoteProvider;
         private string _cachedJwtToken;
 
         public NowPayments(IConfiguration configuration)
-            : this(configuration, new HttpClient { BaseAddress = BaseApiUri })
+            : this(configuration, new HttpClient { BaseAddress = BaseApiUri }, new DollarPriceHelper())
         {
         }
 
         public NowPayments(IConfiguration configuration, HttpClient httpClient)
+            : this(configuration, httpClient, new DollarPriceHelper())
         {
-            _appConfig = configuration.Get<AppConfig>();
-            _httpClient = httpClient;
+        }
+
+        internal NowPayments(
+            IConfiguration configuration,
+            HttpClient httpClient,
+            IDollarPriceQuoteProvider dollarPriceQuoteProvider)
+        {
+            _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
+            _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+            _dollarPriceQuoteProvider = dollarPriceQuoteProvider ?? throw new ArgumentNullException(nameof(dollarPriceQuoteProvider));
             _httpClient.BaseAddress ??= BaseApiUri;
         }
 
@@ -285,9 +295,10 @@ namespace Adminbot.Domain
         {
             priceCurrency ??= _appConfig.NowpaymentPriceCurrency;
 
-            var conversion = await ConvertTomanToPriceCurrencyAsync(tomanAmount, priceCurrency);
+            var conversion = await ConvertTomanToPriceCurrencyAsync(tomanAmount, priceCurrency, cancellationToken);
             var priceAmount = conversion.PriceAmount;
-            Console.WriteLine($"[NOWPayments] calculated invoice amount: toman={tomanAmount}, priceCurrency={priceCurrency}, amount={priceAmount}, payCurrency={(payCurrency ?? "all")}");
+            Console.WriteLine(
+                $"[NOWPayments] rate conversion: tomanAmount={tomanAmount}, normalizedUsdtIrtPrice={conversion.UsdtIrtPrice}, source={conversion.PriceSource}, sourceUnit={conversion.PriceUnit}, fallbackUsed={conversion.UsedFallbackPrice}, calculatedPriceAmount={priceAmount}, priceCurrency={priceCurrency}, payCurrency={(payCurrency ?? "all")}");
 
             var request = new NowPaymentsCreateInvoiceRequest
             {
@@ -323,9 +334,10 @@ namespace Adminbot.Domain
             priceCurrency ??= _appConfig.NowpaymentPriceCurrency;
             payCurrency ??= _appConfig.NowpaymentPayCurrency;
 
-            var conversion = await ConvertTomanToPriceCurrencyAsync(tomanAmount, priceCurrency);
+            var conversion = await ConvertTomanToPriceCurrencyAsync(tomanAmount, priceCurrency, cancellationToken);
             var priceAmount = conversion.PriceAmount;
-            Console.WriteLine($"[NOWPayments] calculated price amount: toman={tomanAmount}, priceCurrency={priceCurrency}, amount={priceAmount}, payCurrency={payCurrency}");
+            Console.WriteLine(
+                $"[NOWPayments] rate conversion: tomanAmount={tomanAmount}, normalizedUsdtIrtPrice={conversion.UsdtIrtPrice}, source={conversion.PriceSource}, sourceUnit={conversion.PriceUnit}, fallbackUsed={conversion.UsedFallbackPrice}, calculatedPriceAmount={priceAmount}, priceCurrency={priceCurrency}, payCurrency={payCurrency}");
 
             var request = new NowPaymentsCreatePaymentRequest
             {
@@ -395,42 +407,101 @@ namespace Adminbot.Domain
             return match.ToObject<NowPaymentsPaymentStatusResult>();
         }
 
-        private async Task<NowPaymentsPriceConversionResult> ConvertTomanToPriceCurrencyAsync(long tomanAmount, string priceCurrency)
+        /// <summary>
+        /// Converts Toman using one canonical contract: every internal USDT quote is IRT/Toman per one USDT.
+        /// No numeric magnitude is used to infer Rial versus Toman.
+        /// </summary>
+        private async Task<NowPaymentsPriceConversionResult> ConvertTomanToPriceCurrencyAsync(
+            long tomanAmount,
+            string priceCurrency,
+            CancellationToken cancellationToken)
         {
             if (tomanAmount <= 0)
                 throw new ArgumentException("Amount must be greater than zero.", nameof(tomanAmount));
 
-            var quote = await new DollarPriceHelper().NobitexUSDTIRTQuote();
-            long usdtIrtPrice = quote.Price;
+            var quote = await _dollarPriceQuoteProvider.NobitexUSDTIRTQuote(cancellationToken);
+            var priceTomanPerUsdt = 0L;
             var usedFallback = false;
-            var priceSource = quote.Source;
-            if (usdtIrtPrice <= 0)
+            var priceSource = quote?.Source;
+
+            if (quote?.Price > 0 && string.Equals(quote.SourceUnit, "IRT", StringComparison.OrdinalIgnoreCase))
             {
-                usdtIrtPrice = _appConfig.NowpaymentUsdIrtFallbackPrice > 0
-                    ? _appConfig.NowpaymentUsdIrtFallbackPrice
-                    : 1800000;
+                priceTomanPerUsdt = quote.Price;
+            }
+            else
+            {
+                if (quote?.Price > 0)
+                {
+                    Console.WriteLine(
+                        $"[NOWPayments] rejected source={quote.Source ?? "unknown"}, raw={quote.RawPrice}, normalizedCandidate={quote.Price}, rejectionReason=non_canonical_unit");
+                }
+
+                priceTomanPerUsdt = NormalizeConfiguredFallbackPriceIrt(
+                    _appConfig.NowpaymentUsdIrtFallbackPrice,
+                    _appConfig.NowpaymentUsdIrtFallbackPriceUnit);
+
+                if (priceTomanPerUsdt <= 0)
+                {
+                    Console.WriteLine(
+                        $"[NOWPayments] rate unavailable: liveSource={(quote?.Source ?? "none")}, fallbackUnit={_appConfig.NowpaymentUsdIrtFallbackPriceUnit ?? "missing"}, rejectionReason=no_trustworthy_canonical_rate");
+                    throw new NowPaymentsRateUnavailableException();
+                }
+
                 usedFallback = true;
                 priceSource = "config:fallback";
-                Console.WriteLine($"[NOWPayments] fallback USD/IRT price from config: {usdtIrtPrice}");
+                Console.WriteLine(
+                    $"[NOWPayments] using normalized fallback: raw={_appConfig.NowpaymentUsdIrtFallbackPrice}, unit={NormalizeFallbackUnitName(_appConfig.NowpaymentUsdIrtFallbackPriceUnit)}, normalizedIrt={priceTomanPerUsdt}");
             }
 
-            var priceIsRial = usdtIrtPrice >= 200000;
-            decimal stableAmount = priceIsRial
-                ? (tomanAmount * 10m) / usdtIrtPrice
-                : tomanAmount / (decimal)usdtIrtPrice;
-
-            stableAmount = Math.Round(stableAmount, 6, MidpointRounding.AwayFromZero);
-            if (stableAmount < 0.000001m)
-                stableAmount = 0.000001m;
-
-            Console.WriteLine($"[NOWPayments] converted toman to {priceCurrency}: {stableAmount}");
+            var stableAmount = ConvertTomanUsingCanonicalIrtPrice(tomanAmount, priceTomanPerUsdt);
             return new NowPaymentsPriceConversionResult
             {
                 PriceAmount = stableAmount,
-                UsdtIrtPrice = usdtIrtPrice,
-                PriceSource = priceSource,
+                UsdtIrtPrice = priceTomanPerUsdt,
+                PriceSource = string.IsNullOrWhiteSpace(priceSource) ? "unknown" : priceSource,
+                PriceUnit = "IRT",
                 UsedFallbackPrice = usedFallback,
-                PriceIsRial = priceIsRial
+                PriceIsRial = false
+            };
+        }
+
+        internal static decimal ConvertTomanUsingCanonicalIrtPrice(long tomanAmount, long priceTomanPerUsdt)
+        {
+            if (tomanAmount <= 0)
+                throw new ArgumentException("Amount must be greater than zero.", nameof(tomanAmount));
+            if (priceTomanPerUsdt <= 0)
+                throw new NowPaymentsRateUnavailableException();
+
+            var amount = Math.Round(
+                tomanAmount / (decimal)priceTomanPerUsdt,
+                6,
+                MidpointRounding.AwayFromZero);
+            return amount < 0.000001m ? 0.000001m : amount;
+        }
+
+        internal static long NormalizeConfiguredFallbackPriceIrt(long configuredPrice, string configuredUnit)
+        {
+            if (configuredPrice <= 0)
+                return 0;
+
+            return NormalizeFallbackUnitName(configuredUnit) switch
+            {
+                "rial" => decimal.ToInt64(decimal.Round(configuredPrice / 10m, 0, MidpointRounding.AwayFromZero)),
+                "irt" => configuredPrice,
+                _ => 0
+            };
+        }
+
+        private static string NormalizeFallbackUnitName(string configuredUnit)
+        {
+            if (string.IsNullOrWhiteSpace(configuredUnit))
+                return "rial";
+
+            return configuredUnit.Trim().ToLowerInvariant() switch
+            {
+                "rial" or "irr" or "rls" => "rial",
+                "irt" or "toman" or "toman/irt" => "irt",
+                _ => "invalid"
             };
         }
 
@@ -666,8 +737,21 @@ namespace Adminbot.Domain
         public decimal PriceAmount { get; set; }
         public long UsdtIrtPrice { get; set; }
         public string PriceSource { get; set; }
+        public string PriceUnit { get; set; } = "IRT";
         public bool UsedFallbackPrice { get; set; }
+        /// <summary>Compatibility diagnostic only. Canonical conversions are always IRT, so this is always false.</summary>
         public bool PriceIsRial { get; set; }
+    }
+
+    /// <summary>
+    /// Fail-closed financial error raised before a create request when no canonical live quote or valid fallback exists.
+    /// </summary>
+    public sealed class NowPaymentsRateUnavailableException : InvalidOperationException
+    {
+        public NowPaymentsRateUnavailableException()
+            : base("The crypto exchange rate is temporarily unavailable. No payment request was created.")
+        {
+        }
     }
 
     public class NowPaymentsSettlementService

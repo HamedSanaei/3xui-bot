@@ -6590,6 +6590,21 @@ public class TenantBotService
                 cancellationToken: CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "فاکتور پرداخت ساخته شد.", cancellationToken: CancellationToken);
         }
+        catch (NowPaymentsRateUnavailableException ex)
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Failed;
+            order.ErrorMessage = ex.Message;
+            payment.ErrorMessage = ex.Message;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(CancellationToken);
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                "??? ??????? ??? ??????? ?????? ???? ????? ???? ? ??? ??????? ????? ???. ????? ??? ????? ???? ?????? ???? ????.",
+                showAlert: true,
+                cancellationToken: CancellationToken);
+        }
         catch (Exception ex)
         {
             order.PaymentStatus = TenantBotOrderStatuses.Failed;
@@ -6877,6 +6892,21 @@ public class TenantBotService
                 replyMarkup: BuildTenantPaymentKeyboard(order, payment.InvoiceUrl),
                 cancellationToken: cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور پرداخت ساخته شد.", cancellationToken: cancellationToken);
+        }
+        catch (NowPaymentsRateUnavailableException ex)
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Failed;
+            order.ErrorMessage = ex.Message;
+            payment.ErrorMessage = ex.Message;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(cancellationToken);
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "??? ??????? ??? ??????? ?????? ???? ????? ???? ? ??? ??????? ????? ???. ????? ??? ????? ???? ?????? ???? ????.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
