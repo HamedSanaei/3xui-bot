@@ -4,6 +4,7 @@
   "gozargahSiteSyncRetentionDays": 30,
   "tenantOrderNotificationRetentionDays": 30,
   "tenantMinimumSiteWalletToman": 200000,
+  "tenantUnderfundedCustomerAttemptNotificationCooldownMinutes": 15,
   "bots": [
     {
       "id": "owned-brand-bot",

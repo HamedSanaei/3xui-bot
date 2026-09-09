@@ -28,6 +28,9 @@ namespace Adminbot.Domain
         /// through the website-based debt gate. A missing configuration key keeps the documented default.
         /// </remarks>
         public long TenantMinimumSiteWalletToman { get; set; } = 200_000;
+        /// <summary>Persisted cooldown, in minutes, between owner alerts for customer attempts on an underfunded storefront.</summary>
+        /// <remarks>Must be positive. The transition alert is independent and is not suppressed by this cooldown.</remarks>
+        public int TenantUnderfundedCustomerAttemptNotificationCooldownMinutes { get; set; } = 15;
         public BotInstanceConfig SalesAssistantBot { get; set; } = new();
         public string BotToken { get; set; }
         public string IpnSecretKey { get; set; }

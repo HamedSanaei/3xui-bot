@@ -693,11 +693,16 @@ public class TenantBotService
         if (update.Message != null || update.CallbackQuery != null)
         {
             var storefront = await GetCurrentTenantBotAsync(CancellationToken);
-            var restriction = storefront?.OwnerTelegramUserId is long ownerId
-                ? await _serviceProvider.GetRequiredService<TenantAccessService>().EvaluateAsync(ownerId, CancellationToken)
-                : "فروشگاه در حال حاضر غیرفعال است.";
+            TenantAccessEvaluation accessEvaluation = null;
+            if (storefront?.OwnerTelegramUserId is long ownerId)
+                accessEvaluation = await _serviceProvider.GetRequiredService<TenantAccessService>()
+                    .EvaluateDecisionAsync(ownerId, CancellationToken);
+            var restriction = accessEvaluation?.RestrictionMessage ??
+                              (storefront?.OwnerTelegramUserId is null ? "فروشگاه در حال حاضر غیرفعال است." : null);
             if (restriction == null && storefront?.Enabled != true)
                 restriction = "فروشگاه در حال حاضر غیرفعال است.";
+            if (storefront != null && accessEvaluation != null)
+                await OBSERVETENANTSTOREFRONTACCESSBESTEFFORTASYNC(storefront, accessEvaluation, CancellationToken);
             if (restriction != null)
             {
                 if (update.CallbackQuery is { } blockedCallback)
@@ -8479,6 +8484,7 @@ public class TenantBotService
                     includeOwnerAccountDetails: string.Equals(Source, "assistant-final", StringComparison.OrdinalIgnoreCase));
                 await _workflow.SaveAsync(CancellationToken);
                 fulfillmentCommitted = true;
+                await OBSERVETENANTFUNDINGSETTLEMENTBESTEFFORTASYNC(tenant, settlement, CancellationToken);
                 var notificationQueueElapsed = Stopwatch.GetElapsedTime(notificationQueueStarted);
                 var coreTiming = operationTiming.Snapshot();
 
@@ -10453,7 +10459,7 @@ public class TenantBotService
                 return await db.SaveChangesAsync(cancellationToken);
             }, cancellationToken);
         }
-        catch (DbUpdateException ex)
+        catch (DbUpdateException)
         {
             // Only a provable concurrent unique-key insert is benign. Re-read with a fresh short-lived context:
             // if the required (orderId, kind) row now exists the race lost, otherwise the persistence really
@@ -10489,7 +10495,7 @@ public class TenantBotService
                 return await db.SaveChangesAsync(cancellationToken);
             }, cancellationToken);
         }
-        catch (DbUpdateException ex)
+        catch (DbUpdateException)
         {
             // Only benign when every required kind now exists after a fresh read; a real persistence failure
             // (disk full, schema mismatch, unrelated constraint) must propagate so callers never report
@@ -10503,6 +10509,59 @@ public class TenantBotService
                 return 0;
             }
             throw;
+        }
+    }
+
+    internal static bool CANQUEUEUNDERFUNDEDALERT(BotInstance tenant) =>
+        tenant != null && string.Equals(tenant.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) &&
+        tenant.Enabled && !string.IsNullOrWhiteSpace(tenant.Token) && tenant.OwnerTelegramUserId > 0;
+
+    private async Task OBSERVETENANTSTOREFRONTACCESSBESTEFFORTASYNC(
+        BotInstance tenant, TenantAccessEvaluation evaluation, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var canAlert = CANQUEUEUNDERFUNDEDALERT(tenant);
+            await _serviceProvider.GetRequiredService<TenantStorefrontFundingAlertService>().ObserveAsync(
+                tenant,
+                evaluation,
+                customerAttempt: canAlert && evaluation.Decision == TenantAccessDecision.InsufficientFunding,
+                allowUnderfundedAlerts: canAlert,
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Tenant storefront funding alert queue failed. tenantBotId={TenantBotId} ErrorType={ErrorType}",
+                tenant?.Id, ex.GetType().Name);
+        }
+    }
+
+    private async Task OBSERVETENANTFUNDINGSETTLEMENTBESTEFFORTASYNC(
+        BotInstance tenant, TenantOwnerWalletSettlementResult settlement, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var access = _serviceProvider.GetRequiredService<TenantAccessService>();
+            var alerts = _serviceProvider.GetRequiredService<TenantStorefrontFundingAlertService>();
+            var before = access.ClassifyFundingSnapshot(
+                settlement.BotWalletBefore,
+                settlement.SiteWalletBefore?.IsConnected == true,
+                settlement.SiteWalletBefore?.WalletToman);
+            var after = access.ClassifyFundingSnapshot(
+                settlement.BotWalletAfter,
+                settlement.SiteWalletAfter?.IsConnected == true,
+                settlement.SiteWalletAfter?.WalletToman);
+            var canAlert = CANQUEUEUNDERFUNDEDALERT(tenant);
+            if (before.Decision == TenantAccessDecision.Allowed && after.Decision == TenantAccessDecision.InsufficientFunding)
+                await alerts.ObserveAsync(tenant, before, false, canAlert, cancellationToken);
+            await alerts.ObserveAsync(tenant, after, false, canAlert, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Tenant post-settlement funding observation failed. tenantBotId={TenantBotId} ErrorType={ErrorType}",
+                tenant?.Id, ex.GetType().Name);
         }
     }
 
@@ -12661,6 +12720,7 @@ public class TenantBotService
             // Tenant order and ledger are now durable. Releasing the operation lock before this point could allow a
             // second renewal while the first panel mutation was applied but its owner settlement was still incomplete.
             await MarkTenantRenewalOperationSettledAfterCommitAsync(renewalOperation, cancellationToken);
+            await OBSERVETENANTFUNDINGSETTLEMENTBESTEFFORTASYNC(tenant, settlement, cancellationToken);
             var coreTiming = operationTiming.Snapshot();
 
             await QueueGozargahSyncBestEffortAsync(

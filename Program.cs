@@ -160,6 +160,8 @@ public class Program
         services.AddScoped<TenantBotService>();
         services.AddSingleton<TenantStoreStore>();
         services.AddScoped<TenantAccessService>();
+        services.AddScoped<TenantStorefrontFundingAlertService>();
+        services.AddScoped<TenantStorefrontFundingAlertDeliveryService>();
         services.AddScoped<TenantProvisioningAttemptCoordinator>();
         services.AddSingleton<XuiV3LinkChangeOperationStore>();
         services.AddScoped<XuiV3BotFlowService>();
@@ -175,6 +177,7 @@ public class Program
         services.AddHostedService<PaymentSettlementNotificationWorker>();
         services.AddHostedService<TenantManualReceiptNotificationWorker>();
         services.AddHostedService<TenantOrderNotificationWorker>();
+        services.AddHostedService<TenantStorefrontFundingAlertWorker>();
         services.AddSingleton<UniquePayReconciliationHostedService>();
         services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
 
@@ -465,6 +468,8 @@ public class Program
         ArgumentNullException.ThrowIfNull(appConfig);
         if (appConfig.TenantMinimumSiteWalletToman < 0)
             throw new InvalidOperationException("Configuration value 'tenantMinimumSiteWalletToman' cannot be negative.");
+        if (appConfig.TenantUnderfundedCustomerAttemptNotificationCooldownMinutes <= 0)
+            throw new InvalidOperationException("Configuration value 'tenantUnderfundedCustomerAttemptNotificationCooldownMinutes' must be positive.");
     }
 
     /// <summary>

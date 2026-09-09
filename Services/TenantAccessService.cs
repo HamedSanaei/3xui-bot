@@ -43,11 +43,17 @@ public sealed class TenantAccessService
     /// (<see cref="AppConfig.TenantMinimumSiteWalletToman"/>, key <c>tenantMinimumSiteWalletToman</c>) is required.</remarks>
     /// <example><code>var restriction = await access.EvaluateAsync(tenant.OwnerTelegramUserId.Value, token);</code></example>
     public async Task<string> EvaluateAsync(long ownerId, CancellationToken token)
+        => (await EvaluateDecisionAsync(ownerId, token)).RestrictionMessage;
+
+    /// <summary>Runs the existing owner funding policy and exposes its exact denial reason plus safe balance snapshots.</summary>
+    public async Task<TenantAccessEvaluation> EvaluateDecisionAsync(long ownerId, CancellationToken token)
     {
         using var gate = await Owners.EnterAsync(ownerId.ToString(System.Globalization.CultureInfo.InvariantCulture), token);
         var owner = await _credentials.GetUserStatusWithId(ownerId);
-        if (owner?.IsBlocked == true) return BlockedMessage;
-        if (owner == null) return DebtMessage;
+        if (owner?.IsBlocked == true)
+            return new(TenantAccessDecision.OwnerBlocked, owner.AccountBalance, null, false, _appConfig.TenantMinimumSiteWalletToman);
+        if (owner == null)
+            return new(TenantAccessDecision.OwnerMissing, null, null, false, _appConfig.TenantMinimumSiteWalletToman);
 
         TenantDebtTransfer pending;
         await using (var db = _factory.CreateDbContext())
@@ -64,8 +70,11 @@ public sealed class TenantAccessService
         }
 
         owner = await _credentials.GetUserStatusWithId(ownerId);
-        if (owner.IsBlocked) return BlockedMessage;
-        if (owner.AccountBalance > 0) return null;
+        if (owner.IsBlocked)
+            return new(TenantAccessDecision.OwnerBlocked, owner.AccountBalance, null, false, _appConfig.TenantMinimumSiteWalletToman);
+        if (owner.AccountBalance > 0)
+            return ClassifyFundingSnapshot(owner.AccountBalance, false, null);
+
         var site = await ReadSiteAsync(ownerId, token);
         if (pending == null && owner.AccountBalance < 0 && site.CanUse && site.WalletToman > 0)
         {
@@ -79,7 +88,6 @@ public sealed class TenantAccessService
             }, token);
             try
             {
-                // Existing website admission serializes this debit with purchases across every bot.
                 var result = await _site.DeductSiteWalletAfterPanelSuccessAsync(ownerId, amount,
                     "tenant-debt", transfer.Id, "Owner debt repayment", token, async ct =>
                     {
@@ -93,18 +101,29 @@ public sealed class TenantAccessService
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
-                // Keep pending even when the local credit commit failed. Recovery requires the saved website receipt.
                 _logger.LogWarning("Owner debt transfer remains pending. TransferId={TransferId} ErrorType={ErrorType}", transfer.Id, ex.GetType().Name);
             }
             site = await ReadSiteAsync(ownerId, token);
         }
+
         owner = await _credentials.GetUserStatusWithId(ownerId);
-        if (owner.IsBlocked) return BlockedMessage;
-        // The website threshold is configurable: tenantMinimumSiteWalletToman decides the minimum usable wallet
-        // that keeps a storefront active when the owner's local bot wallet is empty or negative.
-        return owner.AccountBalance > 0 || (site.CanUse && site.WalletToman >= _appConfig.TenantMinimumSiteWalletToman) ? null : DebtMessage;
+        if (owner.IsBlocked)
+            return new(TenantAccessDecision.OwnerBlocked, owner.AccountBalance, site.WalletToman, site.CanUse, _appConfig.TenantMinimumSiteWalletToman);
+        return ClassifyFundingSnapshot(owner.AccountBalance, site.CanUse, site.CanUse ? (long?)site.WalletToman : null);
     }
 
+    /// <summary>Applies the single existing OR funding rule to already-observed balances without another website request.</summary>
+    internal TenantAccessEvaluation ClassifyFundingSnapshot(long botBalanceToman, bool siteWalletUsable, long? siteWalletToman)
+    {
+        var allowed = botBalanceToman > 0 ||
+                      (siteWalletUsable && siteWalletToman.HasValue && siteWalletToman.Value >= _appConfig.TenantMinimumSiteWalletToman);
+        return new TenantAccessEvaluation(
+            allowed ? TenantAccessDecision.Allowed : TenantAccessDecision.InsufficientFunding,
+            botBalanceToman,
+            siteWalletUsable ? siteWalletToman : null,
+            siteWalletUsable,
+            _appConfig.TenantMinimumSiteWalletToman);
+    }
     /// <summary>Reads usable website funds without interpreting connectivity failures as credit.</summary>
     /// <param name="ownerId">Global owner Telegram id.</param>
     /// <param name="token">Execution cancellation, which is not swallowed.</param>

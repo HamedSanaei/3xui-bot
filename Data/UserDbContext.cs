@@ -64,6 +64,10 @@ public class UserDbContext : DbContext
     public DbSet<TenantManualReceiptNotification> TenantManualReceiptNotifications { get; set; }
     /// <summary>Durable post-fulfillment Telegram delivery intents keyed by tenant order and notification kind.</summary>
     public DbSet<TenantOrderNotification> TenantOrderNotifications { get; set; }
+    /// <summary>Persistent per-storefront funding episode and customer-attempt cooldown state.</summary>
+    public DbSet<TenantStorefrontFundingAlertState> TenantStorefrontFundingAlertStates { get; set; }
+    /// <summary>Durable owner alerts for underfunded storefront transitions and blocked customer attempts.</summary>
+    public DbSet<TenantStorefrontFundingAlert> TenantStorefrontFundingAlerts { get; set; }
     /// <summary>
     /// Outbox rows for synchronizing successful XUI operations from the bot to the Gozargah website.
     /// </summary>
@@ -490,6 +494,30 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => new { x.Status, x.DeliveredAtUtc });
         });
 
+        modelBuilder.Entity<TenantStorefrontFundingAlertState>(entity =>
+        {
+            entity.ToTable("TenantStorefrontFundingAlertStates");
+            entity.HasKey(x => x.TenantBotId);
+            entity.Property(x => x.TenantBotId).HasMaxLength(64).ValueGeneratedNever();
+        });
+
+        modelBuilder.Entity<TenantStorefrontFundingAlert>(entity =>
+        {
+            entity.ToTable("TenantStorefrontFundingAlerts");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.BusinessKey).IsRequired().HasMaxLength(180);
+            entity.Property(x => x.TenantBotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.TenantBotUsername).HasMaxLength(128);
+            entity.Property(x => x.Kind).IsRequired().HasMaxLength(48);
+            entity.Property(x => x.Status).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.ClaimToken).HasMaxLength(64);
+            entity.Property(x => x.LastError).HasMaxLength(256);
+            entity.HasIndex(x => x.BusinessKey).IsUnique();
+            entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc });
+            entity.HasIndex(x => x.LeaseUntilUtc);
+            entity.HasIndex(x => new { x.TenantBotId, x.CreatedAtUtc });
+        });
         modelBuilder.Entity<GozargahSiteSyncEvent>(entity =>
         {
             entity.ToTable("GozargahSiteSyncEvents");
