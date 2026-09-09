@@ -17,7 +17,10 @@ public sealed class XuiV3VolumeReminderStateStore
     /// Duration of a pre-delivery claim before crash recovery suppresses its ambiguous threshold.
     /// </summary>
     private static readonly TimeSpan DeliveryLease = TimeSpan.FromMinutes(15);
+    /// <summary>Maximum number of stale rows removed by one successful complete-list maintenance cycle.</summary>
+    internal const int MaxPruneBatchSize = 100;
     private readonly UserDbContextFactory _contextFactory;
+    private readonly IConfiguration _configuration;
     private readonly ILogger<XuiV3VolumeReminderStateStore> _logger;
     /// <summary>Serializes batch reconciliation, send claims, outcomes, and renewal hooks within this process.</summary>
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -29,10 +32,95 @@ public sealed class XuiV3VolumeReminderStateStore
     /// <param name="logger">Structured logger for non-customer-facing persistence failures.</param>
     public XuiV3VolumeReminderStateStore(
         UserDbContextFactory contextFactory,
+        IConfiguration configuration,
         ILogger<XuiV3VolumeReminderStateStore> logger)
     {
         _contextFactory = contextFactory ?? throw new ArgumentNullException(nameof(contextFactory));
+        _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    /// <summary>
+    /// Deletes a bounded batch of expired reminder rows for clients proven absent from one successful complete panel list.
+    /// </summary>
+    /// <param name="panelKey">Credential-free identity of the successfully scanned XUI panel.</param>
+    /// <param name="currentPanelClientIds">Positive numeric ids captured directly from the raw complete list before eligibility filtering.</param>
+    /// <param name="nowUtc">UTC time used for retention and active-lease checks.</param>
+    /// <param name="cancellationToken">Cancellation token for the users.db maintenance transaction.</param>
+    /// <returns>The number of rows deleted, never greater than <see cref="MaxPruneBatchSize"/>.</returns>
+    /// <remarks>
+    /// Age alone is never sufficient. A row must also be absent from the authoritative complete-list presence set,
+    /// unclaimed, not processing, and have no active lease. The final SQL delete repeats every safety predicate so a
+    /// concurrent process that claims or re-observes a row between selection and deletion wins and preserves state.
+    /// Only this reminder table is mutated.
+    /// </remarks>
+    public async Task<int> PruneMissingClientsAsync(
+        string panelKey,
+        IReadOnlySet<int> currentPanelClientIds,
+        DateTime nowUtc,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(panelKey))
+            throw new ArgumentException("Volume reminder panel key is required.", nameof(panelKey));
+
+        ArgumentNullException.ThrowIfNull(currentPanelClientIds);
+
+        var retentionDays = (_configuration.Get<AppConfig>() ?? new AppConfig()).XuiV3VolumeReminderStateRetentionDays;
+        if (retentionDays <= 0)
+            throw new InvalidOperationException("XuiV3VolumeReminderStateRetentionDays must be positive.");
+
+        var utcNow = NormalizeUtc(nowUtc);
+        var cutoffUtc = utcNow.AddDays(-retentionDays);
+        var presentIds = currentPanelClientIds.Where(clientId => clientId > 0).ToHashSet();
+
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var context = _contextFactory.CreateDbContext();
+            var staleSafeRows = await context.XuiV3VolumeReminderStates
+                .AsNoTracking()
+                .Where(state => state.PanelKey == panelKey &&
+                                state.LastObservedAtUtc < cutoffUtc &&
+                                state.ClaimedThreshold == null &&
+                                state.DeliveryStatus != XuiV3VolumeReminderDeliveryStatuses.Processing &&
+                                (!state.LeaseUntilUtc.HasValue || state.LeaseUntilUtc.Value <= utcNow))
+                .OrderBy(state => state.LastObservedAtUtc)
+                .ThenBy(state => state.Id)
+                .Select(state => new { state.Id, state.ClientId })
+                .ToListAsync(cancellationToken);
+
+            var deleteIds = staleSafeRows
+                .Where(state => !presentIds.Contains(state.ClientId))
+                .Take(MaxPruneBatchSize)
+                .Select(state => state.Id)
+                .ToArray();
+            if (deleteIds.Length == 0)
+                return 0;
+
+            var deleted = await context.XuiV3VolumeReminderStates
+                .Where(state => deleteIds.Contains(state.Id) &&
+                                state.PanelKey == panelKey &&
+                                state.LastObservedAtUtc < cutoffUtc &&
+                                state.ClaimedThreshold == null &&
+                                state.DeliveryStatus != XuiV3VolumeReminderDeliveryStatuses.Processing &&
+                                (!state.LeaseUntilUtc.HasValue || state.LeaseUntilUtc.Value <= utcNow))
+                .ExecuteDeleteAsync(cancellationToken);
+
+            if (deleted > 0)
+            {
+                _logger.LogInformation(
+                    "Pruned expired missing XUI volume reminder state. deleted={Deleted}, retentionDays={RetentionDays}, batchLimit={BatchLimit}",
+                    deleted,
+                    retentionDays,
+                    MaxPruneBatchSize);
+            }
+
+            return deleted;
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     /// <summary>

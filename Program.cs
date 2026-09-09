@@ -404,6 +404,11 @@ public class Program
             appConfig.VolumeExpirationReminderIntervalMinutes,
             5,
             1440);
+        if (appConfig.XuiV3VolumeReminderStateRetentionDays <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Configuration value '{nameof(appConfig.XuiV3VolumeReminderStateRetentionDays)}' must be positive; actual value is {appConfig.XuiV3VolumeReminderStateRetentionDays}.");
+        }
     }
 
     /// <summary>

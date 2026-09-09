@@ -187,6 +187,14 @@ namespace Adminbot.Domain
         /// request per client; 30 minutes is the production default for balancing freshness and panel load.
         /// </remarks>
         public int VolumeExpirationReminderIntervalMinutes { get; set; } = 30;
+        /// <summary>
+        /// Number of days a missing XUI client reminder row must remain unobserved before safe cleanup may delete it.
+        /// </summary>
+        /// <remarks>
+        /// Cleanup still requires a successful complete panel list proving the numeric client id is absent and never
+        /// removes an active or claimed Telegram delivery. The value must be positive; 30 days is the default.
+        /// </remarks>
+        public int XuiV3VolumeReminderStateRetentionDays { get; set; } = 30;
         public string NowpaymentSuccessUrl { get; set; }
         public string NowpaymentCancelUrl { get; set; }
         public string NowpaymentIpnUrl { get; set; }

@@ -65,6 +65,7 @@
   "xuiV3LinkChangeLeaseSeconds": 300,
   "volumeExpirationReminderEnabled": false,
   "volumeExpirationReminderIntervalMinutes": 30,
+  "xuiV3VolumeReminderStateRetentionDays": 30,
   "referral": {
     "enabled": true,
     "minimumEligiblePaymentAmountToman": 100000,

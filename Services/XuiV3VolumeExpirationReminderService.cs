@@ -142,16 +142,36 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     {
         var serverInfo = BuildConfiguredPanelServerInfo(config);
         var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
-        if (!response.Success)
+        if (!TryCaptureCompletePanelClientIds(response, out var currentPanelClientIds))
         {
             _logger.LogWarning(
-                "XUI v3 volume reminder could not fetch the complete client list. message={Message}",
-                response.Msg ?? "unknown");
+                "XUI v3 volume reminder could not establish a successful complete client list. message={Message}",
+                response?.Msg ?? "unknown");
             return;
         }
 
         var nowUtc = DateTime.UtcNow;
         var panelKey = XuiV3ClientUsageResolver.BuildPanelKey(serverInfo);
+        var prunedStateCount = 0;
+        try
+        {
+            prunedStateCount = await _stateStore.PruneMissingClientsAsync(
+                panelKey,
+                currentPanelClientIds,
+                nowUtc,
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Cleanup is maintenance only. A local database/configuration problem must not change current reminder
+            // reconciliation or delivery semantics for the same successfully fetched panel list.
+            _logger.LogWarning(ex, "XUI v3 volume reminder stale-state cleanup failed; reminder scan will continue.");
+        }
+
         var enabledServices = _purchaseService.GetEnabledServices();
         var evaluatedClients = new List<XuiV3VolumeReminderEvaluatedClient>();
         var malformedClientCount = 0;
@@ -448,14 +468,15 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
                 .OrderBy(group => group.Key, StringComparer.Ordinal)
                 .Select(group => $"{group.Key}={group.Count()}"));
         _logger.LogInformation(
-            "XUI v3 volume reminder scan finished. clients={ClientCount}, finiteObservations={ObservationCount}, eligibility={EligibilityCounts}, candidates={CandidateCount}, sent={Sent}, skipped={Skipped}, failed={Failed}",
-            response.Obj?.Count ?? 0,
+            "XUI v3 volume reminder scan finished. clients={ClientCount}, finiteObservations={ObservationCount}, eligibility={EligibilityCounts}, candidates={CandidateCount}, sent={Sent}, skipped={Skipped}, failed={Failed}, prunedStates={PrunedStates}",
+            response.Obj.Count,
             observations.Count,
             eligibilityCounts,
             candidates.Count,
             sent,
             skipped,
-            failed);
+            failed,
+            prunedStateCount);
     }
 
     /// <summary>
@@ -791,6 +812,33 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
     /// <param name="value">User-visible value that may contain reserved HTML characters.</param>
     /// <returns>HTML-safe text.</returns>
     private static string Html(string value) => WebUtility.HtmlEncode(value ?? string.Empty);
+
+    /// <summary>
+    /// Captures the authoritative positive numeric client-id presence set from one successful complete list response.
+    /// </summary>
+    /// <param name="response">Raw typed envelope returned by <c>GET /panel/api/clients/list</c>.</param>
+    /// <param name="clientIds">Distinct positive ids captured before any reminder eligibility or ownership filtering.</param>
+    /// <returns>True only when the panel envelope succeeded and supplied a non-null complete-list object.</returns>
+    /// <remarks>
+    /// An empty non-null list is a valid complete result. Failed envelopes and successful envelopes with a null object
+    /// are not deletion evidence and therefore return false. Malformed JSON throws before this method is reached.
+    /// </remarks>
+    internal static bool TryCaptureCompletePanelClientIds(
+        XuiV3ApiResponse<List<XuiV3Client>> response,
+        out IReadOnlySet<int> clientIds)
+    {
+        if (response?.Success != true || response.Obj == null)
+        {
+            clientIds = new HashSet<int>();
+            return false;
+        }
+
+        clientIds = response.Obj
+            .Where(client => client != null && client.Id > 0)
+            .Select(client => client.Id)
+            .ToHashSet();
+        return true;
+    }
 
     /// <summary>
     /// Builds the configured XUI v3 panel descriptor without exposing credentials to logs or users.db.

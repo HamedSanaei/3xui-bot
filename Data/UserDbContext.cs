@@ -554,9 +554,8 @@ public class UserDbContext : DbContext
             entity.Property(x => x.LastEligibilitySummary).HasMaxLength(1000);
             // One durable cycle row represents one physical numeric client on one credential-free panel identity.
             entity.HasIndex(x => new { x.PanelKey, x.ClientId }).IsUnique();
-            entity.HasIndex(x => new { x.DeliveryStatus, x.LeaseUntilUtc });
-            entity.HasIndex(x => new { x.BotId, x.TelegramUserId });
-            entity.HasIndex(x => x.LastObservedAtUtc);
+            // Cleanup is panel-scoped and ordered by observation age; query-plan audit showed this avoids a temp sort.
+            entity.HasIndex(x => new { x.PanelKey, x.LastObservedAtUtc });
         });
 
         modelBuilder.Entity<ZibalPaymentInfo>(entity =>
