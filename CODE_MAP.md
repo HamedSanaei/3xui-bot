@@ -487,11 +487,33 @@ and the main menu.
   recovery; it never rewrites the XUI client's `tguserid` or `XuiV3ClientMetadata.TelegramUserId`.
 - Gozargah enqueue/send is best-effort after a durable panel/order/ledger effect in tenant and shared customer flows;
   website failures are logged and retried from the outbox without turning a valid account operation into failure.
+- Queue admission and remote send use separate per-account gates: `QueueGate` protects only the short database-only
+  unresolved/latest-state lookup, semantic dedupe, and insert/reuse decision, while `AccountGate` serializes the actual
+  website I/O inside `SendEventCoreAsync`. Deferred enqueues (`deferSend: true`) therefore never wait behind
+  get_user/create_order/update_order/delete_order of the same account; they persist the row, wake the retry worker,
+  and return.
+- `get_user` failures are classified: the documented HTTP 404 missing-user result and plain business not-found/banned
+  messages become terminal Skipped; HTTP 5xx, invalid JSON, HTML/non-JSON bodies, undocumented 4xx, and empty
+  responses become Failed with a bounded LastError so the retry worker can recover later instead of silently losing
+  the website mirror event.
 - Pending sync events may need to re-read fresh XUI panel data before a super-admin retry.
 - `get_user` HTTP 404 from the Gozargah website means the Telegram user has no website account; wallet-button checks treat it as expected and must not spam the Telegram logger channel.
 - A `delete_order` that hits a missing website order is the desired end state (the order is already absent). `TrySendEventAsync` marks such a delete as skipped instead of leaving it `Failed`, and `SendAsync` suppresses the warning for expected `delete_order`/`update_order` 404 "not found" responses (mirroring the `get_user` exemption). Without this, a stuck/duplicate delete stays `Failed` and the two-minute `GozargahSiteSyncRetryService` resends and re-logs it forever, flooding the logger channel with repeated `Order not found.` messages.
 - Owned-bot profile/status messages should display Gozargah `get_user` 404/not-found as `متصل نشده`, not as the raw HTTP/API error.
 - A successful non-banned `get_user` lookup means the owned-bot buyer should be promoted to `CredUser.IsColleague=true` before tariffs, purchases, or renewals are priced.
+- Tenant renewal fulfillment mirrors the purchase `fulfillmentCommitted` boundary: after the atomic users.db commit
+  (order fulfilled + ledger + notification intents) any post-commit failure (operation `MarkSettledAsync` or optional
+  website mirror) is logged as a bounded warning and still returns Applied; the renewal operation stays locked and the
+  recovery worker settles it later from its durable Applied state. `MarkSettledAsync` is virtual only as a test seam.
+- `TenantOrderNotifications` (users.db outbox) retention is configurable via `tenantOrderNotificationRetentionDays`
+  (positive, default 30). The worker deletes at most 100 rows per scan that are Delivered, older than the cutoff, and
+  carry no claim/lease; Pending/Processing/DeliveryUncertain/ManualReview/FailedPermanent rows are never removed.
+  Migration `20260909204045_HardenTenantOrderNotificationOutbox` adds `SendStartedAtUtc` and the
+  (Status, DeliveredAtUtc) index.
+- Notification worker durable send phase: after the atomic claim the row is Processing with `SendStartedAtUtc=null`;
+  the phase is persisted immediately before the Telegram transport call. An expired lease with a null phase is
+  recycled to Pending (send never started, retryable); an expired lease with a set phase becomes DeliveryUncertain
+  (remote outcome ambiguous, never replayed).
 - Optional Gozargah `get_user` lookups for owned-bot pricing and wallet-button visibility are fail-soft with a short timeout; a slow website API must not block tariff or purchase menus.
 - Owned-bot renewal with a selected Gozargah website wallet falls back to a local bot-wallet debit if website
   eligibility or post-XUI debit fails; the local balance may become negative and a dedicated ledger provider records

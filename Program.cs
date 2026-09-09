@@ -62,6 +62,7 @@ public class Program
         ValidateXuiV3VolumeReminderConfiguration(appConfig);
         ValidateTetraminatorConfiguration(appConfig);
         ValidateTenantStorefrontConfiguration(appConfig);
+        ValidateTenantOrderNotificationConfiguration(appConfig);
 
         ConfigureDatabasePaths(builder.Environment.ContentRootPath, appConfig);
         // Telegrams logs use their own SQLite outbox next to the runtime databases. The path is resolved against
@@ -464,6 +465,30 @@ public class Program
         ArgumentNullException.ThrowIfNull(appConfig);
         if (appConfig.TenantMinimumSiteWalletToman < 0)
             throw new InvalidOperationException("Configuration value 'tenantMinimumSiteWalletToman' cannot be negative.");
+    }
+
+    /// <summary>
+    /// Validates tenant notification outbox retention before the delivery worker can delete delivered rows.
+    /// </summary>
+    /// <param name="appConfig">
+    /// Application configuration bound from <c>Data/configuration.json</c>. A missing key keeps the documented
+    /// 30-day default declared on <see cref="AppConfig.TenantOrderNotificationRetentionDays"/>.
+    /// </param>
+    /// <remarks>
+    /// A non-positive retention would make the worker either delete delivered history immediately or disable the
+    /// bounded cleanup silently; both are rejected at startup instead.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown before database migration and hosted-service startup when the retention is not positive.
+    /// </exception>
+    private static void ValidateTenantOrderNotificationConfiguration(AppConfig appConfig)
+    {
+        ArgumentNullException.ThrowIfNull(appConfig);
+        if (appConfig.TenantOrderNotificationRetentionDays <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Configuration value '{nameof(appConfig.TenantOrderNotificationRetentionDays)}' must be positive; actual value is {appConfig.TenantOrderNotificationRetentionDays}.");
+        }
     }
 
     /// <summary>

@@ -10453,10 +10453,19 @@ public class TenantBotService
                 return await db.SaveChangesAsync(cancellationToken);
             }, cancellationToken);
         }
-        catch (DbUpdateException)
+        catch (DbUpdateException ex)
         {
-            _logger.LogDebug("Tenant notification intent ensure raced with another callback. orderId={OrderId} kind={Kind}", orderId, kind);
-            return 0;
+            // Only a provable concurrent unique-key insert is benign. Re-read with a fresh short-lived context:
+            // if the required (orderId, kind) row now exists the race lost, otherwise the persistence really
+            // failed and the exception must propagate instead of pretending the intent is queued.
+            var exists = await _workflow.ReadAsync(async db => await db.TenantOrderNotifications.AsNoTracking()
+                .AnyAsync(x => x.TenantBotOrderId == orderId && x.Kind == kind, cancellationToken));
+            if (exists)
+            {
+                _logger.LogDebug("Tenant notification intent ensure raced with another callback. orderId={OrderId} kind={Kind}", orderId, kind);
+                return 0;
+            }
+            throw;
         }
     }
 
@@ -10480,10 +10489,20 @@ public class TenantBotService
                 return await db.SaveChangesAsync(cancellationToken);
             }, cancellationToken);
         }
-        catch (DbUpdateException)
+        catch (DbUpdateException ex)
         {
-            _logger.LogDebug("Tenant notification intent ensure raced with another callback. orderId={OrderId}", orderId);
-            return 0;
+            // Only benign when every required kind now exists after a fresh read; a real persistence failure
+            // (disk full, schema mismatch, unrelated constraint) must propagate so callers never report
+            // "queued durably" for an intent that was not actually persisted.
+            var existingKinds = await _workflow.ReadAsync(async db => await db.TenantOrderNotifications.AsNoTracking()
+                .Where(x => x.TenantBotOrderId == orderId).Select(x => x.Kind).ToListAsync(cancellationToken));
+            var required = GETTENANTORDERNOTIFICATIONKINDS(includeOwnerAccountDetails);
+            if (required.All(kind => existingKinds.Contains(kind, StringComparer.Ordinal)))
+            {
+                _logger.LogDebug("Tenant notification intent ensure raced with another callback. orderId={OrderId}", orderId);
+                return 0;
+            }
+            throw;
         }
     }
 
@@ -12562,6 +12581,7 @@ public class TenantBotService
         CancellationToken cancellationToken)
     {
         var serverInfo = BuildConfiguredPanelServerInfo();
+        var fulfillmentCommitted = false;
         var trafficResetApplied = !renewal.ShouldResetTraffic ||
                                   await RESETTENANTRENEWEDTRAFFICASYNC(
                                       serverInfo,
@@ -12633,30 +12653,64 @@ public class TenantBotService
             order,
             includeOwnerAccountDetails: string.Equals(source, "assistant-final", StringComparison.OrdinalIgnoreCase));
         await _workflow.SaveAsync(cancellationToken);
+        fulfillmentCommitted = true;
         var notificationQueueElapsed = Stopwatch.GetElapsedTime(notificationQueueStarted);
 
-        // Tenant order and ledger are now durable. Releasing the operation lock before this point could allow a
-        // second renewal while the first panel mutation was applied but its owner settlement was still incomplete.
-        await _renewalOperationStore.MarkSettledAsync(renewalOperation, cancellationToken);
-        var coreTiming = operationTiming.Snapshot();
+        try
+        {
+            // Tenant order and ledger are now durable. Releasing the operation lock before this point could allow a
+            // second renewal while the first panel mutation was applied but its owner settlement was still incomplete.
+            await MarkTenantRenewalOperationSettledAfterCommitAsync(renewalOperation, cancellationToken);
+            var coreTiming = operationTiming.Snapshot();
 
-        await QueueGozargahSyncBestEffortAsync(
-            "tenant-renew",
-            () => _gozargahSiteSyncService.QueueUpdateAsync(
-                order.OwnerTelegramUserId,
-                order.CustomerTelegramUserId,
-                client,
-                serverInfo,
+            await QueueGozargahSyncBestEffortAsync(
+                "tenant-renew",
+                () => _gozargahSiteSyncService.QueueUpdateAsync(
+                    order.OwnerTelegramUserId,
+                    order.CustomerTelegramUserId,
+                    client,
+                    serverInfo,
+                    order.OrderId,
+                    order.TenantBotId,
+                    cancellationToken,
+                    deferSend: true));
+
+            var callbackTotal = operationTiming.TotalElapsed;
+            LOGTENANTORDER(order, owner, customer, source, "renew-fulfilled", settlement, coreTiming, notificationQueueElapsed);
+            LOGTENANTFULFILLMENTTIMING(order, coreTiming, notificationQueueElapsed, callbackTotal);
+        }
+        catch (Exception ex)
+        {
+            if (!fulfillmentCommitted)
+                throw;
+
+            // The renewal, ledger, and notification intents are durable. Post-commit bookkeeping (the operation
+            // settlement flag or the optional website mirror) must never turn a fulfilled renewal back into a
+            // failure or repeat a financial/XUI mutation; the recovery worker settles the operation from its
+            // durable Applied state on a later cycle.
+            _logger.LogWarning(
+                ex,
+                "Tenant renewal post-commit work failed after durable fulfillment. orderId={OrderId} ErrorType={ErrorType}",
                 order.OrderId,
-                order.TenantBotId,
-                cancellationToken,
-                deferSend: true));
-
-        var callbackTotal = operationTiming.TotalElapsed;
-        LOGTENANTORDER(order, owner, customer, source, "renew-fulfilled", settlement, coreTiming, notificationQueueElapsed);
-        LOGTENANTFULFILLMENTTIMING(order, coreTiming, notificationQueueElapsed, callbackTotal);
+                ex.GetType().Name);
+        }
         return NowPaymentsSettlementResult.Applied(settlement.BotWalletBefore, settlement.BotWalletAfter);
     }
+
+    /// <summary>
+    /// Marks a tenant renewal operation as settled after the durable order, ledger, and notification commit.
+    /// </summary>
+    /// <param name="renewalOperation">Applied renewal operation whose account lock is released by settlement.</param>
+    /// <param name="cancellationToken">Cancellation of the short users.db update.</param>
+    /// <returns>A task completing after the settlement flag is persisted.</returns>
+    /// <remarks>
+    /// This seam exists so regression tests can inject a failure at the post-commit boundary; production behavior is
+    /// exactly the renewal-operation store call. A failure here must never revert the already-durable fulfillment.
+    /// </remarks>
+    internal virtual Task MarkTenantRenewalOperationSettledAfterCommitAsync(
+        XuiV3RenewalOperation renewalOperation,
+        CancellationToken cancellationToken)
+        => _renewalOperationStore.MarkSettledAsync(renewalOperation, cancellationToken);
 
     /// <summary>
     /// Resets traffic counters after a tenant renewal when the shared renewal policy requires it.

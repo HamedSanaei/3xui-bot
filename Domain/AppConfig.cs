@@ -334,6 +334,14 @@ namespace Adminbot.Domain
         /// <summary>Days to retain terminal website outbox history; positive, default 30. Latest successful account state is always kept.</summary>
         public int GozargahSiteSyncRetentionDays { get; set; } = 30;
         /// <summary>
+        /// Days to retain Delivered tenant-order notification rows before the maintenance cleanup removes them.
+        /// </summary>
+        /// <remarks>
+        /// Must be positive; the default is 30. Pending, Processing, DeliveryUncertain, ManualReview, and
+        /// FailedPermanent rows are never candidates for cleanup and remain available for diagnostics.
+        /// </remarks>
+        public int TenantOrderNotificationRetentionDays { get; set; } = 30;
+        /// <summary>
         /// API endpoint used for all Gozargah website actions. The API expects the action name in the JSON body.
         /// </summary>
         public string GozargahSiteApiBaseUrl { get; set; } = "https://api.gozargah.network/api.php";

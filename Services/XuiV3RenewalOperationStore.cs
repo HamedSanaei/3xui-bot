@@ -1368,7 +1368,7 @@ public class XuiV3RenewalOperationStore
     /// <param name="operation">Operation whose wallet debit and ledger write finished.</param>
     /// <param name="cancellationToken">Token that cancels the update.</param>
     /// <returns>A task that completes after the settled status is persisted.</returns>
-    public async Task MarkSettledAsync(
+    public virtual async Task MarkSettledAsync(
         XuiV3RenewalOperation operation,
         CancellationToken cancellationToken = default)
     {

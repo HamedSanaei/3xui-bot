@@ -245,7 +245,7 @@ public sealed partial class ConcurrencyTests
     }
 
     [Fact]
-    public async Task Live_lease_is_not_stolen_and_expired_claim_becomes_uncertain()
+    public async Task Live_lease_is_not_stolen_and_expired_claimed_row_is_retryable()
     {
         using var databases = new Databases();
         var (orderId, _) = await SeedFulfilledOrderWithNotificationAsync(databases, "lease-guard", TenantOrderNotificationKinds.OwnerSaleNotification);
@@ -263,18 +263,24 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(0, await worker.ProcessOnceAsync());
         Assert.Equal(0, sender.Count);
 
+        // The claim expired before the durable send phase was persisted: no Telegram request could have been
+        // sent, so the same scan recycles the row to Pending and redelivers it exactly once instead of parking
+        // it as DeliveryUncertain.
         await using (var db = databases.Users.CreateDbContext())
         {
             var row = await db.TenantOrderNotifications.SingleAsync(x => x.TenantBotOrderId == orderId);
             row.LeaseUntilUtc = DateTime.UtcNow.AddSeconds(-1);
             await db.SaveChangesAsync();
         }
-        Assert.Equal(0, await worker.ProcessOnceAsync());
+        Assert.Equal(1, await worker.ProcessOnceAsync());
+        Assert.Equal(1, sender.Count);
         await using var verify = databases.Users.CreateDbContext();
-        var expired = await verify.TenantOrderNotifications.SingleAsync(x => x.TenantBotOrderId == orderId);
-        Assert.Equal(TenantOrderNotificationStatuses.DeliveryUncertain, expired.Status);
-        Assert.Null(expired.ClaimToken);
-        Assert.Equal("processing_lease_expired_after_possible_delivery", expired.LastError);
+        var recycled = await verify.TenantOrderNotifications.SingleAsync(x => x.TenantBotOrderId == orderId);
+        Assert.Equal(TenantOrderNotificationStatuses.Delivered, recycled.Status);
+        Assert.Null(recycled.SendStartedAtUtc);
+        Assert.Equal(2, recycled.AttemptCount);
+        Assert.Equal(TenantOrderNotificationStatuses.Delivered, recycled.Status);
+        Assert.NotEqual(TenantOrderNotificationStatuses.DeliveryUncertain, recycled.Status);
     }
 
     [Fact]

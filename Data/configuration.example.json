@@ -2,6 +2,7 @@
   "adminsUserIds": [],
   "tenantMaxStoresPerOwner": 5,
   "gozargahSiteSyncRetentionDays": 30,
+  "tenantOrderNotificationRetentionDays": 30,
   "tenantMinimumSiteWalletToman": 200000,
   "bots": [
     {

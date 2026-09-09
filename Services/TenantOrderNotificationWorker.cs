@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using Adminbot.Domain;
+using Microsoft.Extensions.Configuration;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
@@ -166,6 +167,7 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
 {
     private const int MaximumAttempts = 6;
     private const int MaximumBatchSize = 10;
+    private const int MaximumCompactionBatch = 100;
     private static readonly TimeSpan ScanInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan ClaimLease = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromSeconds(15);
@@ -173,21 +175,29 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
     private readonly UserDbContextFactory _contextFactory;
     private readonly ITenantOrderNotificationSender _sender;
     private readonly ILogger<TenantOrderNotificationWorker> _logger;
+    private readonly int _retentionDays;
 
     public TenantOrderNotificationWorker(
         UserDbContextFactory contextFactory,
         IServiceScopeFactory scopeFactory,
+        IConfiguration configuration,
         ILogger<TenantOrderNotificationWorker> logger)
-        : this(contextFactory, new TenantOrderNotificationSender(scopeFactory), logger) { }
+        : this(
+            contextFactory,
+            new TenantOrderNotificationSender(scopeFactory),
+            logger,
+            (configuration.Get<AppConfig>() ?? new AppConfig()).TenantOrderNotificationRetentionDays) { }
 
     internal TenantOrderNotificationWorker(
         UserDbContextFactory contextFactory,
         ITenantOrderNotificationSender sender,
-        ILogger<TenantOrderNotificationWorker> logger)
+        ILogger<TenantOrderNotificationWorker> logger,
+        int retentionDays = 30)
     {
         _contextFactory = contextFactory ?? throw new ArgumentNullException(nameof(contextFactory));
         _sender = sender ?? throw new ArgumentNullException(nameof(sender));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _retentionDays = retentionDays;
     }
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -207,19 +217,59 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
 
     internal async Task<int> ProcessOnceAsync(CancellationToken cancellationToken = default)
     {
+        await RecoverExpiredClaimsBeforeSendAsync(cancellationToken);
         await MarkExpiredClaimsUncertainAsync(cancellationToken);
         var rows = await ClaimDueBatchAsync(cancellationToken);
         foreach (var row in rows)
             await DeliverAsync(row, cancellationToken);
+        await CompactDeliveredAsync(cancellationToken);
         return rows.Count;
     }
 
+    /// <summary>
+    /// Returns expired Processing rows whose Telegram transport was never invoked to Pending for retry.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation of the short SQLite update.</param>
+    /// <returns>A task completing after the conditional update.</returns>
+    /// <remarks>
+    /// A crash right after the atomic claim but before <see cref="SendStartedAtUtc"/> is persisted means no Telegram
+    /// request could have been sent, so recycling the row to Pending is safe and cannot duplicate delivery.
+    /// </remarks>
+    private async Task RecoverExpiredClaimsBeforeSendAsync(CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        await using var db = _contextFactory.CreateDbContext();
+        var count = await db.TenantOrderNotifications
+            .Where(x => x.Status == TenantOrderNotificationStatuses.Processing &&
+                        x.SendStartedAtUtc == null &&
+                        x.LeaseUntilUtc.HasValue && x.LeaseUntilUtc <= now)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, TenantOrderNotificationStatuses.Pending)
+                .SetProperty(x => x.LastError, "processing_lease_expired_before_send_started")
+                .SetProperty(x => x.ClaimToken, (string)null)
+                .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
+                .SetProperty(x => x.NextAttemptAtUtc, now)
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+        if (count > 0)
+            _logger.LogWarning("Tenant order notification claims expired before any send started; recycled for retry. Count={Count}", count);
+    }
+
+    /// <summary>
+    /// Marks expired Processing rows whose Telegram transport may have been invoked as DeliveryUncertain.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation of the short SQLite update.</param>
+    /// <returns>A task completing after the conditional update.</returns>
+    /// <remarks>
+    /// <see cref="SendStartedAtUtc"/> was persisted before the transport call, so the remote outcome is ambiguous
+    /// and the row must never be replayed automatically; it is retained for operator review.
+    /// </remarks>
     private async Task MarkExpiredClaimsUncertainAsync(CancellationToken cancellationToken)
     {
         var now = DateTime.UtcNow;
         await using var db = _contextFactory.CreateDbContext();
         var count = await db.TenantOrderNotifications
             .Where(x => x.Status == TenantOrderNotificationStatuses.Processing &&
+                        x.SendStartedAtUtc != null &&
                         x.LeaseUntilUtc.HasValue && x.LeaseUntilUtc <= now)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, TenantOrderNotificationStatuses.DeliveryUncertain)
@@ -230,6 +280,34 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
                 .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
         if (count > 0)
             _logger.LogError("Tenant order notifications became delivery-uncertain. Count={Count}", count);
+    }
+
+    /// <summary>
+    /// Deletes a bounded batch of old delivered rows whose delivery is fully terminal and never replayable.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation of the short SQLite delete.</param>
+    /// <returns>The number of removed rows, at most <see cref="MaximumCompactionBatch"/>.</returns>
+    /// <remarks>
+    /// Only rows that are Delivered, older than the configured retention, and carrying no claim or lease are removed.
+    /// Pending, Processing, DeliveryUncertain, ManualReview, and FailedPermanent rows are never candidates so they
+    /// stay available for diagnostics and manual handling. The batch limit keeps one maintenance cycle bounded and
+    /// the (Status, DeliveredAtUtc) index keeps the scan narrow.
+    /// </remarks>
+    internal async Task<int> CompactDeliveredAsync(CancellationToken cancellationToken = default)
+    {
+        if (_retentionDays <= 0)
+            return 0;
+        var cutoff = DateTime.UtcNow.AddDays(-Math.Min(_retentionDays, 36500));
+        return await SqliteOperation.RunAsync(async ct =>
+        {
+            await using var db = _contextFactory.CreateDbContext();
+            var candidates = db.TenantOrderNotifications
+                .Where(x => x.Status == TenantOrderNotificationStatuses.Delivered &&
+                            x.DeliveredAtUtc != null && x.DeliveredAtUtc < cutoff &&
+                            x.ClaimToken == null && x.LeaseUntilUtc == null)
+                .OrderBy(x => x.Id).Select(x => x.Id).Take(MaximumCompactionBatch);
+            return await db.TenantOrderNotifications.Where(x => candidates.Contains(x.Id)).ExecuteDeleteAsync(ct);
+        }, cancellationToken);
     }
     private async Task<IReadOnlyList<TenantOrderNotification>> ClaimDueBatchAsync(CancellationToken cancellationToken)
     {
@@ -276,6 +354,15 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
         var started = Stopwatch.GetTimestamp();
         try
         {
+            // Persist the send phase BEFORE invoking the Telegram transport: a crash after this commit but before
+            // the HTTP call may still become DeliveryUncertain (conservative), but the row is never re-sent
+            // blindly because the claim is retained until the lease expires.
+            if (!await MarkSendStartedAsync(notification, cancellationToken))
+            {
+                // The claim was lost (another worker recycled or took over); do not send from a stale claim.
+                LogDuration(order, notification.Kind, started, "claim_lost_before_send");
+                return;
+            }
             var messageId = await _sender.SendAsync(order, notification.Kind, cancellationToken);
             if (messageId.HasValue)
             {
@@ -347,7 +434,7 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
     {
         var now = DateTime.UtcNow;
         await using var db = _contextFactory.CreateDbContext();
-        var updated = await db.TenantOrderNotifications
+        var updated =        await db.TenantOrderNotifications
             .Where(x => x.Id == notification.Id && x.Status == TenantOrderNotificationStatuses.Processing &&
                         x.ClaimToken == notification.ClaimToken)
             .ExecuteUpdateAsync(setters => setters
@@ -355,6 +442,7 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
                 .SetProperty(x => x.TelegramMessageId, messageId)
                 .SetProperty(x => x.DeliveredAtUtc, now)
                 .SetProperty(x => x.LastError, (string)null)
+                .SetProperty(x => x.SendStartedAtUtc, (DateTime?)null)
                 .SetProperty(x => x.ClaimToken, (string)null)
                 .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
                 .SetProperty(x => x.NextAttemptAtUtc, (DateTime?)null)
@@ -382,6 +470,7 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
                 .SetProperty(x => x.Status, TenantOrderNotificationStatuses.Pending)
                 .SetProperty(x => x.NextAttemptAtUtc, now.AddSeconds(seconds))
                 .SetProperty(x => x.LastError, safeError)
+                .SetProperty(x => x.SendStartedAtUtc, (DateTime?)null)
                 .SetProperty(x => x.ClaimToken, (string)null)
                 .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
                 .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
@@ -400,10 +489,33 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, status)
                 .SetProperty(x => x.LastError, safeError)
+                .SetProperty(x => x.SendStartedAtUtc, (DateTime?)null)
                 .SetProperty(x => x.ClaimToken, (string)null)
                 .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
                 .SetProperty(x => x.NextAttemptAtUtc, (DateTime?)null)
                 .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+    }
+
+    /// <summary>
+    /// Persists the durable send phase immediately before the Telegram transport is invoked.
+    /// </summary>
+    /// <param name="notification">Claimed row whose claim token guards the update.</param>
+    /// <param name="cancellationToken">Cancellation of the short SQLite update.</param>
+    /// <returns>
+    /// <c>true</c> when this worker still owns the claim and the send phase was persisted; <c>false</c> when the
+    /// claim was lost and the caller must not invoke the Telegram transport.
+    /// </returns>
+    private async Task<bool> MarkSendStartedAsync(TenantOrderNotification notification, CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        await using var db = _contextFactory.CreateDbContext();
+        var updated = await db.TenantOrderNotifications
+            .Where(x => x.Id == notification.Id && x.Status == TenantOrderNotificationStatuses.Processing &&
+                        x.ClaimToken == notification.ClaimToken && x.SendStartedAtUtc == null)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.SendStartedAtUtc, now)
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+        return updated == 1;
     }
 
     private async Task MarkDeliveryUncertainAsync(

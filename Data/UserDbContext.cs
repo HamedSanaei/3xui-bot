@@ -486,6 +486,8 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => new { x.TenantBotOrderId, x.Kind }).IsUnique();
             entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc });
             entity.HasIndex(x => x.LeaseUntilUtc);
+            // Cleanup scans delivered rows by delivered time while other statuses are never candidates.
+            entity.HasIndex(x => new { x.Status, x.DeliveredAtUtc });
         });
 
         modelBuilder.Entity<GozargahSiteSyncEvent>(entity =>

@@ -32,6 +32,15 @@ public sealed class TenantOrderNotification
     public int AttemptCount { get; set; }
     public DateTime? NextAttemptAtUtc { get; set; }
     public DateTime? LeaseUntilUtc { get; set; }
+    /// <summary>
+    /// Moment the worker persisted that it is about to invoke the Telegram transport for this claimed row.
+    /// </summary>
+    /// <remarks>
+    /// Durable send phase used to distinguish a crash before any Telegram request (null) from a crash where the
+    /// remote outcome may be ambiguous (non-null). Set only while the row is claimed as Processing, and cleared on
+    /// terminal transitions such as Delivered, Pending retry, ManualReview, or FailedPermanent.
+    /// </remarks>
+    public DateTime? SendStartedAtUtc { get; set; }
     public string ClaimToken { get; set; }
     public int? TelegramMessageId { get; set; }
     public string LastError { get; set; }

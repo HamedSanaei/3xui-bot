@@ -805,8 +805,10 @@ namespace Adminbot.Domain
         private readonly UserDbContextFactory _userDbContextFactory;
         /// <summary>Prevents immediate send and recovery from sending the same outbox event concurrently; idle ids are removed.</summary>
         private static readonly AsyncKeyedGate EventGate = new();
-        /// <summary>Serializes queue decisions and retry sends for one UUID (email fallback), removing idle keys.</summary>
+        /// <summary>Serializes actual website sends and retries for one UUID (email fallback), removing idle keys.</summary>
         private static readonly AsyncKeyedGate AccountGate = new();
+        /// <summary>Serializes only short queue-admission decisions for one UUID (email fallback), never website I/O.</summary>
+        private static readonly AsyncKeyedGate QueueGate = new();
         private readonly CredentialsStore _credentialsDbContext;
         private readonly GozargahSiteApiClient _apiClient;
         private readonly AppConfig _appConfig;
@@ -1265,26 +1267,28 @@ namespace Adminbot.Domain
         /// <param name="syncEvent">Detached persisted outbox row; its internal id is reloaded under the per-event gate before sending.</param>
         /// <param name="cancellationToken">Cancellation token for API and database work.</param>
         /// <returns><c>true</c> when the event reached a terminal succeeded or skipped state.</returns>
-        /// <remarks>Account admission precedes the event gate. Equivalent queued updates are marked skipped before HTTP;
-        /// website I/O holds no write transaction and terminal rows return without another send.</remarks>
+        /// <remarks>Remote send serialization is acquired inside <see cref="SendEventCoreAsync"/> so queue admission never
+        /// waits behind website I/O. Equivalent queued updates are marked skipped before HTTP; website I/O holds no
+        /// write transaction and terminal rows return without another send.</remarks>
         public async Task<bool> TrySendEventAsync(GozargahSiteSyncEvent syncEvent, CancellationToken cancellationToken = default)
         {
             if (syncEvent == null) return false;
-            using var accountLease = await AccountGate.EnterAsync(AccountKey(syncEvent.Uuid, syncEvent.Email), cancellationToken);
             return await SendEventCoreAsync(syncEvent, cancellationToken);
         }
 
-        /// <summary>Sends or retries one event while the caller owns account admission.</summary>
+        /// <summary>Sends or retries one event while serializing remote website I/O per account.</summary>
         /// <param name="syncEvent">Detached persisted event; reloaded under its event gate.</param>
         /// <param name="cancellationToken">Cancellation for storage and website I/O.</param>
         /// <returns>Whether the event reached a terminal state.</returns>
-        /// <remarks>Account gate precedes event gate. No write transaction spans HTTP.</remarks>
+        /// <remarks>Account gate precedes event gate. No write transaction spans HTTP. The account gate is never held
+        /// by queue admission, so deferred enqueues for the same account complete without waiting for this send.</remarks>
         private async Task<bool> SendEventCoreAsync(GozargahSiteSyncEvent syncEvent, CancellationToken cancellationToken)
         {
             var _workflow = new UserWorkflowStore(_userDbContextFactory);
             if (syncEvent == null)
                 return false;
 
+            using var accountLease = await AccountGate.EnterAsync(AccountKey(syncEvent.Uuid, syncEvent.Email), cancellationToken);
             using var eventLease = await EventGate.EnterAsync(syncEvent.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
             syncEvent = await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.SingleOrDefaultAsync(x => x.Id == syncEvent.Id, cancellationToken));
             if (syncEvent == null) return true; // A retained terminal event may have been compacted after the caller loaded it.
@@ -1323,18 +1327,29 @@ namespace Adminbot.Domain
                 }
 
                 var siteUser = await _apiClient.GetUserAsync(syncEvent.TelegramUserId, cancellationToken);
-                if (!siteUser.Success || siteUser.Data == null)
+                switch (ClassifyGetUserResponse(siteUser))
                 {
-                    MarkSkipped(syncEvent, siteUser.Message ?? "Gozargah site user was not found.");
-                    await _workflow.SaveAsync(cancellationToken);
-                    return true;
-                }
-
-                if (siteUser.Data.IsBanned)
-                {
-                    MarkSkipped(syncEvent, "Gozargah site user is banned.");
-                    await _workflow.SaveAsync(cancellationToken);
-                    return true;
+                    case GetUserLookupOutcome.Found:
+                        break;
+                    case GetUserLookupOutcome.MissingUser:
+                        MarkSkipped(syncEvent, "Gozargah site user was not found.");
+                        await _workflow.SaveAsync(cancellationToken);
+                        return true;
+                    case GetUserLookupOutcome.Banned:
+                        MarkSkipped(syncEvent, "Gozargah site user is banned.");
+                        await _workflow.SaveAsync(cancellationToken);
+                        return true;
+                    default:
+                        // Operational/transient failure (HTTP 5xx, timeout, invalid JSON, HTML/non-JSON body, or an
+                        // undocumented 4xx): keep the durable event for the retry worker instead of terminally
+                        // skipping it, because the same request may succeed once the upstream recovers.
+                        syncEvent.Status = GozargahSiteSyncStatuses.Failed;
+                        syncEvent.RetryCount++;
+                        syncEvent.LastError = BoundSyncErrorMessage(
+                            siteUser?.Message ?? "Gozargah site user lookup failed transiently.");
+                        syncEvent.UpdatedAtUtc = DateTime.UtcNow;
+                        await _workflow.SaveAsync(cancellationToken);
+                        return false;
                 }
 
                 var payload = JsonConvert.DeserializeObject<GozargahSiteOrderPayload>(syncEvent.RequestJson ?? "{}") ??
@@ -1429,8 +1444,10 @@ namespace Adminbot.Domain
         /// <remarks>
         /// The database row is written before the first API attempt. This preserves the operation for retry if the
         /// website API is unavailable after a successful 3x-ui operation.
-        /// UUID/email admission covers semantic comparison and sending. Tracking identity is excluded; successful
-        /// create/rename state can suppress an unchanged update, while delete tombstones force a real subsequent update.
+        /// UUID/email queue admission covers semantic comparison and dedupe only; remote sends are serialized per
+        /// account by the send gate, so a deferred enqueue never waits behind website I/O of the same account.
+        /// Tracking identity is excluded; successful create/rename state can suppress an unchanged update, while
+        /// delete tombstones force a real subsequent update.
         /// </remarks>
         private async Task<GozargahSiteSyncEvent> QueueAndSendAsync(
             string operation,
@@ -1457,62 +1474,72 @@ namespace Adminbot.Domain
             if (ownership.SiteOwnerTelegramUserId <= 0)
                 return null;
 
-            using var accountLease = await AccountGate.EnterAsync(AccountKey(uuid, email), cancellationToken);
-            var syncEvent = new GozargahSiteSyncEvent
+            // Queue admission is a short database-only section: it inspects unresolved/latest state, performs
+            // semantic dedupe, and inserts or reuses the durable row without ever waiting for website I/O. Remote
+            // sends for the same account are serialized later inside SendEventCoreAsync under AccountGate.
+            GozargahSiteSyncEvent queued;
+            using (var queueLease = await QueueGate.EnterAsync(AccountKey(uuid, email), cancellationToken))
             {
-                BotId = BotContextAccessor.CurrentBotId,
-                TenantBotId = ownership.TenantBotId,
-                TelegramUserId = ownership.SiteOwnerTelegramUserId,
-                OwnerTelegramUserId = ownership.IsTenant ? ownership.SiteOwnerTelegramUserId : null,
-                BuyerTelegramUserId = ownership.BuyerTelegramUserId <= 0 || ownership.BuyerTelegramUserId == ownership.SiteOwnerTelegramUserId ? null : ownership.BuyerTelegramUserId,
-                Email = email,
-                PreviousEmail = previousEmail,
-                Uuid = uuid,
-                SubId = subId,
-                SubLink = subLink,
-                Operation = operation,
-                RequestJson = JsonConvert.SerializeObject(payload),
-                Status = GozargahSiteSyncStatuses.Pending,
-                CreatedAtUtc = DateTime.UtcNow
-            };
-            // Compare successful state, not operation identity: creates and renames also establish account state.
-            await using (var db = _userDbContextFactory.CreateDbContext())
-            {
-                var account = db.GozargahSiteSyncEvents.AsNoTracking().Where(x =>
-                    !string.IsNullOrEmpty(uuid) ? x.Uuid == uuid : (x.Uuid == null || x.Uuid == "") && x.Email == email);
-                var unresolved = await account.Where(x => x.Status != GozargahSiteSyncStatuses.Succeeded
-                    && x.Status != GozargahSiteSyncStatuses.Skipped).OrderByDescending(x => x.Id).FirstOrDefaultAsync(cancellationToken);
-                var previous = await account.Where(x => x.Status == GozargahSiteSyncStatuses.Succeeded
-                    || (x.Status == GozargahSiteSyncStatuses.Skipped && x.Operation == GozargahSiteSyncOperations.Delete))
-                    .OrderByDescending(x => x.SucceededAtUtc ?? x.UpdatedAtUtc ?? x.CreatedAtUtc).ThenByDescending(x => x.Id).FirstOrDefaultAsync(cancellationToken);
-                if (unresolved == null && previous != null
-                    && (operation == GozargahSiteSyncOperations.Update || (previous.Operation == operation && previous.PreviousEmail == previousEmail))
-                    && GozargahSyncSemantics.Equivalent(previous, syncEvent))
+                var syncEvent = new GozargahSiteSyncEvent
                 {
-                    previous.WasUnchanged = operation == GozargahSiteSyncOperations.Update;
-                    return previous;
-                }
-                if (unresolved != null && unresolved.Operation == operation && unresolved.PreviousEmail == previousEmail
-                    && GozargahSyncSemantics.Equivalent(unresolved, syncEvent))
+                    BotId = BotContextAccessor.CurrentBotId,
+                    TenantBotId = ownership.TenantBotId,
+                    TelegramUserId = ownership.SiteOwnerTelegramUserId,
+                    OwnerTelegramUserId = ownership.IsTenant ? ownership.SiteOwnerTelegramUserId : null,
+                    BuyerTelegramUserId = ownership.BuyerTelegramUserId <= 0 || ownership.BuyerTelegramUserId == ownership.SiteOwnerTelegramUserId ? null : ownership.BuyerTelegramUserId,
+                    Email = email,
+                    PreviousEmail = previousEmail,
+                    Uuid = uuid,
+                    SubId = subId,
+                    SubLink = subLink,
+                    Operation = operation,
+                    RequestJson = JsonConvert.SerializeObject(payload),
+                    Status = GozargahSiteSyncStatuses.Pending,
+                    CreatedAtUtc = DateTime.UtcNow
+                };
+                // Compare successful state, not operation identity: creates and renames also establish account state.
+                await using (var db = _userDbContextFactory.CreateDbContext())
                 {
-                    if (deferSend)
-                        GozargahSiteSyncRetryService.Wake();
+                    var account = db.GozargahSiteSyncEvents.AsNoTracking().Where(x =>
+                        !string.IsNullOrEmpty(uuid) ? x.Uuid == uuid : (x.Uuid == null || x.Uuid == "") && x.Email == email);
+                    var unresolved = await account.Where(x => x.Status != GozargahSiteSyncStatuses.Succeeded
+                        && x.Status != GozargahSiteSyncStatuses.Skipped).OrderByDescending(x => x.Id).FirstOrDefaultAsync(cancellationToken);
+                    var previous = await account.Where(x => x.Status == GozargahSiteSyncStatuses.Succeeded
+                        || (x.Status == GozargahSiteSyncStatuses.Skipped && x.Operation == GozargahSiteSyncOperations.Delete))
+                        .OrderByDescending(x => x.SucceededAtUtc ?? x.UpdatedAtUtc ?? x.CreatedAtUtc).ThenByDescending(x => x.Id).FirstOrDefaultAsync(cancellationToken);
+                    if (unresolved == null && previous != null
+                        && (operation == GozargahSiteSyncOperations.Update || (previous.Operation == operation && previous.PreviousEmail == previousEmail))
+                        && GozargahSyncSemantics.Equivalent(previous, syncEvent))
+                    {
+                        previous.WasUnchanged = operation == GozargahSiteSyncOperations.Update;
+                        return previous;
+                    }
+                    if (unresolved != null && unresolved.Operation == operation && unresolved.PreviousEmail == previousEmail
+                        && GozargahSyncSemantics.Equivalent(unresolved, syncEvent))
+                    {
+                        // Reuse the existing durable row; sending happens after the short queue gate is released.
+                        queued = unresolved;
+                    }
                     else
-                        await SendEventCoreAsync(unresolved, cancellationToken);
-                    return await db.GozargahSiteSyncEvents.AsNoTracking().SingleAsync(x => x.Id == unresolved.Id, cancellationToken);
+                    {
+                        if (string.IsNullOrWhiteSpace(payload.TrackingCode))
+                            payload.TrackingCode = $"bot-sync-{Guid.NewGuid():N}";
+                        syncEvent.RequestJson = JsonConvert.SerializeObject(payload);
+                        _workflow.Add(syncEvent);
+                        await _workflow.SaveAsync(cancellationToken);
+                        queued = syncEvent;
+                    }
                 }
             }
-            if (string.IsNullOrWhiteSpace(payload.TrackingCode))
-                payload.TrackingCode = $"bot-sync-{Guid.NewGuid():N}";
-            syncEvent.RequestJson = JsonConvert.SerializeObject(payload);
-            _workflow.Add(syncEvent);
-            await _workflow.SaveAsync(cancellationToken);
+
+            // Queue admission released. A deferred enqueue returns immediately after waking the retry worker and
+            // never waits for get_user/create_order/update_order/delete_order of the same account.
             if (deferSend)
                 GozargahSiteSyncRetryService.Wake();
             else
-                await SendEventCoreAsync(syncEvent, cancellationToken);
+                await SendEventCoreAsync(queued, cancellationToken);
             return await _workflow.ReadAsync(async db => await db.GozargahSiteSyncEvents.AsNoTracking()
-                .SingleAsync(x => x.Id == syncEvent.Id, cancellationToken));
+                .SingleAsync(x => x.Id == queued.Id, cancellationToken));
         }
 
         /// <summary>Builds process-wide account admission identity independently from mutable ownership.</summary>
@@ -1651,6 +1678,94 @@ namespace Adminbot.Domain
             return string.Equals(operation, GozargahSiteSyncOperations.Create, StringComparison.OrdinalIgnoreCase) ||
                    string.Equals(operation, GozargahSiteSyncOperations.Update, StringComparison.OrdinalIgnoreCase) ||
                    string.Equals(operation, GozargahSiteSyncOperations.Rename, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Classifies a website get_user response into terminal business outcomes versus retryable operational failures.</summary>
+        private enum GetUserLookupOutcome { Found, MissingUser, Banned, TransientFailure }
+
+        /// <summary>
+        /// Classifies a website get_user response so transient upstream failures are retried instead of terminally skipped.
+        /// </summary>
+        /// <param name="siteUser">Raw API response returned by <see cref="GozargahSiteApiClient.GetUserAsync"/>.</param>
+        /// <returns>
+        /// <see cref="GetUserLookupOutcome.Found"/> when the user exists and is not banned; MissingUser or Banned for
+        /// the documented permanent results; TransientFailure for HTTP 5xx, timeouts, invalid JSON, HTML/non-JSON
+        /// bodies, and undocumented 4xx responses that may succeed on a later retry.
+        /// </returns>
+        /// <remarks>
+        /// A <c>success=false</c> flag alone is not a terminal condition: the site API reports reverse-proxy pages,
+        /// invalid JSON, and 5xx errors through the same unsuccessful response shape, and skipping those would
+        /// silently lose the durable website mirror event.
+        /// </remarks>
+        private static GetUserLookupOutcome ClassifyGetUserResponse(GozargahSiteApiResponse<GozargahSiteUserData> siteUser)
+        {
+            if (siteUser == null)
+                return GetUserLookupOutcome.TransientFailure;
+            if (siteUser.Success && siteUser.Data != null)
+                return siteUser.Data.IsBanned ? GetUserLookupOutcome.Banned : GetUserLookupOutcome.Found;
+            if (siteUser.Success)
+                return GetUserLookupOutcome.TransientFailure;
+
+            var message = siteUser.Message ?? string.Empty;
+            if (LooksLikeMissingUser(message))
+                return GetUserLookupOutcome.MissingUser;
+            if (LooksLikeBannedUser(message))
+                return GetUserLookupOutcome.Banned;
+            return GetUserLookupOutcome.TransientFailure;
+        }
+
+        /// <summary>
+        /// Detects the documented permanent "site user does not exist" result of get_user.
+        /// </summary>
+        /// <param name="message">Sanitized failure message produced by the website API client.</param>
+        /// <returns>
+        /// <c>true</c> only for the documented HTTP 404 missing-user result or a plain business not-found message;
+        /// other HTTP failures such as 5xx are never classified as a missing user.
+        /// </returns>
+        /// <remarks>
+        /// The client composes the documented missing-user result as <c>HTTP 404: &lt;body&gt;</c>; any other HTTP
+        /// prefix (for example a 500 error page whose preview happens to contain "not found") stays retryable.
+        /// </remarks>
+        private static bool LooksLikeMissingUser(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+            if (message.StartsWith("HTTP ", StringComparison.OrdinalIgnoreCase))
+            {
+                return message.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase) &&
+                       message.Contains("not found", StringComparison.OrdinalIgnoreCase);
+            }
+
+            return message.Contains("not found", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("پیدا نشد", StringComparison.Ordinal) ||
+                   message.Contains("یافت نشد", StringComparison.Ordinal) ||
+                   message.Contains("وجود ندارد", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Detects an explicit banned-user failure returned by the website API.
+        /// </summary>
+        /// <param name="message">Sanitized failure message produced by the website API client.</param>
+        /// <returns><c>true</c> when the message clearly states the user is banned or blocked.</returns>
+        private static bool LooksLikeBannedUser(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+            return message.Contains("banned", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("مسدود", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Bounds a sanitized API failure message for the durable LastError column.
+        /// </summary>
+        /// <param name="message">Failure message produced by the website API client, already preview-bounded.</param>
+        /// <returns>A trimmed message of at most 512 characters, or a fixed safe fallback when blank.</returns>
+        private static string BoundSyncErrorMessage(string message)
+        {
+            var value = string.IsNullOrWhiteSpace(message)
+                ? "Gozargah site API failure."
+                : message.Trim();
+            return value.Length <= 512 ? value : value[..512];
         }
 
         /// <summary>
