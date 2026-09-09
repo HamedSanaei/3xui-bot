@@ -298,7 +298,7 @@ namespace Adminbot.Domain
             var conversion = await ConvertTomanToPriceCurrencyAsync(tomanAmount, priceCurrency, cancellationToken);
             var priceAmount = conversion.PriceAmount;
             Console.WriteLine(
-                $"[NOWPayments] rate conversion: tomanAmount={tomanAmount}, normalizedUsdtIrtPrice={conversion.UsdtIrtPrice}, source={conversion.PriceSource}, sourceUnit={conversion.PriceUnit}, fallbackUsed={conversion.UsedFallbackPrice}, calculatedPriceAmount={priceAmount}, priceCurrency={priceCurrency}, payCurrency={(payCurrency ?? "all")}");
+                $"[NOWPayments] rate conversion: tomanAmount={tomanAmount}, normalizedUsdtIrtPrice={conversion.UsdtIrtPrice}, source={conversion.PriceSource}, sourceUnit={conversion.SourceUnit}, normalizedUnit={conversion.PriceUnit}, fallbackUsed={conversion.UsedFallbackPrice}, calculatedPriceAmount={priceAmount}, priceCurrency={priceCurrency}, payCurrency={(payCurrency ?? "all")}");
 
             var request = new NowPaymentsCreateInvoiceRequest
             {
@@ -337,7 +337,7 @@ namespace Adminbot.Domain
             var conversion = await ConvertTomanToPriceCurrencyAsync(tomanAmount, priceCurrency, cancellationToken);
             var priceAmount = conversion.PriceAmount;
             Console.WriteLine(
-                $"[NOWPayments] rate conversion: tomanAmount={tomanAmount}, normalizedUsdtIrtPrice={conversion.UsdtIrtPrice}, source={conversion.PriceSource}, sourceUnit={conversion.PriceUnit}, fallbackUsed={conversion.UsedFallbackPrice}, calculatedPriceAmount={priceAmount}, priceCurrency={priceCurrency}, payCurrency={payCurrency}");
+                $"[NOWPayments] rate conversion: tomanAmount={tomanAmount}, normalizedUsdtIrtPrice={conversion.UsdtIrtPrice}, source={conversion.PriceSource}, sourceUnit={conversion.SourceUnit}, normalizedUnit={conversion.PriceUnit}, fallbackUsed={conversion.UsedFallbackPrice}, calculatedPriceAmount={priceAmount}, priceCurrency={priceCurrency}, payCurrency={payCurrency}");
 
             var request = new NowPaymentsCreatePaymentRequest
             {
@@ -424,7 +424,7 @@ namespace Adminbot.Domain
             var usedFallback = false;
             var priceSource = quote?.Source;
 
-            if (quote?.Price > 0 && string.Equals(quote.SourceUnit, "IRT", StringComparison.OrdinalIgnoreCase))
+            if (quote?.Price > 0 && string.Equals(quote.NormalizedUnit, "IRT", StringComparison.OrdinalIgnoreCase))
             {
                 priceTomanPerUsdt = quote.Price;
             }
@@ -459,6 +459,7 @@ namespace Adminbot.Domain
                 PriceAmount = stableAmount,
                 UsdtIrtPrice = priceTomanPerUsdt,
                 PriceSource = string.IsNullOrWhiteSpace(priceSource) ? "unknown" : priceSource,
+                SourceUnit = usedFallback ? NormalizeFallbackUnitName(_appConfig.NowpaymentUsdIrtFallbackPriceUnit) : (quote?.SourceUnit ?? "unknown"),
                 PriceUnit = "IRT",
                 UsedFallbackPrice = usedFallback,
                 PriceIsRial = false
@@ -737,6 +738,7 @@ namespace Adminbot.Domain
         public decimal PriceAmount { get; set; }
         public long UsdtIrtPrice { get; set; }
         public string PriceSource { get; set; }
+        public string SourceUnit { get; set; }
         public string PriceUnit { get; set; } = "IRT";
         public bool UsedFallbackPrice { get; set; }
         /// <summary>Compatibility diagnostic only. Canonical conversions are always IRT, so this is always false.</summary>

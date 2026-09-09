@@ -15,11 +15,11 @@ namespace Adminbot.Utils
         private static readonly HttpClient SharedClient = CreateHttpClient();
         private readonly HttpClient _client;
 
-        private static readonly QuoteEndpoint[] IrtNativeEndpoints =
+        private static readonly QuoteEndpoint[] NobitexRateEndpoints =
         {
-            new("https://api.nobitex.ir/v3/orderbook/USDTIRT", "nobitex:v3-orderbook-USDTIRT", "USDTIRT", QuoteShape.OrderBook),
-            new("https://apiv2.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:apiv2-market-stats-usdt-irt", "usdt-irt", QuoteShape.Stats),
-            new("https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:market-stats-usdt-irt", "usdt-irt", QuoteShape.Stats)
+            new("https://api.nobitex.ir/v3/orderbook/USDTIRT", "nobitex:v3-orderbook-USDTIRT", "USDTIRT", "IRR", QuoteShape.OrderBook),
+            new("https://apiv2.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:apiv2-market-stats-usdt-irt", "usdt-irt", "IRR", QuoteShape.Stats),
+            new("https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=irt", "nobitex:market-stats-usdt-irt", "usdt-irt", "IRR", QuoteShape.Stats)
         };
 
         public DollarPriceHelper() : this(SharedClient) { }
@@ -36,12 +36,12 @@ namespace Adminbot.Utils
         }
 
         /// <summary>
-        /// Reads only IRT-native Nobitex markets. DollarPriceQuote.Price always means Toman/IRT per one USDT.
-        /// Ambiguous RLS-labelled endpoints are intentionally excluded from this financial path.
+        /// Reads the supported Nobitex USDT markets and normalizes their raw IRR prices exactly once.
+        /// DollarPriceQuote.Price always means Toman/IRT per one USDT; pair labels never override the explicit source-unit contract.
         /// </summary>
         public async Task<DollarPriceQuote> NobitexUSDTIRTQuote(CancellationToken cancellationToken = default)
         {
-            var tasks = IrtNativeEndpoints.Select(endpoint => TryReadIrtQuoteAsync(endpoint, cancellationToken)).ToArray();
+            var tasks = NobitexRateEndpoints.Select(endpoint => TryReadQuoteAsync(endpoint, cancellationToken)).ToArray();
             var quotes = (await Task.WhenAll(tasks)).Where(quote => quote.Price > 0).ToList();
             return SelectConsensus(quotes);
         }
@@ -54,7 +54,7 @@ namespace Adminbot.Utils
             return client;
         }
 
-        private async Task<DollarPriceQuote> TryReadIrtQuoteAsync(QuoteEndpoint endpoint, CancellationToken cancellationToken)
+        private async Task<DollarPriceQuote> TryReadQuoteAsync(QuoteEndpoint endpoint, CancellationToken cancellationToken)
         {
             try
             {
@@ -69,15 +69,22 @@ namespace Adminbot.Utils
                 if (rawPrice <= 0)
                     return DollarPriceQuote.Empty;
 
+                var normalizedPriceIrt = NormalizeSourcePriceToIrt(rawPrice, endpoint.SourceUnit);
+                if (normalizedPriceIrt <= 0)
+                    return DollarPriceQuote.Empty;
+
                 return new DollarPriceQuote
                 {
-                    Price = rawPrice,
+                    Price = normalizedPriceIrt,
                     RawPrice = rawPrice,
-                    NormalizedPriceIrt = rawPrice,
+                    NormalizedPriceIrt = normalizedPriceIrt,
                     Source = endpoint.Source,
                     SourcePair = endpoint.Pair,
-                    SourceUnit = "IRT",
-                    Normalization = "irt-native:none"
+                    SourceUnit = endpoint.SourceUnit,
+                    NormalizedUnit = "IRT",
+                    Normalization = string.Equals(endpoint.SourceUnit, "IRR", StringComparison.OrdinalIgnoreCase)
+                        ? "irr-to-irt:/10"
+                        : "irt:none"
                 };
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -93,7 +100,7 @@ namespace Adminbot.Utils
         internal static DollarPriceQuote SelectConsensus(IReadOnlyList<DollarPriceQuote> input)
         {
             var quotes = input?.Where(quote => quote != null && quote.Price > 0 &&
-                string.Equals(quote.SourceUnit, "IRT", StringComparison.OrdinalIgnoreCase)).ToList()
+                string.Equals(quote.NormalizedUnit, "IRT", StringComparison.OrdinalIgnoreCase)).ToList()
                 ?? new List<DollarPriceQuote>();
 
             if (quotes.Count == 0)
@@ -139,6 +146,22 @@ namespace Adminbot.Utils
                 .First().Quote;
             chosen.ConsensusSourceCount = bestCluster.Count;
             return chosen;
+        }
+
+        internal static long NormalizeSourcePriceToIrt(long rawPrice, string sourceUnit)
+        {
+            if (rawPrice <= 0) return 0;
+            if (string.Equals(sourceUnit, "IRR", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(sourceUnit, "RIAL", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(sourceUnit, "RLS", StringComparison.OrdinalIgnoreCase))
+            {
+                return decimal.ToInt64(decimal.Round(rawPrice / 10m, 0, MidpointRounding.AwayFromZero));
+            }
+
+            return string.Equals(sourceUnit, "IRT", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(sourceUnit, "TOMAN", StringComparison.OrdinalIgnoreCase)
+                ? rawPrice
+                : 0;
         }
 
         private static bool IsSameScale(long left, long right)
@@ -218,7 +241,7 @@ namespace Adminbot.Utils
             return value > 0;
         }
 
-        private sealed record QuoteEndpoint(string Url, string Source, string Pair, QuoteShape Shape);
+        private sealed record QuoteEndpoint(string Url, string Source, string Pair, string SourceUnit, QuoteShape Shape);
         private enum QuoteShape { OrderBook, Stats }
     }
 
@@ -231,7 +254,10 @@ namespace Adminbot.Utils
         public long NormalizedPriceIrt { get; set; }
         public string Source { get; set; }
         public string SourcePair { get; set; }
+        /// <summary>Raw unit returned by the source endpoint (for Nobitex currently IRR/Rial).</summary>
         public string SourceUnit { get; set; }
+        /// <summary>Unit of Price and NormalizedPriceIrt. Always IRT/Toman for usable quotes.</summary>
+        public string NormalizedUnit { get; set; }
         public string Normalization { get; set; }
         public int ConsensusSourceCount { get; set; }
     }

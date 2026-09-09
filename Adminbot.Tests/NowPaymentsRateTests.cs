@@ -19,13 +19,14 @@ public sealed class NowPaymentsRateTests
     [Fact]
     public async Task Changed_rls_behavior_is_not_used_by_financial_quote_path()
     {
-        var handler = new NobitexFixtureHandler(v3: 187_944, apiv2Irt: null, apiIrt: null);
+        var handler = new NobitexFixtureHandler(v3: 1_879_440, apiv2Irt: null, apiIrt: null);
         var helper = new DollarPriceHelper(new HttpClient(handler));
 
         var quote = await helper.NobitexUSDTIRTQuote();
 
         Assert.Equal(187_944, quote.Price);
-        Assert.Equal("IRT", quote.SourceUnit);
+        Assert.Equal("IRR", quote.SourceUnit);
+        Assert.Equal("IRT", quote.NormalizedUnit);
         Assert.Equal(0, handler.RlsRequestCount);
         Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("dstCurrency=rls", StringComparison.OrdinalIgnoreCase));
     }
@@ -33,14 +34,16 @@ public sealed class NowPaymentsRateTests
     [Fact]
     public async Task V3_orderbook_last_trade_price_is_canonical_irt()
     {
-        var handler = new NobitexFixtureHandler(v3: 187_944, apiv2Irt: null, apiIrt: null);
+        var handler = new NobitexFixtureHandler(v3: 1_879_440, apiv2Irt: null, apiIrt: null);
         var quote = await new DollarPriceHelper(new HttpClient(handler)).NobitexUSDTIRTQuote();
 
         Assert.Equal(187_944, quote.Price);
-        Assert.Equal(187_944, quote.RawPrice);
+        Assert.Equal(1_879_440, quote.RawPrice);
         Assert.Equal(187_944, quote.NormalizedPriceIrt);
         Assert.Equal("USDTIRT", quote.SourcePair);
-        Assert.Equal("irt-native:none", quote.Normalization);
+        Assert.Equal("IRR", quote.SourceUnit);
+        Assert.Equal("IRT", quote.NormalizedUnit);
+        Assert.Equal("irr-to-irt:/10", quote.Normalization);
     }
 
     [Theory]
@@ -58,12 +61,29 @@ public sealed class NowPaymentsRateTests
     [Fact]
     public async Task Factor_of_ten_disagreement_rejects_outlier_and_uses_consensus()
     {
-        var handler = new NobitexFixtureHandler(v3: 188_000, apiv2Irt: 187_900, apiIrt: 18_800);
+        var handler = new NobitexFixtureHandler(v3: 1_880_000, apiv2Irt: 1_879_000, apiIrt: 188_000);
         var quote = await new DollarPriceHelper(new HttpClient(handler)).NobitexUSDTIRTQuote();
 
         Assert.Equal(188_000, quote.Price);
         Assert.Equal(2, quote.ConsensusSourceCount);
         Assert.NotEqual(18_800, quote.Price);
+    }
+
+    [Fact]
+    public async Task Live_nobitex_irr_scale_is_divided_by_ten_before_nowpayments_conversion()
+    {
+        var handler = new NobitexFixtureHandler(v3: null, apiv2Irt: 2_330_010, apiIrt: null);
+        var quote = await new DollarPriceHelper(new HttpClient(handler)).NobitexUSDTIRTQuote();
+
+        Assert.Equal(2_330_010, quote.RawPrice);
+        Assert.Equal(233_001, quote.Price);
+        Assert.Equal("IRR", quote.SourceUnit);
+        Assert.Equal("IRT", quote.NormalizedUnit);
+        Assert.Equal("irr-to-irt:/10", quote.Normalization);
+
+        var amount = NowPayments.ConvertTomanUsingCanonicalIrtPrice(319_000, quote.Price);
+        Assert.Equal(Math.Round(319_000m / 233_001m, 6, MidpointRounding.AwayFromZero), amount);
+        Assert.NotEqual(0.136909m, amount);
     }
 
     [Fact]
@@ -144,7 +164,8 @@ public sealed class NowPaymentsRateTests
         Source = source,
         SourcePair = "USDTIRT",
         SourceUnit = "IRT",
-        Normalization = "irt-native:none"
+        NormalizedUnit = "IRT",
+        Normalization = "irt:none"
     };
 
     private static decimal ReadPriceAmount(string body)
