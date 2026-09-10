@@ -51,3 +51,12 @@ printf '  rejected staged Data injection\n'
 printf '  removed stale non-Data publish/source files\n'
 printf '  installed new publish/source files\n'
 printf '  left outside-of-test marker unchanged\n'
+
+if streamed_output="$(bash -s -- invalid-sha "$CANONICAL_REPO_URL" 1 1 "$EXPECTED_LIVE_ROOT" "$EXPECTED_SERVICE_NAME" \
+  < "$script_dir/deploy-production.sh" 2>&1)"; then
+  echo "Expected streamed deployment entrypoint to reject an invalid SHA." >&2
+  exit 1
+fi
+grep -Fq "deployment SHA must be exactly 40 hexadecimal characters" <<< "$streamed_output"
+[[ "$streamed_output" != *"BASH_SOURCE"* ]]
+printf '  streamed bash -s entrypoint safely rejected invalid SHA\n'

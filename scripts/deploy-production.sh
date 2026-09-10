@@ -168,6 +168,6 @@ main() {
   printf 'Production deployment completed for commit %s.\n' "$deploy_sha"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
   main "$@"
 fi
