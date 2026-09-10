@@ -5,6 +5,8 @@
   "tenantOrderNotificationRetentionDays": 30,
   "tenantMinimumSiteWalletToman": 200000,
   "tenantUnderfundedCustomerAttemptNotificationCooldownMinutes": 15,
+  "tenantStorefrontFundingAlertRetentionDays": 30,
+  "tenantStorefrontFundingMonitorIntervalMinutes": 5,
   "bots": [
     {
       "id": "owned-brand-bot",

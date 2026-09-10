@@ -44,6 +44,11 @@ public sealed class TenantStorefrontFundingAlertService
                     ApplySnapshot(state, evaluation, now);
                     await db.SaveChangesAsync(ct);
                 }
+                // Funding recovered: obsolete alerts from the previous underfunded episode must never reach the owner.
+                // Pending rows never started a Telegram request. Processing rows whose send never started are also
+                // safe to cancel: the worker's conditional send-start update still requires Status == Processing, so a
+                // live claim simply stops without sending. Possible-send rows are left untouched and stay conservative.
+                await CancelSupersededAlertsAsync(db, tenant.Id, now, ct);
                 await transaction.CommitAsync(ct);
                 return (false, false);
             }
@@ -73,7 +78,7 @@ public sealed class TenantStorefrontFundingAlertService
                 state.UnderfundedSinceUtc = now;
                 state.UnderfundedEpisodeNotifiedAtUtc = now;
                 db.TenantStorefrontFundingAlerts.Add(BuildAlert(tenant, evaluation,
-                    TenantStorefrontFundingAlertKinds.UnderfundedTransition,
+                    TenantStorefrontFundingAlertKinds.UnderfundedTransition, state.EpisodeNumber,
                     $"tenant-funding:{tenant.Id}:episode:{state.EpisodeNumber}:transition", now));
             }
 
@@ -84,7 +89,7 @@ public sealed class TenantStorefrontFundingAlertService
             {
                 state.LastCustomerAttemptAlertAtUtc = now;
                 db.TenantStorefrontFundingAlerts.Add(BuildAlert(tenant, evaluation,
-                    TenantStorefrontFundingAlertKinds.CustomerAttempt,
+                    TenantStorefrontFundingAlertKinds.CustomerAttempt, state.EpisodeNumber,
                     $"tenant-funding:{tenant.Id}:attempt:{now.Ticks}", now));
             }
 
@@ -120,13 +125,14 @@ public sealed class TenantStorefrontFundingAlertService
     }
 
     private static TenantStorefrontFundingAlert BuildAlert(BotInstance tenant, TenantAccessEvaluation evaluation,
-        string kind, string businessKey, DateTime now) => new()
+        string kind, int episodeNumber, string businessKey, DateTime now) => new()
     {
         BusinessKey = businessKey,
         TenantBotId = tenant.Id,
         OwnerTelegramUserId = tenant.OwnerTelegramUserId ?? 0,
         TenantBotUsername = tenant.Username ?? tenant.Id,
         Kind = kind,
+        EpisodeNumber = episodeNumber,
         BotBalanceToman = evaluation.BotBalanceToman ?? 0,
         SiteWalletToman = evaluation.SiteWalletToman,
         MinimumSiteWalletToman = evaluation.MinimumSiteWalletToman,
@@ -134,6 +140,39 @@ public sealed class TenantStorefrontFundingAlertService
         CreatedAtUtc = now,
         UpdatedAtUtc = now
     };
+
+    /// <summary>
+    /// Terminates obsolete funding alerts for a storefront that just became funded, inside the recovery transaction.
+    /// </summary>
+    /// <param name="db">Users.db context participating in the caller's active transaction.</param>
+    /// <param name="tenantBotId">Storefront bot id whose alerts are superseded.</param>
+    /// <param name="now">Current UTC timestamp written to the cancelled rows.</param>
+    /// <param name="ct">Transaction cancellation token.</param>
+    /// <returns>A task completing when the cancellation updates are applied.</returns>
+    /// <remarks>
+    /// Only rows that provably never started a Telegram request are cancelled: Pending rows and Processing rows with
+    /// <see cref="TenantStorefrontFundingAlert.SendStartedAtUtc"/> still null. Possible-send rows keep their
+    /// conservative outcome so delivery uncertainty is never silently converted into a false "not sent".
+    /// </remarks>
+    private static async Task CancelSupersededAlertsAsync(UserDbContext db, string tenantBotId, DateTime now, CancellationToken ct)
+    {
+        await db.TenantStorefrontFundingAlerts
+            .Where(x => x.TenantBotId == tenantBotId && x.Status == TenantStorefrontFundingAlertStatuses.Pending)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.Cancelled)
+                .SetProperty(x => x.LastError, "superseded_by_funding_recovery")
+                .SetProperty(x => x.UpdatedAtUtc, now), ct);
+        await db.TenantStorefrontFundingAlerts
+            .Where(x => x.TenantBotId == tenantBotId && x.Status == TenantStorefrontFundingAlertStatuses.Processing
+                        && x.SendStartedAtUtc == null)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.Cancelled)
+                .SetProperty(x => x.LastError, "superseded_by_funding_recovery")
+                .SetProperty(x => x.ClaimToken, (string)null)
+                .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
+                .SetProperty(x => x.NextAttemptAtUtc, (DateTime?)null)
+                .SetProperty(x => x.UpdatedAtUtc, now), ct);
+    }
 }
 
 internal interface ITenantStorefrontFundingAlertSender
@@ -211,22 +250,25 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
 {
     private const int MaximumAttempts = 6;
     private const int MaximumBatchSize = 10;
+    private const int MaximumCleanupBatch = 100;
     private static readonly TimeSpan ClaimLease = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan MaximumRetryDelay = TimeSpan.FromMinutes(15);
     private static readonly SemaphoreSlim WakeSignal = new(0, 1);
     private readonly UserDbContextFactory _factory;
     private readonly ITenantStorefrontFundingAlertSender _sender;
+    private readonly int _retentionDays;
     private readonly ILogger<TenantStorefrontFundingAlertWorker> _logger;
 
     public TenantStorefrontFundingAlertWorker(UserDbContextFactory factory, IServiceScopeFactory scopeFactory,
-        ILogger<TenantStorefrontFundingAlertWorker> logger)
-        : this(factory, new TenantStorefrontFundingAlertSender(scopeFactory), logger) { }
+        IConfiguration configuration, ILogger<TenantStorefrontFundingAlertWorker> logger)
+        : this(factory, new TenantStorefrontFundingAlertSender(scopeFactory), logger,
+            (configuration.Get<AppConfig>() ?? new AppConfig()).TenantStorefrontFundingAlertRetentionDays) { }
 
     internal TenantStorefrontFundingAlertWorker(UserDbContextFactory factory, ITenantStorefrontFundingAlertSender sender,
-        ILogger<TenantStorefrontFundingAlertWorker> logger)
+        ILogger<TenantStorefrontFundingAlertWorker> logger, int retentionDays = 30)
     {
-        _factory = factory; _sender = sender; _logger = logger;
+        _factory = factory; _sender = sender; _retentionDays = retentionDays; _logger = logger;
     }
 
     internal static void Wake()
@@ -248,18 +290,41 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
 
     internal async Task<int> ProcessOnceAsync(CancellationToken cancellationToken = default)
     {
-        await MarkExpiredClaimsUncertainAsync(cancellationToken);
+        await RecoverExpiredClaimsAsync(cancellationToken);
+        await CompactDeliveredAsync(cancellationToken);
         var rows = await ClaimDueBatchAsync(cancellationToken);
         foreach (var row in rows) await DeliverAsync(row, cancellationToken);
         return rows.Count;
     }
 
-    private async Task MarkExpiredClaimsUncertainAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Resolves expired processing leases using the durable send phase so a pre-send crash retries instead of
+    /// becoming DeliveryUncertain.
+    /// </summary>
+    /// <param name="cancellationToken">Scan cancellation token.</param>
+    /// <returns>A task completing after both recovery updates are applied.</returns>
+    /// <remarks>
+    /// An expired claim whose <see cref="TenantStorefrontFundingAlert.SendStartedAtUtc"/> is null proves no Telegram
+    /// request was started, so the row returns to Pending with an immediate retry. An expired claim whose send phase
+    /// is set may have invoked Telegram, so it is conservatively marked DeliveryUncertain and never replayed.
+    /// </remarks>
+    internal async Task RecoverExpiredClaimsAsync(CancellationToken cancellationToken = default)
     {
         var now = DateTime.UtcNow;
         await using var db = _factory.CreateDbContext();
         await db.TenantStorefrontFundingAlerts
-            .Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Processing && x.LeaseUntilUtc <= now)
+            .Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Processing && x.LeaseUntilUtc <= now
+                        && x.SendStartedAtUtc == null)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.Pending)
+                .SetProperty(x => x.NextAttemptAtUtc, now)
+                .SetProperty(x => x.LastError, "processing_lease_expired_before_send")
+                .SetProperty(x => x.ClaimToken, (string)null)
+                .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+        await db.TenantStorefrontFundingAlerts
+            .Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Processing && x.LeaseUntilUtc <= now
+                        && x.SendStartedAtUtc != null)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.DeliveryUncertain)
                 .SetProperty(x => x.LastError, "processing_lease_expired_after_possible_delivery")
@@ -267,6 +332,32 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
                 .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
                 .SetProperty(x => x.NextAttemptAtUtc, (DateTime?)null)
                 .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+    }
+
+    /// <summary>
+    /// Deletes Delivered funding alerts older than the configured retention, at most one bounded batch per cycle.
+    /// </summary>
+    /// <param name="cancellationToken">Scan cancellation token.</param>
+    /// <returns>The number of deleted rows, at most <see cref="MaximumCleanupBatch"/>.</returns>
+    /// <remarks>
+    /// Only rows that are Delivered, delivered before the cutoff, and free of any claim or lease are candidates.
+    /// Pending, Processing, DeliveryUncertain, ManualReview, and Cancelled rows are never deleted automatically.
+    /// </remarks>
+    internal async Task<int> CompactDeliveredAsync(CancellationToken cancellationToken = default)
+    {
+        if (_retentionDays <= 0)
+            return 0;
+        var cutoff = DateTime.UtcNow.AddDays(-Math.Min(_retentionDays, 36500));
+        return await SqliteOperation.RunAsync(async ct =>
+        {
+            await using var db = _factory.CreateDbContext();
+            var candidates = db.TenantStorefrontFundingAlerts
+                .Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Delivered &&
+                            x.DeliveredAtUtc != null && x.DeliveredAtUtc < cutoff &&
+                            x.ClaimToken == null && x.LeaseUntilUtc == null)
+                .OrderBy(x => x.Id).Select(x => x.Id).Take(MaximumCleanupBatch);
+            return await db.TenantStorefrontFundingAlerts.Where(x => candidates.Contains(x.Id)).ExecuteDeleteAsync(ct);
+        }, cancellationToken);
     }
 
     private async Task<List<TenantStorefrontFundingAlert>> ClaimDueBatchAsync(CancellationToken cancellationToken)
@@ -290,6 +381,7 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
                     .SetProperty(x => x.AttemptCount, x => x.AttemptCount + 1)
                     .SetProperty(x => x.ClaimToken, token)
                     .SetProperty(x => x.LeaseUntilUtc, now.Add(ClaimLease))
+                    .SetProperty(x => x.SendStartedAtUtc, (DateTime?)null)
                     .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
             if (updated == 1)
                 claimed.Add(await db.TenantStorefrontFundingAlerts.AsNoTracking().SingleAsync(x => x.Id == id && x.ClaimToken == token, cancellationToken));
@@ -297,10 +389,66 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
         return claimed;
     }
 
+    /// <summary>
+    /// Persists the durable send-start phase immediately before the Telegram transport is invoked.
+    /// </summary>
+    /// <param name="alert">The claimed, detached alert row being delivered.</param>
+    /// <param name="cancellationToken">Scan cancellation token.</param>
+    /// <returns>
+    /// <c>true</c> only when exactly one row was updated; <c>false</c> when the claim was cancelled or superseded,
+    /// in which case the caller must not invoke Telegram.
+    /// </returns>
+    /// <remarks>
+    /// The conditional update verifies Id, Processing status, the exact claim token, and that the send phase is still
+    /// null. A storefront recovery that cancelled the claim between admission and here makes the update affect zero
+    /// rows, which prevents a stale alert from ever reaching the owner. The tiny crash window after this persist and
+    /// before the HTTP call is acceptable: the row may become DeliveryUncertain but is never replayed.
+    /// </remarks>
+    internal async Task<bool> MarkSendStartedAsync(TenantStorefrontFundingAlert alert, CancellationToken cancellationToken = default)
+    {
+        var now = DateTime.UtcNow;
+        await using var db = _factory.CreateDbContext();
+        var updated = await db.TenantStorefrontFundingAlerts
+            .Where(x => x.Id == alert.Id && x.Status == TenantStorefrontFundingAlertStatuses.Processing
+                        && x.ClaimToken == alert.ClaimToken && x.SendStartedAtUtc == null)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(x => x.SendStartedAtUtc, now)
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+        return updated == 1;
+    }
+
+    /// <summary>
+    /// Verifies the storefront is still underfunded in the same episode before a queued alert may be delivered.
+    /// </summary>
+    /// <param name="alert">The claimed, detached alert row being delivered.</param>
+    /// <param name="cancellationToken">Scan cancellation token.</param>
+    /// <returns>
+    /// <c>true</c> when the storefront state exists, is underfunded, and its episode matches the alert (a zero episode
+    /// marks a legacy row persisted before episode tracking and is accepted while underfunded).
+    /// </returns>
+    /// <remarks>
+    /// This is the second line of defense after the recovery-time cancellation: rows that were cancelled while Pending
+    /// are never claimed, and rows cancelled while Processing fail the <see cref="MarkSendStartedAsync"/> conditional.
+    /// </remarks>
+    private async Task<bool> IsCurrentEpisodeAsync(TenantStorefrontFundingAlert alert, CancellationToken cancellationToken)
+    {
+        await using var db = _factory.CreateDbContext();
+        var state = await db.TenantStorefrontFundingAlertStates.AsNoTracking()
+            .SingleOrDefaultAsync(x => x.TenantBotId == alert.TenantBotId, cancellationToken);
+        if (state == null || !state.IsUnderfunded) return false;
+        return alert.EpisodeNumber == 0 || alert.EpisodeNumber == state.EpisodeNumber;
+    }
+
     private async Task DeliverAsync(TenantStorefrontFundingAlert alert, CancellationToken cancellationToken)
     {
         try
         {
+            if (!await IsCurrentEpisodeAsync(alert, cancellationToken))
+            {
+                await MarkCancelledAsync(alert, "superseded_by_funding_recovery", cancellationToken);
+                return;
+            }
+            if (!await MarkSendStartedAsync(alert, cancellationToken)) return;
             var messageId = await _sender.SendAsync(alert, cancellationToken);
             if (messageId.HasValue) { await MarkDeliveredAsync(alert, messageId.Value, cancellationToken); return; }
             await RetryAsync(alert, "owner_transport_unavailable", cancellationToken);
@@ -326,6 +474,7 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
         await db.TenantStorefrontFundingAlerts.Where(x => x.Id == alert.Id && x.Status == TenantStorefrontFundingAlertStatuses.Processing && x.ClaimToken == alert.ClaimToken)
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.Delivered)
                 .SetProperty(x => x.TelegramMessageId, messageId).SetProperty(x => x.DeliveredAtUtc, now)
+                .SetProperty(x => x.SendStartedAtUtc, (DateTime?)null)
                 .SetProperty(x => x.LastError, (string)null).SetProperty(x => x.ClaimToken, (string)null)
                 .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null).SetProperty(x => x.NextAttemptAtUtc, (DateTime?)null)
                 .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
@@ -340,6 +489,7 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
         await db.TenantStorefrontFundingAlerts.Where(x => x.Id == alert.Id && x.Status == TenantStorefrontFundingAlertStatuses.Processing && x.ClaimToken == alert.ClaimToken)
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.Pending)
                 .SetProperty(x => x.NextAttemptAtUtc, now.AddSeconds(seconds)).SetProperty(x => x.LastError, error)
+                .SetProperty(x => x.SendStartedAtUtc, (DateTime?)null)
                 .SetProperty(x => x.ClaimToken, (string)null).SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
                 .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
     }
@@ -348,6 +498,8 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
         MarkTerminalAsync(alert, TenantStorefrontFundingAlertStatuses.ManualReview, error, cancellationToken);
     private Task MarkUncertainAsync(TenantStorefrontFundingAlert alert, string error, CancellationToken cancellationToken) =>
         MarkTerminalAsync(alert, TenantStorefrontFundingAlertStatuses.DeliveryUncertain, error, cancellationToken);
+    private Task MarkCancelledAsync(TenantStorefrontFundingAlert alert, string error, CancellationToken cancellationToken) =>
+        MarkTerminalAsync(alert, TenantStorefrontFundingAlertStatuses.Cancelled, error, cancellationToken);
 
     private async Task MarkTerminalAsync(TenantStorefrontFundingAlert alert, string status, string error, CancellationToken cancellationToken)
     {
@@ -355,6 +507,7 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
         await using var db = _factory.CreateDbContext();
         await db.TenantStorefrontFundingAlerts.Where(x => x.Id == alert.Id && x.Status == TenantStorefrontFundingAlertStatuses.Processing && x.ClaimToken == alert.ClaimToken)
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, status).SetProperty(x => x.LastError, error)
+                .SetProperty(x => x.SendStartedAtUtc, (DateTime?)null)
                 .SetProperty(x => x.ClaimToken, (string)null).SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
                 .SetProperty(x => x.NextAttemptAtUtc, (DateTime?)null).SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
     }

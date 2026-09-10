@@ -31,6 +31,24 @@ namespace Adminbot.Domain
         /// <summary>Persisted cooldown, in minutes, between owner alerts for customer attempts on an underfunded storefront.</summary>
         /// <remarks>Must be positive. The transition alert is independent and is not suppressed by this cooldown.</remarks>
         public int TenantUnderfundedCustomerAttemptNotificationCooldownMinutes { get; set; } = 15;
+        /// <summary>
+        /// Days to retain Delivered tenant storefront funding alerts before the delivery worker's bounded cleanup
+        /// removes them.
+        /// </summary>
+        /// <remarks>
+        /// Must be positive; the default is 30. Pending, Processing, DeliveryUncertain, ManualReview, and Cancelled
+        /// rows are never candidates for cleanup and remain available for diagnostics.
+        /// </remarks>
+        public int TenantStorefrontFundingAlertRetentionDays { get; set; } = 30;
+        /// <summary>
+        /// Minutes between read-only tenant storefront funding monitor cycles that detect external Gozargah wallet
+        /// changes between customer interactions.
+        /// </summary>
+        /// <remarks>
+        /// Must be positive; the default is 5. Each cycle performs at most one read-only website wallet lookup per
+        /// storefront owner and never mutates wallets, debt transfers, orders, payments, or XUI state.
+        /// </remarks>
+        public int TenantStorefrontFundingMonitorIntervalMinutes { get; set; } = 5;
         public BotInstanceConfig SalesAssistantBot { get; set; } = new();
         public string BotToken { get; set; }
         public string IpnSecretKey { get; set; }

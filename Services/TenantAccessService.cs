@@ -112,6 +112,34 @@ public sealed class TenantAccessService
         return ClassifyFundingSnapshot(owner.AccountBalance, site.CanUse, site.CanUse ? (long?)site.WalletToman : null);
     }
 
+    /// <summary>
+    /// Evaluates the same owner funding policy as <see cref="EvaluateDecisionAsync"/> without any financial side
+    /// effect, for read-only background monitoring of externally funded Gozargah wallets.
+    /// </summary>
+    /// <param name="ownerId">Required storefront owner's Telegram id, never the customer's id.</param>
+    /// <param name="token">Cancellation for the credential read and the optional website wallet lookup.</param>
+    /// <returns>
+    /// The same <see cref="TenantAccessEvaluation"/> the access gate would produce, with safe balance snapshots.
+    /// </returns>
+    /// <remarks>
+    /// Read-only by construction: it never creates a <see cref="TenantDebtTransfer"/>, never debits the Gozargah
+    /// site wallet, never repays debt, and never mutates wallets, orders, payments, or XUI state. A positive local
+    /// balance short-circuits before any website lookup, matching the production OR rule.
+    /// </remarks>
+    /// <example><code>var evaluation = await access.EvaluateFundingSnapshotAsync(tenant.OwnerTelegramUserId.Value, token);</code></example>
+    public async Task<TenantAccessEvaluation> EvaluateFundingSnapshotAsync(long ownerId, CancellationToken token)
+    {
+        var owner = await _credentials.GetUserStatusWithId(ownerId);
+        if (owner?.IsBlocked == true)
+            return new(TenantAccessDecision.OwnerBlocked, owner.AccountBalance, null, false, _appConfig.TenantMinimumSiteWalletToman);
+        if (owner == null)
+            return new(TenantAccessDecision.OwnerMissing, null, null, false, _appConfig.TenantMinimumSiteWalletToman);
+        if (owner.AccountBalance > 0)
+            return ClassifyFundingSnapshot(owner.AccountBalance, false, null);
+        var site = await ReadSiteAsync(ownerId, token);
+        return ClassifyFundingSnapshot(owner.AccountBalance, site.CanUse, site.CanUse ? (long?)site.WalletToman : null);
+    }
+
     /// <summary>Applies the single existing OR funding rule to already-observed balances without another website request.</summary>
     internal TenantAccessEvaluation ClassifyFundingSnapshot(long botBalanceToman, bool siteWalletUsable, long? siteWalletToman)
     {

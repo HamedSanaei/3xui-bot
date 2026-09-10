@@ -517,6 +517,8 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc });
             entity.HasIndex(x => x.LeaseUntilUtc);
             entity.HasIndex(x => new { x.TenantBotId, x.CreatedAtUtc });
+            // Supports the bounded delivered-history cleanup without scanning every row of the outbox.
+            entity.HasIndex(x => new { x.Status, x.DeliveredAtUtc });
         });
         modelBuilder.Entity<GozargahSiteSyncEvent>(entity =>
         {

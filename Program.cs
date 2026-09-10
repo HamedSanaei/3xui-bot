@@ -178,6 +178,7 @@ public class Program
         services.AddHostedService<TenantManualReceiptNotificationWorker>();
         services.AddHostedService<TenantOrderNotificationWorker>();
         services.AddHostedService<TenantStorefrontFundingAlertWorker>();
+        services.AddHostedService<TenantStorefrontFundingMonitorHostedService>();
         services.AddSingleton<UniquePayReconciliationHostedService>();
         services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
 
@@ -470,6 +471,16 @@ public class Program
             throw new InvalidOperationException("Configuration value 'tenantMinimumSiteWalletToman' cannot be negative.");
         if (appConfig.TenantUnderfundedCustomerAttemptNotificationCooldownMinutes <= 0)
             throw new InvalidOperationException("Configuration value 'tenantUnderfundedCustomerAttemptNotificationCooldownMinutes' must be positive.");
+        if (appConfig.TenantStorefrontFundingAlertRetentionDays <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Configuration value '{nameof(appConfig.TenantStorefrontFundingAlertRetentionDays)}' must be positive; actual value is {appConfig.TenantStorefrontFundingAlertRetentionDays}.");
+        }
+        if (appConfig.TenantStorefrontFundingMonitorIntervalMinutes <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Configuration value '{nameof(appConfig.TenantStorefrontFundingMonitorIntervalMinutes)}' must be positive; actual value is {appConfig.TenantStorefrontFundingMonitorIntervalMinutes}.");
+        }
     }
 
     /// <summary>
