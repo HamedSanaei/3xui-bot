@@ -567,17 +567,10 @@ public class SalesAssistantService
         bool? showAlert = null,
         CancellationToken cancellationToken = default)
     {
-        try
-        {
-            await botClient.AnswerCallbackQueryAsync(callbackQueryId, text, showAlert, cancellationToken: cancellationToken);
-        }
-        catch (ApiRequestException ex) when (ex.ErrorCode == 400 &&
-                                            (ex.Message.Contains("query is too old", StringComparison.OrdinalIgnoreCase) ||
-                                             ex.Message.Contains("query ID is invalid", StringComparison.OrdinalIgnoreCase) ||
-                                             ex.Message.Contains("response timeout expired", StringComparison.OrdinalIgnoreCase)))
-        {
-            _logger.LogWarning(ex, "Ignoring stale sales-assistant callback answer. callbackQueryId={CallbackQueryId}", callbackQueryId);
-        }
+        await TelegramCallbackAnswerPolicy.TryAnswerAsync(
+            botClient, callbackQueryId, text, showAlert,
+            cancellationToken: cancellationToken, logger: _logger,
+            botId: BotContextAccessor.CurrentBotId);
     }
 
     /// <summary>

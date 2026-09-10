@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Builder;
+﻿using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using System.Globalization;
@@ -646,7 +646,8 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(expectedUsers, Path.GetFullPath(await ReadMainDatabasePathAsync(fixtureUsers)));
         var applied = (await fixtureUsers.Database.GetAppliedMigrationsAsync()).ToList();
         Assert.Contains("20260625000000_AddMultiBotState", applied);
-        Assert.Equal("20260910012628_AddAtlasPayGateway", applied[^1]);
+        Assert.Contains("20260910012628_AddAtlasPayGateway", applied);
+        Assert.Equal("20260910184123_AddTenantOwnerNotificationRoute", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1293,8 +1294,9 @@ public sealed partial class ConcurrencyTests
             payment.ProviderStatus="confirmed"; payment.PaidAtUtc=DateTime.UtcNow;
             db.AtlasPayPaymentInfos.Add(payment); await db.SaveChangesAsync(); paymentId=payment.Id;
         }
-        // Close SQLite pools and overwrite the users.db file so every later read fails with SqliteException.
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        // Release only this fixture's users.db pools, then overwrite users.db so every later read fails with
+        // SqliteException. Scoped clearing keeps any pool belonging to a parallel fixture intact.
+        SqliteTestPools.ClearFor(Path.Combine(databases.DirectoryPath, "users.db"));
         await System.IO.File.WriteAllBytesAsync(Path.Combine(databases.DirectoryPath, "users.db"),
             new byte[] { 0x44, 0x45, 0x41, 0x44, 0x42, 0x45, 0x45, 0x46, 0x00, 0x01, 0x02, 0x03 });
         await using var provider = IncidentProvider(databases).Provider;
@@ -1358,7 +1360,8 @@ public sealed partial class ConcurrencyTests
             Assert.False(order.IsFulfilled);
             Assert.Empty(await users.AtlasPayPaymentInfos.ToListAsync());
             var applied = (await users.Database.GetAppliedMigrationsAsync()).ToList();
-            Assert.Equal(atlasMigration, applied[^1]);
+            Assert.Contains(atlasMigration, applied);
+            Assert.Equal("20260910184123_AddTenantOwnerNotificationRoute", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1370,7 +1373,8 @@ public sealed partial class ConcurrencyTests
             Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
             var history = (await users.Database.GetAppliedMigrationsAsync()).ToList();
             Assert.Contains("20260625000000_AddMultiBotState", history);
-            Assert.Equal(atlasMigration, history[^1]);
+            Assert.Contains(atlasMigration, history);
+            Assert.Equal("20260910184123_AddTenantOwnerNotificationRoute", history[^1]);
         }
     }
 

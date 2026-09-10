@@ -506,8 +506,10 @@ public sealed partial class ConcurrencyTests
         await using var transaction = await blocker.Database.BeginTransactionAsync();
         await blocker.Database.ExecuteSqlRawAsync("UPDATE Users SET LastStep = LastStep");
         var attempts = new List<Guid>();
+        // Non-pooled so the fixture can release this handle when it disposes; a pooled connection would keep
+        // users.db open and make the fixture's scoped pool cleanup and directory delete unreliable.
         var options = new DbContextOptionsBuilder<UserDbContext>().UseSqlite(new SqliteConnectionStringBuilder
-        { DataSource = Path.Combine(databases.DirectoryPath, "users.db"), DefaultTimeout = 1 }.ToString()).Options;
+        { DataSource = Path.Combine(databases.DirectoryPath, "users.db"), DefaultTimeout = 1, Pooling = false }.ToString()).Options;
         var failure = await Assert.ThrowsAsync<SqliteException>(() => SqliteOperation.RunAsync(async token =>
         {
             await using var context = new UserDbContext(options); attempts.Add(context.ContextId.InstanceId);

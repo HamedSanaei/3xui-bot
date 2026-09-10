@@ -77,9 +77,11 @@ public sealed class MigrationDeploymentGuardTests
         using var fixture = new MigrationFixture();
         await using (var users = fixture.CreateUsers()) await users.Database.MigrateAsync();
         await using (var credentials = fixture.CreateCredentials()) await credentials.Database.MigrateAsync();
-        // Close pooled migration connections before the timestamp baseline so a delayed WAL checkpoint from test
-        // setup cannot be mistaken for a write performed by the read-only production preflight.
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        // Release this fixture's pooled migration connections before the timestamp baseline so a delayed WAL
+        // checkpoint from test setup cannot be mistaken for a write performed by the read-only production
+        // preflight. Only this fixture's paths are cleared, so parallel fixtures keep their pools.
+        SqliteTestPools.ClearFor(fixture.UsersPath);
+        SqliteTestPools.ClearFor(fixture.CredentialsPath);
         var usersWrite = File.GetLastWriteTimeUtc(fixture.UsersPath);
         var credentialsWrite = File.GetLastWriteTimeUtc(fixture.CredentialsPath);
         using var output = new StringWriter();
@@ -129,10 +131,12 @@ public sealed class MigrationDeploymentGuardTests
         /// <returns>A disposable context using the production SQLite options and migration assembly.</returns>
         public CredentialsDbContext CreateCredentials() => new(new DbContextOptionsBuilder<CredentialsDbContext>()
             .UseSqlite(SqliteOperation.ConnectionString(CredentialsPath)).Options);
-        /// <summary>Clears SQLite pools and removes only this fixture's random OS-temporary directory.</summary>
+        /// <summary>Releases this fixture's own SQLite pools and removes only its random OS-temporary directory.</summary>
+        /// <remarks>Every cleared pool key embeds this fixture's random directory, so fixtures running in parallel are unaffected.</remarks>
         public void Dispose()
         {
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            SqliteTestPools.ClearFor(UsersPath);
+            SqliteTestPools.ClearFor(CredentialsPath);
             var root = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
             if (!Path.GetFullPath(_directory).StartsWith(root, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Invalid migration fixture directory.");

@@ -136,6 +136,7 @@ public class BotRegistry
             TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled,
             TenantUniquePayEnabled = bot.TenantUniquePayEnabled,
             TenantAtlasPayEnabled = bot.TenantAtlasPayEnabled,
+            TenantOwnerNotificationBotId = bot.TenantOwnerNotificationBotId,
             TenantTutorialsJson = bot.TenantTutorialsJson
         };
     }
@@ -253,6 +254,7 @@ public class BotRegistry
             TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled,
             TenantUniquePayEnabled = bot.TenantUniquePayEnabled,
             TenantAtlasPayEnabled = bot.TenantAtlasPayEnabled,
+            TenantOwnerNotificationBotId = bot.TenantOwnerNotificationBotId,
             TenantTutorialsJson = bot.TenantTutorialsJson,
             IsSalesAssistant = bot.IsSalesAssistant
         };

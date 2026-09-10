@@ -1,4 +1,4 @@
-using Adminbot.Domain;
+﻿using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -323,19 +323,37 @@ public sealed partial class ConcurrencyTests
     }
 
     [Fact]
-    public async Task Owner_sale_delivery_uses_token_valid_default_bot_even_when_receiver_is_disabled()
+    public async Task Owner_sale_delivery_uses_explicit_owner_notification_route_even_when_default_bot_is_unavailable()
     {
         using var databases = new Databases();
         var (provider, registry, clients) = IncidentProvider(databases);
         await using (provider)
         {
-            var main = registry.DefaultBot;
-            main.Enabled = false;
-            var order = HistoricalOrder("owner-default-send", fulfilled: true);
+            registry.DefaultBot.Enabled = false;
+            registry.Upsert(new BotInstance { Id = "owner-control", Type = BotInstanceTypes.Owned, Enabled = true, Token = Token(10003) });
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                db.BotInstances.Add(new BotInstance
+                {
+                    Id = "tenant-reset", Type = BotInstanceTypes.Tenant, Enabled = true, OwnerTelegramUserId = 711,
+                    TenantOwnerNotificationBotId = "owner-control", CreatedAtUtc = DateTime.UtcNow
+                });
+                await db.SaveChangesAsync();
+            }
+            var order = HistoricalOrder("owner-explicit-route-send", fulfilled: true);
+            await using var before = databases.Users.CreateDbContext();
+            var ledgerBefore = await before.TenantBotLedgerEntries.CountAsync();
+            var debitBefore = await before.Set<SiteWalletDebitOperation>().CountAsync();
             await using var scope = provider.CreateAsyncScope();
             var delivery = scope.ServiceProvider.GetRequiredService<TenantOrderNotificationDeliveryService>();
             Assert.NotNull(await delivery.SendAsync(order, TenantOrderNotificationKinds.OwnerSaleNotification, default));
-            Assert.True(clients.ContainsKey("main"));
+            Assert.Single(clients["owner-control"].Texts);
+            Assert.False(clients.TryGetValue("main", out var main) && main.Texts.Count > 0);
+            Assert.False(clients.TryGetValue("tenant-reset", out var tenant) && tenant.Texts.Count > 0);
+            Assert.False(clients.TryGetValue("assistant", out var assistant) && assistant.Texts.Count > 0);
+            await using var after = databases.Users.CreateDbContext();
+            Assert.Equal(ledgerBefore, await after.TenantBotLedgerEntries.CountAsync());
+            Assert.Equal(debitBefore, await after.Set<SiteWalletDebitOperation>().CountAsync());
         }
     }
 

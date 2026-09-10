@@ -205,26 +205,33 @@ internal sealed class TenantStorefrontFundingAlertSender(IServiceScopeFactory sc
 
 public sealed class TenantStorefrontFundingAlertDeliveryService
 {
-    private readonly BotRegistry _botRegistry;
-    private readonly BotClientProvider _botClientProvider;
+    private readonly TenantOwnerNotificationTransportResolver _ownerTransportResolver;
+    private readonly UserDbContextFactory _factory;
     private readonly CredentialsStore _credentials;
 
-    public TenantStorefrontFundingAlertDeliveryService(BotRegistry botRegistry, BotClientProvider botClientProvider,
+    public TenantStorefrontFundingAlertDeliveryService(
+        TenantOwnerNotificationTransportResolver ownerTransportResolver,
+        UserDbContextFactory factory,
         CredentialsStore credentials)
     {
-        _botRegistry = botRegistry;
-        _botClientProvider = botClientProvider;
+        _ownerTransportResolver = ownerTransportResolver;
+        _factory = factory;
         _credentials = credentials;
     }
 
     public async Task<int?> SendAsync(TenantStorefrontFundingAlert alert, CancellationToken cancellationToken)
     {
-        var bot = _botRegistry.DefaultBot;
-        if (bot == null || string.IsNullOrWhiteSpace(bot.Token)) return null;
+        await using var db = _factory.CreateDbContext();
+        var tenant = await db.BotInstances.AsNoTracking().SingleOrDefaultAsync(x =>
+            x.Id == alert.TenantBotId && x.Type == BotInstanceTypes.Tenant &&
+            x.OwnerTelegramUserId == alert.OwnerTelegramUserId, cancellationToken);
+        if (tenant == null)
+            throw new OwnerNotificationTransportUnavailableException();
+        var resolved = await _ownerTransportResolver.ResolveClientAsync(tenant, alert.OwnerTelegramUserId, cancellationToken);
         var owner = await _credentials.GetUserStatusWithId(alert.OwnerTelegramUserId);
         var chatId = owner?.ChatID > 0 ? owner.ChatID : alert.OwnerTelegramUserId;
         var text = BuildMessage(alert);
-        return (await _botClientProvider.GetClient(bot.Id).SendTextMessageAsync(chatId, text,
+        return (await resolved.Client.SendTextMessageAsync(chatId, text,
             parseMode: ParseMode.Html, cancellationToken: cancellationToken)).MessageId;
     }
 
@@ -467,10 +474,11 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
             await RetryAsync(alert, "owner_transport_unavailable", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-        catch (ApiRequestException ex) when (ex.ErrorCode == 429) { await RetryAsync(alert, "telegram_api_429", cancellationToken); }
+        catch (OwnerNotificationTransportUnavailableException) { await RetryAsync(alert, OwnerNotificationTransportUnavailableException.SafeReason, cancellationToken); }
+        catch (ApiRequestException ex) when (ex.ErrorCode == 429) { await RetryAsync(alert, TelegramDeliveryFailureClassifier.Classify(ex), cancellationToken); }
         catch (BotTransportUnavailableException) { await RetryAsync(alert, "bot_transport_unavailable", cancellationToken); }
-        catch (ApiRequestException ex) when (ex.ErrorCode >= 500) { await MarkUncertainAsync(alert, $"telegram_api_{ex.ErrorCode}", cancellationToken); }
-        catch (ApiRequestException ex) { await MarkManualReviewAsync(alert, $"telegram_api_{ex.ErrorCode}", cancellationToken); }
+        catch (ApiRequestException ex) when (ex.ErrorCode >= 500) { await MarkUncertainAsync(alert, TelegramDeliveryFailureClassifier.Classify(ex), cancellationToken); }
+        catch (ApiRequestException ex) { await MarkManualReviewAsync(alert, TelegramDeliveryFailureClassifier.Classify(ex), cancellationToken); }
         catch (Exception ex) when (ex is Telegram.Bot.Exceptions.RequestException or TimeoutException or HttpRequestException or TaskCanceledException)
         { await MarkUncertainAsync(alert, "telegram_send_outcome_uncertain", cancellationToken); }
         catch (Exception ex)

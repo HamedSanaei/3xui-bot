@@ -137,10 +137,11 @@ public sealed class AdminPanelRoutingTests
             State = new global::UserStateStore(Users);
         }
 
-        /// <summary>Closes SQLite pools and removes only this fixture's validated temporary directory.</summary>
+        /// <summary>Releases this fixture's own SQLite pools and removes only its validated temporary directory.</summary>
+        /// <remarks>Every cleared pool key embeds this fixture's random directory, so fixtures running in parallel are unaffected.</remarks>
         public void Dispose()
         {
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            SqliteTestPools.ClearForDirectory(_directory);
             var root = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
             if (!Path.GetFullPath(_directory).StartsWith(root, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Invalid test directory");

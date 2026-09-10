@@ -155,20 +155,34 @@ public sealed partial class ConcurrencyTests
         Assert.DoesNotContain(200_000L.FormatCurrency(), text);
     }
 
-    [Fact]
-    public async Task Funding_alert_delivery_uses_owned_default_bot_not_disabled_tenant_transport()
+    [Theory]
+    [InlineData(TenantStorefrontFundingAlertKinds.UnderfundedTransition)]
+    [InlineData(TenantStorefrontFundingAlertKinds.CustomerAttempt)]
+    public async Task Funding_alert_delivery_uses_explicit_owner_route_not_default_or_tenant_transport(string kind)
     {
         using var databases = new Databases();
         var (provider, registry, clients) = IncidentProvider(databases);
         await using (provider)
         {
+            registry.Upsert(new BotInstance { Id = "owner-control", Type = BotInstanceTypes.Owned, Enabled = true, Token = Token(10003) });
             registry.Upsert(new BotInstance { Id = "tenant-alert-reset", Type = BotInstanceTypes.Tenant, Enabled = false, Token = null, OwnerTelegramUserId = 711 });
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                db.BotInstances.Add(new BotInstance
+                {
+                    Id = "tenant-alert-reset", Type = BotInstanceTypes.Tenant, Enabled = false, OwnerTelegramUserId = 711,
+                    TenantOwnerNotificationBotId = "owner-control", CreatedAtUtc = DateTime.UtcNow
+                });
+                await db.SaveChangesAsync();
+            }
             await using var scope = provider.CreateAsyncScope();
             var delivery = scope.ServiceProvider.GetRequiredService<TenantStorefrontFundingAlertDeliveryService>();
-            var alert = FundingAlert("tenant-alert-reset", TenantStorefrontFundingAlertKinds.UnderfundedTransition);
+            var alert = FundingAlert("tenant-alert-reset", kind);
             Assert.NotNull(await delivery.SendAsync(alert, default));
-            Assert.True(clients.ContainsKey("main"));
-            Assert.False(clients.ContainsKey("tenant-alert-reset"));
+            Assert.Single(clients["owner-control"].Texts);
+            Assert.False(clients.TryGetValue("main", out var main) && main.Texts.Count > 0);
+            Assert.False(clients.TryGetValue("tenant-alert-reset", out var tenant) && tenant.Texts.Count > 0);
+            Assert.False(clients.TryGetValue("assistant", out var assistant) && assistant.Texts.Count > 0);
         }
     }
 

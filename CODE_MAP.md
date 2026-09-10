@@ -710,3 +710,43 @@ and the main menu.
   serializes receiver start/stop per `BotId` through per-bot lifecycle gates. The legacy `PeriodicTaskRunner`
   (`async void` timer + static DbContext) and `ZibalHttpServer` are dead code with no source references and are not
   registered anywhere.
+
+## Owner Notification Routing and Telegram Lane Safety
+
+- Owner-facing operational notifications (`owner_sale_notification` from `TenantOrderNotificationWorker`, and storefront
+  funding alerts from `TenantStorefrontFundingAlertDeliveryService`) are routed by the single
+  `Services/TenantOwnerNotificationTransportResolver.cs`. The persisted `BotInstances.TenantOwnerNotificationBotId`
+  wins when it still points at an owned bot that the same owner controls and that is enabled with a configured token.
+  Otherwise the resolver derives the transport deterministically from the newest `BotUserStates` row for that owner
+  restricted to those same valid owned bots (`explicit` then `historical_bot_user_state`). No valid owned bot, or no
+  historical evidence at all, yields `OwnerNotificationTransportUnavailableException`
+  (`owner_notification_transport_unavailable`) and the row stays a retryable pre-send failure: the owned default bot and
+  the tenant bot are never used as owner operational transport. Sales Assistant sale notices keep their own separate
+  route (`SalesAssistantSaleNotification`), and customer delivery keeps using the order's tenant bot.
+- `BotInstances.TenantOwnerNotificationBotId` is written opportunistically when an owned bot is created for an owner
+  (`TenantStoreStore`, `Program` bot sync); `TenantStoreStore` also backfills tenants that still have a null value.
+  Migration `20260910184123_AddTenantOwnerNotificationRoute` only adds the nullable `TEXT(64)` column. It never
+  backfills and never writes the default bot, so legacy tenant rows stay null and are resolved by evidence at send
+  time; it is the final `UserDbContext` migration and `Database.Migrate()` startup behavior is unchanged.
+- Telegram callback acknowledgements use `Services/TelegramCallbackAnswerPolicy.cs`: one 2-second linked-token budget
+  per acknowledgement, local timeout / `RequestException` / `ApiRequestException` are best-effort and never abort the
+  business flow, `query is too old` / invalid query id / expired response timeouts are harmless noise, and the caller's
+  outer cancellation still propagates. Applied by `TelegramBotService`, `TenantBotService`, `SalesAssistantService`,
+  `XuiV3AdminFlowService`, and `XuiV3BotFlowService.AnswerCallbackSafelyAsync`. Business-critical Telegram sends are
+  deliberately not converted to best-effort acknowledgements.
+- `TelegramBotService.isJoinedToChannel` checks every mandatory channel under one overall 5-second budget (not 5
+  seconds per channel) and fails closed on timeout, transport failure, or channel-access errors, so a slow channel can
+  never open a storefront. Tenant forced join keeps its separate per-customer `GetChatMember` fail-closed check with a
+  single `PARTICIPANT_ID_INVALID` retry.
+- Background notification workers persist only stable reason codes from
+  `Services/TelegramDeliveryFailureClassifier.cs` (`telegram_chat_not_found`, `telegram_bot_blocked_by_user`,
+  `telegram_user_deactivated`, `telegram_forbidden`, `telegram_api_400_other`, `telegram_api_429`,
+  `telegram_api_5xx`) plus generic uncertainty codes; raw Telegram exception text is never stored. Both workers claim
+  only `Pending` rows, so `ManualReview`, `DeliveryUncertain`, and `Cancelled` history is never replayed, and compaction
+  deletes only old `Delivered` rows.
+- Test infrastructure: `Adminbot.Tests/SqliteTestPools.cs` releases SQLite connection pools per fixture path and
+  per fixture directory only. Global `SqliteConnection.ClearAllPools()` must not be used from fixture disposal, because
+  a SQLite pool is keyed by the exact connection string: clearing only the fixture's own shape leaked pooled handles
+  for production options, the read-only backup snapshot, and the shared-cache outbox, and the fixture directory delete
+  then failed with `IOException: The process cannot access the file ... because it is being used by another process`.
+  Fixture connections declare `Pooling=false`, and the helper refuses any directory outside the OS temp root.

@@ -159,6 +159,7 @@ public class Program
         services.AddScoped<GozargahSiteSyncService>();
         services.AddScoped<OwnedBotNotificationService>();
         services.AddScoped<SalesAssistantService>();
+        services.AddScoped<TenantOwnerNotificationTransportResolver>();
         services.AddScoped<TenantOrderNotificationDeliveryService>();
         services.AddScoped<TenantBotService>();
         services.AddSingleton<TenantStoreStore>();
@@ -341,6 +342,10 @@ public class Program
             existing.TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled;
             existing.TenantUniquePayEnabled = bot.TenantUniquePayEnabled;
             existing.TenantAtlasPayEnabled = bot.TenantAtlasPayEnabled;
+            if (string.Equals(existing.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) &&
+                string.IsNullOrWhiteSpace(existing.TenantOwnerNotificationBotId) &&
+                !string.IsNullOrWhiteSpace(bot.TenantOwnerNotificationBotId))
+                existing.TenantOwnerNotificationBotId = bot.TenantOwnerNotificationBotId;
             existing.UpdatedAtUtc = DateTime.UtcNow;
         }
 

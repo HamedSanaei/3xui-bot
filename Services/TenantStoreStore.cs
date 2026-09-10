@@ -50,6 +50,7 @@ public sealed class TenantStoreStore
     public Task<BotInstance> CreateAsync(long ownerId, string creationKey, CancellationToken token = default)
     {
         if (ownerId <= 0 || !Guid.TryParseExact(creationKey, "N", out _)) throw new ArgumentException("Invalid storefront allocation identity.");
+        var ownerNotificationBotId = GetCurrentOwnedBotId();
         return SqliteOperation.RunAsync(async ct =>
         {
             await using var db = _factory.CreateDbContext();
@@ -57,13 +58,23 @@ public sealed class TenantStoreStore
             await using var tx = await db.Database.BeginTransactionAsync(ct);
             var stores = await db.BotInstances.Where(x => x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId == ownerId).ToListAsync(ct);
             var existing = stores.SingleOrDefault(x => x.TenantCreationKey == creationKey);
-            if (existing != null) return existing;
+            if (existing != null)
+            {
+                if (string.IsNullOrWhiteSpace(existing.TenantOwnerNotificationBotId) && !string.IsNullOrWhiteSpace(ownerNotificationBotId))
+                {
+                    existing.TenantOwnerNotificationBotId = ownerNotificationBotId;
+                    await db.SaveChangesAsync(ct);
+                    await tx.CommitAsync(ct);
+                }
+                return existing;
+            }
             if (stores.Count >= _limit) return null;
             var number = checked(stores.Select(x => x.TenantStoreNumber ?? 0).DefaultIfEmpty().Max() + 1);
             var store = new BotInstance
             {
                 Id = $"tenant-{ownerId}-{number}", OwnerTelegramUserId = ownerId, TenantStoreNumber = number,
                 TenantCreationKey = creationKey, Type = BotInstanceTypes.Tenant, Enabled = false,
+                TenantOwnerNotificationBotId = ownerNotificationBotId,
                 BrandName = $"فروشگاه {number}", CreatedAtUtc = DateTime.UtcNow
             };
             db.BotInstances.Add(store);
@@ -72,4 +83,25 @@ public sealed class TenantStoreStore
             return store;
         }, token);
     }
+
+    public async Task<bool> EstablishOwnerNotificationRouteFromCurrentOwnedBotAsync(
+        string tenantBotId, long ownerId, CancellationToken token = default)
+    {
+        var ownedBotId = GetCurrentOwnedBotId();
+        if (string.IsNullOrWhiteSpace(tenantBotId) || ownerId <= 0 || string.IsNullOrWhiteSpace(ownedBotId))
+            return false;
+        await using var db = _factory.CreateDbContext();
+        var updated = await db.BotInstances
+            .Where(x => x.Id == tenantBotId && x.Type == BotInstanceTypes.Tenant &&
+                        x.OwnerTelegramUserId == ownerId && x.TenantOwnerNotificationBotId == null)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.TenantOwnerNotificationBotId, ownedBotId), token);
+        return updated == 1;
+    }
+
+    private static string GetCurrentOwnedBotId() =>
+        string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase) &&
+        !string.IsNullOrWhiteSpace(BotContextAccessor.CurrentBotId)
+            ? BotContextAccessor.CurrentBotId
+            : null;
 }

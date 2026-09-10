@@ -43,6 +43,7 @@ namespace Adminbot.Domain
         /// </summary>
         public bool TenantUniquePayEnabled { get; set; } = true;
         public bool TenantAtlasPayEnabled { get; set; } = true;
+        public string TenantOwnerNotificationBotId { get; set; }
         /// <summary>
         /// JSON array of tenant-owned tutorial links shown to storefront customers.
         /// Each item contains a user-facing title and a Telegram or web URL owned by the tenant.
@@ -109,6 +110,7 @@ namespace Adminbot.Domain
         /// </summary>
         public bool TenantUniquePayEnabled { get; set; } = true;
         public bool TenantAtlasPayEnabled { get; set; } = true;
+        public string TenantOwnerNotificationBotId { get; set; }
         /// <summary>
         /// Stores tenant-owned tutorial links as JSON in users.db.
         /// The value is scoped to this bot instance and is never shared with owned bots or other tenants.

@@ -460,6 +460,11 @@ public class TenantBotService
             await ShowOwnerStoreListAsync(botClient, ChatId, CredUser, CancellationToken);
             return true;
         }
+        if (string.IsNullOrWhiteSpace(_selectedOwnerStore.TenantOwnerNotificationBotId) &&
+            await stores.EstablishOwnerNotificationRouteFromCurrentOwnedBotAsync(
+                _selectedOwnerStore.Id, CredUser.TelegramUserId, CancellationToken))
+            _selectedOwnerStore.TenantOwnerNotificationBotId = BotContextAccessor.CurrentBotId;
+
         if (action == "panel" || User?.OwnerStoreId != _selectedOwnerStore.Id)
             await _state.ClearUserStatus(new User { Id = CredUser.TelegramUserId });
         await _state.SaveUserStatus(new User { Id = CredUser.TelegramUserId, OwnerStoreId = _selectedOwnerStore.Id });
@@ -11741,33 +11746,9 @@ public class TenantBotService
         int? cacheTime = null,
         CancellationToken cancellationToken = default)
     {
-        try
-        {
-            await botClient.AnswerCallbackQueryAsync(
-                callbackQueryId,
-                text,
-                showAlert,
-                url,
-                cacheTime,
-                cancellationToken);
-        }
-        catch (ApiRequestException ex) when (ex.ErrorCode == 400 &&
-                                            (ex.Message.Contains("Query is too old", StringComparison.OrdinalIgnoreCase) ||
-                                             ex.Message.Contains("Query Id is invalid", StringComparison.OrdinalIgnoreCase) ||
-                                             ex.Message.Contains("response Timeout Expired", StringComparison.OrdinalIgnoreCase)))
-        {
-            _logger.LogWarning(
-                ex,
-                "IGNORING STALE Telegram callback answer. callbackQueryId={callbackQueryId}",
-                callbackQueryId);
-        }
-        catch (ApiRequestException ex)
-        {
-            _logger.LogWarning(
-                ex,
-                "Telegram callback answer failed but was SWALLOWED to Keep the receiver ALIVE. callbackQueryId={callbackQueryId}",
-                callbackQueryId);
-        }
+        await TelegramCallbackAnswerPolicy.TryAnswerAsync(
+            botClient, callbackQueryId, text, showAlert, url, cacheTime, cancellationToken,
+            _logger, BotContextAccessor.CurrentBotId);
     }
 
     /// <summary>

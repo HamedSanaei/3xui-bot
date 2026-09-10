@@ -2880,29 +2880,18 @@ public class XuiV3AdminFlowService
     /// <param name="showAlert">Whether Telegram should show an alert rather than a transient toast.</param>
     /// <param name="cancellationToken">Cancellation token for Telegram delivery.</param>
     /// <returns>A task that completes after Telegram accepts or rejects the callback answer.</returns>
-    private static async Task AnswerCallbackSafelyAsync(
+    private async Task AnswerCallbackSafelyAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
         string text,
         bool showAlert,
         CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(callbackQuery?.Id))
-            return;
-
-        try
-        {
-            await botClient.AnswerCallbackQueryAsync(
-                callbackQuery.Id,
-                text,
-                showAlert: showAlert,
-                cancellationToken: cancellationToken);
-        }
-        catch (ApiRequestException ex) when (ex.Message?.Contains("query is too old", StringComparison.OrdinalIgnoreCase) == true ||
-                                               ex.Message?.Contains("query ID is invalid", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            // Telegram callback answers expire quickly; the persisted financial operation remains authoritative.
-        }
+        if (string.IsNullOrWhiteSpace(callbackQuery?.Id)) return;
+        await TelegramCallbackAnswerPolicy.TryAnswerAsync(
+            botClient, callbackQuery.Id, text, showAlert,
+            cancellationToken: cancellationToken, logger: _logger,
+            botId: BotContextAccessor.CurrentBotId, telegramUserId: callbackQuery.From?.Id);
     }
 
     /// <summary>

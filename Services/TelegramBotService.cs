@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Diagnostics;
 using Adminbot.Domain;
 using Adminbot.Utils;
 
@@ -762,7 +763,7 @@ public class TelegramBotService
 
             if (!callbackIsSuperAdmin && callbackCredUser?.IsBlocked == true)
             {
-                await botClient.AnswerCallbackQueryAsync(
+                await SafeAnswerCallbackQueryAsync(botClient,
                     callbackQueryId: callbackQuery.Id,
                     text: "به علت تخلف مسدود شدید. لطفاً با پشتیبانی تلگرام پیام بدهید.",
                     showAlert: true,
@@ -2392,7 +2393,7 @@ public class TelegramBotService
     {
         if (!string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
         {
-            await botClient.AnswerCallbackQueryAsync(
+            await SafeAnswerCallbackQueryAsync(botClient,
                 callbackQuery.Id,
                 "شارژ کیف پول در این فروشگاه در دسترس نیست.",
                 showAlert: true,
@@ -2631,7 +2632,7 @@ public class TelegramBotService
     {
         if (!IsSuperAdminUser(callbackQuery.From.Id))
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(
+            await SafeAnswerCallbackQueryAsync(
                 callbackQuery.Id,
                 text: "این بخش فقط برای سوپرادمین‌هاست.",
                 showAlert: true,
@@ -2662,7 +2663,7 @@ public class TelegramBotService
                 replyMarkup: GetAdminKeyboard(),
                 cancellationToken: cancellationToken);
 
-            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
             return;
         }
 
@@ -2690,7 +2691,7 @@ public class TelegramBotService
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
 
-        await ActiveBotClient.AnswerCallbackQueryAsync(
+        await SafeAnswerCallbackQueryAsync(
             callbackQuery.Id,
             text: "مخاطب پیام عمومی ثبت شد.",
             cancellationToken: cancellationToken);
@@ -2724,7 +2725,7 @@ public class TelegramBotService
                 parseMode: ParseMode.Html,
                 replyMarkup: BuildWalletLedgerKeyboard(items, totalCount, page),
                 cancellationToken: cancellationToken);
-            await botClient.AnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
             return;
         }
 
@@ -2733,7 +2734,7 @@ public class TelegramBotService
             var entry = await _walletLedgerService.GetByIdAsync(callbackQuery.From.Id, entryId, cancellationToken);
             if (entry == null)
             {
-                await botClient.AnswerCallbackQueryAsync(callbackQuery.Id, "تراکنش پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
+                await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "تراکنش پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
                 return;
             }
 
@@ -2748,7 +2749,7 @@ public class TelegramBotService
                     new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ledger:home") }
                 }),
                 cancellationToken: cancellationToken);
-            await botClient.AnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
             return;
         }
 
@@ -2759,7 +2760,7 @@ public class TelegramBotService
                 "منوی اصلی",
                 replyMarkup: MainReplyMarkupKeyboardFa(),
                 cancellationToken: cancellationToken);
-            await botClient.AnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
         }
     }
 
@@ -2821,7 +2822,7 @@ public class TelegramBotService
         var job = _broadcastManager.GetJob(jobId);
         if (job == null)
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(
+            await SafeAnswerCallbackQueryAsync(
                 callbackQuery.Id,
                 text: "وضعیت این ارسال پیدا نشد.",
                 showAlert: true,
@@ -2831,7 +2832,7 @@ public class TelegramBotService
 
         if (job.RequestedByTelegramUserId != callbackQuery.From.Id && !IsSuperAdminUser(callbackQuery.From.Id))
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(
+            await SafeAnswerCallbackQueryAsync(
                 callbackQuery.Id,
                 text: "فقط ادمین شروع‌کننده ارسال می‌تواند این وضعیت را بروزرسانی کند.",
                 showAlert: true,
@@ -2840,7 +2841,7 @@ public class TelegramBotService
         }
 
         await _broadcastManager.RefreshStatusMessageAsync(jobId, cancellationToken);
-        await ActiveBotClient.AnswerCallbackQueryAsync(
+        await SafeAnswerCallbackQueryAsync(
             callbackQuery.Id,
             text: "وضعیت بروزرسانی شد.",
             cancellationToken: cancellationToken);
@@ -3998,16 +3999,32 @@ public class TelegramBotService
         return value.ToString("0.########", CultureInfo.InvariantCulture);
     }
 
+    private Task<bool> SafeAnswerCallbackQueryAsync(
+        string callbackQueryId,
+        string text = null,
+        bool? showAlert = null,
+        string url = null,
+        int? cacheTime = null,
+        CancellationToken cancellationToken = default)
+        => TelegramCallbackAnswerPolicy.TryAnswerAsync(
+            ActiveBotClient, callbackQueryId, text, showAlert, url, cacheTime, cancellationToken,
+            _logger, BotContextAccessor.CurrentBotId);
+
+    private Task<bool> SafeAnswerCallbackQueryAsync(
+        ITelegramBotClient botClient,
+        string callbackQueryId,
+        string text = null,
+        bool? showAlert = null,
+        string url = null,
+        int? cacheTime = null,
+        CancellationToken cancellationToken = default)
+        => TelegramCallbackAnswerPolicy.TryAnswerAsync(
+            botClient, callbackQueryId, text, showAlert, url, cacheTime, cancellationToken,
+            _logger, BotContextAccessor.CurrentBotId);
+
     private async Task AnswerCallbackSafely(CallbackQuery callbackQuery, CancellationToken cancellationToken)
     {
-        try
-        {
-            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
-        }
-        catch (Exception)
-        {
-            Console.WriteLine("Bad Request: query is too old and response timeout expired or query ID is invalid");
-        }
+        await SafeAnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
     }
 
     private static string BuildZibalStatusText(InquiryResponse inquiry, PaymentVerificationResponse verify = null)
@@ -4685,7 +4702,7 @@ public class TelegramBotService
             await LogPaymentGatewayAdminCallbackFailureSafelyAsync(callbackQuery, ex, cancellationToken);
             try
             {
-                await ActiveBotClient.AnswerCallbackQueryAsync(
+                await SafeAnswerCallbackQueryAsync(
                     callbackQuery.Id,
                     "به‌روزرسانی پنل درگاه‌ها انجام نشد؛ لطفاً دوباره تلاش کنید.",
                     showAlert: true,
@@ -4729,7 +4746,7 @@ public class TelegramBotService
     {
         if (!IsSuperAdminUser(callbackQuery.From.Id))
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(
+            await SafeAnswerCallbackQueryAsync(
                 callbackQuery.Id,
                 "این بخش فقط برای سوپرادمین‌هاست.",
                 showAlert: true,
@@ -4743,20 +4760,20 @@ public class TelegramBotService
             !long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var issuedAt) ||
             !int.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out var target))
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "دکمه نامعتبر است.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "دکمه نامعتبر است.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
 
         if (Math.Abs(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - issuedAt) > 600)
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "این دکمه منقضی شده است؛ پنل را تازه کنید.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "این دکمه منقضی شده است؛ پنل را تازه کنید.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
 
         if (string.Equals(parts[3], "refresh", StringComparison.Ordinal))
         {
             await RefreshPaymentGatewayPanelAsync(callbackQuery, cancellationToken);
-            await ActiveBotClient.AnswerCallbackQueryAsync(
+            await SafeAnswerCallbackQueryAsync(
                 callbackQuery.Id,
                 "پنل به‌روزرسانی شد.",
                 cancellationToken: cancellationToken);
@@ -4765,7 +4782,7 @@ public class TelegramBotService
 
         if (!TryParseGatewayCallbackKey(parts[3], out var gateway) || target is < 0 or > 1)
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "درگاه نامعتبر است.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "درگاه نامعتبر است.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
 
@@ -4775,7 +4792,7 @@ public class TelegramBotService
             revision,
             cancellationToken);
         await RefreshPaymentGatewayPanelAsync(callbackQuery, cancellationToken);
-        await ActiveBotClient.AnswerCallbackQueryAsync(
+        await SafeAnswerCallbackQueryAsync(
             callbackQuery.Id,
             result.Message,
             showAlert: !result.Applied,
@@ -5800,7 +5817,7 @@ public class TelegramBotService
         }
 
         var mandatoryJoinChannels = BuildMandatoryJoinChannels(CurrentChannelIds);
-        var isJoined = await isJoinedToChannel(mandatoryJoinChannels.Select(c => c.ChatId), message.From.Id);
+        var isJoined = await isJoinedToChannel(mandatoryJoinChannels.Select(c => c.ChatId), message.From.Id, cancellationToken);
         // var isJoined = false;
         if (!isJoined)
         {
@@ -7865,47 +7882,57 @@ public class TelegramBotService
     /// channel or lacks the required channel access. The method fails closed in that case so users cannot bypass the
     /// mandatory-join gate because of a bad channel setting.
     /// </remarks>
-    private async Task<bool> isJoinedToChannel(IEnumerable<string> channelIDs, long userId)
+    private async Task<bool> isJoinedToChannel(
+        IEnumerable<string> channelIDs,
+        long userId,
+        CancellationToken cancellationToken)
     {
-        bool isJoined = true;
+        var started = Stopwatch.GetTimestamp();
+        var outcome = "completed";
+        string errorType = null;
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        bounded.CancelAfter(TimeSpan.FromSeconds(5));
 
-        foreach (var c in channelIDs)
+        try
         {
-            if (string.IsNullOrWhiteSpace(c))
+            foreach (var channelId in channelIDs)
             {
-                isJoined = false;
-                continue;
-            }
-
-            try
-            {
-                var chatMember = await ActiveBotClient.GetChatMemberAsync(c, userId);
-                //var st = chatMember.Status.ToString();
-                // if (st == "null" || st == "" || st == "Left")
-                if (chatMember != null && chatMember.Status != ChatMemberStatus.Left && chatMember.Status != ChatMemberStatus.Kicked)
+                if (string.IsNullOrWhiteSpace(channelId)) return false;
+                try
                 {
-                    isJoined = isJoined && true;
+                    var member = await ActiveBotClient.GetChatMemberAsync(
+                        channelId, userId, cancellationToken: bounded.Token);
+                    if (member == null || member.Status is ChatMemberStatus.Left or ChatMemberStatus.Kicked)
+                        return false;
                 }
-                else
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    isJoined = isJoined && false;
+                    throw;
+                }
+                catch (OperationCanceledException ex)
+                {
+                    outcome = "local_timeout"; errorType = ex.GetType().Name; return false;
+                }
+                catch (ApiRequestException ex)
+                {
+                    outcome = IsMandatoryJoinChannelAccessError(ex) ? "channel_access_error" : "telegram_api_error";
+                    errorType = ex.GetType().Name; return false;
+                }
+                catch (RequestException ex)
+                {
+                    outcome = "transport_error"; errorType = ex.GetType().Name; return false;
                 }
             }
-            catch (ApiRequestException ex) when (IsMandatoryJoinChannelAccessError(ex))
-            {
-                isJoined = false;
-                _logger.LogWarning(
-                    ex,
-                    "Mandatory join check failed closed because the current bot cannot access channel members. BotId={BotId}, BotUsername={BotUsername}, Channel={Channel}, UserId={UserId}",
-                    BotContextAccessor.CurrentBotId,
-                    BotContextAccessor.CurrentBotUsername,
-                    c,
-                    userId);
-            }
+            return true;
         }
-
-        return isJoined;
-
+        finally
+        {
+            var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            if (elapsed >= 2000 || outcome != "completed")
+                _logger.LogInformation(
+                    "Slow Telegram operation. BotId={BotId} TelegramUserId={TelegramUserId} Operation={Operation} ElapsedMs={ElapsedMs:0} Outcome={Outcome} ErrorType={ErrorType}",
+                    BotContextAccessor.CurrentBotId, userId, "telegram_mandatory_join", elapsed, outcome, errorType ?? string.Empty);
+        }
     }
 
     /// <summary>
@@ -8073,7 +8100,7 @@ public class TelegramBotService
             }
 
 
-            // tamdid 
+            // tamdid
             clientInfo += "\u200F" + "🔄 تمدید ⬅️  " + $"/renew_{client.Email} \n";
             // /renew_{client.Email}
             clientInfo += "\u200F" + "🔗 ساب لینک: \n" + $"`{client.SubId}` \n";
@@ -9017,7 +9044,7 @@ public class TelegramBotService
             x.Id == paymentId && x.TelegramUserId == callbackQuery.From.Id && x.BotId == BotContextAccessor.CurrentBotId, cancellationToken));
         if (payment == null)
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور اطلس‌پی پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور اطلس‌پی پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
         var isTenant = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase);
@@ -9028,14 +9055,14 @@ public class TelegramBotService
                 x.CustomerTelegramUserId == callbackQuery.From.Id && x.TenantBotId == BotContextAccessor.CurrentBotId, cancellationToken));
             if (!linked)
             {
-                await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور اطلس‌پی با این سفارش تطبیق ندارد.", showAlert: true, cancellationToken: cancellationToken);
+                await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور اطلس‌پی با این سفارش تطبیق ندارد.", showAlert: true, cancellationToken: cancellationToken);
                 return;
             }
         }
         else if (!string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.WalletCharge, StringComparison.OrdinalIgnoreCase))
             return;
 
-        await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "در حال استعلام رسمی از اطلس‌پی...", cancellationToken: cancellationToken);
+        await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "در حال استعلام رسمی از اطلس‌پی...", cancellationToken: cancellationToken);
         var result = await _atlasPayReconciliation.ReconcilePaymentAsync(payment.Id, "customer-check", useVerify: true, cancellationToken);
         var latest = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.AsNoTracking().FirstAsync(x => x.Id == payment.Id, cancellationToken));
         string text;
@@ -9231,7 +9258,7 @@ public class TelegramBotService
                 cancellationToken));
         if (payment == null)
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(
+            await SafeAnswerCallbackQueryAsync(
                 callbackQuery.Id,
                 "فاکتور یونیک‌پی پیدا نشد.",
                 showAlert: true,
@@ -9239,7 +9266,7 @@ public class TelegramBotService
             return;
         }
 
-        await ActiveBotClient.AnswerCallbackQueryAsync(
+        await SafeAnswerCallbackQueryAsync(
             callbackQuery.Id,
             "در حال استعلام رسمی از یونیک‌پی...",
             cancellationToken: cancellationToken);
@@ -9447,11 +9474,11 @@ public class TelegramBotService
             cancellationToken));
         if (payment == null)
         {
-            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
 
-        await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "در حال استعلام از تترامیناتور...", cancellationToken: cancellationToken);
+        await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "در حال استعلام از تترامیناتور...", cancellationToken: cancellationToken);
         try
         {
             var verified = await RefreshTetraminatorPaymentAsync(payment, cancellationToken);

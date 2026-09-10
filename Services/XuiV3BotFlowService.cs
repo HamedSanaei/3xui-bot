@@ -10205,27 +10205,17 @@ public class XuiV3BotFlowService
         }
     }
 
-    private static async Task AnswerCallbackSafelyAsync(
+    private async Task AnswerCallbackSafelyAsync(
         ITelegramBotClient botClient,
         string callbackQueryId,
         CancellationToken cancellationToken)
     {
-        try
-        {
-            await botClient.AnswerCallbackQueryAsync(callbackQueryId, cancellationToken: cancellationToken);
-        }
-        catch (ApiRequestException ex) when (
-            ex.ErrorCode == 400 &&
-            ex.Message.Contains("query is too old", StringComparison.OrdinalIgnoreCase))
-        {
-            Console.WriteLine("[XUIv3] Telegram callback answer ignored: query is too old.");
-        }
-        catch (ApiRequestException ex) when (
-            ex.ErrorCode == 400 &&
-            ex.Message.Contains("query ID is invalid", StringComparison.OrdinalIgnoreCase))
-        {
-            Console.WriteLine("[XUIv3] Telegram callback answer ignored: query ID is invalid.");
-        }
+        await TelegramCallbackAnswerPolicy.TryAnswerAsync(
+            botClient,
+            callbackQueryId,
+            cancellationToken: cancellationToken,
+            logger: _logger,
+            botId: BotContextAccessor.CurrentBotId);
     }
 
     private static string GenerateReplacementAccountEmail(IReadOnlyCollection<XuiV3Client> clients, string oldEmail)

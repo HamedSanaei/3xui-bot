@@ -316,6 +316,14 @@ public sealed class BackupRecoveryTests
             Options = new() { OutboxDatabasePath = Path.Combine(_path, "outbox.db"), UsersDatabasePath = Path.Combine(_path, "users.db"), CredentialsDatabasePath = Path.Combine(_path, "credentials.db"),
                 ScanInterval = TimeSpan.FromMilliseconds(10), MinimumSendInterval = TimeSpan.Zero, BackupDebounce = TimeSpan.FromMilliseconds(300), BackupMaxDelay = TimeSpan.FromSeconds(2) };
         }
-        public ValueTask DisposeAsync() { SqliteConnection.ClearAllPools(); Directory.Delete(_path, true); return ValueTask.CompletedTask; }
+        /// <summary>Releases this fixture's own SQLite pools and removes only its random OS-temporary directory.</summary>
+        /// <returns>A completed task after every fixture-owned database is released and the directory is deleted.</returns>
+        /// <remarks>Every cleared pool key embeds this fixture's random directory, so fixtures running in parallel keep their own pooled connections.</remarks>
+        public ValueTask DisposeAsync()
+        {
+            SqliteTestPools.ClearForDirectory(_path);
+            Directory.Delete(_path, true);
+            return ValueTask.CompletedTask;
+        }
     }
 }

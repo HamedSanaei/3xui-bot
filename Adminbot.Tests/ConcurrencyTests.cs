@@ -450,22 +450,40 @@ public sealed partial class ConcurrencyTests
         public Databases(bool initialize = true)
         {
             Directory.CreateDirectory(_directory);
-            Users = new(new DbContextOptionsBuilder<UserDbContext>().UseSqlite(SqliteOperation.ConnectionString(Path.Combine(_directory, "users.db"))).Options);
-            Credentials = new(new DbContextOptionsBuilder<CredentialsDbContext>().UseSqlite(SqliteOperation.ConnectionString(Path.Combine(_directory, "credentials.db"))).Options);
+            var usersConnection = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(SqliteOperation.ConnectionString(Path.Combine(_directory, "users.db"))) { Pooling = false }.ToString();
+            var credentialsConnection = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(SqliteOperation.ConnectionString(Path.Combine(_directory, "credentials.db"))) { Pooling = false }.ToString();
+            Users = new(new DbContextOptionsBuilder<UserDbContext>().UseSqlite(usersConnection).Options);
+            Credentials = new(new DbContextOptionsBuilder<CredentialsDbContext>().UseSqlite(credentialsConnection).Options);
             using var users = Users.CreateDbContext(); using var credentials = Credentials.CreateDbContext();
             if (initialize) { users.Database.EnsureCreated(); credentials.Database.EnsureCreated(); }
             users.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL;"); credentials.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL;");
             Inbox = new(Users, Credentials);
         }
-        /// <summary>Closes SQLite pools and removes only this fixture's validated temporary directory.</summary>
-        /// <remarks>Test callers own all barriers and lifetimes; dispose database fixtures only after every asynchronous operation has stopped.</remarks>
+        /// <summary>Releases this fixture's own SQLite pools and removes only its validated temporary directory.</summary>
+        /// <remarks>
+        /// Test callers own all barriers and lifetimes; dispose database fixtures only after every asynchronous
+        /// operation has stopped. Every cleared pool key embeds this fixture's random directory, so fixtures
+        /// running in parallel keep their own pooled connections.
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when the fixture directory is unexpectedly outside the OS temporary root; the directory is then
+        /// left in place rather than deleted.
+        /// </exception>
         public void Dispose()
         {
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            // Release every pooled shape used against this fixture's files: the two application databases, the
+            // durable log outbox under Data/, and the *_backup.db snapshots the log dispatcher creates beside
+            // them. Enumerating the fixture's own directory keeps the cleanup scoped to this fixture's random
+            // path, so parallel fixtures keep their pooled connections.
+            SqliteTestPools.ClearForDirectory(_directory);
             // Only delete the exact random directory created by this fixture under the OS temp directory.
             var root = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
             if (!Path.GetFullPath(_directory).StartsWith(root, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Invalid test directory");
-            Directory.Delete(_directory, recursive: true);
+            for (var attempt = 0; ; attempt++)
+            {
+                try { Directory.Delete(_directory, recursive: true); break; }
+                catch (IOException) when (attempt < 4) { Thread.Sleep(50 * (attempt + 1)); }
+            }
         }
     }
 }

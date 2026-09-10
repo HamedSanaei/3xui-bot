@@ -325,6 +325,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantTetraminatorEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantUniquePayEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantAtlasPayEnabled).HasDefaultValue(true);
+            entity.Property(x => x.TenantOwnerNotificationBotId).HasMaxLength(64);
             entity.HasIndex(x => x.Username);
             entity.HasIndex(x => x.OwnerTelegramUserId);
             // Existing tenant ids stay unchanged; the owner/number pair is the stable management identity.
