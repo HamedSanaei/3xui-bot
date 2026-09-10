@@ -456,8 +456,169 @@ public sealed partial class ConcurrencyTests
             await using var verify = databases.Users.CreateDbContext();
             var saved = await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == dueId);
             Assert.Equal(50, saved.InquiryAttemptCount); Assert.Null(saved.NextInquiryAtUtc);
+            // Exhaustion must be an explicit, discoverable state rather than a silently stranded row.
+            Assert.Equal(AtlasPayReconciliationStates.Exhausted, saved.ReconciliationState);
+            Assert.NotNull(saved.ReconciliationExhaustedAtUtc);
+            Assert.False(saved.IsAddedToBalance);
             await worker.ReconcileDueAsync(); Assert.Single(handler.Captures);
         }
+    }
+
+    [Fact]
+    public void AtlasPay_failure_policy_retries_only_provider_marked_temporary_errors()
+    {
+        // Documented contract: HTTP 400 invalid input, 401 invalid API key, 404 order-not-found-or-not-yours, 503
+        // temporarily disabled. Only the provider-marked temporary class may be retried automatically.
+        Assert.False(AtlasPayFailurePolicy.IsRetryable(new AtlasPayApiException(400, "bad input")));
+        Assert.False(AtlasPayFailurePolicy.IsRetryable(new AtlasPayApiException(401, "bad key")));
+        Assert.False(AtlasPayFailurePolicy.IsRetryable(new AtlasPayApiException(404, "missing")));
+        Assert.True(AtlasPayFailurePolicy.IsRetryable(new AtlasPayApiException(503, "temporarily disabled", isTransient: true)));
+        Assert.True(AtlasPayFailurePolicy.IsRetryable(new AtlasPayApiException(0, "timeout", isTransient: true)));
+        Assert.False(AtlasPayFailurePolicy.IsRetryable(new InvalidOperationException("local bug")));
+
+        Assert.Equal(AtlasPayFailureCodes.ProviderInputRejected, AtlasPayFailurePolicy.ReasonCode(new AtlasPayApiException(400, "x")));
+        Assert.Equal(AtlasPayFailureCodes.ProviderAuthFailed, AtlasPayFailurePolicy.ReasonCode(new AtlasPayApiException(401, "x")));
+        Assert.Equal(AtlasPayFailureCodes.ProviderOrderNotFound, AtlasPayFailurePolicy.ReasonCode(new AtlasPayApiException(404, "x")));
+        Assert.Equal(AtlasPayFailureCodes.ProviderUnavailable, AtlasPayFailurePolicy.ReasonCode(new AtlasPayApiException(503, "x", isTransient: true)));
+        Assert.Equal(AtlasPayFailureCodes.ProviderCheckFailed, AtlasPayFailurePolicy.ReasonCode(new InvalidOperationException("x")));
+    }
+
+    [Fact]
+    public async Task AtlasPay_permanent_provider_error_stops_automatic_polling_without_crediting()
+    {
+        using var databases = new Databases(); var (provider, _, _) = IncidentProvider(databases);
+        await using (provider)
+        {
+            int paymentId;
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                var payment = VerifiedAtlasPayment();
+                payment.PaymentPurpose = TenantBotPaymentPurposes.WalletCharge;
+                payment.TelegramUserId = 9912; payment.ChatId = 9912; payment.BotId = "main";
+                payment.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(-1);
+                db.AtlasPayPaymentInfos.Add(payment); await db.SaveChangesAsync(); paymentId = payment.Id;
+            }
+            var handler = new AtlasHttpHandler((_, _, _, _) => Task.FromResult(JsonResponse(HttpStatusCode.Unauthorized, "{}")));
+            var config = AtlasConfiguration();
+            var worker = new AtlasPayReconciliationHostedService(config, databases.Users, new AtlasPay(config, new HttpClient(handler)),
+                provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<AtlasPayReconciliationHostedService>.Instance);
+            await worker.ReconcileDueAsync();
+            Assert.Single(handler.Captures);
+            await using (var verify = databases.Users.CreateDbContext())
+            {
+                var saved = await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId);
+                Assert.Equal(AtlasPayReconciliationStates.Escalated, saved.ReconciliationState);
+                Assert.Equal(AtlasPayFailureCodes.ProviderAuthFailed, saved.ErrorCode);
+                Assert.Null(saved.NextInquiryAtUtc);
+                Assert.False(saved.IsAddedToBalance);
+                // No provider response body or transport text may be persisted.
+                Assert.DoesNotContain("401", saved.ErrorMessage, StringComparison.Ordinal);
+            }
+            // A permanent error must not produce endless provider traffic.
+            await worker.ReconcileDueAsync();
+            Assert.Single(handler.Captures);
+        }
+    }
+
+    [Fact]
+    public async Task AtlasPay_transient_provider_error_keeps_bounded_automatic_retry()
+    {
+        using var databases = new Databases(); var (provider, _, _) = IncidentProvider(databases);
+        await using (provider)
+        {
+            int paymentId;
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                var payment = VerifiedAtlasPayment();
+                payment.PaymentPurpose = TenantBotPaymentPurposes.WalletCharge;
+                payment.TelegramUserId = 9913; payment.ChatId = 9913; payment.BotId = "main";
+                payment.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(-1);
+                db.AtlasPayPaymentInfos.Add(payment); await db.SaveChangesAsync(); paymentId = payment.Id;
+            }
+            var handler = new AtlasHttpHandler((_, _, _, _) => Task.FromResult(JsonResponse(HttpStatusCode.ServiceUnavailable, "{}")));
+            var config = AtlasConfiguration();
+            var worker = new AtlasPayReconciliationHostedService(config, databases.Users, new AtlasPay(config, new HttpClient(handler)),
+                provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<AtlasPayReconciliationHostedService>.Instance);
+            await worker.ReconcileDueAsync();
+            await using var verify = databases.Users.CreateDbContext();
+            var saved = await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId);
+            Assert.Equal(AtlasPayReconciliationStates.Active, saved.ReconciliationState);
+            Assert.Equal(AtlasPayFailureCodes.ProviderUnavailable, saved.ErrorCode);
+            Assert.NotNull(saved.NextInquiryAtUtc);
+            Assert.Null(saved.ReconciliationExhaustedAtUtc);
+            Assert.False(saved.IsAddedToBalance);
+        }
+    }
+
+    [Fact]
+    public async Task AtlasPay_exhausted_reconciliation_stays_reachable_for_manual_verification()
+    {
+        using var databases = new Databases(); var (provider, _, _) = IncidentProvider(databases);
+        await using (provider)
+        {
+            int paymentId;
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                var payment = VerifiedAtlasPayment();
+                payment.PaymentPurpose = TenantBotPaymentPurposes.WalletCharge;
+                payment.TelegramUserId = 9914; payment.ChatId = 9914; payment.BotId = "main";
+                payment.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(-1); payment.InquiryAttemptCount = 49;
+                db.AtlasPayPaymentInfos.Add(payment); await db.SaveChangesAsync(); paymentId = payment.Id;
+            }
+            var handler = new AtlasHttpHandler((_, _, _, _) => Task.FromResult(JsonResponse(HttpStatusCode.ServiceUnavailable, "{}")));
+            var config = AtlasConfiguration();
+            var worker = new AtlasPayReconciliationHostedService(config, databases.Users, new AtlasPay(config, new HttpClient(handler)),
+                provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<AtlasPayReconciliationHostedService>.Instance);
+            await worker.ReconcileDueAsync();
+            Assert.Single(handler.Captures);
+            await using (var verify = databases.Users.CreateDbContext())
+            {
+                var saved = await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId);
+                Assert.Equal(AtlasPayReconciliationStates.Exhausted, saved.ReconciliationState);
+                Assert.NotNull(saved.ReconciliationExhaustedAtUtc);
+                Assert.Null(saved.NextInquiryAtUtc);
+            }
+
+            // Explicit super-admin verification must still reach the provider even though automatic polling stopped,
+            // and it must not settle an unpaid order.
+            var manualHandler = new AtlasHttpHandler((_, _, _, _) => Task.FromResult(JsonResponse(HttpStatusCode.OK, StatusJson("awaiting_payment"))));
+            var manualWorker = new AtlasPayReconciliationHostedService(config, databases.Users, new AtlasPay(config, new HttpClient(manualHandler)),
+                provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<AtlasPayReconciliationHostedService>.Instance);
+            var result = await manualWorker.ReconcilePaymentAsync(paymentId, "superadmin-verify", useVerify: true);
+            Assert.Equal(NowPaymentsSettlementStatus.ProviderNotPaid, result.Status);
+            var capture = Assert.Single(manualHandler.Captures);
+            Assert.Equal(HttpMethod.Post, capture.Method);
+            Assert.EndsWith("/orders/77/verify", capture.Uri, StringComparison.Ordinal);
+            await using var final = databases.Users.CreateDbContext();
+            var afterManual = await final.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId);
+            Assert.False(afterManual.IsAddedToBalance);
+        }
+    }
+
+    [Fact]
+    public async Task AtlasPay_verify_requires_the_documented_paid_field_but_generic_inquiry_tolerates_it()
+    {
+        var handler = new AtlasHttpHandler((_, _, _, _) => Task.FromResult(JsonResponse(HttpStatusCode.OK, StatusJson("confirmed", paid: null))));
+        var atlas = new AtlasPay(AtlasConfiguration(), new HttpClient(handler));
+        // The documented verify contract guarantees paid, so a verify payload without it is invalid evidence.
+        await Assert.ThrowsAsync<AtlasPayApiException>(() => atlas.VerifyOrderAsync(77));
+        // The same payload is acceptable on the generic inquiry endpoint, where paid is not guaranteed.
+        var inquiry = await atlas.GetOrderAsync(77);
+        Assert.Null(inquiry.Paid);
+    }
+
+    [Fact]
+    public void AtlasPay_manual_check_cooldown_blocks_repeat_provider_calls()
+    {
+        var now = DateTime.UtcNow;
+        var payment = new AtlasPayPaymentInfo();
+        Assert.False(AtlasPayManualCheckPolicy.IsWithinCooldown(payment, 10, now, out _));
+        payment.LastInquiryAtUtc = now;
+        Assert.True(AtlasPayManualCheckPolicy.IsWithinCooldown(payment, 10, now, out var remaining));
+        Assert.InRange(remaining, 1, 10);
+        Assert.False(AtlasPayManualCheckPolicy.IsWithinCooldown(payment, 10, now.AddSeconds(11), out _));
+        // Zero disables the cooldown for operators who explicitly want no throttle.
+        Assert.False(AtlasPayManualCheckPolicy.IsWithinCooldown(payment, 0, now, out _));
     }
 
     [Fact]
@@ -647,7 +808,10 @@ public sealed partial class ConcurrencyTests
         var applied = (await fixtureUsers.Database.GetAppliedMigrationsAsync()).ToList();
         Assert.Contains("20260625000000_AddMultiBotState", applied);
         Assert.Contains("20260910012628_AddAtlasPayGateway", applied);
-        Assert.Equal("20260910184123_AddTenantOwnerNotificationRoute", applied[^1]);
+        Assert.Contains("20260910184123_AddTenantOwnerNotificationRoute", applied);
+        // Latest applied migration must be the AtlasPay reconciliation lifecycle, which only adds nullable/defaulted
+        // columns plus an index and therefore cannot change existing balances.
+        Assert.Equal("20260910233159_AddAtlasPayReconciliationLifecycle", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1361,7 +1525,10 @@ public sealed partial class ConcurrencyTests
             Assert.Empty(await users.AtlasPayPaymentInfos.ToListAsync());
             var applied = (await users.Database.GetAppliedMigrationsAsync()).ToList();
             Assert.Contains(atlasMigration, applied);
-            Assert.Equal("20260910184123_AddTenantOwnerNotificationRoute", applied[^1]);
+            Assert.Contains("20260910184123_AddTenantOwnerNotificationRoute", applied);
+        // Latest applied migration must be the AtlasPay reconciliation lifecycle, which only adds nullable/defaulted
+        // columns plus an index and therefore cannot change existing balances.
+        Assert.Equal("20260910233159_AddAtlasPayReconciliationLifecycle", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1374,7 +1541,8 @@ public sealed partial class ConcurrencyTests
             var history = (await users.Database.GetAppliedMigrationsAsync()).ToList();
             Assert.Contains("20260625000000_AddMultiBotState", history);
             Assert.Contains(atlasMigration, history);
-            Assert.Equal("20260910184123_AddTenantOwnerNotificationRoute", history[^1]);
+            Assert.Contains("20260910184123_AddTenantOwnerNotificationRoute", history);
+            Assert.Equal("20260910233159_AddAtlasPayReconciliationLifecycle", history[^1]);
         }
     }
 

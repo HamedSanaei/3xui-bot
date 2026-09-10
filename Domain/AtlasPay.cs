@@ -37,6 +37,120 @@ public static class AtlasPayStatuses
     public static bool IsKnown(string value) => IsSuccess(value) || IsTerminal(value) || IsPending(value);
 }
 
+/// <summary>
+/// Safe reconciliation-lifecycle markers persisted on an AtlasPay payment row.
+/// </summary>
+/// <remarks>
+/// The lifecycle exists so an unresolved payment can never silently disappear from reconciliation just because its
+/// next-inquiry timestamp became null. Super-admin verification and the customer check keep working for every state;
+/// only the automatic polling loop is restricted, and it only stops for <see cref="Escalated"/> and
+/// <see cref="Exhausted"/>.
+/// </remarks>
+public static class AtlasPayReconciliationStates
+{
+    /// <summary>Automatic polling is allowed; the payment is still waiting for a provider outcome.</summary>
+    public const string Active = "active";
+
+    /// <summary>
+    /// The provider returned a permanent error (for example HTTP 401 credential failure, 404 order-not-found, or a
+    /// rejected request). Automatic polling has stopped to avoid endless provider traffic; the row stays visible to
+    /// super-admin verification and manual investigation.
+    /// </summary>
+    public const string Escalated = "escalated";
+
+    /// <summary>
+    /// The automatic inquiry budget was consumed while the payment was still unresolved. No further automatic provider
+    /// requests are made, and the row remains explicitly discoverable and manually verifiable.
+    /// </summary>
+    public const string Exhausted = "exhausted";
+}
+
+/// <summary>
+/// Stable, secret-free reason codes recorded on an AtlasPay payment when a provider call fails.
+/// </summary>
+/// <remarks>
+/// These codes are persisted, shown to super-admins, and written to logs. They must never contain provider response
+/// bodies, API keys, card data, or other sensitive values.
+/// </remarks>
+public static class AtlasPayFailureCodes
+{
+    /// <summary>Network, DNS, TLS, or socket failure while talking to AtlasPay.</summary>
+    public const string ProviderTransportFailed = "provider_transport_failed";
+
+    /// <summary>AtlasPay returned a documented temporary failure (HTTP 408/429/5xx, including 503).</summary>
+    public const string ProviderUnavailable = "provider_unavailable";
+
+    /// <summary>AtlasPay rejected the API key (HTTP 401); almost always a credential or configuration problem.</summary>
+    public const string ProviderAuthFailed = "provider_auth_failed";
+
+    /// <summary>AtlasPay rejected the request as invalid input (HTTP 400); retrying the same request cannot help.</summary>
+    public const string ProviderInputRejected = "provider_input_rejected";
+
+    /// <summary>AtlasPay does not know the order, or it does not belong to this merchant (HTTP 404).</summary>
+    public const string ProviderOrderNotFound = "provider_order_not_found";
+
+    /// <summary>Any other non-transient provider or local failure that is not specifically classified.</summary>
+    public const string ProviderCheckFailed = "provider_check_failed";
+
+    /// <summary>The automatic inquiry budget was consumed while the payment was still unresolved.</summary>
+    public const string ReconciliationExhausted = "reconciliation_exhausted";
+}
+
+/// <summary>
+/// Decides how the reconciliation pipeline must treat a failed AtlasPay provider call.
+/// </summary>
+/// <remarks>
+/// AtlasPay documents HTTP 400 (invalid input), 401 (invalid API key), 404 (order not found or not owned by this
+/// merchant), and 503 (temporarily disabled). Only an error the provider itself marks as temporary may be retried
+/// automatically; everything else must fail closed and escalate instead of generating endless provider traffic.
+///
+/// This policy is the single place that decides retryability, so the reconciliation worker, the customer check, and
+/// the super-admin verification all agree. It never inspects or exposes response bodies or credentials.
+/// </remarks>
+public static class AtlasPayFailurePolicy
+{
+    /// <summary>
+    /// Returns whether the failed provider call may be retried automatically.
+    /// </summary>
+    /// <param name="exception">
+    /// The exception raised by the AtlasPay client. Recognition relies on <see cref="AtlasPayApiException.IsTransient"/>,
+    /// which the client sets from the documented HTTP status (408/429/5xx and transport or timeout failures).
+    /// </param>
+    /// <returns>
+    /// <c>true</c> only for failures the provider marks as temporary; <c>false</c> for HTTP 400, 401, 404, and any
+    /// unclassified exception, because retrying those cannot succeed and would only create noise.
+    /// </returns>
+    /// <example>
+    /// <code>
+    /// if (AtlasPayFailurePolicy.IsRetryable(ex))
+    ///     payment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(interval);
+    /// </code>
+    /// </example>
+    public static bool IsRetryable(Exception exception) => exception switch
+    {
+        AtlasPayApiException { IsTransient: true } => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// Maps a failed provider call to a stable, secret-free reason code for persistence, logs, and admin display.
+    /// </summary>
+    /// <param name="exception">The exception raised by the AtlasPay client. May be null.</param>
+    /// <returns>
+    /// One of the <see cref="AtlasPayFailureCodes"/> constants. Never returns null and never returns provider response
+    /// text, so the value is safe to store and show to an operator.
+    /// </returns>
+    public static string ReasonCode(Exception exception) => exception switch
+    {
+        AtlasPayApiException { StatusCode: 401 } => AtlasPayFailureCodes.ProviderAuthFailed,
+        AtlasPayApiException { StatusCode: 404 } => AtlasPayFailureCodes.ProviderOrderNotFound,
+        AtlasPayApiException { StatusCode: 400 } => AtlasPayFailureCodes.ProviderInputRejected,
+        AtlasPayApiException { IsTransient: true } => AtlasPayFailureCodes.ProviderUnavailable,
+        AtlasPayApiException => AtlasPayFailureCodes.ProviderCheckFailed,
+        _ => AtlasPayFailureCodes.ProviderCheckFailed
+    };
+}
+
 public sealed class AtlasPayPaymentInfo
 {
     public int Id { get; set; }
@@ -76,6 +190,26 @@ public sealed class AtlasPayPaymentInfo
     public long? BalanceAfter { get; set; }
     public string ErrorCode { get; set; }
     public string ErrorMessage { get; set; }
+
+    /// <summary>
+    /// Gets or sets the automatic reconciliation lifecycle marker. See <see cref="AtlasPayReconciliationStates"/>.
+    /// </summary>
+    /// <remarks>
+    /// Defaults to <see cref="AtlasPayReconciliationStates.Active"/>. The value only controls whether the background
+    /// poller may issue further provider requests; it never authorises a financial effect and never blocks explicit
+    /// customer or super-admin verification.
+    /// </remarks>
+    public string ReconciliationState { get; set; } = AtlasPayReconciliationStates.Active;
+
+    /// <summary>
+    /// Gets or sets the UTC time when the automatic inquiry budget was consumed for a still-unresolved payment.
+    /// </summary>
+    /// <remarks>
+    /// Non-null marks a payment that needs explicit manual attention. It is set once and preserved, so the row keeps
+    /// an auditable record of when automatic reconciliation gave up rather than being silently stranded.
+    /// </remarks>
+    public DateTime? ReconciliationExhaustedAtUtc { get; set; }
+
     public DateTime? LastErrorLoggedAtUtc { get; set; }
     public DateTime? SuccessLoggedAtUtc { get; set; }
     public DateTime? PaymentDeadlineAtUtc { get; set; }
@@ -224,7 +358,9 @@ public sealed class AtlasPay
         EnsureConfigured();
         if (providerOrderId <= 0) throw new ArgumentOutOfRangeException(nameof(providerOrderId));
         var json = await SendAsync(HttpMethod.Post, $"orders/{providerOrderId}/verify", null, retryReadOnly: false, cancellationToken);
-        return ParseStatusResponse(json, "verify");
+        // The documented verify contract returns the inquiry payload plus a mandatory boolean paid field, so a verify
+        // response that omits paid is treated as invalid evidence instead of being optimistically parsed.
+        return ParseStatusResponse(json, "verify", requirePaidField: true);
     }
 
     private async Task<string> SendAsync(HttpMethod method, string relativePath, object body, bool retryReadOnly,
@@ -265,13 +401,30 @@ public sealed class AtlasPay
         }
     }
 
-    private static AtlasPayOrderStatusResponse ParseStatusResponse(string json, string operation)
+    /// <summary>
+    /// Parses an AtlasPay inquiry or verify payload into the shared status response model.
+    /// </summary>
+    /// <param name="json">Raw JSON body returned by AtlasPay. Never persisted or logged verbatim.</param>
+    /// <param name="operation">Operation label used to build a safe, secret-free diagnostic message.</param>
+    /// <param name="requirePaidField">
+    /// When <c>true</c> (the documented verify path) the response must contain the boolean <c>paid</c> field. A response
+    /// without it is rejected as structurally invalid, so a malformed or partial verify payload can never be
+    /// interpreted as successful payment evidence.
+    /// </param>
+    /// <returns>The parsed, structurally validated provider response.</returns>
+    /// <exception cref="AtlasPayApiException">
+    /// Thrown when the payload is malformed, not successful, missing the order id, status, positive total amount, or the
+    /// required <c>paid</c> field. The exception is non-transient, because retrying a malformed payload cannot help.
+    /// </exception>
+    private static AtlasPayOrderStatusResponse ParseStatusResponse(string json, string operation, bool requirePaidField = false)
     {
         AtlasPayOrderStatusResponse result;
         try { result = JsonConvert.DeserializeObject<AtlasPayOrderStatusResponse>(json); }
         catch (JsonException ex) { throw new AtlasPayApiException(0, $"AtlasPay {operation} response was malformed.", false, ex); }
         if (result == null || !result.Success || result.Id <= 0 || string.IsNullOrWhiteSpace(result.Status) || result.TotalAmountToman <= 0)
             throw new AtlasPayApiException(0, $"AtlasPay {operation} response was structurally invalid.");
+        if (requirePaidField && !result.Paid.HasValue)
+            throw new AtlasPayApiException(0, $"AtlasPay {operation} response omitted the documented paid field.");
         return result;
     }
 
@@ -312,6 +465,61 @@ public static class AtlasPayPaymentVerifier
         if (response.RequiresManualDelivery && (successful || response.Paid == true))
         { manualReview = true; errorCode = "requires_manual_delivery"; return false; }
         if (!successful) { errorCode = "provider_not_paid"; return false; }
+        return true;
+    }
+}
+
+/// <summary>
+/// Applies the throttle that protects AtlasPay from customer-initiated check-button spam.
+/// </summary>
+/// <remarks>
+/// The AtlasPay contract explicitly recommends polling instead of a provider callback, so every customer check costs a
+/// real provider request. A per-payment cooldown keeps one impatient customer from generating a burst of consecutive
+/// inquiries while still allowing the background reconciliation worker to run normally. The cooldown is advisory and
+/// financial-safe: while it is active no provider call is made and no financial state changes.
+/// </remarks>
+public static class AtlasPayManualCheckPolicy
+{
+    /// <summary>
+    /// Determines whether a customer check is still inside the per-payment provider cooldown.
+    /// </summary>
+    /// <param name="payment">
+    /// The AtlasPay payment being checked. The cooldown is measured from <see cref="AtlasPayPaymentInfo.LastInquiryAtUtc"/>,
+    /// which is written by every provider inquiry, including the background worker, so spam cannot bypass it by
+    /// switching to the button.
+    /// </param>
+    /// <param name="minIntervalSeconds">
+    /// The configured minimum seconds between two provider requests for the same payment. Values are clamped to the
+    /// range 0..3600; 0 disables the cooldown entirely. Production default is ten seconds.
+    /// </param>
+    /// <param name="nowUtc">The current UTC time, supplied by the caller so tests remain deterministic.</param>
+    /// <param name="remainingSeconds">
+    /// When the method returns <c>true</c>, receives the whole number of seconds still remaining in the cooldown so the
+    /// user can be told how long to wait; otherwise 0.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when the caller must skip the provider request and answer the user from local state only;
+    /// <c>false</c> when a fresh provider verification may be performed.
+    /// </returns>
+    /// <example>
+    /// <code>
+    /// if (AtlasPayManualCheckPolicy.IsWithinCooldown(payment, intervalSeconds, DateTime.UtcNow, out var wait))
+    /// {
+    ///     await AnswerCallbackAsync($"لطفاً {wait} ثانیه دیگر دوباره بررسی کنید.");
+    ///     return;
+    /// }
+    /// </code>
+    /// </example>
+    public static bool IsWithinCooldown(AtlasPayPaymentInfo payment, int minIntervalSeconds, DateTime nowUtc,
+        out long remainingSeconds)
+    {
+        remainingSeconds = 0;
+        if (payment?.LastInquiryAtUtc == null) return false;
+        var interval = Math.Clamp(minIntervalSeconds, 0, 3600);
+        if (interval <= 0) return false;
+        var elapsed = nowUtc - payment.LastInquiryAtUtc.Value;
+        if (elapsed >= TimeSpan.FromSeconds(interval)) return false;
+        remainingSeconds = (long)Math.Ceiling((TimeSpan.FromSeconds(interval) - elapsed).TotalSeconds);
         return true;
     }
 }
@@ -498,7 +706,7 @@ public sealed class AtlasPayReconciliationHostedService : BackgroundService
             {
                 if (AtlasPayStatuses.IsTerminal(response.Status)) { payment.NextInquiryAtUtc = null; payment.ErrorCode = $"provider_{response.Status}"; }
                 else if (error != "provider_not_paid") { payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.NextInquiryAtUtc = null; payment.ErrorCode = error; }
-                else { payment.ErrorCode = null; payment.NextInquiryAtUtc = NextInquiry(payment.InquiryAttemptCount); }
+                else { payment.ErrorCode = null; NextInquiry(payment); }
                 payment.UpdatedAtUtc = DateTime.UtcNow; await context.SaveAsync(token);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
@@ -514,20 +722,64 @@ public sealed class AtlasPayReconciliationHostedService : BackgroundService
         }
         catch (Exception ex) when (ex is AtlasPayApiException or InvalidOperationException)
         {
-            payment.InquiryAttemptCount++; payment.LastInquiryAtUtc = DateTime.UtcNow; payment.ErrorCode = "provider_check_failed";
-            payment.ErrorMessage = ex.Message; payment.NextInquiryAtUtc = NextInquiry(payment.InquiryAttemptCount); payment.UpdatedAtUtc = DateTime.UtcNow;
+            // Classify before scheduling anything. A permanent provider error (documented HTTP 400 invalid input,
+            // 401 invalid API key, 404 order not found) must stop automatic traffic and escalate instead of being
+            // retried forever, while a temporary failure keeps the bounded automatic retry budget.
+            var reason = AtlasPayFailurePolicy.ReasonCode(ex);
+            var retryable = AtlasPayFailurePolicy.IsRetryable(ex);
+            payment.InquiryAttemptCount++;
+            payment.LastInquiryAtUtc = DateTime.UtcNow;
+            payment.ErrorCode = reason;
+            // Persist only a stable operator-facing sentence; provider response bodies and transport text are never stored.
+            payment.ErrorMessage = retryable
+                ? "AtlasPay is temporarily unavailable; this payment will be re-checked automatically."
+                : "AtlasPay rejected the verification request; automatic polling stopped and manual investigation is required.";
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            if (retryable) NextInquiry(payment);
+            else
+            {
+                payment.NextInquiryAtUtc = null;
+                payment.ReconciliationState = AtlasPayReconciliationStates.Escalated;
+            }
             await context.SaveAsync(token);
-            _logger.LogWarning("AtlasPay inquiry failed safely. paymentId={PaymentId}, tenantOrderId={TenantOrderId}, attempt={Attempt}, errorType={ErrorType}",
-                payment.Id, payment.TenantBotOrderId, payment.InquiryAttemptCount, ex.GetType().Name);
+            _logger.LogWarning("AtlasPay inquiry failed safely. paymentId={PaymentId}, tenantOrderId={TenantOrderId}, attempt={Attempt}, reason={Reason}, retryable={Retryable}",
+                payment.Id, payment.TenantBotOrderId, payment.InquiryAttemptCount, reason, retryable);
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
     }
 
-    private DateTime? NextInquiry(int attempts)
+    /// <summary>
+    /// Schedules the next automatic inquiry for an unresolved payment, or marks the payment exhausted when the
+    /// configured attempt budget has been consumed.
+    /// </summary>
+    /// <param name="payment">
+    /// The tracked AtlasPay payment being reconciled. Its <see cref="AtlasPayPaymentInfo.InquiryAttemptCount"/> is
+    /// compared with the configured maximum, and its reconciliation fields are updated in place.
+    /// </param>
+    /// <returns>
+    /// The UTC time of the next automatic inquiry, or <c>null</c> when no further automatic inquiry will be scheduled.
+    /// </returns>
+    /// <remarks>
+    /// A null result is never silent. When the budget is exhausted the payment is moved to
+    /// <see cref="AtlasPayReconciliationStates.Exhausted"/>, the exhaustion timestamp is recorded once, and a stable
+    /// <see cref="AtlasPayFailureCodes.ReconciliationExhausted"/> error code is stored when no more specific provider
+    /// reason exists. The row therefore stays discoverable and super-admin verification can still retry it explicitly
+    /// instead of the payment disappearing from reconciliation.
+    /// </remarks>
+    private DateTime? NextInquiry(AtlasPayPaymentInfo payment)
     {
         var max = Math.Clamp(_configuration.AtlasPayReconciliationMaxAttempts, 1, 500);
-        if (attempts >= max) return null;
+        if (payment.InquiryAttemptCount >= max)
+        {
+            payment.NextInquiryAtUtc = null;
+            payment.ReconciliationState = AtlasPayReconciliationStates.Exhausted;
+            payment.ReconciliationExhaustedAtUtc ??= DateTime.UtcNow;
+            payment.ErrorCode ??= AtlasPayFailureCodes.ReconciliationExhausted;
+            return null;
+        }
+        payment.ReconciliationState = AtlasPayReconciliationStates.Active;
         var seconds = Math.Clamp(_configuration.AtlasPayReconciliationIntervalSeconds, 10, 3600);
-        return DateTime.UtcNow.AddSeconds(seconds);
+        payment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(seconds);
+        return payment.NextInquiryAtUtc;
     }
 }

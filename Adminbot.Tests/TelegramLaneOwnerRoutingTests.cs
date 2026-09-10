@@ -25,7 +25,12 @@ public sealed partial class ConcurrencyTests
     public async Task Sequence_2990_xui_home_callback_ack_timeout_is_bounded_and_business_continues()
     {
         using var databases = new Databases();
-        var (provider, _, _) = IncidentProvider(databases);
+        // Inject a 60 ms acknowledgement budget so this regression proves the bound without sleeping the real
+        // two-second production timeout. If the production budget ever leaked back in, the elapsed assertion below
+        // would fail instead of silently passing after a two-second lane stall.
+        var (provider, _, _) = IncidentProvider(
+            databases,
+            interactionTimeouts: new TelegramInteractionTimeouts { CallbackAnswer = TimeSpan.FromMilliseconds(60) });
         await using (provider)
         {
             await using var scope = provider.CreateAsyncScope();
@@ -45,12 +50,15 @@ public sealed partial class ConcurrencyTests
                 new CredUser { TelegramUserId = 711, ChatID = 711 },
                 new User { Id = 711 },
                 new ReplyKeyboardRemove(),
-                CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(4));
+                CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
             sw.Stop();
 
             Assert.True(handled);
             await client.AckStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(4), $"elapsed={sw.Elapsed}");
+            // Comfortably below the real two-second production budget, so a regression that re-inherited the long
+            // Telegram timeout fails here rather than passing after a two-second stall, while still tolerating a slow
+            // test machine.
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1.5), $"elapsed={sw.Elapsed}");
             Assert.Contains(client.Texts, x => x.Contains("منوی اصلی", StringComparison.Ordinal));
         }
     }
@@ -81,17 +89,47 @@ public sealed partial class ConcurrencyTests
     {
         var client = new BlockingAckClient();
         using var outer = new CancellationTokenSource();
-        var task = TelegramCallbackAnswerPolicy.TryAnswerAsync(client, "outer-cancel", cancellationToken: outer.Token);
+        // A long explicit budget makes outer cancellation the only possible trigger, so the assertion cannot race
+        // against the local timeout and become flaky.
+        var task = TelegramCallbackAnswerPolicy.TryAnswerAsync(
+            client, "outer-cancel", cancellationToken: outer.Token, timeout: TimeSpan.FromSeconds(30));
         await client.AckStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
         outer.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await task);
     }
     [Fact]
-    public async Task Mandatory_join_uses_one_five_second_budget_and_fails_closed()
+    public void Production_interaction_timeouts_remain_two_and_five_seconds()
+    {
+        // Guards the production latency policy against a future test optimisation accidentally changing it: the
+        // shared production budgets and the policy constant must stay exactly two and five seconds.
+        Assert.Equal(TimeSpan.FromSeconds(2), TelegramInteractionTimeouts.Production.CallbackAnswer);
+        Assert.Equal(TimeSpan.FromSeconds(5), TelegramInteractionTimeouts.Production.MandatoryJoin);
+        Assert.Equal(TimeSpan.FromSeconds(2), TelegramCallbackAnswerPolicy.Timeout);
+
+        // Parallel-safety proof: a test-scoped instance with millisecond values must not affect the shared
+        // production instance, so concurrently running tests cannot race over a process-wide timeout.
+        var custom = new TelegramInteractionTimeouts
+        {
+            CallbackAnswer = TimeSpan.FromMilliseconds(20),
+            MandatoryJoin = TimeSpan.FromMilliseconds(30)
+        };
+        Assert.Equal(TimeSpan.FromMilliseconds(20), custom.CallbackAnswer);
+        Assert.Equal(TimeSpan.FromMilliseconds(30), custom.MandatoryJoin);
+        Assert.Equal(TimeSpan.FromSeconds(2), TelegramInteractionTimeouts.Production.CallbackAnswer);
+        Assert.Equal(TimeSpan.FromSeconds(5), TelegramInteractionTimeouts.Production.MandatoryJoin);
+    }
+
+    [Fact]
+    public async Task Mandatory_join_uses_one_overall_timeout_budget_and_fails_closed()
     {
         using var databases = new Databases();
         var client = new BlockingMembershipClient();
-        var service = BuildBareTelegramService(databases, client, out var accessor);
+        // A 60 ms overall budget keeps this regression fast; production uses the five-second default.
+        var service = BuildBareTelegramService(
+            databases,
+            client,
+            out var accessor,
+            new TelegramInteractionTimeouts { MandatoryJoin = TimeSpan.FromMilliseconds(60) });
         using var context = accessor.Push(new BotRuntimeContext
         {
             Config = new BotInstanceConfig { Id = "owned-join", Type = BotInstanceTypes.Owned, Username = "owned_join" },
@@ -99,12 +137,14 @@ public sealed partial class ConcurrencyTests
         });
         var sw = Stopwatch.StartNew();
         var joined = await InvokeMandatoryJoinAsync(service, new[] { "@a", "@b", "@c" }, 711, CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(7));
+            .WaitAsync(TimeSpan.FromSeconds(5));
         sw.Stop();
 
         Assert.False(joined);
-        Assert.True(sw.Elapsed >= TimeSpan.FromSeconds(4), $"elapsed={sw.Elapsed}");
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(7), $"elapsed={sw.Elapsed}");
+        Assert.True(sw.Elapsed >= TimeSpan.FromMilliseconds(40), $"elapsed={sw.Elapsed}");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1), $"elapsed={sw.Elapsed}");
+        // The blocked first channel is abandoned when the single overall budget expires, so the loop never reaches
+        // the second or third channel. One call proves the budget is overall rather than per channel.
         Assert.Equal(1, client.GetChatMemberCalls);
     }
 
@@ -113,7 +153,12 @@ public sealed partial class ConcurrencyTests
     {
         using var databases = new Databases();
         var client = new BlockingMembershipClient();
-        var service = BuildBareTelegramService(databases, client, out var accessor);
+        // A long budget keeps outer cancellation the only trigger, so this test cannot race the local timeout.
+        var service = BuildBareTelegramService(
+            databases,
+            client,
+            out var accessor,
+            new TelegramInteractionTimeouts { MandatoryJoin = TimeSpan.FromSeconds(30) });
         using var context = accessor.Push(new BotRuntimeContext
         {
             Config = new BotInstanceConfig { Id = "owned-join", Type = BotInstanceTypes.Owned },
@@ -153,7 +198,10 @@ public sealed partial class ConcurrencyTests
             if (item.Update.Id == 1)
             {
                 firstStarted.TrySetResult();
-                await TelegramCallbackAnswerPolicy.TryAnswerAsync(client, "lane-ack", cancellationToken: token);
+                // Tiny budget: the first update still blocks in the acknowledgement until the bound expires, which is
+                // what the FIFO assertion depends on, but the lane is released in milliseconds instead of two seconds.
+                await TelegramCallbackAnswerPolicy.TryAnswerAsync(
+                    client, "lane-ack", cancellationToken: token, timeout: TimeSpan.FromMilliseconds(40));
                 Interlocked.Exchange(ref firstFinished, 1);
             }
             else
@@ -360,8 +408,23 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(expected, result);
         Assert.DoesNotContain("arbitrary provider detail", result, StringComparison.OrdinalIgnoreCase);
     }
+    /// <summary>
+    /// Builds a production <see cref="TelegramBotService"/> instance whose UX-only interaction budgets can be
+    /// shrunk by tests.
+    /// </summary>
+    /// <param name="databases">Temporary database fixture backing the user-state and credentials dependencies.</param>
+    /// <param name="client">Fake Telegram client used by the test to observe acknowledgement and membership calls.</param>
+    /// <param name="accessor">Receives the bot context accessor the caller must push a runtime context onto.</param>
+    /// <param name="timeouts">
+    /// Optional immutable interaction budgets. When null production defaults apply, so callback acknowledgement is
+    /// bounded at two seconds and mandatory-join verification at one overall five-second budget.
+    /// </param>
+    /// <returns>A configured service instance ready for the private callback and mandatory-join paths under test.</returns>
     private static TelegramBotService BuildBareTelegramService(
-        Databases databases, ITelegramBotClient client, out BotContextAccessor accessor)
+        Databases databases,
+        ITelegramBotClient client,
+        out BotContextAccessor accessor,
+        TelegramInteractionTimeouts? timeouts = null)
     {
         var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
@@ -374,7 +437,7 @@ public sealed partial class ConcurrencyTests
             new CredentialsStore(databases.Credentials), configuration, NullLogger<TelegramBotService>.Instance,
             null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!,
             null!, null!, null!, new UserActivityLogService(configuration), null!, null!, null!, null!, null!, null!,
-            null!, null!, accessor, null!);
+            null!, null!, accessor, null!, timeouts);
     }
 
     private static Task<bool> InvokeMandatoryJoinAsync(

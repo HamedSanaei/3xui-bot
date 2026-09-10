@@ -151,6 +151,10 @@ public class Program
         services.AddSingleton<UsageReportDispatchStore>();
         services.AddSingleton<XuiV3VolumeReminderStateStore>();
         services.AddSingleton<XuiV3RenewalOperationStore>();
+        // Immutable, non-configurable budgets for UX-only Telegram interactions: callback acknowledgement (2s)
+        // and the single overall mandatory-join membership budget (5s). Registered as a shared immutable
+        // instance so bounded-timeout behaviour cannot be raised by deployment configuration or raced by tests.
+        services.AddSingleton(TelegramInteractionTimeouts.Production);
         services.AddSingleton<WalletLedgerService>();
         services.AddHostedService<WalletOperationReconciliationService>();
         services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();
@@ -467,6 +471,8 @@ public class Program
         ValidateRange(nameof(appConfig.AtlasPayReconciliationIntervalSeconds), appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600);
         ValidateRange(nameof(appConfig.AtlasPayReconciliationMaxAttempts), appConfig.AtlasPayReconciliationMaxAttempts, 1, 500);
         ValidateRange(nameof(appConfig.AtlasPayReconciliationBatchSize), appConfig.AtlasPayReconciliationBatchSize, 1, 500);
+        // Customer check cooldown: 0 disables it, 3600 caps it at one provider request per hour per payment.
+        ValidateRange(nameof(appConfig.AtlasPayManualCheckMinIntervalSeconds), appConfig.AtlasPayManualCheckMinIntervalSeconds, 0, 3600);
         if (!appConfig.AtlasPayEnabled) return;
         if (string.IsNullOrWhiteSpace(appConfig.AtlasPayApiKey))
             throw new InvalidOperationException("AtlasPay is enabled but 'atlasPayApiKey' is missing.");

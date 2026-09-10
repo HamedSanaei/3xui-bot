@@ -253,6 +253,37 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - UniquePay `feePayer` is controlled by the business-level `gatewayFee`/`feePayer` settings in the provider panel; the documented create-invoice form has no fee-payer field. Keep verification support for `user`/`buyer` and `owner` so existing invoices remain settleable; the provider currently reports `user` when the customer bears the configured 12% fee.
 - Tenant UniquePay availability is `global UniquePay enabled && TenantUniquePayEnabled`; the tenant owner panel shows `سراسری خاموش` when the global switch is off and refuses local enabling until global configuration is ready.
 - AtlasPay is a toman card-to-card provider (`Domain/AtlasPay.cs`) using `X-API-Key` over HTTPS with `POST /orders`, `GET /orders/{id}`, `POST /orders/{id}/verify`; the customer-visible reference is `trackingCode` and the charged amount is `totalAmountToman`, while settlement always credits/stores the immutable `BaseAmountToman`. Migration `20260910012628_AddAtlasPayGateway` adds `AtlasPayPaymentInfos`, `TenantBotOrders.AtlasPayPaymentInfoId`, and `BotInstances.TenantAtlasPayEnabled` (default true); no other table changes. The API key is restart-loaded only (never persisted or logged); full provider card numbers are never stored, only `CardNumberMasked`. Invoice creation is single-attempt: the local payment row and order FK are persisted before `POST /orders`, and HTTP 400/401 are definitive while 5xx/timeout/transport/malformed-success are ambiguous and never auto-retried. Reconciliation/verify only inquire (`GET`/`verify`) and never re-create. Settlement is `IsVerifiedForAutomaticSettlement` fail-closed on identity (provider order id, merchant ref, tracking code, total amount), known status (`confirmed`/`settled` eligible), and `requiresManualDelivery` (never auto-settles; moves to `manual_review`). Owned wallet credits use operation key `payment:atlaspay:{id}:credit`; tenant fulfillment reuses the common purchase/renewal pipeline with an atomic `pending -> processing -> settled` claim and tenant/order linkage checks. Tenant AtlasPay availability is `global AtlasPay enabled && TenantAtlasPayEnabled`; the owner panel refuses local enabling while the global switch is off, and both switches govern creation only (existing payments keep settling). Referral eligibility includes `atlaspay`.
+- **AtlasPay has no provider callback.** The authoritative vendor guide (`api_docs/atlaspay-sdk.md`) documents only
+  `POST /orders`, `GET /orders/{id}`, and `POST /orders/{id}/verify`, and states explicitly that polling needs no public
+  endpoint and no signature verification. There is therefore no webhook route, no callback URL, no callback secret, no
+  event id, and no replay protection to implement; `PaymentController` intentionally has no AtlasPay endpoint. The three
+  real triggers are: the background poller (primary), the customer "check payment" button (`apchk_<id>` for owned bots
+  and the tenant store link, both authoritative `verify`), and the super-admin verification action. All three converge on
+  `AtlasPayReconciliationHostedService.ReconcilePaymentAsync`, so no second financial path exists.
+- AtlasPay super-admin verification: type `AP:<localId>` in the admin payment-status screen
+  (`XuiV3AdminFlowService.TryHandleAtlasPayStatusAsync`). `AP:` is mandatory and bare ids are rejected, the row must
+  exist locally (a raw provider order id can never be settled), and the action only calls the shared verification
+  boundary — it is verification, not a force-credit button. The report shows local id, provider order id, tracking code,
+  provider status, purpose, bot/tenant linkage, `BaseAmountToman` vs `TotalAmountToman` vs actual received, manual-delivery
+  flag, settlement state, and reconciliation state, and never exposes the API key or card data.
+- AtlasPay reconciliation policy: `AtlasPayFailurePolicy` is the single classifier. Only provider-marked temporary
+  failures (HTTP 408/429/5xx including the documented 503, plus timeout/transport) keep the bounded automatic retry
+  budget. Documented permanent errors (400 invalid input, 401 invalid key, 404 order-not-found-or-not-yours) stop
+  automatic polling, persist a stable `AtlasPayFailureCodes` reason, and move the row to
+  `AtlasPayReconciliationStates.Escalated` so an operator can investigate instead of the worker generating endless
+  provider traffic. When the attempt budget is consumed while still unresolved the row becomes `Exhausted` with
+  `ReconciliationExhaustedAtUtc` set, which keeps it discoverable and manually verifiable rather than stranded by a null
+  `NextInquiryAtUtc`. Provider response bodies and transport text are never persisted; only the safe sentence and reason
+  code are stored.
+- AtlasPay `/verify` parsing is stricter than generic `GET` parsing: the documented verify contract guarantees a boolean
+  `paid` field, so a verify payload that omits `paid` is rejected as structurally invalid instead of being optimistically
+  interpreted as evidence.
+- AtlasPay customer manual check is throttled per payment by `AtlasPayManualCheckPolicy` using the last inquiry (written
+  by the poller too) and `atlasPayManualCheckMinIntervalSeconds` (default 10, 0 disables). During the cooldown the user is
+  answered from local state with a wait hint, no provider request is made, and no financial state changes.
+- Migration `20260910233159_AddAtlasPayReconciliationLifecycle` adds `AtlasPayPaymentInfos.ReconciliationState`
+  (default `active`) and `ReconciliationExhaustedAtUtc`, plus an index on the pair. It performs no backfill and changes no
+  balance, so existing AtlasPay rows keep polling after the upgrade.
 - Super-admin `⚙️ مدیریت درگاه‌ها` displays all four live gateway states, root key names, and configuration readiness without exposing secrets. Enabling a gateway with missing token/URL is rejected. Target-state callbacks carry a revision and short expiry, and are restricted to configured super-admin ids.
 - New HooshPay invoices require the live global `hooshPayEnabled` switch and, for tenant storefronts, the
   per-tenant `TenantHooshPayEnabled` preference. Disabling either switch hides and blocks only new invoices, including
@@ -750,3 +781,12 @@ and the main menu.
   for production options, the read-only backup snapshot, and the shared-cache outbox, and the fixture directory delete
   then failed with `IOException: The process cannot access the file ... because it is being used by another process`.
   Fixture connections declare `Pooling=false`, and the helper refuses any directory outside the OS temp root.
+- UX-only Telegram latency budgets are injectable for tests through the immutable
+  `Services/TelegramInteractionTimeouts.cs` (`CallbackAnswer` = 2 s, `MandatoryJoin` = 5 s), registered in
+  `Program.RegisterApplicationServices` as a shared singleton and consumed via a trailing *optional* constructor
+  parameter on `TelegramBotService`, `XuiV3BotFlowService`, `TenantBotService`, `SalesAssistantService`, and
+  `XuiV3AdminFlowService`. Production always resolves the `Production` instance because the value is never read from
+  configuration. Tests shrink the budget to milliseconds by passing their own instance (directly to the service, or via
+  `IncidentProvider(..., interactionTimeouts: ...)`), so timeout regressions run in milliseconds instead of sleeping the
+  real 2 s / 5 s. There is deliberately no mutable static timeout; a guard test asserts the production values stay
+  exactly 2 s and 5 s.

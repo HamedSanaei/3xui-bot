@@ -96,6 +96,13 @@ public class XuiV3BotFlowService
     private readonly XuiV3RenewalOperationStore _renewalOperationStore;
 
     /// <summary>
+    /// Immutable budget for UX-only callback acknowledgement inside this flow. Production uses the shared
+    /// two-second default; tests inject a millisecond budget so bounded-acknowledgement behaviour is proven
+    /// without waiting the real production timeout.
+    /// </summary>
+    private readonly TelegramInteractionTimeouts _interactionTimeouts;
+
+    /// <summary>
     /// Creates the shared XUI v3 customer-flow service used by owned bots and tenant storefront bots.
     /// </summary>
     /// <param name="purchaseService">
@@ -140,6 +147,11 @@ public class XuiV3BotFlowService
     /// Durable users.db store that makes each renewal operation exactly-once: unique-key creation, lease-bound
     /// processing claims, the atomic applied transition, the settlement guard, and read-only timeout recovery.
     /// </param>
+    /// <param name="interactionTimeouts">
+    /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
+    /// callback acknowledgement is bounded at two seconds. Tests pass millisecond values. This value is never read
+    /// from configuration and never affects purchase, renewal, wallet, or settlement semantics.
+    /// </param>
     /// <remarks>
     /// This service is intentionally shared between owned bots and tenant storefronts. Tenant callers must
     /// set the active bot context before invoking it so state reads and callback handling stay scoped to the
@@ -158,7 +170,8 @@ public class XuiV3BotFlowService
         BotContextAccessor botContextAccessor,
         XuiV3LinkChangeOperationStore linkChangeOperationStore,
         XuiV3VolumeReminderStateStore volumeReminderStateStore,
-        XuiV3RenewalOperationStore renewalOperationStore)
+        XuiV3RenewalOperationStore renewalOperationStore,
+        TelegramInteractionTimeouts interactionTimeouts = null)
     {
         _purchaseService = purchaseService;
         _sessionStore = sessionStore;
@@ -174,6 +187,7 @@ public class XuiV3BotFlowService
         _linkChangeOperationStore = linkChangeOperationStore;
         _volumeReminderStateStore = volumeReminderStateStore;
         _renewalOperationStore = renewalOperationStore;
+        _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
     }
 
     public bool IsEnabledForPurchaseFlow()
@@ -10215,7 +10229,8 @@ public class XuiV3BotFlowService
             callbackQueryId,
             cancellationToken: cancellationToken,
             logger: _logger,
-            botId: BotContextAccessor.CurrentBotId);
+            botId: BotContextAccessor.CurrentBotId,
+            timeout: _interactionTimeouts.CallbackAnswer);
     }
 
     private static string GenerateReplacementAccountEmail(IReadOnlyCollection<XuiV3Client> clients, string oldEmail)

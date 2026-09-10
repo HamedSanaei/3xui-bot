@@ -292,6 +292,19 @@ namespace Adminbot.Domain
         public int AtlasPayReconciliationIntervalSeconds { get; set; } = 30;
         public int AtlasPayReconciliationMaxAttempts { get; set; } = 50;
         public int AtlasPayReconciliationBatchSize { get; set; } = 50;
+
+        /// <summary>
+        /// Gets or sets the minimum number of seconds between two provider requests for the same AtlasPay payment when
+        /// the customer presses the check button.
+        /// </summary>
+        /// <remarks>
+        /// AtlasPay's authoritative guide recommends polling and provides no server callback, so every customer check is
+        /// a real provider request. This cooldown is measured from the last inquiry, which the background reconciliation
+        /// worker also writes, so pressing the button cannot be used to bypass the provider rate limit. Values are
+        /// clamped to 0..3600 seconds; 0 disables the cooldown. While the cooldown is active the user is answered from
+        /// local state and no financial state changes.
+        /// </remarks>
+        public int AtlasPayManualCheckMinIntervalSeconds { get; set; } = 10;
         public bool UniquePayEnabled { get; set; }
         /// <summary>
         /// Official UniquePay API host used for generic invoice creation and inquiry endpoints.

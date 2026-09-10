@@ -318,8 +318,29 @@ public sealed partial class ConcurrencyTests
             }).Build();
     }
 
+    /// <summary>
+    /// Builds a full production-shaped service provider for incident regression tests on top of a temporary
+    /// users.db/credentials.db fixture directory.
+    /// </summary>
+    /// <param name="databases">Temporary database fixture that owns the users.db and credentials.db files used by the provider.</param>
+    /// <param name="fundingMonitorEnabled">
+    /// Optional override for the tenant storefront funding monitor flag. When null the incident configuration default is used.
+    /// </param>
+    /// <param name="interactionTimeouts">
+    /// Optional immutable override for the UX-only Telegram latency budgets. When null production defaults apply, so
+    /// callback acknowledgement is bounded at two seconds and mandatory-join verification at one overall five-second
+    /// budget. Tests that assert bounded-timeout behaviour pass millisecond values so they do not wait the real
+    /// production budgets. This override cannot change purchase, wallet, or settlement semantics.
+    /// </param>
+    /// <returns>
+    /// A provider exposing the registered production services, the configured <see cref="BotRegistry"/>, and the
+    /// per-bot fake Telegram clients keyed by bot id. The caller owns and must dispose the provider.
+    /// </returns>
     private static (ServiceProvider Provider, BotRegistry Registry, ConcurrentDictionary<string, StorefrontClient> Clients)
-        IncidentProvider(Databases databases, bool? fundingMonitorEnabled = null)
+        IncidentProvider(
+            Databases databases,
+            bool? fundingMonitorEnabled = null,
+            TelegramInteractionTimeouts? interactionTimeouts = null)
     {
         IConfiguration configuration = IncidentConfiguration();
         if (fundingMonitorEnabled.HasValue)
@@ -336,6 +357,11 @@ public sealed partial class ConcurrencyTests
         appConfig.CredentialsDatabasePath = Path.Combine(databases.DirectoryPath, "credentials.db");
         var services = new ServiceCollection();
         Program.RegisterApplicationServices(services, configuration, appConfig, databases.DirectoryPath);
+
+        // Registered after production so the last registration wins for a single-service resolve. Tests use this
+        // to shrink the UX-only Telegram budgets to milliseconds without touching production latency policy.
+        if (interactionTimeouts != null)
+            services.AddSingleton(interactionTimeouts);
 
         var registry = new BotRegistry(configuration);
         var clients = new ConcurrentDictionary<string, StorefrontClient>(StringComparer.OrdinalIgnoreCase);

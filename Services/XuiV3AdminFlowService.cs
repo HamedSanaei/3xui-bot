@@ -74,6 +74,12 @@ public class XuiV3AdminFlowService
     private readonly TetraminatorSettlementService _tetraminatorSettlementService;
     /// <summary>Serialized authoritative UniquePay inquiry and provisional-decision coordinator.</summary>
     private readonly UniquePayReconciliationHostedService _uniquePayReconciliation;
+
+    /// <summary>
+    /// Shared AtlasPay reconciliation service used by the super-admin verification action so administrative checks go
+    /// through exactly the same authoritative verification and settlement boundary as polling and customer checks.
+    /// </summary>
+    private readonly AtlasPayReconciliationHostedService _atlasPayReconciliation;
     private readonly BotRegistry _botRegistry;
     private readonly TenantBotService _tenantBotService;
     private readonly XuiV3PurchaseService _purchaseService;
@@ -81,6 +87,13 @@ public class XuiV3AdminFlowService
     private readonly ILogger<XuiV3AdminFlowService> _logger;
     private readonly UserActivityLogService _activityLog;
     private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
+
+    /// <summary>
+    /// Immutable budget for UX-only callback acknowledgement on admin panels. Production uses the shared
+    /// two-second default; tests inject a millisecond budget so bounded-acknowledgement behaviour is proven
+    /// without waiting the real production timeout.
+    /// </summary>
+    private readonly TelegramInteractionTimeouts _interactionTimeouts;
 
     /// <summary>
     /// Creates the super-admin XuiV3 flow service and injects the payment and tenant services needed by admin tools.
@@ -113,6 +126,16 @@ public class XuiV3AdminFlowService
     /// Durable users.db volume-cycle store notified after the panel accepts an admin renewal. Reminder persistence is
     /// best-effort and never changes the account update or any financial state.
     /// </param>
+    /// <param name="interactionTimeouts">
+    /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
+    /// callback acknowledgement is bounded at two seconds. Tests pass millisecond values. This value never affects
+    /// admin authorization, panel mutations, or financial state.
+    /// </param>
+    /// <param name="atlasPayReconciliation">
+    /// Shared AtlasPay reconciliation service backing the super-admin verify action. Injecting the same service used by
+    /// the background poller and the customer check guarantees one settlement boundary, so an admin verification cannot
+    /// double-credit a wallet or double-fulfil a tenant order.
+    /// </param>
     /// <remarks>Register this handler as scoped so admin execution never shares its users.db tracker with another update or recovery worker.</remarks>
     public XuiV3AdminFlowService(
         UserWorkflowStore userDbContext,
@@ -132,7 +155,9 @@ public class XuiV3AdminFlowService
         GozargahSiteSyncService gozargahSiteSyncService,
         ILogger<XuiV3AdminFlowService> logger,
         UserActivityLogService activityLog,
-        XuiV3VolumeReminderStateStore volumeReminderStateStore)
+        XuiV3VolumeReminderStateStore volumeReminderStateStore,
+        AtlasPayReconciliationHostedService atlasPayReconciliation = null,
+        TelegramInteractionTimeouts interactionTimeouts = null)
     {
         _workflow = userDbContext;
         _state = stateStore;
@@ -146,6 +171,7 @@ public class XuiV3AdminFlowService
         _tetraminator = tetraminator;
         _tetraminatorSettlementService = tetraminatorSettlementService;
         _uniquePayReconciliation = uniquePayReconciliation;
+        _atlasPayReconciliation = atlasPayReconciliation;
         _botRegistry = botRegistry;
         _tenantBotService = tenantBotService;
         _purchaseService = purchaseService;
@@ -153,6 +179,7 @@ public class XuiV3AdminFlowService
         _logger = logger;
         _activityLog = activityLog;
         _volumeReminderStateStore = volumeReminderStateStore;
+        _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
     }
 
     /// <summary>
@@ -388,7 +415,7 @@ public class XuiV3AdminFlowService
 
             await botClient.SendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای تترامیناتور می‌توانید `Order ID`، `Pay ID` یا شناسه داخلی رکورد را بفرستید.\nبرای UniquePay می‌توانید `UP:8`، `Hash ID` یا `Ref ID` بفرستید.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
+                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای تترامیناتور می‌توانید `Order ID`، `Pay ID` یا شناسه داخلی رکورد را بفرستید.\nبرای UniquePay می‌توانید `UP:8`، `Hash ID` یا `Ref ID` بفرستید.\nبرای AtlasPay می‌توانید `AP:8` یا شناسه داخلی پرداخت AtlasPay را بفرستید تا با استعلام رسمی \"تایید پرداخت\" بررسی شود.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
                 parseMode: ParseMode.Markdown,
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
@@ -1572,6 +1599,23 @@ public class XuiV3AdminFlowService
         CancellationToken cancellationToken)
     {
         var input = message.Text.Trim();
+        // AtlasPay is addressed by its own namespaced local identifier so an operator can never accidentally hand a bare
+        // AtlasPay row id to another provider's lookup.
+        if (input.StartsWith("AP:", StringComparison.OrdinalIgnoreCase))
+        {
+            if (await TryHandleAtlasPayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
+                return;
+
+            await FinishWithMessageAsync(
+                botClient,
+                message.Chat.Id,
+                currentUser,
+                mainMenu,
+                "پرداخت AtlasPay با این شناسه داخلی پیدا نشد.",
+                cancellationToken);
+            return;
+        }
+
         if (input.StartsWith("UP:", StringComparison.OrdinalIgnoreCase))
         {
             if (await TryHandleUniquePayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
@@ -1598,10 +1642,12 @@ public class XuiV3AdminFlowService
                 return;
             if (await TryHandleUniquePayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
                 return;
+            if (await TryHandleAtlasPayStatusAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
+                return;
             if (await TryHandleTenantOrderManualConfirmationAsync(botClient, message, currentUser, mainMenu, input, cancellationToken))
                 return;
 
-            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments، HooshPay، تترامیناتور، UniquePay یا سفارش tenant با این شناسه پیدا نشد.", cancellationToken);
+            await FinishWithMessageAsync(botClient, message.Chat.Id, currentUser, mainMenu, "پرداخت NOWPayments، HooshPay، تترامیناتور، UniquePay، AtlasPay یا سفارش tenant با این شناسه پیدا نشد.", cancellationToken);
             return;
         }
 
@@ -2080,6 +2126,177 @@ public class XuiV3AdminFlowService
         if (string.IsNullOrWhiteSpace(input) || !input.StartsWith("UP:", StringComparison.OrdinalIgnoreCase))
             return false;
         return int.TryParse(input[3..].Trim(), out paymentId) && paymentId > 0;
+    }
+
+    /// <summary>
+    /// Handles a super-admin AtlasPay lookup by resolving exactly one trusted local payment row, requesting a fresh
+    /// authoritative AtlasPay verification, and reporting the shared settlement outcome.
+    /// </summary>
+    /// <param name="botClient">Owned-bot Telegram client serving the configured global super-admin.</param>
+    /// <param name="message">Admin message containing a provider-qualified <c>AP:&lt;localId&gt;</c> identifier.</param>
+    /// <param name="currentUser">Bot-scoped admin flow state cleared before the verification report is sent.</param>
+    /// <param name="mainMenu">Super-admin reply keyboard restored after the report.</param>
+    /// <param name="input">Provider-qualified local AtlasPay payment id. The value is an address, never payment proof.</param>
+    /// <param name="cancellationToken">
+    /// Cancellation token covering the provider request, settlement/fulfilment, activity logging, and Telegram delivery.
+    /// </param>
+    /// <returns>
+    /// <c>true</c> when a local AtlasPay row was found and its verification report was sent; <c>false</c> when the input
+    /// is not a valid AtlasPay identifier or no matching local row exists, so the caller can fall through to the next
+    /// provider lookup.
+    /// </returns>
+    /// <remarks>
+    /// This is verification, not a force-settle button. The handler cannot credit a wallet or fulfil a tenant order from
+    /// local data, does not trust any amount or status supplied by the operator, and delegates every financial effect to
+    /// the same <see cref="AtlasPayReconciliationHostedService.ReconcilePaymentAsync"/> boundary used by the background
+    /// poller and the customer check. Repeating the command is therefore idempotent: an already-settled payment reports
+    /// <c>AlreadyAdded</c> instead of crediting again.
+    ///
+    /// Only global super-admins reach this handler, because the admin flow performs the super-admin authorization before
+    /// dispatching admin messages.
+    ///
+    /// Security: the report never contains the AtlasPay API key, signing material, or full card numbers, and raw provider
+    /// response text is never echoed.
+    /// </remarks>
+    private async Task<bool> TryHandleAtlasPayStatusAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        User currentUser,
+        IReplyMarkup mainMenu,
+        string input,
+        CancellationToken cancellationToken)
+    {
+        if (!TryParseAtlasPayInternalId(input, out var paymentId)) return false;
+        if (_atlasPayReconciliation == null) return false;
+
+        var payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos
+            .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken));
+        if (payment == null) return false;
+
+        // Same authoritative boundary as polling and customer checks. The admin identity in the audit log is the only
+        // thing that differs; settlement, idempotency keys, and tenant fulfilment semantics stay identical.
+        var settlement = await _atlasPayReconciliation.ReconcilePaymentAsync(
+            payment.Id, "superadmin-verify", useVerify: true, cancellationToken);
+        await _workflow.ReloadAsync(payment, cancellationToken);
+
+        var actor = await GetActivityActorAsync(message.From.Id);
+        await _activityLog.LogBotActionAsync(
+            "atlaspay_status_verified",
+            actor,
+            true,
+            new Dictionary<string, object>
+            {
+                ["paymentId"] = payment.Id,
+                ["providerOrderId"] = payment.ProviderOrderId ?? 0,
+                ["trackingCode"] = payment.TrackingCode ?? string.Empty,
+                ["paymentPurpose"] = payment.PaymentPurpose ?? string.Empty,
+                ["paymentStatus"] = payment.ProviderStatus ?? string.Empty,
+                ["settlementStatus"] = settlement.Status.ToString(),
+                ["reconciliationState"] = payment.ReconciliationState ?? string.Empty,
+                ["errorCode"] = payment.ErrorCode ?? string.Empty
+            },
+            cancellationToken);
+
+        await FinishWithMessageAsync(
+            botClient,
+            message.Chat.Id,
+            currentUser,
+            mainMenu,
+            BuildAtlasPayPaymentInfo(payment, settlement),
+            cancellationToken,
+            ParseMode.Html);
+        return true;
+    }
+
+    /// <summary>Parses a provider-qualified AtlasPay internal payment id.</summary>
+    /// <param name="input">Admin input in exact case-insensitive <c>AP:&lt;positive integer&gt;</c> form.</param>
+    /// <param name="paymentId">Parsed positive users.db primary key, or zero when parsing fails.</param>
+    /// <returns><c>true</c> when the provider prefix and a positive numeric id are both present.</returns>
+    /// <remarks>
+    /// A bare numeric id is deliberately rejected so an AtlasPay row can never be confused with another provider's
+    /// table, and so an operator cannot reach a payment by guessing an unrelated local key.
+    /// </remarks>
+    private static bool TryParseAtlasPayInternalId(string input, out int paymentId)
+    {
+        paymentId = 0;
+        if (string.IsNullOrWhiteSpace(input) || !input.StartsWith("AP:", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return int.TryParse(input[3..].Trim(), out paymentId) && paymentId > 0;
+    }
+
+    /// <summary>
+    /// Builds the HTML-safe AtlasPay verification report shown to a super-admin.
+    /// </summary>
+    /// <param name="payment">Local AtlasPay row containing provider observations, linkage, and audit flags.</param>
+    /// <param name="settlement">Result of the immediately preceding authoritative verification attempt.</param>
+    /// <returns>
+    /// HTML text containing the local identifier, provider identity, amounts, settlement state, automatic-polling state,
+    /// and a single human-readable outcome line. It never contains the API key, signing material, or full card numbers.
+    /// </returns>
+    /// <remarks>
+    /// The report deliberately separates the business amount (<c>BaseAmountToman</c>, what the application credits or
+    /// fulfils) from the customer-facing transfer amount (<c>TotalAmountToman</c>) and the actually received amount, so an
+    /// operator can see an accepted underpayment without ever treating it as a full payment.
+    /// </remarks>
+    private static string BuildAtlasPayPaymentInfo(AtlasPayPaymentInfo payment, NowPaymentsSettlementResult settlement)
+        => "🧾 <b>وضعیت پرداخت AtlasPay</b>\n\n" +
+           $"شناسه داخلی: <code>AP:{payment.Id}</code>\n" +
+           $"سفارش provider: <code>{payment.ProviderOrderId}</code>\n" +
+           $"شماره پیگیری: <code>{Html(payment.TrackingCode)}</code>\n" +
+           $"وضعیت provider: <code>{Html(payment.ProviderStatus)}</code>\n" +
+           $"هدف پرداخت: <code>{Html(payment.PaymentPurpose)}</code>\n" +
+           $"ربات: <code>{Html(payment.BotId)}</code> / <code>{Html(payment.BotUsername)}</code>\n" +
+           $"سفارش ربات فروشگاهی: <code>{payment.TenantBotOrderId}</code>\n" +
+           $"کاربر تلگرام: <code>{payment.TelegramUserId}</code>\n" +
+           $"مبلغ پایه: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+           $"مبلغ کل پرداخت: <code>{Html(payment.TotalAmountToman?.FormatCurrency())}</code>\n" +
+           $"مبلغ دریافتی واقعی: <code>{Html(payment.ActualReceivedAmountToman?.FormatCurrency())}</code>\n" +
+           $"نیاز به تحویل دستی: <code>{(payment.RequiresManualDelivery ? "بله" : "خیر")}</code>\n" +
+           $"وضعیت تسویه: <code>{Html(payment.SettlementState)}</code>\n" +
+           $"پایش خودکار: <code>{Html(payment.ReconciliationState)}</code>\n" +
+           $"اعمال شده روی کیف پول: <code>{(payment.IsAddedToBalance ? "بله" : "خیر")}</code>\n" +
+           $"کد خطا: <code>{Html(payment.ErrorCode ?? "-")}</code>\n" +
+           "\n" + BuildAtlasPayOutcomeLine(payment, settlement);
+
+    /// <summary>
+    /// Maps the current AtlasPay payment and settlement state to one operator-facing outcome sentence.
+    /// </summary>
+    /// <param name="payment">Local AtlasPay row read after the verification attempt.</param>
+    /// <param name="settlement">Result of the verification attempt; may be null.</param>
+    /// <returns>
+    /// A short Persian sentence distinguishing settled-now, already-settled, manual-delivery review, permanent provider
+    /// error, exhausted automatic retries, provider-terminal states, and still-pending payments.
+    /// </returns>
+    /// <remarks>
+    /// The order of the checks matters: an accepted underpayment and a stopped reconciliation are both reported ahead of
+    /// the generic pending sentence so an operator is never told a payment is merely pending when it actually needs a
+    /// decision or provider investigation.
+    /// </remarks>
+    private static string BuildAtlasPayOutcomeLine(AtlasPayPaymentInfo payment, NowPaymentsSettlementResult settlement)
+    {
+        if (settlement?.Status == NowPaymentsSettlementStatus.Applied)
+            return "✅ استعلام رسمی تایید شد و تسویه/تحویل انجام شد.";
+        if (settlement?.Status == NowPaymentsSettlementStatus.AlreadyAdded)
+            return "ℹ️ این پرداخت قبلاً تسویه شده است و دوباره اعمال نشد.";
+        if (payment.RequiresManualDelivery ||
+            string.Equals(payment.SettlementState, AtlasPaySettlementStates.ManualReview, StringComparison.Ordinal))
+            return "⚠️ کسری واریز پذیرفته شده است؛ پیش از تحویل خودکار نیاز به بررسی دستی دارد.";
+        if (string.Equals(payment.ReconciliationState, AtlasPayReconciliationStates.Escalated, StringComparison.Ordinal))
+            return string.Equals(payment.ErrorCode, AtlasPayFailureCodes.ProviderAuthFailed, StringComparison.Ordinal)
+                ? "⚠️ کلید API اطلس‌پی پذیرفته نشد؛ پایش خودکار متوقف شده و تنظیمات درگاه باید بررسی شود."
+                : "⚠️ استعلام رسمی با خطای دائمی درگاه مواجه شد؛ پایش خودکار متوقف شده و موضوع نیازمند بررسی است.";
+        if (string.Equals(payment.ReconciliationState, AtlasPayReconciliationStates.Exhausted, StringComparison.Ordinal))
+            return "⚠️ سقف تلاش‌های خودکار تمام شده است؛ پرداخت هنوز تسویه نشده و بررسی دستی لازم است.";
+        if (AtlasPayStatuses.IsTerminal(payment.ProviderStatus))
+            return payment.ProviderStatus switch
+            {
+                "expired" => "⌛ مهلت پرداخت منقضی شده است.",
+                "cancelled" => "🚫 پرداخت لغو شده است.",
+                _ => "❌ پرداخت توسط درگاه رد شده است."
+            };
+        if (string.Equals(payment.ErrorCode, AtlasPayFailureCodes.ProviderOrderNotFound, StringComparison.Ordinal))
+            return "⚠️ سفارش در اطلس‌پی پیدا نشد یا متعلق به این فروشگاه نیست.";
+        return "⏳ پرداخت هنوز توسط درگاه تایید نشده است.";
     }
 
     /// <summary>Handles start, confirmation, and cancellation callbacks for UniquePay provisional wallet credit.</summary>
@@ -2891,7 +3108,8 @@ public class XuiV3AdminFlowService
         await TelegramCallbackAnswerPolicy.TryAnswerAsync(
             botClient, callbackQuery.Id, text, showAlert,
             cancellationToken: cancellationToken, logger: _logger,
-            botId: BotContextAccessor.CurrentBotId, telegramUserId: callbackQuery.From?.Id);
+            botId: BotContextAccessor.CurrentBotId, telegramUserId: callbackQuery.From?.Id,
+            timeout: _interactionTimeouts.CallbackAnswer);
     }
 
     /// <summary>

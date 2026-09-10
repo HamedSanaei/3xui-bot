@@ -71,6 +71,7 @@
   "atlasPayReconciliationIntervalSeconds": 30,
   "atlasPayReconciliationMaxAttempts": 50,
   "atlasPayReconciliationBatchSize": 50,
+  "atlasPayManualCheckMinIntervalSeconds": 10,
   "xuiV3LinkChangeConfirmationMinutes": 10,
   "xuiV3LinkChangeRecoveryPollSeconds": 30,
   "xuiV3LinkChangeRecoveryMaxAttempts": 12,

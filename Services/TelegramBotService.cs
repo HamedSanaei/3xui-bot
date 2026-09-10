@@ -171,6 +171,13 @@ public class TelegramBotService
     private readonly BotRegistry _botRegistry;
     private readonly BotRuntimeStatusStore _botRuntimeStatusStore;
     private readonly BotContextAccessor _botContextAccessor;
+
+    /// <summary>
+    /// Immutable latency budgets for UX-only Telegram interactions (callback acknowledgement and mandatory-join
+    /// membership verification). Injected so timeout behaviour can be proven by tests without waiting the real
+    /// production budgets, while production always uses <see cref="TelegramInteractionTimeouts.Production"/>.
+    /// </summary>
+    private readonly TelegramInteractionTimeouts _interactionTimeouts;
     private ITelegramBotClient ActiveBotClient => _botContextAccessor.Current?.Client ?? _botClient;
     private BotInstanceConfig CurrentBot => _botContextAccessor.Current?.Config;
     private IEnumerable<string> CurrentChannelIds => CurrentBot != null
@@ -272,6 +279,14 @@ public class TelegramBotService
     /// <param name="referralService">
     /// Global owned-bot referral service used by start payloads, user reporting, and final legacy Zibal settlement.
     /// </param>
+    /// <param name="interactionTimeouts">
+    /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used:
+    /// two seconds for callback acknowledgement and one overall five-second budget for mandatory-join
+    /// membership verification. Tests pass millisecond values so bounded-timeout behaviour is deterministic and
+    /// fast; production dependency injection supplies the shared <see cref="TelegramInteractionTimeouts.Production"/>
+    /// instance. This value is never read from configuration, so a deployment cannot raise it back to the
+    /// pathological default Telegram HTTP timeout.
+    /// </param>
     /// <remarks>
     /// The service belongs to one execution/request scope. Conversation and financial stores create independent
     /// users.db contexts through their factories. Runtime bot identity always comes from <see cref="BotContextAccessor"/>
@@ -312,7 +327,8 @@ public class TelegramBotService
         BotRegistry botRegistry,
         BotRuntimeStatusStore botRuntimeStatusStore,
         BotContextAccessor botContextAccessor,
-        ReferralService referralService)
+        ReferralService referralService,
+        TelegramInteractionTimeouts interactionTimeouts = null)
     {
         _botClient = botClient;
         _workflow = dbContext;
@@ -350,6 +366,7 @@ public class TelegramBotService
         _botRuntimeStatusStore = botRuntimeStatusStore;
         _botContextAccessor = botContextAccessor;
         _referralService = referralService;
+        _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
     }
 
     /// <summary>
@@ -4008,7 +4025,7 @@ public class TelegramBotService
         CancellationToken cancellationToken = default)
         => TelegramCallbackAnswerPolicy.TryAnswerAsync(
             ActiveBotClient, callbackQueryId, text, showAlert, url, cacheTime, cancellationToken,
-            _logger, BotContextAccessor.CurrentBotId);
+            _logger, BotContextAccessor.CurrentBotId, timeout: _interactionTimeouts.CallbackAnswer);
 
     private Task<bool> SafeAnswerCallbackQueryAsync(
         ITelegramBotClient botClient,
@@ -4020,7 +4037,7 @@ public class TelegramBotService
         CancellationToken cancellationToken = default)
         => TelegramCallbackAnswerPolicy.TryAnswerAsync(
             botClient, callbackQueryId, text, showAlert, url, cacheTime, cancellationToken,
-            _logger, BotContextAccessor.CurrentBotId);
+            _logger, BotContextAccessor.CurrentBotId, timeout: _interactionTimeouts.CallbackAnswer);
 
     private async Task AnswerCallbackSafely(CallbackQuery callbackQuery, CancellationToken cancellationToken)
     {
@@ -7881,7 +7898,28 @@ public class TelegramBotService
     /// Telegram may return <c>chat not found</c> or <c>member list is inaccessible</c> when the bot is not added to the
     /// channel or lacks the required channel access. The method fails closed in that case so users cannot bypass the
     /// mandatory-join gate because of a bad channel setting.
+    ///
+    /// Budget shape:
+    /// The timeout is one overall budget for the entire channel loop, taken from
+    /// <see cref="TelegramInteractionTimeouts.MandatoryJoin"/> (five seconds in production). It is deliberately
+    /// not one budget per channel: with N channels the whole evaluation must still finish inside a single
+    /// five-second window, otherwise a slow Telegram API would stretch a three-channel check into fifteen
+    /// seconds of lane stall. Tests inject a millisecond budget so this behaviour is proven without waiting.
+    ///
+    /// Failure mode:
+    /// On local timeout, transport failure, or channel-access error the method returns <c>false</c> so membership
+    /// is treated as unverified and the gate stays closed. Cancellation from <paramref name="cancellationToken"/>
+    /// is rethrown, because that means the lane itself is stopping.
+    ///
+    /// Side effects:
+    /// Emits one slow-operation diagnostic for the <c>telegram_mandatory_join</c> operation when the evaluation is
+    /// slow or fails. The diagnostic carries only bot id, Telegram user id, elapsed milliseconds, outcome, and
+    /// exception type; it never logs channel payloads or bot tokens.
     /// </remarks>
+    /// <param name="cancellationToken">
+    /// Outer lane cancellation token. When cancelled the resulting <see cref="OperationCanceledException"/> is
+    /// propagated instead of being converted into a local timeout.
+    /// </param>
     private async Task<bool> isJoinedToChannel(
         IEnumerable<string> channelIDs,
         long userId,
@@ -7890,8 +7928,10 @@ public class TelegramBotService
         var started = Stopwatch.GetTimestamp();
         var outcome = "completed";
         string errorType = null;
+        // One linked source bounds the whole channel loop, so the total wait never exceeds a single budget
+        // while outer lane cancellation still propagates immediately.
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        bounded.CancelAfter(TimeSpan.FromSeconds(5));
+        bounded.CancelAfter(_interactionTimeouts.MandatoryJoin);
 
         try
         {
@@ -9061,6 +9101,18 @@ public class TelegramBotService
         }
         else if (!string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.WalletCharge, StringComparison.OrdinalIgnoreCase))
             return;
+
+        // Provider-traffic guard: AtlasPay documents polling and provides no server callback, so every customer check is
+        // a real provider request. The cooldown is measured from the last inquiry, which the background reconciliation
+        // worker also writes, so pressing the button cannot bypass the provider rate limit. While it is active no
+        // provider call is made and no financial state changes.
+        if (AtlasPayManualCheckPolicy.IsWithinCooldown(payment, _appConfig.AtlasPayManualCheckMinIntervalSeconds,
+                DateTime.UtcNow, out var waitSeconds))
+        {
+            await SafeAnswerCallbackQueryAsync(callbackQuery.Id,
+                $"لطفاً {waitSeconds} ثانیه دیگر دوباره بررسی کنید.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
 
         await SafeAnswerCallbackQueryAsync(callbackQuery.Id, "در حال استعلام رسمی از اطلس‌پی...", cancellationToken: cancellationToken);
         var result = await _atlasPayReconciliation.ReconcilePaymentAsync(payment.Id, "customer-check", useVerify: true, cancellationToken);

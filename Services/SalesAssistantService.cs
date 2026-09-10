@@ -26,6 +26,13 @@ public class SalesAssistantService
     private readonly ILogger<SalesAssistantService> _logger;
 
     /// <summary>
+    /// Immutable budget for UX-only callback acknowledgement on the Sales Assistant bot. Production uses the
+    /// shared two-second default; tests inject a millisecond budget so bounded-acknowledgement behaviour is
+    /// proven without waiting the real production timeout.
+    /// </summary>
+    private readonly TelegramInteractionTimeouts _interactionTimeouts;
+
+    /// <summary>
     /// creates the sales assistant service with the runtime Bot registry and tenant order database dependencies.
     /// </summary>
     /// <param name="UserDbContext">Factory for operation-owned users.db contexts. Detached input rows are reloaded before writes.</param>
@@ -34,6 +41,11 @@ public class SalesAssistantService
     /// <param name="ServiceProvider">service Provider used to resolve <see cref="TenantBotService" /> for final receipt Approval.</param>
     /// <param name="PurchaseService">XUI v3 catalog service used to render the persisted purchase plan safely.</param>
     /// <param name="Logger">Logger used for failed assistant delivery or callback processing.</param>
+    /// <param name="InteractionTimeouts">
+    /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
+    /// callback acknowledgement is bounded at two seconds. Tests pass millisecond values. This value never affects
+    /// receipt approval, tenant-owner authorization, or order fulfillment.
+    /// </param>
     /// <remarks>Each operation owns its users.db context. Receipt/order checks preserve tenant-owner authorization; financial approval delegates to the durable tenant fulfillment boundary.</remarks>
     public SalesAssistantService(
         UserDbContextFactory UserDbContext,
@@ -41,7 +53,8 @@ public class SalesAssistantService
         BotClientProvider BotClientProvider,
         IServiceProvider ServiceProvider,
         XuiV3PurchaseService PurchaseService,
-        ILogger<SalesAssistantService> Logger)
+        ILogger<SalesAssistantService> Logger,
+        TelegramInteractionTimeouts InteractionTimeouts = null)
     {
         _userDbContextFactory = UserDbContext;
         _botRegistry = BotRegistry;
@@ -49,6 +62,7 @@ public class SalesAssistantService
         _serviceProvider = ServiceProvider;
         _purchaseService = PurchaseService;
         _logger = Logger;
+        _interactionTimeouts = InteractionTimeouts ?? TelegramInteractionTimeouts.Production;
     }
 
     /// <summary>
@@ -570,7 +584,7 @@ public class SalesAssistantService
         await TelegramCallbackAnswerPolicy.TryAnswerAsync(
             botClient, callbackQueryId, text, showAlert,
             cancellationToken: cancellationToken, logger: _logger,
-            botId: BotContextAccessor.CurrentBotId);
+            botId: BotContextAccessor.CurrentBotId, timeout: _interactionTimeouts.CallbackAnswer);
     }
 
     /// <summary>

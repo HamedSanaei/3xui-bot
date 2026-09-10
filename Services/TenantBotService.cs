@@ -107,6 +107,13 @@ public class TenantBotService
     private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
     private readonly XuiV3RenewalOperationStore _renewalOperationStore;
     private readonly TenantProvisioningAttemptCoordinator _tenantProvisioningCoordinator;
+
+    /// <summary>
+    /// Immutable budget for UX-only callback acknowledgement on the tenant bot. Production uses the shared
+    /// two-second default; tests inject a millisecond budget so bounded-acknowledgement behaviour is proven
+    /// without waiting the real production timeout.
+    /// </summary>
+    private readonly TelegramInteractionTimeouts _interactionTimeouts;
     private readonly Dictionary<string, TenantJoinCapabilityCacheEntry> _tenantJoinCapabilityCache = new(StringComparer.Ordinal);
     private readonly object _tenantJoinCapabilitySync = new();
 
@@ -169,6 +176,11 @@ public class TenantBotService
     /// <c>tenant-create:</c> operation, allocating a new <c>:retry:N</c> generation only under a new explicit durable
     /// retry authorization after a definitive rejection.
     /// </param>
+    /// <param name="InteractionTimeouts">
+    /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
+    /// callback acknowledgement is bounded at two seconds. Tests pass millisecond values. This value never affects
+    /// tenant pricing, wallet debit, order fulfillment, or XUI exactly-once semantics.
+    /// </param>
     /// <remarks>The order is scoped to its tenant and reloaded under an order-specific gate. Wallet receipt keys are derived from that durable order identity.</remarks>
     public TenantBotService(
         UserWorkflowStore UserDbContext,
@@ -196,7 +208,8 @@ public class TenantBotService
         ILogger<TenantBotService> Logger,
         XuiV3VolumeReminderStateStore VolumeReminderStateStore,
         XuiV3RenewalOperationStore RenewalOperationStore,
-        TenantProvisioningAttemptCoordinator TenantProvisioningCoordinator)
+        TenantProvisioningAttemptCoordinator TenantProvisioningCoordinator,
+        TelegramInteractionTimeouts InteractionTimeouts = null)
     {
         _workflow = UserDbContext;
         _state = stateStore;
@@ -225,6 +238,7 @@ public class TenantBotService
         _volumeReminderStateStore = VolumeReminderStateStore;
         _renewalOperationStore = RenewalOperationStore;
         _tenantProvisioningCoordinator = TenantProvisioningCoordinator;
+        _interactionTimeouts = InteractionTimeouts ?? TelegramInteractionTimeouts.Production;
     }
 
     /// <summary>
@@ -9450,6 +9464,16 @@ public class TenantBotService
                 CancellationToken));
             if (atlasPayment == null)
             { await botClient.SendTextMessageAsync(ChatId, "فاکتور اطلس‌پی این سفارش پیدا نشد.", cancellationToken: CancellationToken); return; }
+            // Provider-traffic guard: the tenant storefront has no server callback, so each check is a real provider
+            // request. The cooldown uses the last inquiry recorded by any caller, including the background worker, so
+            // repeated taps by the customer cannot produce a burst of AtlasPay requests or mutate financial state.
+            if (AtlasPayManualCheckPolicy.IsWithinCooldown(atlasPayment, _appConfig.AtlasPayManualCheckMinIntervalSeconds,
+                    DateTime.UtcNow, out var waitSeconds))
+            {
+                await botClient.SendTextMessageAsync(ChatId, $"لطفاً {waitSeconds} ثانیه دیگر دوباره بررسی کنید.",
+                    cancellationToken: CancellationToken);
+                return;
+            }
             var settlement = await _atlasPayReconciliation.ReconcilePaymentAsync(atlasPayment.Id, "customer-check", useVerify: true, CancellationToken);
             var latest = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.AsNoTracking().FirstAsync(x => x.Id == atlasPayment.Id, CancellationToken));
             if (settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded)
@@ -11748,7 +11772,7 @@ public class TenantBotService
     {
         await TelegramCallbackAnswerPolicy.TryAnswerAsync(
             botClient, callbackQueryId, text, showAlert, url, cacheTime, cancellationToken,
-            _logger, BotContextAccessor.CurrentBotId);
+            _logger, BotContextAccessor.CurrentBotId, timeout: _interactionTimeouts.CallbackAnswer);
     }
 
     /// <summary>

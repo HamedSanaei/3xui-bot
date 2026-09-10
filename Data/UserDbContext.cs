@@ -281,6 +281,10 @@ public class UserDbContext : DbContext
             entity.Property(x => x.PaymentPurpose).HasMaxLength(64); entity.Property(x => x.CreationState).IsRequired().HasMaxLength(32).HasDefaultValue(AtlasPayCreationStates.Ambiguous);
             entity.Property(x => x.CreationErrorCode).HasMaxLength(128); entity.Property(x => x.SettlementState).IsRequired().HasMaxLength(32).HasDefaultValue(AtlasPaySettlementStates.Pending);
             entity.Property(x => x.SettlementAttemptId).HasMaxLength(64); entity.Property(x => x.ErrorCode).HasMaxLength(128); entity.Property(x => x.ErrorMessage).HasMaxLength(1000);
+            // Automatic reconciliation lifecycle; defaults to active so existing AtlasPay rows keep polling after the migration.
+            entity.Property(x => x.ReconciliationState).IsRequired().HasMaxLength(32).HasDefaultValue(AtlasPayReconciliationStates.Active);
+            // Non-null marks an unresolved payment whose automatic retry budget was consumed, keeping it discoverable instead of stranded.
+            entity.HasIndex(x => new { x.ReconciliationState, x.ReconciliationExhaustedAtUtc });
             entity.HasIndex(x => x.MerchantOrderRef).IsUnique(); entity.HasIndex(x => x.ProviderOrderId).IsUnique().HasFilter("\"ProviderOrderId\" IS NOT NULL");
             entity.HasIndex(x => x.TrackingCode); entity.HasIndex(x => x.TelegramUserId); entity.HasIndex(x => x.BotId);
             entity.HasIndex(x => x.TenantBotOrderId); entity.HasIndex(x => x.ProviderStatus); entity.HasIndex(x => new { x.SettlementState, x.NextInquiryAtUtc });
