@@ -2522,16 +2522,16 @@ public class TelegramBotService
         if (callbackQuery == null || string.IsNullOrWhiteSpace(callbackQuery.Data))
             return;
 
+        if (callbackQuery.Data.StartsWith("gw:", StringComparison.Ordinal))
+        {
+            await ProcessPaymentGatewayCallbackSafelyAsync(callbackQuery, cancellationToken);
+            return;
+        }
+
         try
         {
             if (callbackQuery.Data.Contains("Paid!"))
                 return;
-
-            if (callbackQuery.Data.StartsWith("gw:", StringComparison.Ordinal))
-            {
-                await ProcessPaymentGatewayCallbackAsync(callbackQuery, cancellationToken);
-                return;
-            }
 
             if (callbackQuery.Data.StartsWith("broadcast_status_", StringComparison.Ordinal))
             {
@@ -4668,6 +4668,61 @@ public class TelegramBotService
     /// Authorization is checked independently of the UI route. A stale callback cannot overwrite a newer state, and
     /// enabling a provider with missing credential/URL configuration is rejected by the central service.
     /// </remarks>
+    private async Task ProcessPaymentGatewayCallbackSafelyAsync(
+        CallbackQuery callbackQuery,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await ProcessPaymentGatewayCallbackAsync(callbackQuery, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await LogPaymentGatewayAdminCallbackFailureSafelyAsync(callbackQuery, ex, cancellationToken);
+            try
+            {
+                await ActiveBotClient.AnswerCallbackQueryAsync(
+                    callbackQuery.Id,
+                    "به‌روزرسانی پنل درگاه‌ها انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                    showAlert: true,
+                    cancellationToken: cancellationToken);
+            }
+            catch (Exception answerEx)
+            {
+                _logger.LogWarning("Gateway admin callback failure response could not be delivered. botId={BotId}, errorType={ErrorType}", BotContextAccessor.CurrentBotId, answerEx.GetType().Name);
+            }
+        }
+    }
+
+    private async Task LogPaymentGatewayAdminCallbackFailureSafelyAsync(
+        CallbackQuery callbackQuery, Exception exception, CancellationToken cancellationToken)
+    {
+        var parts = (callbackQuery.Data ?? string.Empty).Split(':');
+        var action = parts.Length >= 4 ? parts[3] : "unknown";
+        try
+        {
+            var credUser = await _credentialsDbContext.GetUserStatus(
+                GetCreduserFromTelegramUser(callbackQuery.From, callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id));
+            await _userActivityLog.LogErrorAsync(
+                "payment_gateway_admin_callback_failed", exception, credUser, IsSuperAdminUser(callbackQuery.From.Id),
+                new Dictionary<string, object>
+                {
+                    ["callbackFamily"] = "gw", ["gatewayAction"] = action,
+                    ["exceptionType"] = exception.GetType().Name,
+                    ["botId"] = BotContextAccessor.CurrentBotId ?? string.Empty
+                }, cancellationToken);
+        }
+        catch (Exception logException)
+        {
+            _logger.LogWarning("Gateway admin callback audit logging failed. botId={BotId}, errorType={ErrorType}", BotContextAccessor.CurrentBotId, logException.GetType().Name);
+        }
+        _logger.LogWarning(exception, "Payment gateway admin callback failed. callbackFamily=gw, gatewayAction={GatewayAction}, botId={BotId}, superAdmin={SuperAdmin}", action, BotContextAccessor.CurrentBotId, IsSuperAdminUser(callbackQuery.From.Id));
+    }
+
     private async Task ProcessPaymentGatewayCallbackAsync(
         CallbackQuery callbackQuery,
         CancellationToken cancellationToken)
@@ -4701,6 +4756,10 @@ public class TelegramBotService
         if (string.Equals(parts[3], "refresh", StringComparison.Ordinal))
         {
             await RefreshPaymentGatewayPanelAsync(callbackQuery, cancellationToken);
+            await ActiveBotClient.AnswerCallbackQueryAsync(
+                callbackQuery.Id,
+                "پنل به‌روزرسانی شد.",
+                cancellationToken: cancellationToken);
             return;
         }
 
@@ -4735,13 +4794,20 @@ public class TelegramBotService
     {
         if (callbackQuery.Message == null)
             return;
-        await ActiveBotClient.EditMessageTextAsync(
-            callbackQuery.Message.Chat.Id,
-            callbackQuery.Message.MessageId,
-            BuildPaymentGatewayPanelText(),
-            parseMode: ParseMode.Html,
-            replyMarkup: BuildPaymentGatewayPanelMarkup(),
-            cancellationToken: cancellationToken);
+        try
+        {
+            await ActiveBotClient.EditMessageTextAsync(
+                callbackQuery.Message.Chat.Id,
+                callbackQuery.Message.MessageId,
+                BuildPaymentGatewayPanelText(),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildPaymentGatewayPanelMarkup(),
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (TenantBotService.ISTELEGRAMMESSAGENOTMODIFIED(ex.ErrorCode, ex.Message))
+        {
+            // Telegram already displays the requested gateway panel; this is semantic success.
+        }
     }
 
     /// <summary>Maps a gateway enum to a short callback-safe key.</summary>
