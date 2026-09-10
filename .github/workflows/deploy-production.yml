@@ -57,7 +57,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           for required in PROD_HOST PROD_PORT PROD_USER PROD_SSH_KEY PROD_KNOWN_HOSTS; do
-            [[ -n "${!required:-}" ]] || { echo "Missing required GitHub secret: $required" >&2; exit 64; }          done
+            [[ -n "${!required:-}" ]] || { echo "Missing required GitHub secret: $required" >&2; exit 64; }
+          done
           install -d -m 700 "$HOME/.ssh"
           umask 077
           printf '%s\n' "$PROD_SSH_KEY" > "$RUNNER_TEMP/prod_deploy_key"
@@ -85,7 +86,8 @@ jobs:
             fi
             [[ -n "$key_value" ]] || { echo "PROD_KNOWN_HOSTS contains an incomplete key line." >&2; exit 64; }
             printf '%s %s %s\n' "$target_known_host" "$key_type" "$key_value" >> "$HOME/.ssh/known_hosts"
-            parsed_keys=$((parsed_keys + 1))          done < "$raw_known_hosts"
+            parsed_keys=$((parsed_keys + 1))
+          done < "$raw_known_hosts"
           [[ "$parsed_keys" -gt 0 ]] || { echo "PROD_KNOWN_HOSTS contains no usable host key." >&2; exit 64; }
           chmod 600 "$HOME/.ssh/known_hosts"
           rm -f -- "$raw_known_hosts"
