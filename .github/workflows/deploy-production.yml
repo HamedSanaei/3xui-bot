@@ -57,13 +57,42 @@ jobs:
         run: |
           set -Eeuo pipefail
           for required in PROD_HOST PROD_PORT PROD_USER PROD_SSH_KEY PROD_KNOWN_HOSTS; do
-            [[ -n "${!required:-}" ]] || { echo "Missing required GitHub secret: $required" >&2; exit 64; }
-          done
+            [[ -n "${!required:-}" ]] || { echo "Missing required GitHub secret: $required" >&2; exit 64; }          done
           install -d -m 700 "$HOME/.ssh"
           umask 077
           printf '%s\n' "$PROD_SSH_KEY" > "$RUNNER_TEMP/prod_deploy_key"
           chmod 600 "$RUNNER_TEMP/prod_deploy_key"
-          printf '%s\n' "$PROD_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+
+          raw_known_hosts="$RUNNER_TEMP/prod_known_hosts_raw"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" > "$raw_known_hosts"
+          target_known_host="$PROD_HOST"
+          if [[ "$PROD_PORT" != "22" ]]; then
+            target_known_host="[$PROD_HOST]:$PROD_PORT"
+          fi
+          : > "$HOME/.ssh/known_hosts"
+          parsed_keys=0
+          while read -r first second third _; do
+            [[ -z "${first:-}" || "$first" == \#* ]] && continue
+            if [[ "$first" == ssh-* || "$first" == ecdsa-* || "$first" == sk-* ]]; then
+              key_type="$first"
+              key_value="${second:-}"
+            elif [[ "$second" == ssh-* || "$second" == ecdsa-* || "$second" == sk-* ]]; then
+              key_type="$second"
+              key_value="${third:-}"
+            else
+              echo "PROD_KNOWN_HOSTS contains an unsupported line format." >&2
+              exit 64
+            fi
+            [[ -n "$key_value" ]] || { echo "PROD_KNOWN_HOSTS contains an incomplete key line." >&2; exit 64; }
+            printf '%s %s %s\n' "$target_known_host" "$key_type" "$key_value" >> "$HOME/.ssh/known_hosts"
+            parsed_keys=$((parsed_keys + 1))          done < "$raw_known_hosts"
+          [[ "$parsed_keys" -gt 0 ]] || { echo "PROD_KNOWN_HOSTS contains no usable host key." >&2; exit 64; }
+          chmod 600 "$HOME/.ssh/known_hosts"
+          rm -f -- "$raw_known_hosts"
+          ssh-keygen -F "$target_known_host" -f "$HOME/.ssh/known_hosts" >/dev/null || {
+            echo "Normalized production host key entry could not be verified." >&2
+            exit 64
+          }
 
       - name: Deploy exact pushed commit
         shell: bash
@@ -89,4 +118,4 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -f -- "$RUNNER_TEMP/prod_deploy_key"
+          rm -f -- "$RUNNER_TEMP/prod_deploy_key" "$RUNNER_TEMP/prod_known_hosts_raw"
