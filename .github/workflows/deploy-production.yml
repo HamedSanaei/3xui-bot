@@ -1,0 +1,92 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  REPO_URL: https://github.com/HamedSanaei/3xui-bot.git
+  DEPLOY_PATH: /root/vpnetiran
+  SERVICE_NAME: vpnetiranbot.service
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    name: Deploy Production
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Validate deployment scripts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n scripts/deploy-production.sh
+          bash -n scripts/deploy-production.tests.sh
+          bash scripts/deploy-production.tests.sh
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/deploy-production.sh scripts/deploy-production.tests.sh
+          else
+            echo "shellcheck is not installed on this runner; syntax and preservation tests already passed."
+          fi
+
+      - name: Configure production SSH
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          for required in PROD_HOST PROD_PORT PROD_USER PROD_SSH_KEY PROD_KNOWN_HOSTS; do
+            [[ -n "${!required:-}" ]] || { echo "Missing required GitHub secret: $required" >&2; exit 64; }
+          done
+          install -d -m 700 "$HOME/.ssh"
+          umask 077
+          printf '%s\n' "$PROD_SSH_KEY" > "$RUNNER_TEMP/prod_deploy_key"
+          chmod 600 "$RUNNER_TEMP/prod_deploy_key"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+
+      - name: Deploy exact pushed commit
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+        run: |
+          set -Eeuo pipefail
+          remote_cmd="$(printf 'bash -s -- %q %q %q %q %q %q' \
+            "$GITHUB_SHA" "$REPO_URL" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$DEPLOY_PATH" "$SERVICE_NAME")"
+          ssh \
+            -i "$RUNNER_TEMP/prod_deploy_key" \
+            -p "$PROD_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -- "$PROD_USER@$PROD_HOST" "$remote_cmd" \
+            < scripts/deploy-production.sh
+
+      - name: Remove temporary SSH key
+        if: always()
+        shell: bash
+        run: |
+          rm -f -- "$RUNNER_TEMP/prod_deploy_key"
