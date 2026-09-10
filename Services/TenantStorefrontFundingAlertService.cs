@@ -71,32 +71,45 @@ public sealed class TenantStorefrontFundingAlertService
             }
 
             var transition = !state.IsUnderfunded;
+            var transitionAlertQueued = false;
+            var customerAlertQueued = false;
             if (transition)
             {
                 state.IsUnderfunded = true;
                 state.EpisodeNumber++;
                 state.UnderfundedSinceUtc = now;
                 state.UnderfundedEpisodeNotifiedAtUtc = now;
-                db.TenantStorefrontFundingAlerts.Add(BuildAlert(tenant, evaluation,
-                    TenantStorefrontFundingAlertKinds.UnderfundedTransition, state.EpisodeNumber,
-                    $"tenant-funding:{tenant.Id}:episode:{state.EpisodeNumber}:transition", now));
+                if (customerAttempt)
+                {
+                    state.LastCustomerAttemptAlertAtUtc = now;
+                    db.TenantStorefrontFundingAlerts.Add(BuildAlert(tenant, evaluation,
+                        TenantStorefrontFundingAlertKinds.CustomerAttempt, state.EpisodeNumber,
+                        $"tenant-funding:{tenant.Id}:episode:{state.EpisodeNumber}:customer-entry", now));
+                    customerAlertQueued = true;
+                }
+                else
+                {
+                    db.TenantStorefrontFundingAlerts.Add(BuildAlert(tenant, evaluation,
+                        TenantStorefrontFundingAlertKinds.UnderfundedTransition, state.EpisodeNumber,
+                        $"tenant-funding:{tenant.Id}:episode:{state.EpisodeNumber}:transition", now));
+                    transitionAlertQueued = true;
+                }
             }
-
-            var attempt = customerAttempt &&
-                (!state.LastCustomerAttemptAlertAtUtc.HasValue ||
-                 state.LastCustomerAttemptAlertAtUtc.Value <= now.AddMinutes(-_cooldownMinutes));
-            if (attempt)
+            else if (customerAttempt &&
+                     (!state.LastCustomerAttemptAlertAtUtc.HasValue ||
+                      state.LastCustomerAttemptAlertAtUtc.Value <= now.AddMinutes(-_cooldownMinutes)))
             {
                 state.LastCustomerAttemptAlertAtUtc = now;
                 db.TenantStorefrontFundingAlerts.Add(BuildAlert(tenant, evaluation,
                     TenantStorefrontFundingAlertKinds.CustomerAttempt, state.EpisodeNumber,
                     $"tenant-funding:{tenant.Id}:attempt:{now.Ticks}", now));
+                customerAlertQueued = true;
             }
 
             ApplySnapshot(state, evaluation, now);
             await db.SaveChangesAsync(ct);
             await transaction.CommitAsync(ct);
-            return (transition, attempt);
+            return (transitionAlertQueued, customerAlertQueued);
         }, cancellationToken);
 
         if (queued.Item1)

@@ -15,6 +15,7 @@ public sealed class TenantStorefrontFundingMonitorHostedService : BackgroundServ
 {
     private const int MaximumStorefrontsPerCycle = 20;
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly bool _enabled;
     private readonly int _intervalMinutes;
     private readonly ILogger<TenantStorefrontFundingMonitorHostedService> _logger;
     private readonly SemaphoreSlim _cycleGuard = new(1, 1);
@@ -35,6 +36,7 @@ public sealed class TenantStorefrontFundingMonitorHostedService : BackgroundServ
         ILogger<TenantStorefrontFundingMonitorHostedService> logger)
     {
         _scopeFactory = scopeFactory;
+        _enabled = appConfig.TenantStorefrontFundingMonitorEnabled;
         _intervalMinutes = appConfig.TenantStorefrontFundingMonitorIntervalMinutes;
         _logger = logger;
     }
@@ -47,6 +49,11 @@ public sealed class TenantStorefrontFundingMonitorHostedService : BackgroundServ
     /// </remarks>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (!_enabled)
+        {
+            _logger.LogInformation("Tenant storefront background funding monitor is disabled.");
+            return;
+        }
         while (!stoppingToken.IsCancellationRequested)
         {
             await RunCycleGuardedAsync(stoppingToken);
@@ -57,6 +64,7 @@ public sealed class TenantStorefrontFundingMonitorHostedService : BackgroundServ
 
     internal async Task RunCycleGuardedAsync(CancellationToken cancellationToken)
     {
+        if (!_enabled) return;
         if (!await _cycleGuard.WaitAsync(0, cancellationToken))
         {
             _logger.LogInformation("Tenant storefront funding monitor cycle skipped because the previous cycle is still running.");

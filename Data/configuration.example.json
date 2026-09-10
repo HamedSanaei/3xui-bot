@@ -6,6 +6,7 @@
   "tenantMinimumSiteWalletToman": 200000,
   "tenantUnderfundedCustomerAttemptNotificationCooldownMinutes": 15,
   "tenantStorefrontFundingAlertRetentionDays": 30,
+  "tenantStorefrontFundingMonitorEnabled": true,
   "tenantStorefrontFundingMonitorIntervalMinutes": 5,
   "bots": [
     {

@@ -74,14 +74,18 @@ public sealed partial class ConcurrencyTests
         var underfunded = FundingEvaluation(TenantAccessDecision.InsufficientFunding, 0, 50_000, true, 200_000);
         var service = FundingAlertService(databases, configuration);
 
-        await service.ObserveAsync(tenant, underfunded, true, true, default);
         await Task.WhenAll(Enumerable.Range(0, 20).Select(_ =>
             FundingAlertService(databases, configuration).ObserveAsync(tenant, underfunded, true, true, default)));
 
         await using (var db = databases.Users.CreateDbContext())
         {
-            Assert.Equal(1, await db.TenantStorefrontFundingAlerts.CountAsync(x => x.Kind == TenantStorefrontFundingAlertKinds.CustomerAttempt));
+            var first = Assert.Single(await db.TenantStorefrontFundingAlerts.ToListAsync());
+            Assert.Equal(TenantStorefrontFundingAlertKinds.CustomerAttempt, first.Kind);
+            Assert.Equal($"tenant-funding:{tenant.Id}:episode:1:customer-entry", first.BusinessKey);
             var state = await db.TenantStorefrontFundingAlertStates.SingleAsync(x => x.TenantBotId == tenant.Id);
+            Assert.Equal(1, state.EpisodeNumber);
+            Assert.NotNull(state.UnderfundedEpisodeNotifiedAtUtc);
+            Assert.NotNull(state.LastCustomerAttemptAlertAtUtc);
             state.LastCustomerAttemptAlertAtUtc = DateTime.UtcNow.AddMinutes(-16);
             await db.SaveChangesAsync();
         }
@@ -89,6 +93,26 @@ public sealed partial class ConcurrencyTests
         await service.ObserveAsync(tenant, underfunded, true, true, default);
         await using var verify = databases.Users.CreateDbContext();
         Assert.Equal(2, await verify.TenantStorefrontFundingAlerts.CountAsync(x => x.Kind == TenantStorefrontFundingAlertKinds.CustomerAttempt));
+        Assert.Equal(0, await verify.TenantStorefrontFundingAlerts.CountAsync(x => x.Kind == TenantStorefrontFundingAlertKinds.UnderfundedTransition));
+    }
+
+    [Fact]
+    public async Task Customer_triggered_recovery_starts_new_episode_with_one_customer_entry_alert()
+    {
+        using var databases = new Databases();
+        var service = FundingAlertService(databases, FundingConfiguration());
+        var tenant = FundingTenant("tenant-customer-recovery");
+        var underfunded = FundingEvaluation(TenantAccessDecision.InsufficientFunding, 0, 50_000, true, 200_000);
+        var allowed = FundingEvaluation(TenantAccessDecision.Allowed, 10_000, 50_000, true, 200_000);
+        await service.ObserveAsync(tenant, underfunded, true, true, default);
+        await service.ObserveAsync(tenant, allowed, false, true, default);
+        await service.ObserveAsync(tenant, underfunded, true, true, default);
+        await using var db = databases.Users.CreateDbContext();
+        var alerts = await db.TenantStorefrontFundingAlerts.OrderBy(x => x.EpisodeNumber).ToListAsync();
+        Assert.Equal(2, alerts.Count);
+        Assert.All(alerts, x => Assert.Equal(TenantStorefrontFundingAlertKinds.CustomerAttempt, x.Kind));
+        Assert.Equal(new[] { 1, 2 }, alerts.Select(x => x.EpisodeNumber));
+        Assert.Equal(2, (await db.TenantStorefrontFundingAlertStates.SingleAsync()).EpisodeNumber);
     }
 
     [Fact]
@@ -149,10 +173,10 @@ public sealed partial class ConcurrencyTests
     }
 
     [Fact]
-    public async Task Customer_underfunded_storefront_returns_promptly_and_queues_both_alert_reasons()
+    public async Task Monitor_disabled_customer_underfunded_storefront_queues_one_immediate_customer_alert()
     {
         using var databases = new Databases();
-        var (provider, registry, clients) = IncidentProvider(databases);
+        var (provider, registry, clients) = IncidentProvider(databases, fundingMonitorEnabled: false);
         await using (provider)
         {
             var tenant = FundingTenant("tenant-customer-lane");
@@ -175,8 +199,9 @@ public sealed partial class ConcurrencyTests
             }
             Assert.Contains(clients[tenant.Id].Texts, x => x.Contains(TenantAccessService.DebtMessage, StringComparison.Ordinal));
             await using var verify = databases.Users.CreateDbContext();
-            Assert.Equal(1, await verify.TenantStorefrontFundingAlerts.CountAsync(x => x.Kind == TenantStorefrontFundingAlertKinds.UnderfundedTransition));
-            Assert.Equal(1, await verify.TenantStorefrontFundingAlerts.CountAsync(x => x.Kind == TenantStorefrontFundingAlertKinds.CustomerAttempt));
+            var alert = Assert.Single(await verify.TenantStorefrontFundingAlerts.ToListAsync());
+            Assert.Equal(TenantStorefrontFundingAlertKinds.CustomerAttempt, alert.Kind);
+            Assert.Equal($"tenant-funding:{tenant.Id}:episode:1:customer-entry", alert.BusinessKey);
         }
     }
 
@@ -239,6 +264,27 @@ public sealed partial class ConcurrencyTests
             sender.Release.TrySetResult();
             Assert.Equal(1, await delivery.WaitAsync(TimeSpan.FromSeconds(5)));
         }
+    }
+
+    [Fact]
+    public async Task First_customer_underfunded_event_delivers_exactly_one_customer_attempt_alert()
+    {
+        using var databases = new Databases();
+        var service = FundingAlertService(databases, FundingConfiguration());
+        var tenant = FundingTenant("tenant-first-customer-delivery");
+        await service.ObserveAsync(tenant,
+            FundingEvaluation(TenantAccessDecision.InsufficientFunding, 0, 10_000, true, 200_000),
+            customerAttempt: true, allowUnderfundedAlerts: true, default);
+        var sender = new CountingFundingAlertSender();
+        var worker = new TenantStorefrontFundingAlertWorker(databases.Users, sender,
+            NullLogger<TenantStorefrontFundingAlertWorker>.Instance);
+        Assert.Equal(1, await worker.ProcessOnceAsync());
+        Assert.Equal(1, sender.Count);
+        await using var db = databases.Users.CreateDbContext();
+        var row = Assert.Single(await db.TenantStorefrontFundingAlerts.ToListAsync());
+        Assert.Equal(TenantStorefrontFundingAlertKinds.CustomerAttempt, row.Kind);
+        Assert.Equal(TenantStorefrontFundingAlertStatuses.Delivered, row.Status);
+        Assert.Contains("یک مشتری", TenantStorefrontFundingAlertDeliveryService.BuildMessage(row));
     }
 
     [Fact]
@@ -350,6 +396,22 @@ public sealed partial class ConcurrencyTests
     }
 
     [Fact]
+    public async Task Monitor_disabled_does_not_disable_post_settlement_transition_observation()
+    {
+        using var databases = new Databases();
+        var service = FundingAlertService(databases,
+            FundingConfiguration(monitorEnabled: false, monitorInterval: 0));
+        var tenant = FundingTenant("tenant-disabled-monitor-settlement");
+        var before = FundingEvaluation(TenantAccessDecision.Allowed, 0, 300_000, true, 200_000);
+        var after = FundingEvaluation(TenantAccessDecision.InsufficientFunding, 0, 50_000, true, 200_000);
+        await service.ObserveSettlementAsync(tenant, before, after, default);
+        await using var db = databases.Users.CreateDbContext();
+        var alert = Assert.Single(await db.TenantStorefrontFundingAlerts.ToListAsync());
+        Assert.Equal(TenantStorefrontFundingAlertKinds.UnderfundedTransition, alert.Kind);
+        Assert.Equal(1, alert.EpisodeNumber);
+    }
+
+    [Fact]
     public void Funding_alert_cooldown_configuration_is_positive_and_validated()
     {
         Assert.Equal(15, new AppConfig().TenantUnderfundedCustomerAttemptNotificationCooldownMinutes);
@@ -360,11 +422,14 @@ public sealed partial class ConcurrencyTests
         validator.Invoke(null, new object[] { new AppConfig { TenantUnderfundedCustomerAttemptNotificationCooldownMinutes = 15 } });
     }
 
-    private static IConfiguration FundingConfiguration(long minimum = 200_000, int cooldown = 15) =>
+    private static IConfiguration FundingConfiguration(long minimum = 200_000, int cooldown = 15,
+        bool monitorEnabled = true, int monitorInterval = 5) =>
         new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["tenantMinimumSiteWalletToman"] = minimum.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["tenantUnderfundedCustomerAttemptNotificationCooldownMinutes"] = cooldown.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["tenantStorefrontFundingMonitorEnabled"] = monitorEnabled.ToString(),
+            ["tenantStorefrontFundingMonitorIntervalMinutes"] = monitorInterval.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["gozargahSiteSyncEnabled"] = "false", ["gozargahSiteWalletPaymentsEnabled"] = "false"
         }).Build();
 

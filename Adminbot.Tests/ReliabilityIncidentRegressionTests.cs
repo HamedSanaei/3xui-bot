@@ -319,9 +319,18 @@ public sealed partial class ConcurrencyTests
     }
 
     private static (ServiceProvider Provider, BotRegistry Registry, ConcurrentDictionary<string, StorefrontClient> Clients)
-        IncidentProvider(Databases databases)
+        IncidentProvider(Databases databases, bool? fundingMonitorEnabled = null)
     {
-        var configuration = IncidentConfiguration();
+        IConfiguration configuration = IncidentConfiguration();
+        if (fundingMonitorEnabled.HasValue)
+        {
+            configuration = new ConfigurationBuilder().AddConfiguration(configuration)
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["tenantStorefrontFundingMonitorEnabled"] = fundingMonitorEnabled.Value.ToString(),
+                    ["tenantStorefrontFundingMonitorIntervalMinutes"] = fundingMonitorEnabled.Value ? "5" : "0"
+                }).Build();
+        }
         var appConfig = configuration.Get<AppConfig>()!;
         appConfig.UserDatabasePath = Path.Combine(databases.DirectoryPath, "users.db");
         appConfig.CredentialsDatabasePath = Path.Combine(databases.DirectoryPath, "credentials.db");

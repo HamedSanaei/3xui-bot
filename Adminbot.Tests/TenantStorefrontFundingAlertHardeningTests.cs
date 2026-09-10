@@ -320,7 +320,7 @@ public sealed partial class ConcurrencyTests
 
         await using (var verify = databases.Users.CreateDbContext())
         {
-            Assert.Equal(2, await verify.TenantStorefrontFundingAlerts.CountAsync(x => x.Status == TenantStorefrontFundingAlertStatuses.Cancelled));
+            Assert.Equal(1, await verify.TenantStorefrontFundingAlerts.CountAsync(x => x.Status == TenantStorefrontFundingAlertStatuses.Cancelled));
             Assert.Empty(await verify.TenantStorefrontFundingAlerts.Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Pending).ToListAsync());
             Assert.False((await verify.TenantStorefrontFundingAlertStates.SingleAsync()).IsUnderfunded);
         }
@@ -514,18 +514,43 @@ public sealed partial class ConcurrencyTests
     }
 
     [Fact]
+    public async Task Disabled_background_monitor_performs_no_scope_resolution_or_polling()
+    {
+        var scopeFactory = new CountingThrowingScopeFactory();
+        var monitor = new TenantStorefrontFundingMonitorHostedService(scopeFactory,
+            new AppConfig { TenantStorefrontFundingMonitorEnabled = false, TenantStorefrontFundingMonitorIntervalMinutes = 0 },
+            NullLogger<TenantStorefrontFundingMonitorHostedService>.Instance);
+        await monitor.StartAsync(default);
+        await monitor.StopAsync(default);
+        Assert.Equal(0, scopeFactory.CreateScopeCalls);
+    }
+
+    [Fact]
     public void Funding_alert_retention_and_monitor_interval_are_validated()
     {
         Assert.Equal(30, new AppConfig().TenantStorefrontFundingAlertRetentionDays);
+        Assert.True(new AppConfig().TenantStorefrontFundingMonitorEnabled);
         Assert.Equal(5, new AppConfig().TenantStorefrontFundingMonitorIntervalMinutes);
         var validator = typeof(Program).GetMethod("ValidateTenantStorefrontConfiguration", BindingFlags.Static | BindingFlags.NonPublic)!;
         var thrown = Assert.Throws<TargetInvocationException>(() => validator.Invoke(null,
             new object[] { new AppConfig { TenantStorefrontFundingAlertRetentionDays = 0 } }));
         Assert.IsType<InvalidOperationException>(thrown.InnerException);
         var thrownInterval = Assert.Throws<TargetInvocationException>(() => validator.Invoke(null,
-            new object[] { new AppConfig { TenantStorefrontFundingMonitorIntervalMinutes = 0 } }));
+            new object[] { new AppConfig { TenantStorefrontFundingMonitorEnabled = true, TenantStorefrontFundingMonitorIntervalMinutes = 0 } }));
         Assert.IsType<InvalidOperationException>(thrownInterval.InnerException);
+        validator.Invoke(null, new object[] { new AppConfig { TenantStorefrontFundingMonitorEnabled = false, TenantStorefrontFundingMonitorIntervalMinutes = 0 } });
         validator.Invoke(null, new object[] { new AppConfig() });
+    }
+
+    private sealed class CountingThrowingScopeFactory : IServiceScopeFactory
+    {
+        private int _createScopeCalls;
+        public int CreateScopeCalls => Volatile.Read(ref _createScopeCalls);
+        public IServiceScope CreateScope()
+        {
+            Interlocked.Increment(ref _createScopeCalls);
+            throw new InvalidOperationException("disabled monitor must not resolve a scope");
+        }
     }
 
     private static async Task InsertAlertRowAsync(Databases databases, BotInstance tenant, TenantStorefrontFundingAlert alert)

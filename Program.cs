@@ -496,7 +496,7 @@ public class Program
             throw new InvalidOperationException(
                 $"Configuration value '{nameof(appConfig.TenantStorefrontFundingAlertRetentionDays)}' must be positive; actual value is {appConfig.TenantStorefrontFundingAlertRetentionDays}.");
         }
-        if (appConfig.TenantStorefrontFundingMonitorIntervalMinutes <= 0)
+        if (appConfig.TenantStorefrontFundingMonitorEnabled && appConfig.TenantStorefrontFundingMonitorIntervalMinutes <= 0)
         {
             throw new InvalidOperationException(
                 $"Configuration value '{nameof(appConfig.TenantStorefrontFundingMonitorIntervalMinutes)}' must be positive; actual value is {appConfig.TenantStorefrontFundingMonitorIntervalMinutes}.");

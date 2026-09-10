@@ -48,6 +48,7 @@ namespace Adminbot.Domain
         /// Must be positive; the default is 5. Each cycle performs at most one read-only website wallet lookup per
         /// storefront owner and never mutates wallets, debt transfers, orders, payments, or XUI state.
         /// </remarks>
+        public bool TenantStorefrontFundingMonitorEnabled { get; set; } = true;
         public int TenantStorefrontFundingMonitorIntervalMinutes { get; set; } = 5;
         public BotInstanceConfig SalesAssistantBot { get; set; } = new();
         public string BotToken { get; set; }
