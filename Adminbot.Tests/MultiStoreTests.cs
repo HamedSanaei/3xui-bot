@@ -70,9 +70,17 @@ public sealed partial class ConcurrencyTests
                 TenantMandatoryJoinEnabled, TenantCardPaymentEnabled, TenantHooshPayEnabled, TenantNowPaymentsEnabled, CreatedAtUtc)
             VALUES ('tenant-711', 'tenant', 711, 0, 0, 23, 0, 0, 1, 1, '2025-01-01 00:00:00');
             """);
-        users.TenantBotOrders.Add(new TenantBotOrder { OrderId = "legacy-pending-settlement", TenantBotId = "tenant-711", OwnerTelegramUserId = 711,
-            PaymentProvider = "tenant_card", BaseCostToman = 500, CreatedAccountEmail = "legacy-created" });
-        await users.SaveChangesAsync();
+        // The legacy order must be inserted with only the columns that existed at this intermediate migration.
+        // Using the current EF model here would also write later columns such as AtlasPayPaymentInfoId that the
+        // intermediate schema does not have yet.
+        await users.Database.ExecuteSqlRawAsync("""
+            INSERT INTO TenantBotOrders (OrderId, TenantBotId, OwnerTelegramUserId, CustomerTelegramUserId,
+                CustomerChatId, AccountCount, IsFulfilled, IsOwnerCredited, OwnerWalletDelta,
+                PaymentProvider, PaymentStatus, SalePriceToman, BaseCostToman, ProfitToman,
+                CreatedAccountEmail, CreatedAtUtc)
+            VALUES ('legacy-pending-settlement', 'tenant-711', 711, 0, 0, 1, 0, 0, 0,
+                'tenant_card', 'pending', 0, 500, 0, 'legacy-created', '2025-01-01 00:00:00');
+            """);
         await users.Database.MigrateAsync();
         var old = await users.BotInstances.AsNoTracking().SingleAsync(x => x.Id == "tenant-711");
         Assert.Equal("tenant-711", old.Id); Assert.Equal(1, old.TenantStoreNumber); Assert.Equal(23, old.TenantPriceMarkupPercent);

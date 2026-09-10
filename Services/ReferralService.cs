@@ -334,6 +334,7 @@ public sealed class ReferralService
         "hooshpay",
         "tetraminator",
         "uniquepay",
+        "atlaspay",
         "zibal"
     };
     /// <summary>
@@ -1328,6 +1329,11 @@ public sealed class ReferralReconciliationHostedService : BackgroundService
                 .Where(x => x.IsAddedToBalance &&
                             x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge)
                 .ToListAsync(cancellationToken);
+            var atlasPay = await context.AtlasPayPaymentInfos
+                .AsNoTracking()
+                .Where(x => x.IsAddedToBalance &&
+                            x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge)
+                .ToListAsync(cancellationToken);
             var zibal = await context.ZibalPaymentInfos
                 .AsNoTracking()
                 .Where(x => x.IsAddedToBallance && x.IsPaid)
@@ -1375,6 +1381,13 @@ public sealed class ReferralReconciliationHostedService : BackgroundService
                         true,
                         true,
                         false)))
+                .Concat(atlasPay
+                    .Where(x => AtlasPayStatuses.IsSuccess(x.ProviderStatus) && !x.RequiresManualDelivery && IsOwnedBotId(x.BotId, ownedBotIds))
+                    .Select(x => new ReferralPaymentSource(
+                        "atlaspay", TenantBotPaymentPurposes.WalletCharge,
+                        x.ProviderOrderId?.ToString(CultureInfo.InvariantCulture) ?? x.MerchantOrderRef,
+                        NormalizeOwnedBotId(x.BotId), BotInstanceTypes.Owned, x.TelegramUserId, x.BaseAmountToman,
+                        x.SettledAtUtc ?? x.PaidAtUtc ?? x.CreatedAtUtc, true, true, false)))
                 .Concat(zibal
                     .Where(x => IsOwnedBotId(x.BotId, ownedBotIds))
                     .Select(x => new ReferralPaymentSource(

@@ -91,6 +91,7 @@ public class UserDbContext : DbContext
     public DbSet<TetraminatorPaymentInfo> TetraminatorPaymentInfos { get; set; }
     /// <summary>Persisted UniquePay invoices and polling/settlement audit state for owned and tenant payments.</summary>
     public DbSet<UniquePayPaymentInfo> UniquePayPaymentInfos { get; set; }
+    public DbSet<AtlasPayPaymentInfo> AtlasPayPaymentInfos { get; set; }
     /// <summary>
     /// Durable, independently retried Telegram notifications created by first-time owned-wallet settlements.
     /// </summary>
@@ -270,6 +271,21 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => new { x.IsAddedToBalance, x.SettlementState, x.NextInquiryAtUtc });
         });
 
+        modelBuilder.Entity<AtlasPayPaymentInfo>(entity =>
+        {
+            entity.ToTable("AtlasPayPaymentInfos"); entity.HasKey(x => x.Id); entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.MerchantOrderRef).IsRequired().HasMaxLength(180);
+            entity.Property(x => x.TrackingCode).HasMaxLength(180); entity.Property(x => x.CustomerStartLink).HasMaxLength(1024);
+            entity.Property(x => x.CardNumberMasked).HasMaxLength(64); entity.Property(x => x.ProviderStatus).HasMaxLength(64);
+            entity.Property(x => x.BotId).HasMaxLength(64); entity.Property(x => x.BotUsername).HasMaxLength(128);
+            entity.Property(x => x.PaymentPurpose).HasMaxLength(64); entity.Property(x => x.CreationState).IsRequired().HasMaxLength(32).HasDefaultValue(AtlasPayCreationStates.Ambiguous);
+            entity.Property(x => x.CreationErrorCode).HasMaxLength(128); entity.Property(x => x.SettlementState).IsRequired().HasMaxLength(32).HasDefaultValue(AtlasPaySettlementStates.Pending);
+            entity.Property(x => x.SettlementAttemptId).HasMaxLength(64); entity.Property(x => x.ErrorCode).HasMaxLength(128); entity.Property(x => x.ErrorMessage).HasMaxLength(1000);
+            entity.HasIndex(x => x.MerchantOrderRef).IsUnique(); entity.HasIndex(x => x.ProviderOrderId).IsUnique().HasFilter("\"ProviderOrderId\" IS NOT NULL");
+            entity.HasIndex(x => x.TrackingCode); entity.HasIndex(x => x.TelegramUserId); entity.HasIndex(x => x.BotId);
+            entity.HasIndex(x => x.TenantBotOrderId); entity.HasIndex(x => x.ProviderStatus); entity.HasIndex(x => new { x.SettlementState, x.NextInquiryAtUtc });
+        });
+
         modelBuilder.Entity<PaymentSettlementNotification>(entity =>
         {
             entity.ToTable("PaymentSettlementNotifications");
@@ -308,6 +324,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantTutorialsJson);
             entity.Property(x => x.TenantTetraminatorEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantUniquePayEnabled).HasDefaultValue(true);
+            entity.Property(x => x.TenantAtlasPayEnabled).HasDefaultValue(true);
             entity.HasIndex(x => x.Username);
             entity.HasIndex(x => x.OwnerTelegramUserId);
             // Existing tenant ids stay unchanged; the owner/number pair is the stable management identity.
@@ -353,6 +370,7 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.HooshPayPaymentInfoId);
             entity.HasIndex(x => x.TetraminatorPaymentInfoId);
             entity.HasIndex(x => x.UniquePayPaymentInfoId);
+            entity.HasIndex(x => x.AtlasPayPaymentInfoId);
         });
 
         modelBuilder.Entity<TenantBotLedgerEntry>(entity =>

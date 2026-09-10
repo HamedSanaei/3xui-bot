@@ -119,6 +119,8 @@ public class TelegramBotService
     /// <summary>Owned-wallet UniquePay action label with its displayed gateway fee.</summary>
     private const string UniquePayGatewayAction = "⚡ یونیک‌پی آنی | کارمزد ۱۲٪";
 
+    private const string AtlasPayGatewayAction = "💳 اطلس‌پی | کارت‌به‌کارت آنی";
+
     /// <summary>Owned-wallet NOWPayments action label with its displayed zero-fee policy.</summary>
     private const string CryptoGatewayAction = "⚡ ارز دیجیتال آنی | کارمزد ۰٪";
 
@@ -147,6 +149,8 @@ public class TelegramBotService
     private readonly TetraminatorSettlementService _tetraminatorSettlementService;
     private readonly UniquePay _uniquePay;
     private readonly UniquePayReconciliationHostedService _uniquePayReconciliation;
+    private readonly AtlasPay _atlasPay;
+    private readonly AtlasPayReconciliationHostedService _atlasPayReconciliation;
     private readonly IPaymentGatewayAvailability _gatewayAvailability;
     private readonly XuiV3PurchaseService _xuiV3PurchaseService;
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
@@ -288,6 +292,8 @@ public class TelegramBotService
         TetraminatorSettlementService tetraminatorSettlementService,
         UniquePay uniquePay,
         UniquePayReconciliationHostedService uniquePayReconciliation,
+        AtlasPay atlasPay,
+        AtlasPayReconciliationHostedService atlasPayReconciliation,
         IPaymentGatewayAvailability gatewayAvailability,
         XuiV3PurchaseService xuiV3PurchaseService,
         XuiV3BotFlowService xuiV3BotFlowService,
@@ -323,6 +329,8 @@ public class TelegramBotService
         _tetraminatorSettlementService = tetraminatorSettlementService;
         _uniquePay = uniquePay;
         _uniquePayReconciliation = uniquePayReconciliation;
+        _atlasPay = atlasPay;
+        _atlasPayReconciliation = atlasPayReconciliation;
         _gatewayAvailability = gatewayAvailability;
         _xuiV3PurchaseService = xuiV3PurchaseService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
@@ -2568,6 +2576,12 @@ public class TelegramBotService
                 return;
             }
 
+            if (callbackQuery.Data.StartsWith("apchk_", StringComparison.Ordinal))
+            {
+                await ProcessAtlasPayPaymentCallbackAsync(callbackQuery, cancellationToken);
+                return;
+            }
+
             if (callbackQuery.Data.StartsWith("settle_crypto_partial_"))
             {
                 await ProcessCryptoPartialSettlementCallback(callbackQuery, cancellationToken);
@@ -4586,6 +4600,7 @@ public class TelegramBotService
         AppendGatewayPanelLine(builder, PaymentGateway.HooshPay, "هوش‌پی", "hooshPayEnabled", snapshot);
         AppendGatewayPanelLine(builder, PaymentGateway.Tetraminator, "تترامیناتور", "tetraminatorEnabled", snapshot);
         AppendGatewayPanelLine(builder, PaymentGateway.UniquePay, "یونیک‌پی", "uniquePayEnabled", snapshot);
+        AppendGatewayPanelLine(builder, PaymentGateway.AtlasPay, "اطلس‌پی", "atlasPayEnabled", snapshot);
         AppendGatewayPanelLine(builder, PaymentGateway.NowPayments, "NOWPayments", "nowPaymentsEnabled", snapshot);
         builder.AppendLine();
         builder.Append("تغییر فقط روی ساخت پرداخت‌های جدید اثر دارد؛ بررسی و تسویه پرداخت‌های قبلی ادامه خواهد داشت.");
@@ -4738,6 +4753,7 @@ public class TelegramBotService
             PaymentGateway.HooshPay => "hp",
             PaymentGateway.Tetraminator => "tm",
             PaymentGateway.UniquePay => "up",
+            PaymentGateway.AtlasPay => "ap",
             PaymentGateway.NowPayments => "np",
             _ => "unknown"
         };
@@ -4753,6 +4769,7 @@ public class TelegramBotService
             "hp" => PaymentGateway.HooshPay,
             "tm" => PaymentGateway.Tetraminator,
             "up" => PaymentGateway.UniquePay,
+            "ap" => PaymentGateway.AtlasPay,
             "np" => PaymentGateway.NowPayments,
             _ => (PaymentGateway)(-1)
         };
@@ -4768,6 +4785,7 @@ public class TelegramBotService
             PaymentGateway.HooshPay => "هوش‌پی",
             PaymentGateway.Tetraminator => "تترامیناتور",
             PaymentGateway.UniquePay => "یونیک‌پی",
+            PaymentGateway.AtlasPay => "اطلس‌پی",
             PaymentGateway.NowPayments => "NOWPayments",
             _ => gateway.ToString()
         };
@@ -6353,6 +6371,17 @@ public class TelegramBotService
                     return;
                 }
 
+                if (user.PaymentMethod == "atlaspay" &&
+                    !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
+                {
+                    user.LastStep = "payment_method_selection"; user.Flow = "charge"; user.PaymentMethod = string.Empty;
+                    await _state.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(message.Chat.Id,
+                        "درگاه اطلس‌پی در حال حاضر غیرفعال است. لطفاً از درگاه‌های فعال استفاده کنید.",
+                        replyMarkup: BuildChargePaymentMethodKeyboard(), cancellationToken: cancellationToken);
+                    return;
+                }
+
                 if (user.PaymentMethod == "crypto" &&
                     !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments))
                 {
@@ -6453,6 +6482,10 @@ public class TelegramBotService
                 else if (user.PaymentMethod == "uniquepay")
                 {
                     await CreateUniquePayWalletChargeAsync(message, credUser, user, cancellationToken);
+                }
+                else if (user.PaymentMethod == "atlaspay")
+                {
+                    await CreateAtlasPayWalletChargeAsync(message, credUser, user, cancellationToken);
                 }
 
                 else if (user.PaymentMethod == "swapino")
@@ -6814,6 +6847,19 @@ public class TelegramBotService
 
                 user.PaymentMethod = "uniquepay";
             }
+            else if (IsGatewayAction(message.Text, AtlasPayGatewayAction, "درگاه ریالی اطلس‌پی"))
+            {
+                if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
+                {
+                    user.LastStep = "payment_method_selection"; user.Flow = "charge"; user.PaymentMethod = string.Empty;
+                    await _state.SaveUserStatus(user);
+                    await botClient.CustomSendTextMessageAsync(message.Chat.Id,
+                        "درگاه اطلس‌پی در حال حاضر غیرفعال است.", replyMarkup: BuildChargePaymentMethodKeyboard(),
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+                user.PaymentMethod = "atlaspay";
+            }
             else if (message.Text == "درگاه ریالی" || message.Text == "درگاه ریالی (غیرفعال)")
             {
                 user.LastStep = "payment_method_selection";
@@ -6859,6 +6905,8 @@ public class TelegramBotService
                     ? "درگاه ریالی تترامیناتور آنی با کارمزد ۱۲٪"
                 : user.PaymentMethod == "uniquepay"
                     ? "درگاه ریالی یونیک‌پی آنی با کارمزد ۱۲٪"
+                : user.PaymentMethod == "atlaspay"
+                    ? "اطلس‌پی | کارت‌به‌کارت آنی"
                 : user.PaymentMethod == "zibal"
                     ? "درگاه ریالی"
                     : "درگاه پرداخت";
@@ -8579,6 +8627,8 @@ public class TelegramBotService
             rows.Add(new[] { new KeyboardButton(TetraminatorGatewayAction) });
         if (snapshot.IsEnabled(PaymentGateway.UniquePay))
             rows.Add(new[] { new KeyboardButton(UniquePayGatewayAction) });
+        if (snapshot.IsEnabled(PaymentGateway.AtlasPay))
+            rows.Add(new[] { new KeyboardButton(AtlasPayGatewayAction) });
         if (snapshot.IsEnabled(PaymentGateway.NowPayments))
             rows.Add(new[] { new KeyboardButton(CryptoGatewayAction) });
 
@@ -8610,6 +8660,8 @@ public class TelegramBotService
             lines.Add("💳 تترامیناتور: <b>کارمزد ۱۲٪</b>");
         if (snapshot.IsEnabled(PaymentGateway.UniquePay))
             lines.Add("💳 یونیک‌پی: <b>کارمزد ۱۲٪</b>");
+        if (snapshot.IsEnabled(PaymentGateway.AtlasPay))
+            lines.Add("💳 اطلس‌پی: <b>مبلغ نهایی در فاکتور نمایش داده می‌شود</b>");
         if (snapshot.IsEnabled(PaymentGateway.NowPayments))
             lines.Add("🪙 ارز دیجیتال: <b>کارمزد ۰٪</b>");
         if (lines.Count == 0)
@@ -8825,6 +8877,113 @@ public class TelegramBotService
                 replyMarkup: MainReplyMarkupKeyboardFa(),
                 cancellationToken: cancellationToken);
         }
+    }
+
+    private async Task CreateAtlasPayWalletChargeAsync(Message message, CredUser credUser, User user, CancellationToken cancellationToken)
+    {
+        if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
+        {
+            await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, "درگاه اطلس‌پی در حال حاضر غیرفعال است.",
+                replyMarkup: BuildChargePaymentMethodKeyboard(), cancellationToken: cancellationToken);
+            return;
+        }
+        var amount = long.TryParse(user.ConfigLink, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) ? parsed : 0;
+        if (amount <= 0)
+        {
+            await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, "مبلغ پرداخت معتبر نیست.",
+                replyMarkup: BuildChargePaymentMethodKeyboard(), cancellationToken: cancellationToken);
+            return;
+        }
+        await _state.ClearUserStatus(user);
+        var payment = AtlasPayPaymentInfo.CreateWalletCharge(credUser.TelegramUserId, message.Chat.Id, amount);
+        payment.BotId = BotContextAccessor.CurrentBotId;
+        payment.BotUsername = CurrentBot?.Username;
+        payment.BeginCreationAttempt(DateTime.UtcNow);
+        _workflow.Add(payment);
+        await _workflow.SaveAsync(cancellationToken);
+        try
+        {
+            var created = await _atlasPay.CreateOrderAsync(payment.MerchantOrderRef, payment.BaseAmountToman,
+                payment.TelegramUserId, cancellationToken);
+            payment.ApplyCreate(created, DateTime.UtcNow,
+                DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600)));
+            await _workflow.SaveAsync(cancellationToken);
+            var deadline = payment.PaymentDeadlineAtUtc?.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture) ?? "نامشخص";
+            var text = "⚠️ <b>پیش از پرداخت لطفاً موارد زیر را بررسی کنید:</b>\n\n" +
+                       $"💰 مبلغ دقیق قابل پرداخت: <code>{Html(payment.TotalAmountToman!.Value.FormatCurrency())}</code>\n" +
+                       $"⏱ مهلت پرداخت: <code>{Html(deadline)}</code>\n" +
+                       $"🔖 شماره پیگیری: <code>{Html(payment.TrackingCode)}</code>\n\n" +
+                       "مبلغ را دقیقاً مطابق عدد بالا پرداخت کنید. شارژ کیف پول فقط پس از استعلام رسمی اطلس‌پی انجام می‌شود.";
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی", payment.CustomerStartLink) },
+                new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", $"apchk_{payment.Id}") }
+            });
+            var sent = await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, text, parseMode: ParseMode.Html,
+                replyMarkup: keyboard, cancellationToken: cancellationToken);
+            payment.TelMsgId = sent.MessageId;
+            await _workflow.SaveAsync(cancellationToken);
+            await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, "منوی اصلی", replyMarkup: MainReplyMarkupKeyboardFa(),
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            var definitive = AtlasPay.IsDefinitiveCreateFailure(ex);
+            var code = ex is AtlasPayApiException api ? (api.StatusCode > 0 ? api.StatusCode.ToString(CultureInfo.InvariantCulture) : "ambiguous") : "ambiguous";
+            payment.RecordCreationFailure(definitive, code, DateTime.UtcNow);
+            payment.ErrorCode = code;
+            payment.ErrorMessage = definitive ? "AtlasPay rejected order creation." : "AtlasPay create outcome is ambiguous; automatic retry is disabled.";
+            await _workflow.SaveAsync(cancellationToken);
+            _logger.LogWarning("AtlasPay create attempt ended without a usable invoice. paymentId={PaymentId}, botId={BotId}, definitive={Definitive}, errorType={ErrorType}",
+                payment.Id, payment.BotId, definitive, ex.GetType().Name);
+            await ActiveBotClient.SendTextMessageAsync(message.Chat.Id,
+                definitive ? "ساخت فاکتور اطلس‌پی ناموفق بود. لطفاً از درگاه دیگری استفاده کنید."
+                    : "نتیجه ساخت فاکتور اطلس‌پی نامشخص است. برای جلوگیری از صدور فاکتور تکراری، درخواست ساخت دوباره ارسال نخواهد شد و موضوع نیازمند بررسی است.",
+                replyMarkup: MainReplyMarkupKeyboardFa(), cancellationToken: cancellationToken);
+        }
+    }
+
+    private async Task ProcessAtlasPayPaymentCallbackAsync(CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        var value = callbackQuery.Data?["apchk_".Length..];
+        if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var paymentId)) return;
+        var payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.AsNoTracking().FirstOrDefaultAsync(x =>
+            x.Id == paymentId && x.TelegramUserId == callbackQuery.From.Id && x.BotId == BotContextAccessor.CurrentBotId, cancellationToken));
+        if (payment == null)
+        {
+            await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور اطلس‌پی پیدا نشد.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+        var isTenant = string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase);
+        if (isTenant)
+        {
+            var linked = await _workflow.ReadAsync(async db => await db.TenantBotOrders.AsNoTracking().AnyAsync(x =>
+                x.Id == payment.TenantBotOrderId && x.AtlasPayPaymentInfoId == payment.Id &&
+                x.CustomerTelegramUserId == callbackQuery.From.Id && x.TenantBotId == BotContextAccessor.CurrentBotId, cancellationToken));
+            if (!linked)
+            {
+                await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "فاکتور اطلس‌پی با این سفارش تطبیق ندارد.", showAlert: true, cancellationToken: cancellationToken);
+                return;
+            }
+        }
+        else if (!string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.WalletCharge, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        await ActiveBotClient.AnswerCallbackQueryAsync(callbackQuery.Id, "در حال استعلام رسمی از اطلس‌پی...", cancellationToken: cancellationToken);
+        var result = await _atlasPayReconciliation.ReconcilePaymentAsync(payment.Id, "customer-check", useVerify: true, cancellationToken);
+        var latest = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.AsNoTracking().FirstAsync(x => x.Id == payment.Id, cancellationToken));
+        string text;
+        if (result.Status == NowPaymentsSettlementStatus.Applied) text = isTenant ? "✅ پرداخت اطلس‌پی تایید و سفارش شما پردازش شد." : "✅ پرداخت اطلس‌پی تایید و کیف پول شما شارژ شد.";
+        else if (result.Status == NowPaymentsSettlementStatus.AlreadyAdded) text = "این پرداخت قبلاً تایید و به کیف پول شما اضافه شده است.";
+        else if (latest.RequiresManualDelivery || latest.SettlementState == AtlasPaySettlementStates.ManualReview)
+            text = "⚠️ پرداخت شما ثبت شده اما به دلیل مغایرت مبلغ نیاز به بررسی دستی دارد.";
+        else if (AtlasPayStatuses.IsTerminal(latest.ProviderStatus))
+            text = latest.ProviderStatus == "expired" ? "مهلت این پرداخت منقضی شده است." : latest.ProviderStatus == "cancelled" ? "این پرداخت لغو شده است." : "این پرداخت توسط اطلس‌پی رد شده است.";
+        else text = "پرداخت هنوز تایید نشده است.";
+        await ActiveBotClient.SendTextMessageAsync(callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id, text,
+            replyMarkup: !AtlasPayStatuses.IsTerminal(latest.ProviderStatus) && latest.SettlementState != AtlasPaySettlementStates.ManualReview && !latest.IsAddedToBalance
+                ? new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"apchk_{payment.Id}") } }) : MainReplyMarkupKeyboardFa(),
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>

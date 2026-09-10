@@ -49,6 +49,7 @@ public class TenantBotService
     /// Serializes the local claim before UniquePay's non-retried invoice creation request.
     /// </summary>
     private static readonly AsyncKeyedGate TenantUniquePayInvoiceCreationGate = new();
+    private static readonly AsyncKeyedGate TenantAtlasPayInvoiceCreationGate = new();
     public const string OwnerMenuButton = "🛒 فعالسازی ربات فروشگاهی";
 
     private const string OWNERCALLBACKPREFIX = "TBM:";
@@ -89,6 +90,8 @@ public class TenantBotService
     private readonly NowPayments _nowPayments;
     private readonly Tetraminator _tetraminator;
     private readonly UniquePay _uniquePay;
+    private readonly AtlasPay _atlasPay;
+    private readonly AtlasPayReconciliationHostedService _atlasPayReconciliation;
     private readonly IPaymentGatewayAvailability _gatewayAvailability;
     private readonly BotRegistry _botRegistry;
     private readonly BotClientProvider _botClientProvider;
@@ -177,6 +180,8 @@ public class TenantBotService
         NowPayments NowPayments,
         Tetraminator Tetraminator,
         UniquePay UniquePay,
+        AtlasPay AtlasPay,
+        AtlasPayReconciliationHostedService AtlasPayReconciliation,
         IPaymentGatewayAvailability GatewayAvailability,
         BotRegistry BotRegistry,
         BotClientProvider BotClientProvider,
@@ -203,6 +208,8 @@ public class TenantBotService
         _nowPayments = NowPayments;
         _tetraminator = Tetraminator;
         _uniquePay = UniquePay;
+        _atlasPay = AtlasPay;
+        _atlasPayReconciliation = AtlasPayReconciliation;
         _gatewayAvailability = GatewayAvailability;
         _botRegistry = BotRegistry;
         _botClientProvider = BotClientProvider;
@@ -1189,6 +1196,7 @@ public class TenantBotService
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) && tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) ? "سراسری خاموش" : tenant?.TenantHooshPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) && tenant?.TenantTetraminatorEnabled == true)} درگاه تترامیناتور: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) ? "سراسری خاموش" : tenant?.TenantTetraminatorEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) && tenant?.TenantUniquePayEnabled == true)} درگاه یونیک‌پی (۱۲٪): <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) ? "سراسری خاموش" : tenant?.TenantUniquePayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay) && tenant?.TenantAtlasPayEnabled == true)} درگاه اطلس‌پی: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay) ? "سراسری خاموش" : tenant?.TenantAtlasPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ? "سراسری خاموش" : tenant?.TenantNowPaymentsEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(tenant?.TenantCardPaymentEnabled == true)} کارت به کارت همکار: <code>{Html(card)}</code>\n" +
                $"{STATUSICON(tenant?.TenantMandatoryJoinEnabled == true)} جوین اجباری فروشگاه: <code>{Html(TENANTJOIN)}</code>\n" +
@@ -1208,6 +1216,7 @@ public class TenantBotService
         var TETRAMINATORENABLED = tenant?.TenantTetraminatorEnabled == true;
         var NOWPAYMENTSENABLED = tenant?.TenantNowPaymentsEnabled == true;
         var UNIQUEPAYENABLED = tenant?.TenantUniquePayEnabled == true;
+        var ATLASPAYENABLED = tenant?.TenantAtlasPayEnabled == true;
         var CARDENABLED = tenant?.TenantCardPaymentEnabled == true;
         var JOINENABLED = tenant?.TenantMandatoryJoinEnabled == true;
         var revision = BuildTenantPanelRevision(tenant);
@@ -1243,7 +1252,8 @@ public class TenantBotService
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData(UNIQUEPAYENABLED ? "✅ یونیک‌پی ۱۲٪" : "❌ یونیک‌پی ۱۲٪", BuildTenantSettingCallback("UniquePay", !UNIQUEPAYENABLED, revision, issuedAt))
+                InlineKeyboardButton.WithCallbackData(UNIQUEPAYENABLED ? "✅ یونیک‌پی ۱۲٪" : "❌ یونیک‌پی ۱۲٪", BuildTenantSettingCallback("UniquePay", !UNIQUEPAYENABLED, revision, issuedAt)),
+                InlineKeyboardButton.WithCallbackData(ATLASPAYENABLED ? "✅ اطلس‌پی" : "❌ اطلس‌پی", BuildTenantSettingCallback("AtlasPay", !ATLASPAYENABLED, revision, issuedAt))
             },
             new[]
             {
@@ -1669,6 +1679,7 @@ public class TenantBotService
         tenant.TenantTetraminatorEnabled = true;
         tenant.TenantNowPaymentsEnabled = true;
         tenant.TenantUniquePayEnabled = true;
+        tenant.TenantAtlasPayEnabled = true;
         tenant.TenantTutorialsJson = JsonConvert.SerializeObject(Array.Empty<TenantTutorialLink>());
     }
 
@@ -2509,6 +2520,15 @@ public class TenantBotService
                     return;
                 }
                 break;
+            case "AtlasPay":
+                currentEnabled = tenant.TenantAtlasPayEnabled;
+                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
+                {
+                    await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id,
+                        "درگاه اطلس‌پی در تنظیمات سراسری خاموش یا ناقص است.", showAlert: true, cancellationToken: CancellationToken);
+                    return;
+                }
+                break;
             case "NowPayments":
                 currentEnabled = tenant.TenantNowPaymentsEnabled;
                 if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments))
@@ -2574,6 +2594,9 @@ public class TenantBotService
                 break;
             case "UniquePay":
                 tenant.TenantUniquePayEnabled = desiredEnabled;
+                break;
+            case "AtlasPay":
+                tenant.TenantAtlasPayEnabled = desiredEnabled;
                 break;
             case "NowPayments":
                 tenant.TenantNowPaymentsEnabled = desiredEnabled;
@@ -5692,6 +5715,7 @@ public class TenantBotService
         if (action.StartsWith("PAYHP:", StringComparison.Ordinal) ||
             action.StartsWith("PAYTM:", StringComparison.Ordinal) ||
             action.StartsWith("PAYUP:", StringComparison.Ordinal) ||
+            action.StartsWith("PAYAP:", StringComparison.Ordinal) ||
             action.StartsWith("PAYNP:", StringComparison.Ordinal) ||
             action.StartsWith("PAYCARD:", StringComparison.Ordinal))
         {
@@ -5729,6 +5753,11 @@ public class TenantBotService
                 await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await CreateTenantUniquePayInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
             }
+            else if (Provider == "PAYAP")
+            {
+                await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
+                await CreateTenantAtlasPayInvoiceAsync(botClient, CallbackQuery, tenant, customer, selection, CancellationToken);
+            }
             else if (Provider == "PAYNP")
             {
                 await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
@@ -5745,6 +5774,7 @@ public class TenantBotService
         if (action.StartsWith("RNHP:", StringComparison.Ordinal) ||
             action.StartsWith("RNTM:", StringComparison.Ordinal) ||
             action.StartsWith("RNUP:", StringComparison.Ordinal) ||
+            action.StartsWith("RNAP:", StringComparison.Ordinal) ||
             action.StartsWith("RNNP:", StringComparison.Ordinal) ||
             action.StartsWith("RNCARD:", StringComparison.Ordinal))
         {
@@ -5762,6 +5792,8 @@ public class TenantBotService
                 await CreateTenantTetraminatorInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
             else if (provider == "RNUP")
                 await CreateTenantUniquePayInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
+            else if (provider == "RNAP")
+                await CreateTenantAtlasPayInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
             else if (provider == "RNNP")
                 await CreateTenantNowPaymentsInvoiceForExistingOrderAsync(botClient, CallbackQuery, tenant, customer, orderDbId, CancellationToken);
             else
@@ -6360,6 +6392,8 @@ public class TenantBotService
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + "PAYTM:" + BUILDPAYACTION(selection)) });
         if (IsTenantUniquePayAvailable(tenant, Price.SalePriceToman))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + "PAYUP:" + BUILDPAYACTION(selection)) });
+        if (IsTenantAtlasPayAvailable(tenant))
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی", CUSTOMERCALLBACKPREFIX + "PAYAP:" + BUILDPAYACTION(selection)) });
         if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی | کارمزد ۰٪", CUSTOMERCALLBACKPREFIX + "PAYNP:" + BUILDPAYACTION(selection)) });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
@@ -6924,6 +6958,116 @@ public class TenantBotService
             await _workflow.SaveAsync(cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "ساخت فاکتور ناموفق بود.", showAlert: true, cancellationToken: cancellationToken);
         }
+    }
+
+    private async Task CreateTenantAtlasPayInvoiceAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery,
+        BotInstance tenant, CredUser customer, XuiV3PurchaseSelection selection, CancellationToken cancellationToken)
+    {
+        var price = CalculateTenantPrice(tenant, selection);
+        if (!IsTenantAtlasPayAvailable(tenant))
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, BuildTenantAtlasPayUnavailableMessage(tenant),
+                showAlert: true, cancellationToken: cancellationToken); return;
+        }
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "atlaspay");
+        _workflow.Add(order); await _workflow.SaveAsync(cancellationToken);
+        await CreateTenantAtlasPayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
+    }
+
+    private async Task CreateTenantAtlasPayInvoiceForExistingOrderAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery,
+        BotInstance tenant, CredUser customer, int orderDbId, CancellationToken cancellationToken)
+    {
+        var order = await GetPendingTenantRenewOrderAsync(orderDbId, tenant, customer, cancellationToken);
+        if (order == null)
+        { await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.", showAlert: true, cancellationToken: cancellationToken); return; }
+        if (!IsTenantAtlasPayAvailable(tenant))
+        { await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, BuildTenantAtlasPayUnavailableMessage(tenant), showAlert: true, cancellationToken: cancellationToken); return; }
+        order.PaymentProvider = "atlaspay"; order.UpdatedAtUtc = DateTime.UtcNow; await _workflow.SaveAsync(cancellationToken);
+        await CreateTenantAtlasPayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
+    }
+
+    private async Task CreateTenantAtlasPayInvoiceCoreAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery,
+        BotInstance tenant, CredUser customer, TenantBotOrder order, CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        if (!IsTenantAtlasPayAvailable(tenant))
+        { await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, BuildTenantAtlasPayUnavailableMessage(tenant), showAlert: true, cancellationToken: cancellationToken); return; }
+        AtlasPayPaymentInfo payment; string existingLink = null; bool mutationBlocked = false;
+        using var gate = await TenantAtlasPayInvoiceCreationGate.EnterAsync(order.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
+        try
+        {
+            payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, cancellationToken));
+            if (payment != null)
+            {
+                order.AtlasPayPaymentInfoId = payment.Id; order.UpdatedAtUtc = DateTime.UtcNow;
+                if (!string.IsNullOrWhiteSpace(payment.CustomerStartLink)) { order.PaymentUrl = payment.CustomerStartLink; existingLink = payment.CustomerStartLink; }
+                else mutationBlocked = true;
+                await _workflow.SaveAsync(cancellationToken);
+            }
+            else
+            {
+                payment = new AtlasPayPaymentInfo
+                {
+                    MerchantOrderRef = AtlasPayPaymentInfo.CreateMerchantOrderRef(), BaseAmountToman = order.SalePriceToman,
+                    TelegramUserId = customer.TelegramUserId, ChatId = chatId, BotId = tenant.Id, BotUsername = tenant.Username,
+                    PaymentPurpose = TenantBotPaymentPurposes.TenantOrder, TenantBotOrderId = order.Id,
+                    TenantOwnerTelegramUserId = tenant.OwnerTelegramUserId, CreationState = AtlasPayCreationStates.Attempting,
+                    SettlementState = AtlasPaySettlementStates.Pending, CreatedAtUtc = DateTime.UtcNow, UpdatedAtUtc = DateTime.UtcNow
+                };
+                payment.BeginCreationAttempt(payment.CreatedAtUtc); _workflow.Add(payment); await _workflow.SaveAsync(cancellationToken);
+                order.AtlasPayPaymentInfoId = payment.Id; order.PaymentProvider = "atlaspay"; order.UpdatedAtUtc = DateTime.UtcNow;
+                await _workflow.SaveAsync(cancellationToken);
+            }
+        }
+        finally { gate.Dispose(); }
+        if (!string.IsNullOrWhiteSpace(existingLink))
+        {
+            await botClient.SendTextMessageAsync(chatId, BuildTenantAtlasPayPaymentText(order, payment), parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantAtlasPayPaymentKeyboard(payment), cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور قبلی اطلس‌پی دوباره نمایش داده شد.", cancellationToken: cancellationToken); return;
+        }
+        if (mutationBlocked)
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id,
+                payment.CreationState == AtlasPayCreationStates.Failed ? "ساخت فاکتور قبلی اطلس‌پی ناموفق بود و درخواست تکراری ارسال نشد."
+                : "نتیجه ساخت فاکتور قبلی اطلس‌پی نامشخص است؛ درخواست ساخت دوباره ارسال نشد.", showAlert: true, cancellationToken: cancellationToken); return;
+        }
+        try
+        {
+            var created = await _atlasPay.CreateOrderAsync(payment.MerchantOrderRef, payment.BaseAmountToman, payment.TelegramUserId, cancellationToken);
+            payment.ApplyCreate(created, DateTime.UtcNow, DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600)));
+            order.AtlasPayPaymentInfoId = payment.Id; order.PaymentUrl = payment.CustomerStartLink; order.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(cancellationToken);
+            await botClient.SendTextMessageAsync(chatId, BuildTenantAtlasPayPaymentText(order, payment), parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantAtlasPayPaymentKeyboard(payment), cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور اطلس‌پی ساخته شد.", cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            var definitive = AtlasPay.IsDefinitiveCreateFailure(ex);
+            var code = ex is AtlasPayApiException api && api.StatusCode > 0 ? api.StatusCode.ToString(CultureInfo.InvariantCulture) : "ambiguous";
+            payment.RecordCreationFailure(definitive, code, DateTime.UtcNow); payment.ErrorCode = code;
+            payment.ErrorMessage = definitive ? "AtlasPay rejected order creation." : "AtlasPay create outcome is ambiguous; no automatic retry.";
+            order.PaymentStatus = definitive ? TenantBotOrderStatuses.Failed : TenantBotOrderStatuses.Pending;
+            order.ErrorMessage = definitive ? "AtlasPay invoice creation failed." : "AtlasPay invoice creation outcome is ambiguous.";
+            order.UpdatedAtUtc = DateTime.UtcNow; await _workflow.SaveAsync(cancellationToken);
+            _logger.LogWarning("AtlasPay tenant create ended without usable invoice. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, definitive={Definitive}, errorType={ErrorType}",
+                tenant.Id, order.OrderId, payment.Id, definitive, ex.GetType().Name);
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id,
+                definitive ? "ساخت فاکتور اطلس‌پی ناموفق بود." : "نتیجه ساخت فاکتور اطلس‌پی نامشخص است؛ برای جلوگیری از فاکتور تکراری درخواست دوباره ارسال نمی‌شود.",
+                showAlert: true, cancellationToken: cancellationToken);
+        }
+    }
+
+    internal static string BuildTenantAtlasPayPaymentText(TenantBotOrder order, AtlasPayPaymentInfo payment)
+    {
+        var deadline = payment.PaymentDeadlineAtUtc?.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture) ?? "نامشخص";
+        return "⚠️ <b>پیش از پرداخت لطفاً موارد زیر را بررسی کنید:</b>\n\n" +
+               $"💰 مبلغ دقیق قابل پرداخت: <code>{Html(payment.TotalAmountToman!.Value.FormatCurrency())}</code>\n" +
+               $"⏱ مهلت پرداخت: <code>{Html(deadline)}</code>\n" +
+               $"🔖 شماره پیگیری: <code>{Html(payment.TrackingCode)}</code>\n\n" +
+               "مبلغ را دقیقاً مطابق عدد بالا پرداخت کنید. پس از پرداخت، وضعیت فقط با استعلام رسمی اطلس‌پی تایید می‌شود.";
     }
 
     /// <summary>
@@ -7702,6 +7846,80 @@ public class TenantBotService
         return await FULFILLPAIDTENANTORDERASYNC(order, Source, payment, null, false, CancellationToken, retryAuthorization);
     }
 
+    public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
+        AtlasPayPaymentInfo payment, string Source, CancellationToken CancellationToken = default,
+        TenantProvisioningRetryAuthorization retryAuthorization = null)
+    {
+        if (payment == null || !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) ||
+            !AtlasPayStatuses.IsSuccess(payment.ProviderStatus) || payment.RequiresManualDelivery || !payment.PaidAtUtc.HasValue)
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.FirstOrDefaultAsync(x => x.Id == payment.Id, CancellationToken));
+        if (payment == null) return NowPaymentsSettlementResult.NotFound();
+        if (payment.IsAddedToBalance || payment.SettlementState == AtlasPaySettlementStates.Settled)
+            return NowPaymentsSettlementResult.AlreadyAdded(payment.BalanceAfter ?? 0);
+        if (payment.SettlementState == AtlasPaySettlementStates.ManualReview) return NowPaymentsSettlementResult.ProviderNotPaid();
+        if (payment.SettlementState == AtlasPaySettlementStates.Processing)
+        {
+            if (!payment.SettlementStartedAtUtc.HasValue || DateTime.UtcNow - payment.SettlementStartedAtUtc.Value >= TimeSpan.FromMinutes(30))
+            {
+                payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.ErrorCode = "tenant_fulfillment_claim_ambiguous";
+                payment.ErrorMessage = "A previous AtlasPay tenant fulfillment claim became stale and requires manual review.";
+                payment.NextInquiryAtUtc = null; payment.UpdatedAtUtc = DateTime.UtcNow; await _workflow.SaveAsync(CancellationToken);
+            }
+            return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(x => x.Id == payment.TenantBotOrderId, CancellationToken));
+        if (order == null)
+        {
+            payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.ErrorCode = "tenant_order_not_found";
+            payment.ErrorMessage = "The paid AtlasPay row is not linked to a tenant order."; payment.NextInquiryAtUtc = null;
+            payment.UpdatedAtUtc = DateTime.UtcNow; await _workflow.SaveAsync(CancellationToken); return NowPaymentsSettlementResult.NotFound();
+        }
+        if (!string.Equals(order.TenantBotId, payment.BotId, StringComparison.Ordinal) || order.CustomerTelegramUserId != payment.TelegramUserId ||
+            order.SalePriceToman != payment.BaseAmountToman || order.AtlasPayPaymentInfoId != payment.Id)
+        {
+            payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.ErrorCode = "tenant_payment_link_mismatch";
+            payment.ErrorMessage = "AtlasPay tenant payment linkage did not match the saved order."; payment.NextInquiryAtUtc = null;
+            payment.UpdatedAtUtc = DateTime.UtcNow; await _workflow.SaveAsync(CancellationToken); return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+        var attemptId = Guid.NewGuid().ToString("N"); var now = DateTime.UtcNow;
+        var claimed = await _workflow.WriteAsync(async db => await db.AtlasPayPaymentInfos
+            .Where(x => x.Id == payment.Id && !x.IsAddedToBalance && x.SettlementState == AtlasPaySettlementStates.Pending)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.SettlementState, AtlasPaySettlementStates.Processing)
+                .SetProperty(x => x.SettlementAttemptId, attemptId).SetProperty(x => x.SettlementStartedAtUtc, now)
+                .SetProperty(x => x.UpdatedAtUtc, now), CancellationToken));
+        if (claimed != 1) return NowPaymentsSettlementResult.ProviderNotPaid();
+        NowPaymentsSettlementResult settlement;
+        try { settlement = await FULFILLPAIDTENANTORDERASYNC(order, Source, null, null, false, CancellationToken, retryAuthorization); }
+        catch (Exception ex)
+        {
+            payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.FirstAsync(x => x.Id == payment.Id, CancellationToken));
+            payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.ErrorCode = "tenant_fulfillment_ambiguous";
+            payment.ErrorMessage = ex.GetType().Name; payment.NextInquiryAtUtc = null; payment.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(CancellationToken); return NowPaymentsSettlementResult.ProviderNotPaid();
+        }
+        payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.FirstAsync(x => x.Id == payment.Id, CancellationToken));
+        if (settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded)
+        {
+            payment.IsAddedToBalance = true; payment.SettlementState = AtlasPaySettlementStates.Settled;
+            payment.SettlementAttemptId = null; payment.SettlementStartedAtUtc = null; payment.SettledAtUtc ??= order.FulfilledAtUtc ?? DateTime.UtcNow;
+            payment.BalanceBefore = settlement.BeforeBalance; payment.BalanceAfter = settlement.AfterBalance; payment.NextInquiryAtUtc = null;
+            payment.ErrorCode = null; payment.ErrorMessage = null; payment.SuccessLoggedAtUtc ??= DateTime.UtcNow; payment.UpdatedAtUtc = DateTime.UtcNow;
+        }
+        else if (settlement.Status is NowPaymentsSettlementStatus.UserNotFound or NowPaymentsSettlementStatus.PaymentNotFound)
+        {
+            payment.SettlementState = AtlasPaySettlementStates.Pending; payment.SettlementAttemptId = null; payment.SettlementStartedAtUtc = null;
+            payment.NextInquiryAtUtc = DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600));
+            payment.ErrorCode = "tenant_fulfillment_prerequisite_failed"; payment.UpdatedAtUtc = DateTime.UtcNow;
+        }
+        else
+        {
+            payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.ErrorCode = "tenant_fulfillment_ambiguous";
+            payment.NextInquiryAtUtc = null; payment.UpdatedAtUtc = DateTime.UtcNow;
+        }
+        await _workflow.SaveAsync(CancellationToken); return settlement;
+    }
+
     /// <summary>
     /// Fulfills a UniquePay tenant order exactly once after a verified provider inquiry.
     /// </summary>
@@ -8217,6 +8435,13 @@ public class TenantBotService
                 .Where(x => x.TenantBotOrderId == order.Id).Select(x => new { x.PaidAtUtc, x.PaymentStatus })
                 .SingleOrDefaultAsync(cancellationToken));
             return evidence?.PaidAtUtc != null && TetraminatorStatuses.IsPaid(evidence.PaymentStatus);
+        }
+        if (string.Equals(order.PaymentProvider, "atlaspay", StringComparison.OrdinalIgnoreCase))
+        {
+            var evidence = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.AsNoTracking()
+                .Where(x => x.TenantBotOrderId == order.Id).Select(x => new { x.PaidAtUtc, x.ProviderStatus, x.RequiresManualDelivery })
+                .SingleOrDefaultAsync(cancellationToken));
+            return evidence?.PaidAtUtc != null && AtlasPayStatuses.IsSuccess(evidence.ProviderStatus) && !evidence.RequiresManualDelivery;
         }
         if (string.Equals(order.PaymentProvider, "uniquepay", StringComparison.OrdinalIgnoreCase))
         {
@@ -9207,6 +9432,34 @@ public class TenantBotService
             await botClient.SendTextMessageAsync(
                 ChatId,
                 "پرداخت شما توسط مدیر تایید شده است، اما ساخت اکانت هنوز کامل نشده یا نیاز به تلاش مجدد دارد. لطفاً کمی صبر کنید یا با پشتیبانی فروشگاه تماس بگیرید.",
+                cancellationToken: CancellationToken);
+            return;
+        }
+
+        if (order.AtlasPayPaymentInfoId.HasValue ||
+            string.Equals(order.PaymentProvider, "AtlasPay", StringComparison.OrdinalIgnoreCase))
+        {
+            var atlasPayment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.AsNoTracking().FirstOrDefaultAsync(x =>
+                (x.Id == order.AtlasPayPaymentInfoId || x.TenantBotOrderId == order.Id) &&
+                x.TenantBotOrderId == order.Id && x.TelegramUserId == CustomerTelegramUserId && x.BotId == order.TenantBotId,
+                CancellationToken));
+            if (atlasPayment == null)
+            { await botClient.SendTextMessageAsync(ChatId, "فاکتور اطلس‌پی این سفارش پیدا نشد.", cancellationToken: CancellationToken); return; }
+            var settlement = await _atlasPayReconciliation.ReconcilePaymentAsync(atlasPayment.Id, "customer-check", useVerify: true, CancellationToken);
+            var latest = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.AsNoTracking().FirstAsync(x => x.Id == atlasPayment.Id, CancellationToken));
+            if (settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded)
+            { await SENDTENANTSETTLEMENTCHECKRESULTASYNC(botClient, ChatId, order, settlement, CancellationToken); return; }
+            string text;
+            if (latest.RequiresManualDelivery || latest.SettlementState == AtlasPaySettlementStates.ManualReview)
+                text = "⚠️ پرداخت شما ثبت شده اما به دلیل مغایرت مبلغ نیاز به بررسی دستی دارد.";
+            else if (AtlasPayStatuses.IsTerminal(latest.ProviderStatus))
+                text = latest.ProviderStatus == "expired" ? "مهلت فاکتور اطلس‌پی منقضی شده و سفارش تحویل نشد."
+                    : latest.ProviderStatus == "cancelled" ? "فاکتور اطلس‌پی لغو شده و سفارش تحویل نشد."
+                    : "پرداخت اطلس‌پی رد شده و سفارش تحویل نشد.";
+            else text = "پرداخت اطلس‌پی هنوز تایید نشده است.";
+            await botClient.SendTextMessageAsync(ChatId, text,
+                replyMarkup: latest.SettlementState != AtlasPaySettlementStates.ManualReview && !AtlasPayStatuses.IsTerminal(latest.ProviderStatus)
+                    ? BuildTenantPaymentKeyboard(order, latest.CustomerStartLink) : null,
                 cancellationToken: CancellationToken);
             return;
         }
@@ -10900,6 +11153,16 @@ public class TenantBotService
            tenant?.TenantUniquePayEnabled == true &&
            UniquePayAmountPolicy.IsValid(amountToman);
 
+    private bool IsTenantAtlasPayAvailable(BotInstance tenant)
+        => _gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay) && tenant?.TenantAtlasPayEnabled == true;
+
+    private string BuildTenantAtlasPayUnavailableMessage(BotInstance tenant)
+        => !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay)
+            ? "درگاه اطلس‌پی در تنظیمات سراسری خاموش یا ناقص است."
+            : tenant?.TenantAtlasPayEnabled != true
+                ? "درگاه اطلس‌پی برای این فروشگاه خاموش است."
+                : "درگاه اطلس‌پی در حال حاضر در دسترس نیست.";
+
     /// <summary>
     /// Builds the safe customer-facing explanation for a disabled tenant UniquePay callback.
     /// </summary>
@@ -10957,6 +11220,8 @@ public class TenantBotService
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی", CUSTOMERCALLBACKPREFIX + $"RNTM:{order.Id}") });
         if (IsTenantUniquePayAvailable(tenant, order.SalePriceToman))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + $"RNUP:{order.Id}") });
+        if (IsTenantAtlasPayAvailable(tenant))
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی", CUSTOMERCALLBACKPREFIX + $"RNAP:{order.Id}") });
         if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی", CUSTOMERCALLBACKPREFIX + $"RNNP:{order.Id}") });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
@@ -10993,6 +11258,16 @@ public class TenantBotService
         if (!string.IsNullOrWhiteSpace(payment.PaymentUrl))
             rows.Add(new[] { InlineKeyboardButton.WithUrl("پرداخت", payment.PaymentUrl) });
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت پرداخت", CUSTOMERCALLBACKPREFIX + $"chk:{order.Id}") });
+        return new InlineKeyboardMarkup(rows);
+    }
+
+    private static InlineKeyboardMarkup BuildTenantAtlasPayPaymentKeyboard(AtlasPayPaymentInfo payment)
+    {
+        var rows = new List<InlineKeyboardButton[]>();
+        if (!string.IsNullOrWhiteSpace(payment?.CustomerStartLink))
+            rows.Add(new[] { InlineKeyboardButton.WithUrl("?? ?????? ?? ???????", payment.CustomerStartLink) });
+        if (payment != null && payment.Id > 0)
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("?? ????? ????? ??????", $"apchk_{payment.Id}") });
         return new InlineKeyboardMarkup(rows);
     }
 

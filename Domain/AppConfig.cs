@@ -283,6 +283,14 @@ namespace Adminbot.Domain
         /// and this JSON key immediately. Existing invoices remain eligible for polling and settlement while disabled;
         /// a missing key initializes the gateway as disabled.
         /// </remarks>
+        public bool AtlasPayEnabled { get; set; } = false;
+        public string AtlasPayApiKey { get; set; }
+        public string AtlasPayBaseUrl { get; set; } = "https://api.atlaspay.space/api/v1";
+        public int AtlasPayRequestTimeoutSeconds { get; set; } = 15;
+        public int AtlasPayInquiryRetryCount { get; set; } = 3;
+        public int AtlasPayReconciliationIntervalSeconds { get; set; } = 30;
+        public int AtlasPayReconciliationMaxAttempts { get; set; } = 50;
+        public int AtlasPayReconciliationBatchSize { get; set; } = 50;
         public bool UniquePayEnabled { get; set; }
         /// <summary>
         /// Official UniquePay API host used for generic invoice creation and inquiry endpoints.

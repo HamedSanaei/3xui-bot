@@ -69,6 +69,8 @@ public sealed class AdminPanelRoutingTests
                 tetraminatorSettlementService: null,
                 uniquePay: null,
                 uniquePayReconciliation: null,
+                atlasPay: null,
+                atlasPayReconciliation: null,
                 gatewayAvailability: null,
                 xuiV3PurchaseService: null,
                 xuiV3BotFlowService: null,

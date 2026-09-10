@@ -16,6 +16,9 @@ public enum PaymentGateway
     /// <summary>UniquePay rial invoices.</summary>
     UniquePay,
 
+    /// <summary>AtlasPay toman card-transfer orders.</summary>
+    AtlasPay,
+
     /// <summary>NOWPayments cryptocurrency invoices.</summary>
     NowPayments
 }
@@ -34,6 +37,7 @@ public sealed record PaymentGatewayAvailabilitySnapshot(
     bool HooshPayEnabled,
     bool TetraminatorEnabled,
     bool UniquePayEnabled,
+    bool AtlasPayEnabled,
     bool NowPaymentsEnabled,
     long Revision)
 {
@@ -54,6 +58,7 @@ public sealed record PaymentGatewayAvailabilitySnapshot(
             PaymentGateway.HooshPay => HooshPayEnabled,
             PaymentGateway.Tetraminator => TetraminatorEnabled,
             PaymentGateway.UniquePay => UniquePayEnabled,
+            PaymentGateway.AtlasPay => AtlasPayEnabled,
             PaymentGateway.NowPayments => NowPaymentsEnabled,
             _ => false
         };
@@ -156,6 +161,7 @@ public sealed class PaymentGatewayAvailabilityService : IPaymentGatewayAvailabil
             configuration.HooshPayEnabled,
             configuration.TetraminatorEnabled,
             configuration.UniquePayEnabled && IsConfigured(PaymentGateway.UniquePay),
+            configuration.AtlasPayEnabled && IsConfigured(PaymentGateway.AtlasPay),
             configuration.NowPaymentsEnabled,
             Revision: 1);
     }
@@ -182,6 +188,10 @@ public sealed class PaymentGatewayAvailabilityService : IPaymentGatewayAvailabil
                 IsAbsoluteHttpUrl(_configuration.UniquePayReturnUrl) &&
                 IsAbsoluteHttpUrl(_configuration.UniquePayCallbackUrl) &&
                 _configuration.UniquePayFeePercent == 12m,
+            PaymentGateway.AtlasPay =>
+                HasSecret(_configuration.AtlasPayApiKey) &&
+                Uri.TryCreate(_configuration.AtlasPayBaseUrl, UriKind.Absolute, out var atlasUri) &&
+                string.Equals(atlasUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase),
             PaymentGateway.NowPayments =>
                 HasSecret(_configuration.NowPaymentApiKey) &&
                 HasSecret(_configuration.IpnSecretKey) &&
@@ -233,6 +243,7 @@ public sealed class PaymentGatewayAvailabilityService : IPaymentGatewayAvailabil
                 HooshPayEnabled = gateway == PaymentGateway.HooshPay ? enabled : current.HooshPayEnabled,
                 TetraminatorEnabled = gateway == PaymentGateway.Tetraminator ? enabled : current.TetraminatorEnabled,
                 UniquePayEnabled = gateway == PaymentGateway.UniquePay ? enabled : current.UniquePayEnabled,
+                AtlasPayEnabled = gateway == PaymentGateway.AtlasPay ? enabled : current.AtlasPayEnabled,
                 NowPaymentsEnabled = gateway == PaymentGateway.NowPayments ? enabled : current.NowPaymentsEnabled,
                 Revision = current.Revision + 1
             };
@@ -282,6 +293,7 @@ public sealed class PaymentGatewayAvailabilityService : IPaymentGatewayAvailabil
             PaymentGateway.HooshPay => "hooshPayEnabled",
             PaymentGateway.Tetraminator => "tetraminatorEnabled",
             PaymentGateway.UniquePay => "uniquePayEnabled",
+            PaymentGateway.AtlasPay => "atlasPayEnabled",
             PaymentGateway.NowPayments => "nowPaymentsEnabled",
             _ => throw new ArgumentOutOfRangeException(nameof(gateway), gateway, "Unknown payment gateway.")
         };

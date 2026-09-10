@@ -61,6 +61,7 @@ public class Program
         ValidateXuiV3LinkChangeConfiguration(appConfig);
         ValidateXuiV3VolumeReminderConfiguration(appConfig);
         ValidateTetraminatorConfiguration(appConfig);
+        ValidateAtlasPayConfiguration(appConfig);
         ValidateTenantStorefrontConfiguration(appConfig);
         ValidateTenantOrderNotificationConfiguration(appConfig);
 
@@ -120,6 +121,8 @@ public class Program
         services.AddScoped<TetraminatorSettlementService>();
         services.AddSingleton<UniquePay>();
         services.AddScoped<UniquePaySettlementService>();
+        services.AddSingleton<AtlasPay>();
+        services.AddScoped<AtlasPaySettlementService>();
         services.AddSingleton<BotContextAccessor>();
         services.AddSingleton<BotRegistry>();
         services.AddSingleton<BotClientProvider>();
@@ -181,6 +184,8 @@ public class Program
         services.AddHostedService<TenantStorefrontFundingMonitorHostedService>();
         services.AddSingleton<UniquePayReconciliationHostedService>();
         services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
+        services.AddSingleton<AtlasPayReconciliationHostedService>();
+        services.AddHostedService(sp => sp.GetRequiredService<AtlasPayReconciliationHostedService>());
 
         services.AddScoped<TelegramBotService>();
         TelegramUpdateScheduler.ValidateConfiguration(appConfig);
@@ -335,6 +340,7 @@ public class Program
             existing.TenantNowPaymentsEnabled = bot.TenantNowPaymentsEnabled;
             existing.TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled;
             existing.TenantUniquePayEnabled = bot.TenantUniquePayEnabled;
+            existing.TenantAtlasPayEnabled = bot.TenantAtlasPayEnabled;
             existing.UpdatedAtUtc = DateTime.UtcNow;
         }
 
@@ -446,6 +452,20 @@ public class Program
             throw new InvalidOperationException("Tetraminator is enabled but 'tetraminatorApiBaseUrl' is not an absolute HTTP/HTTPS URL.");
         if (!IsAbsoluteHttpUrl(appConfig.TetraminatorCallbackUrl))
             throw new InvalidOperationException("Tetraminator is enabled but 'tetraminatorCallbackUrl' is not an absolute HTTP/HTTPS URL.");
+    }
+
+    private static void ValidateAtlasPayConfiguration(AppConfig appConfig)
+    {
+        ArgumentNullException.ThrowIfNull(appConfig);
+        ValidateRange(nameof(appConfig.AtlasPayRequestTimeoutSeconds), appConfig.AtlasPayRequestTimeoutSeconds, 1, 120);
+        ValidateRange(nameof(appConfig.AtlasPayInquiryRetryCount), appConfig.AtlasPayInquiryRetryCount, 0, 10);
+        ValidateRange(nameof(appConfig.AtlasPayReconciliationIntervalSeconds), appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600);
+        ValidateRange(nameof(appConfig.AtlasPayReconciliationMaxAttempts), appConfig.AtlasPayReconciliationMaxAttempts, 1, 500);
+        ValidateRange(nameof(appConfig.AtlasPayReconciliationBatchSize), appConfig.AtlasPayReconciliationBatchSize, 1, 500);
+        if (!appConfig.AtlasPayEnabled) return;
+        if (string.IsNullOrWhiteSpace(appConfig.AtlasPayApiKey))
+            throw new InvalidOperationException("AtlasPay is enabled but 'atlasPayApiKey' is missing.");
+        AtlasPay.ValidateBaseUrl(appConfig.AtlasPayBaseUrl);
     }
 
     /// <summary>
