@@ -687,7 +687,14 @@ public sealed partial class ConcurrencyTests
         var previousIndex = applied.IndexOf(previous);
         var currentIndex = applied.IndexOf(current);
         Assert.True(previousIndex >= 0 && previousIndex < currentIndex, "owner-route migration must follow the AtlasPay migration");
-        Assert.Equal("20260911000006_AddTenantCardProvisionalDelivery", applied[^1]);
+        Assert.Contains("20260911023015_AddTenantCardProvisionalOperation", applied);
+        // The newest migration only adds the provisional finalize/revoke saga-state table, so it cannot rewrite the
+        // legacy rows asserted above. Ordering is asserted rather than a hard-coded "is latest" name so an unrelated
+        // future migration does not fail a test about backfill behaviour.
+        var provisionalDeliveryIndex = applied.IndexOf("20260911000006_AddTenantCardProvisionalDelivery");
+        var sagaStateIndex = applied.IndexOf("20260911023015_AddTenantCardProvisionalOperation");
+        Assert.True(provisionalDeliveryIndex >= 0 && provisionalDeliveryIndex < sagaStateIndex,
+            "the provisional saga-state migration must follow the provisional-delivery schema");
 
         var (resolver, _, _, _) = CreateRoutingResolver(databases);
         var resolved = await resolver.ResolveAsync(tenant, RoutingOwnerId);

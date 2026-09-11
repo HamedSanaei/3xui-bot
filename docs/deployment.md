@@ -48,6 +48,34 @@ preflight starts no web server, Telegram receiver, hosted worker, or remote logg
   --credentials-source /opt/vpnetiran/shared/Data/credentials.db
 ```
 
+## Synchronized-deployment gate (`scripts/deploy-production.sh`)
+
+The GitHub production workflow streams `scripts/deploy-production.sh` to the host, which clones the exact pushed SHA and
+synchronizes it into `/root/vpnetiran` before restarting `vpnetiranbot.service`. That path must clear the same gates as
+the immutable-release path; `dotnet publish` alone is explicitly **not** sufficient, because it compiles the application
+but never runs the suite or the EF model checks.
+
+Against the freshly cloned staging checkout, and before any source or publish synchronization and before systemd is
+touched, the script now runs, in order:
+
+```bash
+dotnet tool restore
+dotnet restore Adminbot.sln
+dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=<sha>"
+dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
+dotnet ef migrations has-pending-model-changes --no-build --context UserDbContext
+dotnet ef migrations has-pending-model-changes --no-build --context CredentialsDbContext
+```
+
+It then publishes with the same `SourceRevisionId` stamp, and runs the published executable's migration preflight twice:
+once against fresh databases, then against online-backup copies of `.../publish/Data/users.db` and
+`.../publish/Data/credentials.db`. Only after every gate passes does it synchronize source and publish and restart the
+service; a failing gate exits before the protected `Data` directory or systemd is touched.
+
+`scripts/deploy-production.tests.sh` asserts the *ordering* structurally (restore/build/tests/EF checks and the
+preflight all precede synchronization, and synchronization precedes the restart) so the gate cannot be dropped or moved
+by a later edit on a machine without rsync or systemd.
+
 ## Test schema policy
 
 The general concurrency fixture in `Adminbot.Tests/ConcurrencyTests.cs` uses `EnsureCreated` only for short-lived unit

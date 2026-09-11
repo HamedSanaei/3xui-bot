@@ -47,6 +47,8 @@ public class UserDbContext : DbContext
     public DbSet<TelegramUpdateInboxEntry> TelegramUpdateInbox { get; set; }
     /// <summary>Private durable XUI creation identities that prevent a second addClient after a restart.</summary>
     public DbSet<XuiV3CreationOperation> XuiV3CreationOperations { get; set; }
+    /// <summary>Restart-safe step state for tenant card-to-card provisional finalize and revoke sagas.</summary>
+    public DbSet<TenantCardProvisionalOperation> TenantCardProvisionalOperations { get; set; }
     public DbSet<BotInstance> BotInstances { get; set; }
     public DbSet<BotUserState> BotUserStates { get; set; }
     // Tenant storefront state stays in users.db; credentials.db owns global profiles, balances, and wallet receipts.
@@ -157,6 +159,19 @@ public class UserDbContext : DbContext
             entity.Property(x => x.OperationKey).HasMaxLength(240);
             entity.HasIndex(x => new { x.TelegramUserId, x.CreatedAtUtc });
             entity.HasIndex(x => x.InboxSequence);
+        });
+        modelBuilder.Entity<TenantCardProvisionalOperation>(entity =>
+        {
+            // The operation key is the durable identity of one finalize or revoke saga for one order.
+            entity.HasKey(x => x.OperationKey);
+            entity.Property(x => x.OperationKey).HasMaxLength(240);
+            entity.Property(x => x.Kind).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.Step).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.OrderId).HasMaxLength(120);
+            entity.Property(x => x.ErrorCode).HasMaxLength(120);
+            // Recovery scans for in-flight sagas, so index the order link and the terminal-step filter helper.
+            entity.HasIndex(x => x.TenantBotOrderId);
+            entity.HasIndex(x => new { x.Step, x.UpdatedAtUtc });
         });
         modelBuilder.Entity<TelegramUpdateInboxEntry>(entity =>
         {

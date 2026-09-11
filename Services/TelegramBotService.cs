@@ -8264,13 +8264,22 @@ public class TelegramBotService
         var isDeliveryError = IsUserDeliveryPollingError(exception);
         var isTransientTelegramError = IsTransientTelegramPollingError(exception);
         if (isDeliveryError)
+        {
             _logger.LogDebug("Telegram polling delivery error ignored. {ErrorMessage}", ErrorMessage);
+        }
         else if (isTransientTelegramError)
+        {
             _logger.LogDebug("Transient Telegram polling error ignored. {ErrorMessage}", ErrorMessage);
+        }
         else
+        {
             _logger.LogError(exception, "Telegram polling error. {ErrorMessage}", ErrorMessage);
 
-        Console.WriteLine(isDeliveryError || isTransientTelegramError ? $"Telegram polling skipped: {exception.Message}" : ErrorMessage);
+            // Only genuine, non-transient polling failures reach the process console. Per-user delivery noise and
+            // transient 5xx/429/timeout bursts are already captured in the local activity log, and writing one console
+            // line per failed getUpdates across every bot receiver is what previously flooded the journal.
+            Console.WriteLine(ErrorMessage);
+        }
     }
 
     /// <summary>
@@ -8304,24 +8313,21 @@ public class TelegramBotService
     /// </summary>
     /// <param name="exception">Exception raised by Telegram polling or update handling.</param>
     /// <returns>
-    /// <c>true</c> when Telegram returned a transient response such as a 429 rate limit or a 502 Bad Gateway;
-    /// otherwise <c>false</c>.
+    /// <c>true</c> when Telegram returned a transient response such as a 429 rate limit, a 5xx gateway/server status,
+    /// or a network transport failure that the polling loop will retry; otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
     /// These errors happen before a user update is available and are retried by the polling loop. They are written
     /// to the local activity file as warnings but logged only at debug level through <see cref="ILogger"/> so the
     /// private Telegram logger channel does not receive repeated non-actionable rate-limit or 502 messages.
+    /// Classification is delegated to <see cref="TelegramPollingBackoffPolicy.IsTransientGatewayFailure"/> so the shared
+    /// dispatcher and the multi-bot receiver lifecycle cannot disagree about what is transient.
     /// </remarks>
     private static bool IsTransientTelegramPollingError(Exception exception)
     {
-        if (exception is not ApiRequestException apiException)
-            return false;
-
-        var message = apiException.Message ?? string.Empty;
-        return apiException.ErrorCode is 429 or 500 or 502 or 503 or 504 ||
-               message.Contains("bad gateway", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("gateway timeout", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("service unavailable", StringComparison.OrdinalIgnoreCase);
+        // Shares one classifier with the multi-bot polling error handler so the dispatcher cannot disagree with the
+        // receiver about whether a 502/503/504, an HTTP timeout, or a network transport failure is transient.
+        return TelegramPollingBackoffPolicy.IsTransientGatewayFailure(exception);
     }
 
     /// <summary>

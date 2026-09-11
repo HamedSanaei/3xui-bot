@@ -42,6 +42,14 @@
     <None Include="Assets\Fonts\OFL.txt"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
+    <!-- Built-in tenant installation tutorial images. These are ordinary publish files, deliberately not embedded
+         resources, so they travel to production through the normal CI publish artifact and can be inspected or replaced
+         on the host without rebuilding. `Update` (not `Include`) is required: the SDK already globs these files into the
+         None item group, and including them twice would produce duplicate-item build errors. Deployment refuses to
+         release when any of the three tutorial directories is missing or empty from the publish output. -->
+    <None Update="Assets\tutorials\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
     <!-- Production Data is shared state and must never be copied into an immutable release artifact. -->
     <Content Update="Data\**" CopyToPublishDirectory="Never" />
     <None Update="Data\**" CopyToPublishDirectory="Never" />

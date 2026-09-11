@@ -32,8 +32,9 @@ namespace Adminbot.Domain.Logging
         /// <remarks>
         /// The method intentionally suppresses only known noisy patterns: stale callbacks, unchanged Telegram edits,
         /// receipt-photo relay failures that have a text fallback, repeated tenant forced-join probes, routine XUI v3
-        /// volume-reminder scan summaries, per-attempt UniquePay GET-reconciliation diagnostics, and Telegram polling
-        /// 5xx/429/timeouts. The first ambiguous UniquePay create and the terminal recovery/manual-review transition
+        /// volume-reminder scan summaries, per-attempt UniquePay GET-reconciliation diagnostics, the compact
+        /// <c>Telegram polling degraded</c> transient-backoff summary, and Telegram polling 5xx/429/timeouts. The first
+        /// ambiguous UniquePay create and the terminal recovery/manual-review transition
         /// use different messages and remain visible. Business failures such as invalid tokens, duplicate tokens, XUI
         /// scan/delivery failures, and payment settlement errors are not suppressed.
         ///
@@ -70,6 +71,8 @@ namespace Adminbot.Domain.Logging
                 ContainsOrdinalIgnoreCase(combined, "Tenant UniquePay customer inquiry failed") ||
                 ContainsOrdinalIgnoreCase(combined, "UniquePay HTTP trigger inquiry failed") ||
                 ContainsOrdinalIgnoreCase(combined, "XUI v3 volume reminder scan finished.") ||
+                ContainsOrdinalIgnoreCase(combined, "Telegram polling degraded.") ||
+                ContainsOrdinalIgnoreCase(combined, "Transient Telegram polling gateway error ignored") ||
                 ContainsOrdinalIgnoreCase(combined, "Gozargah site wallet debit response received."))
             {
                 return true;

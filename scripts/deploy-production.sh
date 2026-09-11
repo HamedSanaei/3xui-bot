@@ -13,6 +13,38 @@ fail() {
   exit 64
 }
 
+# Built-in installation tutorials are shipped as ordinary publish files beside the application. The tenant customer flow
+# exposes the tutorial buttons unconditionally, so a release whose images were never copied would ship a guide that fails
+# at send time. This preflight inspects ONLY the staged publish artifact - never the developer source tree - so it proves
+# both that the asset copy rules work and that the artifact about to be synchronized is complete.
+REQUIRED_TUTORIAL_ASSET_DIRS=(
+  "android_v2rayng"
+  "windows_v2rayn"
+  "ios_android_v2box"
+)
+
+assert_tutorial_assets() {
+  local publish_root="$1"
+  local tutorial_root="$publish_root/Assets/tutorials"
+  local dir target entry image_count
+
+  [[ -d "$tutorial_root" ]] || fail "published artifact is missing Assets/tutorials."
+  for dir in "${REQUIRED_TUTORIAL_ASSET_DIRS[@]}"; do
+    target="$tutorial_root/$dir"
+    [[ -d "$target" ]] || fail "published artifact is missing the built-in tutorial directory Assets/tutorials/$dir."
+    image_count=0
+    for entry in "$target"/*; do
+      [[ -f "$entry" ]] || continue
+      case "${entry,,}" in
+        *.jpg|*.jpeg|*.png) image_count=$((image_count + 1)) ;;
+      esac
+    done
+    if ((image_count == 0)); then
+      fail "published tutorial directory Assets/tutorials/$dir contains no supported image files."
+    fi
+  done
+}
+
 sync_source() {
   local source_dir="$1"
   local live_root="$2"
@@ -123,14 +155,50 @@ main() {
   [[ "$actual_sha" == "$deploy_sha" ]] || fail "fresh clone HEAD does not match requested GitHub SHA."
   [[ -z "$(git -C "$stage_source" status --porcelain)" ]] || fail "fresh staging checkout is unexpectedly dirty."
 
+  # Repository-required release gates. These run against the freshly checked-out staging clone BEFORE any source or
+  # publish synchronization and BEFORE systemd is touched, so a commit that does not build, does not pass its tests, or
+  # leaves either EF context with pending model changes can never reach production. Publish alone is deliberately not
+  # treated as a sufficient gate: it compiles the application but never runs the suite or the EF model checks.
+  printf 'Running release gates for commit %s.\n' "$actual_sha"
+  (
+    cd "$stage_source"
+    dotnet tool restore
+    dotnet restore Adminbot.sln
+    dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=$actual_sha"
+    dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
+    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context UserDbContext --configuration Release
+    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context CredentialsDbContext --configuration Release
+  ) || fail "release gates failed for commit $actual_sha; production was not synchronized or restarted."
+  printf 'Release gates passed for commit %s.\n' "$actual_sha"
+
   mkdir -p "$stage_publish"
   printf 'Publishing verified commit %s in staging.\n' "$actual_sha"
   (
     cd "$stage_source"
-    dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false -o "$stage_publish"
+    dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false \
+      "/p:SourceRevisionId=$actual_sha" -o "$stage_publish"
   )
 
   [[ -x "$stage_publish/Adminbot" ]] || fail "staged publish is missing the Adminbot executable."
+
+  # Built-in tutorial images must exist in the artifact before anything is synchronized or restarted. This runs after
+  # publish and before the migration preflight and any source/publish synchronization, so an incomplete release can never
+  # replace a working one.
+  printf 'Verifying built-in tutorial assets in the staged publish artifact.\n'
+  assert_tutorial_assets "$stage_publish"
+  printf 'Built-in tutorial assets verified in the staged publish artifact.\n'
+
+  # Migration preflight on the exact published executable: fresh databases first, then online-backup copies of the
+  # live production databases. This starts no web server, Telegram receiver, or worker, and it only reads the live
+  # database files, so a schema change that cannot apply to real production data aborts the deployment here.
+  printf 'Running migration preflight against fresh databases.\n'
+  "$stage_publish/Adminbot" --migration-check \
+    || fail "migration preflight failed against fresh databases."
+  printf 'Running migration preflight against production database copies.\n'
+  "$stage_publish/Adminbot" --migration-check \
+    --users-source "$live_data/users.db" \
+    --credentials-source "$live_data/credentials.db" \
+    || fail "migration preflight failed against production database copies."
   assert_data_unchanged
 
   printf 'Synchronizing repository source into live tree.\n'

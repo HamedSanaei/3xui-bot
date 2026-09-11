@@ -265,12 +265,9 @@ public class XuiV3PurchaseService
         if (selection == null)
             throw new ArgumentNullException(nameof(selection));
 
-        var catalog = LoadCatalog();
-        var service = catalog.Services.FirstOrDefault(s =>
-            string.Equals(s.Key, selection.ServiceKey, StringComparison.OrdinalIgnoreCase) && s.IsEnabled);
-
-        if (service == null)
-            throw new InvalidOperationException($"Service plan '{selection.ServiceKey}' was not found or is disabled.");
+        // One authoritative enabled-service lookup for the whole class, so the commercial path and the placement-only
+        // path can never disagree about which catalog entries exist or are switched on.
+        var service = FindService(selection.ServiceKey);
 
         if (service.IsUnlimited)
         {
@@ -1261,12 +1258,16 @@ public class XuiV3PurchaseService
     /// owner. <see cref="CredUser.IsColleague" /> is recorded in the panel comment only; it never changes pricing here.
     /// </param>
     /// <param name="serverInfo">Authenticated panel endpoint for the tenant or owned account. Never logged.</param>
-    /// <param name="serviceKey">
-    /// Service key from the plan catalog that supplies the server/inbound placement, for example <c>normal</c>. It must
-    /// come from a persisted order, not from Telegram text.
+    /// <param name="placement">
+    /// Placement produced by <see cref="ResolveTenantProvisionalPlacement" /> from the ORIGINAL tenant order selection.
+    /// This type cannot be constructed from a bare service key, which is what makes the tenant eligibility check
+    /// structurally unavoidable. Must not be <c>null</c>.
     /// </param>
     /// <param name="selectedCountry">Panel tag stored in legacy user state for display and audit.</param>
-    /// <param name="trafficGb">Traffic limit in whole GB. Must be greater than zero; no catalog minimum is applied.</param>
+    /// <param name="trafficGb">
+    /// Traffic limit in whole GB. Must be greater than zero; no catalog minimum is applied. This value is the single
+    /// source of the panel quota: the byte quota is always <c>ApiService.ConvertGBToBytes(trafficGb)</c>.
+    /// </param>
     /// <param name="durationDays">Lifetime in whole days. Must be greater than zero; no catalog duration key is required.</param>
     /// <param name="cancellationToken">Cancellation of the reservation, the single panel POST, and read-back recovery.</param>
     /// <param name="metadataOptions">
@@ -1277,17 +1278,28 @@ public class XuiV3PurchaseService
     /// Verified creation proof, or a safe failure. <see cref="XuiV3AccountCreationResult.Success" /> is the only positive
     /// signal; an ambiguous result never authorizes another panel create and must be reconciled by reading the panel.
     /// </returns>
-    /// <exception cref="ArgumentNullException">The credentials profile or panel descriptor is null.</exception>
+    /// <exception cref="ArgumentNullException">The credentials profile, panel descriptor, or placement is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException">The supplied traffic or duration is not positive.</exception>
+    /// <exception cref="ArgumentException">
+    /// <see cref="XuiV3AccountMetadataOptions.TrafficBytes" /> was supplied with a value that disagrees with
+    /// <c>ApiService.ConvertGBToBytes(trafficGb)</c>. A quota mismatch is rejected rather than silently applied, because
+    /// the customer-visible "1 GB" must always mean exactly 1 GiB on the panel.
+    /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// The service key is unknown or disabled, so no trusted placement exists.
+    /// The placement carries no enabled service, so no trusted server/inbound mapping exists.
     /// </exception>
     /// <remarks>
     /// This entry point exists for account shapes that are deliberately not catalog plans, specifically the provisional
-    /// tenant card-to-card courtesy account whose limits are policy constants rather than customer selections. It reuses
-    /// <see cref="FindService" /> and <see cref="ResolveServiceInboundIds" /> so server/inbound placement is never
-    /// duplicated, and it deliberately does not call <see cref="ResolvePurchase" />, which would reject limits below the
-    /// configured service minimum and any duration key the catalog does not define.
+    /// tenant card-to-card courtesy account whose limits are policy constants rather than customer selections. It accepts
+    /// only a <see cref="XuiV3ProvisionalPlacement" /> so the caller must have cleared
+    /// <see cref="ResolveTenantProvisionalPlacement" /> first, and it reuses the shared enabled-service lookup and
+    /// <see cref="ResolveServiceInboundIds" /> so server/inbound placement is never duplicated. It deliberately does not
+    /// call <see cref="ResolvePurchase" />, which would reject limits below the configured service minimum and any
+    /// duration key the catalog does not define.
+    ///
+    /// Quota integrity: the panel quota is always derived from <paramref name="trafficGb" />. A conflicting
+    /// <see cref="XuiV3AccountMetadataOptions.TrafficBytes" /> is rejected with <see cref="ArgumentException" /> instead of
+    /// being allowed to produce a different amount than the customer was promised.
     ///
     /// Side effects: one panel client is created through the same Reserve / single-POST / Applied-or-Ambiguous boundary as
     /// <see cref="CreateAccountAsync" />. No wallet debit, ledger entry, order mutation, or Telegram send happens here;
@@ -1295,10 +1307,13 @@ public class XuiV3PurchaseService
     /// </remarks>
     /// <example>
     /// <code>
+    /// // The original ordered plan is revalidated for current tenant eligibility first.
+    /// var placement = purchaseService.ResolveTenantProvisionalPlacement(originalSelection);
+    ///
     /// var result = await purchaseService.CreateAccountWithExplicitLimitsAsync(
     ///     user,
     ///     serverInfo,
-    ///     serviceKey: order.ServiceKey,
+    ///     placement,
     ///     selectedCountry: "tenant-card-provisional",
     ///     trafficGb: 1,
     ///     durationDays: 1,
@@ -1315,7 +1330,7 @@ public class XuiV3PurchaseService
     internal async Task<XuiV3AccountCreationResult> CreateAccountWithExplicitLimitsAsync(
         CredUser user,
         ServerInfo serverInfo,
-        string serviceKey,
+        XuiV3ProvisionalPlacement placement,
         string selectedCountry,
         int trafficGb,
         int durationDays,
@@ -1326,6 +1341,8 @@ public class XuiV3PurchaseService
             throw new ArgumentNullException(nameof(user));
         if (serverInfo == null)
             throw new ArgumentNullException(nameof(serverInfo));
+        if (placement?.Service == null)
+            throw new ArgumentNullException(nameof(placement));
         if (trafficGb <= 0)
             throw new ArgumentOutOfRangeException(nameof(trafficGb));
         if (durationDays <= 0)
@@ -1334,22 +1351,31 @@ public class XuiV3PurchaseService
         metadataOptions ??= new XuiV3AccountMetadataOptions();
         metadataOptions.AccountCounter = await ResolveAccountCounterAsync(user, metadataOptions);
 
-        // Placement is configuration and comes from the authoritative catalog lookup. The commercial limits below are
+        // The caller-supplied GB value is the single source of the quota. A conflicting byte override is refused rather
+        // than applied, so "1 GB" on the button can never become a different amount on the panel.
+        var trafficBytes = ApiService.ConvertGBToBytes(trafficGb);
+        if (metadataOptions.TrafficBytes > 0 && metadataOptions.TrafficBytes != trafficBytes)
+        {
+            throw new ArgumentException(
+                $"TrafficBytes ({metadataOptions.TrafficBytes}) must equal ConvertGBToBytes({trafficGb}) ({trafficBytes}).",
+                nameof(metadataOptions));
+        }
+
+        // Placement was already authorized against the original order selection; the commercial limits below are
         // caller-owned policy, so catalog minimum-traffic and duration-key validation is intentionally skipped.
-        var service = FindService(serviceKey);
-        var inboundIds = ResolveServiceInboundIds(service);
+        var service = placement.Service;
+        var inboundIds = placement.InboundIds?.Distinct().ToList() ?? ResolveServiceInboundIds(service);
         var priceToman = metadataOptions.PriceTomanOverride ?? 0L;
         var resolved = new XuiV3ResolvedPurchase
         {
             Service = service,
             TrafficGb = trafficGb,
-            TrafficBytes = ApiService.ConvertGBToBytes(trafficGb),
+            TrafficBytes = trafficBytes,
             DurationDays = durationDays,
             LimitIp = 0,
             PriceToman = priceToman,
             IsUnlimited = false
         };
-        var trafficBytes = metadataOptions.TrafficBytes > 0 ? metadataOptions.TrafficBytes : resolved.TrafficBytes;
         Console.WriteLine(
             $"[XUIv3] create explicit-limit account target panel url={serverInfo.Url}, rootPath={serverInfo.RootPath}, panelTag={selectedCountry}, service={service.Key}, inboundIds=[{string.Join(",", inboundIds)}], trafficGb={trafficGb}, durationDays={durationDays}");
 
@@ -1763,10 +1789,11 @@ public class XuiV3PurchaseService
     /// than provisioning against a guessed service.
     /// </exception>
     /// <remarks>
-    /// This is the placement half of <see cref="ResolvePurchase" />, separated so a caller that must supply its own
-    /// commercial limits can still reuse the authoritative service-to-server/inbound mapping instead of duplicating it.
-    /// Normal purchase and renewal paths continue to call <see cref="ResolvePurchase" />, which additionally enforces
-    /// the configured minimum traffic and enabled duration keys.
+    /// This is the ONLY enabled-service lookup in the class: <see cref="ResolvePurchase" /> and
+    /// <see cref="ResolveServiceInboundIds" /> both build on it, so there is no second equivalent catalog query that
+    /// could drift out of sync. Resolving a service here proves only that the catalog entry exists and is switched on;
+    /// it is not tenant authorization. Callers that need audience eligibility must additionally go through
+    /// <see cref="ResolveTenantPurchase" />, which is what <see cref="ResolveTenantProvisionalPlacement" /> enforces.
     /// </remarks>
     internal XuiV3ServiceDefinition FindService(string serviceKey)
     {
@@ -1796,6 +1823,69 @@ public class XuiV3PurchaseService
     internal static List<int> ResolveServiceInboundIds(XuiV3ServiceDefinition service)
     {
         return service?.InboundIds?.Distinct().ToList() ?? new List<int>();
+    }
+
+    /// <summary>
+    /// Authorizes provisional tenant courtesy-account placement for an <b>original</b> tenant order selection.
+    /// </summary>
+    /// <param name="originalSelection">
+    /// The tenant order's own commercial intent rebuilt from persisted order fields,
+    /// <see cref="Adminbot.Domain.TenantBotOrder.ServiceKey" /> with
+    /// <see cref="Adminbot.Domain.TenantBotOrder.TrafficGb" />, <see cref="Adminbot.Domain.TenantBotOrder.DurationKey" />,
+    /// and <see cref="Adminbot.Domain.TenantBotOrder.UnlimitedPlanKey" />. It must never be the synthetic 1 GB / 1 day
+    /// selection used for the courtesy account.
+    /// </param>
+    /// <returns>
+    /// The authorized service plus its configured panel inbound placement. The returned placement is the only input the
+    /// explicit-limit provisioning path accepts, so provisional access cannot be created from a bare service key.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">The selection is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The ordered service is unknown or disabled, the ordered traffic is below the configured service minimum, the
+    /// ordered duration key is no longer enabled, or an ordered unlimited plan is hidden from tenant storefronts. Every
+    /// one of these means the plan is no longer tenant-visible, so provisional access must not be granted.
+    /// </exception>
+    /// <remarks>
+    /// This is the eligibility gate the provisional flow must clear BEFORE any panel create. It answers exactly one
+    /// question - "is the customer's original order still sellable from this storefront right now?" - and nothing about
+    /// price. Eligibility is checked with the public role because the provisional courtesy account is delivered to the
+    /// customer, never priced or charged.
+    ///
+    /// The provisional 1 GB / 1 day limits deliberately do NOT flow through this method: they bypass commercial
+    /// minimum-traffic and duration-key validation inside <see cref="CreateAccountWithExplicitLimitsAsync" />. Do not
+    /// "simplify" either path into the other, or provisional delivery becomes impossible (the catalog rejects the
+    /// provisional shape) or unauthorized (a disabled or hidden plan would still grant free access).
+    ///
+    /// This method performs no I/O, no pricing, and no mutation. It only reads the in-memory plan catalog.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var originalSelection = new XuiV3PurchaseSelection
+    /// {
+    ///     ServiceKey = order.ServiceKey,
+    ///     TrafficGb = order.TrafficGb,
+    ///     DurationKey = order.DurationKey,
+    ///     UnlimitedPlanKey = order.UnlimitedPlanKey
+    /// };
+    ///
+    /// // Throws when the ordered plan is no longer tenant-visible, which must abort provisional delivery.
+    /// var placement = purchaseService.ResolveTenantProvisionalPlacement(originalSelection);
+    /// </code>
+    /// </example>
+    internal XuiV3ProvisionalPlacement ResolveTenantProvisionalPlacement(XuiV3PurchaseSelection originalSelection)
+    {
+        if (originalSelection == null)
+            throw new ArgumentNullException(nameof(originalSelection));
+
+        // Eligibility only, using the original ordered plan. This throws for a disabled service, a traffic value below
+        // the configured minimum, an unenabled duration key, or a tenant-hidden unlimited plan.
+        var resolved = ResolveTenantPurchase(originalSelection, false);
+
+        return new XuiV3ProvisionalPlacement
+        {
+            Service = resolved.Service,
+            InboundIds = ResolveServiceInboundIds(resolved.Service)
+        };
     }
 
     /// <summary>Serializes account metadata, retaining the recipient and originating storefront for free trials.</summary>
@@ -2037,6 +2127,33 @@ public class XuiV3PurchaseService
     {
         return inboundIds == null ? "[]" : $"[{string.Join(",", inboundIds)}]";
     }
+}
+
+/// <summary>
+/// Authorized service placement for a provisional tenant courtesy account.
+/// </summary>
+/// <remarks>
+/// This type exists so provisional provisioning cannot be reached with a bare service key. The only producer is
+/// <see cref="XuiV3PurchaseService.ResolveTenantProvisionalPlacement" />, which first revalidates the tenant order's
+/// ORIGINAL selection through <see cref="XuiV3PurchaseService.ResolveTenantPurchase" />. A globally enabled catalog
+/// entry on its own is therefore never sufficient authorization to hand out free provisional access.
+///
+/// The type carries placement only - service and panel inbound ids - and no price, quota, or duration, because the
+/// provisional 1 GB / 1 day limits are policy constants owned by the caller and must not be derived from the catalog.
+/// </remarks>
+public sealed class XuiV3ProvisionalPlacement
+{
+    /// <summary>
+    /// Gets or sets the enabled plan-catalog service that supplies the server/inbound placement and account metadata
+    /// for the provisional client. Never <c>null</c> on a placement returned by the resolver.
+    /// </summary>
+    public XuiV3ServiceDefinition Service { get; set; }
+
+    /// <summary>
+    /// Gets or sets the configured panel inbound ids the provisional client must be attached to, taken from the same
+    /// authoritative mapping the normal purchase path uses. The list can be empty when the plan file omits placement.
+    /// </summary>
+    public IReadOnlyList<int> InboundIds { get; set; }
 }
 
 public class XuiV3AccountMetadataOptions

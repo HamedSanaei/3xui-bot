@@ -687,6 +687,15 @@ public class MultiBotHostedService : IHostedService
     /// one stop/preflight/restart recovery task for that internal bot id.
     /// </summary>
     private readonly HashSet<string> _webhookConflictRecoveries = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Per-bot transient polling failure state used for bounded exponential backoff with jitter.
+    /// </summary>
+    /// <remarks>
+    /// State is keyed by the internal runtime bot id, so a Telegram outage that hits every owned and tenant receiver at
+    /// once produces independent delays per bot instead of one synchronized retry storm. This is process-local memory
+    /// only and never touches the database, the Telegram log outbox, or bot configuration.
+    /// </remarks>
+    private readonly TelegramPollingBackoffTracker _transientPollingBackoff = new();
     private readonly object _syncRoot = new();
 
     /// <summary>
@@ -1423,7 +1432,11 @@ public class MultiBotHostedService : IHostedService
     /// the affected tenant bot and then delegates normal error logging to the shared dispatcher.
     /// User-block and chat-not-found errors are treated as definitive per-user delivery failures. Request timeouts
     /// and Telegram 5xx responses are treated as transient polling transport failures and do not change chat state
-    /// or stop the receiver. A Telegram 429 rate limit pauses this receiver for Telegram's <c>RetryAfter</c> window
+    /// or stop the receiver. Transient failures additionally apply a bounded exponential delay with jitter, tracked
+    /// independently per internal bot id through <see cref="TelegramPollingBackoffTracker" />, so a Telegram outage that
+    /// hits every owned and tenant receiver at once cannot produce one synchronized retry storm; the delay is awaited
+    /// with the receiver cancellation token and a cancelled wait is the normal shutdown path. A Telegram 429 rate limit
+    /// pauses this receiver for Telegram's <c>RetryAfter</c> window
     /// (plus a small buffer) before the polling loop issues the next <c>getUpdates</c>, because Telegram.Bot 19.x does
     /// not delay on its own and would otherwise tight-loop through the whole rate-limit window. A Telegram 409
     /// getUpdates conflict means another process or receiver is already polling the same token; this receiver is
@@ -1437,6 +1450,11 @@ public class MultiBotHostedService : IHostedService
 
         if (TelegramRateLimitPolicy.IsRateLimited(exception))
         {
+            // A 429 proves Telegram's HTTP path is reachable, so the current transient-5xx incident is over; the wasted
+            // exponential counter is cleared. The delay itself stays Telegram's authoritative Retry-After and is never
+            // replaced or combined with the exponential 5xx backoff.
+            _transientPollingBackoff.RecordHealthyPolling(botId);
+
             var retryDelay = TelegramRateLimitPolicy.GetRetryDelay(exception);
             _logger.LogDebug(
                 "Telegram polling rate limited; pausing this receiver before the next getUpdates call. botId={BotId}, retryAfterSeconds={RetryAfterSeconds}",
@@ -1456,6 +1474,10 @@ public class MultiBotHostedService : IHostedService
 
         if (IsTelegramUserDeliveryError(exception))
         {
+            // A per-user delivery failure means an update was actually received from Telegram, which is direct evidence
+            // that long polling is healthy again, so any transient gateway incident is cleared.
+            _transientPollingBackoff.RecordHealthyPolling(botId);
+
             _logger.LogDebug(
                 "Telegram polling delivery error ignored. botId={BotId}, telegramError={Message}",
                 botId,
@@ -1465,10 +1487,36 @@ public class MultiBotHostedService : IHostedService
 
         if (IsTelegramTransientGatewayPollingError(exception))
         {
-            _logger.LogDebug(
-                "Transient Telegram polling gateway error ignored. botId={BotId}, telegramError={Message}",
-                botId,
-                exception.Message);
+            // One bounded, jittered delay PER BOT. Telegram.Bot 19 awaits this polling error handler before issuing the
+            // next getUpdates, exactly like the existing 429 pause, so the delay itself breaks the synchronized retry
+            // storm. The decision is computed quickly under the tracker's short per-bot lock and the delay is awaited
+            // afterwards with no registry, lifecycle, or database lock held.
+            var decision = _transientPollingBackoff.RegisterTransientFailure(botId);
+
+            if (decision.ShouldLogOperational)
+            {
+                // Compact operational summary: at most one line per bot per logging window. The raw Telegram message is
+                // intentionally not logged so a provider payload can never leak into local or forwarded logs, and this
+                // message text is suppressed from the Telegram logger channel by TelegramLogSuppression.
+                _logger.LogInformation(
+                    "Telegram polling degraded. botId={BotId} consecutiveFailures={ConsecutiveFailures} delaySeconds={DelaySeconds} errorType={ErrorType}",
+                    botId,
+                    decision.ConsecutiveFailures,
+                    Math.Round(decision.Delay.TotalSeconds, 2),
+                    exception.GetType().Name);
+            }
+            else
+            {
+                _logger.LogDebug(
+                    "Transient Telegram polling gateway error ignored. botId={BotId}, consecutiveFailures={ConsecutiveFailures}, delaySeconds={DelaySeconds}",
+                    botId,
+                    decision.ConsecutiveFailures,
+                    Math.Round(decision.Delay.TotalSeconds, 2));
+            }
+
+            // Shutdown during the backoff window is the normal stop path: it is never logged as an error, never marks
+            // the bot failed, and never restarts the receiver.
+            await TelegramPollingBackoffPolicy.DelayAsync(decision.Delay, cancellationToken);
             return;
         }
 
@@ -1711,32 +1759,23 @@ public class MultiBotHostedService : IHostedService
     /// </summary>
     /// <param name="exception">Exception raised by the Telegram polling loop.</param>
     /// <returns>
-    /// <c>true</c> for Telegram request timeouts, HTTP 429 rate limits, and 5xx gateway/server responses that should
-    /// be retried by polling; otherwise <c>false</c>.
+    /// <c>true</c> for Telegram request timeouts, HTTP 429 rate limits, HTTP/transport 5xx gateway-server failures, and
+    /// network-level transport exceptions that should be retried by polling with a bounded delay; otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
     /// Telegram occasionally returns request timeouts or bursts of 502 Bad Gateway from <c>getUpdates</c>. Those
     /// failures do not mean a user chat, bot token, or receiver is broken. HTTP 429 is included so startup probes and
     /// polling treat rate limits as transient instead of reporting a tenant failure through the Telegram log channel.
+    /// Classification delegates to <see cref="TelegramPollingBackoffPolicy.IsTransientGatewayFailure" /> so the shared
+    /// dispatcher cannot disagree with the receiver about whether a 502 is transient, including the case where the
+    /// Telegram edge returns a plain <c>RequestException</c> carrying only an HTTP status.
     /// </remarks>
     private static bool IsTelegramTransientGatewayPollingError(Exception exception)
     {
-        if (exception is RequestException requestException)
-        {
-            var requestMessage = requestException.Message ?? string.Empty;
-            return requestMessage.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
-                   requestMessage.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
-                   requestMessage.Contains("timeout", StringComparison.OrdinalIgnoreCase);
-        }
-
-        if (exception is not ApiRequestException apiException)
-            return false;
-
-        var message = apiException.Message ?? string.Empty;
-        return apiException.ErrorCode is 429 or 500 or 502 or 503 or 504 ||
-               message.Contains("bad gateway", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("gateway timeout", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("service unavailable", StringComparison.OrdinalIgnoreCase);
+        // Delegates to the shared classifier so owned, assistant, and tenant receivers all agree on what is transient.
+        // A Telegram edge 502 can arrive as a plain RequestException carrying only an HTTP status, which previously fell
+        // through to the noisy legacy polling logger instead of the bounded backoff path.
+        return TelegramPollingBackoffPolicy.IsTransientGatewayFailure(exception);
     }
 
     /// <summary>
@@ -2266,6 +2305,10 @@ public class MultiBotHostedService : IHostedService
 
         if (cts == null)
             return false;
+
+        // Receiver lifecycle ended: drop this bot's transient backoff state so a later, unrelated incident starts again
+        // at the first step and so historical tenant bot ids cannot accumulate unbounded in-memory state.
+        _transientPollingBackoff.Remove(botId);
 
         cts.Cancel();
         cts.Dispose();

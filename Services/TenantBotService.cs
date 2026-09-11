@@ -4,6 +4,7 @@ using System.Net;
 using System.Text;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
+using Adminbot.Services;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -68,6 +69,21 @@ public class TenantBotService
     private const string STEPMANUALCARDORDERID = "manual-card-order-id";
     private const string STEPTUTORIALTITLE = "tutorial-title";
     private const string STEPTUTORIALURL = "tutorial-url";
+    /// <summary>
+    /// Safe response shown when a tenant owner triggers the now-disabled owner-configurable tutorial manager.
+    /// </summary>
+    /// <remarks>
+    /// Used both for stale <c>TBM:tutorial*</c> callbacks from old Telegram messages and for obsolete owner input steps,
+    /// so an owner always learns that tutorials are provided by the system instead of silently getting no reaction.
+    /// </remarks>
+    private const string TENANTTUTORIALMANAGERDISABLEDMESSAGE =
+        "این بخش فعلاً غیرفعال است و آموزش‌ها به‌صورت پیش‌فرض توسط سیستم ارائه می‌شوند.";
+    /// <summary>Customer-facing menu text shown before the three built-in installation tutorials.</summary>
+    private const string TENANTTUTORIALMENUTEXT =
+        "📚 آموزش نصب\n\nسیستم‌عامل یا نرم‌افزار موردنظر خود را انتخاب کنید:";
+    /// <summary>Customer-facing text used when the built-in tutorial images cannot be read from the deployed assets.</summary>
+    private const string TENANTTUTORIALASSETSUNAVAILABLEMESSAGE =
+        "در حال حاضر فایل‌های آموزش در دسترس نیستند. لطفاً کمی بعد دوباره تلاش کنید.";
     private const string STEPBROADCASTINPUT = "broadcast-input";
     private const string TENANTRENEWFLOW = "TENANTBOT-renew";
     private const string TENANTRENEWSTEPACCOUNT = "renew-account";
@@ -392,9 +408,11 @@ public class TenantBotService
             return true;
         }
 
+        // Owner-configurable tutorials are disabled. A stale prompt from an old message must cancel the obsolete step
+        // without writing anything into TenantTutorialsJson, then return the owner to the tenant panel.
         if (step == STEPTUTORIALTITLE || step == STEPTUTORIALURL)
         {
-            await SAVETENANTTUTORIALSTEPASYNC(botClient, Message, CredUser, User, CancellationToken);
+            await HANDLEOBSOLETETUTORIALSTEPASYNC(botClient, Message, CredUser, CancellationToken);
             return true;
         }
 
@@ -635,21 +653,18 @@ public class TenantBotService
             return true;
         }
 
-        if (action == "tutorials")
+        // Owner-configured tutorial links are disabled. Historical messages still carry these buttons, so every legacy
+        // tutorial callback answers safely and returns without touching users.db. TenantTutorialsJson is never read or
+        // rewritten here, which keeps a later rollback to owner-configurable tutorials possible.
+        if (action == "tutorials" || action == "tutorial-add" || action.StartsWith("tutorial-del:", StringComparison.Ordinal))
         {
-            await SHOWTENANTTUTORIALMANAGERASYNC(botClient, CallbackQuery, CredUser, CancellationToken);
-            return true;
-        }
-
-        if (action == "tutorial-add")
-        {
-            await STARTTENANTTUTORIALADDASYNC(botClient, CallbackQuery, CancellationToken);
-            return true;
-        }
-
-        if (action.StartsWith("tutorial-del:", StringComparison.Ordinal))
-        {
-            await DELETETENANTTUTORIALASYNC(botClient, CallbackQuery, CredUser, action["tutorial-del:".Length..], CancellationToken);
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                CallbackQuery.Id,
+                TENANTTUTORIALMANAGERDISABLEDMESSAGE,
+                showAlert: true,
+                cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(botClient, CallbackQuery.Message.Chat.Id, CredUser, null, CancellationToken);
             return true;
         }
 
@@ -1285,7 +1300,9 @@ public class TenantBotService
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData("🎓 آموزش‌ها", OWNERCALLBACKPREFIX + "tutorials"),
+                // The owner-configurable tutorial manager is intentionally not offered anymore: customer tutorials are
+                // now the built-in, system-provided albums. The legacy callback handlers stay reachable as safe no-ops so
+                // a stale button in an old Telegram message cannot mutate tenant tutorial data.
                 InlineKeyboardButton.WithCallbackData("📢 پیام عمومی", OWNERCALLBACKPREFIX + "broadcast")
             },
             new[]
@@ -5359,15 +5376,20 @@ public class TenantBotService
     }
 
     /// <summary>
-    /// Sends tenant-specific installation tutorial links when the owner configured them for the storefront.
+    /// Shows the tenant customer the three built-in installation tutorials as category buttons.
     /// </summary>
-    /// <param name="botClient">Tenant bot client used to send the tutorial message.</param>
+    /// <param name="botClient">Tenant bot client used to send the tutorial menu.</param>
     /// <param name="chatId">Telegram chat id of the tenant customer requesting help.</param>
-    /// <param name="tenant">Tenant bot row that owns tutorial link configuration.</param>
+    /// <param name="tenant">Tenant bot that owns this storefront conversation; used only for tenant context.</param>
     /// <param name="cancellationToken">Cancellation token for the Telegram send operation.</param>
+    /// <returns>A task completing after the category menu has been sent.</returns>
     /// <remarks>
-    /// Tutorial links are tenant-owned storefront settings. When no links are configured, the customer receives a
-    /// clear tenant message instead of falling back to the platform-owned bot tutorials.
+    /// Tutorials are built into the application and are identical for every storefront. This method therefore never
+    /// reads <c>TenantTutorialsJson</c> and performs no users.db write: choosing a tutorial is a pure presentation action
+    /// and cannot change customer, order, wallet, or tenant state.
+    ///
+    /// The customer is never left in a tutorial conversation step, so the normal tenant reply keyboard keeps working after
+    /// the guide is delivered.
     /// </remarks>
     private async Task SendTenantTutorialsAsync(
         ITelegramBotClient botClient,
@@ -5375,30 +5397,98 @@ public class TenantBotService
         BotInstance tenant,
         CancellationToken cancellationToken)
     {
-        var rows = ReadTenantTutorials(tenant)
-            .Select(x => new[] { InlineKeyboardButton.WithUrl(x.Title, x.Url) })
-            .ToList();
-
-        if (rows.Count == 0)
+        // One row per category so the operating system is unambiguous on narrow mobile clients.
+        var rows = new List<InlineKeyboardButton[]>
         {
-            await botClient.SendTextMessageAsync(
-                chatId,
-                "هنوز آموزشی برای این فروشگاه ثبت نشده است. لطفاً با پشتیبانی فروشگاه تماس بگیرید.",
-                replyMarkup: BuildTenantReplyKeyboard(),
-                cancellationToken: cancellationToken);
-            return;
-        }
+            new[] { InlineKeyboardButton.WithCallbackData("🤖 آموزش نصب Android", CUSTOMERCALLBACKPREFIX + "tutorial:" + TenantTutorialKinds.Android) },
+            new[] { InlineKeyboardButton.WithCallbackData("🍎 آموزش نصب iOS", CUSTOMERCALLBACKPREFIX + "tutorial:" + TenantTutorialKinds.Ios) },
+            new[] { InlineKeyboardButton.WithCallbackData("🪟 آموزش نصب ویندوز", CUSTOMERCALLBACKPREFIX + "tutorial:" + TenantTutorialKinds.Windows) }
+        };
 
         await botClient.SendTextMessageAsync(
             chatId,
-            "برای دریافت آموزش، یکی از دکمه‌های زیر را انتخاب کنید:",
+            TENANTTUTORIALMENUTEXT,
             replyMarkup: new InlineKeyboardMarkup(rows),
             cancellationToken: cancellationToken);
     }
 
     /// <summary>
+    /// Delivers one built-in installation tutorial to a tenant customer as Telegram photo albums.
+    /// </summary>
+    /// <param name="botClient">Tenant bot client that serves the requesting customer.</param>
+    /// <param name="chatId">Customer chat that requested the tutorial.</param>
+    /// <param name="tutorialKind">
+    /// Tutorial kind extracted from the callback payload. Only the three closed <see cref="TenantTutorialKinds" />
+    /// values resolve to a directory; any other value is treated as unavailable rather than mapped to a folder.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for local file reads and Telegram uploads.</param>
+    /// <returns>A task completing after the albums or the unavailable notice have been sent.</returns>
+    /// <remarks>
+    /// Reads only the fixed built-in tutorial directory for the requested kind and performs no database work, so
+    /// requesting a tutorial cannot change customer, order, wallet, XUI, or tenant configuration state.
+    ///
+    /// A missing, empty, or unreadable asset directory is a local operational condition: it is logged with the tutorial
+    /// kind and its repository-relative directory (never an absolute server path) and the customer receives a friendly
+    /// temporary-unavailable message instead of a failed callback.
+    /// </remarks>
+    private async Task SENDTENANTTUTORIALALBUMASYNC(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        string tutorialKind,
+        CancellationToken cancellationToken)
+    {
+        var assets = TenantTutorialAssetService.Resolve(tutorialKind);
+        if (!assets.IsAvailable)
+        {
+            _logger.LogWarning(
+                "Tenant tutorial assets unavailable. kind={TutorialKind}, dir={RelativeDirectory}, status={AssetStatus}",
+                assets.Kind ?? "unsupported",
+                assets.RelativeDirectory,
+                assets.Status);
+            await botClient.SendTextMessageAsync(
+                chatId,
+                TENANTTUTORIALASSETSUNAVAILABLEMESSAGE,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        await TenantTutorialAlbumSender.SendAsync(botClient, chatId, assets, _logger, cancellationToken);
+    }
+
+    /// <summary>
+    /// Cancels an obsolete owner tutorial input step without persisting anything.
+    /// </summary>
+    /// <param name="botClient">Owned bot client used to answer the owner and restore the tenant panel.</param>
+    /// <param name="message">Owner text message that arrived while an obsolete tutorial step was still stored.</param>
+    /// <param name="owner">Authenticated colleague profile that owns the current storefront selection.</param>
+    /// <param name="cancellationToken">Cancellation token for state and Telegram operations.</param>
+    /// <returns>A task completing after the stale step is cleared and the owner is returned to the panel.</returns>
+    /// <remarks>
+    /// This path exists only for owners whose conversation state still holds <c>tutorial-title</c> or <c>tutorial-url</c>
+    /// from before owner-configurable tutorials were disabled. It clears the bot-scoped step and never writes
+    /// <c>TenantTutorialsJson</c>, so historical tutorial data stays intact for a possible future rollback.
+    /// </remarks>
+    private async Task HANDLEOBSOLETETUTORIALSTEPASYNC(
+        ITelegramBotClient botClient,
+        Message message,
+        CredUser owner,
+        CancellationToken cancellationToken)
+    {
+        await _state.ClearUserStatus(new User { Id = message.From.Id });
+        await botClient.SendTextMessageAsync(
+            message.Chat.Id,
+            TENANTTUTORIALMANAGERDISABLEDMESSAGE,
+            cancellationToken: cancellationToken);
+        await SHOWOWNERPANELASYNC(botClient, message.Chat.Id, owner, null, cancellationToken);
+    }
+
+    /// <summary>
     /// Adds URL buttons for one tutorial platform to a tenant tutorial keyboard.
     /// </summary>
+    /// <remarks>
+    /// Dormant: owner-configurable tutorial links are disabled, so this helper currently has no production caller. It is
+    /// intentionally retained so re-enabling owner tutorials later does not require reconstructing the keyboard logic.
+    /// </remarks>
     /// <param name="rows">Mutable inline-keyboard rows that will be sent to the tenant customer.</param>
     /// <param name="label">Human-readable platform label, such as Android or Windows.</param>
     /// <param name="json">JSON array of URLs stored on the tenant bot row; null or invalid JSON is ignored.</param>
@@ -5518,6 +5608,24 @@ public class TenantBotService
             await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
             await SendTenantHomeAsync(botClient, ChatId, tenant, CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
+            return;
+        }
+
+        // Built-in installation tutorials. The payload selects one of three compile-time kinds only: it can never
+        // choose a filesystem path, another tenant bot, or an arbitrary folder, so no customer input reaches the
+        // filesystem resolver. The callback is acknowledged before any file I/O so the client spinner is not held open
+        // while several photos are uploaded.
+        if (action.StartsWith("tutorial:", StringComparison.Ordinal))
+        {
+            // No conversation state is written or cleared: the tutorial menu is a standalone inline message, and
+            // interrupting an in-progress purchase just to view a guide must not discard that flow. Requesting a
+            // tutorial is therefore a pure presentation action with no users.db effect.
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
+            await SENDTENANTTUTORIALALBUMASYNC(
+                botClient,
+                ChatId,
+                action["tutorial:".Length..],
+                CancellationToken);
             return;
         }
 

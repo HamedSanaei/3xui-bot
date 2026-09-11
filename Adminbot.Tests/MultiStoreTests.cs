@@ -438,6 +438,22 @@ public sealed partial class ConcurrencyTests
         public List<string> Labels { get; } = new();
         /// <summary>Callback alerts captured for authorization and stale-button assertions.</summary>
         public List<string> Answers { get; } = new();
+        /// <summary>
+        /// Ordered request-kind log used to prove that a callback is acknowledged before slower work starts.
+        /// </summary>
+        /// <remarks>
+        /// Entries are short stable markers such as <c>answer</c>, <c>media-group</c>, <c>photo</c>, and <c>text</c>, so a
+        /// test can assert relative ordering instead of wall-clock timing.
+        /// </remarks>
+        public List<string> Events { get; } = new();
+        /// <summary>Item count of each media-group (album) request, in send order.</summary>
+        public List<int> MediaGroupSizes { get; } = new();
+        /// <summary>Captions supplied on media-group items, in send order. A null slide caption is not recorded.</summary>
+        public List<string> MediaGroupCaptions { get; } = new();
+        /// <summary>Number of single-photo sends, used to prove the one-image path avoids an invalid media group.</summary>
+        public int SinglePhotoSends { get; private set; }
+        /// <summary>Captions supplied on single-photo sends, in send order.</summary>
+        public List<string> SinglePhotoCaptions { get; } = new();
         /// <inheritdoc />
         public bool LocalBotServer => false;
         /// <inheritdoc />
@@ -462,16 +478,35 @@ public sealed partial class ConcurrencyTests
         public virtual Task<TResponse> MakeRequestAsync<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
         {
             InlineKeyboardMarkup? keyboard = null;
-            if (request is AnswerCallbackQueryRequest answer && answer.Text != null) Answers.Add(answer.Text);
-            if (request is SendMessageRequest send) { Texts.Add(send.Text); keyboard = send.ReplyMarkup as InlineKeyboardMarkup; }
-            if (request is EditMessageTextRequest edit) { Texts.Add(edit.Text); keyboard = edit.ReplyMarkup; }
+            if (request is AnswerCallbackQueryRequest answer) { Events.Add("answer"); if (answer.Text != null) Answers.Add(answer.Text); }
+            if (request is SendMessageRequest send) { Events.Add("text"); Texts.Add(send.Text); keyboard = send.ReplyMarkup as InlineKeyboardMarkup; }
+            if (request is EditMessageTextRequest edit) { Events.Add("text"); Texts.Add(edit.Text); keyboard = edit.ReplyMarkup; }
+            if (request is SendMediaGroupRequest mediaGroup)
+            {
+                // Album sends are recorded by size and caption so a test can prove batching and one-caption placement.
+                Events.Add("media-group");
+                var items = mediaGroup.Media.ToList();
+                MediaGroupSizes.Add(items.Count);
+                MediaGroupCaptions.AddRange(items.OfType<InputMediaPhoto>().Select(x => x.Caption).Where(x => x != null)!);
+            }
+            if (request is SendPhotoRequest photoRequest)
+            {
+                Events.Add("photo");
+                SinglePhotoSends++;
+                if (photoRequest.Caption != null) SinglePhotoCaptions.Add(photoRequest.Caption);
+            }
             if (keyboard != null)
             {
                 var flat = keyboard.InlineKeyboard.SelectMany(x => x).ToList();
                 Callbacks.AddRange(flat.Select(x => x.CallbackData).Where(x => x != null)!);
                 Labels.AddRange(flat.Select(x => x.Text));
             }
-            object result = typeof(TResponse) == typeof(bool) ? true : new Message { MessageId = 1, Chat = new Chat { Id = 711 } };
+            object result = typeof(TResponse) == typeof(bool)
+                ? true
+                // Album sends return Message[], so an empty array is returned instead of a single message.
+                : typeof(TResponse).IsArray
+                    ? Array.CreateInstance(typeof(TResponse).GetElementType()!, 0)
+                    : new Message { MessageId = 1, Chat = new Chat { Id = 711 } };
             return Task.FromResult((TResponse)result);
         }
     }

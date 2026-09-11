@@ -1498,7 +1498,53 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> BulkAdjustClientsAsync(ServerInfo serverInfo, IConfiguration configuration, object request, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/bulkAdjust", request, true, cancellationToken);
 
-    /// <summary>POST /panel/api/clients/resetTraffic/{email}. Resets one client's up/down counters.</summary>
+    /// <summary>
+    /// POST /panel/api/clients/resetTraffic/{email}. Authoritatively resets every usage source for one client.
+    /// </summary>
+    /// <param name="serverInfo">Panel that owns the client record, its inbounds, and its traffic rows.</param>
+    /// <param name="configuration">Runtime timeout, authentication, and retry configuration.</param>
+    /// <param name="email">
+    /// Stable XUI client email. The panel resolves the owning <c>ClientRecord</c> by this value and fails when no record
+    /// exists, so a detached email cannot be reset.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the external request.</param>
+    /// <returns>
+    /// The panel response. A success means the panel already disabled-and-re-enabled bookkeeping; callers must still
+    /// read the client back before treating any derived state as settled.
+    /// </returns>
+    /// <remarks>
+    /// Proved against upstream 3x-ui v3.7.0 and v3.4.2 source. <c>ClientService.ResetTrafficByEmail</c>:
+    /// <list type="number">
+    /// <item>loads the client record and resolves every inbound the client is attached to;</item>
+    /// <item><b>auto-enables a disabled client</b> by writing <c>enable = true</c> through the normal update path, logging
+    /// and continuing when that write fails;</item>
+    /// <item>then calls <c>InboundService.ResetClientTraffic</c> per inbound (or <c>ResetClientTrafficByEmail</c> when the
+    /// client has no inbound), which zeroes <c>client_traffics.up/down</c>, forces <c>enable = true</c>, deletes every
+    /// master-pushed <c>client_global_traffics</c> row, deletes every <c>node_client_traffics</c> row, bumps the inbound's
+    /// <c>last_traffic_reset_time</c>, and marks remote nodes dirty.</item>
+    /// </list>
+    ///
+    /// Two consequences are contractual and must never be assumed away:
+    /// <list type="bullet">
+    /// <item><b>The client is left enabled.</b> A caller that needs a disabled client must disable it again afterwards and
+    /// prove that state by read-back; it must not assume the reset preserved a disabled flag.</item>
+    /// <item><b>This is the only operation that clears all usage sources.</b> <see cref="UpdateClientTrafficAsync"/> cannot
+    /// substitute for it on a panel that receives master-pushed global traffic or hosts remote nodes, because those rows
+    /// survive a counter write and are re-overlaid onto reads.</item>
+    /// </list>
+    /// The operation is value-idempotent: replaying it after an ambiguous response converges on the same zeroed, enabled
+    /// state and cannot double-count usage.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var reset = await ApiServicev3.ResetClientTrafficAsync(serverInfo, configuration, email, cancellationToken);
+    /// if (!reset.Success)
+    ///     return; // no Telegram request was made by this call; safe to retry later
+    ///
+    /// var traffic = await ApiServicev3.GetClientTrafficAsync(serverInfo, configuration, email, cancellationToken);
+    /// // Up == 0 and Down == 0 prove counters were cleared; the client is enabled by contract.
+    /// </code>
+    /// </example>
     public static Task<XuiV3ApiResponse<JToken>> ResetClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/resetTraffic/{EscapePath(email)}", null, true, cancellationToken);
 
@@ -1510,17 +1556,37 @@ public class ApiServicev3
     public static Task<XuiV3ApiResponse<JToken>> ResetAllClientTrafficsAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/resetAllTraffics", null, true, cancellationToken);
 
-    /// <summary>Writes explicit upload and download counters for one XUI client.</summary>
+    /// <summary>Writes absolute upload and download counters for one XUI client.</summary>
     /// <param name="serverInfo">Panel that owns the client and traffic row.</param>
     /// <param name="configuration">Runtime timeout, authentication, and retry configuration.</param>
-    /// <param name="email">Current XUI client email used by the traffic endpoint.</param>
-    /// <param name="up">Uploaded bytes; must be non-negative.</param>
-    /// <param name="down">Downloaded bytes; must be non-negative.</param>
+    /// <param name="email">
+    /// Current XUI client email used by the traffic endpoint. The email is the client's stable identity in the panel and
+    /// is the key of the single shared <c>client_traffics</c> row, not a per-inbound row.
+    /// </param>
+    /// <param name="up">Absolute uploaded bytes to store; must be non-negative. This is a value, not a delta.</param>
+    /// <param name="down">Absolute downloaded bytes to store; must be non-negative. This is a value, not a delta.</param>
     /// <param name="cancellationToken">Token that cancels the external request.</param>
     /// <param name="retryMode">Replay policy; link-change repair disables blind retries and verifies by read-back.</param>
     /// <returns>The panel response; a timeout is ambiguous and must not be interpreted as counters being reset.</returns>
+    /// <remarks>
+    /// Proved against upstream 3x-ui v3.7.0/v3.4.2 source. The handler
+    /// (<c>ClientController.updateTrafficByEmail</c>) binds a JSON body of
+    /// <c>{ "upload": &lt;int64&gt;, "download": &lt;int64&gt; }</c> and forwards it to
+    /// <c>InboundService.UpdateClientTrafficByEmail</c>, which performs a single
+    /// <c>UPDATE client_traffics SET up = ?, down = ? WHERE email = ?</c>.
+    ///
+    /// Because the panel binds only those two field names, a request that spelled them <c>up</c>/<c>down</c> would be
+    /// accepted with HTTP 200 while both counters were written as zero. The wire body is therefore declared with
+    /// explicit JSON property names so a future rename cannot silently reintroduce that silent data loss.
+    ///
+    /// This endpoint is deliberately narrow. It does NOT change the client's enable flag, does NOT delete
+    /// master-pushed <c>client_global_traffics</c> rows, does NOT delete <c>node_client_traffics</c> rows, and does not
+    /// touch the Xray runtime or any inbound settings. A read after writing zero can therefore still report the
+    /// master-pushed overlay, because read paths raise <c>up</c>/<c>down</c> to the maximum of fresh global rows. Use
+    /// <see cref="ResetClientTrafficAsync"/> when an authoritative reset of every usage source is required.
+    /// </remarks>
     public static Task<XuiV3ApiResponse<JToken>> UpdateClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email, long up, long down, CancellationToken cancellationToken = default, XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.IdempotentMutation)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/updateTraffic/{EscapePath(email)}", new { up, down }, true, cancellationToken, retryMode: retryMode);
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/updateTraffic/{EscapePath(email)}", new XuiV3TrafficUpdateRequest { Upload = up, Download = down }, true, cancellationToken, retryMode: retryMode);
 
     /// <summary>POST /panel/api/clients/delDepleted. Deletes clients whose traffic quota is exhausted.</summary>
     public static Task<XuiV3ApiResponse<JToken>> DeleteDepletedClientsAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
@@ -3459,4 +3525,27 @@ public class XuiV3ApiTokenCreated : XuiV3ApiTokenInfo
 {
     [JsonProperty("token")]
     public string Token { get; set; }
+}
+
+/// <summary>
+/// Exact JSON body accepted by <c>POST /panel/api/clients/updateTraffic/{email}</c>.
+/// </summary>
+/// <remarks>
+/// Proved against upstream 3x-ui v3.7.0/v3.4.2 <c>ClientController.updateTrafficByEmail</c>, which binds struct
+/// fields tagged <c>json:"upload"</c> and <c>json:"download"</c>. Every property carries an explicit
+/// <see cref="JsonPropertyAttribute" /> so a future C# rename cannot silently change the wire contract: the panel ignores
+/// unknown fields and would answer HTTP 200 while storing zero, which is data loss rather than an error.
+///
+/// Both values are absolute counters, not deltas, and this endpoint changes nothing except the single shared
+/// <c>client_traffics</c> row selected by email.
+/// </remarks>
+internal sealed class XuiV3TrafficUpdateRequest
+{
+    /// <summary>Absolute uploaded byte counter to store in <c>client_traffics.up</c>.</summary>
+    [JsonProperty("upload")]
+    public long Upload { get; set; }
+
+    /// <summary>Absolute downloaded byte counter to store in <c>client_traffics.down</c>.</summary>
+    [JsonProperty("download")]
+    public long Download { get; set; }
 }

@@ -69,6 +69,14 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   HTTP listener, Telegram receiver, hosted worker, or remote logger.
 - Production deployment uses immutable `/opt/vpnetiran/releases/<commit>/` directories, shared persistent Data,
   atomic `current`/`previous` symlinks, and rollback-aware systemd activation through `scripts/deploy-release.sh`.
+  The GitHub workflow uses the OTHER path: it streams `scripts/deploy-production.sh` to the host, which clones the exact
+  pushed SHA into staging and rsyncs it into the live tree before restarting. That path now runs the full gate against
+  the staged clone BEFORE any synchronization or systemd action: `dotnet tool restore`, `dotnet restore Adminbot.sln`,
+  `dotnet build Adminbot.sln -c Release --no-restore`, `dotnet test Adminbot.Tests ... --no-build`, both
+  `dotnet ef migrations has-pending-model-changes` contexts, then publish with `SourceRevisionId`, then the published
+  executable's `--migration-check` against fresh databases AND online-backup copies of the live
+  `Data/users.db` + `Data/credentials.db`. `dotnet publish` alone was previously the only check on that path and is
+  explicitly not sufficient. `scripts/deploy-production.tests.sh` asserts this ordering structurally.
   See `docs/deployment.md`. A dirty or SHA-mismatched checkout is rejected before build, and systemd is untouched until
   every build/test/EF/artifact check succeeds. Release assemblies log their embedded commit and build configuration.
 - Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
@@ -726,7 +734,7 @@ and the main menu.
 - `telegramBotStartupProbeTimeoutSeconds` controls the short Telegram startup/panel probe (default 12 seconds).
   `SetMyCommands` is background initialization and must not stop an already registered receiver.
 - Super-admins can use `🤖 وضعیت ربات‌ها` to see process-local receiver health for every owned, assistant, and tenant bot. The report comes from `BotRuntimeStatusStore`; it never exposes tokens and does not call Telegram.
-- Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel.
+- Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel. They now also apply a bounded per-bot backoff through `Domain/Logging/TelegramPollingBackoffPolicy.cs`: `TelegramPollingBackoffTracker` keeps `ConsecutiveTransientFailures`/`LastFailureAtUtc`/`LastOperationalLogAtUtc` per internal `BotId` (in-memory only, no schema, no migration), the delay is `1s,2s,4s,8s,16s,…` capped at 30s with ±20% jitter, and it is awaited with the receiver token (shutdown during backoff is the normal stop path). State decays after a `HealthyResetSeconds` (60s) gap because Telegram.Bot 19 exposes no successful-empty-`getUpdates` callback, and it is cleared on 429, on a per-user delivery error, and when a receiver stops (`StopBotCore`), so historical tenant ids cannot accumulate state. `IsTransientGatewayFailure` is the single classifier shared by `MultiBotHostedService` and `TelegramBotService`; it trusts `RequestException.HttpStatusCode` 5xx (the Telegram edge can return a plain status without a JSON error body) plus `HttpRequestException`/`IOException`, while 401/403/400 and both 409 conflict variants stay non-transient. Bursts log at most one `Telegram polling degraded.` summary per bot per window (suppressed from the Telegram channel); only genuine non-transient polling errors reach the process console, and these failures are never written to `TelegramOutbox`.
 - Telegram `429 Too Many Requests` is handled centrally through `Domain/Logging/TelegramRateLimitPolicy.cs`: the polling error handler pauses the receiver for Telegram's `RetryAfter` (+1s buffer, capped at 60s) before the next `getUpdates` (Telegram.Bot 19.x does not delay on its own and would tight-loop), the update wrapper swallows a 429 after the same backoff instead of letting it kill the receiver, and `Domain/Logging/TelegramLogSuppression.cs` suppresses any log entry whose exception is a Telegram 429 so the logger never amplifies the rate-limit storm. Receivers keep polling after the window and are never restarted, so no duplicate receiver instances can appear.
 - `Domain/Logging/TelegramLogger.cs` also applies message-level channel suppression for known noncritical noise: stale Sales Assistant callbacks, unchanged Telegram edits, receipt-photo relay warnings that have a text fallback, repeated tenant forced-join probes, routine XUI v3 volume-reminder scan summaries, and Telegram polling 5xx/429/timeouts. Suppression is Telegram-provider-only, so standard/local logging retains these entries; payment/audit logs and real token/XUI/settlement failures still reach the private channel.
 - Tenant forced-join activation validates the tenant bot identity, channel access, administrator-list access, and that the
@@ -781,6 +789,28 @@ and the main menu.
   for production options, the read-only backup snapshot, and the shared-cache outbox, and the fixture directory delete
   then failed with `IOException: The process cannot access the file ... because it is being used by another process`.
   Fixture connections declare `Pooling=false`, and the helper refuses any directory outside the OS temp root.
+- **Tenant storefront installation tutorials are built in, not owner-configured.** Customer tutorials are three fixed
+  image albums shipped as publish assets under `Assets/tutorials/` (`android_v2rayng`, `windows_v2rayn`,
+  `ios_android_v2box`). `Services/TenantTutorialAssetService.cs` owns the closed kind set
+  (`TenantTutorialKinds.android|ios|windows`), the kind-to-directory mapping, the supported-format whitelist
+  (`.jpg/.jpeg/.png`, case-insensitive; `.webp` deliberately excluded as unshipped/unverified), natural step ordering
+  (`1,2,…,10`, not `1,10,2`), and batching. `Services/TenantTutorialAlbumSender.cs` uploads each batch as a real
+  Telegram **media group** (max 10 items per album, caption on the first slide of the first album only, a single image
+  sent via `SendPhotoAsync` because a one-item media group is invalid). Streams are opened per batch and disposed
+  immediately after that batch's request. The customer menu is reached by the existing `راهنما نصب` / `💡راهنما نصب`
+  aliases and by the callbacks `TN:tutorial:android`, `TN:tutorial:ios`, `TN:tutorial:windows`; the callback payload
+  can only select one of the three compile-time kinds, never a path or another bot. Requesting a tutorial writes nothing
+  to users.db (the callback branch deliberately does not clear conversation state, so an in-progress purchase survives),
+  and the menu never reads `TenantTutorialsJson`. Owner configuration is disabled: the `🎓 آموزش‌ها` button is no longer
+  rendered, and stale `TBM:tutorials` / `TBM:tutorial-add` / `TBM:tutorial-del:*` callbacks and obsolete
+  `tutorial-title` / `tutorial-url` input steps answer with a "disabled" notice and write nothing.
+  **`TenantTutorialsJson` is preserved, not dropped or cleared** — the column, its historical migration, and existing
+  values stay intact so owner-configurable tutorials can be re-enabled later. The legacy owner manager methods are
+  retained but dormant/unreachable. `Adminbot.csproj` copies `Assets\tutorials\**\*` to build and publish output as
+  ordinary files (via `None Update`, not `Include`, to avoid duplicate SDK items); they are not embedded. Deployment
+  refuses to release when the staged publish artifact is missing any of the three tutorial directories or when one
+  contains no supported image (`assert_tutorial_assets` in `scripts/deploy-production.sh`, asserted by
+  `scripts/deploy-production.tests.sh`).
 - **Tenant personal card-to-card (`tenant_card`) provisional delivery — SCHEMA LANDED, BEHAVIOR NOT WIRED.**
   Migration `20260911000006_AddTenantCardProvisionalDelivery` adds `TenantBotOrders.ProvisionalDeliveryState`
   (default `none`), `ProvisionalCreatedAtUtc`, `ProvisionalDeliveredAtUtc`, `ProvisionalAccountEmail`,
@@ -792,10 +822,15 @@ and the main menu.
   fields yet** — the flag is not honored and the flow is not implemented, so production behavior is unchanged.
   Scope is purchase-only: `PaymentProvider == "tenant_card"` with `TenantBotOrderKinds.Purchase`; renewals (which would
   destructively downgrade an existing client) and all automatic gateways are excluded by design.
-- **BLOCKER discovered while wiring the provisional flow (must be resolved before implementing it).** The documented
-  1 GB / 1 day temporary limits are **not representable** through the tenant plan catalog. `XuiV3PurchaseService.ResolvePurchase`
+- **RESOLVED (was: provisional limits not representable).** The 1 GB / 1 day temporary limits are not representable
+  through the tenant plan catalog; `CreateAccountWithExplicitLimitsAsync` plus `ResolveTenantProvisionalPlacement` (below)
+  is the supported path. Historical detail of the original blocker: `XuiV3PurchaseService.ResolvePurchase`
   requires a configured, enabled `DurationKey` (`TryResolveDurationKey`, throwing `Duration '{key}' is not configured or
-  is disabled`) and `selection.TrafficGb >= GetMinimumTrafficGb(service)`; there is no 1-day duration key and the service
+  is disabled`) and `selection.TrafficGb >= GetMinimumTrafficGb(service)`. The blocking rule is the MINIMUM TRAFFIC, not a
+  missing duration key: `normal` requires at least 10 GB, so a 1 GB provisional selection is refused, while `normal` does
+  accept custom `days-N` durations including `days-1` (see `customDurationDays`). Services without a custom-duration
+  policy (for example `national`) cannot express a 1-day duration at all, so a provisional shim placed in the catalog
+  would still need a synthetic plan. Either way the configured service
   minimum may exceed 1 GB. Because `TenantBotService.FULFILLPAIDTENANTORDERASYNC` calls `ResolveTenantPurchase` before
   `_purchaseService.CreateAccountAsync`, a synthetic 1 GB/1 day selection is rejected. The two viable designs are
   (a) add an explicit provisional plan/duration to the catalog, or (b) bypass catalog resolution and call
@@ -820,6 +855,40 @@ and the main menu.
   such as `tenant-card-provisional-create:{orderId}` is exactly-once and never replays an ambiguous create. The catalog
   path provably rejects a 1 GB / 1 day `normal` selection, so this entry point is the only supported way to create that
   shape; `Adminbot.Tests/ProvisionalProvisioningPlacementTests.cs` pins both facts.
+- **3x-ui traffic-endpoint wire contract (proved against upstream MHSanaei/3x-ui v3.7.0 and v3.4.2 source).**
+  `POST /panel/api/clients/updateTraffic/{email}` binds JSON `{ "upload": <int64>, "download": <int64> }` and performs a
+  single `UPDATE client_traffics SET up = ?, down = ? WHERE email = ?`. The panel **ignores unknown field names and still
+  answers HTTP 200**, so a body spelled `up`/`down` silently writes zeros. `ApiServicev3.UpdateClientTrafficAsync` sends
+  the explicit `XuiV3TrafficUpdateRequest` (`[JsonProperty("upload")]`/`[JsonProperty("download")]`) for this reason —
+  never rename that body to raw `up`/`down`. This endpoint changes **only** the shared row: it does not touch the enable
+  flag, `client_global_traffics`, `node_client_traffics`, or the Xray runtime.
+  `POST /panel/api/clients/resetTraffic/{email}` is the only authoritative reset: it resolves every attached inbound,
+  **force-enables a disabled client**, zeroes the shared row, deletes master-pushed `client_global_traffics` rows, deletes
+  `node_client_traffics` rows, bumps `last_traffic_reset_time`, and marks remote nodes dirty. It is value-idempotent, so
+  replaying it after an ambiguous response converges on the same zeroed/enabled state. Read paths raise `up`/`down` to the
+  maximum of the shared row and fresh global rows, so a counter write **cannot** clear pushed usage.
+  `Adminbot.Tests/XuiV3TrafficContractTests.cs` observes our real wire body on a loopback HTTP request and encodes the
+  upstream semantics in a fake panel; the semantic half is a model of cited upstream source, not the live Go code.
+- **Tenant card-to-card provisional finalize/revoke saga state.** Migration
+  `20260911023015_AddTenantCardProvisionalOperation` adds table `TenantCardProvisionalOperations` keyed by
+  `OperationKey` in `tenant-card-{finalize|revoke}:{publicOrderId}` form, with indexes on `TenantBotOrderId` and
+  `(Step, UpdatedAtUtc)`. `Domain/TenantCardProvisionalOperation.cs` owns the step vocabulary
+  (`claimed/disabled/reset/re_disabled/zeroed/quota_written/proven/revoked/manual_review`) and
+  `TenantCardProvisionalOperationStore` (`ClaimAsync`/`AdvanceAsync`/`MarkManualReviewAsync`/`FindAsync`) enforces
+  **forward-only** progress in short users.db transactions: a replayed step returns `false`, a row never rewinds, and
+  `manual_review` is terminal so an ambiguous panel outcome escalates to a human instead of replaying. An unknown stored
+  step sorts above every mutable step, which is the fail-closed direction. The table is audit state and holds no tokens,
+  balances, ledger rows, or raw payloads; it is created empty and backfills nothing.
+  **NOT WIRED:** the store has no production caller yet. No provisional create, finalize, revoke, reminder exclusion, or
+  Gozargah gating is implemented, so `TenantCardProvisionalDeliveryEnabled=false` remains fully inert in production. The
+  remaining wiring points are `CREATETENANTMANUALRECEIPTASYNC` (after `PERSISTTENANTMANUALRECEIPTASYNC`),
+  `APPROVEMANUALRECEIPTASYNC`, `CONFIRMMANUALCARDORDERBYORDERIDASYNC`, `CONFIRMTENANTORDERBYSUPERADMINASYNC`, and the
+  Sales Assistant reject branch at `SalesAssistantService.cs` `REJECT:{receiptId}`. Provisional create and finalize must
+  land in the SAME change: enabling create without the finalize branch makes every card order produce two accounts.
+- **Finalization ordering is dictated by the reset's enable side effect:** disable → prove disabled → official reset
+  (which re-enables) → re-disable → prove disabled → zero the shared row → `UpdateClientAsync` with the exact ordered
+  `TotalGB` plus final expiry and `Enable = true` → prove by read-back → only then cross the financial settlement
+  boundary. The post-approval `TotalGB` is the **absolute** ordered quota, never `purchasedBytes + usedBytes`.
 - `XuiV3AccountMetadataOptions.PlanKeyOverride` / `PlanNameOverride` let a non-catalog account record a meaningful plan
   label in the panel comment (the comment JSON is the durable signal reminder/sync logic can key on).
 - UX-only Telegram latency budgets are injectable for tests through the immutable
