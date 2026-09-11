@@ -428,6 +428,14 @@ public sealed partial class ConcurrencyTests
         public List<string> Texts { get; } = new();
         /// <summary>Callback payloads captured for addressing and byte-limit assertions.</summary>
         public List<string> Callbacks { get; } = new();
+        /// <summary>
+        /// Customer-visible inline-button captions captured alongside the callback payloads.
+        /// </summary>
+        /// <remarks>
+        /// Labels and callback data are captured from the same keyboard so a test can prove that a display-label change
+        /// left the routing payload untouched.
+        /// </remarks>
+        public List<string> Labels { get; } = new();
         /// <summary>Callback alerts captured for authorization and stale-button assertions.</summary>
         public List<string> Answers { get; } = new();
         /// <inheritdoc />
@@ -457,7 +465,12 @@ public sealed partial class ConcurrencyTests
             if (request is AnswerCallbackQueryRequest answer && answer.Text != null) Answers.Add(answer.Text);
             if (request is SendMessageRequest send) { Texts.Add(send.Text); keyboard = send.ReplyMarkup as InlineKeyboardMarkup; }
             if (request is EditMessageTextRequest edit) { Texts.Add(edit.Text); keyboard = edit.ReplyMarkup; }
-            if (keyboard != null) Callbacks.AddRange(keyboard.InlineKeyboard.SelectMany(x => x).Select(x => x.CallbackData).Where(x => x != null)!);
+            if (keyboard != null)
+            {
+                var flat = keyboard.InlineKeyboard.SelectMany(x => x).ToList();
+                Callbacks.AddRange(flat.Select(x => x.CallbackData).Where(x => x != null)!);
+                Labels.AddRange(flat.Select(x => x.Text));
+            }
             object result = typeof(TResponse) == typeof(bool) ? true : new Message { MessageId = 1, Chat = new Chat { Id = 711 } };
             return Task.FromResult((TResponse)result);
         }

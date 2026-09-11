@@ -658,6 +658,10 @@ public sealed partial class ConcurrencyTests
             """);
 
         await migrator.MigrateAsync(current);
+        // The owner-route migration under test is no longer the newest one, so advance to the full latest schema before
+        // reading through the current EF model: the model always expects every applied column, and a test that pins an
+        // earlier migration could only use raw SQL for those reads. Legacy seeded rows must survive this step unchanged.
+        await migrator.MigrateAsync();
         var tenant = await users.BotInstances.AsNoTracking().SingleAsync(x => x.Id == "tenant-legacy-route");
         Assert.Null(tenant.TenantOwnerNotificationBotId);
         Assert.Equal(27, tenant.TenantPriceMarkupPercent);
@@ -667,9 +671,23 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(150000, order.SalePriceToman);
         Assert.Equal(100000, order.BaseCostToman);
         Assert.Equal(50000, order.ProfitToman);
+        // The tenant card-to-card provisional-delivery migration must not backfill anything: a historical fulfilled
+        // order keeps "none" and no temporary account identity, so deploying it cannot resurrect old receipts.
+        Assert.Equal(TenantCardProvisionalStates.None, order.ProvisionalDeliveryState);
+        Assert.Null(order.ProvisionalAccountEmail);
+        Assert.Null(order.ProvisionalCreatedAtUtc);
+        // Historical financial and fulfillment state is untouched by the new migration.
+        Assert.True(order.IsFulfilled);
+        Assert.True(order.IsOwnerCredited);
+
         var applied = (await users.Database.GetAppliedMigrationsAsync()).ToList();
-        Assert.Equal(current, applied[^1]);
-        Assert.Equal(previous, applied[^2]);
+        Assert.Contains(current, applied);
+        Assert.Contains(previous, applied);
+        Assert.Contains("20260911000006_AddTenantCardProvisionalDelivery", applied);
+        var previousIndex = applied.IndexOf(previous);
+        var currentIndex = applied.IndexOf(current);
+        Assert.True(previousIndex >= 0 && previousIndex < currentIndex, "owner-route migration must follow the AtlasPay migration");
+        Assert.Equal("20260911000006_AddTenantCardProvisionalDelivery", applied[^1]);
 
         var (resolver, _, _, _) = CreateRoutingResolver(databases);
         var resolved = await resolver.ResolveAsync(tenant, RoutingOwnerId);

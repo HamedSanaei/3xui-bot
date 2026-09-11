@@ -111,18 +111,38 @@ public class TelegramBotService
     /// </summary>
     private const string CancelAdminPhoneButton = "❌ انصراف";
 
-    /// <summary>Owned-wallet HooshPay action label with its displayed customer fee.</summary>
-    private const string HooshPayGatewayAction = "⚡ هوش‌پی آنی | کارمزد ۱۵٪";
+    /// <summary>
+    /// Owned-wallet HooshPay action label with its displayed customer fee and its rial-payment marker.
+    /// </summary>
+    /// <remarks>
+    /// The trailing <c>| ریالی</c> marker tells the customer this gateway settles in Iranian tomans. The gateway name,
+    /// emoji, and fee text are preserved exactly as before; only the marker was appended. This constant is also compared
+    /// against the customer's reply-keyboard text, so both the button and the match must stay in sync.
+    /// </remarks>
+    private const string HooshPayGatewayAction = "⚡ هوش‌پی آنی | کارمزد ۱۵٪ | ریالی";
 
-    /// <summary>Owned-wallet Tetraminator action label with its displayed customer fee.</summary>
-    private const string TetraminatorGatewayAction = "⚡ تترامیناتور آنی | کارمزد ۱۲٪";
+    /// <summary>
+    /// Owned-wallet Tetraminator action label with its displayed customer fee and its rial-payment marker.
+    /// </summary>
+    private const string TetraminatorGatewayAction = "⚡ تترامیناتور آنی | کارمزد ۱۲٪ | ریالی";
 
-    /// <summary>Owned-wallet UniquePay action label with its displayed gateway fee.</summary>
-    private const string UniquePayGatewayAction = "⚡ یونیک‌پی آنی | کارمزد ۱۲٪";
+    /// <summary>
+    /// Owned-wallet UniquePay action label with its displayed gateway fee and its rial-payment marker.
+    /// </summary>
+    private const string UniquePayGatewayAction = "⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی";
 
-    private const string AtlasPayGatewayAction = "💳 اطلس‌پی | کارت‌به‌کارت آنی";
+    /// <summary>
+    /// Owned-wallet AtlasPay action label with its card-to-card wording and its rial-payment marker.
+    /// </summary>
+    private const string AtlasPayGatewayAction = "💳 اطلس‌پی | کارت‌به‌کارت آنی | ریالی";
 
-    /// <summary>Owned-wallet NOWPayments action label with its displayed zero-fee policy.</summary>
+    /// <summary>
+    /// Owned-wallet NOWPayments (cryptocurrency) action label with its displayed zero-fee policy.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately carries no <c>ریالی</c> marker: it settles in cryptocurrency, not Iranian tomans. Do not add the
+    /// rial marker here even if other gateway labels change.
+    /// </remarks>
     private const string CryptoGatewayAction = "⚡ ارز دیجیتال آنی | کارمزد ۰٪";
 
     /// <summary>
@@ -6878,7 +6898,7 @@ public class TelegramBotService
                     cancellationToken: cancellationToken);
                 return;
             }
-            else if (IsGatewayAction(message.Text, HooshPayGatewayAction, "درگاه ریالی هوش‌پی"))
+            else if (IsGatewayAction(message.Text, HooshPayGatewayAction, "⚡ هوش‌پی آنی | کارمزد ۱۵٪", "درگاه ریالی هوش‌پی"))
             {
                 var amount = long.TryParse(user.ConfigLink, NumberStyles.Integer, CultureInfo.InvariantCulture, out var selectedAmount)
                     ? selectedAmount
@@ -6902,7 +6922,7 @@ public class TelegramBotService
 
                 user.PaymentMethod = "hooshpay";
             }
-            else if (IsGatewayAction(message.Text, TetraminatorGatewayAction, "درگاه ریالی تترامیناتور"))
+            else if (IsGatewayAction(message.Text, TetraminatorGatewayAction, "⚡ تترامیناتور آنی | کارمزد ۱۲٪", "درگاه ریالی تترامیناتور"))
             {
                 var amount = long.TryParse(user.ConfigLink, out var selectedAmount) ? selectedAmount : 0;
                 if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) ||
@@ -6923,7 +6943,7 @@ public class TelegramBotService
                 }
                 user.PaymentMethod = "tetraminator";
             }
-            else if (IsGatewayAction(message.Text, UniquePayGatewayAction, "درگاه ریالی یونیک‌پی"))
+            else if (IsGatewayAction(message.Text, UniquePayGatewayAction, "⚡ یونیک‌پی آنی | کارمزد ۱۲٪", "درگاه ریالی یونیک‌پی"))
             {
                 var amount = long.TryParse(user.ConfigLink, NumberStyles.Integer, CultureInfo.InvariantCulture, out var selectedAmount)
                     ? selectedAmount
@@ -6947,7 +6967,7 @@ public class TelegramBotService
 
                 user.PaymentMethod = "uniquepay";
             }
-            else if (IsGatewayAction(message.Text, AtlasPayGatewayAction, "درگاه ریالی اطلس‌پی"))
+            else if (IsGatewayAction(message.Text, AtlasPayGatewayAction, "💳 اطلس‌پی | کارت‌به‌کارت آنی", "درگاه ریالی اطلس‌پی"))
             {
                 if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
                 {
@@ -8806,18 +8826,43 @@ public class TelegramBotService
     /// Matches a current fee-bearing gateway button while preserving compatibility with already-issued legacy keyboards.
     /// </summary>
     /// <param name="input">Incoming owned-bot reply-keyboard text; it may be empty for non-text updates.</param>
-    /// <param name="currentLabel">Current instant-gateway label containing the displayed fee percentage.</param>
-    /// <param name="legacyLabel">Previous label accepted only so stale keyboards remain functional after deployment.</param>
-    /// <returns><c>true</c> when the trimmed input equals either current or legacy label; otherwise <c>false</c>.</returns>
+    /// <param name="currentLabel">Current instant-gateway label, including its displayed fee percentage and rial marker.</param>
+    /// <param name="acceptedLegacyLabels">
+    /// Zero or more previously shipped button labels accepted only so keyboards already delivered to customers keep
+    /// routing correctly after a label change. Ordering is irrelevant and duplicate values are harmless.
+    /// </param>
+    /// <returns><c>true</c> when the trimmed input equals the current label or any accepted legacy label; otherwise <c>false</c>.</returns>
     /// <remarks>
     /// The selected label controls routing only. Actual payment amount and provider settlement continue to come from
     /// the persisted wallet-charge state and provider response, never from Telegram button text.
+    ///
+    /// Telegram reply keyboards are one-time and already issued to customers, so every label that gained the
+    /// <c>ریالی</c> marker also passes its pre-marker wording here. Without that alias a customer who received the
+    /// payment-method keyboard before a label change could press the older button and be routed to "unknown" text.
     /// </remarks>
-    private static bool IsGatewayAction(string input, string currentLabel, string legacyLabel)
+    /// <example>
+    /// <code>
+    /// // A keyboard issued after the rial marker was added, plus the caption issued before it.
+    /// if (IsGatewayAction(message.Text, HooshPayGatewayAction, "⚡ هوش‌پی آنی | کارمزد ۱۵٪", "درگاه ریالی هوش‌پی"))
+    /// {
+    ///     user.PaymentMethod = "hooshpay";
+    /// }
+    /// </code>
+    /// </example>
+    private static bool IsGatewayAction(string input, string currentLabel, params string[] acceptedLegacyLabels)
     {
         var normalized = input?.Trim();
-        return string.Equals(normalized, currentLabel, StringComparison.Ordinal) ||
-               string.Equals(normalized, legacyLabel, StringComparison.Ordinal);
+        if (string.Equals(normalized, currentLabel, StringComparison.Ordinal))
+            return true;
+
+        // Alias comparison stays case-sensitive and ordinal because these are Persian display labels, not identifiers.
+        foreach (var legacyLabel in acceptedLegacyLabels)
+        {
+            if (string.Equals(normalized, legacyLabel, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -9049,7 +9094,7 @@ public class TelegramBotService
                        "مبلغ را دقیقاً مطابق عدد بالا پرداخت کنید. شارژ کیف پول فقط پس از استعلام رسمی اطلس‌پی انجام می‌شود.";
             var keyboard = new InlineKeyboardMarkup(new[]
             {
-                new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی", payment.CustomerStartLink) },
+                new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | ریالی", payment.CustomerStartLink) },
                 new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", $"apchk_{payment.Id}") }
             });
             var sent = await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, text, parseMode: ParseMode.Html,
@@ -9223,7 +9268,7 @@ public class TelegramBotService
                        "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از استعلام رسمی یونیک‌پی انجام می‌شود.";
             var keyboard = new InlineKeyboardMarkup(new[]
             {
-                new[] { InlineKeyboardButton.WithUrl("پرداخت با یونیک‌پی", payment.PaymentLink) },
+                new[] { InlineKeyboardButton.WithUrl("پرداخت با یونیک‌پی | ریالی", payment.PaymentLink) },
                 new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت", $"upchk_{payment.Id}") }
             });
             var sent = await ActiveBotClient.SendTextMessageAsync(
@@ -9464,7 +9509,7 @@ public class TelegramBotService
                        "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از تایید رسمی درگاه انجام می‌شود.";
             var keyboard = new InlineKeyboardMarkup(new[]
             {
-                new[] { InlineKeyboardButton.WithUrl("پرداخت با تترامیناتور", payment.PaymentLink) },
+                new[] { InlineKeyboardButton.WithUrl("پرداخت با تترامیناتور | ریالی", payment.PaymentLink) },
                 new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت", $"tmchk_{payment.Id}") }
             });
             var sent = await ActiveBotClient.SendTextMessageAsync(

@@ -366,6 +366,15 @@ public class UserDbContext : DbContext
             entity.Property(x => x.PaymentStatus).HasMaxLength(64);
             entity.Property(x => x.FulfillmentSource).HasMaxLength(64);
             entity.Property(x => x.HooshPayInvoiceUid).HasMaxLength(120);
+            // Provisional tenant card-to-card delivery. Defaults to "none" so every historical order stays unchanged and
+            // no old receipt can suddenly start a temporary account after the upgrade.
+            entity.Property(x => x.ProvisionalDeliveryState).IsRequired().HasMaxLength(32).HasDefaultValue(TenantCardProvisionalStates.None);
+            entity.Property(x => x.ProvisionalAccountEmail).HasMaxLength(160);
+            entity.Property(x => x.ProvisionalAccountUuid).HasMaxLength(64);
+            entity.Property(x => x.ProvisionalSubId).HasMaxLength(64);
+            entity.Property(x => x.ProvisionalErrorCode).HasMaxLength(96);
+            // Supports the operator-facing "provisional work outstanding" lookup and resubmission-abuse audit.
+            entity.HasIndex(x => new { x.ProvisionalDeliveryState, x.TenantBotId });
             entity.HasIndex(x => x.ManualReceiptId);
             entity.HasIndex(x => x.NowPaymentsPaymentInfoId);
             entity.HasIndex(x => x.OrderKind);

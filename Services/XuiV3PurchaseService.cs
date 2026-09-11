@@ -1212,7 +1212,7 @@ public class XuiV3PurchaseService
         metadataOptions ??= new XuiV3AccountMetadataOptions();
         metadataOptions.AccountCounter = await ResolveAccountCounterAsync(user, metadataOptions);
         var resolved = ResolvePurchase(selection, user.IsColleague);
-        var inboundIds = ResolveInboundIds(resolved.Service);
+        var inboundIds = ResolveServiceInboundIds(resolved.Service);
         var trafficBytes = metadataOptions.TrafficBytes > 0 ? metadataOptions.TrafficBytes : resolved.TrafficBytes;
         var priceToman = metadataOptions.PriceTomanOverride ?? resolved.PriceToman;
         Console.WriteLine(
@@ -1245,6 +1245,141 @@ public class XuiV3PurchaseService
                 DurationDays = resolved.DurationDays,
                 LimitIp = resolved.LimitIp,
                 StartExpiryAfterFirstUse = resolved.IsUnlimited,
+                Comment = BuildClientComment(user, resolved, inboundIds, serverInfo, metadataOptions, trafficBytes, priceToman),
+                SaveUserStatus = metadataOptions.SaveUserStatus
+            },
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Provisions exactly one panel client with caller-supplied traffic and lifetime limits while reusing the plan
+    /// catalog's authoritative service placement.
+    /// </summary>
+    /// <param name="user">
+    /// Detached global credentials profile of the account recipient. Its <see cref="CredUser.TelegramUserId" /> becomes
+    /// the panel owner and, when <see cref="XuiV3AccountMetadataOptions.SaveUserStatus" /> is enabled, the users.db state
+    /// owner. <see cref="CredUser.IsColleague" /> is recorded in the panel comment only; it never changes pricing here.
+    /// </param>
+    /// <param name="serverInfo">Authenticated panel endpoint for the tenant or owned account. Never logged.</param>
+    /// <param name="serviceKey">
+    /// Service key from the plan catalog that supplies the server/inbound placement, for example <c>normal</c>. It must
+    /// come from a persisted order, not from Telegram text.
+    /// </param>
+    /// <param name="selectedCountry">Panel tag stored in legacy user state for display and audit.</param>
+    /// <param name="trafficGb">Traffic limit in whole GB. Must be greater than zero; no catalog minimum is applied.</param>
+    /// <param name="durationDays">Lifetime in whole days. Must be greater than zero; no catalog duration key is required.</param>
+    /// <param name="cancellationToken">Cancellation of the reservation, the single panel POST, and read-back recovery.</param>
+    /// <param name="metadataOptions">
+    /// Optional durable operation key, plan-label override, price override, and audit options. A durable operation key
+    /// makes repeated calls read-back only.
+    /// </param>
+    /// <returns>
+    /// Verified creation proof, or a safe failure. <see cref="XuiV3AccountCreationResult.Success" /> is the only positive
+    /// signal; an ambiguous result never authorizes another panel create and must be reconciled by reading the panel.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">The credentials profile or panel descriptor is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The supplied traffic or duration is not positive.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The service key is unknown or disabled, so no trusted placement exists.
+    /// </exception>
+    /// <remarks>
+    /// This entry point exists for account shapes that are deliberately not catalog plans, specifically the provisional
+    /// tenant card-to-card courtesy account whose limits are policy constants rather than customer selections. It reuses
+    /// <see cref="FindService" /> and <see cref="ResolveServiceInboundIds" /> so server/inbound placement is never
+    /// duplicated, and it deliberately does not call <see cref="ResolvePurchase" />, which would reject limits below the
+    /// configured service minimum and any duration key the catalog does not define.
+    ///
+    /// Side effects: one panel client is created through the same Reserve / single-POST / Applied-or-Ambiguous boundary as
+    /// <see cref="CreateAccountAsync" />. No wallet debit, ledger entry, order mutation, or Telegram send happens here;
+    /// callers own financial settlement and customer delivery.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var result = await purchaseService.CreateAccountWithExplicitLimitsAsync(
+    ///     user,
+    ///     serverInfo,
+    ///     serviceKey: order.ServiceKey,
+    ///     selectedCountry: "tenant-card-provisional",
+    ///     trafficGb: 1,
+    ///     durationDays: 1,
+    ///     cancellationToken: cancellationToken,
+    ///     metadataOptions: new XuiV3AccountMetadataOptions
+    ///     {
+    ///         OperationKey = $"tenant-card-provisional-create:{order.Id}",
+    ///         PlanKeyOverride = "provisional-1gb-1d",
+    ///         PriceTomanOverride = 0,
+    ///         SaveUserStatus = false
+    ///     });
+    /// </code>
+    /// </example>
+    internal async Task<XuiV3AccountCreationResult> CreateAccountWithExplicitLimitsAsync(
+        CredUser user,
+        ServerInfo serverInfo,
+        string serviceKey,
+        string selectedCountry,
+        int trafficGb,
+        int durationDays,
+        CancellationToken cancellationToken = default,
+        XuiV3AccountMetadataOptions metadataOptions = null)
+    {
+        if (user == null)
+            throw new ArgumentNullException(nameof(user));
+        if (serverInfo == null)
+            throw new ArgumentNullException(nameof(serverInfo));
+        if (trafficGb <= 0)
+            throw new ArgumentOutOfRangeException(nameof(trafficGb));
+        if (durationDays <= 0)
+            throw new ArgumentOutOfRangeException(nameof(durationDays));
+
+        metadataOptions ??= new XuiV3AccountMetadataOptions();
+        metadataOptions.AccountCounter = await ResolveAccountCounterAsync(user, metadataOptions);
+
+        // Placement is configuration and comes from the authoritative catalog lookup. The commercial limits below are
+        // caller-owned policy, so catalog minimum-traffic and duration-key validation is intentionally skipped.
+        var service = FindService(serviceKey);
+        var inboundIds = ResolveServiceInboundIds(service);
+        var priceToman = metadataOptions.PriceTomanOverride ?? 0L;
+        var resolved = new XuiV3ResolvedPurchase
+        {
+            Service = service,
+            TrafficGb = trafficGb,
+            TrafficBytes = ApiService.ConvertGBToBytes(trafficGb),
+            DurationDays = durationDays,
+            LimitIp = 0,
+            PriceToman = priceToman,
+            IsUnlimited = false
+        };
+        var trafficBytes = metadataOptions.TrafficBytes > 0 ? metadataOptions.TrafficBytes : resolved.TrafficBytes;
+        Console.WriteLine(
+            $"[XUIv3] create explicit-limit account target panel url={serverInfo.Url}, rootPath={serverInfo.RootPath}, panelTag={selectedCountry}, service={service.Key}, inboundIds=[{string.Join(",", inboundIds)}], trafficGb={trafficGb}, durationDays={durationDays}");
+
+        var accountDto = new AccountDto
+        {
+            TelegramUserId = user.TelegramUserId,
+            SelectedCountry = selectedCountry,
+            SelectedPeriod = $"{durationDays} Days",
+            TotoalGB = trafficGb.ToString(),
+            ServerInfo = serverInfo,
+            AccType = service.Key,
+            IsColleague = user.IsColleague,
+            AccountCounter = metadataOptions.AccountCounter
+        };
+
+        return await ApiServicev3.CreateUserAccountAsync(
+            accountDto,
+            _configuration,
+            new XuiV3CreateAccountOptions
+            {
+                OperationKey = metadataOptions.OperationKey,
+                OperationStore = _creationOperations,
+                AuthorizedByKey = metadataOptions.AuthorizedByKey,
+                PriceToman = priceToman,
+                InboundIds = inboundIds,
+                TrafficGb = trafficGb,
+                TrafficBytes = trafficBytes,
+                DurationDays = durationDays,
+                LimitIp = 0,
+                StartExpiryAfterFirstUse = false,
                 Comment = BuildClientComment(user, resolved, inboundIds, serverInfo, metadataOptions, trafficBytes, priceToman),
                 SaveUserStatus = metadataOptions.SaveUserStatus
             },
@@ -1416,7 +1551,7 @@ public class XuiV3PurchaseService
         CancellationToken cancellationToken = default)
     {
         var service = FindService(serviceKey);
-        var inboundIds = ResolveInboundIds(service);
+        var inboundIds = ResolveServiceInboundIds(service);
         var resolved = new XuiV3ResolvedPurchase
         {
             Service = service,
@@ -1610,7 +1745,30 @@ public class XuiV3PurchaseService
         }
     }
 
-    private XuiV3ServiceDefinition FindService(string serviceKey)
+    /// <summary>
+    /// Resolves the enabled plan-catalog service that owns a service key without applying pricing, traffic, or
+    /// duration policy.
+    /// </summary>
+    /// <param name="serviceKey">
+    /// Configured service key from <c>xui-v3-service-plans.json</c>, for example <c>normal</c>. Comparison is
+    /// case-insensitive. The value must come from a persisted order or an authenticated selection, never from raw
+    /// Telegram message text.
+    /// </param>
+    /// <returns>
+    /// The enabled <see cref="XuiV3ServiceDefinition" />. The instance is detached configuration data; it authorizes
+    /// placement only and carries no price, traffic, or duration decision.
+    /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// The key is unknown or the service is disabled. Callers must treat this as a terminal configuration error rather
+    /// than provisioning against a guessed service.
+    /// </exception>
+    /// <remarks>
+    /// This is the placement half of <see cref="ResolvePurchase" />, separated so a caller that must supply its own
+    /// commercial limits can still reuse the authoritative service-to-server/inbound mapping instead of duplicating it.
+    /// Normal purchase and renewal paths continue to call <see cref="ResolvePurchase" />, which additionally enforces
+    /// the configured minimum traffic and enabled duration keys.
+    /// </remarks>
+    internal XuiV3ServiceDefinition FindService(string serviceKey)
     {
         var service = GetEnabledServices().FirstOrDefault(s =>
             string.Equals(s.Key, serviceKey, StringComparison.OrdinalIgnoreCase));
@@ -1621,7 +1779,21 @@ public class XuiV3PurchaseService
         return service;
     }
 
-    private static List<int> ResolveInboundIds(XuiV3ServiceDefinition service)
+    /// <summary>
+    /// Gets the configured panel inbound placement for a service.
+    /// </summary>
+    /// <param name="service">
+    /// Enabled service definition previously resolved from the plan catalog. A null value produces an empty list.
+    /// </param>
+    /// <returns>
+    /// The distinct panel inbound ids the account must be attached to. The list can be empty when the plan file omits
+    /// placement; the panel client is expected to reject that rather than the caller inventing an inbound.
+    /// </returns>
+    /// <remarks>
+    /// Placement is configuration, not user input, so the result is safe to reuse across the normal and explicit-limit
+    /// provisioning paths. This method performs no I/O and no pricing.
+    /// </remarks>
+    internal static List<int> ResolveServiceInboundIds(XuiV3ServiceDefinition service)
     {
         return service?.InboundIds?.Distinct().ToList() ?? new List<int>();
     }
@@ -1656,8 +1828,10 @@ public class XuiV3PurchaseService
             ServiceKey = resolved.Service.Key,
             ServiceName = resolved.Service.DisplayName,
             ServiceKind = resolved.Service.Kind,
-            PlanKey = resolved.IsUnlimited ? resolved.UnlimitedPlan?.Key : resolved.Duration?.Key,
-            PlanName = resolved.IsUnlimited ? resolved.UnlimitedPlan?.DisplayName : resolved.Duration?.DisplayName,
+            PlanKey = metadataOptions.PlanKeyOverride ??
+                (resolved.IsUnlimited ? resolved.UnlimitedPlan?.Key : resolved.Duration?.Key),
+            PlanName = metadataOptions.PlanNameOverride ??
+                (resolved.IsUnlimited ? resolved.UnlimitedPlan?.DisplayName : resolved.Duration?.DisplayName),
             TrafficGb = resolved.TrafficGb,
             TrafficBytes = trafficBytes,
             DurationDays = resolved.DurationDays,
@@ -1882,6 +2056,17 @@ public class XuiV3AccountMetadataOptions
     public string TrialKey { get; set; }
     public long TrafficBytes { get; set; }
     public long? PriceTomanOverride { get; set; }
+    /// <summary>
+    /// Optional plan key recorded in the panel comment when the account does not come from a catalog duration or
+    /// unlimited plan, such as a provisional tenant card-to-card courtesy account. Null keeps the catalog plan key.
+    /// </summary>
+    /// <remarks>Restricted non-secret value written to the panel comment; it must never contain customer text.</remarks>
+    public string PlanKeyOverride { get; set; }
+    /// <summary>
+    /// Optional human-readable plan name recorded in the panel comment alongside <see cref="PlanKeyOverride" />. Null
+    /// keeps the catalog plan name.
+    /// </summary>
+    public string PlanNameOverride { get; set; }
     public long? CreatedByTelegramUserId { get; set; }
     public long? LastUpdatedByTelegramUserId { get; set; }
     public string CreatedByBotId { get; set; }

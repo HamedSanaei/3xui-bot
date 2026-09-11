@@ -781,6 +781,47 @@ and the main menu.
   for production options, the read-only backup snapshot, and the shared-cache outbox, and the fixture directory delete
   then failed with `IOException: The process cannot access the file ... because it is being used by another process`.
   Fixture connections declare `Pooling=false`, and the helper refuses any directory outside the OS temp root.
+- **Tenant personal card-to-card (`tenant_card`) provisional delivery — SCHEMA LANDED, BEHAVIOR NOT WIRED.**
+  Migration `20260911000006_AddTenantCardProvisionalDelivery` adds `TenantBotOrders.ProvisionalDeliveryState`
+  (default `none`), `ProvisionalCreatedAtUtc`, `ProvisionalDeliveredAtUtc`, `ProvisionalAccountEmail`,
+  `ProvisionalAccountUuid`, `ProvisionalSubId`, `ProvisionalFinalizedAtUtc`, `ProvisionalRevokedAtUtc`,
+  `ProvisionalErrorCode`, plus a `(ProvisionalDeliveryState, TenantBotId)` index. It performs no backfill and touches no
+  balance, receipt, or fulfillment field. `AppConfig.TenantCardProvisionalDeliveryEnabled` exists and defaults to
+  `false`, and `TenantCardProvisionalStates` defines the intended state machine
+  (`none/provisioning/delivered/finalizing/finalized/revoking/revoked/manual_review`). **Nothing reads or writes these
+  fields yet** — the flag is not honored and the flow is not implemented, so production behavior is unchanged.
+  Scope is purchase-only: `PaymentProvider == "tenant_card"` with `TenantBotOrderKinds.Purchase`; renewals (which would
+  destructively downgrade an existing client) and all automatic gateways are excluded by design.
+- **BLOCKER discovered while wiring the provisional flow (must be resolved before implementing it).** The documented
+  1 GB / 1 day temporary limits are **not representable** through the tenant plan catalog. `XuiV3PurchaseService.ResolvePurchase`
+  requires a configured, enabled `DurationKey` (`TryResolveDurationKey`, throwing `Duration '{key}' is not configured or
+  is disabled`) and `selection.TrafficGb >= GetMinimumTrafficGb(service)`; there is no 1-day duration key and the service
+  minimum may exceed 1 GB. Because `TenantBotService.FULFILLPAIDTENANTORDERASYNC` calls `ResolveTenantPurchase` before
+  `_purchaseService.CreateAccountAsync`, a synthetic 1 GB/1 day selection is rejected. The two viable designs are
+  (a) add an explicit provisional plan/duration to the catalog, or (b) bypass catalog resolution and call
+  `ApiServicev3.CreateUserAccountAsync` directly with `XuiV3CreateAccountOptions { TrafficGb = 1, DurationDays = 1 }`,
+  which requires re-deriving the service→server/inbound mapping outside the catalog (a duplication the change must
+  avoid or refactor deliberately). Durable exactly-once for provisional creation is already available: pass a unique
+  `OperationKey` such as `tenant-card-provisional-create:{orderId}` plus the existing `XuiV3CreationOperationStore` to
+  `CreateUserAccountAsync`, which yields Reserve → single POST → `Applied`/`DefinitiveRejected`/`Ambiguous` with GET-only
+  recovery and never a blind replay. Same-client finalization uses
+  `ApiServicev3.UpdateClientAsync(serverInfo, configuration, email, payload, ct)`, and rejection revocation should reuse
+  the same durable-update pattern rather than a second create.
+- `XuiV3PurchaseService` separates *placement* resolution from *commercial* resolution. `FindService(serviceKey)`
+  (enabled-only catalog lookup) and `ResolveServiceInboundIds(service)` are the authoritative
+  `ServiceKey -> enabled service -> server/inbound` mapping and are the only place that mapping exists.
+  `ResolvePurchase`/`ResolveTenantPurchase` remain the commercial path and still enforce `GetMinimumTrafficGb` and an
+  enabled `DurationKey`.
+- `XuiV3PurchaseService.CreateAccountWithExplicitLimitsAsync(...)` provisions one client with caller-supplied
+  `trafficGb`/`durationDays` while reusing the catalog placement above, and deliberately skips
+  `ResolvePurchase`'s minimum-traffic and duration-key validation. It exists for account shapes that are policy rather
+  than catalog plans (the provisional tenant card-to-card courtesy account). It goes through the same
+  `XuiV3CreationOperationStore` Reserve -> single POST -> Applied/Ambiguous boundary, so a distinct `OperationKey`
+  such as `tenant-card-provisional-create:{orderId}` is exactly-once and never replays an ambiguous create. The catalog
+  path provably rejects a 1 GB / 1 day `normal` selection, so this entry point is the only supported way to create that
+  shape; `Adminbot.Tests/ProvisionalProvisioningPlacementTests.cs` pins both facts.
+- `XuiV3AccountMetadataOptions.PlanKeyOverride` / `PlanNameOverride` let a non-catalog account record a meaningful plan
+  label in the panel comment (the comment JSON is the durable signal reminder/sync logic can key on).
 - UX-only Telegram latency budgets are injectable for tests through the immutable
   `Services/TelegramInteractionTimeouts.cs` (`CallbackAnswer` = 2 s, `MandatoryJoin` = 5 s), registered in
   `Program.RegisterApplicationServices` as a shared singleton and consumed via a trailing *optional* constructor
@@ -790,3 +831,20 @@ and the main menu.
   `IncidentProvider(..., interactionTimeouts: ...)`), so timeout regressions run in milliseconds instead of sleeping the
   real 2 s / 5 s. There is deliberately no mutable static timeout; a guard test asserts the production values stay
   exactly 2 s and 5 s.
+- Customer-facing rial payment buttons carry a trailing ` | ریالی` marker. Covered surfaces: the owned-bot wallet-charge
+  reply keyboard (`TelegramBotService` constants `HooshPayGatewayAction` / `TetraminatorGatewayAction` /
+  `UniquePayGatewayAction` / `AtlasPayGatewayAction`), the tenant purchase and renewal pre-invoice keyboards
+  (`SHOWCUSTOMERCONFIRMASYNC`, `BuildTenantRenewPaymentProviderKeyboard`), the tenant personal card-to-card rows
+  (`PAYCARD:` / `RNCARD:`), and the named-rial invoice payment links (`WithUrl`). NOWPayments/crypto (`CryptoGatewayAction`,
+  `PAYNP:` / `RNNP:`) is deliberately unmarked because it settles in cryptocurrency. The marker is display-only and never
+  enters callback data; `Adminbot.Tests/PaymentGatewayLabelTests.cs` asserts captions and byte-exact payloads.
+- `TelegramBotService.IsGatewayAction` takes the current caption plus a `params` list of previously shipped captions.
+  Telegram reply keyboards are one-time and already delivered, so every caption that gained the rial marker also passes
+  its pre-marker wording (and older descriptive aliases) or a stale-button press would fall through. Ordering is
+  irrelevant; comparison is ordinal because these are Persian display labels, not identifiers.
+- `TenantBotService.BuildTenantAtlasPayPaymentKeyboard` is `internal static` so tests can render it directly. Its two
+  captions were shipped as literal `??` placeholders by an older revision (commit `93b0fce`) and were restored from the
+  identical owned-bot sibling labels (`💳 پرداخت با اطلس‌پی`, `🔄 بررسی وضعیت پرداخت`) in commit-local history; the
+  callback payload `apchk_{paymentId}` never changed. Other `???` runs in `TelegramBotService` (~line 6797) and
+  `TenantBotService` (~lines 6663, 6966) are pre-existing corrupted prose (a NOWPayments rate-unavailable message) that
+  has no in-repo authoritative counterpart and still needs the owner's original text; do not guess-replace it.

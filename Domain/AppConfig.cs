@@ -305,6 +305,22 @@ namespace Adminbot.Domain
         /// local state and no financial state changes.
         /// </remarks>
         public int AtlasPayManualCheckMinIntervalSeconds { get; set; } = 10;
+
+        /// <summary>
+        /// Gets or sets whether tenant card-to-card PURCHASES immediately receive a temporary 1 GB / 1 day account
+        /// while the owner still reviews the payment receipt.
+        /// </summary>
+        /// <remarks>
+        /// Defaults to <c>false</c>, so deploying this change does not alter production behavior until an operator
+        /// explicitly enables it. When disabled, tenant card-to-card receipts follow the original flow exactly: the
+        /// owner approves, and only then is the purchased account created.
+        ///
+        /// Only <c>PaymentProvider == "tenant_card"</c> with <see cref="TenantBotOrderKinds.Purchase"/> is affected.
+        /// Renewals and every automatic gateway (AtlasPay, HooshPay, Tetraminator, UniquePay, NOWPayments) and owned-bot
+        /// wallet payments are never affected, because a provisional downgrade of an existing account would be
+        /// destructive.
+        /// </remarks>
+        public bool TenantCardProvisionalDeliveryEnabled { get; set; } = false;
         public bool UniquePayEnabled { get; set; }
         /// <summary>
         /// Official UniquePay API host used for generic invoice creation and inquiry endpoints.

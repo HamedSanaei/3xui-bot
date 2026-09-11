@@ -6384,10 +6384,13 @@ public class TenantBotService
     /// movement, ledger entry, or XUI account.
     ///
     /// Every enabled online gateway is displayed as instant and includes its customer-facing fee percentage:
-    /// NOWPayments 0%, Tetraminator 12%, UniquePay 12%, and HooshPay 15%. Callback data remains unchanged, so
-    /// previously issued invoices and idempotent settlement behavior are unaffected by these display labels. A shared
-    /// notice distinguishes automatic verified online fulfillment from card-to-card fulfillment that waits for the
-    /// tenant owner's receipt approval and may take longer.
+    /// HooshPay 15%, Tetraminator 12%, UniquePay 12%, AtlasPay card-to-card, and NOWPayments 0%. Rial methods - the four
+    /// Iranian toman gateways and the tenant owner's personal card-to-card option - end with a <c>ریالی</c> marker,
+    /// while the NOWPayments button deliberately does not, so a customer can separate toman methods from cryptocurrency
+    /// at a glance. The marker is display-only and never enters callback data, so previously issued invoices and
+    /// idempotent settlement behavior are unaffected by these display labels. A shared notice distinguishes automatic
+    /// verified online fulfillment from card-to-card fulfillment that waits for the tenant owner's receipt approval and
+    /// may take longer.
     /// </remarks>
     private async Task SHOWCUSTOMERCONFIRMASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, XuiV3PurchaseSelection selection, CancellationToken CancellationToken)
     {
@@ -6406,17 +6409,17 @@ public class TenantBotService
 
         var PAYMENTROWS = new List<InlineKeyboardButton[]>();
         if (IsTenantHooshPayAvailable(tenant, Price.SalePriceToman))
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ هوش‌پی آنی | کارمزد ۱۵٪", CUSTOMERCALLBACKPREFIX + "PAYHP:" + BUILDPAYACTION(selection)) });
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ هوش‌پی آنی | کارمزد ۱۵٪ | ریالی", CUSTOMERCALLBACKPREFIX + "PAYHP:" + BUILDPAYACTION(selection)) });
         if (IsTenantTetraminatorAvailable(tenant, Price.SalePriceToman))
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + "PAYTM:" + BUILDPAYACTION(selection)) });
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + "PAYTM:" + BUILDPAYACTION(selection)) });
         if (IsTenantUniquePayAvailable(tenant, Price.SalePriceToman))
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + "PAYUP:" + BUILDPAYACTION(selection)) });
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + "PAYUP:" + BUILDPAYACTION(selection)) });
         if (IsTenantAtlasPayAvailable(tenant))
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی", CUSTOMERCALLBACKPREFIX + "PAYAP:" + BUILDPAYACTION(selection)) });
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | ریالی", CUSTOMERCALLBACKPREFIX + "PAYAP:" + BUILDPAYACTION(selection)) });
         if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی | کارمزد ۰٪", CUSTOMERCALLBACKPREFIX + "PAYNP:" + BUILDPAYACTION(selection)) });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("🧾 کارت‌به‌کارت به فروشگاه", CUSTOMERCALLBACKPREFIX + "PAYCARD:" + BUILDPAYACTION(selection)) });
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("🧾 کارت‌به‌کارت به فروشگاه | ریالی", CUSTOMERCALLBACKPREFIX + "PAYCARD:" + BUILDPAYACTION(selection)) });
         PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") });
 
         await EDITORSENDASYNC(
@@ -11237,24 +11240,26 @@ public class TenantBotService
     /// <param name="tenant">Tenant bot whose enabled gateway settings decide which buttons are visible.</param>
     /// <returns>Inline keyboard containing instant online providers, administrator-reviewed card payment, and status check.</returns>
     /// <remarks>
-    /// Labels explain timing only. Stable callback values, gateway amount policies, provider fees, settlement checks,
+    /// Labels explain timing and currency only: the rial methods (HooshPay, Tetraminator, UniquePay, AtlasPay, and the
+    /// tenant owner's personal card-to-card option) end with a <c>ریالی</c> marker, while the NOWPayments cryptocurrency
+    /// button deliberately does not. Stable callback values, gateway amount policies, provider fees, settlement checks,
     /// wallet idempotency, and XUI fulfillment behavior are unchanged. This builder has no external side effects.
     /// </remarks>
     private InlineKeyboardMarkup BuildTenantRenewPaymentProviderKeyboard(TenantBotOrder order, BotInstance tenant)
     {
         var rows = new List<InlineKeyboardButton[]>();
         if (IsTenantHooshPayAvailable(tenant, order.SalePriceToman))
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ هوش‌پی آنی", CUSTOMERCALLBACKPREFIX + $"RNHP:{order.Id}") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ هوش‌پی آنی | ریالی", CUSTOMERCALLBACKPREFIX + $"RNHP:{order.Id}") });
         if (IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی", CUSTOMERCALLBACKPREFIX + $"RNTM:{order.Id}") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی | ریالی", CUSTOMERCALLBACKPREFIX + $"RNTM:{order.Id}") });
         if (IsTenantUniquePayAvailable(tenant, order.SalePriceToman))
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪", CUSTOMERCALLBACKPREFIX + $"RNUP:{order.Id}") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + $"RNUP:{order.Id}") });
         if (IsTenantAtlasPayAvailable(tenant))
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی", CUSTOMERCALLBACKPREFIX + $"RNAP:{order.Id}") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | ریالی", CUSTOMERCALLBACKPREFIX + $"RNAP:{order.Id}") });
         if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی", CUSTOMERCALLBACKPREFIX + $"RNNP:{order.Id}") });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🧾 کارت‌به‌کارت به فروشگاه", CUSTOMERCALLBACKPREFIX + $"RNCARD:{order.Id}") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🧾 کارت‌به‌کارت به فروشگاه | ریالی", CUSTOMERCALLBACKPREFIX + $"RNCARD:{order.Id}") });
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت سفارش", CUSTOMERCALLBACKPREFIX + $"chk:{order.Id}") });
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به فروشگاه", CUSTOMERCALLBACKPREFIX + "home") });
         return new InlineKeyboardMarkup(rows);
@@ -11290,13 +11295,32 @@ public class TenantBotService
         return new InlineKeyboardMarkup(rows);
     }
 
-    private static InlineKeyboardMarkup BuildTenantAtlasPayPaymentKeyboard(AtlasPayPaymentInfo payment)
+    /// <summary>
+    /// Builds the inline keyboard for an EXISTING tenant AtlasPay invoice: the official provider payment link plus the
+    /// tenant-scoped manual status check.
+    /// </summary>
+    /// <param name="payment">
+    /// Persisted tenant AtlasPay payment row. The provider checkout link is read from <c>CustomerStartLink</c>, and the
+    /// local numeric row id becomes the callback payload. A <c>null</c> or unsaved row yields fewer buttons.
+    /// </param>
+    /// <returns>
+    /// An inline keyboard containing the rial AtlasPay payment button when a provider link exists and the
+    /// <c>apchk_</c> status-check button when the row has been persisted. Either entry may be omitted; the returned
+    /// markup is never <c>null</c> and may be empty.
+    /// </returns>
+    /// <remarks>
+    /// Display labels only. The callback payload stays <c>apchk_{payment.Id}</c>, and the tenant customer check still
+    /// re-verifies the payment against the official AtlasPay API before any wallet credit, order fulfillment, or ledger
+    /// effect. The payment button carries the <c>ریالی</c> marker because AtlasPay settles in Iranian tomans; AtlasPay
+    /// exposes no provider webhook in this integration, so no callback data depends on the button text.
+    /// </remarks>
+    internal static InlineKeyboardMarkup BuildTenantAtlasPayPaymentKeyboard(AtlasPayPaymentInfo payment)
     {
         var rows = new List<InlineKeyboardButton[]>();
         if (!string.IsNullOrWhiteSpace(payment?.CustomerStartLink))
-            rows.Add(new[] { InlineKeyboardButton.WithUrl("?? ?????? ?? ???????", payment.CustomerStartLink) });
+            rows.Add(new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | ریالی", payment.CustomerStartLink) });
         if (payment != null && payment.Id > 0)
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("?? ????? ????? ??????", $"apchk_{payment.Id}") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", $"apchk_{payment.Id}") });
         return new InlineKeyboardMarkup(rows);
     }
 

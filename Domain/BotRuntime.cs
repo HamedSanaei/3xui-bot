@@ -182,6 +182,49 @@ namespace Adminbot.Domain
     }
 
     /// <summary>
+    /// Durable lifecycle markers for the provisional 1 GB / 1 day delivery granted to tenants' card-to-card purchase
+    /// customers while their receipt is still under owner review.
+    /// </summary>
+    /// <remarks>
+    /// The provisional account is a temporary courtesy, not a completed sale. These values live on the immutable
+    /// <see cref="TenantBotOrder"/> so the exact XUI client can be found again after a restart and upgraded in place
+    /// instead of being recreated.
+    ///
+    /// Scope: only <c>PaymentProvider == "tenant_card"</c> with <see cref="TenantBotOrderKinds.Purchase"/> may use
+    /// these states. Renewals and every automatic gateway keep their existing behavior.
+    ///
+    /// <see cref="TenantBotOrder.IsFulfilled"/> must stay <c>false</c> for every state except <see cref="Finalized"/>,
+    /// because fulfillment continues to mean "the customer holds the full purchased entitlement and the owner
+    /// settlement succeeded".
+    /// </remarks>
+    public static class TenantCardProvisionalStates
+    {
+        /// <summary>No provisional delivery was ever requested for this order.</summary>
+        public const string None = "none";
+
+        /// <summary>A provisional creation attempt is durably claimed but not yet proven applied.</summary>
+        public const string Provisioning = "provisioning";
+
+        /// <summary>The 1 GB / 1 day account exists and the customer has been told about it.</summary>
+        public const string Delivered = "delivered";
+
+        /// <summary>The receipt was approved and the same client is being upgraded to the purchased entitlement.</summary>
+        public const string Finalizing = "finalizing";
+
+        /// <summary>The purchased entitlement is proven applied and the normal settlement boundary completed.</summary>
+        public const string Finalized = "finalized";
+
+        /// <summary>The receipt was rejected and provisional access is being revoked.</summary>
+        public const string Revoking = "revoking";
+
+        /// <summary>The provisional client is proven disabled; the customer no longer has access.</summary>
+        public const string Revoked = "revoked";
+
+        /// <summary>An external outcome is ambiguous and a human must reconcile it before any further XUI mutation.</summary>
+        public const string ManualReview = "manual_review";
+    }
+
+    /// <summary>
     /// Represents one direct-sale order made inside a colleague tenant bot.
     /// The order links customer, owner, selected XUI plan, HooshPay invoice, fulfillment result, and owner profit.
     /// </summary>
@@ -262,6 +305,54 @@ namespace Adminbot.Domain
         public string CreatedSubLink { get; set; }
         public string CreatedAccountJson { get; set; }
         public string ErrorMessage { get; set; }
+
+        /// <summary>
+        /// Gets or sets the durable provisional-delivery lifecycle state. See <see cref="TenantCardProvisionalStates"/>.
+        /// </summary>
+        /// <remarks>
+        /// Defaults to <see cref="TenantCardProvisionalStates.None"/> so every historical order and every non
+        /// card-to-card order keeps its current behavior after the migration. This column, together with the unique
+        /// provisional creation operation key, is what guarantees at most one temporary account per order: a second
+        /// receipt photo can never re-enter <see cref="TenantCardProvisionalStates.None"/>.
+        /// </remarks>
+        public string ProvisionalDeliveryState { get; set; } = TenantCardProvisionalStates.None;
+
+        /// <summary>Gets or sets the UTC time the provisional XUI client was proven created.</summary>
+        public DateTime? ProvisionalCreatedAtUtc { get; set; }
+
+        /// <summary>Gets or sets the UTC time the provisional account details were handed to the customer.</summary>
+        /// <remarks>
+        /// Deliberately separate from <see cref="ProvisionalCreatedAtUtc"/>: a failed Telegram send must never look like a
+        /// failed provisioning, and provisioning success must never depend on the send succeeding.
+        /// </remarks>
+        public DateTime? ProvisionalDeliveredAtUtc { get; set; }
+
+        /// <summary>
+        /// Gets or sets the normalized XUI client email of the provisional account, used to locate the same client at
+        /// finalization and revocation time.
+        /// </summary>
+        public string ProvisionalAccountEmail { get; set; }
+
+        /// <summary>
+        /// Gets or sets the XUI client UUID of the provisional account, which is the strongest identity available and is
+        /// revalidated against the live panel record before any update.
+        /// </summary>
+        public string ProvisionalAccountUuid { get; set; }
+
+        /// <summary>Gets or sets the optional XUI subscription identity recorded as supporting evidence during finalization.</summary>
+        public string ProvisionalSubId { get; set; }
+
+        /// <summary>Gets or sets the UTC time the provisional account was upgraded to the purchased entitlement.</summary>
+        public DateTime? ProvisionalFinalizedAtUtc { get; set; }
+
+        /// <summary>Gets or sets the UTC time provisional access was proven revoked after receipt rejection.</summary>
+        public DateTime? ProvisionalRevokedAtUtc { get; set; }
+
+        /// <summary>
+        /// Gets or sets a stable, secret-free provisional failure reason code.
+        /// </summary>
+        /// <remarks>Never stores panel response bodies, credentials, or customer text.</remarks>
+        public string ProvisionalErrorCode { get; set; }
         public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
         public DateTime? UpdatedAtUtc { get; set; }
         public DateTime? PaidAtUtc { get; set; }
