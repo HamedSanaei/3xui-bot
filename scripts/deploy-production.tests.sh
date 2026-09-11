@@ -74,6 +74,8 @@ user_context_line="$(grep -n -m1 -F -- '--context UserDbContext' "$deploy_script
 credentials_context_line="$(grep -n -m1 -F -- '--context CredentialsDbContext' "$deploy_script" | cut -d: -f1)"
 publish_line="$(grep -n -m1 -F -- 'dotnet publish Adminbot.csproj' "$deploy_script" | cut -d: -f1)"
 last_preflight_line="$(grep -n -F -- '--migration-check' "$deploy_script" | tail -n 1 | cut -d: -f1)"
+# Search for the literal deploy-source expression; $stage_source must not expand in this structural assertion.
+# shellcheck disable=SC2016
 first_sync_line="$(grep -n -m1 -F -- 'sync_source "$stage_source"' "$deploy_script" | cut -d: -f1)"
 restart_line="$(grep -n -m1 -F -- 'systemctl restart' "$deploy_script" | cut -d: -f1)"
 
@@ -140,6 +142,8 @@ if ( assert_tutorial_assets "$empty_assets" ) 2>/dev/null; then
   exit 1
 fi
 
+# Search for the literal preflight expression; $stage_publish must not expand in this structural assertion.
+# shellcheck disable=SC2016
 asset_line="$(grep -n -m1 -F -- 'assert_tutorial_assets "$stage_publish"' "$deploy_script" | cut -d: -f1)"
 if [[ -z "$asset_line" ]]; then
   echo "The tutorial asset preflight is missing from deploy-production.sh." >&2
