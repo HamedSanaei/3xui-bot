@@ -30,6 +30,7 @@
   "userActivityLogLevel": "Information",
   "userActivityLogFilePath": "./Data/Logs/user-activity-{shamsiDate}.jsonl",
   "weeklyUsageReportEnabled": true,
+  "latestClientDownloadEnabled": false,
   "nowPaymentsEnabled": false,
   "nowPaymentApiKey": "",
   "ipnSecretKey": "",

@@ -169,6 +169,11 @@ public class UserDbContext : DbContext
             entity.Property(x => x.Step).IsRequired().HasMaxLength(32);
             entity.Property(x => x.OrderId).HasMaxLength(120);
             entity.Property(x => x.ErrorCode).HasMaxLength(120);
+            // The frozen final entitlement is what makes a retried final write deterministic: the effective instant and
+            // the expiry are captured once and reused, so a restart cannot extend the paid period or drift the quota.
+            entity.Property(x => x.FinalizationEffectiveAtUtc);
+            entity.Property(x => x.FinalQuotaBytes);
+            entity.Property(x => x.FinalExpiryTimeMs);
             // Recovery scans for in-flight sagas, so index the order link and the terminal-step filter helper.
             entity.HasIndex(x => x.TenantBotOrderId);
             entity.HasIndex(x => new { x.Step, x.UpdatedAtUtc });

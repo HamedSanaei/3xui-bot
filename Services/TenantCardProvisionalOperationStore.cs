@@ -162,14 +162,8 @@ namespace Adminbot.Services
 
                 switch (step)
                 {
-                    case TenantCardProvisionalSteps.Disabled:
-                        row.DisabledAtUtc = now;
-                        break;
                     case TenantCardProvisionalSteps.Reset:
                         row.ResetAtUtc = now;
-                        break;
-                    case TenantCardProvisionalSteps.ReDisabled:
-                        row.ReDisabledAtUtc = now;
                         break;
                     case TenantCardProvisionalSteps.Zeroed:
                         row.ZeroedAtUtc = now;
@@ -226,6 +220,70 @@ namespace Adminbot.Services
                         .SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow)
                         .SetProperty(x => x.UpdatedAtUtc, DateTime.UtcNow), ct);
                 return changed == 1;
+            }, token);
+        }
+
+        /// <summary>
+        /// Freezes the final entitlement once so every later retry writes the same quota and the same expiry.
+        /// </summary>
+        /// <param name="operationKey">Exact key of the claimed saga row.</param>
+        /// <param name="effectiveAtUtc">
+        /// The UTC instant the purchased subscription period starts from. Pass the current UTC time on the first call;
+        /// later calls pass nothing because the stored value wins.
+        /// </param>
+        /// <param name="quotaBytes">
+        /// Exact purchased quota in bytes, taken from the commercial order rather than from measured usage. Zero means
+        /// an unlimited/lifetime order and is stored as-is.
+        /// </param>
+        /// <param name="expiryTimeMs">
+        /// Absolute expiry in Unix milliseconds derived once from <paramref name="effectiveAtUtc" /> plus the purchased
+        /// duration, or <c>0</c> for a lifetime order. Must never be recomputed from the current time on a retry.
+        /// </param>
+        /// <param name="token">Cancellation token for the short update transaction.</param>
+        /// <returns>
+        /// The durable row after the write. When the row already carried a frozen value the stored values are returned
+        /// unchanged, which is what stops a restart from extending a paid period or drifting the quota upward.
+        /// </returns>
+        /// <remarks>
+        /// Idempotent by construction: the first caller to succeed freezes the values and every later caller observes
+        /// them. The write is deliberately separate from step advancement so a crash between freezing and the first panel
+        /// mutation still resumes with a stable, restart-safe final entitlement.
+        /// </remarks>
+        public Task<TenantCardProvisionalOperation> FreezeFinalEntitlementAsync(
+            string operationKey,
+            DateTime effectiveAtUtc,
+            long quotaBytes,
+            long expiryTimeMs,
+            CancellationToken token)
+        {
+            if (string.IsNullOrWhiteSpace(operationKey))
+                throw new ArgumentException("A provisional operation key is required.", nameof(operationKey));
+            if (quotaBytes < 0)
+                throw new ArgumentOutOfRangeException(nameof(quotaBytes), quotaBytes, "A purchased quota cannot be negative.");
+            if (expiryTimeMs < 0)
+                throw new ArgumentOutOfRangeException(nameof(expiryTimeMs), expiryTimeMs, "A lifetime expiry is expressed as zero, never as a negative absolute time.");
+
+            return SqliteOperation.RunAsync(async ct =>
+            {
+                await using var db = _factory.CreateDbContext();
+                await using var transaction = await db.Database.BeginTransactionAsync(ct);
+                var row = await db.TenantCardProvisionalOperations
+                    .SingleOrDefaultAsync(x => x.OperationKey == operationKey, ct)
+                    ?? throw new InvalidOperationException("The provisional saga must be claimed before its final entitlement is frozen.");
+
+                // First writer wins. A restart must never re-derive the expiry from the current clock, because that
+                // would silently extend the customer's paid period by the duration of the outage.
+                if (row.FinalizationEffectiveAtUtc == null)
+                {
+                    row.FinalizationEffectiveAtUtc = effectiveAtUtc;
+                    row.FinalQuotaBytes = quotaBytes;
+                    row.FinalExpiryTimeMs = expiryTimeMs;
+                    row.UpdatedAtUtc = DateTime.UtcNow;
+                    await db.SaveChangesAsync(ct);
+                }
+
+                await transaction.CommitAsync(ct);
+                return row;
             }, token);
         }
 

@@ -152,6 +152,7 @@ public sealed partial class ConcurrencyTests
             client, new UserWorkflowStore(databases.Users), new UserStateStore(databases.Users),
             new CredentialsStore(databases.Credentials), configuration, NullLogger<TelegramBotService>.Instance,
             null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, gateway,
+            null!, null!,
             null!, null!, null!, null!, null!, null!, new UserActivityLogService(configuration), null!, null!,
             null!, null!, null!, null!, null!, null!, accessor, null!);
         return (service, accessor, activityLogPath);

@@ -812,9 +812,9 @@ public sealed partial class ConcurrencyTests
         // Latest applied migration must be the AtlasPay reconciliation lifecycle, which only adds nullable/defaulted
         // columns plus an index and therefore cannot change existing balances.
         Assert.Contains("20260910233159_AddAtlasPayReconciliationLifecycle", applied);
-        // Latest applied migration is the tenant card provisional-delivery schema, which only adds nullable/defaulted
-        // columns plus an index and therefore cannot change existing balances, receipts, or fulfillment state.
-        Assert.Equal("20260911023015_AddTenantCardProvisionalOperation", applied[^1]);
+        // Latest applied migration is the provisional finalize freeze, which only adds nullable columns to the
+        // provisional saga-state table and therefore cannot change existing balances, receipts, or fulfillment state.
+        Assert.Equal("20260911035150_AddProvisionalFinalizationFreeze", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1532,9 +1532,9 @@ public sealed partial class ConcurrencyTests
         // Latest applied migration must be the AtlasPay reconciliation lifecycle, which only adds nullable/defaulted
         // columns plus an index and therefore cannot change existing balances.
         Assert.Contains("20260910233159_AddAtlasPayReconciliationLifecycle", applied);
-        // Latest applied migration is the tenant card provisional-delivery schema, which only adds nullable/defaulted
-        // columns plus an index and therefore cannot change existing balances, receipts, or fulfillment state.
-        Assert.Equal("20260911023015_AddTenantCardProvisionalOperation", applied[^1]);
+        // Latest applied migration is the provisional finalize freeze, which only adds nullable columns to the
+        // provisional saga-state table and therefore cannot change existing balances, receipts, or fulfillment state.
+        Assert.Equal("20260911035150_AddProvisionalFinalizationFreeze", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1549,10 +1549,11 @@ public sealed partial class ConcurrencyTests
             Assert.Contains(atlasMigration, history);
             Assert.Contains("20260910184123_AddTenantOwnerNotificationRoute", history);
             Assert.Contains("20260910233159_AddAtlasPayReconciliationLifecycle", history);
-            // Latest applied migration is the provisional finalize/revoke saga-state table. It only adds a new table
-            // and indexes, so it cannot change existing balances, receipts, or fulfillment state, and it must be empty
-            // for a database that only just migrated.
-            Assert.Equal("20260911023015_AddTenantCardProvisionalOperation", history[^1]);
+            // Latest applied migration freezes the final entitlement columns on the provisional saga-state table. It only
+            // adds nullable columns, so it cannot change existing balances, receipts, or fulfillment state, and the saga
+            // table must still be empty for a database that only just migrated.
+            Assert.Contains("20260911023015_AddTenantCardProvisionalOperation", history);
+            Assert.Equal("20260911035150_AddProvisionalFinalizationFreeze", history[^1]);
             command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='TenantCardProvisionalOperations';";
             Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
             command.CommandText = "SELECT COUNT(*) FROM TenantCardProvisionalOperations;";

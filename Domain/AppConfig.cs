@@ -50,6 +50,17 @@ namespace Adminbot.Domain
         /// </remarks>
         public bool TenantStorefrontFundingMonitorEnabled { get; set; } = true;
         public int TenantStorefrontFundingMonitorIntervalMinutes { get; set; } = 5;
+        /// <summary>
+        /// Globally enables latest client software download links in owned and tenant bots.
+        /// </summary>
+        /// <remarks>
+        /// Missing configuration keeps the feature disabled, so the key is optional and never has to exist in
+        /// <c>configuration.json</c> for the application to start. This startup value is only the initial state: after
+        /// startup, runtime readers must consult <see cref="IClientDownloadAvailability.Snapshot" /> so a super-admin
+        /// toggle takes effect immediately without an application restart. The switch is global and is never stored per
+        /// tenant, per owned bot, or in users.db.
+        /// </remarks>
+        public bool LatestClientDownloadEnabled { get; set; }
         public BotInstanceConfig SalesAssistantBot { get; set; } = new();
         public string BotToken { get; set; }
         public string IpnSecretKey { get; set; }

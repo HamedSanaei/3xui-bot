@@ -72,6 +72,8 @@ public sealed class AdminPanelRoutingTests
                 atlasPay: null,
                 atlasPayReconciliation: null,
                 gatewayAvailability: null,
+                clientDownloadAvailability: null,
+                clientReleaseService: null,
                 xuiV3PurchaseService: null,
                 xuiV3BotFlowService: null,
                 xuiV3PurchaseSessionStore: sessions,

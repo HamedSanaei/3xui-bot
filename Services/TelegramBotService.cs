@@ -27,7 +27,7 @@ using Newtonsoft.Json.Linq;
 /// <see cref="DispatchUpdateAsync"/> with a <see cref="BotRuntimeContext"/>. The current bot context selects the
 /// correct token, brand config, mandatory-join channels, support account, payment return URLs, and bot-scoped user state.
 /// </remarks>
-public class TelegramBotService
+public partial class TelegramBotService
 {
     private const string BroadcastAudienceAll = "all";
     private const string BroadcastAudienceCustomers = "customers";
@@ -173,6 +173,8 @@ public class TelegramBotService
     private readonly AtlasPay _atlasPay;
     private readonly AtlasPayReconciliationHostedService _atlasPayReconciliation;
     private readonly IPaymentGatewayAvailability _gatewayAvailability;
+    private readonly IClientDownloadAvailability _clientDownloadAvailability;
+    private readonly IClientReleaseService _clientReleaseService;
     private readonly XuiV3PurchaseService _xuiV3PurchaseService;
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
     private readonly XuiV3PurchaseSessionStore _xuiV3PurchaseSessionStore;
@@ -331,6 +333,8 @@ public class TelegramBotService
         AtlasPay atlasPay,
         AtlasPayReconciliationHostedService atlasPayReconciliation,
         IPaymentGatewayAvailability gatewayAvailability,
+        IClientDownloadAvailability clientDownloadAvailability,
+        IClientReleaseService clientReleaseService,
         XuiV3PurchaseService xuiV3PurchaseService,
         XuiV3BotFlowService xuiV3BotFlowService,
         XuiV3PurchaseSessionStore xuiV3PurchaseSessionStore,
@@ -369,6 +373,8 @@ public class TelegramBotService
         _atlasPay = atlasPay;
         _atlasPayReconciliation = atlasPayReconciliation;
         _gatewayAvailability = gatewayAvailability;
+        _clientDownloadAvailability = clientDownloadAvailability;
+        _clientReleaseService = clientReleaseService;
         _xuiV3PurchaseService = xuiV3PurchaseService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _xuiV3PurchaseSessionStore = xuiV3PurchaseSessionStore;
@@ -847,6 +853,14 @@ public class TelegramBotService
                     return;
             }
 
+            // Latest-client-software downloads are a global feature shared with tenant storefronts. The callback is
+            // routed before the legacy payment/admin dispatcher so the owned flow never mistakes it for a payment action.
+            if (ClientDownloadCallbacks.TryParse(callbackQuery.Data, out var downloadPlatform))
+            {
+                await HandleClientDownloadPlatformCallbackAsync(botClient, callbackQuery, downloadPlatform, cancellationToken);
+                return;
+            }
+
             await ProccessCallbacks(callbackQuery, cancellationToken);
             return;
         }
@@ -982,6 +996,12 @@ public class TelegramBotService
         if (message.Text == AdminPaymentGatewayAction)
         {
             await SendPaymentGatewayPanelAsync(botClient, message.Chat.Id, cancellationToken);
+            return;
+        }
+
+        if (message.Text == AdminClientDownloadAction)
+        {
+            await SendClientDownloadPanelAsync(botClient, message.Chat.Id, cancellationToken);
             return;
         }
 
@@ -2563,6 +2583,12 @@ public class TelegramBotService
         if (callbackQuery.Data.StartsWith("gw:", StringComparison.Ordinal))
         {
             await ProcessPaymentGatewayCallbackSafelyAsync(callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (callbackQuery.Data.StartsWith(ClientDownloadAdminCallbackPrefix, StringComparison.Ordinal))
+        {
+            await ProcessClientDownloadCallbackSafelyAsync(callbackQuery, cancellationToken);
             return;
         }
 
@@ -5599,6 +5625,7 @@ public class TelegramBotService
             AdminWeeklyUsageAction,
             AdminMonthlyUsageAction,
             AdminPaymentGatewayAction,
+            AdminClientDownloadAction,
             "🤖 وضعیت ربات‌ها",
             "📑 Menu"
         };
@@ -5831,6 +5858,11 @@ public class TelegramBotService
 
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
         var user = await _state.GetUserStatus(message.From.Id);
+        // The download menu is high-level navigation. It is answered before any conversation state can consume the label
+        // as user data, and it re-checks the live global switch so a stale reply keyboard fails closed.
+        if (await TryHandleClientDownloadMenuRequestAsync(botClient, message, user, cancellationToken))
+            return;
+
         var hasNavigationCommand = TelegramNavigationCommandParser.TryParse(
             message.Text,
             CurrentBot?.Username ?? BotContextAccessor.CurrentBotUsername,
@@ -9944,15 +9976,24 @@ public class TelegramBotService
     /// </remarks>
     ReplyKeyboardMarkup MainReplyMarkupKeyboardFa()
     {
+        // The latest-client-download row is global and re-read from the live switch on every render, so a super-admin
+        // toggle shows up on the next keyboard the customer receives. Only the customer menu carries it; the super-admin
+        // keyboard is built separately and is unaffected.
+        var rows = new List<KeyboardButton[]>
+        {
+            new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
+            new KeyboardButton[] { "📋 تعرفه‌ها", "📒 تراکنش‌های من" },
+            new KeyboardButton[] { "⚙️ مدیریت اکانت" },
+            new KeyboardButton[] { "🌟اکانت تست", "💡راهنما نصب" },
+            new KeyboardButton[] { "🎁 دعوت از دوستان", "💻 ارتباط با ادمین" }
+        };
 
-        ReplyKeyboardMarkup replyKeyboardMarkup = new(new[]
-               {
-                    new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
-                    new KeyboardButton[] { "📋 تعرفه‌ها", "📒 تراکنش‌های من" },
-                    new KeyboardButton[] { "⚙️ مدیریت اکانت" },
-                    new KeyboardButton[] { "🌟اکانت تست", "💡راهنما نصب" },
-                    new KeyboardButton[] { "🎁 دعوت از دوستان", "💻 ارتباط با ادمین" },
-                    new KeyboardButton[] { "🏠منو" }})
+        if (_clientDownloadAvailability.Snapshot.Enabled)
+            rows.Add(new KeyboardButton[] { ClientDownloadCallbacks.OpenCommand });
+
+        rows.Add(new KeyboardButton[] { "🏠منو" });
+
+        ReplyKeyboardMarkup replyKeyboardMarkup = new(rows)
         {
             ResizeKeyboard = true
         };

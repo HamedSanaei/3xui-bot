@@ -10,16 +10,16 @@ using Newtonsoft.Json.Linq;
 using Xunit;
 
 /// <summary>
-/// Pins the exact wire contract and post-reset panel semantics of the two client-traffic endpoints the provisional
-/// tenant card flow depends on: <c>POST /panel/api/clients/updateTraffic/{email}</c> and
-/// <c>POST /panel/api/clients/resetTraffic/{email}</c>.
+/// Pins the exact wire contract, the post-reset panel semantics, and the reset's enable guards for the client-traffic and
+/// client-update endpoints the provisional tenant card flow depends on.
 /// </summary>
 /// <remarks>
 /// <b>Why these tests exist.</b> The provisional flow must, after owner approval, leave the SAME panel client carrying
 /// exactly the ordered quota with zero provisional usage counted against it. That requires knowing precisely (a) what
 /// field names the panel binds for a counter write and (b) what a reset actually clears. Both were previously assumed
 /// incorrectly: our counter write sent <c>{ up, down }</c> while the panel binds <c>{ upload, download }</c>, and a reset
-/// was assumed to leave a disabled client disabled.
+/// was assumed to leave a disabled client disabled, and the disable-before-reset ordering that assumption implied would
+/// have turned the reset's own auto-enable into the one mutation that re-admits a credential mid-saga.
 ///
 /// <b>What is proven from upstream source (not from these tests).</b> Against MHSanaei/3x-ui v3.7.0 and v3.4.2:
 /// <list type="bullet">
@@ -30,6 +30,12 @@ using Xunit;
 /// disabled client</b> through the normal update path, then per inbound zeroes <c>client_traffics</c>, forces
 /// <c>enable = true</c>, deletes master-pushed <c>client_global_traffics</c> rows, deletes <c>node_client_traffics</c>
 /// rows, bumps <c>last_traffic_reset_time</c>, and marks remote nodes dirty.</item>
+/// <item><b>Both re-admission paths are guarded on the client being disabled:</b> <c>ResetTrafficByEmail</c> runs its
+/// enabling update only under <c>if !rec.Enable</c>, and <c>InboundService.resetClientTrafficLocked</c> builds its runtime
+/// <c>AddUser</c> plan only under <c>if !traffic.Enable</c>. An already-enabled client therefore makes the reset perform no
+/// enable mutation and touch no running Xray user. Because <c>enable</c> is 3x-ui's only instantaneous admission gate
+/// (quota and expiry are enforced by the periodic traffic poll, not by Xray when a connection opens), this guard is why
+/// the finalization saga reaches the reset with an enabled client rather than disabling first.</item>
 /// </list>
 ///
 /// <b>Honest limitation.</b> No real 3x-ui panel is reachable from this test project, so these tests cannot observe
@@ -116,9 +122,10 @@ public sealed class XuiV3TrafficContractTests
     /// saga has to design around instead of assuming away.
     /// </summary>
     /// <remarks>
-    /// The enable side effect is the reason the ordering is disable-then-reset rather than reset-then-disable: the reset
-    /// would undo a preceding disable. The saga therefore treats "reset" as the point where the client becomes live
-    /// again, not as a step that preserves a disabled flag.
+    /// <b>Read this together with the guard proofs below.</b> The enable side effect fires only when the client was
+    /// disabled when the reset ran, so the ordering that avoids re-admitting a credential is the one that reaches the
+    /// reset with the client already enabled — not the intuitive disable-then-reset sequence, which makes the reset's own
+    /// auto-enable the single mutation that restores access.
     /// </remarks>
     [Fact]
     public async Task Reset_clears_all_usage_sources_and_enables_client()
@@ -221,9 +228,10 @@ public sealed class XuiV3TrafficContractTests
     /// and subscription identity, so no step of the saga rotates the customer's UUID, password, or subId.
     /// </summary>
     /// <remarks>
-    /// The saga disables the client so traffic cannot accrue while counters transition, then re-enables the same client.
-    /// If either write dropped identity fields the customer's existing link would break mid-finalization, so this test
-    /// pins identity preservation across both directions.
+    /// The proven saga reaches the reset with an enabled client and therefore never disables it, but the enable controls
+    /// remain the only way to re-admit a provisional client the panel had already disabled (an exhausted quota or an
+    /// elapsed provisional expiry disables it). If either direction dropped identity fields the customer's existing link
+    /// would break during finalization, so this test pins identity preservation across both directions.
     /// </remarks>
     [Fact]
     public async Task Disable_and_reenable_preserve_uuid_email_and_sub_id()
@@ -266,11 +274,16 @@ public sealed class XuiV3TrafficContractTests
         var configuration = BuildConfiguration();
         var expiry = DateTimeOffset.UtcNow.AddDays(30).ToUnixTimeMilliseconds();
 
-        // Ordering the saga uses: disable -> reset (this is where usage is zeroed) -> write exact quota on the SAME client.
-        Assert.True((await ApiServicev3.SetClientEnabledAsync(
-            panel.ServerInfo, configuration, "cust-quota", false)).Success);
+        // Proven ordering: the client stays enabled, the reset clears every usage source including the ones a counter
+        // write cannot reach, a side-effect-free counter write re-proves zero, and only then is the exact quota written.
+        // Disabling before the reset is deliberately absent: that is the sequence that would trigger the reset's
+        // auto-enable branch and re-admit the credential.
+        panel.ConsumeTraffic("cust-quota", up: 400_000_000, down: 300_000_000);
         Assert.True((await ApiServicev3.ResetClientTrafficAsync(
             panel.ServerInfo, configuration, "cust-quota")).Success);
+        Assert.True((await ApiServicev3.UpdateClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-quota", 0, 0)).Success);
+        Assert.Equal(0, panel.EnableMutationCount);
 
         var update = await ApiServicev3.UpdateClientAsync(panel.ServerInfo, configuration, "cust-quota",
             new XuiV3ClientPayload
@@ -300,6 +313,159 @@ public sealed class XuiV3TrafficContractTests
         Assert.Equal("sub-quota", client["subId"]!.Value<string>());
     }
 
+    /// <summary>
+    /// Proves the barrier the finalization saga depends on: the official reset performs no enable mutation and no
+    /// runtime admission when the client it is given is already enabled.
+    /// </summary>
+    /// <remarks>
+    /// This is the single most load-bearing contract in the finalize design. 3x-ui's <c>enable</c> flag is the only
+    /// instantaneous admission gate — quota and expiry are enforced by the periodic traffic poll, not by Xray when a
+    /// connection opens — so any mutation that flips <c>enable</c> back on is a mutation that re-admits a credential.
+    /// Upstream guards both re-admission paths on the client being disabled (<c>if !rec.Enable</c> in
+    /// <c>ClientService.ResetTrafficByEmail</c>, <c>if !traffic.Enable</c> in <c>InboundService.resetClientTrafficLocked</c>),
+    /// which is exactly why the saga reaches the reset with the client enabled. If either guard ever becomes
+    /// unconditional, this test fails and the saga must be redesigned rather than shipped.
+    /// </remarks>
+    [Fact]
+    public async Task Reset_on_an_enabled_client_performs_no_enable_mutation_and_no_runtime_admission()
+    {
+        await using var panel = await FakeUpstreamPanel.StartAsync();
+        panel.SeedClient("cust-barrier", up: 500_000_000, down: 400_000_000, enable: true);
+        panel.PushGlobalTraffic("cust-barrier", up: 900_000_000, down: 800_000_000);
+        panel.PushNodeTraffic("cust-barrier", inboundId: 2, up: 700, down: 600);
+        var configuration = BuildConfiguration();
+
+        var response = await ApiServicev3.ResetClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-barrier");
+        Assert.True(response.Success, response.Msg);
+
+        var readBack = await ApiServicev3.GetClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-barrier");
+        Assert.True(readBack.Success, readBack.Msg);
+
+        // The reset still does its job: every usage source is cleared.
+        Assert.Equal(0, readBack.Obj.Up);
+        Assert.Equal(0, readBack.Obj.Down);
+        Assert.Empty(panel.GlobalTrafficRows("cust-barrier"));
+        Assert.Empty(panel.NodeTrafficRowsForAllInbounds("cust-barrier"));
+        Assert.True(readBack.Obj.Enable);
+
+        // And it did none of it by touching enable or the running Xray user set.
+        Assert.Equal(0, panel.EnableMutationCount);
+        Assert.Equal(0, panel.RuntimeAddUserCount);
+        Assert.Equal(0, panel.RuntimeRemoveUserCount);
+    }
+
+    /// <summary>
+    /// Pins the opposite case: handed a disabled client, the official reset force-enables it and re-admits the runtime
+    /// user.
+    /// </summary>
+    /// <remarks>
+    /// The finalization saga must never produce this state, but the hazard has to stay proven rather than assumed — if
+    /// the reset ever stopped re-enabling, the saga's ordering choice would no longer be the conservative one and the
+    /// design would need re-deriving. The revoke saga, which deliberately disables the client, must also know that a
+    /// later reset on that client would re-admit it.
+    /// </remarks>
+    [Fact]
+    public async Task Reset_on_a_disabled_client_force_enables_and_rerecruits_the_runtime_user()
+    {
+        await using var panel = await FakeUpstreamPanel.StartAsync();
+        panel.SeedClient("cust-readmit", up: 10, down: 20, enable: false);
+        var configuration = BuildConfiguration();
+
+        var response = await ApiServicev3.ResetClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-readmit");
+        Assert.True(response.Success, response.Msg);
+
+        var readBack = await ApiServicev3.GetClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-readmit");
+        Assert.True(readBack.Success, readBack.Msg);
+
+        Assert.True(readBack.Obj.Enable);
+        Assert.Equal(1, panel.EnableMutationCount);
+        Assert.Equal(1, panel.RuntimeAddUserCount);
+    }
+
+    /// <summary>
+    /// Proves the counter write the saga uses to re-zero usage after the reset has no enable or runtime side effect.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes the post-reset re-zero safe: it erases usage accrued inside the reset window without ever
+    /// re-admitting a credential, which the reset itself cannot promise.
+    /// </remarks>
+    [Fact]
+    public async Task Counter_write_has_no_enable_or_runtime_side_effect()
+    {
+        await using var panel = await FakeUpstreamPanel.StartAsync();
+        panel.SeedClient("cust-sideeffect", up: 111, down: 222, enable: false);
+        var configuration = BuildConfiguration();
+
+        var response = await ApiServicev3.UpdateClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-sideeffect", 0, 0);
+        Assert.True(response.Success, response.Msg);
+
+        Assert.Equal(0, panel.ReadTraffic("cust-sideeffect")["up"]!.Value<long>());
+        // Still disabled, and nothing was added to or removed from the running runtime.
+        Assert.False(panel.ReadTraffic("cust-sideeffect")["enable"]!.Value<bool>());
+        Assert.Equal(0, panel.EnableMutationCount);
+        Assert.Equal(0, panel.RuntimeAddUserCount);
+        Assert.Equal(0, panel.RuntimeRemoveUserCount);
+    }
+
+    /// <summary>
+    /// Regression for the silent usage loss on the link-change traffic-preservation path.
+    /// </summary>
+    /// <remarks>
+    /// The link-change repair path reads a client's counters, rewrites the client, and restores the previously observed
+    /// usage by calling <see cref="ApiServicev3.UpdateClientTrafficAsync" />. While that call sent <c>up</c>/<c>down</c>,
+    /// the panel ignored both fields, answered HTTP 200, and wrote zeros, so every link change silently wiped the
+    /// customer's usage. This test reproduces that exact sequence — read, update, restore, read — and asserts the restored
+    /// bytes really are the bytes that were read before the mutation.
+    /// </remarks>
+    [Fact]
+    public async Task Link_change_traffic_preservation_restores_previously_recorded_usage()
+    {
+        await using var panel = await FakeUpstreamPanel.StartAsync();
+        panel.SeedClient("cust-preserve", up: 12_345_678, down: 87_654_321);
+        panel.SetClientIdentity("cust-preserve", uuid: "99999999-8888-7777-6666-555555555555", subId: "sub-preserve");
+        var configuration = BuildConfiguration();
+
+        var before = await ApiServicev3.GetClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-preserve");
+        Assert.True(before.Success, before.Msg);
+        var preservedUp = before.Obj.Up;
+        var preservedDown = before.Obj.Down;
+        Assert.NotEqual(0, preservedUp);
+        Assert.NotEqual(0, preservedDown);
+
+        // The link-change path rewrites the client, then restores the usage it read before the rewrite.
+        var update = await ApiServicev3.UpdateClientAsync(panel.ServerInfo, configuration, "cust-preserve",
+            new XuiV3ClientPayload
+            {
+                Email = "cust-preserve",
+                TotalGB = OneGibBytes,
+                ExpiryTime = 0,
+                Enable = true,
+                SubId = "sub-preserve",
+                Uuid = "99999999-8888-7777-6666-555555555555"
+            });
+        Assert.True(update.Success, update.Msg);
+
+        var restore = await ApiServicev3.UpdateClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-preserve", preservedUp, preservedDown);
+        Assert.True(restore.Success, restore.Msg);
+
+        var after = await ApiServicev3.GetClientTrafficAsync(
+            panel.ServerInfo, configuration, "cust-preserve");
+        Assert.True(after.Success, after.Msg);
+
+        // With the corrected body these round-trip; with the old `up`/`down` body both reads were zero.
+        Assert.Equal(preservedUp, after.Obj.Up);
+        Assert.Equal(preservedDown, after.Obj.Down);
+        Assert.NotEqual(0, after.Obj.Up);
+        Assert.NotEqual(0, after.Obj.Down);
+    }
+
     /// <summary>Creates the configuration used by the contract tests, with retries disabled so tests are deterministic.</summary>
     /// <returns>In-memory configuration with no live panel or provider credentials.</returns>
     private static IConfiguration BuildConfiguration()
@@ -309,324 +475,4 @@ public sealed class XuiV3TrafficContractTests
             ["xuiV3TransientRetryCount"] = "0",
             ["xuiV3RequestTimeoutSeconds"] = "5"
         }).Build();
-
-    /// <summary>
-    /// In-process fake 3x-ui panel that models the traffic semantics proven from upstream v3.7.0/v3.4.2 source.
-    /// </summary>
-    /// <remarks>
-    /// The model deliberately reproduces upstream's most surprising behaviours so the saga cannot be designed around a
-    /// convenient fiction:
-    /// <list type="bullet">
-    /// <item>the counter endpoint binds only <c>upload</c>/<c>download</c>, so a body spelled <c>up</c>/<c>down</c>
-    /// writes zeros (matching the silent-data-loss hazard);</item>
-    /// <item>traffic reads raise <c>up</c>/<c>down</c> to the maximum of the shared row and any master-pushed global
-    /// row, so a counter write cannot clear pushed usage;</item>
-    /// <item>the official reset zeroes the shared row, force-enables the client, and deletes every global and per-inbound
-    /// node row.</item>
-    /// </list>
-    /// The panel is not a panel emulator and serves only the endpoints these tests exercise.
-    /// </remarks>
-    private sealed class FakeUpstreamPanel : IAsyncDisposable
-    {
-        private readonly object _sync = new();
-        private readonly Dictionary<string, JObject> _clients = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, List<JObject>> _globalTraffic = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, Dictionary<int, List<JObject>>> _nodeTraffic = new(StringComparer.OrdinalIgnoreCase);
-
-        private WebApplication? _app;
-
-        /// <summary>Gets the loopback base URL the fake panel listens on.</summary>
-        public string Url { get; private set; } = string.Empty;
-
-        /// <summary>Gets connection settings pointing at this fake panel.</summary>
-        public ServerInfo ServerInfo { get; private set; } = new();
-
-        /// <summary>Gets the raw body of the most recent request that carried one.</summary>
-        public string? LastRawBody { get; private set; }
-
-        /// <summary>Gets the number of reset requests observed.</summary>
-        public int ResetRequestCount { get; private set; }
-
-        /// <summary>Starts the fake panel on an ephemeral loopback port.</summary>
-        /// <returns>The started panel.</returns>
-        public static async Task<FakeUpstreamPanel> StartAsync()
-        {
-            var panel = new FakeUpstreamPanel();
-            var builder = WebApplication.CreateBuilder();
-            builder.Logging.ClearProviders();
-            builder.WebHost.UseUrls("http://127.0.0.1:0");
-            var app = builder.Build();
-            app.Run(async context => await panel.HandleAsync(context));
-            await app.StartAsync();
-            panel._app = app;
-            panel.Url = app.Urls.Single();
-            panel.ServerInfo = new ServerInfo { Url = panel.Url, ApiToken = "test-only" };
-            return panel;
-        }
-
-        /// <summary>Seeds a client's shared traffic row.</summary>
-        /// <param name="email">Client email, the stable key of the shared traffic row.</param>
-        /// <param name="up">Initial uploaded bytes.</param>
-        /// <param name="down">Initial downloaded bytes.</param>
-        /// <param name="enable">Initial enable flag.</param>
-        public void SeedClient(string email, long up, long down, bool enable = true)
-        {
-            lock (_sync)
-            {
-                _clients[email] = new JObject
-                {
-                    ["id"] = 1,
-                    ["email"] = email,
-                    ["up"] = up,
-                    ["down"] = down,
-                    ["enable"] = enable,
-                    ["totalGB"] = 0,
-                    ["expiryTime"] = 0,
-                    ["uuid"] = string.Empty,
-                    ["subId"] = email
-                };
-            }
-        }
-
-        /// <summary>Sets the identity fields that must survive finalization.</summary>
-        /// <param name="email">Client email.</param>
-        /// <param name="uuid">Client UUID that the existing subscription link embeds.</param>
-        /// <param name="subId">Client subscription id.</param>
-        public void SetClientIdentity(string email, string uuid, string subId)
-        {
-            lock (_sync)
-            {
-                _clients[email]["uuid"] = uuid;
-                _clients[email]["subId"] = subId;
-            }
-        }
-
-        /// <summary>Records the inbounds a client is attached to, mirroring upstream per-inbound fanout.</summary>
-        /// <param name="email">Client email.</param>
-        /// <param name="inboundIds">Inbound ids the client is attached to.</param>
-        public void AttachInbounds(string email, params int[] inboundIds)
-        {
-            lock (_sync)
-            {
-                var ids = inboundIds.Select(value => (long)value).ToArray();
-                _clients[email]["inboundIds"] = new JArray(ids);
-            }
-        }
-
-        /// <summary>Adds a master-pushed global traffic row that overrides a counter write.</summary>
-        /// <param name="email">Client email.</param>
-        /// <param name="up">Uploaded bytes reported by the parent panel.</param>
-        /// <param name="down">Downloaded bytes reported by the parent panel.</param>
-        public void PushGlobalTraffic(string email, long up, long down)
-        {
-            lock (_sync)
-            {
-                if (!_globalTraffic.TryGetValue(email, out var rows))
-                    _globalTraffic[email] = rows = new List<JObject>();
-                rows.Add(new JObject { ["up"] = up, ["down"] = down });
-            }
-        }
-
-        /// <summary>Adds a per-inbound node traffic row.</summary>
-        /// <param name="email">Client email.</param>
-        /// <param name="inboundId">Inbound the node accounting belongs to.</param>
-        /// <param name="up">Uploaded bytes recorded on the node.</param>
-        /// <param name="down">Downloaded bytes recorded on the node.</param>
-        public void PushNodeTraffic(string email, int inboundId, long up, long down)
-        {
-            lock (_sync)
-            {
-                if (!_nodeTraffic.TryGetValue(email, out var byInbound))
-                    _nodeTraffic[email] = byInbound = new Dictionary<int, List<JObject>>();
-                if (!byInbound.TryGetValue(inboundId, out var rows))
-                    byInbound[inboundId] = rows = new List<JObject>();
-                rows.Add(new JObject { ["up"] = up, ["down"] = down });
-            }
-        }
-
-        /// <summary>Reads the shared traffic row for a client.</summary>
-        /// <param name="email">Client email.</param>
-        /// <returns>The shared traffic row.</returns>
-        public JObject ReadTraffic(string email)
-        {
-            lock (_sync)
-                return (JObject)_clients[email].DeepClone();
-        }
-
-        /// <summary>Reads the full client record for a client.</summary>
-        /// <param name="email">Client email.</param>
-        /// <returns>The stored client record.</returns>
-        public JObject ReadClient(string email)
-        {
-            lock (_sync)
-                return (JObject)_clients[email].DeepClone();
-        }
-
-        /// <summary>Reads the master-pushed global traffic rows for a client.</summary>
-        /// <param name="email">Client email.</param>
-        /// <returns>Global traffic rows; empty when none exist.</returns>
-        public IReadOnlyList<JObject> GlobalTrafficRows(string email)
-        {
-            lock (_sync)
-                return _globalTraffic.TryGetValue(email, out var rows) ? rows.ToArray() : Array.Empty<JObject>();
-        }
-
-        /// <summary>Reads node traffic rows keyed by inbound for a client.</summary>
-        /// <param name="email">Client email.</param>
-        /// <returns>Per-inbound node rows; missing inbounds map to an empty list.</returns>
-        public IReadOnlyDictionary<int, IReadOnlyList<JObject>> NodeTrafficRowsForAllInbounds(string email)
-        {
-            lock (_sync)
-            {
-                var result = new Dictionary<int, IReadOnlyList<JObject>>();
-                if (!_nodeTraffic.TryGetValue(email, out var byInbound))
-                    return result;
-
-                foreach (var pair in byInbound)
-                    result[pair.Key] = pair.Value.ToArray();
-
-                return result;
-            }
-        }
-
-        /// <summary>Dispatches one fake panel request.</summary>
-        /// <param name="context">Request being served.</param>
-        /// <returns>A task that completes when the response has been written.</returns>
-        private async Task HandleAsync(HttpContext context)
-        {
-            var path = context.Request.Path.Value ?? string.Empty;
-            var email = Uri.UnescapeDataString(path[(path.LastIndexOf('/') + 1)..]);
-
-            if (context.Request.Method == "POST")
-            {
-                var body = await new StreamReader(context.Request.Body).ReadToEndAsync();
-                LastRawBody = body;
-
-                if (path.Contains("/updateTraffic/", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Upstream binds ONLY these two field names. Unknown names are ignored and the counters are
-                    // overwritten with the bound defaults, which is exactly the silent zero-write hazard.
-                    var payload = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-                    lock (_sync)
-                    {
-                        _clients[email]["up"] = payload.Value<long?>("upload") ?? 0;
-                        _clients[email]["down"] = payload.Value<long?>("download") ?? 0;
-                    }
-
-                    await WriteSuccessAsync(context, new JObject());
-                    return;
-                }
-
-                if (path.Contains("/resetTraffic/", StringComparison.OrdinalIgnoreCase))
-                {
-                    ResetRequestCount++;
-                    lock (_sync)
-                    {
-                        _clients[email]["up"] = 0;
-                        _clients[email]["down"] = 0;
-                        // Contractual upstream side effect: the reset force-enables a disabled client.
-                        _clients[email]["enable"] = true;
-                        // And it deletes master-pushed global rows plus per-inbound node rows.
-                        _globalTraffic.Remove(email);
-                        _nodeTraffic.Remove(email);
-                    }
-
-                    await WriteSuccessAsync(context, new JObject());
-                    return;
-                }
-
-                if (path.Contains("/update/", StringComparison.OrdinalIgnoreCase))
-                {
-                    var payload = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-                    lock (_sync)
-                    {
-                        foreach (var property in payload.Properties())
-                        {
-                            if (string.Equals(property.Name, "id", StringComparison.OrdinalIgnoreCase))
-                                continue;
-                            _clients[email][property.Name] = property.Value.DeepClone();
-                        }
-                    }
-
-                    await WriteSuccessAsync(context, new JObject());
-                    return;
-                }
-
-                await WriteSuccessAsync(context, new JObject());
-                return;
-            }
-
-            if (path.Contains("/traffic/", StringComparison.OrdinalIgnoreCase))
-            {
-                await WriteSuccessAsync(context, BuildTrafficView(email));
-                return;
-            }
-
-            if (path.Contains("/get/", StringComparison.OrdinalIgnoreCase))
-            {
-                await WriteSuccessAsync(context, ReadClient(email));
-                return;
-            }
-
-            if (path.Contains("/list", StringComparison.OrdinalIgnoreCase))
-            {
-                JArray list;
-                lock (_sync)
-                    list = new JArray(_clients.Values.Select(item => item.DeepClone()));
-
-                await WriteSuccessAsync(context, list);
-                return;
-            }
-
-            await WriteSuccessAsync(context, new JObject());
-        }
-
-        /// <summary>Builds the traffic view the panel returns, including the master-pushed overlay.</summary>
-        /// <param name="email">Client email.</param>
-        /// <returns>The traffic object a read returns.</returns>
-        private JObject BuildTrafficView(string email)
-        {
-            lock (_sync)
-            {
-                var client = _clients[email];
-                var up = client["up"]!.Value<long>();
-                var down = client["down"]!.Value<long>();
-
-                if (_globalTraffic.TryGetValue(email, out var globals))
-                {
-                    up = Math.Max(up, globals.Max(row => row["up"]!.Value<long>()));
-                    down = Math.Max(down, globals.Max(row => row["down"]!.Value<long>()));
-                }
-
-                return new JObject
-                {
-                    ["email"] = email,
-                    ["up"] = up,
-                    ["down"] = down,
-                    ["total"] = client["totalGB"]!.Value<long>(),
-                    ["totalGB"] = client["totalGB"]!.Value<long>(),
-                    ["expiryTime"] = client["expiryTime"]!.Value<long>(),
-                    ["enable"] = client["enable"]!.Value<bool>()
-                };
-            }
-        }
-
-        /// <summary>Writes a successful panel envelope.</summary>
-        /// <param name="context">Request being served.</param>
-        /// <param name="obj">Object to place in the envelope's <c>obj</c> property.</param>
-        /// <returns>A task that completes when the response has been written.</returns>
-        private static async Task WriteSuccessAsync(HttpContext context, JToken obj)
-        {
-            context.Response.ContentType = "application/json";
-            context.Response.StatusCode = StatusCodes.Status200OK;
-            await context.Response.WriteAsync(new JObject { ["success"] = true, ["obj"] = obj }.ToString());
-        }
-
-        /// <inheritdoc />
-        public async ValueTask DisposeAsync()
-        {
-            if (_app != null)
-                await _app.StopAsync();
-        }
-    }
 }

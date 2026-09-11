@@ -24,7 +24,7 @@ using Telegram.Bot.Types.ReplyMarkups;
 /// </summary>
 /// <remarks>One execution scope owns one explicitly selected management store. Settings and customer state are per store;
 /// all sibling stores retain the same owner's global wallet and website account. Never reuse this scoped service concurrently.</remarks>
-public class TenantBotService
+public partial class TenantBotService
 {
     /// <summary>Explicit owner-authorized selection for this execution scope, never inferred from the first owned store.</summary>
     private BotInstance _selectedOwnerStore;
@@ -120,6 +120,8 @@ public class TenantBotService
     private readonly UsageAnalyticsService _usageAnalyticsService;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TenantBotService> _logger;
+    private readonly IClientDownloadAvailability _clientDownloadAvailability;
+    private readonly IClientReleaseService _clientReleaseService;
     private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
     private readonly XuiV3RenewalOperationStore _renewalOperationStore;
     private readonly TenantProvisioningAttemptCoordinator _tenantProvisioningCoordinator;
@@ -211,6 +213,8 @@ public class TenantBotService
         AtlasPay AtlasPay,
         AtlasPayReconciliationHostedService AtlasPayReconciliation,
         IPaymentGatewayAvailability GatewayAvailability,
+        IClientDownloadAvailability ClientDownloadAvailability,
+        IClientReleaseService ClientReleaseService,
         BotRegistry BotRegistry,
         BotClientProvider BotClientProvider,
         BotContextAccessor BotContextAccessor,
@@ -251,6 +255,8 @@ public class TenantBotService
         _usageAnalyticsService = UsageAnalyticsService;
         _serviceProvider = ServiceProvider;
         _logger = Logger;
+        _clientDownloadAvailability = ClientDownloadAvailability;
+        _clientReleaseService = ClientReleaseService;
         _volumeReminderStateStore = VolumeReminderStateStore;
         _renewalOperationStore = RenewalOperationStore;
         _tenantProvisioningCoordinator = TenantProvisioningCoordinator;
@@ -761,6 +767,15 @@ public class TenantBotService
             if (tenant != null)
                 await TouchTenantCustomerStateAsync(tenant, CallbackQuery.From.Id, CancellationToken);
 
+            // Latest-client-software downloads share one callback namespace with the owned bot so both storefront
+            // families behave identically. Only the three compile-time platforms can be selected, and the handler
+            // re-checks the live global switch so a stale inline button fails closed without contacting GitHub.
+            if (ClientDownloadCallbacks.TryParse(CallbackQuery.Data, out var downloadPlatform))
+            {
+                await HandleClientDownloadPlatformCallbackAsync(botClient, CallbackQuery, downloadPlatform, CancellationToken);
+                return true;
+            }
+
             if (IsCustomerCallback(CallbackQuery.Data))
             {
                 await HANDLECUSTOMERCALLBACKASYNC(botClient, CallbackQuery, CredUser, User, CancellationToken);
@@ -800,6 +815,12 @@ public class TenantBotService
         var messageTenant = await GetCurrentTenantBotAsync(CancellationToken);
         if (messageTenant != null)
             await TouchTenantCustomerStateAsync(messageTenant, Message.From.Id, CancellationToken);
+
+        // The download menu is high-level navigation for tenant customers too. It is answered before the storefront
+        // conversation state can consume the label as purchase, duration, account, or receipt input, and it
+        // deliberately mutates no order, payment, wallet, tenant, or XUI state.
+        if (await TryHandleClientDownloadMenuRequestAsync(botClient, Message, CancellationToken))
+            return true;
 
         await HANDLECUSTOMERMESSAGEASYNC(botClient, Message, CredUser, User, CancellationToken);
         return true;
@@ -5975,15 +5996,23 @@ public class TenantBotService
     /// </summary>
     /// <returns>Storefront menu displaying «اکانت تست» for the shared owned-policy trial entry.</returns>
     /// <remarks>All actions execute under the current store; trial history remains bot/user scoped.</remarks>
-    private static ReplyKeyboardMarkup BuildTenantReplyKeyboard()
+    private ReplyKeyboardMarkup BuildTenantReplyKeyboard()
     {
-        return new ReplyKeyboardMarkup(new[]
+        // The latest-client-download button is global and read from the live switch on every render, so a super-admin
+        // toggle affects newly drawn tenant keyboards immediately and no tenant can override it. Tenant owners have no
+        // per-tenant flag for this feature and none is persisted on BotInstance.
+        var rows = new List<KeyboardButton[]>
         {
             new KeyboardButton[] { "💳 خرید اکانت", "📋 تعرفه‌ها" },
             new KeyboardButton[] { "اکانت‌های من", "🔄 تمدید اکانت" },
             new KeyboardButton[] { "جستجوی اکانت", "راهنما نصب" },
             new KeyboardButton[] { "🌟اکانت تست", "💬 پشتیبانی" }
-        })
+        };
+
+        if (_clientDownloadAvailability.Snapshot.Enabled)
+            rows.Add(new KeyboardButton[] { ClientDownloadCallbacks.OpenCommand });
+
+        return new ReplyKeyboardMarkup(rows)
         {
             ResizeKeyboard = true
         };

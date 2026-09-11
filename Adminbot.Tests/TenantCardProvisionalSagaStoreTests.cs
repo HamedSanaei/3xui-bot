@@ -84,18 +84,20 @@ public sealed partial class ConcurrencyTests
         var key = ProvisionalOperationKey(TenantCardProvisionalOperationKinds.Finalize, "T-1003");
         await store.ClaimAsync(key, 10, "T-1003", TenantCardProvisionalOperationKinds.Finalize, CancellationToken.None);
 
-        Assert.True(await store.AdvanceAsync(key, TenantCardProvisionalSteps.Disabled, null, CancellationToken.None));
+        Assert.True(await store.AdvanceAsync(key, TenantCardProvisionalSteps.QuiescenceConfirmed, null, CancellationToken.None));
         Assert.True(await store.AdvanceAsync(key, TenantCardProvisionalSteps.Reset, null, CancellationToken.None));
-        Assert.True(await store.AdvanceAsync(key, TenantCardProvisionalSteps.ReDisabled, null, CancellationToken.None));
+        Assert.True(await store.AdvanceAsync(key, TenantCardProvisionalSteps.Zeroed, null, CancellationToken.None));
 
         // Replaying an already-recorded step must not advance and must not rewind.
         Assert.False(await store.AdvanceAsync(key, TenantCardProvisionalSteps.Reset, null, CancellationToken.None));
-        Assert.False(await store.AdvanceAsync(key, TenantCardProvisionalSteps.Disabled, null, CancellationToken.None));
+        Assert.False(await store.AdvanceAsync(key, TenantCardProvisionalSteps.QuiescenceConfirmed, null, CancellationToken.None));
 
         var row = await store.FindAsync(key, CancellationToken.None);
-        Assert.Equal(TenantCardProvisionalSteps.ReDisabled, row.Step);
+        Assert.Equal(TenantCardProvisionalSteps.Zeroed, row.Step);
         Assert.NotNull(row.ResetAtUtc);
-        Assert.NotNull(row.ReDisabledAtUtc);
+        Assert.NotNull(row.ZeroedAtUtc);
+        // The finalize saga never disables the client, so the revoke-only disable timestamp stays unset.
+        Assert.Null(row.DisabledAtUtc);
     }
 
     /// <summary>
@@ -110,9 +112,8 @@ public sealed partial class ConcurrencyTests
 
         var first = new TenantCardProvisionalOperationStore(databases.Users);
         await first.ClaimAsync(key, 11, "T-1004", TenantCardProvisionalOperationKinds.Finalize, CancellationToken.None);
-        await first.AdvanceAsync(key, TenantCardProvisionalSteps.Disabled, "{\"enable\":false}", CancellationToken.None);
+        await first.AdvanceAsync(key, TenantCardProvisionalSteps.QuiescenceConfirmed, "{\"enable\":\"true\"}", CancellationToken.None);
         await first.AdvanceAsync(key, TenantCardProvisionalSteps.Reset, null, CancellationToken.None);
-        await first.AdvanceAsync(key, TenantCardProvisionalSteps.ReDisabled, null, CancellationToken.None);
         await first.AdvanceAsync(key, TenantCardProvisionalSteps.Zeroed, "{\"up\":0,\"down\":0}", CancellationToken.None);
 
         // Simulates a process restart: a new store over the same migrated database.
@@ -120,7 +121,7 @@ public sealed partial class ConcurrencyTests
         var row = await restarted.FindAsync(key, CancellationToken.None);
 
         Assert.Equal(TenantCardProvisionalSteps.Zeroed, row.Step);
-        Assert.True(TenantCardProvisionalSteps.HasReached(row.Step, TenantCardProvisionalSteps.ReDisabled));
+        Assert.True(TenantCardProvisionalSteps.HasReached(row.Step, TenantCardProvisionalSteps.Reset));
         Assert.False(TenantCardProvisionalSteps.HasReached(row.Step, TenantCardProvisionalSteps.QuotaWritten));
         // The sanitized evidence for the recorded step survives the restart.
         Assert.Contains("\"up\":0", row.EvidenceJson);
@@ -136,7 +137,7 @@ public sealed partial class ConcurrencyTests
         var store = new TenantCardProvisionalOperationStore(databases.Users);
         var key = ProvisionalOperationKey(TenantCardProvisionalOperationKinds.Finalize, "T-1005");
         await store.ClaimAsync(key, 12, "T-1005", TenantCardProvisionalOperationKinds.Finalize, CancellationToken.None);
-        await store.AdvanceAsync(key, TenantCardProvisionalSteps.Disabled, null, CancellationToken.None);
+        await store.AdvanceAsync(key, TenantCardProvisionalSteps.QuiescenceConfirmed, null, CancellationToken.None);
 
         Assert.True(await store.MarkManualReviewAsync(key, "provisional_identity_ambiguous", CancellationToken.None));
         // Recording manual review twice is a no-op rather than an error, so a retried saga cannot double-write.

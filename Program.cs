@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Telegram.Bot;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Adminbot.Services;
 using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Builder;
@@ -113,6 +114,16 @@ public class Program
                 appConfig,
                 Path.Combine(contentRootPath, "Data", "configuration.json"),
                 sp.GetRequiredService<ILogger<PaymentGatewayAvailabilityService>>()));
+        // The latest-client-download switch is a global singleton reading the same byte-preserving configuration file, so
+        // an administrator toggle changes the live snapshot without an application restart.
+        services.AddSingleton<IClientDownloadAvailability>(sp =>
+            new ClientDownloadAvailabilityService(
+                appConfig,
+                Path.Combine(contentRootPath, "Data", "configuration.json"),
+                sp.GetRequiredService<ILogger<ClientDownloadAvailabilityService>>()));
+        // One shared release resolver for owned and tenant bots, so the asset-selection rules cannot diverge between them.
+        services.AddSingleton<IClientReleaseService>(sp =>
+            new ClientReleaseService(sp.GetRequiredService<ILogger<ClientReleaseService>>()));
         services.AddSingleton<NowPayments>();
         services.AddScoped<NowPaymentsSettlementService>();
         services.AddSingleton<HooshPay>();

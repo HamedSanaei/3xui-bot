@@ -435,9 +435,15 @@ public sealed partial class ConcurrencyTests
         return new TelegramBotService(
             client, new UserWorkflowStore(databases.Users), new UserStateStore(databases.Users),
             new CredentialsStore(databases.Credentials), configuration, NullLogger<TelegramBotService>.Instance,
-            null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!,
-            null!, null!, null!, new UserActivityLogService(configuration), null!, null!, null!, null!, null!, null!,
-            null!, null!, accessor, null!, timeouts);
+            // broadcast/nowpayments/hooshpay/tetraminator/uniquepay/atlaspay pairs plus the two availability seams.
+            null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!,
+            null!, null!,
+            // x-ui purchase/session/admin flows, tenant and sales-assistant services.
+            null!, null!, null!, null!, null!, null!,
+            new UserActivityLogService(configuration),
+            // analytics, chart renderer, wallet ledger, notification, gozargah, registry, runtime status.
+            null!, null!, null!, null!, null!, null!, null!, null!,
+            accessor, null!, timeouts);
     }
 
     private static Task<bool> InvokeMandatoryJoinAsync(
@@ -688,13 +694,17 @@ public sealed partial class ConcurrencyTests
         var currentIndex = applied.IndexOf(current);
         Assert.True(previousIndex >= 0 && previousIndex < currentIndex, "owner-route migration must follow the AtlasPay migration");
         Assert.Contains("20260911023015_AddTenantCardProvisionalOperation", applied);
-        // The newest migration only adds the provisional finalize/revoke saga-state table, so it cannot rewrite the
-        // legacy rows asserted above. Ordering is asserted rather than a hard-coded "is latest" name so an unrelated
-        // future migration does not fail a test about backfill behaviour.
+        Assert.Contains("20260911035150_AddProvisionalFinalizationFreeze", applied);
+        // The provisional series only adds a saga-state table and then nullable freeze columns on it, so none of it can
+        // rewrite the legacy rows asserted above. Ordering is asserted rather than a hard-coded "is latest" name so an
+        // unrelated future migration does not fail a test about backfill behaviour.
         var provisionalDeliveryIndex = applied.IndexOf("20260911000006_AddTenantCardProvisionalDelivery");
         var sagaStateIndex = applied.IndexOf("20260911023015_AddTenantCardProvisionalOperation");
+        var finalizeFreezeIndex = applied.IndexOf("20260911035150_AddProvisionalFinalizationFreeze");
         Assert.True(provisionalDeliveryIndex >= 0 && provisionalDeliveryIndex < sagaStateIndex,
             "the provisional saga-state migration must follow the provisional-delivery schema");
+        Assert.True(sagaStateIndex < finalizeFreezeIndex,
+            "the finalize freeze migration must follow the provisional saga-state table it extends");
 
         var (resolver, _, _, _) = CreateRoutingResolver(databases);
         var resolved = await resolver.ResolveAsync(tenant, RoutingOwnerId);
