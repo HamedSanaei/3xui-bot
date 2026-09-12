@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using Adminbot.Domain;
+using Adminbot.Services;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Newtonsoft.Json;
@@ -152,6 +153,14 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
                 continue;
 
             var metadata = TryReadMetadata(client.Comment);
+
+            // A provisional tenant card-to-card courtesy client is not a paid subscription: its 1 GB / 1 day allowance
+            // only exists until the store owner reviews the receipt, and the real entitlement is applied to this same
+            // client at approval. A normal paid-service expiry reminder would tell the customer to renew a plan they
+            // already bought. Finalization replaces this plan key, so the account becomes eligible again afterwards.
+            if (TenantCardProvisionalProvisioningService.IsProvisionalPlanKey(metadata?.PlanKey))
+                continue;
+
             var ownerTelegramUserId = GetOwnerTelegramUserId(client, metadata);
             if (ownerTelegramUserId <= 0 || IsSuperAdmin(ownerTelegramUserId))
                 continue;

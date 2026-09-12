@@ -524,6 +524,27 @@ namespace Adminbot.Domain
         /// <summary>Owned purchase session id scoped by BotId and TelegramUserId; cleared with transient conversation state.</summary>
         public string PurchaseSessionId { get; set; }
         /// <summary>
+        /// Gets or sets the internal <c>users.db</c> id of the tenant card-to-card order whose receipt upload the
+        /// customer just requested.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is the durable binding between the <c>TN:receipt:{orderDbId}</c> callback and the image that arrives
+        /// afterwards. It exists because a receipt used to be attached to the newest eligible card order, so a second
+        /// order becoming newest in the same chat could silently receive the first order's receipt.
+        /// </para>
+        /// <para>
+        /// Scope is the composite <see cref="BotId" /> plus <see cref="TelegramUserId" /> key, so the same Telegram user
+        /// can hold independent receipt targets in different storefront bots and never in a global user-keyed table.
+        /// </para>
+        /// <para>
+        /// Deliberately not cleared by <see cref="Clear" />: the customer may press the receipt button and then send the
+        /// image after any other navigation, and dropping the target in between would reintroduce the guessing bug. It is
+        /// cleared explicitly once the image is persisted or once the target is proven no longer eligible.
+        /// </para>
+        /// </remarks>
+        public int? PendingReceiptOrderDbId { get; set; }
+        /// <summary>
         /// Gets or sets the evidence mode for the temporary tenant renewal service category.
         /// </summary>
         /// <remarks>

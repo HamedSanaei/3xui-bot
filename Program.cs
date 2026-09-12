@@ -182,6 +182,15 @@ public class Program
         services.AddScoped<TenantStorefrontFundingAlertService>();
         services.AddScoped<TenantStorefrontFundingAlertDeliveryService>();
         services.AddScoped<TenantProvisioningAttemptCoordinator>();
+        // Tenant card-to-card provisional delivery. The switch itself defaults to off, so these registrations are inert in
+        // production until an operator sets tenantCardProvisionalDeliveryEnabled. Creation shares the same durable
+        // exactly-once creation-operation store the normal purchase path uses, so a provisional client can never be POSTed
+        // twice; finalization and revocation share one forward-only saga table.
+        services.AddSingleton<XuiV3CreationOperationStore>();
+        services.AddScoped<TenantCardProvisionalOperationStore>();
+        services.AddScoped<TenantCardProvisionalProvisioningService>();
+        services.AddScoped<TenantCardProvisionalFinalizationService>();
+        services.AddScoped<TenantCardProvisionalRevocationService>();
         services.AddSingleton<XuiV3LinkChangeOperationStore>();
         services.AddScoped<XuiV3BotFlowService>();
         services.AddScoped<XuiV3AdminFlowService>();

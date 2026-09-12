@@ -695,16 +695,23 @@ public sealed partial class ConcurrencyTests
         Assert.True(previousIndex >= 0 && previousIndex < currentIndex, "owner-route migration must follow the AtlasPay migration");
         Assert.Contains("20260911023015_AddTenantCardProvisionalOperation", applied);
         Assert.Contains("20260911035150_AddProvisionalFinalizationFreeze", applied);
-        // The provisional series only adds a saga-state table and then nullable freeze columns on it, so none of it can
-        // rewrite the legacy rows asserted above. Ordering is asserted rather than a hard-coded "is latest" name so an
-        // unrelated future migration does not fail a test about backfill behaviour.
+        // Adds one nullable bot-scoped receipt-upload target column; null for every historical row, so no legacy row
+        // asserted above can be rewritten by it.
+        Assert.Contains("20260912005131_AddTenantReceiptUploadTarget", applied);
+        // The provisional series only adds a saga-state table, nullable freeze columns on it, and then one nullable
+        // receipt-target column, so none of it can rewrite the legacy rows asserted above. Ordering is asserted rather
+        // than a hard-coded "is latest" name so an unrelated future migration does not fail a test about backfill
+        // behaviour.
         var provisionalDeliveryIndex = applied.IndexOf("20260911000006_AddTenantCardProvisionalDelivery");
         var sagaStateIndex = applied.IndexOf("20260911023015_AddTenantCardProvisionalOperation");
         var finalizeFreezeIndex = applied.IndexOf("20260911035150_AddProvisionalFinalizationFreeze");
+        var receiptTargetIndex = applied.IndexOf("20260912005131_AddTenantReceiptUploadTarget");
         Assert.True(provisionalDeliveryIndex >= 0 && provisionalDeliveryIndex < sagaStateIndex,
             "the provisional saga-state migration must follow the provisional-delivery schema");
         Assert.True(sagaStateIndex < finalizeFreezeIndex,
             "the finalize freeze migration must follow the provisional saga-state table it extends");
+        Assert.True(finalizeFreezeIndex < receiptTargetIndex,
+            "the receipt-upload target migration must follow the provisional saga-state series");
 
         var (resolver, _, _, _) = CreateRoutingResolver(databases);
         var resolved = await resolver.ResolveAsync(tenant, RoutingOwnerId);

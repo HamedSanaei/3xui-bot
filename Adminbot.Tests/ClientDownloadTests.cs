@@ -816,13 +816,28 @@ public sealed partial class ConcurrencyTests
             ["UserActivityLogEnabled"] = "false"
         }).Build();
         var accessor = new BotContextAccessor();
+        // The provisional tenant card services are real instances over the temporary databases so the storefront service
+        // is constructed exactly as production does. They stay inert here because the provisional switch is off in this
+        // configuration, which is what makes these tests about the download menu rather than about courtesy delivery.
+        var provisionalStore = new TenantCardProvisionalOperationStore(databases.Users);
+        var provisionalProvisioning = new TenantCardProvisionalProvisioningService(
+            databases.Users,
+            new XuiV3PurchaseService(configuration, databases.Users),
+            new XuiV3CreationOperationStore(databases.Users),
+            configuration,
+            NullLogger<TenantCardProvisionalProvisioningService>.Instance);
+        var provisionalFinalization = new TenantCardProvisionalFinalizationService(
+            provisionalStore, configuration, NullLogger<TenantCardProvisionalFinalizationService>.Instance);
+        var provisionalRevocation = new TenantCardProvisionalRevocationService(
+            provisionalStore, configuration, NullLogger<TenantCardProvisionalRevocationService>.Instance);
         return new TenantBotService(
             new UserWorkflowStore(databases.Users), new UserStateStore(databases.Users),
             new CredentialsStore(databases.Credentials), configuration,
             null!, null!, null!, null!, null!, null!, null!, null!,
             flag, releases,
             null!, null!, accessor, null!, null!, null!, null!, null!, null!, null!,
-            NullLogger<TenantBotService>.Instance, null!, null!, null!);
+            NullLogger<TenantBotService>.Instance, null!, null!, null!,
+            provisionalProvisioning, provisionalFinalization, provisionalRevocation);
     }
 
     /// <summary>Flattens the owned customer reply keyboard into its button labels.</summary>

@@ -125,6 +125,22 @@ public partial class TenantBotService
     private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
     private readonly XuiV3RenewalOperationStore _renewalOperationStore;
     private readonly TenantProvisioningAttemptCoordinator _tenantProvisioningCoordinator;
+    /// <summary>
+    /// Creates the single 1 GiB / 1 day courtesy client granted to a tenant card-to-card purchase customer while the
+    /// receipt is still under owner review. Only reached when <see cref="AppConfig.TenantCardProvisionalDeliveryEnabled" />
+    /// is enabled and the order is a card-funded purchase.
+    /// </summary>
+    private readonly TenantCardProvisionalProvisioningService _tenantCardProvisionalProvisioning;
+    /// <summary>
+    /// Upgrades that SAME courtesy client to the exact purchased entitlement once the owner approves the receipt. This
+    /// service must be the only path that fulfills a provisional card order, so approval can never create a second client.
+    /// </summary>
+    private readonly TenantCardProvisionalFinalizationService _tenantCardProvisionalFinalization;
+    /// <summary>
+    /// Disables the courtesy client after the owner rejects the receipt, so a refused payment does not leave the customer
+    /// with working access. Never settles money.
+    /// </summary>
+    private readonly TenantCardProvisionalRevocationService _tenantCardProvisionalRevocation;
 
     /// <summary>
     /// Immutable budget for UX-only callback acknowledgement on the tenant bot. Production uses the shared
@@ -229,6 +245,9 @@ public partial class TenantBotService
         XuiV3VolumeReminderStateStore VolumeReminderStateStore,
         XuiV3RenewalOperationStore RenewalOperationStore,
         TenantProvisioningAttemptCoordinator TenantProvisioningCoordinator,
+        TenantCardProvisionalProvisioningService TenantCardProvisionalProvisioning,
+        TenantCardProvisionalFinalizationService TenantCardProvisionalFinalization,
+        TenantCardProvisionalRevocationService TenantCardProvisionalRevocation,
         TelegramInteractionTimeouts InteractionTimeouts = null)
     {
         _workflow = UserDbContext;
@@ -260,6 +279,9 @@ public partial class TenantBotService
         _volumeReminderStateStore = VolumeReminderStateStore;
         _renewalOperationStore = RenewalOperationStore;
         _tenantProvisioningCoordinator = TenantProvisioningCoordinator;
+        _tenantCardProvisionalProvisioning = TenantCardProvisionalProvisioning ?? throw new ArgumentNullException(nameof(TenantCardProvisionalProvisioning));
+        _tenantCardProvisionalFinalization = TenantCardProvisionalFinalization ?? throw new ArgumentNullException(nameof(TenantCardProvisionalFinalization));
+        _tenantCardProvisionalRevocation = TenantCardProvisionalRevocation ?? throw new ArgumentNullException(nameof(TenantCardProvisionalRevocation));
         _interactionTimeouts = InteractionTimeouts ?? TelegramInteractionTimeouts.Production;
     }
 
@@ -3462,9 +3484,26 @@ public partial class TenantBotService
         if (!await EnsureTenantCustomerJoinAsync(botClient, Message, tenant, CancellationToken))
             return;
 
-        if (Message.Photo?.Length > 0)
+        // A card-to-card receipt may arrive either as a compressed Telegram photo or as an uncompressed image
+        // document, which is what the production incident exposed. Both resolve to a plain file id through one helper so
+        // the two message shapes cannot drift into different ingestion behavior.
+        if (TenantReceiptMediaResolver.TryResolve(Message, out var receiptMedia))
         {
-            await CREATETENANTMANUALRECEIPTASYNC(botClient, Message, tenant, customer, CancellationToken);
+            await CREATETENANTMANUALRECEIPTASYNC(botClient, Message, tenant, customer, receiptMedia, CancellationToken);
+            return;
+        }
+
+        // Only answer an unsupported document when the customer is actually mid receipt-upload, so an unrelated file in
+        // the storefront is not lectured about receipt formats. The durable target is deliberately kept so the customer
+        // can immediately send a correct image without pressing the receipt button again.
+        if (Message.Document != null &&
+            await _state.GetPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken) is not null)
+        {
+            await botClient.SendTextMessageAsync(
+                Message.Chat.Id,
+                "❌ فایل رسید باید تصویر باشد. لطفاً رسید را به صورت عکس (JPG، PNG یا WebP) ارسال کنید.",
+                replyMarkup: BuildTenantReplyKeyboard(),
+                cancellationToken: CancellationToken);
             return;
         }
 
@@ -8738,9 +8777,12 @@ public partial class TenantBotService
             }
         }
 
+        XuiV3ResolvedPurchase resolvedPurchase;
         try
         {
-            _ = _purchaseService.ResolveTenantPurchase(selection, false);
+            // The resolved purchase is captured rather than discarded: when this order already holds a delivered
+            // provisional client, its exact quota and duration are what the same-client finalization must apply.
+            resolvedPurchase = _purchaseService.ResolveTenantPurchase(selection, false);
         }
         catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
         {
@@ -8774,11 +8816,26 @@ public partial class TenantBotService
                 // The coordinator maps the paid order to its current immutable attempt: it reuses Reserved,
                 // PostStarted, Ambiguous, and Applied attempts and opens retry:(highest+1) only when the latest
                 // attempt is DefinitiveRejected AND this call carries a new explicit durable authorization.
-                var attempt = await _tenantProvisioningCoordinator.ResolvePurchaseAttemptAsync(
-                    order.Id,
-                    retryAuthorization,
+                // Provisional tenant card branch. When this order already holds a delivered courtesy client the SAME
+                // client is upgraded here and the normal account creation below is skipped entirely, which is what makes
+                // "one account forever" true for a card order regardless of which confirmation path was used.
+                var provisionalOutcome = await TRYTENANTCARDPROVISIONALFINALIZATIONASYNC(
+                    order,
+                    resolvedPurchase,
                     CancellationToken);
-                if (!attempt.Allowed)
+                if (provisionalOutcome.Handled && !provisionalOutcome.Success)
+                {
+                    await HANDLETENANTCARDPROVISIONALBLOCKEDASYNC(order, provisionalOutcome, Source, CancellationToken);
+                    return NowPaymentsSettlementResult.InvalidAmount();
+                }
+
+                var attempt = provisionalOutcome.Handled
+                    ? null
+                    : await _tenantProvisioningCoordinator.ResolvePurchaseAttemptAsync(
+                        order.Id,
+                        retryAuthorization,
+                        CancellationToken);
+                if (attempt != null && !attempt.Allowed)
                 {
                     // Automatic callbacks and checks never allocate another generation after a definitive
                     // rejection. A fixed safe reason is recorded instead of the raw reservation exception.
@@ -8794,7 +8851,9 @@ public partial class TenantBotService
                     return NowPaymentsSettlementResult.InvalidAmount();
                 }
 
-                var created = await _purchaseService.CreateAccountAsync(
+                var created = provisionalOutcome.Handled
+                    ? provisionalOutcome.Created
+                    : await _purchaseService.CreateAccountAsync(
                     customer,
                     BuildConfiguredPanelServerInfo(),
                     selection,
@@ -8964,6 +9023,11 @@ public partial class TenantBotService
     /// <remarks>
     /// this method does not Create or FULFILL ANYTHING. it only keeps the customer ORIENTED and MAKES
     /// RE-UPLOADING A receipt DISCOVERABLE from the Original order Message.
+    ///
+    /// It does record the durable receipt-upload target for this exact order through
+    /// <see cref="UserStateStore.SetPendingReceiptTargetAsync" />, scoped to the active tenant bot plus
+    /// <paramref name="CustomerTelegramUserId" />. That binding is what makes the following image attach to this order
+    /// instead of to whichever card order happened to become the newest one before the upload arrived.
     /// </remarks>
     private async Task PromptTenantReceiptUploadAsync(
         ITelegramBotClient botClient,
@@ -8989,6 +9053,11 @@ public partial class TenantBotService
         order.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
 
+        // Durable exact-order binding. The image that follows this prompt must attach to THIS order, so the target is
+        // recorded in bot-scoped customer state (BotId + TelegramUserId) rather than rediscovered as "the newest
+        // eligible card order", which could silently attach the receipt to a different order opened in the meantime.
+        await _state.SetPendingReceiptTargetAsync(CustomerTelegramUserId, order.Id, CancellationToken);
+
         await botClient.SendTextMessageAsync(
             ChatId,
             "لطفاً عکس رسید کارت‌به‌کارت همین سفارش را ارسال کنید.\n" +
@@ -9001,27 +9070,110 @@ public partial class TenantBotService
     }
 
     /// <summary>
-    /// creates A manual card-to-card receipt from A customer photo and FORWARDS it to the sales assistant Bot.
+    /// creates A manual card-to-card receipt from a customer image message and FORWARDS it to the sales assistant Bot.
     /// </summary>
-    /// <param name="botClient">tenant Bot client that received the receipt photo.</param>
-    /// <param name="Message">customer photo Message; the largest Telegram photo size is stored as the receipt file Id.</param>
+    /// <param name="botClient">tenant Bot client that received the receipt image.</param>
+    /// <param name="Message">
+    /// customer message carrying the receipt. Either a Telegram photo, whose largest rendition is stored, or a Telegram
+    /// image document (JPG, PNG, WebP). See <see cref="TenantReceiptMediaResolver" /> for what is accepted.
+    /// </param>
     /// <param name="tenant">current tenant Bot that owns the pending order.</param>
     /// <param name="customer">credentials profile of the tenant customer who sent the receipt.</param>
+    /// <param name="receiptMedia">
+    /// Resolved file id and kind for the image in <paramref name="Message" />. Required; a null or empty resolution is
+    /// rejected without touching the database.
+    /// </param>
     /// <param name="CancellationToken">Cancellation Token for users.db and Telegram calls.</param>
+    /// <returns>A task completing after the receipt and its durable owner-notification intent are committed.</returns>
     /// <remarks>
-    /// this method does not FULFILL the order. it only stores an auditable pending receipt and sends it to
-    /// the Central sales assistant where the tenant owner must APPROVE and then finally confirm it.
+    /// <para>
+    /// This method does not FULFILL the order. It stores an auditable pending receipt and its durable Sales Assistant
+    /// relay intent, then hands the image to the Central sales assistant where the tenant owner must APPROVE and then
+    /// finally confirm it. The receipt is committed BEFORE the courtesy provisional client is requested, so an
+    /// unavailable XUI panel can never stop the store owner from receiving and reviewing the receipt.
+    /// </para>
+    /// <para>
+    /// The target order comes from the durable bot-scoped receipt-upload target recorded by
+    /// <see cref="PromptTenantReceiptUploadAsync" />, which is what stops an upload started for one order from attaching
+    /// to a different card order that became newest in the meantime. The fallback to the newest eligible card order is
+    /// retained only for uploads that began before the durable target existed.
+    /// </para>
     /// </remarks>
     private async Task CREATETENANTMANUALRECEIPTASYNC(
         ITelegramBotClient botClient,
         Message Message,
         BotInstance tenant,
         CredUser customer,
+        TenantReceiptMedia receiptMedia,
         CancellationToken CancellationToken)
     {
-        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders
+        if (receiptMedia == null || string.IsNullOrWhiteSpace(receiptMedia.FileId))
+        {
+            await botClient.SendTextMessageAsync(Message.Chat.Id, "فایل رسید معتبر نیست.", cancellationToken: CancellationToken);
+            return;
+        }
+
+        var order = await RESOLVETENANTRECEIPTTARGETORDERASYNC(tenant, customer.TelegramUserId, CancellationToken);
+        if (order == null)
+        {
+            // A stale or forged target must fail closed, so the pointer is dropped instead of being retried forever.
+            await _state.ClearPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken);
+            await botClient.SendTextMessageAsync(Message.Chat.Id, "سفارش کارت‌به‌کارت فعالی برای این رسید پیدا نشد.", cancellationToken: CancellationToken);
+            return;
+        }
+
+        // Receipt row + owner-notification outbox row commit together, and only then is any panel work attempted.
+        await PERSISTTENANTMANUALRECEIPTASYNC(order.Id, receiptMedia.FileId, CancellationToken);
+        await _state.ClearPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken);
+
+        await botClient.SendTextMessageAsync(
+            Message.Chat.Id,
+            "✅ رسید ثبت شد و برای تایید مدیر ارسال شد.",
+            cancellationToken: CancellationToken);
+
+        await PROVISIONTENANTCARDPROVISIONALASYNC(botClient, Message.Chat.Id, customer, order.Id, CancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves the exact tenant card-to-card order one incoming receipt image belongs to.
+    /// </summary>
+    /// <param name="tenant">Tenant storefront bot that received the image; part of the target's identity.</param>
+    /// <param name="customerTelegramUserId">Telegram user id of the sender; also part of the target's identity.</param>
+    /// <param name="CancellationToken">Cancellation token for the short reads.</param>
+    /// <returns>
+    /// The unfulfilled card order whose receipt the sender explicitly requested, or <c>null</c> when the recorded target
+    /// no longer qualifies or no target was ever recorded.
+    /// </returns>
+    /// <remarks>
+    /// A recorded target is honoured only if it is still this bot's, this customer's, card-funded, unfulfilled, and in an
+    /// eligible receipt state. Anything else returns <c>null</c> so the caller fails closed instead of guessing, because
+    /// the previous "newest eligible order" behavior could attach a receipt to the wrong order. The newest-eligible
+    /// fallback is used only when no target exists at all, which is the state of uploads started before the durable
+    /// target column was introduced.
+    /// </remarks>
+    private async Task<TenantBotOrder> RESOLVETENANTRECEIPTTARGETORDERASYNC(
+        BotInstance tenant,
+        long customerTelegramUserId,
+        CancellationToken CancellationToken)
+    {
+        var targetOrderDbId = await _state.GetPendingReceiptTargetAsync(customerTelegramUserId, CancellationToken);
+        if (targetOrderDbId.HasValue)
+        {
+            return await _workflow.ReadAsync(async db => await db.TenantBotOrders
+                .Where(x => x.Id == targetOrderDbId.Value &&
+                            x.TenantBotId == tenant.Id &&
+                            x.CustomerTelegramUserId == customerTelegramUserId &&
+                            x.PaymentProvider == "tenant_card" &&
+                            !x.IsFulfilled &&
+                            (x.PaymentStatus == TenantBotOrderStatuses.AwaitingReceipt ||
+                             x.PaymentStatus == TenantBotOrderStatuses.ReceiptSubmitted ||
+                             x.PaymentStatus == TenantBotOrderStatuses.ReceiptRejected))
+                .FirstOrDefaultAsync(CancellationToken));
+        }
+
+        return await _workflow.ReadAsync(async db => await db.TenantBotOrders
             .Where(x => x.TenantBotId == tenant.Id &&
-                        x.CustomerTelegramUserId == customer.TelegramUserId &&
+                        x.CustomerTelegramUserId == customerTelegramUserId &&
                         x.PaymentProvider == "tenant_card" &&
                         !x.IsFulfilled &&
                         (x.PaymentStatus == TenantBotOrderStatuses.AwaitingReceipt ||
@@ -9029,26 +9181,318 @@ public partial class TenantBotService
                          x.PaymentStatus == TenantBotOrderStatuses.ReceiptRejected))
             .OrderByDescending(x => x.CreatedAtUtc)
             .FirstOrDefaultAsync(CancellationToken));
+    }
 
-        if (order == null)
-        {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "سفارش کارت‌به‌کارت فعالی برای این رسید پیدا نشد.", cancellationToken: CancellationToken);
+    /// <summary>
+    /// Sends the single 1 GB / 1 day courtesy client to a tenant card-to-card customer while their receipt is under review.
+    /// </summary>
+    /// <param name="botClient">Tenant storefront bot used to deliver the details; never another tenant's bot.</param>
+    /// <param name="chatId">Customer chat that receives the provisional account details.</param>
+    /// <param name="customer">
+    /// Detached credentials profile of the customer. <see cref="XuiV3AccountMetadataOptions.SaveUserStatus" /> is disabled
+    /// by the provisioning service, so the courtesy account never overwrites the customer's own conversation state.
+    /// </param>
+    /// <param name="orderDbId">Internal <c>users.db</c> id of the just-persisted card order.</param>
+    /// <param name="CancellationToken">Cancellation token for users.db, panel, and Telegram work.</param>
+    /// <returns>A task completing after the provisional attempt and any customer delivery.</returns>
+    /// <remarks>
+    /// <para>
+    /// Best-effort on the Telegram side by design: the receipt and its owner notification are already durable before
+    /// this runs, so a provisioning or send failure can never lose the owner's ability to review the payment. Nothing
+    /// here settles money, debits a wallet, writes a ledger row, marks the order paid or fulfilled, or inverts the
+    /// customer's purchased entitlement.
+    /// </para>
+    /// <para>
+    /// Skipped entirely when <see cref="AppConfig.TenantCardProvisionalDeliveryEnabled" /> is off, which keeps production
+    /// behavior identical to the previous release until an operator turns the feature on.
+    /// </para>
+    /// </remarks>
+    private async Task PROVISIONTENANTCARDPROVISIONALASYNC(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        CredUser customer,
+        int orderDbId,
+        CancellationToken CancellationToken)
+    {
+        if (!ISPROVISIONALTENANTCARDENABLED())
             return;
-        }
 
-        var photo = Message.Photo.OrderByDescending(x => x.FileSize ?? 0).FirstOrDefault();
-        if (photo == null)
+        try
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "عکس رسید معتبر نیست.", cancellationToken: CancellationToken);
-            return;
-        }
+            var provisional = await _tenantCardProvisionalProvisioning.ProvisionAsync(
+                customer,
+                BuildConfiguredPanelServerInfo(),
+                orderDbId,
+                CancellationToken);
 
-        await PERSISTTENANTMANUALRECEIPTASYNC(order.Id, photo.FileId, CancellationToken);
+            if (provisional.Status is not (TenantCardProvisionalProvisioningStatus.Created
+                or TenantCardProvisionalProvisioningStatus.AlreadyDelivered))
+                return;
+
+            if (string.IsNullOrWhiteSpace(provisional.Email))
+                return;
+
+            await SENDTENANTCARDPROVISIONALDETAILSASYNC(botClient, chatId, provisional, CancellationToken);
+
+            // Marked delivered only after the customer actually received the details, so "account exists" and "customer
+            // was told" stay independently observable and a failed send never triggers another panel create.
+            await _tenantCardProvisionalProvisioning.MarkDeliveredAsync(orderDbId, CancellationToken);
+        }
+        catch (OperationCanceledException) when (CancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Provisional tenant card delivery failed after the receipt was persisted. orderId={OrderId} ErrorType={ErrorType}",
+                orderDbId, ex.GetType().Name);
+        }
+    }
+
+    /// <summary>Tells the customer about their temporary courtesy account in clear, non-misleading Persian.</summary>
+    /// <param name="botClient">Tenant storefront bot used for the send.</param>
+    /// <param name="chatId">Customer chat id.</param>
+    /// <param name="provisional">Proven provisional identity and courtesy limits.</param>
+    /// <param name="CancellationToken">Cancellation token for the Telegram call.</param>
+    /// <returns>A task completing after the message is sent.</returns>
+    /// <remarks>
+    /// The text deliberately avoids any claim that the order is paid or fulfilled, states that the same account will be
+    /// upgraded after approval, and states that a rejected receipt disables the temporary account.
+    /// </remarks>
+    private async Task SENDTENANTCARDPROVISIONALDETAILSASYNC(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        TenantCardProvisionalProvisioningResult provisional,
+        CancellationToken CancellationToken)
+    {
+        var text =
+            "🎁 <b>اکانت موقت شما فعال شد</b>\n\n" +
+            "این اکانت موقت است تا زمانی که رسید کارت‌به‌کارت شما توسط مدیر فروشگاه بررسی شود.\n" +
+            $"📦 حجم موقت: <code>{provisional.TrafficGb} GB</code>\n" +
+            $"⏳ مدت موقت: <code>{provisional.DurationDays} روز</code>\n" +
+            $"🧾 شماره سفارش: <code>{Html(provisional.PublicOrderId)}</code>\n\n" +
+            "پس از تایید رسید، همین اکانت به بسته خریداری‌شده شما ارتقا پیدا می‌کند و اکانت جدیدی ساخته نمی‌شود.\n" +
+            "در صورت رد رسید، این اکانت موقت غیرفعال می‌شود.";
+
+        if (!string.IsNullOrWhiteSpace(provisional.SubLink))
+            text += $"\n\n🔗 لینک اشتراک:\n<code>{Html(provisional.SubLink)}</code>";
 
         await botClient.SendTextMessageAsync(
-            Message.Chat.Id,
-            "✅ رسید شما ثبت شد و برای تایید همکار در صف ارسال قرار گرفت.",
+            chatId,
+            text,
+            parseMode: ParseMode.Html,
+            replyMarkup: BuildTenantReplyKeyboard(),
             cancellationToken: CancellationToken);
+    }
+
+    /// <summary>Reads the live global switch that enables provisional tenant card delivery.</summary>
+    /// <returns><c>true</c> when the feature is currently enabled; otherwise <c>false</c>, including when unset.</returns>
+    /// <remarks>
+    /// Read from configuration on every call rather than from the startup snapshot, so an operator edit is honored by the
+    /// next receipt without a code change. A missing key keeps the feature off, which preserves legacy behavior.
+    /// </remarks>
+    private bool ISPROVISIONALTENANTCARDENABLED()
+        => _configuration.Get<AppConfig>()?.TenantCardProvisionalDeliveryEnabled ?? false;
+
+    /// <summary>
+    /// Outcome of the provisional tenant card fulfillment probe.
+    /// </summary>
+    /// <param name="Handled">
+    /// <c>true</c> when this order is a provisional tenant card purchase and the caller must NOT run the normal
+    /// new-account creation path.
+    /// </param>
+    /// <param name="Success"><c>true</c> only when the same client's purchased entitlement is proven applied.</param>
+    /// <param name="Created">
+    /// Account-creation result describing the finalized client, suitable for the shared settlement tail. Null unless
+    /// <paramref name="Success" /> is <c>true</c>.
+    /// </param>
+    /// <param name="Message">Safe Persian explanation shown when the order could not be finalized automatically.</param>
+    /// <remarks>
+    /// A non-handled outcome is the only case where the normal catalog purchase path may run, and it is returned only
+    /// when the panel is proven to hold no provisional client for this order.
+    /// </remarks>
+    private sealed record TENANTCARDPROVISIONALOUTCOME(
+        bool Handled,
+        bool Success,
+        XuiV3AccountCreationResult Created,
+        string Message);
+
+    /// <summary>
+    /// Decides how one approved tenant card-to-card purchase must be fulfilled and, when required, upgrades the existing
+    /// courtesy client in place.
+    /// </summary>
+    /// <param name="order">
+    /// Tracked tenant order being fulfilled. On success its provisional state is advanced to <c>finalized</c> here, so the
+    /// caller's existing save commits that transition atomically with fulfillment.
+    /// </param>
+    /// <param name="resolvedPurchase">
+    /// Authoritative completed purchase for the order's original selection. Supplies the exact purchased byte quota and
+    /// the purchased duration that the final client must carry.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for users.db, panel, and identity-verification work.</param>
+    /// <returns>
+    /// A handled outcome when this order is a provisional tenant card purchase. <c>Handled</c> with <c>Success</c>
+    /// <c>false</c> means the caller must record the block and settle nothing; <c>Handled</c> <c>false</c> means the order
+    /// has no provisional client and the normal path is safe.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this is the single boundary.</b> Every authorized confirmation path -- Sales Assistant final confirmation,
+    /// owner <c>OrderId</c> confirmation, and super-admin recovery -- funnels through
+    /// <see cref="FULFILLPAIDTENANTORDERASYNC" />, so routing the provisional decision here is what makes all three obey the
+    /// same state machine and stops any of them from creating a second XUI client.
+    /// </para>
+    /// <para>
+    /// <b>Fail-closed rules.</b> A provisional create that may have reached the panel but is not proven is escalated to
+    /// manual review rather than retried or duplicated. Only a key that was never reserved, is still reserved, or was
+    /// definitively rejected by the panel allows the normal path, because only those outcomes prove no client exists.
+    /// </para>
+    /// <para>
+    /// Financial boundary: this method never debits a wallet, writes a ledger row, marks the order fulfilled, or sends a
+    /// final-sale notification. Those remain the caller's shared settlement tail, which runs only after this returns
+    /// <c>Success</c>.
+    /// </para>
+    /// </remarks>
+    private async Task<TENANTCARDPROVISIONALOUTCOME> TRYTENANTCARDPROVISIONALFINALIZATIONASYNC(
+        TenantBotOrder order,
+        XuiV3ResolvedPurchase resolvedPurchase,
+        CancellationToken cancellationToken)
+    {
+        if (!ISPROVISIONALTENANTCARDENABLED() ||
+            !string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(order.OrderKind, TenantBotOrderKinds.Purchase, StringComparison.OrdinalIgnoreCase))
+        {
+            return new TENANTCARDPROVISIONALOUTCOME(false, false, null, null);
+        }
+
+        var hasProvenIdentity = !string.IsNullOrWhiteSpace(order.ProvisionalAccountEmail)
+                                && !string.IsNullOrWhiteSpace(order.ProvisionalAccountUuid);
+
+        if (!hasProvenIdentity)
+        {
+            if (string.Equals(order.ProvisionalDeliveryState, TenantCardProvisionalStates.ManualReview, StringComparison.Ordinal))
+            {
+                return new TENANTCARDPROVISIONALOUTCOME(
+                    true,
+                    false,
+                    null,
+                    "وضعیت این سفارش نیاز به بررسی دستی دارد و اکانت جدیدی ساخته نشد. لطفاً با پشتیبانی تماس بگیرید.");
+            }
+
+            // The panel must be PROVEN free of a provisional client before the normal create is allowed to run again,
+            // otherwise an unreconciled POST could exist and produce a duplicate client.
+            var panelUntouched = await _tenantCardProvisionalProvisioning
+                .IsPanelProvenUntouchedAsync(order.OrderId, cancellationToken);
+            if (!panelUntouched)
+            {
+                await _tenantCardProvisionalProvisioning.MarkManualReviewAsync(
+                    order.Id, "provisional_create_ambiguous", cancellationToken);
+                order.ProvisionalDeliveryState = TenantCardProvisionalStates.ManualReview;
+                order.ProvisionalErrorCode = "provisional_create_ambiguous";
+                order.UpdatedAtUtc = DateTime.UtcNow;
+                return new TENANTCARDPROVISIONALOUTCOME(
+                    true,
+                    false,
+                    null,
+                    "وضعیت اکانت موقت این سفارش مبهم است و برای جلوگیری از ساخت اکانت تکراری، بررسی دستی لازم است. لطفاً با پشتیبانی تماس بگیرید.");
+            }
+
+            // The provisional attempt never reached the panel or was definitively rejected: the normal full-order path is safe.
+            return new TENANTCARDPROVISIONALOUTCOME(false, false, null, null);
+        }
+
+        var finalization = await _tenantCardProvisionalFinalization.FinalizeAsync(
+            new TenantCardProvisionalFinalizationRequest(
+                order.Id,
+                order.OrderId,
+                BuildConfiguredPanelServerInfo(),
+                order.ProvisionalAccountEmail,
+                order.ProvisionalAccountUuid,
+                order.ProvisionalSubId,
+                XuiV3PurchaseService.ResolveServiceInboundIds(resolvedPurchase.Service),
+                resolvedPurchase.TrafficBytes,
+                resolvedPurchase.DurationDays > 0 ? resolvedPurchase.DurationDays : null),
+            cancellationToken);
+
+        if (finalization.Status is not (TenantCardProvisionalFinalizationStatus.Finalized
+            or TenantCardProvisionalFinalizationStatus.AlreadyFinalized))
+        {
+            if (finalization.Status == TenantCardProvisionalFinalizationStatus.ManualReview)
+            {
+                order.ProvisionalDeliveryState = TenantCardProvisionalStates.ManualReview;
+                order.ProvisionalErrorCode = finalization.ReasonCode;
+            }
+
+            order.UpdatedAtUtc = DateTime.UtcNow;
+
+            // No settlement of any kind happens here: the customer's purchased entitlement is not yet proven applied.
+            return new TENANTCARDPROVISIONALOUTCOME(
+                true,
+                false,
+                null,
+                finalization.Status == TenantCardProvisionalFinalizationStatus.ManualReview
+                    ? "تایید رسید ثبت شد اما ارتقای اکانت موقت نیاز به بررسی دستی دارد و هیچ تغییر مالی اعمال نشد. لطفاً با پشتیبانی تماس بگیرید."
+                    : "تایید رسید ثبت شد اما پنل به‌موقع پاسخ نداد. چند دقیقه دیگر همین سفارش را دوباره تایید کنید؛ اکانت تکراری ساخته نمی‌شود.");
+        }
+
+        // The same client now carries the exact purchased entitlement. The caller's shared settlement tail records the
+        // account details, debits the owner base cost, writes the ledger row, and queues notifications exactly once.
+        order.ProvisionalDeliveryState = TenantCardProvisionalStates.Finalized;
+        order.ProvisionalFinalizedAtUtc ??= DateTime.UtcNow;
+        order.ProvisionalErrorCode = null;
+        order.UpdatedAtUtc = DateTime.UtcNow;
+
+        return new TENANTCARDPROVISIONALOUTCOME(
+            true,
+            true,
+            new XuiV3AccountCreationResult
+            {
+                Success = true,
+                Email = order.ProvisionalAccountEmail,
+                Uuid = order.ProvisionalAccountUuid,
+                SubId = string.IsNullOrWhiteSpace(order.ProvisionalSubId) ? order.ProvisionalAccountEmail : order.ProvisionalSubId,
+                SubLink = ApiServicev3.BuildSubscriptionLink(
+                    BuildConfiguredPanelServerInfo(),
+                    string.IsNullOrWhiteSpace(order.ProvisionalSubId) ? order.ProvisionalAccountEmail : order.ProvisionalSubId),
+                TrafficGb = resolvedPurchase.TrafficGb,
+                TrafficBytes = resolvedPurchase.TrafficBytes,
+                DurationDays = resolvedPurchase.DurationDays > 0 ? resolvedPurchase.DurationDays : null,
+                InboundIds = XuiV3PurchaseService.ResolveServiceInboundIds(resolvedPurchase.Service),
+                Message = "provisional-upgraded"
+            },
+            null);
+    }
+
+    /// <summary>
+    /// Records that an approved tenant card purchase could not be finalized automatically and settles nothing.
+    /// </summary>
+    /// <param name="order">Tracked tenant order that must stay unfulfilled.</param>
+    /// <param name="outcome">The blocked probe outcome carrying the operator-visible explanation.</param>
+    /// <param name="source">Fulfillment source label used for the operational audit log.</param>
+    /// <param name="cancellationToken">Cancellation token for the short save and the Telegram failure notice.</param>
+    /// <returns>A task completing after the block is recorded and the customer is told.</returns>
+    /// <remarks>
+    /// This deliberately does not mark the order failed, does not debit the owner, does not write a ledger row, and does
+    /// not enqueue a sale notification. The receipt stays approved so an operator can retry or reconcile, and no second
+    /// XUI client is created.
+    /// </remarks>
+    private async Task HANDLETENANTCARDPROVISIONALBLOCKEDASYNC(
+        TenantBotOrder order,
+        TENANTCARDPROVISIONALOUTCOME outcome,
+        string source,
+        CancellationToken cancellationToken)
+    {
+        order.ErrorMessage = outcome.Message;
+        order.UpdatedAtUtc = DateTime.UtcNow;
+        await _workflow.SaveAsync(cancellationToken);
+
+        _logger.LogWarning(
+            "Tenant card provisional order could not be finalized and was left unsettled. tenantBotId={TenantBotId} orderId={OrderId} source={Source} provisionalState={ProvisionalState}",
+            order.TenantBotId, order.OrderId, source, order.ProvisionalDeliveryState);
+
+        await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, outcome.Message, cancellationToken);
     }
 
     /// <summary>Atomically saves the receipt state and its durable Sales Assistant relay intent in users.db.</summary>
@@ -9186,6 +9630,157 @@ public partial class TenantBotService
             return "رسید تایید شد، اما پنل ساخت اکانت پاسخ نداد. چند دقیقه دیگر دوباره تایید را بزنید.";
 
         return "تایید رسید ثبت شد ولی ساخت اکانت موفق نبود. لاگ را بررسی کنید.";
+    }
+
+    /// <summary>
+    /// Rejects a tenant card-to-card receipt and disables any provisional courtesy client that was already delivered.
+    /// </summary>
+    /// <param name="RECEIPTID">Internal <c>users.db</c> id of the receipt selected in the Sales Assistant bot.</param>
+    /// <param name="ReviewerTelegramUserId">
+    /// Numeric Telegram user id of the tenant owner performing the rejection. It must equal the receipt's owner, and it is
+    /// recorded as the reviewer for audit.
+    /// </param>
+    /// <param name="CancellationToken">Cancellation token for database updates and panel work.</param>
+    /// <returns>A Persian result string shown as the Telegram callback alert in the Sales Assistant.</returns>
+    /// <remarks>
+    /// <para>
+    /// Rejecting a receipt is not only a review outcome once provisional delivery is enabled: the customer may already
+    /// hold a working courtesy client, and leaving it enabled would grant service for a payment the owner refused. The
+    /// rejection therefore also runs the durable revoke saga, which disables that exact client and proves the result by
+    /// read-back.
+    /// </para>
+    /// <para>
+    /// Financial boundary: nothing here debits or credits a wallet, writes a ledger row, marks the order fulfilled, or
+    /// sends a sale notification. A fulfilled order is never revoked, because its client is the purchased account rather
+    /// than a courtesy one.
+    /// </para>
+    /// <para>
+    /// Idempotent: an already-rejected receipt is not rewritten, and a revoked saga only re-reads and re-proves the
+    /// disabled panel state, so a duplicate reject callback cannot issue another mutation.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var result = await tenantService.REJECTMANUALRECEIPTASYNC(receiptId, callback.From.Id, cancellationToken);
+    /// await SafeAnswerCallbackQueryAsync(botClient, callback.Id, result, showAlert: true, cancellationToken: cancellationToken);
+    /// </code>
+    /// </example>
+    public async Task<string> REJECTMANUALRECEIPTASYNC(
+        int RECEIPTID,
+        long ReviewerTelegramUserId,
+        CancellationToken CancellationToken)
+    {
+        var receipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == RECEIPTID, CancellationToken));
+        if (receipt == null)
+            return "رسید پیدا نشد.";
+
+        if (receipt.OwnerTelegramUserId != ReviewerTelegramUserId)
+            return "فقط صاحب همین ربات فروشگاهی می‌تواند این رسید را رد کند.";
+
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
+            x => x.Id == receipt.TenantBotOrderId || x.OrderId == receipt.OrderId,
+            CancellationToken));
+        if (order == null)
+            return "سفارش مرتبط با رسید پیدا نشد.";
+
+        // The review outcome is recorded first and independently of the panel, so the owner's decision is never lost
+        // because XUI was unreachable.
+        if (receipt.Status != TenantManualPaymentReceiptStatuses.Rejected)
+        {
+            receipt.Status = TenantManualPaymentReceiptStatuses.Rejected;
+            receipt.ReviewerTelegramUserId = ReviewerTelegramUserId;
+            receipt.RejectedAtUtc = DateTime.UtcNow;
+            receipt.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(CancellationToken);
+        }
+
+        var revokeNote = await REVOKETENANTCARDPROVISIONALASYNC(order, CancellationToken);
+        return revokeNote ?? "رسید رد شد.";
+    }
+
+    /// <summary>
+    /// Revokes the provisional courtesy client of a rejected tenant card-to-card order, when one exists.
+    /// </summary>
+    /// <param name="order">Tracked tenant order whose receipt was just rejected.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db and panel work.</param>
+    /// <returns>
+    /// A Persian note describing the revoke outcome, or <c>null</c> when the order had no revocable provisional client and
+    /// the caller should show its own default rejection message.
+    /// </returns>
+    /// <remarks>
+    /// Skips a fulfilled order because its panel client is the purchased account, not a courtesy one. Placement is not part
+    /// of the revoke identity check: the provisional email plus panel UUID are the strongest identity available, and
+    /// requiring a placement set that a later catalog edit could change would permanently block revocation.
+    /// </remarks>
+    private async Task<string> REVOKETENANTCARDPROVISIONALASYNC(
+        TenantBotOrder order,
+        CancellationToken cancellationToken)
+    {
+        if (!ISPROVISIONALTENANTCARDENABLED() || order.IsFulfilled)
+            return null;
+
+        var hasProvenIdentity = !string.IsNullOrWhiteSpace(order.ProvisionalAccountEmail)
+                                && !string.IsNullOrWhiteSpace(order.ProvisionalAccountUuid);
+        var revocable = hasProvenIdentity &&
+                        (string.Equals(order.ProvisionalDeliveryState, TenantCardProvisionalStates.Provisioning, StringComparison.Ordinal) ||
+                         string.Equals(order.ProvisionalDeliveryState, TenantCardProvisionalStates.Delivered, StringComparison.Ordinal) ||
+                         string.Equals(order.ProvisionalDeliveryState, TenantCardProvisionalStates.Finalizing, StringComparison.Ordinal) ||
+                         string.Equals(order.ProvisionalDeliveryState, TenantCardProvisionalStates.Revoking, StringComparison.Ordinal));
+
+        if (!revocable)
+            return null;
+
+        try
+        {
+            order.ProvisionalDeliveryState = TenantCardProvisionalStates.Revoking;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(cancellationToken);
+
+            var result = await _tenantCardProvisionalRevocation.RevokeAsync(
+                new TenantCardProvisionalRevocationRequest(
+                    order.Id,
+                    order.OrderId,
+                    BuildConfiguredPanelServerInfo(),
+                    order.ProvisionalAccountEmail,
+                    order.ProvisionalAccountUuid,
+                    order.ProvisionalSubId,
+                    Array.Empty<int>()),
+                cancellationToken);
+
+            switch (result.Status)
+            {
+                case TenantCardProvisionalRevocationStatus.Revoked:
+                case TenantCardProvisionalRevocationStatus.AlreadyRevoked:
+                    order.ProvisionalDeliveryState = TenantCardProvisionalStates.Revoked;
+                    order.ProvisionalRevokedAtUtc ??= DateTime.UtcNow;
+                    order.ProvisionalErrorCode = null;
+                    order.UpdatedAtUtc = DateTime.UtcNow;
+                    await _workflow.SaveAsync(cancellationToken);
+                    return "رسید رد شد و اکانت موقت غیرفعال شد.";
+
+                case TenantCardProvisionalRevocationStatus.ManualReview:
+                    order.ProvisionalDeliveryState = TenantCardProvisionalStates.ManualReview;
+                    order.ProvisionalErrorCode = result.ReasonCode;
+                    order.UpdatedAtUtc = DateTime.UtcNow;
+                    await _workflow.SaveAsync(cancellationToken);
+                    return "رسید رد شد، اما غیرفعال‌سازی اکانت موقت نیاز به بررسی دستی دارد. لطفاً با پشتیبانی تماس بگیرید.";
+
+                default:
+                    return "رسید رد شد؛ غیرفعال‌سازی اکانت موقت در صف تلاش مجدد است.";
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Provisional revoke failed after the receipt was rejected. orderId={OrderId} ErrorType={ErrorType}",
+                order.OrderId, ex.GetType().Name);
+            return "رسید رد شد؛ غیرفعال‌سازی اکانت موقت در صف تلاش مجدد است.";
+        }
     }
 
     /// <summary>

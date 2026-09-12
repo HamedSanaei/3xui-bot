@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using Adminbot.Domain;
+using Adminbot.Services;
 using Microsoft.Extensions.Hosting;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
@@ -185,6 +186,12 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             try
             {
                 if (!XuiV3ClientPlanEligibility.IsClientInActiveServiceInbounds(client, enabledServices))
+                    continue;
+
+                // Provisional tenant card-to-card courtesy accounts carry a 1 GB / 1 day allowance that exists only
+                // until the store owner reviews the receipt, so a normal paid-service volume reminder would be
+                // misleading. Finalization replaces the provisional plan key, making the account eligible again.
+                if (TenantCardProvisionalProvisioningService.IsProvisionalClientComment(client.Comment))
                     continue;
 
                 var snapshot = XuiV3ClientUsageResolver.Resolve(client);

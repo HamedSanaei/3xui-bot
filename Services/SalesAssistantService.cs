@@ -181,7 +181,8 @@ public class SalesAssistantService
             BuildCustomerSummary(order, receipt.CustomerTelegramUserId) +
             BuildPaymentPlanSummary(order) +
             $"💰 مبلغ: <code>{Html(receipt.AmountToman.FormatCurrency())}</code>\n\n" +
-            "برای ساخت اکانت ابتدا تایید و سپس تایید نهایی را بزنید.";
+            "ابتدا تایید و سپس تایید نهایی را بزنید. اگر برای این سفارش اکانت موقت فعال شده باشد، با تایید نهایی همان\n" +
+            "اکانت به بسته خریداری‌شده ارتقا پیدا می‌کند و اکانت جدیدی ساخته نمی‌شود.";
 
         var keyboard = new InlineKeyboardMarkup(new[]
         {
@@ -377,17 +378,13 @@ public class SalesAssistantService
 
         if (parts[0] == "REJECT")
         {
-            var receipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == RECEIPTID, CancellationToken));
-            if (receipt != null && receipt.Status == TenantManualPaymentReceiptStatuses.Pending)
-            {
-                receipt.Status = TenantManualPaymentReceiptStatuses.Rejected;
-                receipt.ReviewerTelegramUserId = CallbackQuery.From.Id;
-                receipt.RejectedAtUtc = DateTime.UtcNow;
-                receipt.UpdatedAtUtc = DateTime.UtcNow;
-                await _workflow.SaveAsync(CancellationToken);
-            }
+            // Delegated so a rejected receipt also disables any provisional courtesy client through the order's own
+            // durable revoke saga. Owner authorization is rechecked inside the tenant service, so an assistant-side
+            // callback cannot bypass it. Nothing here settles money in either direction.
+            var TENANTSERVICE = _serviceProvider.GetRequiredService<TenantBotService>();
+            var REJECTRESULT = await TENANTSERVICE.REJECTMANUALRECEIPTASYNC(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
 
-            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "رسید رد شد.", showAlert: true, cancellationToken: CancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, REJECTRESULT, showAlert: true, cancellationToken: CancellationToken);
             await SafeEditMessageReplyMarkupAsync(
                 botClient,
                 CallbackQuery.Message.Chat.Id,

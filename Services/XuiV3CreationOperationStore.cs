@@ -38,6 +38,34 @@ public sealed class XuiV3CreationOperationStore
             return (candidate, true);
         }, token);
 
+    /// <summary>
+    /// Reads the durable state of one creation operation without reserving, mutating, or authorizing anything.
+    /// </summary>
+    /// <param name="operationKey">Exact immutable business operation key whose durable outcome is being inspected.</param>
+    /// <param name="token">Cancellation of the short read.</param>
+    /// <returns>
+    /// The detached operation row, or <c>null</c> when the key was never reserved, which means no panel POST was ever
+    /// authorized for it.
+    /// </returns>
+    /// <remarks>
+    /// Read-only by design. The provisional tenant card-to-card flow uses this to decide whether a failed provisional
+    /// create left the panel untouched (key absent, still <c>Reserved</c>, or <c>DefinitiveRejected</c> — all safe for the
+    /// normal fulfillment path) or possibly produced a client (<c>PostStarted</c>/<c>Ambiguous</c> — must be reconciled
+    /// before any second account may be created). This method never changes an outcome and never grants a POST.
+    /// </remarks>
+    public Task<XuiV3CreationOperation> FindAsync(string operationKey, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(operationKey))
+            throw new ArgumentException("A creation operation key is required.", nameof(operationKey));
+
+        return SqliteOperation.RunAsync(async ct =>
+        {
+            await using var db = _factory.CreateDbContext();
+            return await db.XuiV3CreationOperations.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.OperationKey == operationKey, ct);
+        }, token);
+    }
+
     /// <summary>Records proven creation without removing the mutation reservation.</summary>
     /// <param name="key">Stable business operation key of the verified client.</param>
     /// <param name="token">Cancellation of local persistence, independent of external retries.</param>

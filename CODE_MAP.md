@@ -812,17 +812,63 @@ and the main menu.
   refuses to release when the staged publish artifact is missing any of the three tutorial directories or when one
   contains no supported image (`assert_tutorial_assets` in `scripts/deploy-production.sh`, asserted by
   `scripts/deploy-production.tests.sh`).
-- **Tenant personal card-to-card (`tenant_card`) provisional delivery — SCHEMA LANDED, BEHAVIOR NOT WIRED.**
-  Migration `20260911000006_AddTenantCardProvisionalDelivery` adds `TenantBotOrders.ProvisionalDeliveryState`
+- **Tenant card-to-card receipt ingestion — Photo OR safe image Document.** Production incident: a customer sent the
+  receipt as a Telegram <b>document</b> ("send without compression") and the order sat in `awaiting_receipt` forever,
+  because the handler only read `Message.Photo`. `Services/TenantReceiptMediaResolver.cs` is the single shared resolver
+  (`TryResolve`, returning a file id, a `photo`/`document` kind, and the untrusted file name) and `HANDLECUSTOMERMESSAGEASYNC`
+  routes both shapes through `CREATETENANTMANUALRECEIPTASYNC`. Accepted documents are `image/jpeg`/`image/png`/`image/webp`,
+  or a `.jpg`/`.jpeg`/`.png`/`.webp` extension when Telegram omits the MIME type; PDF, ZIP, EXE, and a bare
+  `application/octet-stream` with no safe extension are refused. A non-image document is answered with a JPG/PNG/WebP
+  prompt **only** while a receipt upload is actually pending. A safe extension never rescues an explicitly non-image MIME
+  type, and the customer file name is never used as a path. `TenantManualPaymentReceipt.PhotoFileId` keeps its name and
+  stores the document file id too (no rename migration).
+- **Durable exact-order receipt target (migration `20260912005131_AddTenantReceiptUploadTarget`).** Adds nullable
+  `BotUserStates.PendingReceiptOrderDbId`, written by `PromptTenantReceiptUploadAsync` when the customer presses
+  `TN:receipt:{orderDbId}` and consumed by `RESOLVETENANTRECEIPTTARGETORDERASYNC` when the image arrives. Scope is the
+  table's existing composite `BotId` + `TelegramUserId` key, so the same Telegram user holds independent targets per
+  storefront bot and no global user-only table is used. The target is honoured only if it is still that bot's, that
+  customer's, `tenant_card`, unfulfilled, and in an eligible receipt state; otherwise the handler fails closed and clears
+  the pointer. It is deliberately **not** cleared by `BotUserState.Clear()`, so navigation between the button press and
+  the image cannot lose the binding. When no target exists at all (uploads started before this column) the legacy
+  newest-eligible lookup still applies. Accessors: `UserStateStore.SetPendingReceiptTargetAsync` /
+  `GetPendingReceiptTargetAsync` / `ClearPendingReceiptTargetAsync`.
+- **Receipt + owner-notification durability (unchanged and load-bearing).** `PERSISTTENANTMANUALRECEIPTASYNC` still commits
+  the receipt row and its `TenantManualReceiptNotification` outbox row in one transaction, and that commit happens
+  **before** any panel work. `PROVISIONTENANTCARDPROVISIONALASYNC` runs only afterwards and is best-effort, so an
+  unavailable XUI panel can never stop the store owner from receiving and reviewing the receipt. The customer reply is
+  `رسید ثبت شد و برای تایید مدیر ارسال شد`. `TenantManualReceiptNotificationWorker` →
+  `SalesAssistantService.NOTIFYMANUALRECEIPTASYNC` still downloads the file through the tenant bot and re-uploads a fresh
+  stream through the assistant bot, because Telegram file ids are not portable across bots; the text fallback with the
+  approval keyboard is preserved for a relay failure.
+- **Tenant personal card-to-card (`tenant_card`) provisional delivery — WIRED, DEFAULT OFF.**
+  Migration `20260911000006_AddTenantCardProvisionalDelivery` added `TenantBotOrders.ProvisionalDeliveryState`
   (default `none`), `ProvisionalCreatedAtUtc`, `ProvisionalDeliveredAtUtc`, `ProvisionalAccountEmail`,
   `ProvisionalAccountUuid`, `ProvisionalSubId`, `ProvisionalFinalizedAtUtc`, `ProvisionalRevokedAtUtc`,
-  `ProvisionalErrorCode`, plus a `(ProvisionalDeliveryState, TenantBotId)` index. It performs no backfill and touches no
-  balance, receipt, or fulfillment field. `AppConfig.TenantCardProvisionalDeliveryEnabled` exists and defaults to
-  `false`, and `TenantCardProvisionalStates` defines the intended state machine
-  (`none/provisioning/delivered/finalizing/finalized/revoking/revoked/manual_review`). **Nothing reads or writes these
-  fields yet** — the flag is not honored and the flow is not implemented, so production behavior is unchanged.
-  Scope is purchase-only: `PaymentProvider == "tenant_card"` with `TenantBotOrderKinds.Purchase`; renewals (which would
-  destructively downgrade an existing client) and all automatic gateways are excluded by design.
+  `ProvisionalErrorCode`, plus a `(ProvisionalDeliveryState, TenantBotId)` index. No backfill, no balance/receipt/
+  fulfillment field touched. `AppConfig.TenantCardProvisionalDeliveryEnabled` defaults to `false` and
+  `TenantCardProvisionalStates` defines the state machine
+  (`none/provisioning/delivered/finalizing/finalized/revoking/revoked/manual_review`).
+  The switch is read live from configuration on every relevant call, so an operator edit takes effect without a restart.
+  **Enabled** behavior, purchase-only (`PaymentProvider == "tenant_card"` and `TenantBotOrderKinds.Purchase`):
+  `Services/TenantCardProvisionalProvisioningService.cs` revalidates the ORIGINAL order selection through
+  `ResolveTenantProvisionalPlacement` (so a tenant-hidden or disabled plan gets no courtesy account), durably claims
+  `none -> provisioning`, then creates exactly one client at 1 GiB / 1 day through
+  `CreateAccountWithExplicitLimitsAsync` with operation key **`tenant-card-provisional-create:{publicOrderId}`**
+  (never `tenant-create:{orderId}`), `PlanKeyOverride = provisional-1gb-1d`, `PriceTomanOverride = 0`,
+  `SaveUserStatus = false`. Quota is `ApiService.ConvertGBToBytes(1)`, never a decimal 1,000,000,000. Proven identity
+  (email, uuid, subId) is persisted **before** the customer Telegram send, and `provisioning -> delivered` is recorded
+  only after the customer actually receives the details, so a failed send can never cause a second panel create. A brief
+  Persian message states that the account is temporary, 1 GB / 1 day, still awaiting owner approval, upgraded in place on
+  approval, and disabled on rejection. **No money moves at this point**: no wallet debit, no ledger row, no profit, no
+  `PaidAtUtc`, no `IsFulfilled`, no final-sale or Gozargah sync.
+  **Durability:** repeated receipts, duplicate Telegram updates, resubmissions, and restarts all reuse the same creation
+  operation key, so the existing Reserve → single POST → Applied/Ambiguous machinery can only recover the original client
+  by GET read-back and can never POST twice. At approval,
+  `TenantCardProvisionalProvisioningService.IsPanelProvenUntouchedAsync` decides whether the normal account path is safe:
+  an absent key, `Reserved`, or `DefinitiveRejected` proves the panel holds nothing; `PostStarted`/`Ambiguous` escalates to
+  `manual_review` instead of risking a duplicate account.
+  Renewals (which would destructively downgrade an existing client) and every automatic gateway (AtlasPay, HooshPay,
+  Tetraminator, UniquePay, NOWPayments) are excluded, including owned-bot wallet payments.
 - **RESOLVED (was: provisional limits not representable).** The 1 GB / 1 day temporary limits are not representable
   through the tenant plan catalog; `CreateAccountWithExplicitLimitsAsync` plus `ResolveTenantProvisionalPlacement` (below)
   is the supported path. Historical detail of the original blocker: `XuiV3PurchaseService.ResolvePurchase`
@@ -880,16 +926,42 @@ and the main menu.
   `manual_review` is terminal so an ambiguous panel outcome escalates to a human instead of replaying. An unknown stored
   step sorts above every mutable step, which is the fail-closed direction. The table is audit state and holds no tokens,
   balances, ledger rows, or raw payloads; it is created empty and backfills nothing.
-  **NOT WIRED:** the store has no production caller yet. No provisional create, finalize, revoke, reminder exclusion, or
-  Gozargah gating is implemented, so `TenantCardProvisionalDeliveryEnabled=false` remains fully inert in production. The
-  remaining wiring points are `CREATETENANTMANUALRECEIPTASYNC` (after `PERSISTTENANTMANUALRECEIPTASYNC`),
-  `APPROVEMANUALRECEIPTASYNC`, `CONFIRMMANUALCARDORDERBYORDERIDASYNC`, `CONFIRMTENANTORDERBYSUPERADMINASYNC`, and the
-  Sales Assistant reject branch at `SalesAssistantService.cs` `REJECT:{receiptId}`. Provisional create and finalize must
-  land in the SAME change: enabling create without the finalize branch makes every card order produce two accounts.
-- **Finalization ordering is dictated by the reset's enable side effect:** disable → prove disabled → official reset
-  (which re-enables) → re-disable → prove disabled → zero the shared row → `UpdateClientAsync` with the exact ordered
-  `TotalGB` plus final expiry and `Enable = true` → prove by read-back → only then cross the financial settlement
-  boundary. The post-approval `TotalGB` is the **absolute** ordered quota, never `purchasedBytes + usedBytes`.
+  **WIRED:** production callers are `PROVISIONTENANTCARDPROVISIONALASYNC` (create, after
+  `PERSISTTENANTMANUALRECEIPTASYNC`), `TRYTENANTCARDPROVISIONALFINALIZATIONASYNC` (called from inside
+  `FULFILLPAIDTENANTORDERASYNC`), and `REVOKETENANTCARDPROVISIONALASYNC` (from
+  `SalesAssistantService.cs` `REJECT:{receiptId}` → `TenantBotService.REJECTMANUALRECEIPTASYNC`).
+  **Single finalization boundary:** `APPROVEMANUALRECEIPTASYNC`, `CONFIRMMANUALCARDORDERBYORDERIDASYNC`, and
+  `CONFIRMTENANTORDERBYSUPERADMINASYNC` all funnel through `FULFILLPAIDTENANTORDERASYNC`, whose
+  `TRYTENANTCARDPROVISIONALFINALIZATIONASYNC` probe decides once whether to upgrade the SAME client or run the normal
+  `CreateAccountAsync`. A handled-but-unsuccessful probe returns before the settlement tail, so authorization differences
+  between the three confirmation paths can never bypass same-client finalization. Order state advances to `finalized` on
+  the tracked order so the existing save commits it atomically with `IsFulfilled` and the ledger row.
+  **Revoke:** `Services/TenantCardProvisionalRevocationService.cs` uses operation key
+  **`tenant-card-revoke:{publicOrderId}`**, verifies email + uuid + subId against the live panel, disables the exact client,
+  and proves the disabled state by read-back before recording `revoked`; an ambiguous outcome becomes `manual_review`. A
+  fulfilled order is never revoked, placement is deliberately not part of the revoke identity check, and duplicate reject
+  callbacks only re-read and re-prove. Rejection settles no money in either direction and keeps the order unfulfilled.
+  **Reminder exclusion:** both reminder scans skip provisional courtesy clients by plan key / comment
+  (`IsProvisionalPlanKey` / `IsProvisionalClientComment`), since a 1 GB / 1 day courtesy allowance would otherwise produce
+  a misleading paid-service reminder; finalization replaces the plan key, so a finalized account becomes eligible again.
+  Residual limitation: the volume scan can only read the comment the `clients/list` response reports, so if a panel omits
+  it there the exclusion is best-effort for that single scan.
+  **Gozargah:** provisional creation never enqueues a site sync. `QueueGozargahSyncBestEffortAsync("tenant-create", ...)`
+  lives in the settlement tail, which only runs after `Success`, so a courtesy account is never reported as a finalized
+  paid tenant sale.
+  Enabling the flag without a migration is safe; both create and finalize are registered in `Program`
+  (`XuiV3CreationOperationStore` singleton; the three provisional services scoped, matching `TenantBotService`).
+- **Finalization ordering is dictated by the reset's enable side effect.** The finalizer deliberately **never disables**
+  the client: proved against MHSanaei/3x-ui v3.7.0, `ClientService.ResetTrafficByEmail` auto-enables only under
+  `if !rec.Enable` and `InboundService.resetClientTrafficLocked` builds its runtime `AddUser` plan only under
+  `if !traffic.Enable`, so presenting an **enabled** client to the reset suppresses both re-admission guards. The saga is
+  therefore: prove identity and enabled state → official `resetTraffic` (the only call that clears shared, master-pushed
+  global, and per-inbound node usage) → prove zero by read-back → side-effect-free absolute zero counter write →
+  `UpdateClientAsync` on the SAME client with the exact ordered `TotalGB`, the frozen final expiry, and `Enable = true` →
+  prove every field by read-back → only then cross the financial settlement boundary. Quota is written LAST so no
+  intermediate state can pair the large purchased quota with a stale depletion baseline. The post-approval `TotalGB` is
+  the **absolute** ordered quota, never `purchasedBytes + usedBytes`; a bounded number of post-quota counter re-clears
+  handles a customer still using the account and then escalates to `manual_review`.
 - `XuiV3AccountMetadataOptions.PlanKeyOverride` / `PlanNameOverride` let a non-catalog account record a meaningful plan
   label in the panel comment (the comment JSON is the durable signal reminder/sync logic can key on).
 - UX-only Telegram latency budgets are injectable for tests through the immutable

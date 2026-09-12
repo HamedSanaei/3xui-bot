@@ -81,6 +81,7 @@
   "volumeExpirationReminderEnabled": false,
   "volumeExpirationReminderIntervalMinutes": 30,
   "xuiV3VolumeReminderStateRetentionDays": 30,
+  "tenantCardProvisionalDeliveryEnabled": false,
   "referral": {
     "enabled": true,
     "minimumEligiblePaymentAmountToman": 100000,

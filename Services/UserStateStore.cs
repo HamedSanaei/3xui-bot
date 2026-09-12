@@ -72,6 +72,95 @@ public sealed class UserStateStore
             && (row.Type == "realityv6" || !string.IsNullOrEmpty(row.TotoalGB));
     }
 
+    /// <summary>
+    /// Durably records the exact tenant card-to-card order whose receipt image the customer is about to send.
+    /// </summary>
+    /// <param name="userId">Telegram sender id of the customer; the owning bot comes from the active execution context.</param>
+    /// <param name="orderDbId">
+    /// Internal <c>users.db</c> id of the tenant order the customer selected with <c>TN:receipt:{orderDbId}</c>. Never a
+    /// public order id and never a Telegram or panel identifier.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token for the short write transaction.</param>
+    /// <returns>A task completing after the bot-scoped target commits.</returns>
+    /// <remarks>
+    /// The row is keyed by the composite BotId plus TelegramUserId pair, so recording a target in one storefront never
+    /// affects the same customer's state in another bot. The value is an intent pointer only and grants no authority:
+    /// the receipt handler revalidates the order's bot, customer, provider, and fulfillment state before persisting.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="orderDbId" /> is not positive.</exception>
+    public async Task SetPendingReceiptTargetAsync(long userId, int orderDbId, CancellationToken cancellationToken = default)
+    {
+        if (orderDbId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(orderDbId), orderDbId, "A pending receipt target must be a real order id.");
+
+        var botId = BotContextAccessor.CurrentBotId;
+        await SqliteOperation.RunAsync(async token =>
+        {
+            await using var db = _factory.CreateDbContext();
+            await using var transaction = await db.Database.BeginTransactionAsync(token);
+            var row = await db.BotUserStates.SingleOrDefaultAsync(x => x.BotId == botId && x.TelegramUserId == userId, token);
+            if (row == null)
+            {
+                row = BotUserState.FromUser(botId, new User { Id = userId });
+                db.BotUserStates.Add(row);
+            }
+
+            row.PendingReceiptOrderDbId = orderDbId;
+            row.UpdatedAtUtc = DateTime.UtcNow;
+            await db.SaveChangesAsync(token);
+            await transaction.CommitAsync(token);
+            return true;
+        }, cancellationToken);
+    }
+
+    /// <summary>
+    /// Reads the durable receipt-upload target recorded for one bot and Telegram user.
+    /// </summary>
+    /// <param name="userId">Telegram sender id of the customer; the owning bot comes from the active execution context.</param>
+    /// <param name="cancellationToken">Cancellation token for the short read.</param>
+    /// <returns>
+    /// The recorded internal order id, or <c>null</c> when the customer never pressed a receipt button in this bot or the
+    /// target was already consumed or cleared.
+    /// </returns>
+    /// <remarks>
+    /// A <c>null</c> result is the only case where the receipt handler may fall back to its legacy newest-eligible order
+    /// lookup, which keeps receipts for orders created before this column existed working during rollout.
+    /// </remarks>
+    public async Task<int?> GetPendingReceiptTargetAsync(long userId, CancellationToken cancellationToken = default)
+    {
+        var botId = BotContextAccessor.CurrentBotId;
+        await using var db = _factory.CreateDbContext();
+        return await db.BotUserStates.AsNoTracking()
+            .Where(x => x.BotId == botId && x.TelegramUserId == userId)
+            .Select(x => x.PendingReceiptOrderDbId)
+            .SingleOrDefaultAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Clears the durable receipt-upload target after it was consumed, or after it was proven no longer eligible.
+    /// </summary>
+    /// <param name="userId">Telegram sender id of the customer; the owning bot comes from the active execution context.</param>
+    /// <param name="cancellationToken">Cancellation token for the short write.</param>
+    /// <returns>A task completing after the target is cleared. Clearing a missing row is a no-op.</returns>
+    /// <remarks>
+    /// Deliberately does not touch any other conversation field, so a purchase or renewal in progress is never disturbed
+    /// by consuming a receipt target.
+    /// </remarks>
+    public async Task ClearPendingReceiptTargetAsync(long userId, CancellationToken cancellationToken = default)
+    {
+        var botId = BotContextAccessor.CurrentBotId;
+        await SqliteOperation.RunAsync(async token =>
+        {
+            await using var db = _factory.CreateDbContext();
+            await db.BotUserStates
+                .Where(x => x.BotId == botId && x.TelegramUserId == userId && x.PendingReceiptOrderDbId != null)
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.PendingReceiptOrderDbId, (int?)null)
+                    .SetProperty(x => x.UpdatedAtUtc, DateTime.UtcNow), token);
+            return true;
+        }, cancellationToken);
+    }
+
     /// <summary>Reloads and modifies one bot/user row inside a short conflict-safe transaction.</summary>
     /// <param name="user">Required detached replacement or partial snapshot.</param>
     /// <param name="clear">Whether to clear transient fields first.</param>
