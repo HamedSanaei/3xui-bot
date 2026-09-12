@@ -443,6 +443,59 @@ and the main menu.
   bounded 50/150ms + 0-50ms jitter backoff, never network inside the delegate. Both databases run WAL with a 5s busy
   timeout and private cache; connections are per-operation and short.
 
+### Foreground I/O bounds and lane-blocker diagnostics
+
+Production incident (2026-09-11): owned-bot update `916840327` ran a "my accounts" handler for ~103.8 s inside one
+`vpnetiranhub` lane; same-lane updates `916840329/330/331/332` then waited 83.6/42.8/23.1/19.1 s. A tenant
+`/start` handler ran ~61 s and delayed its next two updates by 42.5 s and 5.4 s. **The scheduler was not at fault:**
+strict lane FIFO is intentional and unchanged, and raising `telegramUpdateMaxConcurrency` cannot fix same-lane
+blocking because a lane is serialized by design. The defect was that a foreground handler could await
+provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an unbounded interactive Telegram send.
+
+- **XUI foreground read policy** (`Services/ApiServicev3.cs`, `XuiV3RequestExecutionPolicy`):
+  `BackgroundRead` (default, provider timeout + transient retry unchanged), `ForegroundRead` (ONE overall wall-clock
+  budget for the whole logical read — every attempt, all backoff, and response reading), `IdempotentMutation`, and
+  `NoAutomaticRetryMutation`. The foreground budget is `AppConfig.XuiV3ForegroundReadTimeoutSeconds` (default 12 s)
+  resolved by `ApiServicev3.ResolveForegroundReadOverallBudget`, clamped to a hard 15 s cap and to a 1 ms floor; expiry
+  raises `XuiV3ForegroundReadTimeoutException` and starts no further retry. Foreground call sites: user account list,
+  account search, detail reload, renewal target discovery (`Services/XuiV3BotFlowService.cs`). Reminder scans,
+  reconciliation, and recovery workers keep `BackgroundRead`. **Mutation safety is unchanged:** explicit retry modes
+  still win, `NoAutomaticRetry` still performs exactly one POST, and a timeout never makes an ambiguous mutation
+  replayable (a regression test asserts one POST against a transient status).
+- **Foreground Telegram delivery budget** (`Services/TelegramForegroundDeliveryPolicy.cs`,
+  `Services/ForegroundBoundedTelegramBotClient.cs`): one immutable 8 s overall budget per non-durable interactive
+  delivery (message/photo/album/document send, edits, deletes, callback acknowledgement, chat/membership lookups).
+  `TelegramUpdateExecutor` wraps the resolved client in this decorator **per update execution only**; receivers, long
+  polling, background workers, and `DownloadFileAsync` keep the raw unbounded client, so the shared transport timeout
+  is never changed globally. On expiry the send is abandoned with `TelegramForegroundDeliveryTimeoutException` and is
+  **never automatically re-sent** (an ambiguous send may already have been accepted); `TelegramBotService`
+  (`HandleUpdateAsync`) records one `handle_update_foreground_delivery_timeout` activity entry, logs one warning, and
+  releases the lane as a stable non-error outcome. Existing 2 s callback-ack and 5 s mandatory-join budgets are
+  untouched, and durable outbox delivery keeps its own `delivery_uncertain` semantics.
+- **Stage attribution** (`Services/TelegramUpdateLatencyScope.cs`): closed vocabulary `XuiRead`, `TelegramSend`,
+  `TelegramEdit`, `TelegramMembership`, `SiteLookup`, `ProviderRead`, `DatabaseWait`, `BusinessRecovery`, carried by
+  `AsyncLocal` for one update execution only. The scheduler pushes one scope per execution; the bounded client wrapper,
+  `ApiServicev3` foreground reads, and `GozargahSiteApiClient.SendAsync` report stage durations. Only stages above
+  `SlowStageThreshold` (default 2 s) are logged, and stage names come from the enum so no email, order id, callback
+  payload, URL, or customer text can become a stage string. Background callers have no scope, so instrumentation is a
+  no-op for them.
+- **Lane diagnostics** (`Services/TelegramUpdateScheduler.cs`): one live watchdog fires at `LongHandlerWarningThreshold`
+  (default 10 s, once per execution, via a cancellation timer rather than a polling loop) with
+  `BotId/Sequence/UpdateId/UpdateType/HandlerElapsedMs/ActiveHandlers/MaxConcurrency`; completion above
+  `InteractiveHandlerThreshold` (default 5 s) records the final duration and outcome, at Warning only when the live
+  warning could not fire, so a slow root handler yields exactly one alert. Queue-wait reporting uses
+  `LongQueueWaitThreshold` (default 5 s) and correlates the wait with the **root** blocker via
+  `TelegramUpdateInboxStore.FindPreviousLaneExecutionAsync` (earliest same-lane execution whose interval overlapped the
+  victim's accepted→started wait; metadata only, never a payload), emitting at most one Warning per lane/blocker pair and
+  falling back to Debug for further cascade waits. `Domain/TelegramLaneExecutionSummary.cs` is payload-free.
+- **Diagnostic envelope identity** (`Domain/Logging/DailyErrorFileLoggerProvider.cs`): the ambient
+  `BotContextAccessor.CurrentBotId` falls back to the hardcoded default owned bot, so a singleton scheduler warning
+  about `BotId=tenant-...` could be filed under the wrong bot. The provider now prefers an explicit `BotId=`/`botId=`
+  value already present in the structured message and withholds the ambient username/type when they would contradict it;
+  messages without an explicit marker keep the previous behavior.
+- Regression coverage: `Adminbot.Tests/TelegramForegroundLatencyTests.cs` (17 tests) plus the existing
+  `TelegramLaneOwnerRoutingTests` interaction-timeout guards. No EF model change and no migration.
+
 ## Wallet Operations (durable receipts)
 
 - Every balance mutation (debit, credit, refund, purchase, renewal, referral reward, provisional payment, settlement,

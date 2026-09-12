@@ -121,6 +121,61 @@ public sealed partial class TelegramUpdateInboxStore
         return count;
     }, token);
 
+    /// <summary>
+    /// Finds the previous execution in the same bot/user lane whose execution interval overlapped one update's
+    /// accepted-to-started wait.
+    /// </summary>
+    /// <param name="sequence">Internal inbox sequence of the currently starting (victim) update.</param>
+    /// <param name="botId">Required canonical runtime bot id of the lane; never a token.</param>
+    /// <param name="telegramUserId">Telegram actor id of the lane, or zero for the bot-scoped no-actor fallback lane.</param>
+    /// <param name="acceptedAtUtc">UTC acceptance time of the victim update, which is when its wait began.</param>
+    /// <param name="startedAtUtc">UTC claim time of the victim update, which is when its wait ended.</param>
+    /// <param name="token">Cancellation of the metadata-only read.</param>
+    /// <returns>
+    /// The earliest earlier execution on the same lane whose run overlapped the victim's wait — the root of a slow-lane
+    /// chain — or <c>null</c> when no such execution exists, for example when the victim waited on admission pressure
+    /// rather than on a lane predecessor. The returned object is detached and never carries a payload.
+    /// </returns>
+    /// <remarks>
+    /// This is diagnostics only and never changes scheduling. The overlap test is
+    /// <c>started &lt; victimStarted &amp;&amp; (completed == null || completed &gt; victimAccepted)</c>, which is true
+    /// for a predecessor that was still running when the victim arrived and for one that finished during the wait.
+    ///
+    /// Earliest rather than newest is deliberate. Strict FIFO makes every later update in a lane cascade behind one
+    /// slow handler, so the newest predecessor of victim C is simply victim B, which would make each cascade member look
+    /// like a separate incident and defeat warning deduplication. Every overlapping predecessor contributed to the wait,
+    /// so the earliest of them is the single root blocker the operator needs to see.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var blocker = await store.FindPreviousLaneExecutionAsync(sequence, botId, userId, acceptedAtUtc, startedAtUtc, token);
+    /// </code>
+    /// </example>
+    public async Task<TelegramLaneExecutionSummary> FindPreviousLaneExecutionAsync(
+        long sequence,
+        string botId,
+        long telegramUserId,
+        DateTime acceptedAtUtc,
+        DateTime startedAtUtc,
+        CancellationToken token)
+    {
+        await using var db = _factory.CreateDbContext();
+        return await db.TelegramUpdateInbox.AsNoTracking()
+            .Where(x => x.BotId == botId && x.TelegramUserId == telegramUserId && x.Sequence < sequence
+                && x.StartedAtUtc != null && x.StartedAtUtc < startedAtUtc
+                && (x.CompletedAtUtc == null || x.CompletedAtUtc > acceptedAtUtc))
+            .OrderBy(x => x.Sequence)
+            .Select(x => new TelegramLaneExecutionSummary
+            {
+                Sequence = x.Sequence,
+                UpdateId = x.UpdateId,
+                UpdateType = x.UpdateType,
+                StartedAtUtc = x.StartedAtUtc.Value,
+                CompletedAtUtc = x.CompletedAtUtc
+            })
+            .FirstOrDefaultAsync(token);
+    }
+
     /// <summary>Measures unfinished admission pressure without loading private updates.</summary>
     /// <param name="token">Cancellation of the count.</param>
     /// <returns>The number of queued and currently running Telegram executions.</returns>

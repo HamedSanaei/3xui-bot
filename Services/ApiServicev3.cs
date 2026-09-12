@@ -26,6 +26,80 @@ public enum XuiV3RequestRetryMode
 }
 
 /// <summary>
+/// Classifies one XUI v3 logical operation so the transport can decide whether an interactive Telegram lane needs a
+/// bounded overall wall-clock budget in addition to the provider-oriented per-attempt timeout and retry policy.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="ForegroundRead"/> designates user-facing read-only panel operations where the Telegram user is waiting
+/// (account lists, account search, account detail reloads, navigation reads, safe renewal target discovery before any
+/// mutation). Such requests receive ONE overall wall-clock budget that spans every attempt, every backoff delay, and
+/// response reading. When the budget expires no further retry starts and the request fails with a typed
+/// <see cref="XuiV3ForegroundReadTimeoutException"/> so the caller can release the Telegram lane with a short retry
+/// message.
+/// </para>
+/// <para>
+/// <see cref="BackgroundRead"/> is the default for ordinary read-only calls (expiry/reminder scans, reconciliation,
+/// recovery workers, maintenance). Those keep the existing provider-oriented timeout and transient retry budget
+/// because a background lane is not waiting interactively.
+/// </para>
+/// <para>
+/// <see cref="IdempotentMutation"/> and <see cref="NoAutomaticRetryMutation"/> document mutation callers. They never
+/// receive a foreground budget and never make a non-idempotent mutation retryable: <see cref="NoAutomaticRetryMutation"/>
+/// maps to exactly one HTTP attempt exactly like <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>.
+/// </para>
+/// </remarks>
+public enum XuiV3RequestExecutionPolicy
+{
+    /// <summary>
+    /// Read-only background/recovery call with the provider-oriented timeout and transient retry policy unchanged.
+    /// </summary>
+    BackgroundRead,
+
+    /// <summary>
+    /// Read-only user-facing call bounded by one overall wall-clock budget across all attempts and backoff.
+    /// </summary>
+    ForegroundRead,
+
+    /// <summary>
+    /// Mutating call that may retry only when replaying the same mutation is provider-idempotent.
+    /// </summary>
+    IdempotentMutation,
+
+    /// <summary>
+    /// Mutating call sent exactly once because a timeout may hide a committed non-idempotent panel mutation.
+    /// </summary>
+    NoAutomaticRetryMutation
+}
+
+/// <summary>
+/// Raised when a <see cref="XuiV3RequestExecutionPolicy.ForegroundRead"/> XUI v3 logical request exhausts its overall
+/// wall-clock budget before a successful response. The Telegram lane is released when this escapes to the handler.
+/// </summary>
+/// <remarks>
+/// This type extends <see cref="TimeoutException"/> so generic Telegram handlers classify it as an external timeout
+/// and show a user-safe retry message. It deliberately carries no panel URL, token, endpoint, response body, or stack
+/// details, so rendering this exception to Telegram can never leak provider secrets.
+/// </remarks>
+public sealed class XuiV3ForegroundReadTimeoutException : TimeoutException
+{
+    /// <summary>
+    /// Creates the typed foreground timeout with the overall budget that expired.
+    /// </summary>
+    /// <param name="budget">
+    /// The overall wall-clock budget in effect for the read. Exposed only as a duration, never as a panel secret.
+    /// </param>
+    public XuiV3ForegroundReadTimeoutException(TimeSpan budget)
+        : base($"XUI v3 foreground read exceeded its overall {budget.TotalSeconds:0} second budget.")
+    {
+        Budget = budget;
+    }
+
+    /// <summary>Gets the overall wall-clock budget that expired for this foreground read.</summary>
+    public TimeSpan Budget { get; }
+}
+
+/// <summary>
 /// Provides authenticated XUI v3 panel operations and normalized bot-facing account results.
 /// </summary>
 /// <remarks>
@@ -45,6 +119,19 @@ public class ApiServicev3
     {
         NullValueHandling = NullValueHandling.Ignore
     };
+
+    /// <summary>
+    /// Recommended overall wall-clock budget for one foreground XUI v3 read. The whole logical request — every
+    /// attempt, all backoff, and response reading — must finish inside this window. Production default: 12 seconds.
+    /// </summary>
+    public static readonly TimeSpan DefaultForegroundReadOverallBudget = TimeSpan.FromSeconds(12);
+
+    /// <summary>
+    /// Hard upper bound for the overall foreground XUI v3 read budget. A foreground logical read is capped at
+    /// 15 seconds regardless of configuration so a single interactive Telegram lane can never be held by backend
+    /// retry policy for a provider-oriented timeout.
+    /// </summary>
+    public static readonly TimeSpan ForegroundReadOverallHardCap = TimeSpan.FromSeconds(15);
 
     /// <summary>
     /// Detects whether a panel can answer the v3 API. If a version is forced on ServerInfo or configuration,
@@ -788,15 +875,43 @@ public class ApiServicev3
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/inbounds/{id}/fallbacks", fallbacks, true, cancellationToken);
 
     /// <summary>GET /panel/api/clients/list. Lists every client with inbound IDs and traffic data.</summary>
-    public static Task<XuiV3ApiResponse<List<XuiV3Client>>> GetClientsAsync(ServerInfo serverInfo, IConfiguration configuration, CancellationToken cancellationToken = default)
-        => SendAsync<List<XuiV3Client>>(serverInfo, configuration, HttpMethod.Get, "/panel/api/clients/list", null, true, cancellationToken);
+    /// <param name="serverInfo">Panel descriptor supplying base URL, root path, and bearer token.</param>
+    /// <param name="configuration">Runtime timeout, retry, and foreground-budget configuration.</param>
+    /// <param name="cancellationToken">Token that cancels the read; cancelled reads never retry.</param>
+    /// <param name="executionPolicy">
+    /// Execution boundary for this call. Pass <see cref="XuiV3RequestExecutionPolicy.ForegroundRead"/> for any
+    /// user-facing interactive read (account lists, search, detail reloads, renewal target discovery) so the whole
+    /// logical request is bounded by one overall wall-clock budget. The default keeps the provider-oriented timeout
+    /// and transient retry budget for background/recovery readers.
+    /// </param>
+    /// <returns>The panel response envelope as a client list; callers must check <c>Success</c>.</returns>
+    /// <remarks>
+    /// <see cref="XuiV3ForegroundReadTimeoutException"/> is thrown when a foreground read exceeds its overall budget;
+    /// no further retry is started and the handler must release the Telegram lane.
+    /// </remarks>
+    public static Task<XuiV3ApiResponse<List<XuiV3Client>>> GetClientsAsync(
+        ServerInfo serverInfo,
+        IConfiguration configuration,
+        CancellationToken cancellationToken = default,
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
+        => SendAsync<List<XuiV3Client>>(serverInfo, configuration, HttpMethod.Get, "/panel/api/clients/list", null, true, cancellationToken, executionPolicy: executionPolicy);
 
     /// <summary>GET /panel/api/clients/list/paged. Server-side filtering, sorting and paging for clients.</summary>
+    /// <param name="serverInfo">Panel descriptor supplying base URL, root path, and bearer token.</param>
+    /// <param name="configuration">Runtime timeout, retry, and foreground-budget configuration.</param>
+    /// <param name="query">Paging, search, filter, protocol, sort, and order options.</param>
+    /// <param name="cancellationToken">Token that cancels the read; cancelled reads never retry.</param>
+    /// <param name="executionPolicy">
+    /// Execution boundary; pass <see cref="XuiV3RequestExecutionPolicy.ForegroundRead"/> for interactive reads so the
+    /// whole logical request is bounded by one overall wall-clock budget.
+    /// </param>
+    /// <returns>The paged panel response envelope; callers must check <c>Success</c>.</returns>
     public static Task<XuiV3ApiResponse<JToken>> GetClientsPagedAsync(
         ServerInfo serverInfo,
         IConfiguration configuration,
         XuiV3ClientPageQuery query,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
         var queryValues = new Dictionary<string, string>
         {
@@ -809,7 +924,7 @@ public class ApiServicev3
             ["order"] = query?.Order ?? ""
         };
 
-        return SendAsync<JToken>(serverInfo, configuration, HttpMethod.Get, "/panel/api/clients/list/paged", null, true, cancellationToken, queryValues);
+        return SendAsync<JToken>(serverInfo, configuration, HttpMethod.Get, "/panel/api/clients/list/paged", null, true, cancellationToken, queryValues, executionPolicy: executionPolicy);
     }
 
     /// <summary>
@@ -2239,6 +2354,13 @@ public class ApiServicev3
     /// <param name="cancellationToken">Token that cancels the request and any permitted retry delay.</param>
     /// <param name="query">Optional query values encoded into the request URI.</param>
     /// <param name="retryMode">Replay semantics; non-idempotent mutations must use <c>NoAutomaticRetry</c>.</param>
+    /// <param name="executionPolicy">
+    /// Execution boundary for the logical request. <see cref="XuiV3RequestExecutionPolicy.ForegroundRead"/> applies one
+    /// overall wall-clock budget across every attempt, backoff, and response read and raises
+    /// <see cref="XuiV3ForegroundReadTimeoutException"/> on expiry. <see cref="XuiV3RequestExecutionPolicy.IdempotentMutation"/>
+    /// and <see cref="XuiV3RequestExecutionPolicy.NoAutomaticRetryMutation"/> derive the retry mode when no explicit
+    /// <paramref name="retryMode"/> is supplied. The default respects the supplied <paramref name="retryMode"/>.
+    /// </param>
     /// <returns>The deserialized XUI response envelope.</returns>
     /// <remarks>
     /// A successful HTTP status can still contain <c>success=false</c>; callers remain responsible for checking the
@@ -2253,9 +2375,10 @@ public class ApiServicev3
         bool authenticate = true,
         CancellationToken cancellationToken = default,
         IDictionary<string, string> query = null,
-        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly,
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
-        var raw = await SendRawAsync(serverInfo, configuration, method, relativePath, body, authenticate, cancellationToken, query, retryMode);
+        var raw = await SendRawAsync(serverInfo, configuration, method, relativePath, body, authenticate, cancellationToken, query, EffectiveRetryMode(retryMode, executionPolicy), executionPolicy);
         var result = JsonConvert.DeserializeObject<XuiV3ApiResponse<T>>(raw);
         if (result == null)
             throw new XuiV3ApiException(method.ToString(), BuildPanelUri(serverInfo, relativePath, query).ToString(), 0, raw, null);
@@ -2268,7 +2391,8 @@ public class ApiServicev3
         IConfiguration configuration,
         string relativePath,
         IDictionary<string, string> fields,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
         var safeFields = fields ?? new Dictionary<string, string>();
         var raw = await SendRawWithRetryAsync(
@@ -2280,7 +2404,8 @@ public class ApiServicev3
             true,
             cancellationToken,
             query: null,
-            requestBodyForLog: "<form-content>");
+            requestBodyForLog: "<form-content>",
+            executionPolicy: executionPolicy);
         return JsonConvert.DeserializeObject<XuiV3ApiResponse<T>>(raw) ?? new XuiV3ApiResponse<T>();
     }
 
@@ -2291,20 +2416,21 @@ public class ApiServicev3
         string relativePath,
         object body,
         bool authenticate,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
         var uri = BuildPanelUri(serverInfo, relativePath, null);
         return await SendWithRetryAsync(
             configuration,
             method,
             uri,
-            async () =>
+            async (attemptToken) =>
             {
                 using var httpClient = CreateHttpClient(configuration);
                 using var content = BuildContent(body);
                 using var request = BuildRequest(method, uri, content, serverInfo, configuration, authenticate);
-                using var response = await httpClient.SendAsync(request, cancellationToken);
-                var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+                using var response = await httpClient.SendAsync(request, attemptToken);
+                var bytes = await response.Content.ReadAsByteArrayAsync(attemptToken);
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -2314,7 +2440,9 @@ public class ApiServicev3
 
                 return bytes;
             },
-            cancellationToken);
+            cancellationToken,
+            XuiV3RequestRetryMode.ReadOnly,
+            executionPolicy);
     }
 
     /// <summary>
@@ -2348,20 +2476,21 @@ public class ApiServicev3
         CancellationToken cancellationToken,
         IDictionary<string, string> query = null,
         string requestBodyForLog = null,
-        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly,
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
         var uri = BuildPanelUri(serverInfo, relativePath, query);
         return SendWithRetryAsync(
             configuration,
             method,
             uri,
-            async () =>
+            async (attemptToken) =>
             {
                 using var httpClient = CreateHttpClient(configuration);
-                using var content = contentFactory == null ? null : await contentFactory(cancellationToken);
+                using var content = contentFactory == null ? null : await contentFactory(attemptToken);
                 using var request = BuildRequest(method, uri, content, serverInfo, configuration, authenticate);
-                using var response = await httpClient.SendAsync(request, cancellationToken);
-                var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var response = await httpClient.SendAsync(request, attemptToken);
+                var responseText = await response.Content.ReadAsStringAsync(attemptToken);
 
                 if (!response.IsSuccessStatusCode)
                     throw new XuiV3ApiException(method.ToString(), uri.ToString(), (int)response.StatusCode, responseText, requestBodyForLog);
@@ -2369,7 +2498,8 @@ public class ApiServicev3
                 return responseText;
             },
             cancellationToken,
-            retryMode);
+            retryMode,
+            executionPolicy);
     }
 
     /// <summary>
@@ -2379,9 +2509,16 @@ public class ApiServicev3
     /// <param name="configuration">Application configuration that supplies retry count and delay settings.</param>
     /// <param name="method">HTTP method being sent, used for retry diagnostics.</param>
     /// <param name="uri">Fully built XUI panel request URI. It must not include bearer tokens or other secrets.</param>
-    /// <param name="operation">Factory that sends exactly one HTTP attempt and returns the parsed response data.</param>
+    /// <param name="operation">
+    /// Factory that sends exactly one HTTP attempt and returns the parsed response data.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token that stops retries when the Telegram update is cancelled.</param>
     /// <param name="retryMode">Replay policy; <c>NoAutomaticRetry</c> forces exactly one HTTP attempt.</param>
+    /// <param name="executionPolicy">
+    /// Execution boundary. <see cref="XuiV3RequestExecutionPolicy.ForegroundRead"/> adds ONE overall wall-clock budget
+    /// spanning all attempts, all backoff, and response reading; on expiry a typed
+    /// <see cref="XuiV3ForegroundReadTimeoutException"/> is raised and no further retry starts.
+    /// </param>
     /// <returns>The value returned by the first successful HTTP attempt.</returns>
     /// <remarks>
     /// Retry attempts stay out of the private Telegram logger channel, but are written with full exception details to
@@ -2389,15 +2526,29 @@ public class ApiServicev3
     /// When an <see cref="XuiOperationTiming"/> scope is active, the complete logical request—including retry attempts
     /// and configured backoff—is accumulated as panel API time. Calls made outside an operation scope remain unmeasured
     /// and retain their previous behavior.
+    ///
+    /// Foreground budget shape:
+    /// The budget is NOT per attempt. The whole logical request (attempt + backoff + response read) must finish inside
+    /// one window, so a 12-second budget with four configured retries cannot turn into 48 seconds of lane stall. The
+    /// effective budget is clamped to <see cref="ForegroundReadOverallHardCap"/> so deployment configuration can never
+    /// raise an interactive read above 15 seconds.
     /// </remarks>
     private static async Task<T> SendWithRetryAsync<T>(
         IConfiguration configuration,
         HttpMethod method,
         Uri uri,
-        Func<Task<T>> operation,
+        Func<CancellationToken, Task<T>> operation,
         CancellationToken cancellationToken,
-        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly,
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
+        // Attribute the complete logical request to the closed-vocabulary foreground stage when this is an interactive
+        // read. Background workers execute without a latency scope, so the measurement is a no-op for them and their
+        // behavior is unchanged.
+        using var stageMeasurement = executionPolicy == XuiV3RequestExecutionPolicy.ForegroundRead
+            ? (TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default)
+            : default;
+
         // One measurement covers the complete logical request, including every retry and retry delay. The ambient
         // operation scope is bot-update-local, so concurrent customer operations cannot mix their API durations.
         using var panelMeasurement = XuiOperationTiming.BeginCurrentPanelCall();
@@ -2409,47 +2560,124 @@ public class ApiServicev3
             ? 1
             : Math.Max(1, retryCount + 1);
         Exception lastException = null;
+        using var foregroundBudget = executionPolicy == XuiV3RequestExecutionPolicy.ForegroundRead
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+            : null;
+        if (foregroundBudget != null)
+            foregroundBudget.CancelAfter(ResolveForegroundReadOverallBudget(appConfig));
 
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                return await operation();
+                var attemptToken = foregroundBudget?.Token ?? cancellationToken;
+                attemptToken.ThrowIfCancellationRequested();
+                try
+                {
+                    return await operation(attemptToken);
+                }
+                catch (Exception ex) when (ShouldRetryXuiRequest(ex, attemptToken, attempt, maxAttempts))
+                {
+                    lastException = ex;
+                    var delay = GetXuiRetryDelay(appConfig, attempt);
+                    var transport = BuildTransportDiagnostic(ex, retryMode);
+                    Console.WriteLine(
+                        $"[XUIv3] transient API failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}, error={ex.Message}");
+                    DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
+                        configuration,
+                        LogLevel.Warning,
+                        nameof(ApiServicev3),
+                        $"XUI v3 transient request failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}, {transport}",
+                        ex);
+                    await Task.Delay(delay, attemptToken);
+                }
+                catch (Exception ex)
+                {
+                    var transport = BuildTransportDiagnostic(ex, retryMode);
+                    // The Telegram-facing exception message is intentionally redacted. Keep the full endpoint and
+                    // provider details only in the private daily diagnostic file. Every attempt owns and disposes its
+                    // handler, and Connection: close disables reuse, so a TLS record-integrity failure already discards
+                    // the failed connection. NoAutomaticRetry mutations still surface after this one attempt.
+                    DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
+                        configuration,
+                        LogLevel.Error,
+                        nameof(ApiServicev3),
+                        $"XUI v3 request failed after retry policy. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, {transport}",
+                        ex);
+                    throw;
+                }
             }
-            catch (Exception ex) when (ShouldRetryXuiRequest(ex, cancellationToken, attempt, maxAttempts))
-            {
-                lastException = ex;
-                var delay = GetXuiRetryDelay(appConfig, attempt);
-                var transport = BuildTransportDiagnostic(ex, retryMode);
-                Console.WriteLine(
-                    $"[XUIv3] transient API failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}, error={ex.Message}");
-                DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
-                    configuration,
-                    LogLevel.Warning,
-                    nameof(ApiServicev3),
-                    $"XUI v3 transient request failure; retrying. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, delayMs={delay.TotalMilliseconds:0}, {transport}",
-                    ex);
-                await Task.Delay(delay, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                var transport = BuildTransportDiagnostic(ex, retryMode);
-                // The Telegram-facing exception message is intentionally redacted. Keep the full endpoint and
-                // provider details only in the private daily diagnostic file. Every attempt owns and disposes its
-                // handler, and Connection: close disables reuse, so a TLS record-integrity failure already discards
-                // the failed connection. NoAutomaticRetry mutations still surface after this one attempt.
-                DailyErrorFileLoggerProvider.WriteExternalDiagnostic(
-                    configuration,
-                    LogLevel.Error,
-                    nameof(ApiServicev3),
-                    $"XUI v3 request failed after retry policy. attempt={attempt}/{maxAttempts}, method={method}, uri={uri}, {transport}",
-                    ex);
-                throw;
-            }
-        }
 
-        throw lastException ?? new InvalidOperationException("XUI v3 request failed without an exception.");
+            throw lastException ?? new InvalidOperationException("XUI v3 request failed without an exception.");
+        }
+        catch (OperationCanceledException) when (IsForegroundReadBudgetExpired(foregroundBudget, cancellationToken))
+        {
+            // The overall foreground window expired while the caller's own lane token is still live: surface the typed
+            // outcome so the handler stops retrying and releases the Telegram lane with a user-safe retry message.
+            throw new XuiV3ForegroundReadTimeoutException(ResolveForegroundReadOverallBudget(appConfig));
+        }
+    }
+
+    /// <summary>
+    /// Resolves the configured overall foreground XUI read budget, clamped to the documented hard cap.
+    /// </summary>
+    /// <param name="appConfig">Runtime application settings; a missing or non-positive value keeps the default.</param>
+    /// <returns>
+    /// The overall wall-clock budget for one foreground logical read, never exceeding
+    /// <see cref="ForegroundReadOverallHardCap"/> and never below one millisecond.
+    /// </returns>
+    /// <remarks>
+    /// The configured value is expressed in fractional seconds so tests can inject sub-second budgets deterministically.
+    /// A null configuration, or one whose <see cref="AppConfig.XuiV3ForegroundReadTimeoutSeconds"/> is absent, zero, or
+    /// negative, falls back to <see cref="DefaultForegroundReadOverallBudget"/> rather than to a near-zero window.
+    /// </remarks>
+    public static TimeSpan ResolveForegroundReadOverallBudget(AppConfig appConfig)
+    {
+        // Fall back to the documented default whenever configuration cannot supply a positive budget, so a missing or
+        // misconfigured value can never collapse an interactive read into an immediate timeout.
+        var configuredSeconds = appConfig?.XuiV3ForegroundReadTimeoutSeconds ?? 0;
+        var seconds = configuredSeconds > 0 ? configuredSeconds : DefaultForegroundReadOverallBudget.TotalSeconds;
+        var clamped = Math.Clamp(seconds * 1000.0, 1.0, ForegroundReadOverallHardCap.TotalMilliseconds);
+        return TimeSpan.FromMilliseconds(clamped);
+    }
+
+    /// <summary>
+    /// Detects whether a foreground-read budget, and not the caller's own cancellation, triggered a cancellation.
+    /// </summary>
+    /// <param name="foregroundBudget">Nullable linked source created only for <see cref="XuiV3RequestExecutionPolicy.ForegroundRead"/>.</param>
+    /// <param name="callerToken">The caller's own lane token; its state distinguishes budget expiry from shutdown.</param>
+    /// <returns>
+    /// <c>true</c> only when the foreground budget source exists, its token is cancelled, and the caller's own token
+    /// is still live; otherwise <c>false</c> so the original cancellation propagates.
+    /// </returns>
+    private static bool IsForegroundReadBudgetExpired(CancellationTokenSource foregroundBudget, CancellationToken callerToken)
+        => foregroundBudget != null && foregroundBudget.Token.IsCancellationRequested && !callerToken.IsCancellationRequested;
+
+    /// <summary>
+    /// Derives the transport retry mode implied by an execution policy when the caller did not supply an explicit mode.
+    /// </summary>
+    /// <param name="retryMode">Explicit retry mode supplied by the caller.</param>
+    /// <param name="executionPolicy">Execution policy governing the logical request.</param>
+    /// <returns>
+    /// The explicit <paramref name="retryMode"/> for the default policy, otherwise the retry mode implied by
+    /// <paramref name="executionPolicy"/>.
+    /// </returns>
+    /// <remarks>
+    /// <see cref="XuiV3RequestExecutionPolicy.ForegroundRead"/> and <see cref="XuiV3RequestExecutionPolicy.BackgroundRead"/>
+    /// both imply <c>ReadOnly</c>; <see cref="XuiV3RequestExecutionPolicy.IdempotentMutation"/> implies
+    /// <c>IdempotentMutation</c>; <see cref="XuiV3RequestExecutionPolicy.NoAutomaticRetryMutation"/> implies
+    /// <c>NoAutomaticRetry</c>. Existing mutable callers that pass an explicit <paramref name="retryMode"/> and keep the
+    /// default policy keep their current semantics exactly.
+    /// </remarks>
+    private static XuiV3RequestRetryMode EffectiveRetryMode(XuiV3RequestRetryMode retryMode, XuiV3RequestExecutionPolicy executionPolicy)
+    {
+        if (executionPolicy == XuiV3RequestExecutionPolicy.BackgroundRead)
+            return retryMode;
+        return executionPolicy == XuiV3RequestExecutionPolicy.IdempotentMutation
+            ? XuiV3RequestRetryMode.IdempotentMutation
+            : executionPolicy == XuiV3RequestExecutionPolicy.NoAutomaticRetryMutation
+                ? XuiV3RequestRetryMode.NoAutomaticRetry
+                : XuiV3RequestRetryMode.ReadOnly;
     }
 
     /// <summary>
@@ -2464,6 +2692,7 @@ public class ApiServicev3
     /// <param name="cancellationToken">Token that cancels the request.</param>
     /// <param name="query">Optional query values.</param>
     /// <param name="retryMode">Replay policy; ambiguous link mutations use <c>NoAutomaticRetry</c>.</param>
+    /// <param name="executionPolicy">Execution boundary that may add an overall budget for interactive reads.</param>
     /// <returns>Successful UTF-8 response body.</returns>
     private static async Task<string> SendRawAsync(
         ServerInfo serverInfo,
@@ -2474,7 +2703,8 @@ public class ApiServicev3
         bool authenticate,
         CancellationToken cancellationToken,
         IDictionary<string, string> query = null,
-        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly)
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly,
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
         return await SendRawWithRetryAsync(
             serverInfo,
@@ -2486,7 +2716,8 @@ public class ApiServicev3
             cancellationToken,
             query,
             SerializeBodyForLog(body),
-            retryMode);
+            retryMode,
+            executionPolicy);
     }
 
     /// <summary>

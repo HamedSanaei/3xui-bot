@@ -158,6 +158,18 @@ namespace Adminbot.Domain
         /// transient panel timeout.
         /// </summary>
         public int XuiV3RequestTimeoutSeconds { get; set; } = 60;
+
+        /// <summary>
+        /// Overall wall-clock budget, in fractional seconds, for ONE user-facing foreground XUI v3 read.
+        /// </summary>
+        /// <remarks>
+        /// The budget spans every attempt, all backoff, and response reading for a single logical request, so a slow
+        /// panel cannot hold an interactive Telegram lane for the full provider-oriented timeout across four retries.
+        /// The transport clamps the effective value to at most fifteen seconds; values that are missing, zero, or
+        /// negative keep the twelve-second default. Sub-second values are allowed so tests can exercise the budget
+        /// deterministically with millisecond windows (for example <c>0.04</c> equals forty milliseconds).
+        /// </remarks>
+        public double XuiV3ForegroundReadTimeoutSeconds { get; set; } = 12;
         /// <summary>
         /// Number of additional attempts used for transient XUI v3 transport failures such as TLS record errors,
         /// request timeouts, HTTP 429, and HTTP 5xx gateway errors.

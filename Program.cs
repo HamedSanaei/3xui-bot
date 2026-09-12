@@ -179,6 +179,9 @@ public class Program
         // and the single overall mandatory-join membership budget (5s). Registered as a shared immutable
         // instance so bounded-timeout behaviour cannot be raised by deployment configuration or raced by tests.
         services.AddSingleton(TelegramInteractionTimeouts.Production);
+        // One immutable interactive Telegram delivery budget for every scheduled update execution. The bounded client
+        // view is created per update, so receivers, long polling, and durable workers keep the unbounded transport.
+        services.AddSingleton(TelegramForegroundDeliveryPolicy.Production);
         services.AddSingleton<WalletLedgerService>();
         services.AddHostedService<WalletOperationReconciliationService>();
         services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();

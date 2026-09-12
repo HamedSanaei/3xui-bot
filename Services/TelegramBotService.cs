@@ -441,6 +441,34 @@ public partial class TelegramBotService
         catch (Exception ex)
         {
             var credUser = GetCreduserFromUpdate(update);
+            if (ex is TelegramForegroundDeliveryTimeoutException foregroundDeliveryTimeout)
+            {
+                // Interactive UX delivery only. The message may or may not have been accepted by Telegram before the
+                // budget expired, so it is deliberately never re-sent here: a duplicate navigation reply is worse than
+                // a missing one, and the customer can press the button again to generate a fresh update. The lane is
+                // released promptly and the update finishes as a stable non-error outcome.
+                await _userActivityLog.LogWarningAsync(
+                    "handle_update_foreground_delivery_timeout",
+                    credUser,
+                    IsSuperAdminUser(credUser?.TelegramUserId ?? 0),
+                    new Dictionary<string, object>
+                    {
+                        ["updateType"] = update?.Type.ToString() ?? "unknown",
+                        ["requestKind"] = foregroundDeliveryTimeout.RequestKind,
+                        ["budgetSeconds"] = foregroundDeliveryTimeout.Budget.TotalSeconds,
+                        ["botId"] = BotContextAccessor.CurrentBotId ?? string.Empty
+                    },
+                    cancellationToken);
+
+                _logger.LogWarning(
+                    "Telegram foreground delivery exceeded its interactive budget; the update was released without resending. botId={BotId}, userId={UserId}, requestKind={RequestKind}, budgetSeconds={BudgetSeconds}",
+                    BotContextAccessor.CurrentBotId,
+                    credUser?.TelegramUserId,
+                    foregroundDeliveryTimeout.RequestKind,
+                    foregroundDeliveryTimeout.Budget.TotalSeconds);
+                return;
+            }
+
             if (TelegramRateLimitPolicy.IsRateLimited(ex))
             {
                 var retryDelay = TelegramRateLimitPolicy.GetRetryDelay(ex);

@@ -268,7 +268,7 @@ public class XuiV3BotFlowService
             var serverInfo = BuildConfiguredPanelServerInfo();
             Console.WriteLine($"[XUIv3] my accounts start user={credUser.TelegramUserId} panel={serverInfo.Url}, rootPath={serverInfo.RootPath}");
 
-            var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+            var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
             if (!response.Success)
             {
                 await botClient.SendTextMessageAsync(
@@ -299,6 +299,17 @@ public class XuiV3BotFlowService
             await SendV3AccountListPageAsync(botClient, message.Chat.Id, 0, credUser, cancellationToken);
 
 
+            return true;
+        }
+        catch (XuiV3ForegroundReadTimeoutException)
+        {
+            // The whole foreground panel read exceeded its overall budget. The lane is released immediately with a
+            // safe retry prompt; no panel URL, token, or exception detail is ever exposed to the user.
+            await botClient.SendTextMessageAsync(
+                chatId: message.Chat.Id,
+                text: "دریافت اطلاعات از سرور بیشتر از حد معمول طول کشید. لطفاً چند لحظه دیگر دوباره تلاش کنید.",
+                replyMarkup: mainReplyMarkup,
+                cancellationToken: cancellationToken);
             return true;
         }
         catch (Exception ex)
@@ -874,7 +885,7 @@ public class XuiV3BotFlowService
         try
         {
             var serverInfo = BuildConfiguredPanelServerInfo();
-            var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+            var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
             if (!response.Success)
                 throw new InvalidOperationException("The XUI client list request was unsuccessful.");
 
@@ -1308,7 +1319,7 @@ public class XuiV3BotFlowService
                 }
 
                 var serverInfo = BuildConfiguredPanelServerInfo();
-                var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+                var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
                 if (!clientsResponse.Success)
                 {
                     LogXuiOperationOutcome(
@@ -1440,7 +1451,7 @@ public class XuiV3BotFlowService
         try
         {
             var serverInfo = BuildConfiguredPanelServerInfo();
-            var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+            var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
             if (!response.Success)
             {
                 await botClient.SendTextMessageAsync(
@@ -5244,7 +5255,7 @@ public class XuiV3BotFlowService
         }
 
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
         if (!response.Success)
         {
             await SendOrEditTextAsync(
@@ -5822,7 +5833,7 @@ public class XuiV3BotFlowService
 
         try
         {
-            var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+            var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
             var client = clientsResponse.Obj?.FirstOrDefault(item =>
                 item.Id == clientId.Value && ClientBelongsToUser(item, credUser.TelegramUserId));
             if (!clientsResponse.Success || client == null)

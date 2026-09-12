@@ -145,6 +145,42 @@ internal sealed class DailyErrorFileLogger : ILogger
     }
 
     /// <summary>
+    /// Reads an explicit bot id from a structured log message so the file envelope cannot contradict the message.
+    /// </summary>
+    /// <param name="message">Formatted log message produced by the structured formatter.</param>
+    /// <returns>
+    /// The first <c>BotId=</c> or <c>botId=</c> value found in the message, or <c>null</c> when the message carries no
+    /// explicit bot identity. Only the single token after the marker is returned; nothing else is parsed.
+    /// </returns>
+    /// <remarks>
+    /// This is deliberately a narrow textual lookup, not a general template parser. Scheduler diagnostics always include
+    /// <c>BotId=</c> as a structured property, so preferring it over the ambient accessor keeps global diagnostics
+    /// attributable without changing how per-update handlers resolve their own bot context.
+    /// </remarks>
+    private static string TryReadExplicitBotId(string message)
+    {
+        if (string.IsNullOrEmpty(message))
+            return null;
+
+        foreach (var marker in new[] { "BotId=", "botId=" })
+        {
+            var start = message.IndexOf(marker, StringComparison.Ordinal);
+            if (start < 0)
+                continue;
+
+            var valueStart = start + marker.Length;
+            var valueEnd = valueStart;
+            while (valueEnd < message.Length && !char.IsWhiteSpace(message[valueEnd]))
+                valueEnd++;
+
+            if (valueEnd > valueStart)
+                return message[valueStart..valueEnd];
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Checks whether the current configuration allows one log level to be written to the diagnostic file.
     /// </summary>
     /// <param name="logLevel">Severity supplied by Microsoft.Extensions.Logging.</param>
@@ -184,13 +220,24 @@ internal sealed class DailyErrorFileLogger : ILogger
             var now = GetTehranNow(DateTime.UtcNow);
             var context = _botContextAccessor?.Current;
             var message = formatter?.Invoke(state, exception) ?? state?.ToString() ?? string.Empty;
+
+            // Envelope bot identity. Global components such as the Telegram update scheduler are singletons that log
+            // outside any per-update bot context, and the ambient accessor then falls back to the process-wide default
+            // owned bot. Writing that fallback would label a tenant lane incident as the default bot even though the
+            // message names the real one, which is exactly the misleading production diagnostic this lookup prevents.
+            // A structured message that carries its own authoritative BotId therefore wins, and the ambient username and
+            // type are withheld rather than allowed to contradict it.
+            var ambientBotId = context?.Config?.Id ?? BotContextAccessor.CurrentBotId;
+            var explicitBotId = TryReadExplicitBotId(message);
+            var ambientMatchesMessage = explicitBotId == null
+                || string.Equals(explicitBotId, ambientBotId, StringComparison.Ordinal);
             var entry = new StringBuilder()
                 .Append('[').Append(now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)).Append("] ")
                 .Append(logLevel).Append(' ').Append(_categoryName)
                 .Append(" eventId=").Append(eventId.Id)
-                .Append(" botId=").Append(context?.Config?.Id ?? BotContextAccessor.CurrentBotId ?? "-")
-                .Append(" botUsername=").Append(context?.Config?.Username ?? BotContextAccessor.CurrentBotUsername ?? "-")
-                .Append(" botType=").Append(context?.Config?.Type ?? BotContextAccessor.CurrentBotType ?? "-")
+                .Append(" botId=").Append(explicitBotId ?? ambientBotId ?? "-")
+                .Append(" botUsername=").Append(ambientMatchesMessage ? context?.Config?.Username ?? BotContextAccessor.CurrentBotUsername ?? "-" : "-")
+                .Append(" botType=").Append(ambientMatchesMessage ? context?.Config?.Type ?? BotContextAccessor.CurrentBotType ?? "-" : "-")
                 .AppendLine()
                 .AppendLine(MaskSensitiveData(message));
 
