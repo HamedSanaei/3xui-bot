@@ -136,13 +136,20 @@ namespace Adminbot.Domain.Logging
         /// Category-level filtering cannot see the final message text, so this method performs a second
         /// message-level check inside the Telegram provider. It intentionally suppresses only known noisy patterns:
         /// stale callbacks, unchanged Telegram edits, receipt-photo relay failures that have a text fallback,
-        /// repeated tenant forced-join probes, routine XUI v3 volume-reminder scan summaries, and Telegram polling
-        /// 5xx/429/timeouts. Business failures such as invalid tokens, duplicate tokens, XUI scan/delivery failures,
-        /// and payment settlement errors are not suppressed.
+        /// repeated tenant forced-join probes, routine XUI v3 volume-reminder scan summaries, controlled UX
+        /// latency-guard outcomes, the closed latency-telemetry families (slow stage, completed handlers between the
+        /// five-second interactive threshold and the ten-second incident threshold, and the long-handler completion
+        /// echo), the two routine tenant storefront funding bookkeeping successes, and Telegram polling 5xx/429/timeouts.
+        /// Business failures such as invalid tokens, duplicate tokens, XUI scan/delivery failures, funding delivery
+        /// uncertainty, and payment settlement errors are not suppressed.
         ///
         /// A Telegram 429 exception is suppressed structurally before any message text is inspected: the failure
         /// being reported is Telegram rate limiting, so sending a Telegram notification about it would trigger
         /// another send under the same rate limit and amplify the storm.
+        ///
+        /// Suppression affects this provider only. The same event still reaches the daily diagnostic/error file, the
+        /// console and structured logging providers, and the metrics instruments at its existing level, so the private
+        /// channel stays an actionable incident stream instead of a raw telemetry mirror.
         /// </remarks>
         private bool ShouldSuppressChannelDelivery(string message, Exception exception)
         {

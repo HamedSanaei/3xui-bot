@@ -511,6 +511,26 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   outcome — `transport_error`, `telegram_api_error`, `channel_access_error`, `telegram_timeout` — and every Warning,
   Error, Critical, delivery-uncertain, manual-review, XUI, payment, and provider failure is still delivered. This is a
   narrow closed-list rule, not a general log-suppression framework.
+- **Central Telegram logger channel is actionable, not a telemetry stream** (`Domain/Logging/TelegramLogSuppression.cs`):
+  the private channel receives incidents only, while the daily diagnostic file, the console/structured logger, the
+  metrics instruments (`telegram.update.handler.duration`, `telegram.update.queue.wait`, stage timers), and the
+  watchdog keep every measurement at its existing level. Withheld from the channel: (1) `Telegram slow update stage.`
+  attribution lines, which by themselves only explain an already-counted handler; (2) a `completed`
+  `Telegram update handler exceeded the interactive latency threshold.` record whose `HandlerDurationMs` is below
+  10,000 ms — production sequence 4311 was exactly this shape (users.db: `completed`, no failure code, ~5.38 s), so a
+  successful five-second handler is telemetry, not an incident; (3) the `Telegram long update handler completed.` echo
+  of a >= 10 s execution whose live `Telegram update handler running unusually long.` warning already delivered the one
+  operator alert; (4) the two routine tenant storefront funding bookkeeping successes (`Underfunded tenant storefront
+  customer-attempt alert queued.`, `Tenant storefront became underfunded.`) — the tenant owner still receives the
+  durable funding notification. Still visible: the live >= 10 s root-handler warning, any `Outcome` other than
+  `completed`, a duration at or above the threshold, unparseable/negative/`NaN`/`Infinity` durations (parsing fails
+  open), the deduplicated `Telegram update waited unusually long.` blocker correlation, foreground delivery/XUI/Gozargah
+  timeouts, funding `became uncertain.` / scan failures, `telegram_transport_error`, `channel_access_error`,
+  `DeliveryUncertain`, `ManualReview`, and XUI/payment/provider failures. The 10 s boundary is one shared constant
+  (`TelegramLogSuppression.LongHandlerOperatorThresholdMilliseconds`) that `TelegramUpdateScheduler` uses to initialize
+  `LongHandlerWarningThreshold`, so the watchdog and the channel policy cannot drift. Instrumentation thresholds
+  (`SlowStageThreshold` 2 s, `InteractiveHandlerThreshold` 5 s, `LongHandlerWarningThreshold` 10 s,
+  `LongQueueWaitThreshold` 5 s) are intentionally unchanged: the fix is channel routing, not measurement.
 - **UX telemetry attribution** (`Services/TelegramInteractionActor.cs`): `TelegramUpdateExecutor` publishes the update
   sender once per execution (callback, message, edited message, inline query, chosen inline result, checkout and
   shipping queries, poll answer, chat-member updates) through an `AsyncLocal<long?>` scope, so

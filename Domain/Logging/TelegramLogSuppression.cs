@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Linq;
 
 namespace Adminbot.Domain.Logging
@@ -41,6 +42,26 @@ namespace Adminbot.Domain.Logging
         private const int MaxControlledLatencyKeys = 4096;
 
         /// <summary>
+        /// Handler duration at which a completed handler stops being performance telemetry and becomes an operator
+        /// incident. Production value: ten thousand milliseconds (ten seconds).
+        /// </summary>
+        /// <remarks>
+        /// This is the same boundary the scheduler uses for its live long-handler watchdog. The scheduler initializes
+        /// its warning threshold from this constant, so the channel policy and the watchdog can never disagree about
+        /// where telemetry ends and an incident begins.
+        /// </remarks>
+        public const double LongHandlerOperatorThresholdMilliseconds = 10_000;
+
+        /// <summary>Exact summary family emitted for one closed-vocabulary stage above the slow-stage threshold.</summary>
+        private const string SlowStageMessage = "Telegram slow update stage.";
+
+        /// <summary>Exact summary family emitted when a handler ends above the interactive five-second threshold.</summary>
+        private const string InteractiveThresholdMessage = "Telegram update handler exceeded the interactive latency threshold.";
+
+        /// <summary>Exact summary family emitted when a handler above the live long-handler warning threshold ended.</summary>
+        private const string LongHandlerCompletedMessage = "Telegram long update handler completed.";
+
+        /// <summary>
         /// Determines whether a formatted log entry must stay out of the Telegram logger channel.
         /// </summary>
         /// <param name="message">
@@ -59,14 +80,20 @@ namespace Adminbot.Domain.Logging
         /// The method intentionally suppresses only known noisy patterns: stale callbacks, unchanged Telegram edits,
         /// receipt-photo relay failures that have a text fallback, repeated tenant forced-join probes, routine XUI v3
         /// volume-reminder scan summaries, per-attempt UniquePay GET-reconciliation diagnostics, the compact
-        /// <c>Telegram polling degraded</c> transient-backoff summary, and Telegram polling 5xx/429/timeouts. The first
+        /// <c>Telegram polling degraded</c> transient-backoff summary, Telegram polling 5xx/429/timeouts, the closed
+        /// latency-telemetry families handled by <see cref="ShouldSuppressLatencyTelemetry"/>, and the two routine
+        /// tenant storefront funding bookkeeping successes (the durable owner notification is unaffected). The first
         /// ambiguous UniquePay create and the terminal recovery/manual-review transition
         /// use different messages and remain visible. Business failures such as invalid tokens, duplicate tokens, XUI
-        /// scan/delivery failures, and payment settlement errors are not suppressed.
+        /// scan/delivery failures, funding delivery uncertainty, and payment settlement errors are not suppressed.
         ///
         /// A Telegram 429 exception suppresses the entry before any message text is inspected: the failure being
         /// reported is Telegram rate limiting, so sending a Telegram notification about it would trigger another send
         /// under the same rate limit and amplify the storm.
+        ///
+        /// The channel is an actionable incident stream, not a raw telemetry mirror. The daily diagnostic file, the
+        /// console/structured logger, and the metrics instruments continue to receive every one of these events at its
+        /// existing level, so local diagnosis loses nothing when a message is withheld from Telegram.
         /// </remarks>
         public static bool ShouldSuppress(string message, Exception exception)
         {
@@ -79,6 +106,12 @@ namespace Adminbot.Domain.Logging
             // daily diagnostic file, the structured logger, and the stage instruments, but they must not flood the
             // operator channel. Real guard failures (transport, API, channel-access) are never suppressed here.
             if (ShouldSuppressControlledLatencyEvent(message))
+                return true;
+
+            // Latency measurements and successful bookkeeping are telemetry, not incidents. They stay fully visible in
+            // the daily diagnostic file, the console/structured logger, and the stage instruments, but the operator
+            // channel must not be used as a raw performance stream.
+            if (ShouldSuppressLatencyTelemetry(message))
                 return true;
 
             var combined = string.Join(
@@ -105,6 +138,13 @@ namespace Adminbot.Domain.Logging
                 ContainsOrdinalIgnoreCase(combined, "XUI v3 volume reminder scan finished.") ||
                 ContainsOrdinalIgnoreCase(combined, "Telegram polling degraded.") ||
                 ContainsOrdinalIgnoreCase(combined, "Transient Telegram polling gateway error ignored") ||
+                // Routine internal bookkeeping successes: the tenant owner already receives the durable funding
+                // notification, so the bookkeeping line that merely says the outbox intent was queued or that the
+                // storefront crossed the underfunded threshold is not an operator incident. Genuine delivery failures
+                // ("...became uncertain.", worker scan failures, transport exhaustion) keep their own messages and are
+                // never matched here.
+                ContainsOrdinalIgnoreCase(combined, "Underfunded tenant storefront customer-attempt alert queued.") ||
+                ContainsOrdinalIgnoreCase(combined, "Tenant storefront became underfunded.") ||
                 ContainsOrdinalIgnoreCase(combined, "Gozargah site wallet debit response received."))
             {
                 return true;
@@ -123,6 +163,65 @@ namespace Adminbot.Domain.Logging
                    ContainsOrdinalIgnoreCase(combined, "service unavailable") ||
                    ContainsOrdinalIgnoreCase(combined, "Too Many Requests") ||
                    ContainsOrdinalIgnoreCase(combined, "Request timed out");
+        }
+
+        /// <summary>
+        /// Decides whether one latency-telemetry or routine-success event must be kept out of the operator Telegram
+        /// channel.
+        /// </summary>
+        /// <param name="message">
+        /// Formatted log message. Only the three closed scheduler message families are inspected: the slow-stage
+        /// attribution line, the interactive-threshold completion line, and the long-handler completion line.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> when the entry is a measurement or a completion echo rather than an incident; <c>false</c> for
+        /// the live long-handler warning, for any handler that ended in a failure outcome, and whenever the duration
+        /// cannot be read unambiguously.
+        /// </returns>
+        /// <remarks>
+        /// <para>
+        /// The operator channel is meant to carry actionable incidents, not raw telemetry. Three distinct families are
+        /// classified here:
+        /// </para>
+        /// <list type="bullet">
+        /// <item>The <c>Telegram slow update stage.</c> line attributes one already-counted handler to a closed stage
+        /// (<c>xui_read</c>, <c>telegram_send</c>, <c>telegram_membership</c>, <c>site_lookup</c>). It is valuable for
+        /// local diagnosis and metrics and is never an incident by itself, so it always stays out of the channel.</item>
+        /// <item>A <c>completed</c> handler above the five-second interactive threshold but below the ten-second live
+        /// warning threshold is performance telemetry. Production proved this shape repeatedly: a successful 5.3 second
+        /// handler is not a failure.</item>
+        /// <item>The <c>Telegram long update handler completed.</c> echo only repeats a >= ten-second execution for
+        /// which the live watchdog already delivered the single operator alert.</item>
+        /// </list>
+        /// <para>
+        /// The live <c>Telegram update handler running unusually long.</c> warning, any <c>Outcome</c> other than
+        /// <c>completed</c>, a duration at or above the long-handler threshold, and every unparseable or non-finite
+        /// duration remain visible, so hardening the channel routing can never hide a genuine root blocker.
+        /// </para>
+        /// </remarks>
+        private static bool ShouldSuppressLatencyTelemetry(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+
+            // Case A: per-stage attribution telemetry. Always local/metrics only.
+            if (ContainsOrdinalIgnoreCase(message, SlowStageMessage))
+                return true;
+
+            // Case C: the completion echo of a handler the live watchdog already reported once.
+            if (ContainsOrdinalIgnoreCase(message, LongHandlerCompletedMessage))
+                return true;
+
+            // Case B: the interactive-threshold completion line. Suppression requires all three of an explicit
+            // completed outcome, an unambiguous duration, and a duration strictly below the incident threshold.
+            if (!ContainsOrdinalIgnoreCase(message, InteractiveThresholdMessage))
+                return false;
+
+            if (!string.Equals(TryReadMessageToken(message, "Outcome="), "completed", StringComparison.Ordinal))
+                return false;
+
+            return TryReadNonNegativeFiniteNumber(message, "HandlerDurationMs=", out var handlerDurationMs) &&
+                   handlerDurationMs < LongHandlerOperatorThresholdMilliseconds;
         }
 
         /// <summary>
@@ -187,6 +286,49 @@ namespace Adminbot.Domain.Logging
                 if (ControlledLatencyNotifications.TryUpdate(key, now, previous))
                     return false;
             }
+        }
+
+        /// <summary>
+        /// Reads the single whitespace-delimited token that follows a structured marker in a formatted message.
+        /// </summary>
+        /// <param name="message">Formatted log message produced by the structured formatter.</param>
+        /// <param name="marker">Marker including its trailing equals sign, for example <c>Operation=</c>.</param>
+        /// <returns>The token value, or <c>null</c> when the marker is absent or carries no value.</returns>
+        /// <remarks>
+        /// This is a narrow textual lookup for closed-vocabulary fields only; it never parses free-form text and never
+        /// returns customer data.
+        /// </remarks>
+        /// <summary>
+        /// Reads one structured numeric token from a formatted message and requires an unambiguous value.
+        /// </summary>
+        /// <param name="message">Formatted log message produced by the structured formatter.</param>
+        /// <param name="marker">Marker including its trailing equals sign, for example <c>HandlerDurationMs=</c>.</param>
+        /// <param name="value">
+        /// The parsed value when the token is present and finite; zero when the token is absent or malformed. A caller
+        /// must treat <c>false</c> as "unknown" and must never read the zero placeholder as a real measurement.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> only when the token parses with the invariant culture into a finite, non-negative number.
+        /// </returns>
+        /// <remarks>
+        /// Channel suppression must fail open. A missing, localized, <c>NaN</c>, <c>Infinity</c>, or negative duration
+        /// is unreadable evidence, so the event is delivered instead of being hidden by an accidental match.
+        /// </remarks>
+        private static bool TryReadNonNegativeFiniteNumber(string message, string marker, out double value)
+        {
+            value = 0;
+            var token = TryReadMessageToken(message, marker);
+            if (token == null)
+                return false;
+
+            if (!double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+                return false;
+
+            if (double.IsNaN(parsed) || double.IsInfinity(parsed) || parsed < 0)
+                return false;
+
+            value = parsed;
+            return true;
         }
 
         /// <summary>

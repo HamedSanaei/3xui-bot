@@ -1,4 +1,5 @@
 using Adminbot.Domain;
+using Adminbot.Domain.Logging;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using Telegram.Bot.Types;
@@ -74,8 +75,14 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <remarks>
     /// The warning fires at most once per execution, using a cancellation timer rather than a polling loop, so a slow
     /// handler cannot produce one warning per second. Tests override it with a millisecond value.
+    ///
+    /// This same boundary separates performance telemetry from an operator incident in
+    /// <see cref="TelegramLogSuppression"/>: a completed handler above the interactive five-second threshold but below
+    /// this value is recorded locally and is withheld from the central Telegram logger channel, while a handler at or
+    /// above it remains channel-visible. The initializer reads the shared constant so the two policies cannot drift.
     /// </remarks>
-    internal TimeSpan LongHandlerWarningThreshold { get; init; } = TimeSpan.FromSeconds(10);
+    internal TimeSpan LongHandlerWarningThreshold { get; init; } =
+        TimeSpan.FromMilliseconds(TelegramLogSuppression.LongHandlerOperatorThresholdMilliseconds);
 
     /// <summary>
     /// Queue wait that counts as an unusually long wait. Production value: five seconds.
@@ -449,7 +456,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// This is the attribution signal the production incident lacked: it names the exact stage rather than only the
     /// whole-handler duration. Stage names come from a closed enumeration, so no email, order id, callback payload, or
     /// customer text can appear here. It is logged at Information because it explains one already-counted handler and is
-    /// not itself an alert.
+    /// not itself an alert, and <see cref="TelegramLogSuppression"/> withholds the family from the central Telegram
+    /// logger channel so per-stage measurements cannot look like incidents to operators.
     /// </remarks>
     private void ReportSlowStage(string botId, long sequence, int updateId, UpdateType updateType, TelegramUpdateStage stage, double elapsedMilliseconds)
     {
@@ -475,6 +483,11 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// the handler finished in the same instant the threshold crossed — the completion record itself carries the
     /// Warning, so a long handler is never invisible. Handlers between the interactive and long thresholds are recorded
     /// at Information because a production sample contained several of them and they are not individually actionable.
+    ///
+    /// Channel routing follows the same split: the interactive-threshold line below the long-handler value and the
+    /// long-handler completion echo are performance telemetry and stay out of the central Telegram logger channel, while
+    /// the completion line at or above the long-handler value remains channel-visible when the live watchdog did not
+    /// already report it. See <see cref="TelegramLogSuppression"/>.
     /// </remarks>
     private void RecordHandlerDurationDiagnostic(
         double durationMilliseconds,
