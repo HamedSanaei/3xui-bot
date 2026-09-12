@@ -66,7 +66,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Before publish, CI and deployment run `dotnet ef migrations has-pending-model-changes` independently for
   `UserDbContext` and `CredentialsDbContext`. Publish then targets a new directory and the exact published `Adminbot
   --migration-check` executable validates fresh databases and SQLite online-backup copies; this mode starts no host,
-  HTTP listener, Telegram receiver, hosted worker, or remote logger.
+  HTTP listener, Telegram receiver, hosted worker, or remote logger. The same non-serving shape is used by
+  `--recover-missed-tenant-card-receipts` (see the tenant receipt recovery notes below).
 - Production deployment uses immutable `/opt/vpnetiran/releases/<commit>/` directories, shared persistent Data,
   atomic `current`/`previous` symlinks, and rollback-aware systemd activation through `scripts/deploy-release.sh`.
   The GitHub workflow uses the OTHER path: it streams `scripts/deploy-production.sh` to the host, which clones the exact
@@ -548,9 +549,12 @@ and the main menu.
   recovery worker settles it later from its durable Applied state. `MarkSettledAsync` is virtual only as a test seam.
 - `TenantOrderNotifications` (users.db outbox) retention is configurable via `tenantOrderNotificationRetentionDays`
   (positive, default 30). The worker deletes at most 100 rows per scan that are Delivered, older than the cutoff, and
-  carry no claim/lease; Pending/Processing/DeliveryUncertain/ManualReview/FailedPermanent rows are never removed.
+  carry no claim/lease; Pending/Processing/DeliveryUncertain/ManualReview/FailedPermanent/Superseded rows are never
+  removed.
   Migration `20260909204045_HardenTenantOrderNotificationOutbox` adds `SendStartedAtUtc` and the
-  (Status, DeliveredAtUtc) index.
+  (Status, DeliveredAtUtc) index. Almost every kind in this outbox is post-fulfillment, but
+  `tenant_card_receipt_reupload_recovery` is deliberately **pre-fulfillment**, so the worker's `IsFulfilled` gate is
+  skipped for that one kind only (see the missed-receipt recovery notes).
 - Notification worker durable send phase: after the atomic claim the row is Processing with `SendStartedAtUtc=null`;
   the phase is persisted immediately before the Telegram transport call. An expired lease with a null phase is
   recycled to Pending (send never started, retryable); an expired lease with a set phase becomes DeliveryUncertain
@@ -840,6 +844,49 @@ and the main menu.
   `SalesAssistantService.NOTIFYMANUALRECEIPTASYNC` still downloads the file through the tenant bot and re-uploads a fresh
   stream through the assistant bot, because Telegram file ids are not portable across bots; the text fallback with the
   approval keyboard is preserved for a relay failure.
+- **Missed tenant card-to-card receipt recovery — non-serving CLI, dry run by default.** Recovers customers whose
+  receipt image was dropped by the pre-fix document bug (`awaiting_receipt`, `ManualReceiptId` null, no
+  `TenantManualPaymentReceipt`, no `TenantManualReceiptNotification`) — for example production order 241, whose receipt
+  arrived as `Message.Document`. The dropped Telegram image **cannot** be reconstructed (terminal inbox rows erase their
+  private payload and activity logs only hold coarse markers such as `[Document]`), so recovery asks the customer to
+  re-upload; it never fabricates a receipt, never approves a payment, never sets `receipt_submitted`, and never creates a
+  provisional account. Command: `Adminbot --recover-missed-tenant-card-receipts [--until <UTC ISO-8601>] [--since <UTC>]
+  [--older-than-minutes N] [--tenant-bot-id <id>] [--limit N] [--users-db <path>] [--apply]`. It is handled in
+  `Program.Main` **before** host construction, exactly like `--migration-check`, so it starts no HTTP listener, Telegram
+  receiver, hosted worker, provider reconciliation, XUI worker, or Telegram logging worker, and it never calls Telegram or
+  XUI itself. `Services/TenantCardReceiptRecovery.cs` holds the options/scan types, the service
+  (`ScanAsync` is strictly read-only; `ApplyAsync` only inserts outbox rows), and the CLI. Candidate rule:
+  `PaymentProvider = tenant_card` (case-insensitive) AND `PaymentStatus = awaiting_receipt` AND `IsFulfilled = false` AND
+  `ManualReceiptId IS NULL` AND `CustomerTelegramUserId > 0` AND `TenantBotId` nonblank AND `CreatedAtUtc` inside the
+  window AND **no** `TenantManualPaymentReceipt` for the order AND no existing recovery intent. Purchase and renewal card
+  orders both qualify; only the provisional courtesy account stays purchase-only. **`--apply` requires an explicit
+  `--until`**, because after the fix an ordinary customer who selected card payment but has not paid yet is also
+  `awaiting_receipt` with no receipt, and the operator must declare the incident window (the commit timestamp is never
+  used as a proxy for the deploy time). Duplicate options, missing values, non-UTC timestamps, non-positive counts, and
+  `--since > --until` are refused with exit code 2. **An existing receipt always wins:** `ManualReceiptId` set or any
+  receipt row means the order is never a candidate, and when the owner relay is `manual_review` / `delivery_uncertain` /
+  `failed_permanent` / missing the receipt is reported as an operator diagnostic instead — that is a different incident
+  from a customer re-upload, so it never produces a customer message. Dry run performs zero mutations and prints only
+  safe ids (order id, order number, tenant bot id, customer Telegram id, statuses); never a file id, token, or card data.
+  Apply re-reads each candidate inside a short transaction and relies on the existing unique
+  `(TenantBotOrderId, Kind)` index as the final guard, so repeated, concurrent, or interrupted invocations cannot produce
+  more than one reminder per order and a duplicate-key race is treated as already queued rather than as a failure.
+  **Delivery reuses the existing outbox:** the new kind
+  `TenantOrderNotificationKinds.TenantCardReceiptReuploadRecovery` (`tenant_card_receipt_reupload_recovery`) plus status
+  `TenantOrderNotificationStatuses.Superseded` (`superseded`) need no migration because `Kind` and `Status` are already
+  strings. `TenantOrderNotificationWorker` claims, leases, retries, and persists it like every other row, with one
+  deliberate exemption: this is the only **pre-fulfillment** kind, so `DeliverAsync` skips the `IsFulfilled` gate for it.
+  `TenantOrderNotificationDeliveryService.SendTenantCardReceiptReuploadRecoveryAsync` re-reads the order immediately
+  before the send; if the customer already re-uploaded, the order was fulfilled, or the status moved on, it raises
+  `TenantOrderNotificationSupersededException` and the row terminates as `superseded` **without any Telegram request** (not
+  FailedPermanent, not DeliveryUncertain). An unusable storefront transport (missing, disabled, tokenless, or unregistered)
+  raises `TenantOrderNotificationRequiresReviewException` and terminates as `manual_review` with
+  `tenant_transport_unavailable`; cross-sending through the default owned bot or the Sales Assistant is never allowed. The
+  reminder itself is sent only by `order.TenantBotId`, to `CustomerChatId` when positive else `CustomerTelegramUserId`,
+  states that no receipt is on file and that re-uploading creates no new payment, and carries the same
+  `TN:receipt:{orderDbId}` callback as the original order, so the durable bot-scoped upload target binds the new image to
+  the exact order. After the customer re-uploads, the normal receipt flow takes over unchanged (receipt + owner outbox
+  first, then the optional provisional courtesy account when the feature flag is on).
 - **Tenant personal card-to-card (`tenant_card`) provisional delivery — WIRED, DEFAULT OFF.**
   Migration `20260911000006_AddTenantCardProvisionalDelivery` added `TenantBotOrders.ProvisionalDeliveryState`
   (default `none`), `ProvisionalCreatedAtUtc`, `ProvisionalDeliveredAtUtc`, `ProvisionalAccountEmail`,

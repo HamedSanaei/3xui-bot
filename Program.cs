@@ -30,8 +30,11 @@ public class Program
     /// <returns>A task that completes when the host shuts down.</returns>
     /// <remarks>
     /// <c>--migration-check</c> exits before host construction and validates both real EF migration models against
-    /// isolated temporary databases. Normal startup prints the embedded commit/configuration before loading private
-    /// configuration, then preserves the existing migrate-before-receiver ordering.
+    /// isolated temporary databases. <c>--recover-missed-tenant-card-receipts</c> also exits before host construction
+    /// and queues (or, in its default dry run, only reports) receipt re-upload reminders for tenant card orders whose
+    /// receipt image was dropped before the image-document fix; it starts no listener, receiver, or worker. Normal
+    /// startup prints the embedded commit/configuration before loading private configuration, then preserves the
+    /// existing migrate-before-receiver ordering.
     ///
     /// In addition to the Telegram operational logger, startup registers a fail-soft daily diagnostic file logger for
     /// warning/error/critical entries. This keeps full exception chains on disk even when channel-noise suppression
@@ -45,6 +48,16 @@ public class Program
         if (MigrationPreflight.IsRequested(args))
         {
             Environment.ExitCode = await MigrationPreflight.RunAsync(args, Console.Out, CancellationToken.None);
+            return;
+        }
+
+        // The missed-receipt recovery command is deliberately handled before host construction, exactly like the
+        // migration preflight: it must not start the HTTP listener, Telegram receivers, hosted workers, provider
+        // reconciliation, XUI workers, or the Telegram logging worker. Dry run reads users.db only, and apply only
+        // persists durable reminder intents that the normal notification worker delivers later.
+        if (TenantCardReceiptRecoveryCli.IsRequested(args))
+        {
+            Environment.ExitCode = await TenantCardReceiptRecoveryCli.RunAsync(args, Console.Out, CancellationToken.None);
             return;
         }
 

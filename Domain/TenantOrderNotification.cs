@@ -10,6 +10,16 @@ public static class TenantOrderNotificationKinds
     public const string SalesAssistantSaleNotification = "sales_assistant_sale_notification";
     /// <summary>Sends stored account details through Sales Assistant after the owner explicitly confirms FINAL.</summary>
     public const string OwnerAccountDetailsAfterAssistantFinal = "owner_account_details_after_assistant_final";
+    /// <summary>
+    /// Asks a tenant card-to-card customer to re-upload a receipt that was never persisted.
+    /// </summary>
+    /// <remarks>
+    /// This is the only pre-fulfillment kind: it is queued by the missed-receipt recovery command for orders that are
+    /// still <c>awaiting_receipt</c> with no receipt row, and it deliberately creates no receipt, no payment state
+    /// change, no wallet effect, no ledger row, and no XUI client. Adding another kind value needs no migration because
+    /// <see cref="TenantOrderNotification.Kind" /> is persisted as a string with a unique (order, kind) index.
+    /// </remarks>
+    public const string TenantCardReceiptReuploadRecovery = "tenant_card_receipt_reupload_recovery";
 }
 
 public static class TenantOrderNotificationStatuses
@@ -20,9 +30,24 @@ public static class TenantOrderNotificationStatuses
     public const string FailedPermanent = "failed_permanent";
     public const string ManualReview = "manual_review";
     public const string DeliveryUncertain = "delivery_uncertain";
+    /// <summary>
+    /// Terminal state for a queued intent that became unnecessary before any Telegram request was made.
+    /// </summary>
+    /// <remarks>
+    /// Used by the missed-receipt recovery reminder when the customer's receipt arrived (or the order was fulfilled or
+    /// left <c>awaiting_receipt</c>) between enqueue and delivery. It is not a delivery failure: no message was sent and
+    /// nothing is retried, so it must never be reported as FailedPermanent or DeliveryUncertain.
+    /// </remarks>
+    public const string Superseded = "superseded";
 }
 
-/// <summary>Durable post-fulfillment Telegram delivery intent for one tenant order and logical notification kind.</summary>
+/// <summary>Durable Telegram delivery intent for one tenant order and logical notification kind.</summary>
+/// <remarks>
+/// Almost every kind is post-fulfillment and is delivered only for a fulfilled order. The single exception is
+/// <see cref="TenantOrderNotificationKinds.TenantCardReceiptReuploadRecovery" />, which is intentionally queued before
+/// fulfillment so a customer whose pre-fix receipt image was dropped can be asked to re-upload it. Delivery state never
+/// authorizes receipt approval, payment, wallet mutation, order fulfillment, or any XUI operation.
+/// </remarks>
 public sealed class TenantOrderNotification
 {
     public int Id { get; set; }

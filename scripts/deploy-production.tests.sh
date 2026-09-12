@@ -36,6 +36,25 @@ sync_publish "$stage_publish" "$live_publish"
 [[ -f "$live_publish/new-library.dll" ]]
 [[ ! -e "$live_publish/obsolete.dll" ]]
 
+# A release may never replace, delete, or overwrite the live SQLite databases. The exclusions below are the only
+# thing that stops publish/source synchronization from touching them, so they are asserted structurally: removing
+# one of them must fail this test instead of silently shipping a release that can wipe production data.
+grep -Fq -- "--exclude='*.db'" "$script_dir/deploy-production.sh" \
+  || { echo 'Missing *.db synchronization exclusion in deploy-production.sh.' >&2; exit 1; }
+grep -Fq -- "--exclude='*.db-*'" "$script_dir/deploy-production.sh" \
+  || { echo 'Missing *.db-* synchronization exclusion in deploy-production.sh.' >&2; exit 1; }
+grep -Fq -- "--exclude='Data/'" "$script_dir/deploy-production.sh" \
+  || { echo 'Missing Data/ synchronization exclusion in deploy-production.sh.' >&2; exit 1; }
+grep -Fq 'assert_data_unchanged()' "$script_dir/deploy-production.sh" \
+  || { echo 'Missing assert_data_unchanged guard in deploy-production.sh.' >&2; exit 1; }
+
+# A live users.db must survive a synchronization that carries a staged database file with the same name.
+printf 'live-database\n' > "$live_publish/Data/users.db"
+printf 'staged-database\n' > "$stage_publish/Data/users.db"
+sync_publish "$stage_publish" "$live_publish"
+[[ "$(cat "$live_publish/Data/users.db")" == "live-database" ]]
+printf '  protected live users.db from staged replacement\n'
+
 printf 'tracked-source\n' > "$stage_source/README.deploy-test"
 printf 'stale-source\n' > "$live_root/stale-source.txt"
 sync_source "$stage_source" "$live_root"
