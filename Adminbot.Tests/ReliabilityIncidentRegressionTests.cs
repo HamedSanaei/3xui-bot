@@ -332,6 +332,11 @@ public sealed partial class ConcurrencyTests
     /// budget. Tests that assert bounded-timeout behaviour pass millisecond values so they do not wait the real
     /// production budgets. This override cannot change purchase, wallet, or settlement semantics.
     /// </param>
+    /// <param name="extraConfiguration">
+    /// Optional additional configuration keys layered above the incident configuration, for example enabling the
+    /// global latest-client download switch for one test. When null the incident configuration is used unchanged.
+    /// These keys change feature availability only; they never alter purchase, wallet, or settlement semantics.
+    /// </param>
     /// <returns>
     /// A provider exposing the registered production services, the configured <see cref="BotRegistry"/>, and the
     /// per-bot fake Telegram clients keyed by bot id. The caller owns and must dispose the provider.
@@ -340,7 +345,8 @@ public sealed partial class ConcurrencyTests
         IncidentProvider(
             Databases databases,
             bool? fundingMonitorEnabled = null,
-            TelegramInteractionTimeouts? interactionTimeouts = null)
+            TelegramInteractionTimeouts? interactionTimeouts = null,
+            IReadOnlyDictionary<string, string?>? extraConfiguration = null)
     {
         IConfiguration configuration = IncidentConfiguration();
         if (fundingMonitorEnabled.HasValue)
@@ -351,6 +357,11 @@ public sealed partial class ConcurrencyTests
                     ["tenantStorefrontFundingMonitorEnabled"] = fundingMonitorEnabled.Value.ToString(),
                     ["tenantStorefrontFundingMonitorIntervalMinutes"] = fundingMonitorEnabled.Value ? "5" : "0"
                 }).Build();
+        }
+        if (extraConfiguration != null)
+        {
+            configuration = new ConfigurationBuilder().AddConfiguration(configuration)
+                .AddInMemoryCollection(extraConfiguration).Build();
         }
         var appConfig = configuration.Get<AppConfig>()!;
         appConfig.UserDatabasePath = Path.Combine(databases.DirectoryPath, "users.db");

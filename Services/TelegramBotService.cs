@@ -4090,17 +4090,45 @@ public partial class TelegramBotService
         return value.ToString("0.########", CultureInfo.InvariantCulture);
     }
 
+    /// <summary>
+    /// Acknowledges one callback through the active bot client using the bounded best-effort policy.
+    /// </summary>
+    /// <param name="callbackQueryId">Opaque Telegram callback id valid only briefly.</param>
+    /// <param name="text">Optional toast or alert text; must never contain secrets.</param>
+    /// <param name="showAlert">When true Telegram shows <paramref name="text"/> as a modal alert.</param>
+    /// <param name="url">Optional game-callback URL; normally null.</param>
+    /// <param name="cacheTime">Optional Telegram callback cache lifetime in seconds; normally null.</param>
+    /// <param name="cancellationToken">Update lane cancellation token.</param>
+    /// <param name="telegramUserId">
+    /// Optional sender id of the user who tapped the button, for UX latency telemetry only. When omitted the ambient
+    /// <see cref="TelegramInteractionActor"/> value recorded at dispatch is used.
+    /// </param>
+    /// <returns>A task completing after the bounded acknowledgement attempt; the result is never used for business logic.</returns>
     private Task<bool> SafeAnswerCallbackQueryAsync(
         string callbackQueryId,
         string text = null,
         bool? showAlert = null,
         string url = null,
         int? cacheTime = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        long? telegramUserId = null)
         => TelegramCallbackAnswerPolicy.TryAnswerAsync(
             ActiveBotClient, callbackQueryId, text, showAlert, url, cacheTime, cancellationToken,
-            _logger, BotContextAccessor.CurrentBotId, timeout: _interactionTimeouts.CallbackAnswer);
+            _logger, BotContextAccessor.CurrentBotId, telegramUserId ?? TelegramInteractionActor.Current,
+            _interactionTimeouts.CallbackAnswer);
 
+    /// <summary>
+    /// Acknowledges one callback through an explicitly supplied bot client using the bounded best-effort policy.
+    /// </summary>
+    /// <param name="botClient">Client of the bot that received the callback; never another bot of the same owner.</param>
+    /// <param name="callbackQueryId">Opaque Telegram callback id valid only briefly.</param>
+    /// <param name="text">Optional toast or alert text; must never contain secrets.</param>
+    /// <param name="showAlert">When true Telegram shows <paramref name="text"/> as a modal alert.</param>
+    /// <param name="url">Optional game-callback URL; normally null.</param>
+    /// <param name="cacheTime">Optional Telegram callback cache lifetime in seconds; normally null.</param>
+    /// <param name="cancellationToken">Update lane cancellation token.</param>
+    /// <param name="telegramUserId">Optional sender id of the user who tapped the button, for telemetry only.</param>
+    /// <returns>A task completing after the bounded acknowledgement attempt.</returns>
     private Task<bool> SafeAnswerCallbackQueryAsync(
         ITelegramBotClient botClient,
         string callbackQueryId,
@@ -4108,14 +4136,28 @@ public partial class TelegramBotService
         bool? showAlert = null,
         string url = null,
         int? cacheTime = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        long? telegramUserId = null)
         => TelegramCallbackAnswerPolicy.TryAnswerAsync(
             botClient, callbackQueryId, text, showAlert, url, cacheTime, cancellationToken,
-            _logger, BotContextAccessor.CurrentBotId, timeout: _interactionTimeouts.CallbackAnswer);
+            _logger, BotContextAccessor.CurrentBotId, telegramUserId ?? TelegramInteractionActor.Current,
+            _interactionTimeouts.CallbackAnswer);
 
+    /// <summary>
+    /// Acknowledges one callback whose sender identity is known from the query itself.
+    /// </summary>
+    /// <param name="callbackQuery">Callback being answered; its sender id is forwarded for latency telemetry.</param>
+    /// <param name="cancellationToken">Update lane cancellation token.</param>
+    /// <returns>A task completing after the bounded acknowledgement attempt.</returns>
+    /// <remarks>
+    /// The sender is passed explicitly here because the query is in hand. Other call sites hold only the opaque callback
+    /// id and rely on the ambient <see cref="TelegramInteractionActor"/> recorded for the update execution, so latency
+    /// telemetry names the waiting user instead of <c>(null)</c>.
+    /// </remarks>
     private async Task AnswerCallbackSafely(CallbackQuery callbackQuery, CancellationToken cancellationToken)
     {
-        await SafeAnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+        await SafeAnswerCallbackQueryAsync(
+            callbackQuery.Id, cancellationToken: cancellationToken, telegramUserId: callbackQuery?.From?.Id);
     }
 
     private static string BuildZibalStatusText(InquiryResponse inquiry, PaymentVerificationResponse verify = null)
@@ -4581,6 +4623,11 @@ public partial class TelegramBotService
     /// </example>
     private async Task<List<long>> GetBroadcastRecipientsAsync(string audience, CancellationToken cancellationToken)
     {
+        // Recipient enumeration is the only part of a broadcast that runs inside the owner's update lane, and it is a
+        // pure database read: two bounded audience reads and no per-user Telegram or network call. Measuring it as
+        // database_wait makes a very large or slow audience visible in stage telemetry instead of hiding inside the
+        // owner callback's total duration. Actual delivery belongs to BroadcastManager's background worker.
+        using var stageMeasurement = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.DatabaseWait) ?? default;
         var normalizedAudience = NormalizeBroadcastAudience(audience);
         var botId = BotContextAccessor.CurrentBotId;
         var scopedTelegramUserIds = await _workflow.ReadAsync(async db => await db.BotUserStates
@@ -6852,9 +6899,16 @@ public partial class TelegramBotService
                         });
                         await _workflow.SaveAsync();
 
+                        // Restored literal: the original Persian sentence was committed as literal '?' characters by a
+                        // later edit, so the terminal-shaped message was unreadable. The intended wording was recovered
+                        // verbatim from the revision that introduced this NOWPayments failure branch (the commit that
+                        // added the gateway), which is the same catch block at the same call site. It is deliberately
+                        // identical to the sibling NOWPayments messages on this branch: the customer learns the payment
+                        // attempt failed and that diagnostics were logged, without being told to retry a payment that
+                        // may already have been created.
                         await botClient.CustomSendTextMessageAsync(
                             chatId: message.Chat.Id,
-                            text: "??? ??????? ??? ??????? ?????? ???? ????? ???? ? ??? ??????? ????? ???. ????? ??? ????? ???? ?????? ???? ????.",
+                            text: "ایجاد پرداخت ارز دیجیتال ناموفق بود. جزئیات خطا در ترمینال ثبت شد.",
                             replyMarkup: MainReplyMarkupKeyboardFa(),
                             cancellationToken: cancellationToken);
                     }
@@ -8513,7 +8567,21 @@ public partial class TelegramBotService
         }
     }
 
-    async Task<string> GetUserProfileMessage(CredUser credUser)
+    /// <summary>
+    /// Builds the owned-bot account-status message for one profile.
+    /// </summary>
+    /// <param name="credUser">Detached credentials profile whose status is being displayed.</param>
+    /// <param name="cancellationToken">
+    /// Lane cancellation token forwarded to the optional Gozargah website wallet lookup. A cancelled lane abandons that
+    /// display-only lookup instead of holding the update.
+    /// </param>
+    /// <returns>Markdown-escaped profile text, optionally including the website wallet line for colleagues.</returns>
+    /// <remarks>
+    /// The website wallet line is display-only enrichment. It is bounded by
+    /// <see cref="GozargahSiteApiClient.OptionalLookupTimeout" /> and never blocks the profile response beyond that
+    /// budget, and it never debits either wallet.
+    /// </remarks>
+    async Task<string> GetUserProfileMessage(CredUser credUser, CancellationToken cancellationToken = default)
     {
         var _credUser = await _credentialsDbContext.GetUserStatus(credUser);
 
@@ -8525,7 +8593,7 @@ public partial class TelegramBotService
         text += $"‌💰اعتبار حساب: {_credUser.AccountBalance.FormatCurrency()}\n";
         if (_credUser.IsColleague)
         {
-            text += await BuildGozargahSiteWalletStatusLineAsync(_credUser.TelegramUserId);
+            text += await BuildGozargahSiteWalletStatusLineAsync(_credUser.TelegramUserId, cancellationToken);
             text += $"‌🧰 نوع: اکانت شما از نوع همکار 💎می‌باشد. \n";
         }
         else
@@ -8541,22 +8609,31 @@ public partial class TelegramBotService
     /// <param name="telegramUserId">
     /// Numeric Telegram user id of the colleague. The Gozargah website API uses the same id to find the linked website user.
     /// </param>
+    /// <param name="cancellationToken">
+    /// Lane cancellation token linked with the foreground website-lookup budget so a slow website releases the update
+    /// instead of holding it for the transport ceiling.
+    /// </param>
     /// <returns>
     /// A human-readable status line containing the website wallet balance, ban status, or a short unavailable message.
-    /// The returned text is not escaped; <see cref="GetUserProfileMessage(CredUser)"/> escapes the full profile message.
+    /// The returned text is not escaped; <see cref="GetUserProfileMessage(CredUser, CancellationToken)"/> escapes the full
+    /// profile message.
     /// </returns>
     /// <remarks>
-    /// This method is display-only. It never debits either wallet and never blocks the owned-bot status flow if the
-    /// website API is unavailable.
+    /// This method is display-only and is one of the foreground Gozargah lookups: the colleague is waiting for the
+    /// response. The lookup is therefore bounded by <see cref="GozargahSiteApiClient.CreateOptionalLookupCancellation" />
+    /// (four seconds overall, hard maximum five) rather than by the provider-oriented transport timeout. It never debits
+    /// either wallet, never mutates financial state, and never blocks the owned-bot status flow: on timeout the line simply
+    /// reports that the website is unavailable.
     /// </remarks>
-    private async Task<string> BuildGozargahSiteWalletStatusLineAsync(long telegramUserId)
+    private async Task<string> BuildGozargahSiteWalletStatusLineAsync(long telegramUserId, CancellationToken cancellationToken = default)
     {
         if (_gozargahSiteApiClient == null || !_gozargahSiteApiClient.IsConfigured())
             return string.Empty;
 
         try
         {
-            var siteUser = await _gozargahSiteApiClient.GetUserAsync(telegramUserId);
+            using var lookupTimeout = GozargahSiteApiClient.CreateOptionalLookupCancellation(cancellationToken);
+            var siteUser = await _gozargahSiteApiClient.GetUserAsync(telegramUserId, lookupTimeout.Token);
             if (!siteUser.Success || siteUser.Data == null)
             {
                 var statusText = IsGozargahSiteUserNotConnectedMessage(siteUser.Message)

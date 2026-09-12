@@ -422,15 +422,18 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         {
             // Same lane incident, already reported once: keep the metric and a file diagnostic instead of another alert.
             _logger.LogDebug(
-                "Telegram update waited behind an already reported lane blocker. BotId={BotId} UpdateId={UpdateId} QueueWaitMs={QueueWaitMs} PreviousSequence={PreviousSequence}",
-                item.Key.BotId, item.Update.Id, waitMilliseconds, blockerSequence);
+                "Telegram update waited behind an already reported lane blocker. BotId={BotId} TelegramUserId={TelegramUserId} WaitingSequence={WaitingSequence} WaitingUpdateId={WaitingUpdateId} QueueWaitMs={QueueWaitMs} PreviousSequence={PreviousSequence}",
+                item.Key.BotId, item.Key.TelegramUserId, sequence, item.Update.Id, waitMilliseconds, blockerSequence);
             return;
         }
 
+        // The full correlation block: which update waited, on which lane, for how long, and the exact earlier
+        // execution that caused it. All values are identifiers already present in scheduler telemetry; the inbox
+        // payload is never loaded for correlation.
         _logger.LogWarning(
-            "Telegram update waited unusually long. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} UpdateType={UpdateType} QueueWaitMs={QueueWaitMs} PreviousSequence={PreviousSequence} PreviousUpdateId={PreviousUpdateId} PreviousHandlerDurationMs={PreviousHandlerDurationMs}",
-            item.Key.BotId, sequence, item.Update.Id, item.Update.Type, waitMilliseconds,
-            blockerSequence, blocker?.UpdateId ?? 0, blocker?.HandlerDurationMs ?? 0);
+            "Telegram update waited unusually long. BotId={BotId} TelegramUserId={TelegramUserId} WaitingSequence={WaitingSequence} WaitingUpdateId={WaitingUpdateId} WaitingUpdateType={WaitingUpdateType} QueueWaitMs={QueueWaitMs} PreviousSequence={PreviousSequence} PreviousUpdateId={PreviousUpdateId} PreviousUpdateType={PreviousUpdateType} PreviousHandlerDurationMs={PreviousHandlerDurationMs}",
+            item.Key.BotId, item.Key.TelegramUserId, sequence, item.Update.Id, item.Update.Type, waitMilliseconds,
+            blockerSequence, blocker?.UpdateId ?? 0, blocker?.UpdateType ?? string.Empty, blocker?.HandlerDurationMs ?? 0);
     }
 
     /// <summary>

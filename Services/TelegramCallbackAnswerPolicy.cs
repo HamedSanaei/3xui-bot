@@ -60,7 +60,10 @@ public static class TelegramCallbackAnswerPolicy
     /// Telegram bot id or chat id.
     /// </param>
     /// <param name="telegramUserId">
-    /// Optional numeric Telegram user id of the user who tapped the button, used for diagnostics only.
+    /// Optional numeric Telegram user id of the user who tapped the button, used for diagnostics only. When omitted,
+    /// the ambient <see cref="TelegramInteractionActor"/> value established at the update dispatch boundary is used, so
+    /// an acknowledgement is attributable even though most call sites only hold the opaque callback id. Pass the id
+    /// explicitly whenever <c>CallbackQuery.From.Id</c> is already in hand.
     /// </param>
     /// <param name="timeout">
     /// The effective acknowledgement budget. When null the production budget <see cref="Timeout"/> (two
@@ -104,6 +107,9 @@ public static class TelegramCallbackAnswerPolicy
     {
         ArgumentNullException.ThrowIfNull(client);
         if (string.IsNullOrWhiteSpace(callbackQueryId)) return false;
+        // Prefer an explicitly supplied sender, otherwise use the actor recorded for this update execution. The value is
+        // diagnostics-only and never influences acknowledgement behavior or authorization.
+        var actorUserId = telegramUserId ?? TelegramInteractionActor.Current;
         var started = Stopwatch.GetTimestamp();
         // The caller-supplied token is linked so outer lane cancellation still propagates, while the local
         // budget guarantees this UX-only request cannot outlive its deadline and stall the user lane.
@@ -113,7 +119,7 @@ public static class TelegramCallbackAnswerPolicy
         {
             await client.AnswerCallbackQueryAsync(
                 callbackQueryId, text, showAlert, url, cacheTime, bounded.Token);
-            LogIfSlow(logger, started, botId, telegramUserId, "completed", null);
+            LogIfSlow(logger, started, botId, actorUserId, "completed", null);
             return true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -122,7 +128,7 @@ public static class TelegramCallbackAnswerPolicy
         }
         catch (OperationCanceledException ex)
         {
-            Log(logger, started, botId, telegramUserId, "local_timeout", ex.GetType().Name);
+            Log(logger, started, botId, actorUserId, "local_timeout", ex.GetType().Name);
             return false;
         }
         catch (ApiRequestException ex) when (IsHarmlessStaleCallback(ex))
@@ -133,22 +139,22 @@ public static class TelegramCallbackAnswerPolicy
         }
         catch (ApiRequestException ex)
         {
-            Log(logger, started, botId, telegramUserId, $"telegram_api_{ex.ErrorCode}", ex.GetType().Name);
+            Log(logger, started, botId, actorUserId, $"telegram_api_{ex.ErrorCode}", ex.GetType().Name);
             return false;
         }
         catch (RequestException ex)
         {
-            Log(logger, started, botId, telegramUserId, "telegram_transport_error", ex.GetType().Name);
+            Log(logger, started, botId, actorUserId, "telegram_transport_error", ex.GetType().Name);
             return false;
         }
         catch (HttpRequestException ex)
         {
-            Log(logger, started, botId, telegramUserId, "telegram_http_error", ex.GetType().Name);
+            Log(logger, started, botId, actorUserId, "telegram_http_error", ex.GetType().Name);
             return false;
         }
         catch (TimeoutException ex)
         {
-            Log(logger, started, botId, telegramUserId, "telegram_timeout", ex.GetType().Name);
+            Log(logger, started, botId, actorUserId, "telegram_timeout", ex.GetType().Name);
             return false;
         }
     }

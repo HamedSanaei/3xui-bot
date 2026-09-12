@@ -411,6 +411,60 @@ namespace Adminbot.Domain
     /// </summary>
     public class GozargahSiteApiClient
     {
+        /// <summary>
+        /// Overall wall-clock budget for ONE optional Gozargah website lookup performed while a Telegram user is waiting.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Foreground Gozargah call sites are the website enrichments a customer or colleague waits for: owned-bot
+        /// colleague-role refresh (`PromoteToColleagueIfConnectedSiteUserAsync`), storefront wallet-button eligibility
+        /// (`CheckSiteWalletEligibilityAsync`), the owned-bot profile wallet line, and the tenant access decision that
+        /// depends on those. Each of them must finish inside this one budget so a slow website can never hold a strict
+        /// FIFO Telegram lane the way the production incident held one for 61-104 seconds.
+        /// </para>
+        /// <para>
+        /// Background Gozargah work — the site sync outbox, its retry worker, the storefront funding monitor, and
+        /// post-commit website mirroring — deliberately does NOT use this budget. Those callers pass their own token to
+        /// <see cref="SendAsync{T}" /> and keep the provider-oriented 30-second transport ceiling, because no interactive
+        /// lane is waiting and a slow website must not be mistaken for a business failure.
+        /// </para>
+        /// </remarks>
+        public static readonly TimeSpan OptionalLookupTimeout = TimeSpan.FromSeconds(4);
+
+        /// <summary>
+        /// Hard maximum for the optional foreground website-lookup budget. Never exceeded, whatever the constants say.
+        /// </summary>
+        public static readonly TimeSpan OptionalLookupHardMaximum = TimeSpan.FromSeconds(5);
+
+        /// <summary>
+        /// Creates the linked cancellation scope that bounds one optional foreground website lookup.
+        /// </summary>
+        /// <param name="outerCancellationToken">
+        /// Cancellation token of the active Telegram update or background operation. Cancelling it cancels the lookup
+        /// immediately as part of normal lane shutdown.
+        /// </param>
+        /// <returns>
+        /// A linked source that cancels when the caller's token cancels or when the foreground lookup budget expires,
+        /// whichever happens first. The effective budget is clamped to <see cref="OptionalLookupHardMaximum" />.
+        /// </returns>
+        /// <remarks>
+        /// Callers must dispose the returned source and pass its token to the lookup. On expiry the existing business
+        /// rule applies: colleague promotion keeps the locally known role and wallet eligibility reports the website as
+        /// unavailable, so no financial state is ever mutated from an unknown website result.
+        /// </remarks>
+        /// <example>
+        /// <code>
+        /// using var lookup = GozargahSiteApiClient.CreateOptionalLookupCancellation(cancellationToken);
+        /// var siteUser = await apiClient.GetUserAsync(telegramUserId, lookup.Token);
+        /// </code>
+        /// </example>
+        public static CancellationTokenSource CreateOptionalLookupCancellation(CancellationToken outerCancellationToken)
+        {
+            var budget = OptionalLookupTimeout <= OptionalLookupHardMaximum ? OptionalLookupTimeout : OptionalLookupHardMaximum;
+            var source = CancellationTokenSource.CreateLinkedTokenSource(outerCancellationToken);
+            source.CancelAfter(budget);
+            return source;
+        }
         private readonly AppConfig _appConfig;
         private readonly ILogger<GozargahSiteApiClient> _logger;
 
@@ -805,7 +859,14 @@ namespace Adminbot.Domain
         private const int NationalPlanId = 1;
         private const int NormalPlanId = 2;
         private const int UnlimitedPlanId = 5;
-        private static readonly TimeSpan OptionalWebsiteLookupTimeout = TimeSpan.FromSeconds(4);
+        /// <summary>
+        /// Overall wall-clock budget for one optional, interactive Gozargah website lookup.
+        /// </summary>
+        /// <remarks>
+        /// This is the single source of truth for the foreground site-lookup bound used by both this sync service and
+        /// the owned-bot profile line. Four seconds covers the whole logical lookup (one POST, no retries).
+        /// </remarks>
+        private static readonly TimeSpan OptionalWebsiteLookupTimeout = GozargahSiteApiClient.OptionalLookupTimeout;
         private readonly UserDbContextFactory _userDbContextFactory;
         /// <summary>Prevents immediate send and recovery from sending the same outbox event concurrently; idle ids are removed.</summary>
         private static readonly AsyncKeyedGate EventGate = new();
@@ -989,9 +1050,9 @@ namespace Adminbot.Domain
         /// </remarks>
         private static CancellationTokenSource CreateOptionalWebsiteLookupCancellation(CancellationToken outerCancellationToken)
         {
-            var source = CancellationTokenSource.CreateLinkedTokenSource(outerCancellationToken);
-            source.CancelAfter(OptionalWebsiteLookupTimeout);
-            return source;
+            // Delegates to the shared helper so the foreground site-lookup budget has exactly one definition and cannot
+            // drift past the documented hard maximum.
+            return GozargahSiteApiClient.CreateOptionalLookupCancellation(outerCancellationToken);
         }
 
         /// <summary>

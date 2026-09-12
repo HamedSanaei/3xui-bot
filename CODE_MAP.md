@@ -493,8 +493,57 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   about `BotId=tenant-...` could be filed under the wrong bot. The provider now prefers an explicit `BotId=`/`botId=`
   value already present in the structured message and withholds the ambient username/type when they would contradict it;
   messages without an explicit marker keep the previous behavior.
-- Regression coverage: `Adminbot.Tests/TelegramForegroundLatencyTests.cs` (17 tests) plus the existing
-  `TelegramLaneOwnerRoutingTests` interaction-timeout guards. No EF model change and no migration.
+- **Foreground Gozargah site-lookup budget** (`Domain/GozargahSite.cs`,
+  `GozargahSiteApiClient.OptionalLookupTimeout` = 4 s, `OptionalLookupHardMaximum` = 5 s): the one website lookup that
+  runs while a user waits — owned-bot colleague-role refresh, the profile wallet line, and storefront wallet-button
+  eligibility behind the tenant access decision — is bounded by ONE overall budget through
+  `CreateOptionalLookupCancellation`, which also clamps to the hard maximum. Background website work (sync outbox
+  `QueueAndSendAsync`, its retry worker, the funding monitor, post-commit mirroring) does **not** create this scope and
+  keeps its own caller token plus the provider-oriented 30 s transport ceiling; the budget is opt-in, and a test
+  outlasts the real 4 s window to prove it is not silently imposed on the background path. On expiry the existing
+  business rule applies: colleague promotion keeps the locally known role, wallet eligibility reports the site as
+  unavailable, and no financial state is mutated from an unknown website answer.
+- **Operator-channel latency-noise policy** (`Domain/Logging/TelegramLogSuppression.cs`): production review classified
+  the slow-operation families. `Outcome=completed` for the two controlled guard operations (`telegram_callback_ack`,
+  `telegram_mandatory_join`) is a success and stays out of the Telegram operator channel while remaining in the daily
+  diagnostic file and structured telemetry; `Outcome=local_timeout` for those two operations is delivered at most once
+  per 10 minutes per `BotId|Operation|Outcome` key, so a slow Telegram API cannot flood the channel. Every other
+  outcome — `transport_error`, `telegram_api_error`, `channel_access_error`, `telegram_timeout` — and every Warning,
+  Error, Critical, delivery-uncertain, manual-review, XUI, payment, and provider failure is still delivered. This is a
+  narrow closed-list rule, not a general log-suppression framework.
+- **UX telemetry attribution** (`Services/TelegramInteractionActor.cs`): `TelegramUpdateExecutor` publishes the update
+  sender once per execution (callback, message, edited message, inline query, chosen inline result, checkout and
+  shipping queries, poll answer, chat-member updates) through an `AsyncLocal<long?>` scope, so
+  `TelegramCallbackAnswerPolicy.TryAnswerAsync` and `SafeAnswerCallbackQueryAsync` can name the waiting user even though
+  most call sites only hold the opaque callback id. An explicitly supplied `CallbackQuery.From.Id` always wins; a
+  non-positive id is normalized to `null`; the value is diagnostics-only and never participates in authorization.
+- **Broadcast entry stays inside the lane budget** (`Services/TelegramBotService.cs`): an owner broadcast callback only
+  validates, enumerates recipients, persists/enqueues the work, and sends one bounded response. Recipient enumeration is
+  a pure database read — two bounded audience reads, no per-user Telegram or network call — and is measured as
+  `DatabaseWait` so a very large audience is visible in stage telemetry instead of hiding inside the owner callback.
+  Actual fan-out belongs to the background broadcast manager and is unchanged.
+- **Durable delivery is excluded from the UX budget**: `Services/TenantOrderNotificationWorker.cs` (worker and
+  `TenantOrderNotificationDeliveryService`) and `Services/TenantManualReceiptNotificationWorker.cs` use the raw
+  `BotClientProvider` transport and never reference `ForegroundBoundedTelegramBotClient` /
+  `TelegramForegroundDeliveryPolicy`. An account delivery that legitimately takes ~28 s still completes with
+  `outcome=delivered`, and `SendStarted` / `Delivered` / `DeliveryUncertain` / `ManualReview` semantics are unchanged, so
+  an ambiguous send can never become a blind duplicate account delivery.
+- **Queue-wait correlation fields** (`Services/TelegramUpdateScheduler.cs`): the single root queue-wait warning carries
+  `BotId`, `TelegramUserId`, `WaitingSequence`, `WaitingUpdateId`, `WaitingUpdateType`, `QueueWaitMs`,
+  `PreviousSequence`, `PreviousUpdateId`, `PreviousUpdateType`, and `PreviousHandlerDurationMs`; the deduplicated
+  cascade line at Debug carries the same lane/waiting fields with the already-reported blocker sequence. A victim whose
+  wait outlives its predecessor legitimately resolves to no blocker (`PreviousSequence=0`) and is not an incident.
+- **Restored Persian literal** (`Services/TelegramBotService.cs`, NOWPayments creation failure): a later edit committed
+  the customer-facing sentence as literal `?` characters. The intended text
+  `ایجاد پرداخت ارز دیجیتال ناموفق بود. جزئیات خطا در ترمینال ثبت شد.` was recovered verbatim from the revision that
+  introduced that NOWPayments branch and is identical to the sibling messages on the same branch; it was not guessed.
+- Regression coverage: `Adminbot.Tests/TelegramForegroundLatencyTests.cs` (18 tests) and
+  `Adminbot.Tests/TelegramForegroundLatencyFollowUpTests.cs` (13 tests), plus the existing `TelegramLaneOwnerRoutingTests`
+  interaction-timeout guards. The follow-up file covers operator-channel noise classification, callback sender
+  attribution, the site-lookup budget and the background exclusion, edit/album delivery bounds, the owned
+  installation-guide / main-menu / latest-client menus through the real owned dispatcher, the real `TN:svc:`
+  storefront callback path, the durable-transport architectural guard, and the full blocker-correlation metadata.
+  No EF model change and no migration.
 
 ## Wallet Operations (durable receipts)
 

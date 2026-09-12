@@ -385,7 +385,12 @@ public sealed partial class ConcurrencyTests
         await scheduler.StartAsync(default);
         try
         {
-            for (var id = 1; id <= 4; id++)
+            // Start the slow lane head first and wait until it is actually running, so the victims are accepted while
+            // it holds the lane. Enqueueing all four updates at once would also charge the head for its own
+            // enqueue-to-start latency, which is unrelated to the cascade this test proves.
+            await scheduler.EnqueueAsync("owned", Update(1, 711), default);
+            await Until(() => scheduler.ActiveHandlerCount == 1);
+            for (var id = 2; id <= 4; id++)
                 await scheduler.EnqueueAsync("owned", Update(id, 711), default);
 
             await Until(() => started.Count >= 4);
@@ -407,8 +412,12 @@ public sealed partial class ConcurrencyTests
         var rootWarning = Assert.Single(waits, x => x.Contains("PreviousUpdateId=1", StringComparison.Ordinal));
         Assert.Contains("PreviousHandlerDurationMs=", rootWarning, StringComparison.Ordinal);
         Assert.DoesNotContain("PreviousSequence=0", rootWarning, StringComparison.Ordinal);
-        // The slow head itself waited behind nothing, so it must never be reported as its own victim.
-        Assert.DoesNotContain(waits, x => x.Contains("PreviousSequence=0", StringComparison.Ordinal));
+        // The slow head itself waited behind nothing, so it must never be reported as a victim of a real predecessor.
+        // This is expressed through the head's own waiting update id rather than through the absence of any
+        // PreviousSequence=0 line, because a victim whose wait outlives its predecessor legitimately has no resolved
+        // blocker and that is not the amplification defect this test protects against.
+        Assert.DoesNotContain(waits, x => x.Contains("WaitingUpdateId=1", StringComparison.Ordinal) &&
+                                         !x.Contains("PreviousSequence=0", StringComparison.Ordinal));
     }
 
     /// <summary>A slow execution stage is attributed to one closed-vocabulary stage name.</summary>
@@ -596,6 +605,14 @@ public sealed partial class ConcurrencyTests
             {
                 db.BotInstances.Add(tenant);
                 await db.SaveChangesAsync();
+            }
+            // Seed a funded owner so the storefront access gate allows the customer through to the real home menu.
+            // Without this the tenant would answer with the shared restriction notice, which is also a bounded send
+            // but would not exercise the navigation send this regression targets.
+            await using (var credentials = databases.Credentials.CreateDbContext())
+            {
+                credentials.Users.Add(new CredUser { TelegramUserId = 711, AccountBalance = 12_000_000 });
+                await credentials.SaveChangesAsync();
             }
             registry.Upsert(tenant);
 

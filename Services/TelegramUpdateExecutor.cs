@@ -1,4 +1,5 @@
 using Adminbot.Domain;
+using Telegram.Bot.Types;
 
 /// <summary>Restores bot identity and owns the disposable service graph of one scheduled execution.</summary>
 /// <remarks>Per-operation stores own short database contexts; legacy coordinated workflows share only this execution's unit of work.</remarks>
@@ -53,10 +54,43 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
         var client = new ForegroundBoundedTelegramBotClient(_clients.GetClient(bot.Id), _foregroundDelivery);
         var runtime = new BotRuntimeContext { Config = RuntimeSnapshot.Copy(bot), Client = client };
         using (_context.Push(runtime))
+        // The interaction actor is resolved once from the durable update and published for the whole execution, so
+        // UX-only telemetry such as callback-acknowledgement latency can name the waiting user even though most call
+        // sites only hold an opaque callback id. It is diagnostics-only and never participates in authorization.
+        using (TelegramInteractionActor.Push(ResolveActor(item.Update)))
         {
             await using var scope = _scopes.CreateAsyncScope();
             await scope.ServiceProvider.GetRequiredService<TelegramBotService>()
                 .DispatchUpdateAsync(client, item.Update, runtime, cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Resolves the Telegram user id of the actor that produced one update, for UX telemetry attribution only.
+    /// </summary>
+    /// <param name="update">Private Telegram update that has already been claimed and deserialized by the scheduler.</param>
+    /// <returns>
+    /// The sender's numeric Telegram user id from the first actor-bearing shape the update carries, or <c>null</c> for
+    /// updates that genuinely have no sender (channel posts, poll-answer bookkeeping, and similar shapes).
+    /// </returns>
+    /// <remarks>
+    /// The order mirrors how the update router resolves a customer identity, so the id recorded here matches the id the
+    /// handler uses. No text, callback payload, username, or chat title is ever read.
+    /// </remarks>
+    private static long? ResolveActor(Update update)
+    {
+        if (update == null)
+            return null;
+
+        return update.CallbackQuery?.From?.Id
+            ?? update.Message?.From?.Id
+            ?? update.EditedMessage?.From?.Id
+            ?? update.InlineQuery?.From?.Id
+            ?? update.ChosenInlineResult?.From?.Id
+            ?? update.PreCheckoutQuery?.From?.Id
+            ?? update.ShippingQuery?.From?.Id
+            ?? update.PollAnswer?.User?.Id
+            ?? update.MyChatMember?.From?.Id
+            ?? update.ChatMember?.From?.Id;
     }
 }
