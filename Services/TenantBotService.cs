@@ -4,6 +4,7 @@ using System.Net;
 using System.Text;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
+using Adminbot.Domain.TelegramUi;
 using Adminbot.Services;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
@@ -84,6 +85,40 @@ public partial class TenantBotService
     /// <summary>Customer-facing text used when the built-in tutorial images cannot be read from the deployed assets.</summary>
     private const string TENANTTUTORIALASSETSUNAVAILABLEMESSAGE =
         "در حال حاضر فایل‌های آموزش در دسترس نیستند. لطفاً کمی بعد دوباره تلاش کنید.";
+    /// <summary>Owner-facing explanation shown when the storefront owner's own Telegram account is not Premium.</summary>
+    /// <remarks>
+    /// The wording deliberately attributes the restriction to Telegram and states that it is unrelated to our plans or
+    /// pricing, so it can never read as a product we sell.
+    /// </remarks>
+    private const string TENANTPREMIUMUIPREMIUMREQUIREDMESSAGE =
+        "برای فعال‌سازی ظاهر پریمیوم، حساب تلگرام مالک این ربات باید Telegram Premium فعال داشته باشد.\n\n" +
+        "تلگرام استفاده از Custom Emoji برای ربات را به شرایط حساب مالک ربات محدود می‌کند.\n\n" +
+        "ابتدا Telegram Premium را روی حساب مالک فعال کنید و سپس دوباره تلاش کنید.";
+    /// <summary>Owner-facing explanation shown when no curated premium probe emoji is configured yet.</summary>
+    private const string TENANTPREMIUMUICATALOGUNAVAILABLEMESSAGE =
+        "کاتالوگ اموجی پریمیوم هنوز تنظیم نشده است. لطفاً بعداً دوباره تلاش کنید.";
+    /// <summary>Owner-facing explanation shown when Telegram definitively refused the decorated payload.</summary>
+    private const string TENANTPREMIUMUIREJECTEDMESSAGE =
+        "تلگرام اجازه استفاده از اموجی پریمیوم را برای این ربات تأیید نکرد.\nقابلیت فعال نشد.";
+    /// <summary>Owner-facing explanation shown for every non-definitive probe failure.</summary>
+    private const string TENANTPREMIUMUIUNAVAILABLEMESSAGE =
+        "در حال حاضر امکان بررسی قابلیت پریمیوم ربات وجود ندارد.\nهیچ تغییری اعمال نشد. لطفاً کمی بعد دوباره تلاش کنید.";
+    /// <summary>Owner-facing confirmation that the storefront premium preference was persisted.</summary>
+    /// <remarks>
+    /// It explicitly states that this phase only enables the infrastructure so the owner is not misled into expecting
+    /// every existing menu to look different immediately.
+    /// </remarks>
+    private const string TENANTPREMIUMUIENABLEDMESSAGE =
+        "✅ ظاهر پریمیوم برای این فروشگاه فعال شد.\n\n" +
+        "ربات فروشگاهی شما اکنون آماده استفاده از اموجی‌های پریمیوم و استایل‌های جدید دکمه‌ها است.\n\n" +
+        "در این مرحله زیرساخت فعال شده و بخش‌های رابط کاربری در به‌روزرسانی‌های بعدی به‌تدریج به این ظاهر منتقل می‌شوند.";
+    /// <summary>Owner-facing confirmation that the storefront returned to the classic appearance.</summary>
+    private const string TENANTPREMIUMUIDISABLEDMESSAGE =
+        "ظاهر پریمیوم این فروشگاه غیرفعال شد.\n\n" +
+        "رابط کاربری به اموجی‌های معمولی و ظاهر سازگار پیش‌فرض برمی‌گردد.";
+    /// <summary>Owner-facing notice used when the panel changed under the owner's feet during the capability probe.</summary>
+    private const string TENANTPREMIUMUISTALEMESSAGE =
+        "⚠️ این پنل قدیمی شده است؛ وضعیت جدید نمایش داده شد.";
     private const string STEPBROADCASTINPUT = "broadcast-input";
     private const string TENANTRENEWFLOW = "TENANTBOT-renew";
     private const string TENANTRENEWSTEPACCOUNT = "renew-account";
@@ -118,6 +153,14 @@ public partial class TenantBotService
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
     private readonly BroadcastManager _broadcastManager;
     private readonly UsageAnalyticsService _usageAnalyticsService;
+    /// <summary>
+    /// Proves that the exact storefront bot may use Telegram custom emoji before the owner's opt-in is persisted.
+    /// </summary>
+    /// <remarks>
+    /// Optional so direct test construction keeps working. A missing probe fails closed: the enable path reports the
+    /// generic "capability could not be checked" message and never persists <c>true</c>.
+    /// </remarks>
+    private readonly ITelegramPremiumUiCapabilityProbe _premiumUiCapabilityProbe;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TenantBotService> _logger;
     private readonly IClientDownloadAvailability _clientDownloadAvailability;
@@ -248,6 +291,7 @@ public partial class TenantBotService
         TenantCardProvisionalProvisioningService TenantCardProvisionalProvisioning,
         TenantCardProvisionalFinalizationService TenantCardProvisionalFinalization,
         TenantCardProvisionalRevocationService TenantCardProvisionalRevocation,
+        ITelegramPremiumUiCapabilityProbe PremiumUiCapabilityProbe = null,
         TelegramInteractionTimeouts InteractionTimeouts = null)
     {
         _workflow = UserDbContext;
@@ -282,6 +326,7 @@ public partial class TenantBotService
         _tenantCardProvisionalProvisioning = TenantCardProvisionalProvisioning ?? throw new ArgumentNullException(nameof(TenantCardProvisionalProvisioning));
         _tenantCardProvisionalFinalization = TenantCardProvisionalFinalization ?? throw new ArgumentNullException(nameof(TenantCardProvisionalFinalization));
         _tenantCardProvisionalRevocation = TenantCardProvisionalRevocation ?? throw new ArgumentNullException(nameof(TenantCardProvisionalRevocation));
+        _premiumUiCapabilityProbe = PremiumUiCapabilityProbe;
         _interactionTimeouts = InteractionTimeouts ?? TelegramInteractionTimeouts.Production;
     }
 
@@ -1277,6 +1322,7 @@ public partial class TenantBotService
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ? "سراسری خاموش" : tenant?.TenantNowPaymentsEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(tenant?.TenantCardPaymentEnabled == true)} کارت به کارت همکار: <code>{Html(card)}</code>\n" +
                $"{STATUSICON(tenant?.TenantMandatoryJoinEnabled == true)} جوین اجباری فروشگاه: <code>{Html(TENANTJOIN)}</code>\n" +
+               $"{STATUSICON(tenant?.TenantPremiumUiEnabled == true)} ظاهر پریمیوم فروشگاه: <b>{Html(tenant?.TenantPremiumUiEnabled == true ? "فعال" : "غیرفعال")}</b>\n" +
                $"{STATUSICON(IsEnabled)} وضعیت: <b>{Html(IsEnabled ? "روشن" : "خاموش")}</b>\n\n" +
                "اگر درصد سود را صفر بگذارید، قیمت فروش با تعرفه کاربر عادی محاسبه می‌شود و سود شما اختلاف قیمت کاربر عادی و قیمت همکار خواهد بود.";
     }
@@ -1296,6 +1342,7 @@ public partial class TenantBotService
         var ATLASPAYENABLED = tenant?.TenantAtlasPayEnabled == true;
         var CARDENABLED = tenant?.TenantCardPaymentEnabled == true;
         var JOINENABLED = tenant?.TenantMandatoryJoinEnabled == true;
+        var PREMIUMUIENABLED = tenant?.TenantPremiumUiEnabled == true;
         var revision = BuildTenantPanelRevision(tenant);
         var currentUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var issuedAt = (currentUnixSeconds - currentUnixSeconds % 300).ToString("X", CultureInfo.InvariantCulture);
@@ -1335,6 +1382,15 @@ public partial class TenantBotService
             new[]
             {
                 InlineKeyboardButton.WithCallbackData(JOINENABLED ? "✅ جوین اجباری" : "❌ جوین اجباری", BuildTenantSettingCallback("join", !JOINENABLED, revision, issuedAt))
+            },
+            new[]
+            {
+                // Premium appearance is a storefront-scoped opt-in. Enabling it is only possible after the exact owner's
+                // Telegram Premium status AND a successful decorated capability probe through this storefront's own bot
+                // token; disabling it never requires either.
+                InlineKeyboardButton.WithCallbackData(
+                    PREMIUMUIENABLED ? "🚫 غیرفعال‌سازی ظاهر پریمیوم" : "✨ فعال‌سازی ظاهر پریمیوم",
+                    BuildTenantSettingCallback("premium", !PREMIUMUIENABLED, revision, issuedAt))
             },
             new[]
             {
@@ -2624,6 +2680,9 @@ public partial class TenantBotService
             case "join":
                 currentEnabled = tenant.TenantMandatoryJoinEnabled;
                 break;
+            case "premium":
+                currentEnabled = tenant.TenantPremiumUiEnabled;
+                break;
             default:
                 await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
                 return;
@@ -2644,6 +2703,15 @@ public partial class TenantBotService
             CallbackQuery.Id,
             "در حال به‌روزرسانی تنظیمات...",
             cancellationToken: CancellationToken);
+
+        // Premium appearance is the only storefront setting that requires a Telegram round trip, so it is handled by a
+        // dedicated method instead of the generic switch below. That method resolves authorization, runs the capability
+        // probe OUTSIDE any database transaction, re-validates the panel revision, and only then persists the value.
+        if (string.Equals(setting, "premium", StringComparison.Ordinal))
+        {
+            await SETTENANTPREMIUMUIASYNC(botClient, CallbackQuery, owner, desiredEnabled, expectedRevision, CancellationToken);
+            return;
+        }
 
         if (setting == "join" && desiredEnabled)
         {
@@ -2695,6 +2763,214 @@ public partial class TenantBotService
             owner,
             CallbackQuery.Message?.MessageId,
             CancellationToken);
+    }
+
+    /// <summary>
+    /// Enables or disables the premium visual preference of the explicitly selected storefront.
+    /// </summary>
+    /// <param name="botClient">Main owned Bot client used to edit or send the owner panel.</param>
+    /// <param name="CallbackQuery">Owner callback carrying the panel revision and the sender identity.</param>
+    /// <param name="owner">Colleague owner that was already authenticated against the addressed storefront.</param>
+    /// <param name="desiredEnabled">Desired final value; this is a target state, never an instruction to invert.</param>
+    /// <param name="expectedRevision">Panel revision that must still match the persisted row before any write.</param>
+    /// <param name="CancellationToken">Cancellation token for users.db writes, the Telegram probe, and Telegram sends.</param>
+    /// <returns>A task that completes after the owner has been answered and the panel re-rendered.</returns>
+    /// <remarks>
+    /// <para>
+    /// Authorization order is strict: the addressed storefront and its persisted owner were already re-validated by the
+    /// caller, the owner's Telegram Premium status is read from this callback's sender, and only then is the storefront's
+    /// own bot token used for a real capability probe. A Premium flag alone never enables the feature, because the
+    /// storefront bot token is the only authority for what Telegram accepts.
+    /// </para>
+    /// <para>
+    /// The probe is executed between two independent users.db reads, so no SQLite transaction is open while Telegram is
+    /// contacted. The revision is re-validated after the probe and again by the optimistic write baseline, so a panel that
+    /// changed during the probe never overwrites newer state.
+    /// </para>
+    /// <para>
+    /// Disabling requires no Telegram Premium status, no capability probe, and no configured catalog identifier, so a
+    /// storefront can always return to the classic appearance even after its owner loses Telegram Premium.
+    /// </para>
+    /// </remarks>
+    private async Task SETTENANTPREMIUMUIASYNC(
+        ITelegramBotClient botClient,
+        CallbackQuery CallbackQuery,
+        CredUser owner,
+        bool desiredEnabled,
+        string expectedRevision,
+        CancellationToken CancellationToken)
+    {
+        var ownerChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
+
+        if (CallbackQuery.Message != null)
+        {
+            await SafeEditMessageTextAsync(
+                botClient,
+                CallbackQuery.Message.Chat.Id,
+                CallbackQuery.Message.MessageId,
+                desiredEnabled
+                    ? "⏳ <b>در حال بررسی قابلیت ظاهر پریمیوم...</b>\n\nاین بررسی از طریق ربات فروشگاهی شما انجام می‌شود."
+                    : "⏳ <b>در حال غیرفعال‌کردن ظاهر پریمیوم...</b>",
+                ParseMode.Html,
+                new InlineKeyboardMarkup(new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("🔄 بروزرسانی", OWNERCALLBACKPREFIX + "panel")
+                }),
+                CancellationToken);
+        }
+
+        if (!desiredEnabled)
+        {
+            await APPLYTENANTPREMIUMUIVALUEASYNC(
+                botClient, CallbackQuery, owner, false, expectedRevision, TENANTPREMIUMUIDISABLEDMESSAGE, CancellationToken);
+            return;
+        }
+
+        // Premium status of the exact authenticated owner is a precondition only. It never substitutes for the probe.
+        if (CallbackQuery.From?.IsPremium != true)
+        {
+            await botClient.SendMessage(ownerChatId, $"⚠️ {TENANTPREMIUMUIPREMIUMREQUIREDMESSAGE}", cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(botClient, ownerChatId, owner, CallbackQuery.Message?.MessageId, CancellationToken, CallbackQuery.Message);
+            return;
+        }
+
+        var storefrontBotId = await RESOLVESELECTEDSTOREFRONTBOTIDASYNC(owner, CancellationToken);
+        var probe = _premiumUiCapabilityProbe == null || string.IsNullOrEmpty(storefrontBotId)
+            ? new TelegramPremiumUiProbeResult(TelegramPremiumUiProbeStatus.TransportUnavailable, "probe_not_registered")
+            : await _premiumUiCapabilityProbe.ProbeAsync(
+                new TelegramPremiumUiCapabilityProbeRequest(storefrontBotId, CallbackQuery.From.Id, OwnerIsPremium: true),
+                CancellationToken);
+
+        if (!probe.IsSupported)
+        {
+            await botClient.SendMessage(ownerChatId, $"⚠️ {TENANTPREMIUMUIFAILUREMESSAGE(probe.Status)}", cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(botClient, ownerChatId, owner, CallbackQuery.Message?.MessageId, CancellationToken, CallbackQuery.Message);
+            return;
+        }
+
+        // The probe may have taken seconds. Re-validate the revision before persisting anything so a store change during
+        // the probe can never be overwritten by the confirmed result.
+        await APPLYTENANTPREMIUMUIVALUEASYNC(
+            botClient, CallbackQuery, owner, true, expectedRevision, TENANTPREMIUMUIENABLEDMESSAGE, CancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves the internal BotId of the currently selected storefront for the capability probe.
+    /// </summary>
+    /// <param name="owner">Authenticated colleague owner of the selected storefront.</param>
+    /// <param name="CancellationToken">Cancellation token for the users.db read.</param>
+    /// <returns>
+    /// The exact storefront BotId whose own token must perform the probe, or an empty string when the selection is gone
+    /// so the probe fails closed.
+    /// </returns>
+    /// <remarks>
+    /// Only the tenant storefront id is returned. Owned, sales-assistant, logger, and default bot ids are never used for
+    /// this probe, because proving capability on another bot would prove nothing about the storefront.
+    /// </remarks>
+    private async Task<string> RESOLVESELECTEDSTOREFRONTBOTIDASYNC(CredUser owner, CancellationToken CancellationToken)
+    {
+        try
+        {
+            var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
+            return string.Equals(tenant.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) ? tenant.Id : string.Empty;
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return string.Empty;
+        }
+        catch (InvalidOperationException)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Maps a non-supported probe status to a safe owner-facing sentence.
+    /// </summary>
+    /// <param name="status">Closed-vocabulary probe status that was not <c>Supported</c>.</param>
+    /// <returns>A Persian sentence that never exposes a token, exception text, or provider detail.</returns>
+    private static string TENANTPREMIUMUIFAILUREMESSAGE(TelegramPremiumUiProbeStatus status) => status switch
+    {
+        TelegramPremiumUiProbeStatus.PremiumRequired => TENANTPREMIUMUIPREMIUMREQUIREDMESSAGE,
+        TelegramPremiumUiProbeStatus.CatalogUnavailable => TENANTPREMIUMUICATALOGUNAVAILABLEMESSAGE,
+        TelegramPremiumUiProbeStatus.Rejected => TENANTPREMIUMUIREJECTEDMESSAGE,
+        TelegramPremiumUiProbeStatus.BaselineRejected => TENANTPREMIUMUIREJECTEDMESSAGE,
+        _ => TENANTPREMIUMUIUNAVAILABLEMESSAGE
+    };
+
+    /// <summary>
+    /// Persists one premium-visual value for the selected storefront using the panel revision as a write guard.
+    /// </summary>
+    /// <param name="botClient">Main owned Bot client used to answer and re-render the owner panel.</param>
+    /// <param name="CallbackQuery">Owner callback that requested the change.</param>
+    /// <param name="owner">Authenticated colleague owner.</param>
+    /// <param name="desiredEnabled">Final value to persist. When it already matches the row, no write occurs.</param>
+    /// <param name="expectedRevision">Revision embedded in the pressed panel; a mismatch aborts the write.</param>
+    /// <param name="successMessage">Owner-facing confirmation for a successful change.</param>
+    /// <param name="CancellationToken">Cancellation token for users.db and Telegram calls.</param>
+    /// <returns>A task that completes after the panel has been refreshed.</returns>
+    /// <remarks>
+    /// <para>
+    /// This is the only place that writes <see cref="BotInstance.TenantPremiumUiEnabled"/>. It re-reads the exact owner's
+    /// storefront immediately before writing, compares the revision, and treats losing the optimistic write race as a
+    /// stale panel rather than as a failure, which is what makes duplicate or redelivered enable callbacks idempotent.
+    /// </para>
+    /// <para>
+    /// Side effects: at most one users.db update and one runtime registry refresh for this storefront. No wallet, order,
+    /// payment, XUI, or gateway state is touched.
+    /// </para>
+    /// </remarks>
+    private async Task APPLYTENANTPREMIUMUIVALUEASYNC(
+        ITelegramBotClient botClient,
+        CallbackQuery CallbackQuery,
+        CredUser owner,
+        bool desiredEnabled,
+        string expectedRevision,
+        string successMessage,
+        CancellationToken CancellationToken)
+    {
+        var ownerChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
+
+        BotInstance tenant;
+        try
+        {
+            tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
+        }
+        catch (Exception ex) when (ex is DbUpdateConcurrencyException or InvalidOperationException)
+        {
+            tenant = null;
+        }
+
+        if (tenant == null || !string.Equals(BuildTenantPanelRevision(tenant), expectedRevision, StringComparison.Ordinal))
+        {
+            await botClient.SendMessage(ownerChatId, TENANTPREMIUMUISTALEMESSAGE, cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(botClient, ownerChatId, owner, CallbackQuery.Message?.MessageId, CancellationToken, CallbackQuery.Message);
+            return;
+        }
+
+        if (tenant.TenantPremiumUiEnabled != desiredEnabled)
+        {
+            tenant.TenantPremiumUiEnabled = desiredEnabled;
+            tenant.UpdatedAtUtc = DateTime.UtcNow;
+            try
+            {
+                await _workflow.SaveAsync(CancellationToken);
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                // A parallel callback or another owned bot changed the row after our read. Never advance the baseline:
+                // report the stale panel and let the owner act on the refreshed state.
+                await botClient.SendMessage(ownerChatId, TENANTPREMIUMUISTALEMESSAGE, cancellationToken: CancellationToken);
+                await SHOWOWNERPANELASYNC(botClient, ownerChatId, owner, CallbackQuery.Message?.MessageId, CancellationToken, CallbackQuery.Message);
+                return;
+            }
+
+            // Refresh the runtime registry so the storefront's mode resolver sees the new preference immediately.
+            _botRegistry.Upsert(tenant);
+        }
+
+        await botClient.SendMessage(ownerChatId, successMessage, cancellationToken: CancellationToken);
+        await SHOWOWNERPANELASYNC(botClient, ownerChatId, owner, CallbackQuery.Message?.MessageId, CancellationToken);
     }
 
     /// <summary>

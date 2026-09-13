@@ -1,6 +1,7 @@
 using System.Text.RegularExpressions;
 using System.Diagnostics;
 using Adminbot.Domain;
+using Adminbot.Domain.TelegramUi;
 using Adminbot.Utils;
 
 using Newtonsoft.Json;
@@ -843,6 +844,19 @@ public partial class TelegramBotService
             }
 
             var callbackUserState = await _state.GetUserStatus(callbackQuery.From.Id);
+            // The premium capability preview button is deliberately inert. Answering it here guarantees that pressing the
+            // preview can never reach a tenant business handler, and it mutates no conversation, wallet, order, or panel
+            // state. The payload is a single exact constant, so no prefix rule can accidentally swallow a real callback.
+            if (TelegramPremiumUiCapabilityProbe.IsPreviewCallback(callbackQuery.Data))
+            {
+                await SafeAnswerCallbackQueryAsync(
+                    botClient,
+                    callbackQuery.Id,
+                    "این پیام فقط پیش‌نمایش ظاهر پریمیوم است.",
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
             // Tenant storefront callbacks are isolated from the main bot purchase/account flows.
             if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
             {

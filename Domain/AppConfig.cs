@@ -61,6 +61,25 @@ namespace Adminbot.Domain
         /// tenant, per owned bot, or in users.db.
         /// </remarks>
         public bool LatestClientDownloadEnabled { get; set; }
+        /// <summary>
+        /// Globally requests premium visuals (Telegram custom emoji and semantic button colours) for configured owned
+        /// bots.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The key is optional and defaults to <c>false</c>, so an older <c>configuration.json</c> keeps the classic
+        /// owned-bot UI and never blocks startup. This is a startup-bound value: it is read once when the host is built
+        /// and read again after an application restart, so changing production configuration may require a service
+        /// restart according to the existing <see cref="AppConfig"/> lifetime. It is deliberately not written back at
+        /// runtime by any Telegram failure; a definitive Telegram rejection is recorded only in the ephemeral runtime
+        /// capability circuit.
+        /// </para>
+        /// <para>
+        /// This switch is global for owned bots only and is never stored per bot or in users.db. Tenant storefronts have
+        /// their own persisted <c>TenantPremiumUiEnabled</c> preference and are never affected by this value.
+        /// </para>
+        /// </remarks>
+        public bool OwnedBotPremiumUiEnabled { get; set; }
         public BotInstanceConfig SalesAssistantBot { get; set; } = new();
         public string BotToken { get; set; }
         public string IpnSecretKey { get; set; }

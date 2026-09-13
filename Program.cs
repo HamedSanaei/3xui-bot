@@ -8,6 +8,7 @@ using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Builder;
 using Adminbot.Domain;
+using Adminbot.Domain.TelegramUi;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 
@@ -150,6 +151,17 @@ public class Program
         services.AddSingleton<BotContextAccessor>();
         services.AddSingleton<BotRegistry>();
         services.AddSingleton<BotClientProvider>();
+        // Telegram premium-UI infrastructure. The emoji catalog is loaded and validated ONCE here, during service
+        // registration, so a missing or malformed release asset fails application startup instead of rendering a
+        // half-configured UI later. The remaining registrations are immutable or thread-safe stateless services; none of
+        // them changes existing menus, and none of them is used by any customer flow in this phase.
+        services.AddSingleton<ITelegramUiEmojiCatalog>(TelegramUiEmojiCatalogLoader.LoadFromDefaultAsset());
+        services.AddSingleton<TelegramUiButtonFactory>();
+        services.AddSingleton<ITelegramPremiumUiRuntimeState, TelegramPremiumUiRuntimeState>();
+        services.AddSingleton<ITelegramUiModeResolver, TelegramUiModeResolver>();
+        services.AddSingleton<ITelegramPremiumUiTransportResolver, TelegramPremiumUiTransportResolver>();
+        services.AddSingleton<ITelegramPremiumUiCapabilityProbe, TelegramPremiumUiCapabilityProbe>();
+        services.AddSingleton<TelegramPremiumUiFallbackExecutor>();
         // The outbox dispatcher resolves each bot client by internal BotId at delivery time, so no Telegram client
         // object ever has to survive a restart. The options carry the runtime database paths used by payment backups.
         services.AddSingleton<TelegramLogDispatcher>(sp =>

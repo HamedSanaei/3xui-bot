@@ -50,6 +50,13 @@
     <None Update="Assets\tutorials\**\*"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
+    <!-- The Telegram premium-UI emoji catalog is application content, not configuration or secret state. It must be
+         present in both the build output and the publish artifact because the runtime validates it at startup and
+         refuses to start on a malformed asset. `Update` (not `Include`) avoids duplicate-item errors because the SDK
+         already globs these files into the None item group. -->
+    <None Update="Assets\telegram-ui\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
     <!-- Production Data is shared state and must never be copied into an immutable release artifact. -->
     <Content Update="Data\**" CopyToPublishDirectory="Never" />
     <None Update="Data\**" CopyToPublishDirectory="Never" />

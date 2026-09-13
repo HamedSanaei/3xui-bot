@@ -349,6 +349,10 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantTetraminatorEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantUniquePayEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantAtlasPayEnabled).HasDefaultValue(true);
+            // Premium visuals default to disabled for every existing and future storefront, so the migration cannot
+            // silently opt a tenant in. The column is written only by the owner-panel toggle and the durable
+            // auto-disable path; owned-bot synchronization never touches it.
+            entity.Property(x => x.TenantPremiumUiEnabled).HasDefaultValue(false);
             entity.Property(x => x.TenantOwnerNotificationBotId).HasMaxLength(64);
             entity.HasIndex(x => x.Username);
             entity.HasIndex(x => x.OwnerTelegramUserId);

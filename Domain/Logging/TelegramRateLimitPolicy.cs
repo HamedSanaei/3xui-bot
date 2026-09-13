@@ -11,7 +11,7 @@ namespace Adminbot.Domain.Logging
     /// permanent API errors, and all durable-outbox retry schedules.
     /// </summary>
     /// <remarks>
-    /// Telegram.Bot 19.x does not pause its polling loop or honor <c>RetryAfter</c> after a 429, and a 429 raised while
+    /// Telegram.Bot 22.10.3 does not pause its own polling loop or honor <c>RetryAfter</c> after a 429, and a 429 raised while
     /// sending a message can otherwise escape update handling and stop a receiver. Every Telegram caller that can
     /// observe a 429 (polling error handlers, update wrappers, and the Telegram log channel) routes through this policy
     /// so the whole process back offs together, never tight-loops, and never reports a rate-limit failure back through

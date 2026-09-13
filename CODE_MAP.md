@@ -869,8 +869,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - `telegramBotStartupProbeTimeoutSeconds` controls the short Telegram startup/panel probe (default 12 seconds).
   `SetMyCommands` is background initialization and must not stop an already registered receiver.
 - Super-admins can use `🤖 وضعیت ربات‌ها` to see process-local receiver health for every owned, assistant, and tenant bot. The report comes from `BotRuntimeStatusStore`; it never exposes tokens and does not call Telegram.
-- Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel. They now also apply a bounded per-bot backoff through `Domain/Logging/TelegramPollingBackoffPolicy.cs`: `TelegramPollingBackoffTracker` keeps `ConsecutiveTransientFailures`/`LastFailureAtUtc`/`LastOperationalLogAtUtc` per internal `BotId` (in-memory only, no schema, no migration), the delay is `1s,2s,4s,8s,16s,…` capped at 30s with ±20% jitter, and it is awaited with the receiver token (shutdown during backoff is the normal stop path). State decays after a `HealthyResetSeconds` (60s) gap because Telegram.Bot 19 exposes no successful-empty-`getUpdates` callback, and it is cleared on 429, on a per-user delivery error, and when a receiver stops (`StopBotCore`), so historical tenant ids cannot accumulate state. `IsTransientGatewayFailure` is the single classifier shared by `MultiBotHostedService` and `TelegramBotService`; it trusts `RequestException.HttpStatusCode` 5xx (the Telegram edge can return a plain status without a JSON error body) plus `HttpRequestException`/`IOException`, while 401/403/400 and both 409 conflict variants stay non-transient. Bursts log at most one `Telegram polling degraded.` summary per bot per window (suppressed from the Telegram channel); only genuine non-transient polling errors reach the process console, and these failures are never written to `TelegramOutbox`.
-- Telegram `429 Too Many Requests` is handled centrally through `Domain/Logging/TelegramRateLimitPolicy.cs`: the polling error handler pauses the receiver for Telegram's `RetryAfter` (+1s buffer, capped at 60s) before the next `getUpdates` (Telegram.Bot 19.x does not delay on its own and would tight-loop), the update wrapper swallows a 429 after the same backoff instead of letting it kill the receiver, and `Domain/Logging/TelegramLogSuppression.cs` suppresses any log entry whose exception is a Telegram 429 so the logger never amplifies the rate-limit storm. Receivers keep polling after the window and are never restarted, so no duplicate receiver instances can appear.
+- Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel. They now also apply a bounded per-bot backoff through `Domain/Logging/TelegramPollingBackoffPolicy.cs`: `TelegramPollingBackoffTracker` keeps `ConsecutiveTransientFailures`/`LastFailureAtUtc`/`LastOperationalLogAtUtc` per internal `BotId` (in-memory only, no schema, no migration), the delay is `1s,2s,4s,8s,16s,…` capped at 30s with ±20% jitter, and it is awaited with the receiver token (shutdown during backoff is the normal stop path). State decays after a `HealthyResetSeconds` (60s) gap because Telegram.Bot 22.10.3 only invokes the error handler on failure and exposes no successful-empty-`getUpdates` callback, and it is cleared on 429, on a per-user delivery error, and when a receiver stops (`StopBotCore`), so historical tenant ids cannot accumulate state. `IsTransientGatewayFailure` is the single classifier shared by `MultiBotHostedService` and `TelegramBotService`; it trusts Telegram API error codes and `RequestException.HttpStatusCode` 5xx (the Telegram edge can return a plain status without a JSON error body), and it walks the exception chain so the Telegram.Bot 22.10.3 `RequestException -> HttpRequestException -> IOException -> SocketException` TLS/connection-reset shape (`Bot API Service Failure: ...`) is transient instead of falling through to the legacy polling logger; permanent evidence (400/401/403 and both 409 conflict variants) is evaluated first and always wins, and 408/425 stay transient. Bursts log at most one `Telegram polling degraded.` summary per bot per window (suppressed from the Telegram channel); only genuine non-transient polling errors reach the process console, and these failures are never written to `TelegramOutbox`.
+- Telegram `429 Too Many Requests` is handled centrally through `Domain/Logging/TelegramRateLimitPolicy.cs`: the polling error handler pauses the receiver for Telegram's `RetryAfter` (+1s buffer, capped at 60s) before the next `getUpdates` (runtime clients set `RetryCount=0`, so Telegram.Bot 22.10.3 performs no automatic 429 retry and the receiver would otherwise tight-loop), the update wrapper swallows a 429 after the same backoff instead of letting it kill the receiver, and `Domain/Logging/TelegramLogSuppression.cs` suppresses any log entry whose exception is a Telegram 429 so the logger never amplifies the rate-limit storm. Receivers keep polling after the window and are never restarted, so no duplicate receiver instances can appear.
 - `Domain/Logging/TelegramLogger.cs` also applies message-level channel suppression for known noncritical noise: stale Sales Assistant callbacks, unchanged Telegram edits, receipt-photo relay warnings that have a text fallback, repeated tenant forced-join probes, routine XUI v3 volume-reminder scan summaries, and Telegram polling 5xx/429/timeouts. Suppression is Telegram-provider-only, so standard/local logging retains these entries; payment/audit logs and real token/XUI/settlement failures still reach the private channel.
 - Tenant forced-join activation validates the tenant bot identity, channel access, administrator-list access, and that the
   bot itself is an administrator; it never probes the tenant owner's membership. Runtime storefront access still checks
@@ -1167,3 +1167,67 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   callback payload `apchk_{paymentId}` never changed. Other `???` runs in `TelegramBotService` (~line 6797) and
   `TenantBotService` (~lines 6663, 6966) are pre-existing corrupted prose (a NOWPayments rate-unavailable message) that
   has no in-repo authoritative counterpart and still needs the owner's original text; do not guess-replace it.
+
+## Telegram Premium UI Infrastructure (Phase 1)
+
+- Phase 1 is infrastructure only. It ships `Assets/telegram-ui/emoji-map.json`, the strict catalog, the button/text
+  builders, the mode resolver, the runtime capability circuit, the tenant capability probe and the fallback executor.
+  Existing customer menus, keyboards and messages are deliberately NOT migrated; there is no mass emoji replacement.
+  The only new user-visible surface is the storefront owner's `✨ ظاهر پریمیوم` setting plus the one inert capability
+  preview. See `docs/telegram-premium-ui.md` for the asset format, enable procedures and Phase 2 guidance.
+- `Assets/telegram-ui/emoji-map.json` is the single source-controlled catalog of logical emoji keys, ordinary Unicode
+  fallbacks and curated `customEmojiId` values. It contains **zero** curated identifiers on purpose: a test asserts the
+  production asset invents nothing. `TelegramUiEmojiCatalogLoader` validates version 1, every required
+  `TelegramUiEmojiKeys` constant, trimmed lower_snake_case unique keys, non-empty printable fallbacks, canonical
+  positive decimal identifiers (via `BigInteger`, so `0`, `-1`, `+1`, `00123`, whitespace and non-digits all fail), and
+  duplicate JSON members inside `items`. A malformed asset fails startup instead of degrading at runtime. The file is
+  copied to build and publish output and resolved from `AppContext.BaseDirectory`, so it does not depend on the
+  process working directory. `Adminbot.csproj` copies `Assets\telegram-ui\**\*` the same way as the tutorial images.
+- `Domain/TelegramUi/` holds the infrastructure. `TelegramUiButtonFactory` renders `"{fallback} {label}"` with no
+  `IconCustomEmojiId` and no `Style` in classic mode, and the bare label with the curated identifier plus the semantic
+  tone in premium mode; a missing identifier degrades to the fallback prefix while still applying the tone.
+  `TelegramUiTextBuilder` appends the fallback as the visible placeholder and emits an explicit
+  `MessageEntityType.CustomEmoji` entity only when premium mode is active **and** the catalog holds an identifier.
+  Offsets are UTF-16 code units taken from `StringBuilder.Length`, never code points, runes, graphemes or UTF-8 byte
+  length, which is what keeps entities correct after surrogate pairs and variation selectors.
+- Button colour is an ordinary Bot API field and does NOT require Telegram Premium; grouping colour with custom emoji
+  under one premium visual mode is a product decision. `TelegramPremiumUiFailureClassification` keeps definitive and
+  ambiguous send failures disjoint: only a Telegram **400** is definitive (the request was not accepted), so only that
+  permits one plain classic retry. Timeouts, `TelegramForegroundDeliveryTimeoutException`, connection resets, transport
+  failures, 403, 429 and 5xx are ambiguous and never trigger a second send, because the first request may already have
+  been delivered. The existing `ForegroundBoundedTelegramBotClient` policy bounds the probe; no second timeout layer
+  was added.
+- Premium mode is never inferred from a username, brand, owner id, callback payload or message content.
+  `ITelegramUiModeResolver` answers `requested` (global `ownedBotPremiumUiEnabled` for owned bots, the persisted
+  `BotInstanceConfig.TenantPremiumUiEnabled` for the exact storefront, and always false for the sales assistant) and
+  `active` (requested AND the runtime circuit has not recorded a definitive rejection). Unknown BotIds never inherit the
+  default bot's preference. `AppConfig.OwnedBotPremiumUiEnabled` is optional, defaults to false, is startup-bound
+  (changing production configuration may require a restart), and is never written back at runtime.
+- `BotInstances.TenantPremiumUiEnabled` is a non-null integer defaulting to 0, added by migration
+  `20260913065454_AddTenantPremiumUiEnabled` (additive only: one column with a constant default, so every existing
+  storefront stays opted out and no balance, receipt, fulfillment or wallet value can change). The flag survives every
+  `BotInstance` -> `BotInstanceConfig` conversion and registry hydration. Configuration-owned bot synchronization
+  deliberately does not write it, because only a storefront owns this preference, and it is independent per store even
+  under one owner.
+- Storefront enable is fail-closed and ordered: addressed store + persisted owner reload, owner
+  `CallbackQuery.From.IsPremium`, catalog `premium_probe` identifier, a real capability probe over the storefront's OWN
+  bot token, then a fresh storefront read plus panel-revision re-validation, then persist and refresh the registry. The
+  probe runs between two independent `users.db` reads, so no SQLite transaction is held while Telegram is contacted,
+  and a changed revision is reported as a stale panel instead of overwriting newer state. Redelivered enable callbacks
+  are refused by the same revision guard, so a double tap cannot produce a second probe. Disable requires no Telegram
+  Premium status, no probe and no configured identifier, so a storefront always returns to the classic appearance; an
+  owner who is not Premium is answered without any Telegram call, and the preview callback (`PUI:preview`) is answered
+  by the dispatcher before any business handler so pressing it can never mutate state.
+- `TelegramPremiumUiCapabilityProbe` sends one inert preview (`✨ پیش‌نمایش ظاهر پریمیوم` with a `ظاهر پریمیوم` button
+  carrying the curated identifier and `Style = Primary`). Both the decorated and baseline previews use the same text,
+  chat, callback payload and style so the ONLY capability under test is `IconCustomEmojiId`; colour alone proves nothing.
+  Baseline success ⇒ `Rejected`, baseline failure ⇒ `BaselineRejected`, and no path retries blindly. Probe logging is
+  restricted to the internal BotId, outcome, exception type name and Telegram error code.
+- `TelegramPremiumUiFallbackExecutor` is the reusable premium-with-fallback shape Phase 2 callers should adopt: classic
+  mode never invokes the premium factory; a definitive 400 records the rejection, may durably clear a storefront's
+  preference, and sends the classic form exactly once; an ambiguous outcome returns without sending anything else.
+  `TelegramPremiumUiRuntimeState` is process-local, records only definitive answers, and exposes
+  `MarkTenantCapabilityRejectedAsync` for the durable storefront auto-disable. That auto-disable is idempotent, is scoped
+  to the exact storefront, and is deliberately not wired into every customer send yet; ambiguous failures never disable
+  anything. Owned-bot rejections are runtime-only so a restart retries after the owner fixes Premium or the catalog, and
+  no failure ever edits `configuration.json`.

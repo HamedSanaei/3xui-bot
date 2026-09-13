@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using Telegram.Bot.Exceptions;
@@ -57,10 +58,11 @@ namespace Adminbot.Domain.Logging
         /// Quiet period after which the next transient failure is treated as a new incident instead of a continuation.
         /// </summary>
         /// <remarks>
-        /// Telegram.Bot 19 does not expose a success callback for an empty <c>getUpdates</c> response, so this
-        /// healthy-period decay is the earliest reliable evidence that polling recovered: when failures stop, the
-        /// elapsed gap eventually exceeds this window and the counter restarts at the first step. The state is also
-        /// cleared explicitly when a receiver stops or when Telegram proves reachability with a 429.
+        /// Telegram.Bot 22.10.3 only invokes the polling error handler on failure and still exposes no success
+        /// callback for an empty <c>getUpdates</c> response, so this healthy-period decay is the earliest reliable
+        /// evidence that polling recovered: when failures stop, the elapsed gap eventually exceeds this window and the
+        /// counter restarts at the first step. The state is also cleared explicitly when a receiver stops or when
+        /// Telegram proves reachability with a 429.
         /// </remarks>
         public const int HealthyResetSeconds = 60;
 
@@ -68,6 +70,16 @@ namespace Adminbot.Domain.Logging
         /// Upper bound for the tracked failure count so an unbounded outage cannot overflow the exponential expression.
         /// </summary>
         private const int MaximumTrackedFailures = 20;
+
+        /// <summary>
+        /// Maximum number of <see cref="Exception.InnerException"/> levels inspected before classification gives up.
+        /// </summary>
+        /// <remarks>
+        /// The real Telegram.Bot 22.10.3 transport shape is only three levels deep
+        /// (<c>RequestException -&gt; HttpRequestException -&gt; IOException -&gt; SocketException</c>). The bound protects
+        /// the polling error loop from an unexpectedly deep or self-referencing exception chain.
+        /// </remarks>
+        private const int MaximumExceptionChainDepth = 10;
 
         /// <summary>
         /// Determines whether an exception represents a transient Telegram polling/gateway failure that deserves a
@@ -79,14 +91,21 @@ namespace Adminbot.Domain.Logging
         /// </param>
         /// <returns>
         /// <c>true</c> for Telegram request timeouts, HTTP 5xx gateway/server responses, HTTP 429 rate limits, and
-        /// network-level transport failures; otherwise <c>false</c> so invalid tokens, duplicate conflicts, and
+        /// network-level transport failures, including transport failures nested inside a Telegram.Bot
+        /// <see cref="RequestException"/>; otherwise <c>false</c> so invalid tokens, duplicate conflicts, and
         /// per-user delivery failures keep their existing dedicated handling.
         /// </returns>
         /// <remarks>
         /// Both the owned/tenant polling error handler and the shared dispatcher use this single classifier so a
-        /// <c>502</c> is never transient in one place and fatal in another. Status codes are authoritative because
-        /// Telegram's edge can return <c>RequestException</c> with an HTTP status instead of a parseable Telegram JSON
-        /// error body.
+        /// <c>502</c> is never transient in one place and fatal in another.
+        ///
+        /// Telegram.Bot 22.10.3 wraps a failed <c>HttpClient.SendAsync</c> as
+        /// <c>RequestException -&gt; HttpRequestException -&gt; IOException -&gt; SocketException</c>, for example
+        /// <c>Bot API Service Failure: HttpRequestException: The SSL connection could not be established</c>. A
+        /// <see cref="RequestException"/> therefore cannot be judged from its own status code and message alone: when it
+        /// carries no permanent Telegram/API evidence, its inner exception chain is inspected for transport failures.
+        /// Classification prefers exception types over message text, and permanent evidence such as an HTTP 4xx status
+        /// or an explicit non-transient Telegram error code always wins over a coincidental inner exception.
         /// </remarks>
         /// <example>
         /// <code>
@@ -98,34 +117,144 @@ namespace Adminbot.Domain.Logging
         /// </example>
         public static bool IsTransientGatewayFailure(Exception exception)
         {
-            if (exception is null)
+            return exception is not null && ClassifyTransientFailure(exception, depth: 0);
+        }
+
+        /// <summary>
+        /// Classifies one level of an exception chain and recurses into its inner exception when no decision is possible.
+        /// </summary>
+        /// <param name="exception">Current exception to classify; never <c>null</c> when called.</param>
+        /// <param name="depth">
+        /// Zero-based chain depth already inspected. Must stay below <see cref="MaximumExceptionChainDepth"/> so a
+        /// malformed chain cannot recurse without bound.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> when this exception or a nested transport failure proves the failure is transient; <c>false</c>
+        /// when permanent evidence was found or when the chain contains no transport failure.
+        /// </returns>
+        /// <remarks>
+        /// Order matters: Telegram API error codes and HTTP status codes are authoritative and are evaluated before the
+        /// inner chain, so a permanent 400/401/403/409 response can never be reclassified as transient by an unrelated
+        /// nested exception.
+        /// </remarks>
+        private static bool ClassifyTransientFailure(Exception exception, int depth)
+        {
+            if (depth > MaximumExceptionChainDepth)
                 return false;
 
-            // An ApiRequestException has a Telegram error code, which is the most precise signal available.
+            // An ApiRequestException carries Telegram's own error code, which is the most precise signal available.
             if (exception is ApiRequestException apiException)
             {
-                var apiMessage = apiException.Message ?? string.Empty;
-                return apiException.ErrorCode is 429 or 500 or 502 or 503 or 504 ||
-                       apiException.ErrorCode >= 500 ||
-                       ContainsGatewayText(apiMessage);
-            }
-
-            // A plain RequestException can carry the raw edge HTTP status and message when the body is not JSON.
-            if (exception is RequestException requestException)
-            {
-                if (requestException.HttpStatusCode is { } status && (int)status >= 500 && (int)status <= 599)
+                if (IsTransientStatusCode(apiException.ErrorCode) ||
+                    ContainsGatewayText(apiException.Message ?? string.Empty))
                     return true;
 
-                var requestMessage = requestException.Message ?? string.Empty;
-                return requestMessage.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
-                       requestMessage.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
-                       requestMessage.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
-                       ContainsGatewayText(requestMessage);
+                // An explicit, non-transient Telegram error code such as 400/401/403/409 is permanent evidence: a nested
+                // exception must not turn an invalid token or a duplicate getUpdates conflict into a retry loop.
+                return false;
             }
 
-            // Network-level transport failures are transient and must not be treated as an invalid token or a
-            // duplicate-poller conflict.
-            return exception is HttpRequestException || exception is IOException;
+            // A plain RequestException can be Telegram's transport wrapper (Telegram.Bot 22.10.3) or can carry the raw
+            // edge HTTP status when the response body is not parseable Telegram JSON.
+            if (exception is RequestException requestException)
+            {
+                var hasPermanentClientStatus = false;
+
+                if (requestException.HttpStatusCode is { } status)
+                {
+                    var statusCode = (int)status;
+                    if (statusCode is >= 500 and <= 599)
+                        return true;
+
+                    // 408 Request Timeout and 425 Too Early are timing/transport conditions a gateway can return during
+                    // a short outage rather than a permanent rejection.
+                    if (statusCode is 408 or 425)
+                        return true;
+
+                    hasPermanentClientStatus = statusCode is >= 400 and <= 499;
+                }
+
+                // Message evidence is evaluated before the permanent-status decision so the pre-existing timeout and
+                // gateway handling keeps exactly its previous precedence.
+                if (ContainsTransientRequestText(requestException.Message ?? string.Empty))
+                    return true;
+
+                // An explicit 4xx edge status is a server-side rejection: permanent evidence wins over the inner chain so
+                // a revoked token, an invalid request, or a duplicate conflict cannot become a retry loop.
+                if (hasPermanentClientStatus)
+                    return false;
+
+                // No permanent status, timeout, or gateway evidence: continue into the inner chain, which is where
+                // Telegram.Bot 22.10.3 nests HttpRequestException -> IOException -> SocketException for TLS handshake
+                // and connection-reset failures. This is the production shape that previously fell through to the noisy
+                // legacy polling logger.
+                return requestException.InnerException is not null &&
+                       ClassifyTransientFailure(requestException.InnerException, depth + 1);
+            }
+
+            // Transport-level failures are always transient regardless of which layer wrapped them.
+            if (exception is HttpRequestException || exception is IOException || exception is SocketException)
+                return true;
+
+            // Unwrap unrelated wrappers (for example AggregateException) so a nested transport failure is still seen.
+            return exception.InnerException is not null &&
+                   ClassifyTransientFailure(exception.InnerException, depth + 1);
+        }
+
+        /// <summary>
+        /// Determines whether a Telegram API error code represents a temporary provider-side condition.
+        /// </summary>
+        /// <param name="errorCode">Telegram <c>error_code</c> value from the Bot API response body.</param>
+        /// <returns>
+        /// <c>true</c> for HTTP 429 rate limits and every HTTP 5xx provider failure; <c>false</c> for permanent client
+        /// errors such as 400, 401, 403, and 409.
+        /// </returns>
+        private static bool IsTransientStatusCode(int errorCode)
+        {
+            return errorCode is 429 || errorCode >= 500;
+        }
+
+        /// <summary>
+        /// Checks whether a RequestException message names a timeout, gateway, or network transport condition.
+        /// </summary>
+        /// <param name="message">Telegram request exception message text; null or empty returns <c>false</c>.</param>
+        /// <returns><c>true</c> when the text names a known transient polling condition; otherwise <c>false</c>.</returns>
+        /// <remarks>
+        /// Message matching is a secondary signal for the rare case where Telegram returns a plain
+        /// <see cref="RequestException"/> without a typed transport inner exception. Type-based classification in
+        /// <see cref="ClassifyTransientFailure"/> remains the primary path.
+        /// </remarks>
+        private static bool ContainsTransientRequestText(string message)
+        {
+            return message.Contains("request timed out", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+                   ContainsGatewayText(message) ||
+                   ContainsTransportText(message);
+        }
+
+        /// <summary>
+        /// Checks whether a message names a network transport failure such as a reset or unestablished TLS connection.
+        /// </summary>
+        /// <param name="message">Exception message text to inspect; null or empty returns <c>false</c>.</param>
+        /// <returns><c>true</c> when the text names a known transient transport condition; otherwise <c>false</c>.</returns>
+        /// <remarks>
+        /// This is the message-level fallback for a transport failure that arrives without the usual typed
+        /// <see cref="HttpRequestException"/>/<see cref="IOException"/>/<see cref="SocketException"/> chain. It is only
+        /// consulted after API error codes and HTTP statuses produced no decision.
+        /// </remarks>
+        private static bool ContainsTransportText(string message)
+        {
+            return message.Contains("connection reset", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("connection refused", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("connection closed", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("connection could not be established", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("network is unreachable", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("network unreachable", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("forcibly closed by the remote host", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("no such host is known", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("name or service not known", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("temporary failure in name resolution", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -220,9 +349,9 @@ namespace Adminbot.Domain.Logging
         /// the caller should return without logging an error, marking a bot failed, or restarting a receiver.
         /// </returns>
         /// <remarks>
-        /// Telegram.Bot 19 awaits the polling error handler before issuing the next <c>getUpdates</c>, which is exactly
-        /// how the existing 429 pause already works. Callers must not hold the registry lock, a lifecycle gate, or a
-        /// database lock while awaiting this method.
+        /// Telegram.Bot 22.10.3 awaits the polling error handler before issuing the next <c>getUpdates</c>, which is
+        /// exactly how the existing 429 pause already works. Callers must not hold the registry lock, a lifecycle gate,
+        /// or a database lock while awaiting this method.
         /// </remarks>
         /// <example>
         /// <code>

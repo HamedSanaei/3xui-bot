@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "items": {
+    "premium_probe": {
+      "fallback": "✨",
+      "customEmojiId": null
+    },
+    "home": {
+      "fallback": "🏠",
+      "customEmojiId": null
+    },
+    "back": {
+      "fallback": "🔙",
+      "customEmojiId": null
+    },
+    "confirm": {
+      "fallback": "✅",
+      "customEmojiId": null
+    },
+    "cancel": {
+      "fallback": "❌",
+      "customEmojiId": null
+    },
+    "settings": {
+      "fallback": "⚙️",
+      "customEmojiId": null
+    },
+    "wallet": {
+      "fallback": "💰",
+      "customEmojiId": null
+    },
+    "shop": {
+      "fallback": "🛍️",
+      "customEmojiId": null
+    },
+    "premium": {
+      "fallback": "✨",
+      "customEmojiId": null
+    },
+    "support": {
+      "fallback": "💬",
+      "customEmojiId": null
+    },
+    "download": {
+      "fallback": "📥",
+      "customEmojiId": null
+    },
+    "android": {
+      "fallback": "🤖",
+      "customEmojiId": null
+    },
+    "ios": {
+      "fallback": "🍎",
+      "customEmojiId": null
+    },
+    "windows": {
+      "fallback": "🪟",
+      "customEmojiId": null
+    },
+    "warning": {
+      "fallback": "⚠️",
+      "customEmojiId": null
+    },
+    "info": {
+      "fallback": "ℹ️",
+      "customEmojiId": null
+    },
+    "card": {
+      "fallback": "💳",
+      "customEmojiId": null
+    },
+    "crypto": {
+      "fallback": "⚡",
+      "customEmojiId": null
+    },
+    "gift": {
+      "fallback": "🎁",
+      "customEmojiId": null
+    },
+    "refresh": {
+      "fallback": "🔄",
+      "customEmojiId": null
+    }
+  }
+}

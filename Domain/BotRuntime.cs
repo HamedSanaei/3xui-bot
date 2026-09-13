@@ -43,6 +43,17 @@ namespace Adminbot.Domain
         /// </summary>
         public bool TenantUniquePayEnabled { get; set; } = true;
         public bool TenantAtlasPayEnabled { get; set; } = true;
+        /// <summary>
+        /// Tenant-scoped persisted request for premium visuals (Telegram custom emoji and semantic button colours) in
+        /// this exact storefront bot.
+        /// </summary>
+        /// <remarks>
+        /// Defaults to <c>false</c>, so an existing storefront keeps the classic UI after the migration. The value is
+        /// only ever set to <c>true</c> after the storefront owner's exact Telegram identity, the owner's Telegram Premium
+        /// status, and a successful capability probe through this storefront's own bot token have all been verified. It
+        /// may be cleared back to <c>false</c> at any time without a Telegram round trip.
+        /// </remarks>
+        public bool TenantPremiumUiEnabled { get; set; }
         public string TenantOwnerNotificationBotId { get; set; }
         /// <summary>
         /// JSON array of tenant-owned tutorial links shown to storefront customers.
@@ -110,6 +121,16 @@ namespace Adminbot.Domain
         /// </summary>
         public bool TenantUniquePayEnabled { get; set; } = true;
         public bool TenantAtlasPayEnabled { get; set; } = true;
+        /// <summary>
+        /// Persisted premium-visual preference of this storefront, scoped to this exact bot instance.
+        /// </summary>
+        /// <remarks>
+        /// Stored in users.db as a non-null integer defaulting to 0, so existing tenant rows stay opted out after the
+        /// migration. The value is independent per storefront: enabling or disabling it for one store can never change
+        /// another store, even when both belong to the same owner. Configuration-owned bot synchronization deliberately
+        /// does not write this column, because it is only ever owned by a tenant storefront.
+        /// </remarks>
+        public bool TenantPremiumUiEnabled { get; set; }
         public string TenantOwnerNotificationBotId { get; set; }
         /// <summary>
         /// Stores tenant-owned tutorial links as JSON in users.db.

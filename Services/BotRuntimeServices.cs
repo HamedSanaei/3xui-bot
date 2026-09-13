@@ -136,6 +136,9 @@ public class BotRegistry
             TenantTetraminatorEnabled = bot.TenantTetraminatorEnabled,
             TenantUniquePayEnabled = bot.TenantUniquePayEnabled,
             TenantAtlasPayEnabled = bot.TenantAtlasPayEnabled,
+            // The storefront premium-visual preference must survive every BotInstance -> BotInstanceConfig conversion so
+            // a restart, a receiver rebuild, or an unrelated settings change can never silently disable it.
+            TenantPremiumUiEnabled = bot.TenantPremiumUiEnabled,
             TenantOwnerNotificationBotId = bot.TenantOwnerNotificationBotId,
             TenantTutorialsJson = bot.TenantTutorialsJson
         };
@@ -1438,8 +1441,9 @@ public class MultiBotHostedService : IHostedService
     /// hits every owned and tenant receiver at once cannot produce one synchronized retry storm; the delay is awaited
     /// with the receiver cancellation token and a cancelled wait is the normal shutdown path. A Telegram 429 rate limit
     /// pauses this receiver for Telegram's <c>RetryAfter</c> window
-    /// (plus a small buffer) before the polling loop issues the next <c>getUpdates</c>, because Telegram.Bot 19.x does
-    /// not delay on its own and would otherwise tight-loop through the whole rate-limit window. A Telegram 409
+    /// (plus a small buffer) before the polling loop issues the next <c>getUpdates</c>. These runtime clients disable
+    /// Telegram.Bot 22.10.3's own rate-limit retry (<c>RetryCount=0</c> in <c>BotClientProvider</c>), so without this
+    /// pause the receiver would tight-loop for the whole rate-limit window. A Telegram 409
     /// getUpdates conflict means another process or receiver is already polling the same token; this receiver is
     /// stopped to prevent noisy conflict loops. Telegram's distinct "webhook is active" conflict schedules one
     /// bot-scoped recovery generation, which clears the webhook through the startup guard before polling resumes.
@@ -1488,7 +1492,7 @@ public class MultiBotHostedService : IHostedService
 
         if (IsTelegramTransientGatewayPollingError(exception))
         {
-            // One bounded, jittered delay PER BOT. Telegram.Bot 19 awaits this polling error handler before issuing the
+            // One bounded, jittered delay PER BOT. Telegram.Bot 22.10.3 awaits this polling error handler before issuing the
             // next getUpdates, exactly like the existing 429 pause, so the delay itself breaks the synchronized retry
             // storm. The decision is computed quickly under the tracker's short per-bot lock and the delay is awaited
             // afterwards with no registry, lifecycle, or database lock held.
