@@ -70,7 +70,7 @@ public sealed class TelegramInboxAdminService
             try { response = await ExecuteAuthorizedAsync(botId, message.From.Id, true, parts, deadline.Token); }
             catch (ArgumentException) { response = "Invalid arguments. Use /inbox_resolve, /inbox_reject_creation, or /inbox_retry_tenant_order SEQUENCE review-N."; }
             catch (Exception) when (!token.IsCancellationRequested) { response = "Review unavailable; no unsafe resolution was authorized. Inspect again."; }
-            await client.SendTextMessageAsync(message.Chat.Id, response, cancellationToken: deadline.Token);
+            await client.SendMessage(message.Chat.Id, response, cancellationToken: deadline.Token);
         }
         finally { _gate.Release(); }
         return true;

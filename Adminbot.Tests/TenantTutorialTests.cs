@@ -580,7 +580,7 @@ public sealed partial class ConcurrencyTests
                 Id = Guid.NewGuid().ToString("N"),
                 Data = "TN:tutorial:android",
                 From = new Telegram.Bot.Types.User { Id = 722 },
-                Message = new Message { MessageId = 1, Chat = new Chat { Id = 722 } }
+                Message = new Message { Id = 1, Chat = new Chat { Id = 722 } }
             };
             await (Task)handle.Invoke(service, new object[]
             {
@@ -654,7 +654,7 @@ public sealed partial class ConcurrencyTests
                     Id = Guid.NewGuid().ToString("N"),
                     Data = $"TN:tutorial:{kind}",
                     From = new Telegram.Bot.Types.User { Id = 722 },
-                    Message = new Message { MessageId = 1, Chat = new Chat { Id = 722 } }
+                    Message = new Message { Id = 1, Chat = new Chat { Id = 722 } }
                 },
                 new CredUser { TelegramUserId = 722 },
                 new User { Id = 722 },

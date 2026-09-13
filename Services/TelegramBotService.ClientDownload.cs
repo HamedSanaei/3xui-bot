@@ -55,7 +55,7 @@ public partial class TelegramBotService
 
         if (!_clientDownloadAvailability.Snapshot.Enabled)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 ClientDownloadCallbacks.DisabledMessage,
                 replyMarkup: MainReplyMarkupKeyboardFa(),
@@ -118,7 +118,7 @@ public partial class TelegramBotService
         ChatId chatId,
         CancellationToken cancellationToken)
     {
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             BuildClientDownloadPanelText(),
             parseMode: ParseMode.Html,
@@ -298,7 +298,7 @@ public partial class TelegramBotService
 
         try
         {
-            await ActiveBotClient.EditMessageTextAsync(
+            await ActiveBotClient.EditMessageText(
                 chatId: panelMessage.Chat.Id,
                 messageId: panelMessage.MessageId,
                 text: BuildClientDownloadPanelText(),

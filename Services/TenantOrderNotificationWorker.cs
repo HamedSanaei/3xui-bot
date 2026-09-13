@@ -87,7 +87,7 @@ public sealed class TenantOrderNotificationDeliveryService
         if (string.Equals(order.OrderKind, TenantBotOrderKinds.Renew, StringComparison.OrdinalIgnoreCase))
         {
             var renewalText = BuildRenewalSuccessText(order, created);
-            var sent = await client.SendTextMessageAsync(chatId, renewalText, parseMode: ParseMode.Html,
+            var sent = await client.SendMessage(chatId, renewalText, parseMode: ParseMode.Html,
                 cancellationToken: cancellationToken);
             return sent.MessageId;
         }
@@ -96,12 +96,12 @@ public sealed class TenantOrderNotificationDeliveryService
         if (!string.IsNullOrWhiteSpace(created.SubLink))
         {
             using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(created.SubLink, 200));
-            var sent = await client.SendPhotoAsync(chatId, InputFile.FromStream(qrStream, "subscription-qr.png"),
+            var sent = await client.SendPhoto(chatId, InputFile.FromStream(qrStream, "subscription-qr.png"),
                 caption: text, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
             return sent.MessageId;
         }
 
-        return (await client.SendTextMessageAsync(chatId, text, parseMode: ParseMode.Html,
+        return (await client.SendMessage(chatId, text, parseMode: ParseMode.Html,
             cancellationToken: cancellationToken)).MessageId;
     }
     private async Task<int?> SendOwnerSaleAsync(TenantBotOrder order, CancellationToken cancellationToken)
@@ -124,7 +124,7 @@ public sealed class TenantOrderNotificationDeliveryService
             $"سود/تغییر موجودی: <code>{Html(order.OwnerWalletDelta.FormatCurrency())}</code>\n" +
             $"موجودی قبل: <code>{Html(order.OwnerBalanceBefore?.FormatCurrency())}</code>\n" +
             $"موجودی بعد: <code>{Html(order.OwnerBalanceAfter?.FormatCurrency())}</code>";
-        return (await resolved.Client.SendTextMessageAsync(
+        return (await resolved.Client.SendMessage(
             chatId, text, parseMode: ParseMode.Html, cancellationToken: cancellationToken)).MessageId;
     }
 
@@ -138,7 +138,7 @@ public sealed class TenantOrderNotificationDeliveryService
         if (created == null)
             throw new TenantOrderNotificationPermanentException("stored_account_details_missing");
         var text = "مشخصات اکانت ساخته‌شده:\n\n" + _purchaseService.BuildCreatedAccountText(created);
-        return (await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
+        return (await _botClientProvider.GetClient(assistant.Id).SendMessage(
             order.OwnerTelegramUserId, text, parseMode: ParseMode.Html, cancellationToken: cancellationToken)).MessageId;
     }
     /// <summary>
@@ -191,7 +191,7 @@ public sealed class TenantOrderNotificationDeliveryService
 
         var client = _botClientProvider.GetClient(order.TenantBotId);
         var chatId = order.CustomerChatId > 0 ? order.CustomerChatId : order.CustomerTelegramUserId;
-        var sent = await client.SendTextMessageAsync(
+        var sent = await client.SendMessage(
             chatId,
             BuildReceiptReuploadRecoveryText(order),
             parseMode: ParseMode.Html,

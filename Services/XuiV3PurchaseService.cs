@@ -1107,7 +1107,7 @@ public class XuiV3PurchaseService
     /// <example>
     /// <code>
     /// var text = purchaseService.BuildTariffsText(credUser.IsColleague);
-    /// await botClient.SendTextMessageAsync(chatId, text, parseMode: ParseMode.Html);
+    /// await botClient.SendMessage(chatId, text, parseMode: ParseMode.Html);
     /// </code>
     /// </example>
     public string BuildTariffsText(bool isColleague)
@@ -1446,7 +1446,7 @@ public class XuiV3PurchaseService
     ///     cancellationToken: cancellationToken);
     ///
     /// if (result.SuccessfulCount == 0)
-    ///     await bot.SendTextMessageAsync(chatId, result.Failures[0].Message, cancellationToken: cancellationToken);
+    ///     await bot.SendMessage(chatId, result.Failures[0].Message, cancellationToken: cancellationToken);
     /// </code>
     /// </example>
     public async Task<XuiV3BulkCreationResult> CreateBulkAccountsAsync(
@@ -1688,7 +1688,7 @@ public class XuiV3PurchaseService
     /// <example>
     /// <code>
     /// var text = purchaseService.BuildCreatedAccountText(createdAccount);
-    /// await bot.SendTextMessageAsync(chatId, text, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
+    /// await bot.SendMessage(chatId, text, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
     /// </code>
     /// </example>
     public string BuildCreatedAccountText(XuiV3AccountCreationResult result)

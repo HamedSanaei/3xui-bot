@@ -45,7 +45,7 @@ public partial class TenantBotService
 
         if (!_clientDownloadAvailability.Snapshot.Enabled)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 ClientDownloadCallbacks.DisabledMessage,
                 replyMarkup: BuildTenantReplyKeyboard(),

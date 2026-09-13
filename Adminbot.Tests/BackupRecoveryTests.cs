@@ -290,7 +290,7 @@ public sealed class BackupRecoveryTests
         public System.Collections.Concurrent.ConcurrentBag<string> Files = [];
         /// <summary>Observed document destinations; text-log routes are intentionally excluded.</summary>
         public System.Collections.Concurrent.ConcurrentBag<string> Channels = [];
-        public async Task SendTextMessageAsync(string channelId, string message, ParseMode? parseMode, CancellationToken cancellationToken)
+        public async Task SendMessage(string channelId, string message, ParseMode? parseMode, CancellationToken cancellationToken)
         { var count = Interlocked.Increment(ref Texts); await TextBarrier.WaitAsync(cancellationToken); if (FailFirst && count == 1) throw new HttpRequestException("test transient"); }
         /// <summary>Records a fake document destination and waits at the controlled upload boundary.</summary>
         /// <param name="channelId">Resolved Telegram backup chat id; test data only.</param>
@@ -299,7 +299,7 @@ public sealed class BackupRecoveryTests
         /// <param name="cancellationToken">Dispatcher shutdown token cancelling the fake upload.</param>
         /// <returns>A task completing when the upload barrier releases.</returns>
         /// <remarks>No network request is made. Counting before the barrier marks snapshot/upload start.</remarks>
-        public async Task SendDocumentAsync(string channelId, string fileName, Stream content, CancellationToken cancellationToken)
+        public async Task SendDocument(string channelId, string fileName, Stream content, CancellationToken cancellationToken)
         { Channels.Add(channelId); Files.Add(fileName); Interlocked.Increment(ref Documents); await DocumentBarrier.WaitAsync(cancellationToken); }
     }
 

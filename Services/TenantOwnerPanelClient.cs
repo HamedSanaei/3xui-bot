@@ -26,7 +26,7 @@ internal sealed class TenantOwnerPanelClient : ITelegramBotClient
     /// <inheritdoc />
     public bool LocalBotServer => _inner.LocalBotServer;
     /// <inheritdoc />
-    public long? BotId => _inner.BotId;
+    public long BotId => _inner.BotId;
     /// <inheritdoc />
     public TimeSpan Timeout { get => _inner.Timeout; set => _inner.Timeout = value; }
     /// <inheritdoc />
@@ -36,40 +36,47 @@ internal sealed class TenantOwnerPanelClient : ITelegramBotClient
     /// <inheritdoc />
     public event AsyncEventHandler<ApiResponseEventArgs> OnApiResponseReceived { add => _inner.OnApiResponseReceived += value; remove => _inner.OnApiResponseReceived -= value; }
     /// <inheritdoc />
-    public Task<bool> TestApiAsync(CancellationToken cancellationToken = default) => _inner.TestApiAsync(cancellationToken);
+    public Task<bool> TestApi(CancellationToken cancellationToken = default) => _inner.TestApi(cancellationToken);
     /// <inheritdoc />
-    public Task DownloadFileAsync(string filePath, Stream destination, CancellationToken cancellationToken = default) => _inner.DownloadFileAsync(filePath, destination, cancellationToken);
+    public Task DownloadFile(Telegram.Bot.Types.TGFile file, Stream destination, CancellationToken cancellationToken = default)
+        => DownloadFile(file.FilePath, destination, cancellationToken);
+
+    /// <inheritdoc />
+    public Task DownloadFile(string filePath, Stream destination, CancellationToken cancellationToken = default) => _inner.DownloadFile(filePath, destination, cancellationToken);
 
     /// <summary>Addresses owner keyboards and prefixes owner text with the selected store name before sending.</summary>
     /// <typeparam name="TResponse">Telegram API response type.</typeparam>
     /// <param name="request">Outgoing request from the owner handler; payloads are never logged.</param>
     /// <param name="cancellationToken">Cancellation of the original Telegram request.</param>
     /// <returns>The unchanged underlying Telegram response.</returns>
-    public Task<TResponse> MakeRequestAsync<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+    /// <remarks>v22 request initializers retain preview and reply options while prefixing only this owner's messages.</remarks>
+    public Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
     {
         switch (request)
         {
             case SendMessageRequest send when send.ChatId.Identifier == _chatId:
                 Address(send.ReplyMarkup as InlineKeyboardMarkup);
-                request = (IRequest<TResponse>)(object)new SendMessageRequest(send.ChatId, Prefix(send.Text, send.ParseMode))
+                request = (IRequest<TResponse>)(object)new SendMessageRequest
                 {
+                    ChatId = send.ChatId, Text = Prefix(send.Text, send.ParseMode),
                     ParseMode = send.ParseMode, ReplyMarkup = send.ReplyMarkup, MessageThreadId = send.MessageThreadId,
-                    DisableWebPagePreview = send.DisableWebPagePreview, DisableNotification = send.DisableNotification,
-                    ProtectContent = send.ProtectContent, ReplyToMessageId = send.ReplyToMessageId,
-                    AllowSendingWithoutReply = send.AllowSendingWithoutReply, IsWebhookResponse = send.IsWebhookResponse,
+                    LinkPreviewOptions = send.LinkPreviewOptions, DisableNotification = send.DisableNotification,
+                    ProtectContent = send.ProtectContent, ReplyParameters = send.ReplyParameters,
+                    IsWebhookResponse = send.IsWebhookResponse,
                     Entities = ShiftEntities(send.Entities, Prefix("", send.ParseMode).Length)
                 };
                 break;
             case EditMessageTextRequest edit when edit.ChatId?.Identifier == _chatId:
                 Address(edit.ReplyMarkup);
-                request = (IRequest<TResponse>)(object)new EditMessageTextRequest(edit.ChatId, edit.MessageId, Prefix(edit.Text, edit.ParseMode))
+                request = (IRequest<TResponse>)(object)new EditMessageTextRequest
                 {
-                    ParseMode = edit.ParseMode, ReplyMarkup = edit.ReplyMarkup, DisableWebPagePreview = edit.DisableWebPagePreview,
+                    ChatId = edit.ChatId, MessageId = edit.MessageId, Text = Prefix(edit.Text, edit.ParseMode),
+                    ParseMode = edit.ParseMode, ReplyMarkup = edit.ReplyMarkup, LinkPreviewOptions = edit.LinkPreviewOptions,
                     IsWebhookResponse = edit.IsWebhookResponse, Entities = ShiftEntities(edit.Entities, Prefix("", edit.ParseMode).Length)
                 };
                 break;
         }
-        return _inner.MakeRequestAsync(request, cancellationToken);
+        return _inner.SendRequest(request, cancellationToken);
     }
 
     /// <summary>Labels a response using the store's current name and stable number.</summary>

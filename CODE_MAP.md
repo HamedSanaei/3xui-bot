@@ -1,5 +1,13 @@
 # CODE_MAP.md
 
+- Telegram.Bot is pinned to 22.10.3. API methods no longer use Async suffixes (`SendMessage`, `SendRequest`);
+  markup uses `ReplyMarkup`, files use `TGFile`, and client BotId is non-nullable. Decorators retain delivery budgets.
+  Runtime clients disable SDK automatic retries (`RetryCount=0`) to preserve application retry ownership.
+  Durable updates use `JsonBotAPI.Options` with System.Text.Json, retaining the previous Bot API JSON wire format.
+  `TelegramUpdateLegacyJsonTests.cs` directly persists a v19-generated callback JSON fixture to temporary SQLite,
+  then verifies v22 ClaimAsync routing, nested data and single-claim state. Its one filtered regression passed.
+  See `docs/telegram-bot-22-upgrade.md` for compatibility changes, file inventory and verification.
+
 - Website outbox: `GozargahSyncSemantics` compares canonical payload plus ownership, excluding tracking_code.
   `QueueAndSendAsync` and retries share UUID/email admission; unchanged updates create no event or HTTP mutation.
   `Sync Gozargah Site` reports aggregate changed/unchanged counts. Retry cycles compact <=100 terminal rows older

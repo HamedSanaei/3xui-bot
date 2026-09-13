@@ -117,8 +117,8 @@ public static class TelegramCallbackAnswerPolicy
         bounded.CancelAfter(timeout ?? Timeout);
         try
         {
-            await client.AnswerCallbackQueryAsync(
-                callbackQueryId, text, showAlert, url, cacheTime, bounded.Token);
+            await client.AnswerCallbackQuery(
+                callbackQueryId, text, showAlert ?? false, url, cacheTime, bounded.Token);
             LogIfSlow(logger, started, botId, actorUserId, "completed", null);
             return true;
         }

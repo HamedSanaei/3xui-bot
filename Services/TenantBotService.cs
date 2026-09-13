@@ -327,7 +327,7 @@ public partial class TenantBotService
         Message Message,
         CredUser CredUser,
         User User,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken CancellationToken)
     {
         if (Message?.From == null || string.IsNullOrWhiteSpace(Message.Text))
@@ -339,7 +339,7 @@ public partial class TenantBotService
         {
             if (CredUser?.IsColleague != true)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: Message.Chat.Id,
                     text: "این بخش فقط برای همکاران فعال است.",
                     replyMarkup: mainReplyMarkup,
@@ -358,7 +358,7 @@ public partial class TenantBotService
         if (CredUser?.IsColleague != true)
         {
             await _state.ClearUserStatus(new User { Id = Message.From.Id });
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: Message.Chat.Id,
                 text: "این بخش فقط برای همکاران فعال است.",
                 replyMarkup: mainReplyMarkup,
@@ -379,7 +379,7 @@ public partial class TenantBotService
         if (string.Equals(Message.Text.Trim(), "بازگشت به پنل", StringComparison.Ordinal))
         {
             await _state.ClearUserStatus(new User { Id = Message.From.Id });
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 "به پنل ربات فروشگاهی برگشتید.",
                 replyMarkup: new ReplyKeyboardRemove(),
@@ -778,7 +778,7 @@ public partial class TenantBotService
                     await SafeAnswerCallbackQueryAsync(botClient, blockedCallback.Id, restriction,
                         showAlert: true, cancellationToken: CancellationToken);
                 else
-                    await botClient.SendTextMessageAsync(update.Message.Chat.Id, restriction,
+                    await botClient.SendMessage(update.Message.Chat.Id, restriction,
                         replyMarkup: new ReplyKeyboardRemove(), cancellationToken: CancellationToken);
                 return true;
             }
@@ -1072,7 +1072,7 @@ public partial class TenantBotService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 selectedText,
                 parseMode: ParseMode.Html,
@@ -1080,7 +1080,7 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             service.IsUnlimited
                 ? "یکی از پلن‌های زیر را انتخاب کنید:"
@@ -1128,7 +1128,7 @@ public partial class TenantBotService
             InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home())
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             text,
             replyMarkup: new InlineKeyboardMarkup(rows),
@@ -1223,7 +1223,7 @@ public partial class TenantBotService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: ChatId,
             text: Text,
             parseMode: ParseMode.Html,
@@ -1533,7 +1533,7 @@ public partial class TenantBotService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 text,
                 parseMode: ParseMode.Html,
@@ -1619,9 +1619,9 @@ public partial class TenantBotService
 
         try
         {
-            var client = new TelegramBotClient(tenant.Token);
+            var client = new TelegramBotClient(new TelegramBotClientOptions(tenant.Token) { RetryCount = 0 });
             using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
-            var me = await client.GetMeAsync(probeCts.Token);
+            var me = await client.GetMe(probeCts.Token);
             var username = me.Username?.Trim().TrimStart('@');
             var changed = false;
 
@@ -1894,7 +1894,7 @@ public partial class TenantBotService
             _ => "مقدار جدید را ارسال کنید."
         };
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
             text: PROMPT,
             parseMode: ParseMode.Html,
@@ -1932,7 +1932,7 @@ public partial class TenantBotService
         var Token = Message.Text?.Trim();
         if (string.IsNullOrWhiteSpace(Token) || !Token.Contains(':'))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 "توکن معتبر نیست. توکن BOTFATHER را کامل ارسال کنید.",
                 cancellationToken: CancellationToken);
@@ -1942,13 +1942,13 @@ public partial class TenantBotService
         Telegram.Bot.Types.User me;
         try
         {
-            var TENANTCLIENT = new TelegramBotClient(Token);
+            var TENANTCLIENT = new TelegramBotClient(new TelegramBotClientOptions(Token) { RetryCount = 0 });
             using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
-            me = await TENANTCLIENT.GetMeAsync(probeCts.Token);
+            me = await TENANTCLIENT.GetMe(probeCts.Token);
         }
         catch (Exception)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 "اعتبارسنجی توکن ناموفق بود. توکن و اتصال تلگرام را بررسی کنید.",
                 parseMode: ParseMode.Html,
@@ -1959,7 +1959,7 @@ public partial class TenantBotService
         var Username = me.Username?.Trim().TrimStart('@');
         if (string.IsNullOrWhiteSpace(Username))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 "این توکن یوزرنیم معتبر برنگرداند. لطفاً BOTFATHER را بررسی کنید.",
                 cancellationToken: CancellationToken);
@@ -1968,13 +1968,13 @@ public partial class TenantBotService
 
         if (TelegramBotTokenIdentity.ExtractBotId(Token) != me.Id)
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "هویت ربات با توکن مطابقت ندارد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "هویت ربات با توکن مطابقت ندارد.", cancellationToken: CancellationToken);
             return;
         }
         var duplicate = await FindTenantTokenConflictAsync(Token, Username, owner.TelegramUserId, CancellationToken);
         if (duplicate.HasConflict)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 "این توکن/ربات در حال حاضر برای اکانت یا ربات دیگری استفاده می‌شود. لطفاً توکن دیگری وارد کنید.",
                 cancellationToken: CancellationToken);
@@ -2009,14 +2009,14 @@ public partial class TenantBotService
         catch (DbUpdateException ex) when (ex.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 })
         {
             // A concurrent registration in another owned bot may win after getMe. The unique numeric identity is authoritative.
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "این ربات هم‌زمان در فروشگاه دیگری ثبت شده است. توکن دیگری وارد کنید.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "این ربات هم‌زمان در فروشگاه دیگری ثبت شده است. توکن دیگری وارد کنید.", cancellationToken: CancellationToken);
             return;
         }
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
         _botClientProvider.Invalidate(tenant.Id);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             Message.Chat.Id,
             $"✅ توکن ربات <b>@{Html(Username)}</b> ثبت شد.\nبرای شروع دریافت پیام، فروشگاه را از پنل روشن کنید.",
             parseMode: ParseMode.Html,
@@ -2110,7 +2110,7 @@ public partial class TenantBotService
     {
         if (!int.TryParse(Message.Text?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var markup) || markup < 0 || markup > 500)
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "درصد سود باید عددی بین 0 تا 500 باشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "درصد سود باید عددی بین 0 تا 500 باشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -2121,7 +2121,7 @@ public partial class TenantBotService
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
-        await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ درصد سود ذخیره شد.", cancellationToken: CancellationToken);
+        await botClient.SendMessage(Message.Chat.Id, "✅ درصد سود ذخیره شد.", cancellationToken: CancellationToken);
         await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
     }
 
@@ -2153,7 +2153,7 @@ public partial class TenantBotService
         var support = NormalizeTenantSupportAccount(Message.Text);
         if (string.IsNullOrWhiteSpace(support))
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "آیدی پشتیبانی معتبر نیست. لطفاً یوزرنیم عمومی تلگرام مثل @SUPPORT_USERNAME یا لینک t.me را ارسال کنید.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "آیدی پشتیبانی معتبر نیست. لطفاً یوزرنیم عمومی تلگرام مثل @SUPPORT_USERNAME یا لینک t.me را ارسال کنید.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -2164,7 +2164,7 @@ public partial class TenantBotService
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             Message.Chat.Id,
             "✅ پشتیبانی فروشگاه ذخیره شد.",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -2186,7 +2186,7 @@ public partial class TenantBotService
         var WELCOME = Message.Text?.Trim();
         if (string.IsNullOrWhiteSpace(WELCOME))
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "متن خوشامد نمی‌تواند خالی باشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "متن خوشامد نمی‌تواند خالی باشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -2197,7 +2197,7 @@ public partial class TenantBotService
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
-        await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ متن خوشامد ذخیره شد.", cancellationToken: CancellationToken);
+        await botClient.SendMessage(Message.Chat.Id, "✅ متن خوشامد ذخیره شد.", cancellationToken: CancellationToken);
         await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
     }
 
@@ -2218,7 +2218,7 @@ public partial class TenantBotService
         var cardNumber = Message.Text?.Trim();
         if (string.IsNullOrWhiteSpace(cardNumber))
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "شماره کارت نمی‌تواند خالی باشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "شماره کارت نمی‌تواند خالی باشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -2229,7 +2229,7 @@ public partial class TenantBotService
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
-        await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ شماره کارت فروشگاه ذخیره شد.", cancellationToken: CancellationToken);
+        await botClient.SendMessage(Message.Chat.Id, "✅ شماره کارت فروشگاه ذخیره شد.", cancellationToken: CancellationToken);
         await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
     }
 
@@ -2250,7 +2250,7 @@ public partial class TenantBotService
         var CARDHOLDER = Message.Text?.Trim();
         if (string.IsNullOrWhiteSpace(CARDHOLDER))
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "نام صاحب کارت نمی‌تواند خالی باشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "نام صاحب کارت نمی‌تواند خالی باشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -2261,7 +2261,7 @@ public partial class TenantBotService
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
-        await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ نام صاحب کارت ذخیره شد.", cancellationToken: CancellationToken);
+        await botClient.SendMessage(Message.Chat.Id, "✅ نام صاحب کارت ذخیره شد.", cancellationToken: CancellationToken);
         await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
     }
 
@@ -2282,7 +2282,7 @@ public partial class TenantBotService
         var channel = NORMALIZETELEGRAMCHANNEL(Message.Text);
         if (string.IsNullOrWhiteSpace(channel))
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "کانال معتبر نیست. آیدی کانال مثل @YOURCHANNEL را ارسال کنید.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "کانال معتبر نیست. آیدی کانال مثل @YOURCHANNEL را ارسال کنید.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -2293,7 +2293,7 @@ public partial class TenantBotService
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
 
-        await botClient.SendTextMessageAsync(Message.Chat.Id, "✅ کانال جوین اجباری ذخیره شد.", cancellationToken: CancellationToken);
+        await botClient.SendMessage(Message.Chat.Id, "✅ کانال جوین اجباری ذخیره شد.", cancellationToken: CancellationToken);
         await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
     }
 
@@ -2425,7 +2425,7 @@ public partial class TenantBotService
                 await _workflow.SaveAsync(CancellationToken);
                 _botRegistry.Upsert(tenant);
 
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
                     $"⚠️ {validation.ErrorMessage}",
                     cancellationToken: CancellationToken);
@@ -2459,7 +2459,7 @@ public partial class TenantBotService
                     _botRegistry.Upsert(tenant);
                     _botClientProvider.Invalidate(tenant.Id);
 
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
                         "⚠️ راه‌اندازی ربات فروشگاهی کامل نشد. چند لحظه بعد پنل را به‌روزرسانی و دوباره تلاش کنید.",
                         cancellationToken: CancellationToken);
@@ -2652,7 +2652,7 @@ public partial class TenantBotService
             {
                 tenant.TenantMandatoryJoinEnabled = false;
                 await _workflow.SaveAsync(CancellationToken);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
                     $"⚠️ {validation.ErrorMessage}",
                     cancellationToken: CancellationToken);
@@ -2918,7 +2918,7 @@ public partial class TenantBotService
             Flow = OWNERFLOW,
             LastStep = STEPTUTORIALTITLE
         });
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             callbackQuery.Message.Chat.Id,
             "عنوان آموزش را ارسال کنید؛ مثلا: آموزش نصب روی اندروید",
             cancellationToken: cancellationToken);
@@ -2950,7 +2950,7 @@ public partial class TenantBotService
         {
             if (string.IsNullOrWhiteSpace(text))
             {
-                await botClient.SendTextMessageAsync(message.Chat.Id, "عنوان نمی‌تواند خالی باشد.", cancellationToken: cancellationToken);
+                await botClient.SendMessage(message.Chat.Id, "عنوان نمی‌تواند خالی باشد.", cancellationToken: cancellationToken);
                 return;
             }
 
@@ -2958,13 +2958,13 @@ public partial class TenantBotService
             state.LastStep = STEPTUTORIALURL;
             state.SubLink = text;
             await _state.SaveUserStatus(state);
-            await botClient.SendTextMessageAsync(message.Chat.Id, "حالا لینک آموزش را ارسال کنید.", cancellationToken: cancellationToken);
+            await botClient.SendMessage(message.Chat.Id, "حالا لینک آموزش را ارسال کنید.", cancellationToken: cancellationToken);
             return;
         }
 
         if (!Uri.TryCreate(text, UriKind.Absolute, out _))
         {
-            await botClient.SendTextMessageAsync(message.Chat.Id, "لینک معتبر نیست. یک لینک کامل مثل https://t.me/... ارسال کنید.", cancellationToken: cancellationToken);
+            await botClient.SendMessage(message.Chat.Id, "لینک معتبر نیست. یک لینک کامل مثل https://t.me/... ارسال کنید.", cancellationToken: cancellationToken);
             return;
         }
 
@@ -2975,7 +2975,7 @@ public partial class TenantBotService
         await _workflow.SaveAsync(cancellationToken);
         await _state.ClearUserStatus(state);
         await _state.SaveUserStatus(new User { Id = owner.TelegramUserId, OwnerStoreId = tenant.Id });
-        await botClient.SendTextMessageAsync(message.Chat.Id, "✅ آموزش ثبت شد.", replyMarkup: BUILDOWNERPANELKEYBOARD(tenant), cancellationToken: cancellationToken);
+        await botClient.SendMessage(message.Chat.Id, "✅ آموزش ثبت شد.", replyMarkup: BUILDOWNERPANELKEYBOARD(tenant), cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -3033,7 +3033,7 @@ public partial class TenantBotService
             Flow = OWNERFLOW,
             LastStep = STEPBROADCASTINPUT
         });
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             callbackQuery.Message.Chat.Id,
             "پیام عمومی فروشگاه را ارسال کنید.\nمی‌توانید متن بفرستید یا لینک پست کانال خودتان را ارسال کنید تا همان پست forward شود.",
             cancellationToken: cancellationToken);
@@ -3064,7 +3064,7 @@ public partial class TenantBotService
         var draft = message.Text?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(draft))
         {
-            await botClient.SendTextMessageAsync(message.Chat.Id, "متن یا لینک پست نمی‌تواند خالی باشد.", cancellationToken: cancellationToken);
+            await botClient.SendMessage(message.Chat.Id, "متن یا لینک پست نمی‌تواند خالی باشد.", cancellationToken: cancellationToken);
             return;
         }
 
@@ -3078,7 +3078,7 @@ public partial class TenantBotService
             SubLink = draft
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             message.Chat.Id,
             "📢 <b>پیش‌نمایش پیام عمومی</b>\n\n" +
             $"مخاطب‌های این فروشگاه: <code>{audienceCount}</code>\n" +
@@ -3148,7 +3148,7 @@ public partial class TenantBotService
         await _state.ClearUserStatus(state);
         await _state.SaveUserStatus(new User { Id = owner.TelegramUserId, OwnerStoreId = tenant.Id });
         await _broadcastManager.RefreshStatusMessageAsync(job.Id, cancellationToken);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             callbackQuery.Message.Chat.Id,
             "ارسال عمومی فروشگاه شروع شد. وضعیت را از پیام بالا پیگیری کنید.",
             replyMarkup: BUILDOWNERPANELKEYBOARD(tenant),
@@ -3380,7 +3380,7 @@ public partial class TenantBotService
         var assistantUsername = string.IsNullOrWhiteSpace(assistant.Username) ? "ربات دستیار فروش" : "@" + assistant.Username.TrimStart('@');
         try
         {
-            await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
+            await _botClientProvider.GetClient(assistant.Id).SendMessage(
                 owner.TelegramUserId,
                 "✅ تست ربات دستیار فروش موفق بود.\nاز این به بعد فروش‌ها و رسیدهای کارت‌به‌کارت اینجا برای شما ارسال می‌شود.",
                 cancellationToken: CancellationToken);
@@ -3423,7 +3423,7 @@ public partial class TenantBotService
             LastStep = STEPMANUALCARDORDERID
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
             "OrderId سفارش کارت‌به‌کارت را دقیق ارسال کنید.\nمثال: <code>TENANTBOT-...</code>",
             parseMode: ParseMode.Html,
@@ -3477,7 +3477,7 @@ public partial class TenantBotService
         var tenant = await GetCurrentTenantBotAsync(CancellationToken);
         if (tenant == null || !tenant.Enabled)
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "فروشگاه در حال حاضر غیرفعال است.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "فروشگاه در حال حاضر غیرفعال است.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -3499,7 +3499,7 @@ public partial class TenantBotService
         if (Message.Document != null &&
             await _state.GetPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken) is not null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 "❌ فایل رسید باید تصویر باشد. لطفاً رسید را به صورت عکس (JPG، PNG یا WebP) ارسال کنید.",
                 replyMarkup: BuildTenantReplyKeyboard(),
@@ -3517,7 +3517,7 @@ public partial class TenantBotService
             if (phone != null)
             {
                 await _credentialsDbContext.SavePhoneNumber(Message.From.Id, phone);
-                await botClient.SendTextMessageAsync(Message.Chat.Id,
+                await botClient.SendMessage(Message.Chat.Id,
                     "شماره شما با موفقیت تایید شد. حالا دوباره گزینه مورد نظرتان را انتخاب کنید.",
                     replyMarkup: tenantReplyKeyboard, cancellationToken: CancellationToken);
             }
@@ -3535,7 +3535,7 @@ public partial class TenantBotService
         {
             if (navigationCommand.HasPayloadToken("payment_success"))
             {
-                await botClient.SendTextMessageAsync(Message.Chat.Id, "پرداخت از سمت درگاه پرداخت تایید شد. در حال بررسی وضعیت سفارش...", cancellationToken: CancellationToken);
+                await botClient.SendMessage(Message.Chat.Id, "پرداخت از سمت درگاه پرداخت تایید شد. در حال بررسی وضعیت سفارش...", cancellationToken: CancellationToken);
                 await CHECKLATESTCUSTOMERORDERASYNC(botClient, Message.Chat.Id, customer.TelegramUserId, CancellationToken);
                 return;
             }
@@ -3565,7 +3565,7 @@ public partial class TenantBotService
         if (Text == "تعرفه‌ها" || Text == "📋 تعرفه‌ها")
         {
             await _state.ClearUserStatus(new User { Id = Message.From.Id });
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 BUILDTENANTTARIFFSTEXT(tenant),
                 parseMode: ParseMode.Html,
@@ -3578,7 +3578,7 @@ public partial class TenantBotService
         {
             await _state.ClearUserStatus(new User { Id = Message.From.Id });
             var support = BuildTenantSupportContactHtml(tenant.SupportAccount);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 $"برای پشتیبانی فروشگاه به این آیدی پیام بدهید:\n{support}",
                 parseMode: ParseMode.Html,
@@ -3687,7 +3687,7 @@ public partial class TenantBotService
         if (IsCancelText(text))
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 "فرایند خرید لغو شد.",
                 replyMarkup: BuildTenantReplyKeyboard(),
@@ -3700,7 +3700,7 @@ public partial class TenantBotService
         if (service == null || service.IsUnlimited)
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 "سرویس انتخاب‌شده قبلی دیگر فعال نیست. لطفاً سرویس جدید را انتخاب کنید.",
                 cancellationToken: cancellationToken);
@@ -3712,7 +3712,7 @@ public partial class TenantBotService
         {
             if (!TryParseTenantTrafficSelection(text, service, out var trafficGb))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     message.Chat.Id,
                     BuildTenantMinimumTrafficMessage(service),
                     replyMarkup: BuildTenantTrafficInlineKeyboard(service),
@@ -3763,7 +3763,7 @@ public partial class TenantBotService
                     TotoalGB = string.Empty,
                     PendingUserComment = string.Empty
                 });
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     message.Chat.Id,
                     BuildTenantMinimumTrafficMessage(service),
                     replyMarkup: BuildTenantTrafficInlineKeyboard(service),
@@ -3802,7 +3802,7 @@ public partial class TenantBotService
             return true;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             message.Chat.Id,
             "برای ادامه، مدت سرویس را از دکمه‌های پیام قبلی انتخاب کنید یا انصراف دهید.",
             replyMarkup: new InlineKeyboardMarkup(new[]
@@ -3873,7 +3873,7 @@ public partial class TenantBotService
         BotInstance tenant,
         CredUser customer,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         var text = message.Text?.Trim() ?? string.Empty;
@@ -3894,7 +3894,7 @@ public partial class TenantBotService
             LastStep = TENANTRENEWSTEPACCOUNT
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             message.Chat.Id,
             "یکی از شناسه‌های اکانتی که می‌خواهید تمدید کنید را ارسال کنید:\n" +
             "• نام اکانت (Email)\n" +
@@ -3904,7 +3904,7 @@ public partial class TenantBotService
             "تمدید اکانت شخص دیگر ممکن است، اما مالکیت یا دسترسی مدیریتی آن را تغییر نمی‌دهد.",
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             message.Chat.Id,
             "برای خروج از فرایند تمدید، دکمه زیر را بزنید.",
             replyMarkup: BuildTenantRenewHomeKeyboard(),
@@ -3947,14 +3947,14 @@ public partial class TenantBotService
         BotInstance tenant,
         CredUser customer,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         var text = message.Text?.Trim() ?? string.Empty;
         if (IsCancelText(text))
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(message.Chat.Id, "فرایند تمدید لغو شد.", replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
+            await botClient.SendMessage(message.Chat.Id, "فرایند تمدید لغو شد.", replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
             return;
         }
 
@@ -3966,7 +3966,7 @@ public partial class TenantBotService
 
         if (user.LastStep == TENANTRENEWSTEPEXTERNALTARGETCONFIRMATION)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 "برای ادامه تمدید اکانت شخص دیگر، هشدار قبلی را با دکمه «ادامه تمدید همین اکانت» تأیید کنید یا به منوی اصلی برگردید.",
                 replyMarkup: BuildTenantExternalRenewTargetConfirmationKeyboard(),
@@ -4000,7 +4000,7 @@ public partial class TenantBotService
                 var selectedService = FindTenantRenewServiceCategory(text, candidateServices);
                 if (selectedService == null)
                 {
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         message.Chat.Id,
                         "نوع سرویس معتبر نیست. فقط یکی از گزینه‌های سازگار زیر را انتخاب کنید.",
                         replyMarkup: BuildTenantRenewServiceCategoryKeyboard(candidateServices),
@@ -4019,7 +4019,7 @@ public partial class TenantBotService
                 user.SelectedPeriod = string.Empty;
                 user.Type = string.Empty;
                 await _state.SaveUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     message.Chat.Id,
                     selectedService.IsUnlimited
                         ? "پلن تمدید نامحدود را انتخاب کنید:"
@@ -4097,7 +4097,7 @@ public partial class TenantBotService
         {
             if (!TryParseTenantTrafficSelection(text, service, out var trafficGb))
             {
-                await botClient.SendTextMessageAsync(message.Chat.Id, BuildTenantMinimumTrafficMessage(service), replyMarkup: BuildTenantRenewTrafficKeyboard(service), cancellationToken: cancellationToken);
+                await botClient.SendMessage(message.Chat.Id, BuildTenantMinimumTrafficMessage(service), replyMarkup: BuildTenantRenewTrafficKeyboard(service), cancellationToken: cancellationToken);
                 return;
             }
 
@@ -4105,7 +4105,7 @@ public partial class TenantBotService
             user.LastStep = TENANTRENEWSTEPDURATION;
             user.TotoalGB = trafficGb.ToString(CultureInfo.InvariantCulture);
             await _state.SaveUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 XuiV3PurchaseService.BuildDurationSelectionText(service, "مدت تمدید را انتخاب کنید:"),
                 replyMarkup: BuildTenantRenewDurationKeyboard(service),
@@ -4118,7 +4118,7 @@ public partial class TenantBotService
             var duration = FindTenantDurationOption(service, text);
             if (duration == null)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     message.Chat.Id,
                     XuiV3PurchaseService.BuildDurationSelectionText(
                         service,
@@ -4141,7 +4141,7 @@ public partial class TenantBotService
             var plan = FindTenantUnlimitedPlan(service, text);
             if (plan == null)
             {
-                await botClient.SendTextMessageAsync(message.Chat.Id, "پلن تمدید معتبر نیست. یکی از گزینه‌های زیر را انتخاب کنید.", replyMarkup: BuildTenantRenewUnlimitedKeyboard(service, tenant), cancellationToken: cancellationToken);
+                await botClient.SendMessage(message.Chat.Id, "پلن تمدید معتبر نیست. یکی از گزینه‌های زیر را انتخاب کنید.", replyMarkup: BuildTenantRenewUnlimitedKeyboard(service, tenant), cancellationToken: cancellationToken);
                 return;
             }
 
@@ -4157,7 +4157,7 @@ public partial class TenantBotService
         {
             if (!IsConfirmText(text))
             {
-                await botClient.SendTextMessageAsync(message.Chat.Id, "برای ساخت فاکتور تمدید، گزینه تایید را بزنید یا انصراف دهید.", replyMarkup: BuildTenantRenewConfirmKeyboard(), cancellationToken: cancellationToken);
+                await botClient.SendMessage(message.Chat.Id, "برای ساخت فاکتور تمدید، گزینه تایید را بزنید یا انصراف دهید.", replyMarkup: BuildTenantRenewConfirmKeyboard(), cancellationToken: cancellationToken);
                 return;
             }
 
@@ -4167,7 +4167,7 @@ public partial class TenantBotService
                 user.LastStep = TENANTRENEWSTEPDURATION;
                 user.SelectedPeriod = string.Empty;
                 await _state.SaveUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     message.Chat.Id,
                     XuiV3PurchaseService.BuildDurationSelectionText(
                         service,
@@ -4187,7 +4187,7 @@ public partial class TenantBotService
                 user.LastStep = TENANTRENEWSTEPUNLIMITEDPLAN;
                 user.Type = string.Empty;
                 await _state.SaveUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     message.Chat.Id,
                     "پلن نامحدود انتخاب‌شده دیگر فعال نیست. پلن جدید را انتخاب کنید.",
                     replyMarkup: BuildTenantRenewUnlimitedKeyboard(service, tenant),
@@ -4428,7 +4428,7 @@ public partial class TenantBotService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 warningText,
                 parseMode: ParseMode.Html,
@@ -4516,7 +4516,7 @@ public partial class TenantBotService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 targetText,
                 parseMode: ParseMode.Html,
@@ -4524,7 +4524,7 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             "نوع فعلی اکانت را برای ادامه تمدید انتخاب کنید:",
             replyMarkup: BuildTenantRenewServiceCategoryKeyboard(candidates),
@@ -4592,7 +4592,7 @@ public partial class TenantBotService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 targetText,
                 parseMode: ParseMode.Html,
@@ -4600,7 +4600,7 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             service.IsUnlimited
                 ? "پلن تمدید نامحدود را انتخاب کنید:"
@@ -4663,7 +4663,7 @@ public partial class TenantBotService
         user.PendingUserComment = string.Empty;
         await _state.SaveUserStatus(user);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             $"نوع سرویس اکانت از اطلاعات فعلی پنل دوباره تشخیص داده شد: <b>{Html(service.DisplayName)}</b>\n" +
             "انتخاب قبلی کنار گذاشته شد. لطفاً گزینه تمدید مناسب این سرویس را انتخاب کنید.",
@@ -4971,7 +4971,7 @@ public partial class TenantBotService
             $"مبلغ قابل پرداخت: <b>{Html(price.SalePriceToman.FormatCurrency())}</b>\n\n" +
             "بعد از تایید، روش پرداخت را انتخاب می‌کنید و پس از پرداخت موفق اکانت تمدید می‌شود.";
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             text,
             parseMode: ParseMode.Html,
@@ -5111,7 +5111,7 @@ public partial class TenantBotService
         await _workflow.SaveAsync(cancellationToken);
         await _state.ClearUserStatus(user);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             BuildTenantRenewOrderPaymentChoiceText(order),
             parseMode: ParseMode.Html,
@@ -5465,7 +5465,7 @@ public partial class TenantBotService
             new[] { InlineKeyboardButton.WithCallbackData("🪟 آموزش نصب ویندوز", CUSTOMERCALLBACKPREFIX + "tutorial:" + TenantTutorialKinds.Windows) }
         };
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             TENANTTUTORIALMENUTEXT,
             replyMarkup: new InlineKeyboardMarkup(rows),
@@ -5505,7 +5505,7 @@ public partial class TenantBotService
                 assets.Kind ?? "unsupported",
                 assets.RelativeDirectory,
                 assets.Status);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 TENANTTUTORIALASSETSUNAVAILABLEMESSAGE,
                 cancellationToken: cancellationToken);
@@ -5535,7 +5535,7 @@ public partial class TenantBotService
         CancellationToken cancellationToken)
     {
         await _state.ClearUserStatus(new User { Id = message.From.Id });
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             message.Chat.Id,
             TENANTTUTORIALMANAGERDISABLEDMESSAGE,
             cancellationToken: cancellationToken);
@@ -6022,7 +6022,7 @@ public partial class TenantBotService
             ? $"به فروشگاه {tenant.BrandName ?? tenant.Username} خوش آمدید."
             : tenant.TenantWelcomeText;
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: ChatId,
             text: $"{Html(WELCOME)}\n\nبرای خرید اکانت یا دیدن تعرفه‌ها از دکمه‌های پایین استفاده کنید.",
             parseMode: ParseMode.Html,
@@ -6174,7 +6174,7 @@ public partial class TenantBotService
             return;
         }
 
-        await botClient.SendTextMessageAsync(ChatId, Text, replyMarkup: keyboard, cancellationToken: CancellationToken);
+        await botClient.SendMessage(ChatId, Text, replyMarkup: keyboard, cancellationToken: CancellationToken);
     }
 
     /// <summary>
@@ -6724,7 +6724,7 @@ public partial class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(CancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: ChatId,
                 text: BuildTenantPaymentText(order, payment),
                 parseMode: ParseMode.Html,
@@ -6741,7 +6741,7 @@ public partial class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "ساخت فاکتور ناموفق بود.", showAlert: true, cancellationToken: CancellationToken);
-            await botClient.SendTextMessageAsync(ChatId, "ساخت فاکتور پرداخت ناموفق بود. لطفاً بعداً دوباره تلاش کنید.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(ChatId, "ساخت فاکتور پرداخت ناموفق بود. لطفاً بعداً دوباره تلاش کنید.", cancellationToken: CancellationToken);
         }
     }
 
@@ -6820,7 +6820,7 @@ public partial class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(CancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 ChatId,
                 BUILDTENANTGATEWAYPAYMENTTEXT(order, "ارز دیجیتال"),
                 parseMode: ParseMode.Html,
@@ -6925,7 +6925,7 @@ public partial class TenantBotService
         _workflow.Add(order);
         await _workflow.SaveAsync(CancellationToken);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             ChatId,
             "💳 <b>پرداخت کارت‌به‌کارت فروشگاه</b>\n\n" +
             $"مبلغ دقیق: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
@@ -7030,7 +7030,7 @@ public partial class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 BuildTenantPaymentText(order, payment),
                 parseMode: ParseMode.Html,
@@ -7123,7 +7123,7 @@ public partial class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 BUILDTENANTGATEWAYPAYMENTTEXT(order, "ارز دیجیتال"),
                 parseMode: ParseMode.Html,
@@ -7221,7 +7221,7 @@ public partial class TenantBotService
         finally { gate.Dispose(); }
         if (!string.IsNullOrWhiteSpace(existingLink))
         {
-            await botClient.SendTextMessageAsync(chatId, BuildTenantAtlasPayPaymentText(order, payment), parseMode: ParseMode.Html,
+            await botClient.SendMessage(chatId, BuildTenantAtlasPayPaymentText(order, payment), parseMode: ParseMode.Html,
                 replyMarkup: BuildTenantAtlasPayPaymentKeyboard(payment), cancellationToken: cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور قبلی اطلس‌پی دوباره نمایش داده شد.", cancellationToken: cancellationToken); return;
         }
@@ -7237,7 +7237,7 @@ public partial class TenantBotService
             payment.ApplyCreate(created, DateTime.UtcNow, DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600)));
             order.AtlasPayPaymentInfoId = payment.Id; order.PaymentUrl = payment.CustomerStartLink; order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
-            await botClient.SendTextMessageAsync(chatId, BuildTenantAtlasPayPaymentText(order, payment), parseMode: ParseMode.Html,
+            await botClient.SendMessage(chatId, BuildTenantAtlasPayPaymentText(order, payment), parseMode: ParseMode.Html,
                 replyMarkup: BuildTenantAtlasPayPaymentKeyboard(payment), cancellationToken: cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور اطلس‌پی ساخته شد.", cancellationToken: cancellationToken);
         }
@@ -7469,7 +7469,7 @@ public partial class TenantBotService
 
         if (!string.IsNullOrWhiteSpace(existingPaymentLink))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 BUILDTENANTGATEWAYPAYMENTTEXT(order, "یونیک‌پی | کارمزد ۱۲٪"),
                 parseMode: ParseMode.Html,
@@ -7515,7 +7515,7 @@ public partial class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 BUILDTENANTGATEWAYPAYMENTTEXT(order, "یونیک‌پی | کارمزد ۱۲٪"),
                 parseMode: ParseMode.Html,
@@ -7742,7 +7742,7 @@ public partial class TenantBotService
 
         if (!string.IsNullOrWhiteSpace(existingPaymentLink))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 BUILDTENANTGATEWAYPAYMENTTEXT(order, "تترامیناتور"),
                 parseMode: ParseMode.Html,
@@ -7778,7 +7778,7 @@ public partial class TenantBotService
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 BUILDTENANTGATEWAYPAYMENTTEXT(order, "تترامیناتور"),
                 parseMode: ParseMode.Html,
@@ -7839,7 +7839,7 @@ public partial class TenantBotService
         await _workflow.SaveAsync(cancellationToken);
 
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             "💳 <b>پرداخت کارت‌به‌کارت تمدید</b>\n\n" +
             $"مبلغ دقیق: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
@@ -9045,7 +9045,7 @@ public partial class TenantBotService
 
         if (order == null)
         {
-            await botClient.SendTextMessageAsync(ChatId, "سفارش کارت‌به‌کارت فعالی برای ارسال رسید پیدا نشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(ChatId, "سفارش کارت‌به‌کارت فعالی برای ارسال رسید پیدا نشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -9058,7 +9058,7 @@ public partial class TenantBotService
         // eligible card order", which could silently attach the receipt to a different order opened in the meantime.
         await _state.SetPendingReceiptTargetAsync(CustomerTelegramUserId, order.Id, CancellationToken);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             ChatId,
             "لطفاً عکس رسید کارت‌به‌کارت همین سفارش را ارسال کنید.\n" +
             $"شماره سفارش: <code>{Html(order.OrderId)}</code>\n" +
@@ -9109,7 +9109,7 @@ public partial class TenantBotService
     {
         if (receiptMedia == null || string.IsNullOrWhiteSpace(receiptMedia.FileId))
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "فایل رسید معتبر نیست.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "فایل رسید معتبر نیست.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -9118,7 +9118,7 @@ public partial class TenantBotService
         {
             // A stale or forged target must fail closed, so the pointer is dropped instead of being retried forever.
             await _state.ClearPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken);
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "سفارش کارت‌به‌کارت فعالی برای این رسید پیدا نشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "سفارش کارت‌به‌کارت فعالی برای این رسید پیدا نشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -9126,7 +9126,7 @@ public partial class TenantBotService
         await PERSISTTENANTMANUALRECEIPTASYNC(order.Id, receiptMedia.FileId, CancellationToken);
         await _state.ClearPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             Message.Chat.Id,
             "✅ رسید ثبت شد و برای تایید مدیر ارسال شد.",
             cancellationToken: CancellationToken);
@@ -9279,7 +9279,7 @@ public partial class TenantBotService
         if (!string.IsNullOrWhiteSpace(provisional.SubLink))
             text += $"\n\n🔗 لینک اشتراک:\n<code>{Html(provisional.SubLink)}</code>";
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             text,
             parseMode: ParseMode.Html,
@@ -9806,7 +9806,7 @@ public partial class TenantBotService
         var orderId = Message.Text?.Trim();
         if (string.IsNullOrWhiteSpace(orderId))
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "OrderId نمی‌تواند خالی باشد. دوباره OrderId سفارش کارت‌به‌کارت را ارسال کنید.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "OrderId نمی‌تواند خالی باشد. دوباره OrderId سفارش کارت‌به‌کارت را ارسال کنید.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -9817,7 +9817,7 @@ public partial class TenantBotService
         if (order == null)
         {
             await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "سفارشی با این OrderId برای ربات فروشگاهی شما پیدا نشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "سفارشی با این OrderId برای ربات فروشگاهی شما پیدا نشد.", cancellationToken: CancellationToken);
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
             return;
         }
@@ -9825,7 +9825,7 @@ public partial class TenantBotService
         if (!string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
         {
             await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "این سفارش مربوط به پرداخت کارت‌به‌کارت همکار نیست و از این مسیر قابل تایید دستی نیست.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "این سفارش مربوط به پرداخت کارت‌به‌کارت همکار نیست و از این مسیر قابل تایید دستی نیست.", cancellationToken: CancellationToken);
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
             return;
         }
@@ -9835,7 +9835,7 @@ public partial class TenantBotService
         {
             await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
             await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "این سفارش قبلاً تایید شده بود. مشخصات اکانت فقط برای شما دوباره ارسال شد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "این سفارش قبلاً تایید شده بود. مشخصات اکانت فقط برای شما دوباره ارسال شد.", cancellationToken: CancellationToken);
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
             return;
         }
@@ -9860,11 +9860,11 @@ public partial class TenantBotService
         if (settlement.Status == NowPaymentsSettlementStatus.Applied || settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded)
         {
             await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: false, sendOwner: true, CancellationToken);
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "پرداخت کارت‌به‌کارت تایید شد، سفارش پردازش شد و مشخصات اکانت ارسال شد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "پرداخت کارت‌به‌کارت تایید شد، سفارش پردازش شد و مشخصات اکانت ارسال شد.", cancellationToken: CancellationToken);
         }
         else
         {
-            await botClient.SendTextMessageAsync(Message.Chat.Id, "تایید ثبت شد، اما ساخت اکانت موفق نبود. لاگ را بررسی کنید.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "تایید ثبت شد، اما ساخت اکانت موفق نبود. لاگ را بررسی کنید.", cancellationToken: CancellationToken);
         }
 
         await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
@@ -10129,7 +10129,7 @@ public partial class TenantBotService
 
         if (order == null)
         {
-            await botClient.SendTextMessageAsync(ChatId, "سفارش فعالی برای بررسی پیدا نشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(ChatId, "سفارش فعالی برای بررسی پیدا نشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -10161,7 +10161,7 @@ public partial class TenantBotService
             CancellationToken));
         if (order == null)
         {
-            await botClient.SendTextMessageAsync(ChatId, "سفارش پیدا نشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(ChatId, "سفارش پیدا نشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -10173,7 +10173,7 @@ public partial class TenantBotService
 
         if (IsPendingTenantCardOrder(order))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 ChatId,
                 "در انتظار پرداخت و تایید مدیر.",
                 replyMarkup: BuildTenantCardPaymentKeyboard(order),
@@ -10183,7 +10183,7 @@ public partial class TenantBotService
 
         if (string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 ChatId,
                 "پرداخت شما توسط مدیر تایید شده است، اما ساخت اکانت هنوز کامل نشده یا نیاز به تلاش مجدد دارد. لطفاً کمی صبر کنید یا با پشتیبانی فروشگاه تماس بگیرید.",
                 cancellationToken: CancellationToken);
@@ -10198,14 +10198,14 @@ public partial class TenantBotService
                 x.TenantBotOrderId == order.Id && x.TelegramUserId == CustomerTelegramUserId && x.BotId == order.TenantBotId,
                 CancellationToken));
             if (atlasPayment == null)
-            { await botClient.SendTextMessageAsync(ChatId, "فاکتور اطلس‌پی این سفارش پیدا نشد.", cancellationToken: CancellationToken); return; }
+            { await botClient.SendMessage(ChatId, "فاکتور اطلس‌پی این سفارش پیدا نشد.", cancellationToken: CancellationToken); return; }
             // Provider-traffic guard: the tenant storefront has no server callback, so each check is a real provider
             // request. The cooldown uses the last inquiry recorded by any caller, including the background worker, so
             // repeated taps by the customer cannot produce a burst of AtlasPay requests or mutate financial state.
             if (AtlasPayManualCheckPolicy.IsWithinCooldown(atlasPayment, _appConfig.AtlasPayManualCheckMinIntervalSeconds,
                     DateTime.UtcNow, out var waitSeconds))
             {
-                await botClient.SendTextMessageAsync(ChatId, $"لطفاً {waitSeconds} ثانیه دیگر دوباره بررسی کنید.",
+                await botClient.SendMessage(ChatId, $"لطفاً {waitSeconds} ثانیه دیگر دوباره بررسی کنید.",
                     cancellationToken: CancellationToken);
                 return;
             }
@@ -10221,7 +10221,7 @@ public partial class TenantBotService
                     : latest.ProviderStatus == "cancelled" ? "فاکتور اطلس‌پی لغو شده و سفارش تحویل نشد."
                     : "پرداخت اطلس‌پی رد شده و سفارش تحویل نشد.";
             else text = "پرداخت اطلس‌پی هنوز تایید نشده است.";
-            await botClient.SendTextMessageAsync(ChatId, text,
+            await botClient.SendMessage(ChatId, text,
                 replyMarkup: latest.SettlementState != AtlasPaySettlementStates.ManualReview && !AtlasPayStatuses.IsTerminal(latest.ProviderStatus)
                     ? BuildTenantPaymentKeyboard(order, latest.CustomerStartLink) : null,
                 cancellationToken: CancellationToken);
@@ -10236,7 +10236,7 @@ public partial class TenantBotService
                 CancellationToken));
             if (uniquePayment == null)
             {
-                await botClient.SendTextMessageAsync(ChatId, "فاکتور یونیک‌پی این سفارش پیدا نشد.", cancellationToken: CancellationToken);
+                await botClient.SendMessage(ChatId, "فاکتور یونیک‌پی این سفارش پیدا نشد.", cancellationToken: CancellationToken);
                 return;
             }
 
@@ -10255,7 +10255,7 @@ public partial class TenantBotService
                     uniquePayment.NextInquiryAtUtc = null;
                     uniquePayment.UpdatedAtUtc = DateTime.UtcNow;
                     await _workflow.SaveAsync(CancellationToken);
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         ChatId,
                         string.Equals(providerTerminalStatus, UniquePayStatuses.Expired, StringComparison.Ordinal)
                             ? "مهلت فاکتور یونیک‌پی این سفارش منقضی شده و سفارش تحویل نشد."
@@ -10291,7 +10291,7 @@ public partial class TenantBotService
                     return;
                 }
 
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     ChatId,
                     errorCode == "provider_not_paid"
                         ? "پرداخت یونیک‌پی هنوز تایید نشده است."
@@ -10318,7 +10318,7 @@ public partial class TenantBotService
                     order.TenantBotId,
                     order.OrderId,
                     uniquePayment.Id);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     ChatId,
                     "فعلاً امکان استعلام یونیک‌پی وجود ندارد. کمی بعد دوباره دکمه بررسی وضعیت را بزنید.",
                     replyMarkup: BuildTenantPaymentKeyboard(order, uniquePayment.PaymentLink),
@@ -10335,7 +10335,7 @@ public partial class TenantBotService
                 CancellationToken));
             if (tetraminatorPayment == null || string.IsNullOrWhiteSpace(tetraminatorPayment.PayId))
             {
-                await botClient.SendTextMessageAsync(ChatId, "فاکتور تترامیناتور این سفارش پیدا نشد.", cancellationToken: CancellationToken);
+                await botClient.SendMessage(ChatId, "فاکتور تترامیناتور این سفارش پیدا نشد.", cancellationToken: CancellationToken);
                 return;
             }
 
@@ -10363,7 +10363,7 @@ public partial class TenantBotService
                     return;
                 }
 
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     ChatId,
                     errorCode == "provider_not_paid"
                         ? $"پرداخت هنوز تایید نشده است.\nوضعیت فعلی: <code>{Html(tetraminatorPayment.PaymentStatus)}</code>"
@@ -10385,7 +10385,7 @@ public partial class TenantBotService
                     order.TenantBotId,
                     order.OrderId,
                     tetraminatorPayment.Id);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     ChatId,
                     "فعلاً امکان استعلام تترامیناتور وجود ندارد. کمی بعد دوباره دکمه بررسی وضعیت را بزنید.",
                     replyMarkup: BuildTenantPaymentKeyboard(order, tetraminatorPayment.PaymentLink),
@@ -10404,7 +10404,7 @@ public partial class TenantBotService
                 CancellationToken));
             if (CRYPTOPAYMENT == null)
             {
-                await botClient.SendTextMessageAsync(ChatId, "فاکتور پرداخت این سفارش پیدا نشد.", cancellationToken: CancellationToken);
+                await botClient.SendMessage(ChatId, "فاکتور پرداخت این سفارش پیدا نشد.", cancellationToken: CancellationToken);
                 return;
             }
 
@@ -10431,7 +10431,7 @@ public partial class TenantBotService
                 return;
             }
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 ChatId,
                 $"پرداخت هنوز تایید نشده است.\nوضعیت فعلی: <code>{Html(CRYPTOPAYMENT.PaymentStatus)}</code>",
                 parseMode: ParseMode.Html,
@@ -10441,7 +10441,7 @@ public partial class TenantBotService
         }
         if (payment == null || string.IsNullOrWhiteSpace(payment.InvoiceUid))
         {
-            await botClient.SendTextMessageAsync(ChatId, "فاکتور پرداخت این سفارش پیدا نشد.", cancellationToken: CancellationToken);
+            await botClient.SendMessage(ChatId, "فاکتور پرداخت این سفارش پیدا نشد.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -10462,7 +10462,7 @@ public partial class TenantBotService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             ChatId,
             $"پرداخت هنوز تایید نشده است.\nوضعیت فعلی: <code>{Html(payment.PaymentStatus)}</code>",
             parseMode: ParseMode.Html,
@@ -10527,7 +10527,7 @@ public partial class TenantBotService
     {
         if (settlement?.Status == NowPaymentsSettlementStatus.Applied)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 "✅ پرداخت تایید شد و مشخصات اکانت برای شما ارسال شد.",
                 cancellationToken: cancellationToken);
@@ -10540,7 +10540,7 @@ public partial class TenantBotService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             "پرداخت تایید شد، اما تکمیل سفارش با خطا روبه‌رو شد. موضوع برای بررسی ثبت شد.",
             cancellationToken: cancellationToken);
@@ -10565,7 +10565,7 @@ public partial class TenantBotService
         CancellationToken cancellationToken)
     {
         var sent = await SENDTENANTORDERACCOUNTDETAILSASYNC(order, sendCustomer: true, sendOwner: false, CancellationToken: cancellationToken);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             sent
                 ? "✅ این سفارش قبلاً تایید شده بود. مشخصات اکانت دوباره برای شما ارسال شد."
@@ -10596,7 +10596,7 @@ public partial class TenantBotService
             await _workflow.SaveAsync(CancellationToken);
         }
 
-        await botClient.SendTextMessageAsync(ChatId, "پرداخت توسط کاربر کنسل شد و سفارش بسته شد.", cancellationToken: CancellationToken);
+        await botClient.SendMessage(ChatId, "پرداخت توسط کاربر کنسل شد و سفارش بسته شد.", cancellationToken: CancellationToken);
     }
 
     /// <summary>
@@ -10667,7 +10667,7 @@ public partial class TenantBotService
             {
                 try
                 {
-                    await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
+                    await _botClientProvider.GetClient(assistant.Id).SendMessage(
                         order.OwnerTelegramUserId,
                         "مشخصات اکانت ساخته‌شده:\n\n" + _purchaseService.BuildCreatedAccountText(created),
                         parseMode: ParseMode.Html,
@@ -10748,7 +10748,7 @@ public partial class TenantBotService
         if (!string.IsNullOrWhiteSpace(created.SubLink))
         {
             using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(created.SubLink, 200));
-            await botClient.SendPhotoAsync(
+            await botClient.SendPhoto(
                 chatId: chatId,
                 photo: InputFile.FromStream(qrStream, "subscription-qr.png"),
                 caption: Text,
@@ -10757,7 +10757,7 @@ public partial class TenantBotService
             return;
         }
 
-        await botClient.SendTextMessageAsync(chatId, Text, parseMode: ParseMode.Html, cancellationToken: CancellationToken);
+        await botClient.SendMessage(chatId, Text, parseMode: ParseMode.Html, cancellationToken: CancellationToken);
     }
 
     /// <summary>
@@ -10805,7 +10805,7 @@ public partial class TenantBotService
     {
         try
         {
-            await _botClientProvider.GetClient(order.TenantBotId).SendTextMessageAsync(
+            await _botClientProvider.GetClient(order.TenantBotId).SendMessage(
                 order.CustomerChatId,
                 "پرداخت شما تایید شد، اما ساخت اکانت با خطا روبه‌رو شد. موضوع برای بررسی ثبت شد.",
                 cancellationToken: CancellationToken);
@@ -10837,7 +10837,7 @@ public partial class TenantBotService
     {
         try
         {
-            await _botClientProvider.GetClient(order.TenantBotId).SendTextMessageAsync(
+            await _botClientProvider.GetClient(order.TenantBotId).SendMessage(
                 GetTenantCustomerDeliveryChatId(order),
                 "✅ پرداخت شما تایید شد، اما پنل ساخت اکانت در این لحظه پاسخ نداد. سفارش برای تلاش مجدد ثبت شد و پس از ساخت موفق، مشخصات اکانت برای شما ارسال می‌شود.",
                 cancellationToken: CancellationToken);
@@ -11230,7 +11230,7 @@ public partial class TenantBotService
                   (string.IsNullOrWhiteSpace(settlement.WarningMessage) ? string.Empty : $"\n\n{Html(settlement.WarningMessage)}");
 
             var botClient = _botClientProvider.GetClient(_botRegistry.DefaultBot.Id);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 owner.ChatID == 0 ? owner.TelegramUserId : owner.ChatID,
                 "✅ فروش ربات فروشگاهی انجام شد.\n\n" +
                 $"ربات: @{Html(order.TenantBotUsername)}\n" +
@@ -12117,7 +12117,7 @@ public partial class TenantBotService
             return;
         }
 
-        await botClient.SendTextMessageAsync(ChatId, Text, parseMode: ParseMode, replyMarkup: keyboard, cancellationToken: CancellationToken);
+        await botClient.SendMessage(ChatId, Text, parseMode: ParseMode, replyMarkup: keyboard, cancellationToken: CancellationToken);
     }
 
     /// <summary>
@@ -12462,7 +12462,7 @@ public partial class TenantBotService
         if (stores.Count < _appConfig.TenantMaxStoresPerOwner)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("➕ افزودن فروشگاه", $"TBM:add:{DateTimeOffset.UtcNow.ToUnixTimeSeconds():X}:" + Guid.NewGuid().ToString("N")) });
         var balance = await _credentialsDbContext.GetAccountBalance(owner.TelegramUserId);
-        await client.SendTextMessageAsync(chatId,
+        await client.SendMessage(chatId,
             $"🏪 فروشگاه‌های شما ({stores.Count}/{_appConfig.TenantMaxStoresPerOwner})\n\nکیف پول مشترک مالک: {balance.FormatCurrency()} تومان\nتمام فروشگاه‌ها از یک حساب گذرگاه متعلق به شما استفاده می‌کنند.\nفروشگاه مورد نظر را انتخاب کنید.",
             replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: token);
     }
@@ -12562,11 +12562,11 @@ public partial class TenantBotService
     {
         try
         {
-            await botClient.EditMessageTextAsync(
+            await botClient.EditMessageText(
                 chatId,
                 messageId,
                 text,
-                parseMode: parseMode,
+                parseMode: parseMode ?? ParseMode.None,
                 replyMarkup: replyMarkup,
                 cancellationToken: cancellationToken);
         }
@@ -12664,7 +12664,7 @@ public partial class TenantBotService
             try
             {
                 var member = await ExecuteTenantParticipantLookupWithRetryAsync(
-                    token => botClient.GetChatMemberAsync(channel, telegramUserId, token),
+                    token => botClient.GetChatMember(channel, telegramUserId, token),
                     CancellationToken,
                     ex => _logger.LogDebug(
                         ex,
@@ -12724,7 +12724,7 @@ public partial class TenantBotService
     /// <example>
     /// <code>
     /// var member = await ExecuteTenantParticipantLookupWithRetryAsync(
-    ///     token => botClient.GetChatMemberAsync(channel, telegramUserId, token),
+    ///     token => botClient.GetChatMember(channel, telegramUserId, token),
     ///     cancellationToken);
     /// </code>
     /// </example>
@@ -12817,12 +12817,12 @@ public partial class TenantBotService
         {
             var client = _botClientProvider.GetClient(tenant.Id);
             using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
-            var me = await client.GetMeAsync(probeCts.Token);
+            var me = await client.GetMe(probeCts.Token);
             foreach (var channel in Channels)
             {
                 activeChannel = channel;
-                await client.GetChatAsync(channel, probeCts.Token);
-                var administrators = await client.GetChatAdministratorsAsync(channel, probeCts.Token);
+                await client.GetChat(channel, probeCts.Token);
+            var administrators = await client.GetChatAdministrators(channel, cancellationToken: probeCts.Token);
                 if (!administrators.Any(member => member.User.Id == me.Id))
                 {
                     var notAdmin = (false, $"ربات فروشگاهی در کانال {channel} ادمین نیست. ابتدا ربات را به کانال اضافه و admin کنید.");
@@ -13029,7 +13029,7 @@ public partial class TenantBotService
             .Append(new[] { InlineKeyboardButton.WithCallbackData("عضو شدم", CUSTOMERCALLBACKPREFIX + "joincheck") })
             .ToArray();
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             ChatId,
             PromptText ?? "برای استفاده از فروشگاه ابتدا در کانال معرفی‌شده عضو شوید و سپس دوباره تلاش کنید.",
             replyMarkup: new InlineKeyboardMarkup(rows),
@@ -13879,7 +13879,7 @@ public partial class TenantBotService
                 $"مدت نهایی: <code>{Html(renewal.FinalDurationDays <= 0 ? "نامحدود" : renewal.FinalDurationDays + " روز")}</code>\n" +
                 $"ساب‌لینک: <code>{Html(order.CreatedSubLink)}</code>";
 
-            await _botClientProvider.GetClient(order.TenantBotId).SendTextMessageAsync(
+            await _botClientProvider.GetClient(order.TenantBotId).SendMessage(
                 order.CustomerChatId,
                 text,
                 parseMode: ParseMode.Html,

@@ -8,8 +8,25 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
+/// <summary>Application message helpers preserving the existing delivery and formatting policies.</summary>
 public static class TelegramBotClientExtensions
 {
+    /// <summary>Sends a message using legacy application defaults through the v22 Telegram API.</summary>
+    /// <param name="botClient">Resolved bot client; its runtime owns its lifetime.</param>
+    /// <param name="chatId">Destination Telegram chat id.</param>
+    /// <param name="text">Required message text; preserve its selected markup.</param>
+    /// <param name="messageThreadId">Optional forum topic id.</param>
+    /// <param name="parseMode">Markup mode; defaults to the existing Markdown behavior.</param>
+    /// <param name="entities">Optional explicit Telegram text entities.</param>
+    /// <param name="disableWebPagePreview">Whether link previews are suppressed.</param>
+    /// <param name="disableNotification">Whether delivery is silent.</param>
+    /// <param name="protectContent">Whether Telegram prevents forwarding/saving the content.</param>
+    /// <param name="replyToMessageId">Message being replied to; zero means no reply.</param>
+    /// <param name="allowSendingWithoutReply">Whether a missing reply target permits delivery.</param>
+    /// <param name="replyMarkup">Optional reply or inline keyboard.</param>
+    /// <param name="cancellationToken">Cancellation forwarded to the Telegram request.</param>
+    /// <returns>The accepted Telegram message or null after a caught delivery failure.</returns>
+    /// <remarks>Maps legacy preview and reply parameters to v22 options. Existing exception swallowing is unchanged.</remarks>
     public static async Task<Message> CustomSendTextMessageAsync(
         this ITelegramBotClient botClient,
         ChatId chatId,
@@ -22,25 +39,25 @@ public static class TelegramBotClientExtensions
         bool protectContent = false,
         int replyToMessageId = 0,
         bool allowSendingWithoutReply = false,
-        IReplyMarkup replyMarkup = null,
+        ReplyMarkup replyMarkup = null,
         CancellationToken cancellationToken = default)
     {
         Message result = null;
         try
         {
-            result = await botClient.SendTextMessageAsync(
+            result = await botClient.SendMessage(
                 chatId,
                 text,
-                messageThreadId,
-                parseMode,
-                entities,
-                disableWebPagePreview,
-                disableNotification,
-                protectContent,
-                replyToMessageId,
-                allowSendingWithoutReply,
-                replyMarkup,
-                cancellationToken);
+                messageThreadId: messageThreadId,
+                parseMode: parseMode,
+                entities: entities,
+                linkPreviewOptions: new LinkPreviewOptions { IsDisabled = disableWebPagePreview },
+                disableNotification: disableNotification,
+                protectContent: protectContent,
+                replyParameters: replyToMessageId == 0 ? null : new ReplyParameters
+                { MessageId = replyToMessageId, AllowSendingWithoutReply = allowSendingWithoutReply },
+                replyMarkup: replyMarkup,
+                cancellationToken: cancellationToken);
         }
         catch (ApiRequestException ex) when (ex.ErrorCode == 403)
         {
@@ -105,13 +122,13 @@ public static class TelegramBotClientExtensions
         this ITelegramBotClient botClient,
         ChatId chatId,
         string text,
-        IReplyMarkup replyMarkup = null,
+        ReplyMarkup replyMarkup = null,
         CancellationToken cancellationToken = default)
     {
-        var result = await botClient.SendTextMessageAsync(
+        var result = await botClient.SendMessage(
             chatId: chatId,
             text: text,
-            parseMode: null,
+            parseMode: ParseMode.None,
             replyMarkup: replyMarkup,
             cancellationToken: cancellationToken);
 
@@ -132,7 +149,7 @@ public static class TelegramBotClientExtensions
         try
         {
             var normalizedFromChatId = NormalizeForwardSourceChatId(fromChatId);
-            await botClient.ForwardMessageAsync(
+            await botClient.ForwardMessage(
                 chatId: chatId,
                 fromChatId: normalizedFromChatId,
                 messageId: messageId
@@ -180,7 +197,7 @@ public static class TelegramBotClientExtensions
 
         try
         {
-            await botClient.SendMediaGroupAsync(chatId, mediaGroup);
+            await botClient.SendMediaGroup(chatId, mediaGroup);
         }
         catch (System.Exception ex)
         {

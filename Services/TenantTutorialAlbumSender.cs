@@ -51,7 +51,7 @@ namespace Adminbot.Services
         /// <remarks>
         /// <para>
         /// Batching follows <see cref="TenantTutorialAssetService.BatchForMediaGroups" />: at most ten items per album,
-        /// preserving step order. A single image uses <c>SendPhotoAsync</c> because a one-item media group is invalid.
+        /// preserving step order. A single image uses <c>SendPhoto</c> because a one-item media group is invalid.
         /// </para>
         /// <para>
         /// Only the current batch's file streams are open at any moment, and they are disposed as soon as that batch's
@@ -66,7 +66,7 @@ namespace Adminbot.Services
         /// <code>
         /// var assets = TenantTutorialAssetService.Resolve(TenantTutorialKinds.Android);
         /// if (!assets.IsAvailable)
-        ///     await botClient.SendTextMessageAsync(chatId, unavailableText, cancellationToken: cancellationToken);
+        ///     await botClient.SendMessage(chatId, unavailableText, cancellationToken: cancellationToken);
         /// else
         ///     await TenantTutorialAlbumSender.SendAsync(botClient, chatId, assets, logger, cancellationToken);
         /// </code>
@@ -137,7 +137,7 @@ namespace Adminbot.Services
                 if (batch.Count == 1)
                 {
                     // A one-item media group is rejected by Telegram, so a single image is sent as a normal photo.
-                    await botClient.SendPhotoAsync(
+                    await botClient.SendPhoto(
                         chatId: chatId,
                         photo: InputFile.FromStream(streams[0], Path.GetFileName(batch[0])),
                         caption: caption,
@@ -157,7 +157,7 @@ namespace Adminbot.Services
                     });
                 }
 
-                await botClient.SendMediaGroupAsync(
+                await botClient.SendMediaGroup(
                     chatId: chatId,
                     media: media,
                     cancellationToken: cancellationToken);

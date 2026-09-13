@@ -177,7 +177,7 @@ public sealed partial class ConcurrencyTests
             Data = $"gw:{revision}:{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}:{action}:{target}",
             Message = new Message
             {
-                MessageId = 77,
+                Id = 77,
                 Date = DateTime.UtcNow,
                 Chat = new Chat { Id = actor, Type = Telegram.Bot.Types.Enums.ChatType.Private }
             }
@@ -216,21 +216,25 @@ public sealed partial class ConcurrencyTests
         public List<SendMessageRequest> Sends { get; } = new();
         public Exception? EditException { get; set; }
         public bool LocalBotServer => false;
-        public long? BotId => 12345;
+        public long BotId => 12345;
         public TimeSpan Timeout { get; set; }
         public IExceptionParser ExceptionsParser { get; set; } = null!;
         public event AsyncEventHandler<ApiRequestEventArgs>? OnMakingApiRequest { add { } remove { } }
         public event AsyncEventHandler<ApiResponseEventArgs>? OnApiResponseReceived { add { } remove { } }
-        public Task<bool> TestApiAsync(CancellationToken cancellationToken = default) => Task.FromResult(true);
-        public Task DownloadFileAsync(string filePath, Stream destination, CancellationToken cancellationToken = default) => Task.CompletedTask;
-        public Task<TResponse> MakeRequestAsync<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+        public Task<bool> TestApi(CancellationToken cancellationToken = default) => Task.FromResult(true);
+        /// <inheritdoc />
+        public Task DownloadFile(Telegram.Bot.Types.TGFile file, Stream destination, CancellationToken cancellationToken = default)
+            => DownloadFile(file.FilePath!, destination, cancellationToken);
+
+        public Task DownloadFile(string filePath, Stream destination, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
         {
             if (request is EditMessageTextRequest edit)
             {
                 EditAttempts.Add(edit);
                 if (EditException != null)
                     throw EditException;
-                return Task.FromResult((TResponse)(object)new Message { MessageId = edit.MessageId, Chat = new Chat { Id = 1 } });
+                return Task.FromResult((TResponse)(object)new Message { Id = edit.MessageId, Chat = new Chat { Id = 1 } });
             }
             if (request is AnswerCallbackQueryRequest answer)
             {
@@ -240,7 +244,7 @@ public sealed partial class ConcurrencyTests
             if (request is SendMessageRequest send)
             {
                 Sends.Add(send);
-                return Task.FromResult((TResponse)(object)new Message { MessageId = 1, Chat = new Chat { Id = 1 } });
+                return Task.FromResult((TResponse)(object)new Message { Id = 1, Chat = new Chat { Id = 1 } });
             }
             throw new InvalidOperationException($"Unexpected Telegram request in gateway callback test: {request.GetType().Name}");
         }

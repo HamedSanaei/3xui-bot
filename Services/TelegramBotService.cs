@@ -1240,7 +1240,7 @@ public partial class TelegramBotService
 
 
                     //await botClient.SendImagesWithCaptionAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg)
-                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                    await botClient.SendPhoto(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
                     // .GetAwaiter()
                     // .GetResult();
 
@@ -1497,7 +1497,7 @@ public partial class TelegramBotService
 
                     // Send the photo with caption
 
-                    await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                    await botClient.SendPhoto(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
                     // .GetAwaiter()
                     // .GetResult();
                     await _state.ClearUserStatus(new User { Id = user.Id });
@@ -2280,7 +2280,7 @@ public partial class TelegramBotService
 
                 if (allUsers.Count == 0)
                 {
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         message.Chat.Id,
                         $"هیچ گیرنده‌ای برای ارسال پیام عمومی به «{audienceLabel}» پیدا نشد.",
                         replyMarkup: GetMainMenuKeyboard());
@@ -2537,7 +2537,7 @@ public partial class TelegramBotService
         {
             try
             {
-                await botClient.EditMessageTextAsync(
+                await botClient.EditMessageText(
                     chatId,
                     sourceMessageId.Value,
                     "✅ به منوی شارژ کیف پول هدایت شدید.",
@@ -2741,14 +2741,14 @@ public partial class TelegramBotService
 
             if (messageId.HasValue)
             {
-                await ActiveBotClient.EditMessageTextAsync(
+                await ActiveBotClient.EditMessageText(
                     chatId: chatId,
                     messageId: messageId.Value,
                     text: "ارسال پیام عمومی لغو شد.",
                     cancellationToken: cancellationToken);
             }
 
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 chatId: chatId,
                 text: "Admin:",
                 replyMarkup: GetAdminKeyboard(),
@@ -2768,7 +2768,7 @@ public partial class TelegramBotService
         var audienceLabel = GetBroadcastAudienceLabel(audience);
         if (messageId.HasValue)
         {
-            await ActiveBotClient.EditMessageTextAsync(
+            await ActiveBotClient.EditMessageText(
                 chatId: chatId,
                 messageId: messageId.Value,
                 text: $"مخاطب انتخاب شد: <b>{Html(audienceLabel)}</b>\n\nحالا متن پیام یا لینک پست کانال را ارسال کنید.",
@@ -2776,7 +2776,7 @@ public partial class TelegramBotService
                 cancellationToken: cancellationToken);
         }
 
-        await ActiveBotClient.SendTextMessageAsync(
+        await ActiveBotClient.SendMessage(
             chatId: chatId,
             text: "Type your message and Send it:",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -2791,7 +2791,7 @@ public partial class TelegramBotService
     private async Task SendWalletLedgerAsync(ITelegramBotClient botClient, ChatId chatId, long telegramUserId, int page, CancellationToken cancellationToken)
     {
         var (items, totalCount) = await _walletLedgerService.GetPageAsync(telegramUserId, page, 8, cancellationToken);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             BuildWalletLedgerListText(items, totalCount, page),
             parseMode: ParseMode.Html,
@@ -2809,7 +2809,7 @@ public partial class TelegramBotService
         if (parts.Length >= 3 && parts[1] == "page" && int.TryParse(parts[2], out var page))
         {
             var (items, totalCount) = await _walletLedgerService.GetPageAsync(callbackQuery.From.Id, page, 8, cancellationToken);
-            await botClient.EditMessageTextAsync(
+            await botClient.EditMessageText(
                 chatId,
                 callbackQuery.Message.MessageId,
                 BuildWalletLedgerListText(items, totalCount, page),
@@ -2829,7 +2829,7 @@ public partial class TelegramBotService
                 return;
             }
 
-            await botClient.EditMessageTextAsync(
+            await botClient.EditMessageText(
                 chatId,
                 callbackQuery.Message.MessageId,
                 BuildWalletLedgerDetailText(entry),
@@ -2846,7 +2846,7 @@ public partial class TelegramBotService
 
         if (parts.Length >= 2 && parts[1] == "home")
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 "منوی اصلی",
                 replyMarkup: MainReplyMarkupKeyboardFa(),
@@ -2948,7 +2948,7 @@ public partial class TelegramBotService
         Message statusMessage = null;
         try
         {
-            statusMessage = await botClient.SendTextMessageAsync(
+            statusMessage = await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"در حال آماده‌سازی ارسال عمومی برای <code>{allUsers.Count}</code> کاربر...",
                 parseMode: ParseMode.Html,
@@ -2964,7 +2964,7 @@ public partial class TelegramBotService
 
             await _broadcastManager.RefreshStatusMessageAsync(job.Id, cancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "ارسال عمومی شروع شد. وضعیت را از پیام بالا پیگیری کنید.",
                 replyMarkup: GetMainMenuKeyboard(),
@@ -2976,7 +2976,7 @@ public partial class TelegramBotService
             var errorText = $"شروع ارسال عمومی با خطا روبه‌رو شد:\n<code>{Html(ex.Message)}</code>";
             if (statusMessage != null)
             {
-                await botClient.EditMessageTextAsync(
+                await botClient.EditMessageText(
                     chatId: message.Chat.Id,
                     messageId: statusMessage.MessageId,
                     text: errorText,
@@ -2985,7 +2985,7 @@ public partial class TelegramBotService
             }
             else
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: errorText,
                     parseMode: ParseMode.Html,
@@ -3547,7 +3547,7 @@ public partial class TelegramBotService
         ITelegramBotClient botClient,
         Message message,
         CredUser credUser,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (message?.Text == null)
@@ -3576,7 +3576,7 @@ public partial class TelegramBotService
         if (payment == null)
         {
             Console.WriteLine($"[NOWPayments ReturnUrl] no pending crypto payment found. user={telegramUserId}");
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: isCancel
                     ? "پرداخت در حال انتظاری برای بستن پیدا نشد. اگر قبلاً کنسل شده باشد، نیازی به اقدام دوباره نیست."
@@ -3592,7 +3592,7 @@ public partial class TelegramBotService
             payment.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "پرداخت توسط کاربر کنسل شد و فاکتور مربوطه در درگاه پرداخت به صورت بسته شده درآمد.",
                 replyMarkup: mainReplyMarkup,
@@ -3600,7 +3600,7 @@ public partial class TelegramBotService
             return true;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "پرداخت از سمت درگاه پرداخت تایید شد.\nدر حال بررسی وضعیت پرداخت از NOWPayments هستم...",
             cancellationToken: cancellationToken);
@@ -3683,7 +3683,7 @@ public partial class TelegramBotService
         int messageId,
         long actorUserId,
         string source,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (payment.IsAddedToBalance)
@@ -4446,7 +4446,7 @@ public partial class TelegramBotService
                 },
                 cancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"لاگ رفتار کاربران روشن شد.\nسطح فعلی: {_userActivityLog.CurrentLevel}\nفایل: {_userActivityLog.CurrentFilePath}",
                 cancellationToken: cancellationToken);
@@ -4469,7 +4469,7 @@ public partial class TelegramBotService
                 cancellationToken);
 
             _userActivityLog.SetEnabled(false);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "لاگ رفتار کاربران خاموش شد. برای روشن کردن دوباره از /userlog_on استفاده کنید.",
                 cancellationToken: cancellationToken);
@@ -4480,7 +4480,7 @@ public partial class TelegramBotService
             text.Equals("/userlog status", StringComparison.OrdinalIgnoreCase) ||
             text.Equals("/userlog", StringComparison.OrdinalIgnoreCase))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"وضعیت لاگ رفتار کاربران:\nفعال: {_userActivityLog.IsEnabled}\nسطح: {_userActivityLog.CurrentLevel}\nفایل: {_userActivityLog.CurrentFilePath}\n\nفرمان‌ها:\n/userlog_on\n/userlog_off\n/userlog_level_error\n/userlog_level_warning\n/userlog_level_info\n/userlog_level_debug",
                 cancellationToken: cancellationToken);
@@ -4497,7 +4497,7 @@ public partial class TelegramBotService
         {
             if (!_userActivityLog.TrySetLevel(level, out var normalizedLevel))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "سطح لاگ معتبر نیست. یکی از این مقدارها را بفرستید: error, warning, info, debug",
                     cancellationToken: cancellationToken);
@@ -4516,14 +4516,14 @@ public partial class TelegramBotService
                 },
                 cancellationToken);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"سطح لاگ روی {normalizedLevel} تنظیم شد.",
                 cancellationToken: cancellationToken);
             return true;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "فرمان لاگ نامعتبر است. برای دیدن راهنما /userlog_status را بفرستید.",
             cancellationToken: cancellationToken);
@@ -4712,7 +4712,7 @@ public partial class TelegramBotService
 
         foreach (var chunk in SplitTelegramPlainText(report, 3800))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: chunk,
                 replyMarkup: GetMainMenuKeyboard(),
@@ -4736,7 +4736,7 @@ public partial class TelegramBotService
         ChatId chatId,
         CancellationToken cancellationToken)
     {
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             BuildPaymentGatewayPanelText(),
             parseMode: ParseMode.Html,
@@ -4951,7 +4951,7 @@ public partial class TelegramBotService
             return;
         try
         {
-            await ActiveBotClient.EditMessageTextAsync(
+            await ActiveBotClient.EditMessageText(
                 callbackQuery.Message.Chat.Id,
                 callbackQuery.Message.MessageId,
                 BuildPaymentGatewayPanelText(),
@@ -5593,7 +5593,7 @@ public partial class TelegramBotService
                 cancellationToken);
             var png = _usageReportChartRenderer.RenderCompletedPeriod(report, includeSales: false);
             await using var imageStream = new MemoryStream(png, writable: false);
-            var sentMessage = await botClient.SendPhotoAsync(
+            var sentMessage = await botClient.SendPhoto(
                 chatId: message.Chat.Id,
                 photo: InputFile.FromStream(
                     imageStream,
@@ -5627,7 +5627,7 @@ public partial class TelegramBotService
                 message.From.Id,
                 BotContextAccessor.CurrentBotId,
                 dayCount);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "دریافت آمار در حال حاضر با خطا روبه‌رو شد. جزئیات برای بررسی ثبت شد؛ لطفاً کمی بعد دوباره تلاش کنید.",
                 replyMarkup: GetAdminKeyboard(),
@@ -6858,7 +6858,7 @@ public partial class TelegramBotService
                         if (!string.IsNullOrWhiteSpace(nowPayment.invoice_url))
                         {
                             using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(nowPayment.invoice_url, 200));
-                            latestMsg = await botClient.SendPhotoAsync(
+                            latestMsg = await botClient.SendPhoto(
                                 message.Chat.Id,
                                 InputFile.FromStream(qrStream),
                                 caption: msg,
@@ -7583,11 +7583,11 @@ public partial class TelegramBotService
 
 
         // if (payment_status == "finished")
-        await botClient.EditMessageReplyMarkupAsync(
+        await botClient.EditMessageReplyMarkup(
                   chatId: chatid,
                   messageId: messageId,
                   replyMarkup: paid);
-        // else await botClient.EditMessageReplyMarkupAsync(
+        // else await botClient.EditMessageReplyMarkup(
         // chatId: chatid,
         // messageId: messageId,
         // replyMarkup: notpaid,
@@ -7701,7 +7701,7 @@ public partial class TelegramBotService
 
                 var msg = CaptionForRenewAccount(user, expirationDateUTC: client.ExpiryTime, showTraffic: false);
 
-                await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                await botClient.SendPhoto(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
                 // .GetAwaiter()
                 // .GetResult();
 
@@ -7857,7 +7857,7 @@ public partial class TelegramBotService
 
                 var msg = CaptionForAccountCreation(user, language: "fa", showTraffic: false);
 
-                await botClient.SendPhotoAsync(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                await botClient.SendPhoto(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
                 // .GetAwaiter()
                 // .GetResult();
 
@@ -8074,7 +8074,7 @@ public partial class TelegramBotService
                 if (string.IsNullOrWhiteSpace(channelId)) return false;
                 try
                 {
-                    var member = await ActiveBotClient.GetChatMemberAsync(
+                    var member = await ActiveBotClient.GetChatMember(
                         channelId, userId, cancellationToken: bounded.Token);
                     if (member == null || member.Status is ChatMemberStatus.Left or ChatMemberStatus.Kicked)
                         return false;
@@ -8297,7 +8297,7 @@ public partial class TelegramBotService
         // Send any remaining info
         if (messageBuilder.Length > 0)
         {
-            await ActiveBotClient.SendTextMessageAsync(chatId, messageBuilder.ToString().EscapeMarkdown(), parseMode: ParseMode.Markdown);
+            await ActiveBotClient.SendMessage(chatId, messageBuilder.ToString().EscapeMarkdown(), parseMode: ParseMode.Markdown);
         }
     }
 
@@ -8512,7 +8512,7 @@ public partial class TelegramBotService
 
         try
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId.Value,
                 text: "ارتباط با پنل یا تلگرام بیش از حد طول کشید. لطفاً چند دقیقه دیگر دوباره تلاش کنید.",
                 replyMarkup: MainReplyMarkupKeyboardFa(),
@@ -8551,7 +8551,7 @@ public partial class TelegramBotService
 
         try
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId.Value,
                 text: "انجام درخواست با خطا روبه‌رو شد. لطفاً دوباره تلاش کنید یا از منوی اصلی ادامه دهید.",
                 replyMarkup: MainReplyMarkupKeyboardFa(),
@@ -9117,7 +9117,7 @@ public partial class TelegramBotService
             if (!string.IsNullOrWhiteSpace(payment.PaymentUrl))
             {
                 using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(payment.PaymentUrl, 200));
-                latestMsg = await ActiveBotClient.SendPhotoAsync(
+                latestMsg = await ActiveBotClient.SendPhoto(
                     message.Chat.Id,
                     InputFile.FromStream(qrStream),
                     caption: msg,
@@ -9204,14 +9204,14 @@ public partial class TelegramBotService
     {
         if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
         {
-            await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, "درگاه اطلس‌پی در حال حاضر غیرفعال است.",
+            await ActiveBotClient.SendMessage(message.Chat.Id, "درگاه اطلس‌پی در حال حاضر غیرفعال است.",
                 replyMarkup: BuildChargePaymentMethodKeyboard(), cancellationToken: cancellationToken);
             return;
         }
         var amount = long.TryParse(user.ConfigLink, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) ? parsed : 0;
         if (amount <= 0)
         {
-            await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, "مبلغ پرداخت معتبر نیست.",
+            await ActiveBotClient.SendMessage(message.Chat.Id, "مبلغ پرداخت معتبر نیست.",
                 replyMarkup: BuildChargePaymentMethodKeyboard(), cancellationToken: cancellationToken);
             return;
         }
@@ -9240,11 +9240,11 @@ public partial class TelegramBotService
                 new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | ریالی", payment.CustomerStartLink) },
                 new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", $"apchk_{payment.Id}") }
             });
-            var sent = await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, text, parseMode: ParseMode.Html,
+            var sent = await ActiveBotClient.SendMessage(message.Chat.Id, text, parseMode: ParseMode.Html,
                 replyMarkup: keyboard, cancellationToken: cancellationToken);
             payment.TelMsgId = sent.MessageId;
             await _workflow.SaveAsync(cancellationToken);
-            await ActiveBotClient.SendTextMessageAsync(message.Chat.Id, "منوی اصلی", replyMarkup: MainReplyMarkupKeyboardFa(),
+            await ActiveBotClient.SendMessage(message.Chat.Id, "منوی اصلی", replyMarkup: MainReplyMarkupKeyboardFa(),
                 cancellationToken: cancellationToken);
         }
         catch (Exception ex)
@@ -9257,7 +9257,7 @@ public partial class TelegramBotService
             await _workflow.SaveAsync(cancellationToken);
             _logger.LogWarning("AtlasPay create attempt ended without a usable invoice. paymentId={PaymentId}, botId={BotId}, definitive={Definitive}, errorType={ErrorType}",
                 payment.Id, payment.BotId, definitive, ex.GetType().Name);
-            await ActiveBotClient.SendTextMessageAsync(message.Chat.Id,
+            await ActiveBotClient.SendMessage(message.Chat.Id,
                 definitive ? "ساخت فاکتور اطلس‌پی ناموفق بود. لطفاً از درگاه دیگری استفاده کنید."
                     : "نتیجه ساخت فاکتور اطلس‌پی نامشخص است. برای جلوگیری از صدور فاکتور تکراری، درخواست ساخت دوباره ارسال نخواهد شد و موضوع نیازمند بررسی است.",
                 replyMarkup: MainReplyMarkupKeyboardFa(), cancellationToken: cancellationToken);
@@ -9313,7 +9313,7 @@ public partial class TelegramBotService
         else if (AtlasPayStatuses.IsTerminal(latest.ProviderStatus))
             text = latest.ProviderStatus == "expired" ? "مهلت این پرداخت منقضی شده است." : latest.ProviderStatus == "cancelled" ? "این پرداخت لغو شده است." : "این پرداخت توسط اطلس‌پی رد شده است.";
         else text = "پرداخت هنوز تایید نشده است.";
-        await ActiveBotClient.SendTextMessageAsync(callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id, text,
+        await ActiveBotClient.SendMessage(callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id, text,
             replyMarkup: !AtlasPayStatuses.IsTerminal(latest.ProviderStatus) && latest.SettlementState != AtlasPaySettlementStates.ManualReview && !latest.IsAddedToBalance
                 ? new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"apchk_{payment.Id}") } }) : MainReplyMarkupKeyboardFa(),
             cancellationToken: cancellationToken);
@@ -9344,7 +9344,7 @@ public partial class TelegramBotService
     {
         if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay))
         {
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 "درگاه یونیک‌پی در حال حاضر غیرفعال است.",
                 replyMarkup: BuildChargePaymentMethodKeyboard(),
@@ -9361,7 +9361,7 @@ public partial class TelegramBotService
             user.Flow = "charge";
             user.PaymentMethod = string.Empty;
             await _state.SaveUserStatus(user);
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 UniquePayAmountPolicy.BuildUserMessage(),
                 replyMarkup: BuildChargePaymentMethodKeyboard(),
@@ -9414,7 +9414,7 @@ public partial class TelegramBotService
                 new[] { InlineKeyboardButton.WithUrl("پرداخت با یونیک‌پی | ریالی", payment.PaymentLink) },
                 new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت", $"upchk_{payment.Id}") }
             });
-            var sent = await ActiveBotClient.SendTextMessageAsync(
+            var sent = await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 text,
                 parseMode: ParseMode.Html,
@@ -9422,7 +9422,7 @@ public partial class TelegramBotService
                 cancellationToken: cancellationToken);
             payment.TelMsgId = sent.MessageId;
             await _workflow.SaveAsync(cancellationToken);
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 "منوی اصلی",
                 replyMarkup: MainReplyMarkupKeyboardFa(),
@@ -9462,7 +9462,7 @@ public partial class TelegramBotService
                 payment.Id,
                 amount,
                 payment.ErrorCode);
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 definitiveFailure
                     ? "ساخت فاکتور یونیک‌پی ناموفق بود. مشکل برای مدیر سیستم ثبت شد؛ لطفاً از درگاه دیگری استفاده کنید."
@@ -9533,7 +9533,7 @@ public partial class TelegramBotService
         var canRetry = settlement.Status == NowPaymentsSettlementStatus.ProviderNotPaid &&
                        !UniquePayStatuses.IsTerminal(latest?.PaymentStatus) &&
                        !string.Equals(latest?.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal);
-        await ActiveBotClient.SendTextMessageAsync(
+        await ActiveBotClient.SendMessage(
             callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
             text,
             replyMarkup: canRetry
@@ -9610,7 +9610,7 @@ public partial class TelegramBotService
         if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) ||
             amount < _appConfig.TetraminatorMinimumAmountToman)
         {
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator)
                     ? "درگاه تترامیناتور در حال حاضر غیرفعال است."
@@ -9655,7 +9655,7 @@ public partial class TelegramBotService
                 new[] { InlineKeyboardButton.WithUrl("پرداخت با تترامیناتور | ریالی", payment.PaymentLink) },
                 new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت", $"tmchk_{payment.Id}") }
             });
-            var sent = await ActiveBotClient.SendTextMessageAsync(
+            var sent = await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 text,
                 parseMode: ParseMode.Html,
@@ -9663,7 +9663,7 @@ public partial class TelegramBotService
                 cancellationToken: cancellationToken);
             payment.TelMsgId = sent.MessageId;
             await _workflow.SaveAsync(cancellationToken);
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 "منوی اصلی",
                 replyMarkup: MainReplyMarkupKeyboardFa(),
@@ -9685,7 +9685,7 @@ public partial class TelegramBotService
                 credUser.TelegramUserId,
                 payment.Id,
                 amount);
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 "ساخت فاکتور تترامیناتور ناموفق بود. لطفاً کمی بعد دوباره تلاش کنید.",
                 replyMarkup: MainReplyMarkupKeyboardFa(),
@@ -9724,7 +9724,7 @@ public partial class TelegramBotService
             var verified = await RefreshTetraminatorPaymentAsync(payment, cancellationToken);
             if (!verified)
             {
-                await ActiveBotClient.SendTextMessageAsync(
+                await ActiveBotClient.SendMessage(
                     callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
                     payment.ErrorCode == "provider_not_paid"
                         ? $"پرداخت هنوز تایید نشده است.\nوضعیت: <code>{Html(payment.PaymentStatus)}</code>"
@@ -9745,7 +9745,7 @@ public partial class TelegramBotService
                 : settlement.Status == NowPaymentsSettlementStatus.AlreadyAdded
                     ? "این پرداخت قبلاً تایید و به کیف پول شما اضافه شده است."
                     : "پرداخت تایید شد، اما اعمال موجودی کامل نشد. موضوع برای بررسی ثبت شد.";
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
                 resultText,
                 replyMarkup: MainReplyMarkupKeyboardFa(),
@@ -9754,7 +9754,7 @@ public partial class TelegramBotService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Tetraminator customer inquiry failed. paymentId={PaymentId}, userId={UserId}", payment.Id, callbackQuery.From.Id);
-            await ActiveBotClient.SendTextMessageAsync(
+            await ActiveBotClient.SendMessage(
                 callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
                 "فعلاً امکان استعلام تترامیناتور وجود ندارد. کمی بعد دوباره تلاش کنید.",
                 replyMarkup: new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"tmchk_{payment.Id}") } }),
@@ -10491,7 +10491,7 @@ public partial class TelegramBotService
             ? "پشتیبانی این ربات تنظیم نشده است."
             : support;
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: $"به علت تخلف مسدود شدید و امکان استفاده از ربات را ندارید.\nبرای پیگیری می‌توانید به پشتیبانی تلگرام پیام بدهید:\n{supportText}",
             parseMode: ParseMode.Html,

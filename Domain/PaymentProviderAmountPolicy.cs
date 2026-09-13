@@ -69,7 +69,7 @@ public static class HooshPayAmountPolicy
     /// <example>
     /// <code>
     /// if (!HooshPayAmountPolicy.IsValid(amountToman))
-    ///     await bot.SendTextMessageAsync(chatId, HooshPayAmountPolicy.BuildUserMessage());
+    ///     await bot.SendMessage(chatId, HooshPayAmountPolicy.BuildUserMessage());
     /// </code>
     /// </example>
     public static string BuildUserMessage()
@@ -135,7 +135,7 @@ public static class UniquePayAmountPolicy
     /// <example>
     /// <code>
     /// if (!UniquePayAmountPolicy.IsValid(amountToman))
-    ///     await bot.SendTextMessageAsync(chatId, UniquePayAmountPolicy.BuildUserMessage());
+    ///     await bot.SendMessage(chatId, UniquePayAmountPolicy.BuildUserMessage());
     /// </code>
     /// </example>
     public static string BuildUserMessage()

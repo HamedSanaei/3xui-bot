@@ -715,7 +715,7 @@ public sealed partial class ConcurrencyTests
         await using var scope = provider.CreateAsyncScope();
         var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
         var method = typeof(TenantBotService).GetMethod("CreateTenantAtlasPayInvoiceAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        var callback = new CallbackQuery { Id="atlas-create", From=new Telegram.Bot.Types.User { Id=722 }, Message=new Message { MessageId=1, Chat=new Chat { Id=722 } } };
+        var callback = new CallbackQuery { Id="atlas-create", From=new Telegram.Bot.Types.User { Id=722 }, Message=new Message { Id =1, Chat=new Chat { Id=722 } } };
         var selection = new XuiV3PurchaseSelection { ServiceKey="normal", TrafficGb=10, DurationKey="m1", AccountCount=1 };
         await (Task)method.Invoke(service, new object[] { client, callback, tenant, customer!, selection, CancellationToken.None })!;
 
@@ -1021,7 +1021,7 @@ public sealed partial class ConcurrencyTests
             var method = typeof(TenantBotService).GetMethod("CreateTenantAtlasPayInvoiceForExistingOrderAsync",
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
             var callback = new CallbackQuery { Id="atlas-renew-create", From=new Telegram.Bot.Types.User { Id=722 },
-                Message=new Message { MessageId=1, Chat=new Chat { Id=722 } } };
+                Message=new Message { Id =1, Chat=new Chat { Id=722 } } };
             await (Task)method.Invoke(service, new object[] { telegram, callback, tenant, customer!, orderId, CancellationToken.None })!;
             Assert.True(prePersisted); Assert.Equal(1, atlasCreatePosts);
             int paymentId;
@@ -1176,7 +1176,7 @@ public sealed partial class ConcurrencyTests
         var method = typeof(TelegramBotService).GetMethod("ProcessAtlasPayPaymentCallbackAsync",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
         var callback = new CallbackQuery { Id="apchk-cross-user", Data=$"apchk_{paymentId}",
-            From=new Telegram.Bot.Types.User { Id=723 }, Message=new Message { MessageId=1, Chat=new Chat { Id=723 } } };
+            From=new Telegram.Bot.Types.User { Id=723 }, Message=new Message { Id =1, Chat=new Chat { Id=723 } } };
         await (Task)method.Invoke(service, new object[] { callback, CancellationToken.None })!;
         Assert.Contains("فاکتور اطلس‌پی پیدا نشد.", client.Answers);
         await using var verify = databases.Users.CreateDbContext();
@@ -1226,7 +1226,7 @@ public sealed partial class ConcurrencyTests
         var method = typeof(TelegramBotService).GetMethod("ProcessAtlasPayPaymentCallbackAsync",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
         var callback = new CallbackQuery { Id="apchk-cross-bot", Data=$"apchk_{paymentId}",
-            From=new Telegram.Bot.Types.User { Id=722 }, Message=new Message { MessageId=1, Chat=new Chat { Id=722 } } };
+            From=new Telegram.Bot.Types.User { Id=722 }, Message=new Message { Id =1, Chat=new Chat { Id=722 } } };
         await (Task)method.Invoke(service, new object[] { callback, CancellationToken.None })!;
         Assert.Contains("فاکتور اطلس‌پی پیدا نشد.", client.Answers);
         await using var verify = databases.Users.CreateDbContext();
@@ -1284,7 +1284,7 @@ public sealed partial class ConcurrencyTests
         var method = typeof(TelegramBotService).GetMethod("ProcessAtlasPayPaymentCallbackAsync",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
         var callback = new CallbackQuery { Id="apchk-cross-tenant", Data=$"apchk_{paymentId}",
-            From=new Telegram.Bot.Types.User { Id=722 }, Message=new Message { MessageId=1, Chat=new Chat { Id=722 } } };
+            From=new Telegram.Bot.Types.User { Id=722 }, Message=new Message { Id =1, Chat=new Chat { Id=722 } } };
         await (Task)method.Invoke(service, new object[] { callback, CancellationToken.None })!;
         Assert.Contains("فاکتور اطلس‌پی پیدا نشد.", client.Answers);
         await using var verify = databases.Users.CreateDbContext();
@@ -1783,7 +1783,7 @@ public sealed partial class ConcurrencyTests
             var method = typeof(TenantBotService).GetMethod("CreateTenantAtlasPayInvoiceAsync",
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
             var callback = new CallbackQuery { Id="switch-reject", From=new Telegram.Bot.Types.User { Id=722 },
-                Message=new Message { MessageId=1, Chat=new Chat { Id=722 } } };
+                Message=new Message { Id =1, Chat=new Chat { Id=722 } } };
             var selection = new XuiV3PurchaseSelection { ServiceKey="normal", TrafficGb=10, DurationKey="m1", AccountCount=1 };
             await (Task)method.Invoke(service, new object[] { client, callback, tenant, customer!, selection, CancellationToken.None })!;
             Assert.Contains(client.Answers, x => x.Contains(scenario.Expected, StringComparison.Ordinal));

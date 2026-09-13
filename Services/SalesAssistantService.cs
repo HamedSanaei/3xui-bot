@@ -94,7 +94,7 @@ public class SalesAssistantService
 
         if (update.Message is { } Message)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 Message.Chat.Id,
                 "ربات دستیار فروش فعال است.\nاعلان فروش‌ها و رسیدهای کارت‌به‌کارت اینجا نمایش داده می‌شود.",
                 cancellationToken: CancellationToken);
@@ -139,7 +139,7 @@ public class SalesAssistantService
             $"💳 موجودی قبل: <code>{Html(beforeBalance.FormatCurrency())}</code>\n" +
             $"💳 موجودی بعد: <code>{Html(afterBalance.FormatCurrency())}</code>\n" +
             $"📦 اکانت: <code>{Html(order.CreatedAccountEmail)}</code>";
-        var sent = await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
+        var sent = await _botClientProvider.GetClient(assistant.Id).SendMessage(
             order.OwnerTelegramUserId, text, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
         return sent.MessageId;
     }
@@ -200,14 +200,14 @@ public class SalesAssistantService
         try
         {
             var TENANTCLIENT = _botClientProvider.GetClient(receipt.TenantBotId);
-            var TELEGRAMFILE = await TENANTCLIENT.GetFileAsync(receipt.PhotoFileId, CancellationToken);
+            var TELEGRAMFILE = await TENANTCLIENT.GetFile(receipt.PhotoFileId, CancellationToken);
             await using var PHOTOSTREAM = new MemoryStream();
             // Telegram file ids received by A tenant Bot can fail when REUSED by the assistant Bot,
             // so the assistant always UPLOADS A FRESH Stream instead of forwarding the Original file Id.
-            await TENANTCLIENT.DownloadFileAsync(TELEGRAMFILE.FilePath, PHOTOSTREAM, CancellationToken);
+            await TENANTCLIENT.DownloadFile(TELEGRAMFILE.FilePath, PHOTOSTREAM, CancellationToken);
             PHOTOSTREAM.Position = 0;
 
-            var sent = await _botClientProvider.GetClient(assistant.Id).SendPhotoAsync(
+            var sent = await _botClientProvider.GetClient(assistant.Id).SendPhoto(
                 chatId: receipt.OwnerTelegramUserId,
                 photo: InputFile.FromStream(PHOTOSTREAM, $"tenant-receipt-{receipt.Id}.JPG"),
                 caption: Text,
@@ -267,7 +267,7 @@ public class SalesAssistantService
 
         try
         {
-            var sent = await _botClientProvider.GetClient(assistant.Id).SendTextMessageAsync(
+            var sent = await _botClientProvider.GetClient(assistant.Id).SendMessage(
                 chatId: receipt.OwnerTelegramUserId,
                 text: fallbackText,
                 parseMode: ParseMode.Html,
@@ -601,7 +601,7 @@ public class SalesAssistantService
     {
         try
         {
-            await botClient.EditMessageReplyMarkupAsync(chatId, messageId, replyMarkup, CancellationToken);
+        await botClient.EditMessageReplyMarkup(chatId, messageId, replyMarkup, cancellationToken: CancellationToken);
         }
         catch (ApiRequestException ex) when (ex.ErrorCode == 400 &&
                                             ex.Message.Contains("message is not modified", StringComparison.OrdinalIgnoreCase))
@@ -770,7 +770,7 @@ public class SalesAssistantService
     {
         try
         {
-            await botClient.EditMessageCaptionAsync(
+            await botClient.EditMessageCaption(
                 chatId: chatId,
                 messageId: messageId,
                 caption: caption,

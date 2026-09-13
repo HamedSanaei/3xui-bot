@@ -908,7 +908,7 @@ public sealed partial class ConcurrencyTests
             Id = "cb-1",
             From = new TelegramUser { Id = 4242 },
             Data = payload,
-            Message = new Message { MessageId = 7, Chat = new Chat { Id = 4242 } }
+            Message = new Message { Id = 7, Chat = new Chat { Id = 4242 } }
         };
         await (Task)method.Invoke(service, new object[] { client, query, platform, CancellationToken.None })!;
     }

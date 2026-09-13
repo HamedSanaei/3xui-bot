@@ -62,7 +62,7 @@ internal static class ClientDownloadFlow
                 ClientDownloadCallbacks.Build(ClientDownloadPlatform.Windows)) }
         };
 
-        return botClient.SendTextMessageAsync(
+        return botClient.SendMessage(
             chatId,
             "📲 دریافت آخرین نسخه نرم‌افزار\nسیستم‌عامل خود را انتخاب کنید:",
             replyMarkup: new InlineKeyboardMarkup(rows),
@@ -102,7 +102,7 @@ internal static class ClientDownloadFlow
         catch (Exception)
         {
             // A provider outage must never escape into the Telegram update pipeline.
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 BuildUnavailableMessage(platform),
                 cancellationToken: cancellationToken);
@@ -111,7 +111,7 @@ internal static class ClientDownloadFlow
 
         if (!resolution.Success || resolution.Link == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId,
                 BuildUnavailableMessage(platform),
                 cancellationToken: cancellationToken);
@@ -153,7 +153,7 @@ internal static class ClientDownloadFlow
             ? "📥 دریافت از App Store"
             : $"📥 دانلود {link.FileName}";
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             builder.ToString(),
             replyMarkup: new InlineKeyboardMarkup(new[]

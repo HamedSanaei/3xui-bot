@@ -37,7 +37,7 @@ public static class XuiV3UserSafeError
     /// catch (Exception ex)
     /// {
     ///     logger.LogError(ex, "XUI account creation failed.");
-    ///     await bot.SendTextMessageAsync(chatId, XuiV3UserSafeError.ForAccountCreation(ex));
+    ///     await bot.SendMessage(chatId, XuiV3UserSafeError.ForAccountCreation(ex));
     /// }
     /// </code>
     /// </example>

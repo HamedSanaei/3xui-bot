@@ -333,14 +333,14 @@ public sealed partial class ConcurrencyTests
         public ConcurrentQueue<string> Texts { get; } = new();
 
         /// <inheritdoc />
-        public Task SendTextMessageAsync(string channelId, string message, ParseMode? parseMode, CancellationToken cancellationToken)
+        public Task SendMessage(string channelId, string message, ParseMode? parseMode, CancellationToken cancellationToken)
         {
             Texts.Enqueue(message);
             return Task.CompletedTask;
         }
 
         /// <inheritdoc />
-        public Task SendDocumentAsync(string channelId, string fileName, Stream content, CancellationToken cancellationToken)
+        public Task SendDocument(string channelId, string fileName, Stream content, CancellationToken cancellationToken)
             => Task.CompletedTask;
     }
 }

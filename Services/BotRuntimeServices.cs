@@ -289,8 +289,9 @@ public class BotClientProvider
     /// Creates a provider bound to the shared BotRegistry.
     /// </summary>
     /// <param name="registry">Runtime bot registry.</param>
+    /// <remarks>Disables v22 automatic rate-limit retries so the application's existing delivery/recovery policy remains authoritative.</remarks>
     public BotClientProvider(BotRegistry registry)
-        : this(registry, bot => new TelegramBotClient(bot.Token))
+        : this(registry, bot => new TelegramBotClient(new TelegramBotClientOptions(bot.Token) { RetryCount = 0 }))
     {
     }
 
@@ -941,7 +942,7 @@ public class MultiBotHostedService : IHostedService
             try
             {
                 using var probeCts = CreateStartupProbeCancellation(cancellationToken);
-                me = await client.GetMeAsync(probeCts.Token);
+                me = await client.GetMe(probeCts.Token);
             }
             catch (Exception ex) when (IsTelegramTransientStartupError(ex))
             {
@@ -971,7 +972,7 @@ public class MultiBotHostedService : IHostedService
                             .TryHandleAsync(bot.Id, client, update, token)) return;
                     await _scheduler.EnqueueAsync(bot.Id, update, token);
                 },
-                pollingErrorHandler: (_, exception, token) => HandleBotPollingErrorAsync(bot.Id, exception, token),
+                errorHandler: (_, exception, token) => HandleBotPollingErrorAsync(bot.Id, exception, token),
                 receiverOptions: new ReceiverOptions
                 {
                     AllowedUpdates = Array.Empty<UpdateType>()
@@ -1107,7 +1108,7 @@ public class MultiBotHostedService : IHostedService
         CancellationToken cancellationToken)
     {
         using var initialProbeCts = CreateStartupProbeCancellation(cancellationToken);
-        var webhookInfo = await client.GetWebhookInfoAsync(initialProbeCts.Token);
+        var webhookInfo = await client.GetWebhookInfo(initialProbeCts.Token);
         if (string.IsNullOrWhiteSpace(webhookInfo?.Url))
             return;
 
@@ -1117,12 +1118,12 @@ public class MultiBotHostedService : IHostedService
             bot.Type);
 
         using var deleteCts = CreateStartupProbeCancellation(cancellationToken);
-        await client.DeleteWebhookAsync(
+        await client.DeleteWebhook(
             dropPendingUpdates: false,
             cancellationToken: deleteCts.Token);
 
         using var verificationCts = CreateStartupProbeCancellation(cancellationToken);
-        var verified = await client.GetWebhookInfoAsync(verificationCts.Token);
+        var verified = await client.GetWebhookInfo(verificationCts.Token);
         if (!string.IsNullOrWhiteSpace(verified?.Url))
             throw new InvalidOperationException("Telegram still reports an active webhook after deletion.");
     }
@@ -1167,7 +1168,7 @@ public class MultiBotHostedService : IHostedService
             {
                 var client = _clientProvider.GetClient(bot.Id);
                 using var probeCts = CreateStartupProbeCancellation(cancellationToken);
-                var me = await client.GetMeAsync(probeCts.Token);
+                var me = await client.GetMe(probeCts.Token);
                 await ConfigureBotCommandsAsync(client, bot, probeCts.Token);
 
                 if (!IsReceiverRunning(botId))
@@ -1964,7 +1965,7 @@ public class MultiBotHostedService : IHostedService
                 ? "ربات فروشگاهی شما"
                 : "@" + TelegramBotTokenIdentity.NormalizeUsername(tenantUsername);
 
-            await _clientProvider.GetDefaultClient().SendTextMessageAsync(
+            await _clientProvider.GetDefaultClient().SendMessage(
                 ownerTelegramUserId,
                 $"⚠️ توکن {username} باطل یا تکراری تشخیص داده شد.\nفروشگاه خاموش شد و توکن حذف شد. لطفاً از BotFather توکن جدید بگیرید و دوباره ثبت کنید.",
                 cancellationToken: cancellationToken);
@@ -2229,7 +2230,7 @@ public class MultiBotHostedService : IHostedService
             return;
         }
 
-        await client.SetMyCommandsAsync(commands, cancellationToken: cancellationToken);
+        await client.SetMyCommands(commands, cancellationToken: cancellationToken);
     }
 
     /// <summary>

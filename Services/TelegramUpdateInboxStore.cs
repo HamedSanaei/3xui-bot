@@ -26,7 +26,8 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="capacity">Positive maximum queued or currently running Telegram executions.</param>
     /// <param name="token">Receiver cancellation before acceptance.</param>
     /// <returns>True when committed or already accepted; false when admission must wait for capacity.</returns>
-    /// <remarks>Duplicate delivery succeeds even when full. The count stops at capacity inside the admission transaction. Cancellation after commit is resolved by durable deduplication.</remarks>
+    /// <remarks>Duplicate delivery succeeds even when full. The count stops at capacity inside the admission transaction. Cancellation after commit is resolved by durable deduplication.
+    /// Telegram's native serializer retains the Bot API wire format now that v22 uses System.Text.Json attributes.</remarks>
     /// <example><code>while (!await store.TryAcceptAsync(botId, update, capacity, token)) await Task.Delay(100, token);</code></example>
     public Task<bool> TryAcceptAsync(string botId, Update update, int capacity, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
     {
@@ -38,7 +39,7 @@ public sealed partial class TelegramUpdateInboxStore
         db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry
         {
             BotId = botId, UpdateId = update.Id, TelegramUserId = TelegramUpdateIdentity.ResolveUserId(update),
-            UpdateType = update.Type.ToString(), Payload = JsonConvert.SerializeObject(update), AcceptedAtUtc = DateTime.UtcNow
+            UpdateType = update.Type.ToString(), Payload = System.Text.Json.JsonSerializer.Serialize(update, Telegram.Bot.JsonBotAPI.Options), AcceptedAtUtc = DateTime.UtcNow
         });
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
@@ -68,7 +69,8 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="sequence">Internal inbox sequence selected by this scheduler.</param>
     /// <param name="token">Cancellation of the local claim.</param>
     /// <returns>A private work item, or null if another executor already claimed the row.</returns>
-    /// <remarks>A process crash after the claim creates a terminal review receipt at recovery; unsafe business mutations are protected by their own durable operation records.</remarks>
+    /// <remarks>A process crash after the claim creates a terminal review receipt at recovery; unsafe business mutations are protected by their own durable operation records.
+    /// Bot API serialization options read both newly accepted updates and existing v19 snake-case payloads.</remarks>
     public Task<TelegramUpdateWorkItem> ClaimAsync(long sequence, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
@@ -79,7 +81,7 @@ public sealed partial class TelegramUpdateInboxStore
         var row = await db.TelegramUpdateInbox.AsNoTracking().SingleAsync(x => x.Sequence == sequence, ct);
         await transaction.CommitAsync(ct);
         return new TelegramUpdateWorkItem(row.Sequence, new(row.BotId, row.TelegramUserId),
-            JsonConvert.DeserializeObject<Update>(row.Payload) ?? throw new InvalidOperationException("Invalid durable update payload."), row.AcceptedAtUtc);
+            System.Text.Json.JsonSerializer.Deserialize<Update>(row.Payload, Telegram.Bot.JsonBotAPI.Options) ?? throw new InvalidOperationException("Invalid durable update payload."), row.AcceptedAtUtc);
     }, token);
 
     /// <summary>Finalizes a claim as a payload-free terminal receipt after the handler exits.</summary>

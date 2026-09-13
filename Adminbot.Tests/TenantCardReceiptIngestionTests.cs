@@ -173,7 +173,7 @@ public sealed partial class ConcurrencyTests
             var handle = typeof(TenantBotService).GetMethod("HANDLECUSTOMERMESSAGEASYNC", BindingFlags.Instance | BindingFlags.NonPublic)!;
             var message = new Message
             {
-                MessageId = 11,
+                Id = 11,
                 Chat = new Chat { Id = ReceiptCustomerId },
                 From = new Telegram.Bot.Types.User { Id = ReceiptCustomerId },
                 Photo = new[] { new PhotoSize { FileId = "photo-receipt-file", FileSize = 2048 } }
@@ -530,7 +530,7 @@ public sealed partial class ConcurrencyTests
         var handle = typeof(TenantBotService).GetMethod("HANDLECUSTOMERMESSAGEASYNC", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var message = new Message
         {
-            MessageId = 7,
+            Id = 7,
             Chat = new Chat { Id = ReceiptCustomerId },
             From = new Telegram.Bot.Types.User { Id = ReceiptCustomerId },
             Document = document

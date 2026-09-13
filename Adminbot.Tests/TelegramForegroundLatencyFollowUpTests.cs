@@ -55,19 +55,23 @@ public sealed partial class ConcurrencyTests
         /// <inheritdoc />
         public bool LocalBotServer => false;
         /// <inheritdoc />
-        public long? BotId => 1;
+        public long BotId => 1;
         /// <inheritdoc />
         public TimeSpan Timeout { get; set; }
         /// <inheritdoc />
         public IExceptionParser ExceptionsParser { get; set; } = null!;
         /// <inheritdoc />
-        public event AsyncEventHandler<ApiRequestEventArgs> OnMakingApiRequest { add { } remove { } }
+        public event AsyncEventHandler<ApiRequestEventArgs>? OnMakingApiRequest { add { } remove { } }
         /// <inheritdoc />
-        public event AsyncEventHandler<ApiResponseEventArgs> OnApiResponseReceived { add { } remove { } }
+        public event AsyncEventHandler<ApiResponseEventArgs>? OnApiResponseReceived { add { } remove { } }
         /// <inheritdoc />
-        public Task<bool> TestApiAsync(CancellationToken cancellationToken = default) => Task.FromResult(true);
+        public Task<bool> TestApi(CancellationToken cancellationToken = default) => Task.FromResult(true);
         /// <inheritdoc />
-        public Task DownloadFileAsync(string filePath, Stream destination, CancellationToken cancellationToken = default)
+        public Task DownloadFile(Telegram.Bot.Types.TGFile file, Stream destination, CancellationToken cancellationToken = default)
+            => DownloadFile(file.FilePath!, destination, cancellationToken);
+
+        /// <inheritdoc />
+        public Task DownloadFile(string filePath, Stream destination, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
         /// <summary>Records the request kind and either hangs until cancellation or answers immediately.</summary>
@@ -75,7 +79,7 @@ public sealed partial class ConcurrencyTests
         /// <param name="request">Request built by the caller.</param>
         /// <param name="cancellationToken">Token that also carries any foreground delivery budget.</param>
         /// <returns>A synthetic Telegram response shaped like the real API payload.</returns>
-        public async Task<TResponse> MakeRequestAsync<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+        public async Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
         {
             var name = request.GetType().Name;
             _attempts.AddOrUpdate(name, 1, (_, value) => value + 1);
@@ -92,7 +96,7 @@ public sealed partial class ConcurrencyTests
                     ? new Telegram.Bot.Types.User { Id = 7, FirstName = "probe" }
                     : typeof(TResponse) == typeof(ChatMember)
                         ? new ChatMemberMember { User = new Telegram.Bot.Types.User { Id = 7, FirstName = "probe" } }
-                        : new Message { MessageId = 1, Chat = new Chat { Id = 7 } };
+                        : new Message { Id = 1, Chat = new Chat { Id = 7 } };
             return (TResponse)result;
         }
     }
@@ -407,7 +411,7 @@ public sealed partial class ConcurrencyTests
 
         var editSw = Stopwatch.StartNew();
         var editTimeout = await Assert.ThrowsAsync<TelegramForegroundDeliveryTimeoutException>(
-            () => bounded.EditMessageTextAsync(chatId: 7, messageId: 5, text: "menu", cancellationToken: CancellationToken.None));
+            () => bounded.EditMessageText(chatId: 7, messageId: 5, text: "menu", cancellationToken: CancellationToken.None));
         editSw.Stop();
 
         Assert.Equal("edit_message_text", editTimeout.RequestKind);
@@ -416,7 +420,7 @@ public sealed partial class ConcurrencyTests
 
         var albumSw = Stopwatch.StartNew();
         var albumTimeout = await Assert.ThrowsAsync<TelegramForegroundDeliveryTimeoutException>(
-            () => bounded.SendMediaGroupAsync(
+            () => bounded.SendMediaGroup(
                 chatId: 7,
                 media: new[] { new InputMediaPhoto(InputFile.FromFileId("test-file-id")) },
                 cancellationToken: CancellationToken.None));
@@ -477,7 +481,7 @@ public sealed partial class ConcurrencyTests
                 From = new Telegram.Bot.Types.User { Id = 7468859738, IsBot = false, FirstName = "customer" },
                 Message = new Message
                 {
-                    MessageId = 11, Date = DateTime.UtcNow,
+                    Id = 11, Date = DateTime.UtcNow,
                     Chat = new Chat { Id = 7468859738, Type = ChatType.Private }
                 },
                 Data = "TN:svc:normal"
@@ -643,7 +647,7 @@ public sealed partial class ConcurrencyTests
                 };
                 var message = new Message
                 {
-                    MessageId = 21,
+                    Id = 21,
                     Date = DateTime.UtcNow,
                     Text = text,
                     Chat = new Chat { Id = 7468859739, Type = ChatType.Private },

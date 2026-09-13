@@ -77,10 +77,10 @@ public class OwnedBotNotificationService
             try
             {
                 var client = _botClientProvider.GetClient(botId);
-                await client.SendTextMessageAsync(
+                await client.SendMessage(
                     chatId: new ChatId(telegramUserId),
                     text: text,
-                    parseMode: parseMode,
+                    parseMode: parseMode ?? ParseMode.None,
                     cancellationToken: cancellationToken);
             }
             catch (ApiRequestException ex)

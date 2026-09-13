@@ -271,7 +271,7 @@ public sealed class ReferralNotificationSender : IReferralNotificationSender
         {
             try
             {
-                await _botClientProvider.GetClient(botId).SendTextMessageAsync(
+                await _botClientProvider.GetClient(botId).SendMessage(
                     chatId: telegramUserId,
                     text: text,
                     cancellationToken: cancellationToken);

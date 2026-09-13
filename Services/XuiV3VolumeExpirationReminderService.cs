@@ -705,7 +705,7 @@ public sealed class XuiV3VolumeExpirationReminderService : BackgroundService
             await WaitForSendSlotAsync(candidate.BotId, chatId, cancellationToken);
             try
             {
-                var message = await botClient.SendTextMessageAsync(
+                var message = await botClient.SendMessage(
                     chatId: chatId,
                     text: BuildMessage(candidate, userComment),
                     parseMode: ParseMode.Html,

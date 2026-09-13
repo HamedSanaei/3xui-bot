@@ -205,7 +205,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (!IsEnabled() || message?.Text == null)
@@ -299,7 +299,7 @@ public class XuiV3AdminFlowService
                 LastStep = StepCreateTargetUser
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "تلگرام آیدی صاحب اکانت را بفرستید یا گزینه «برای خودم» را بزنید:",
                 replyMarkup: new ReplyKeyboardMarkup(new[]
@@ -324,7 +324,7 @@ public class XuiV3AdminFlowService
                 LastStep = StepRenewAccount
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "ایمیل اکانت نسخه ۳ را برای تمدید ارسال کنید. اگر تلگرام آیدی بفرستید، اکانت‌های همان کاربر را لیست می‌کنم.",
                 replyMarkup: new ReplyKeyboardRemove(),
@@ -395,7 +395,7 @@ public class XuiV3AdminFlowService
                 LastStep = StepGetAccountInfo
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "ایمیل اکانت نسخه ۳، آیدی تلگرام کاربر، یا ترکیب آیدی تلگرام و شماره اکانت را ارسال کنید.\nمثال:\n<code>8787745942 12</code>",
                 parseMode: ParseMode.Html,
@@ -413,7 +413,7 @@ public class XuiV3AdminFlowService
                 LastStep = StepGetNowPaymentStatus
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای تترامیناتور می‌توانید `Order ID`، `Pay ID` یا شناسه داخلی رکورد را بفرستید.\nبرای UniquePay می‌توانید `UP:8`، `Hash ID` یا `Ref ID` بفرستید.\nبرای AtlasPay می‌توانید `AP:8` یا شناسه داخلی پرداخت AtlasPay را بفرستید تا با استعلام رسمی \"تایید پرداخت\" بررسی شود.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
                 parseMode: ParseMode.Markdown,
@@ -431,7 +431,7 @@ public class XuiV3AdminFlowService
                 LastStep = StepDeleteExpiredTargetUser
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "تلگرام آیدی عددی کاربر را بفرستید تا اکانت‌های منقضی او روی پنل نسخه ۳ بررسی شود:",
                 replyMarkup: new ReplyKeyboardRemove(),
@@ -449,7 +449,7 @@ public class XuiV3AdminFlowService
                 LastStep = shouldBlock ? StepBanUsers : StepUnbanUsers
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: shouldBlock
                     ? "آیدی عددی کاربر یا کاربران مورد نظر برای مسدودسازی را بفرستید. می‌توانید چند آیدی را با فاصله، ویرگول یا خط جدید بفرستید."
@@ -468,7 +468,7 @@ public class XuiV3AdminFlowService
                 LastStep = StepSendPrivateTarget
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "آیدی عددی کاربری که می‌خواهید برای او پیام خصوصی ارسال شود را بفرستید:",
                 replyMarkup: new ReplyKeyboardRemove(),
@@ -505,7 +505,7 @@ public class XuiV3AdminFlowService
 
         if (targetTelegramUserId == 0 && !long.TryParse(input, out targetTelegramUserId))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "تلگرام آیدی معتبر نیست. فقط عدد بفرستید.",
                 cancellationToken: cancellationToken);
@@ -520,7 +520,7 @@ public class XuiV3AdminFlowService
             ConfigLink = targetTelegramUserId.ToString()
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: $"صاحب اکانت: <code>{targetTelegramUserId}</code>\nنوع سرویس را انتخاب کنید:",
             parseMode: ParseMode.Html,
@@ -540,7 +540,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -549,7 +549,7 @@ public class XuiV3AdminFlowService
         var service = TryGetServiceFromText(message.Text);
         if (service == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "سرویس معتبر نیست. یکی از گزینه‌های لیست را انتخاب کنید.",
                 replyMarkup: BuildServiceReplyKeyboard(),
@@ -565,7 +565,7 @@ public class XuiV3AdminFlowService
             SelectedCountry = service.Key
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: service.IsUnlimited
                 ? "پلن نامحدود را انتخاب کنید:"
@@ -586,7 +586,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -595,7 +595,7 @@ public class XuiV3AdminFlowService
         var service = FindService(currentUser.SelectedCountry);
         if (!TryGetTrafficGbFromText(message.Text, out var trafficGb) || trafficGb <= 0)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "حجم معتبر نیست. یکی از دکمه‌ها را بزنید یا فقط عدد صحیح بفرستید؛ مثلا 7 یا ۷.",
                 replyMarkup: BuildTrafficReplyKeyboard(service),
@@ -611,7 +611,7 @@ public class XuiV3AdminFlowService
             TotoalGB = trafficGb.ToString()
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "مدت اکانت را انتخاب کنید:",
             replyMarkup: BuildDurationReplyKeyboard(service),
@@ -630,7 +630,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -640,7 +640,7 @@ public class XuiV3AdminFlowService
         var duration = TryGetDurationFromText(service, message.Text);
         if (duration == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "مدت معتبر نیست. یکی از گزینه‌ها را انتخاب کنید.",
                 replyMarkup: BuildDurationReplyKeyboard(service),
@@ -656,7 +656,7 @@ public class XuiV3AdminFlowService
             SelectedPeriod = duration.Key
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: $"تعداد اکانت مورد نظر را وارد کنید. حداکثر تعداد در هر سفارش {XuiV3PurchaseService.MaxBulkAccountCount} است.",
             replyMarkup: BuildAccountCountReplyKeyboard(),
@@ -675,7 +675,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -685,7 +685,7 @@ public class XuiV3AdminFlowService
         var plan = TryGetUnlimitedPlanFromText(service, message.Text);
         if (plan == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "پلن معتبر نیست. یکی از گزینه‌ها را انتخاب کنید.",
                 replyMarkup: BuildUnlimitedPlanReplyKeyboard(service, false),
@@ -701,7 +701,7 @@ public class XuiV3AdminFlowService
             Type = plan.Key
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: $"تعداد اکانت مورد نظر را وارد کنید. حداکثر تعداد در هر سفارش {XuiV3PurchaseService.MaxBulkAccountCount} است.",
             replyMarkup: BuildAccountCountReplyKeyboard(),
@@ -720,7 +720,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -730,7 +730,7 @@ public class XuiV3AdminFlowService
             accountCount <= 0 ||
             accountCount > XuiV3PurchaseService.MaxBulkAccountCount)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"تعداد اکانت معتبر نیست. یک عدد بین 1 تا {XuiV3PurchaseService.MaxBulkAccountCount} بفرستید.",
                 replyMarkup: BuildAccountCountReplyKeyboard(),
@@ -746,7 +746,7 @@ public class XuiV3AdminFlowService
             PendingAccountCount = accountCount
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "اگر می‌خواهید برای این سفارش کامنت ذخیره شود، متن آن را بفرستید.\n\nاگر کامنتی ندارید، گزینه «ادامه بدون کامنت» را بزنید.",
             replyMarkup: BuildOptionalCommentReplyKeyboard(),
@@ -765,7 +765,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -784,7 +784,7 @@ public class XuiV3AdminFlowService
         });
 
         var refreshedUser = await _state.GetUserStatus(message.From.Id);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: BuildCreateSummary(refreshedUser),
             parseMode: ParseMode.Html,
@@ -831,7 +831,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (message.Text == "No Don't Create!" || IsCancel(message.Text))
@@ -842,7 +842,7 @@ public class XuiV3AdminFlowService
 
         if (message.Text != "Yes Create!")
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "برای ساخت اکانت گزینه تایید را بزنید.",
                 replyMarkup: BuildYesNoKeyboard("Yes Create!", "No Don't Create!"),
@@ -850,7 +850,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "در حال ساخت اکانت نسخه ۳...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -884,7 +884,7 @@ public class XuiV3AdminFlowService
             if (!string.IsNullOrWhiteSpace(createdAccount.SubLink))
             {
                 using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(createdAccount.SubLink, 200));
-                await botClient.SendPhotoAsync(
+                await botClient.SendPhoto(
                     chatId: message.Chat.Id,
                     photo: InputFile.FromStream(qrStream, $"xui-v3-admin-account-{createdAccount.Email}.png"),
                     caption: text,
@@ -893,7 +893,7 @@ public class XuiV3AdminFlowService
             }
             else
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: text,
                     parseMode: ParseMode.Html,
@@ -920,7 +920,7 @@ public class XuiV3AdminFlowService
 
         if (bulkResult.Failures.Count > 0)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: BuildAdminBulkFailureText(bulkResult),
                 parseMode: ParseMode.Html,
@@ -969,7 +969,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -990,7 +990,7 @@ public class XuiV3AdminFlowService
                     : "برای این تلگرام آیدی چند اکانت پیدا شد. لطفاً ایمیل یکی از این اکانت‌ها را بفرستید:\n" +
                       string.Join("\n", matches.Select(c => $"<code>{Html(c.Email)}</code>"));
 
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: list,
                     parseMode: ParseMode.Html,
@@ -1009,7 +1009,7 @@ public class XuiV3AdminFlowService
 
         if (client == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "اکانت نسخه ۳ پیدا نشد.",
                 cancellationToken: cancellationToken);
@@ -1027,7 +1027,7 @@ public class XuiV3AdminFlowService
             SelectedCountry = service?.Key ?? metadata?.ServiceKey
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: $"اکانت انتخاب شد: <code>{Html(client.Email)}</code>\nتلگرام آیدی مالک فعلی: <code>{client.TgId}</code>\nحجم اضافه را به گیگابایت بفرستید.\nمی‌توانید یکی از دکمه‌ها را بزنید یا عدد دلخواه را مستقیم بفرستید؛ مثلا 7 یا ۷:",
             parseMode: ParseMode.Html,
@@ -1047,7 +1047,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -1055,7 +1055,7 @@ public class XuiV3AdminFlowService
 
         if (!TryGetTrafficGbFromText(message.Text, out var trafficGb) || trafficGb < 0)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "حجم معتبر نیست. عدد صحیح گیگابایت را بفرستید. برای تمدید فقط زمانی می‌توانید 0 بفرستید.",
                 cancellationToken: cancellationToken);
@@ -1071,7 +1071,7 @@ public class XuiV3AdminFlowService
         });
 
         var service = TryFindService(currentUser.SelectedCountry);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "مدت اضافه را انتخاب کنید:",
             replyMarkup: service == null ? BuildGenericDurationReplyKeyboard() : BuildDurationReplyKeyboard(service),
@@ -1090,7 +1090,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -1103,7 +1103,7 @@ public class XuiV3AdminFlowService
 
         if (durationDays == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "مدت معتبر نیست.",
                 replyMarkup: service == null ? BuildGenericDurationReplyKeyboard() : BuildDurationReplyKeyboard(service),
@@ -1120,7 +1120,7 @@ public class XuiV3AdminFlowService
         });
 
         var refreshedUser = await _state.GetUserStatus(message.From.Id);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: await BuildRenewSummaryAsync(refreshedUser, cancellationToken),
             parseMode: ParseMode.Html,
@@ -1150,7 +1150,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (message.Text == "No Don't Create!" || IsCancel(message.Text))
@@ -1161,7 +1161,7 @@ public class XuiV3AdminFlowService
 
         if (message.Text != "Yes Renew!")
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "برای تمدید اکانت گزینه تایید را بزنید.",
                 replyMarkup: BuildYesNoKeyboard("Yes Renew!", "No Don't Create!"),
@@ -1169,7 +1169,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "در حال تمدید اکانت نسخه ۳...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -1273,7 +1273,7 @@ public class XuiV3AdminFlowService
             traffic.Down = 0;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "✅ اکانت با موفقیت تمدید شد.\n\n" + BuildClientInfo(client, serverInfo),
             parseMode: ParseMode.Html,
@@ -1397,7 +1397,7 @@ public class XuiV3AdminFlowService
     public async Task<bool> TryHandleCallbackAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         var data = callbackQuery?.Data ?? string.Empty;
@@ -1529,13 +1529,13 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         var input = message.Text.Trim();
         var serverInfo = BuildConfiguredPanelServerInfo();
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "در حال دریافت اطلاعات از پنل نسخه ۳...",
             cancellationToken: cancellationToken);
@@ -1595,7 +1595,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         var input = message.Text.Trim();
@@ -1748,7 +1748,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         string input,
         CancellationToken cancellationToken)
     {
@@ -1843,14 +1843,14 @@ public class XuiV3AdminFlowService
             CanProvisionallyApproveTetraminator(payment))
         {
             await _state.ClearUserStatus(currentUser);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 BuildTetraminatorPaymentInfo(payment, settlement) +
                 "\n\nاین پرداخت هنوز از سمت تترامیناتور تایید نشده است. فقط در صورت اطمینان از دریافت وجه می‌توانید شارژ موقت owned wallet را آغاز کنید.",
                 parseMode: ParseMode.Html,
                 replyMarkup: BuildProvisionalTetraminatorStartKeyboard(payment.Id),
                 cancellationToken: cancellationToken);
-            await botClient.SendTextMessageAsync(message.Chat.Id, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
+            await botClient.SendMessage(message.Chat.Id, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
             return true;
         }
 
@@ -1886,7 +1886,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         string input,
         CancellationToken cancellationToken)
     {
@@ -1996,14 +1996,14 @@ public class XuiV3AdminFlowService
         if (settlement == null && CanProvisionallyApproveHooshPay(payment))
         {
             await _state.ClearUserStatus(currentUser);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: BuildHooshPayPaymentInfo(payment, settlement) +
                       "\n\nاین پرداخت هنوز از سمت HooshPay تایید نشده است. در صورت مشاهده و تایید دستی پرداخت، می‌توانید شارژ موقت انجام دهید.",
                 parseMode: ParseMode.Html,
                 replyMarkup: BuildProvisionalHooshPayStartKeyboard(payment.Id),
                 cancellationToken: cancellationToken);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "منوی اصلی",
                 replyMarkup: mainMenu,
@@ -2041,7 +2041,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         string input,
         CancellationToken cancellationToken)
     {
@@ -2089,14 +2089,14 @@ public class XuiV3AdminFlowService
         if (UniquePaySettlementService.CanApplyProvisionalCredit(payment))
         {
             await _state.ClearUserStatus(currentUser);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 BuildUniquePayPaymentInfo(payment, settlement) +
                 "\n\nاین پرداخت در استعلام تازه هنوز paid نیست. فقط در صورت اطمینان از دریافت وجه می‌توانید شارژ موقت کیف پول OWNED را آغاز کنید.",
                 parseMode: ParseMode.Html,
                 replyMarkup: BuildProvisionalUniquePayStartKeyboard(payment.Id),
                 cancellationToken: cancellationToken);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 message.Chat.Id,
                 "منوی اصلی",
                 replyMarkup: mainMenu,
@@ -2162,7 +2162,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         string input,
         CancellationToken cancellationToken)
     {
@@ -2313,7 +2313,7 @@ public class XuiV3AdminFlowService
     private async Task<bool> TryHandleUniquePayProvisionalCallbackAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (!IsConfiguredSuperAdmin(callbackQuery.From?.Id ?? 0))
@@ -2402,7 +2402,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
         UniquePayPaymentInfo payment,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         try
@@ -2532,7 +2532,7 @@ public class XuiV3AdminFlowService
             {
                 try
                 {
-                    await botClient.SendTextMessageAsync(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
+                    await botClient.SendMessage(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
                 }
                 catch (ApiRequestException ex) when (ex.ErrorCode == 403 || ex.ErrorCode == 400)
                 {
@@ -2557,7 +2557,7 @@ public class XuiV3AdminFlowService
     private async Task<bool> TryHandleTetraminatorProvisionalCallbackAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (!IsConfiguredSuperAdmin(callbackQuery.From?.Id ?? 0))
@@ -2648,7 +2648,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
         TetraminatorPaymentInfo payment,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         try
@@ -2755,7 +2755,7 @@ public class XuiV3AdminFlowService
             {
                 try
                 {
-                    await botClient.SendTextMessageAsync(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
+                    await botClient.SendMessage(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
                 }
                 catch (ApiRequestException ex) when (ex.ErrorCode is 400 or 403)
                 {
@@ -2890,7 +2890,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
         HooshPayPaymentInfo payment,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         try
@@ -3002,7 +3002,7 @@ public class XuiV3AdminFlowService
             {
                 try
                 {
-                    await botClient.SendTextMessageAsync(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
+                    await botClient.SendMessage(chatId, "منوی اصلی", replyMarkup: mainMenu, cancellationToken: cancellationToken);
                 }
                 catch (ApiRequestException ex) when (ex.ErrorCode == 403 || ex.ErrorCode == 400)
                 {
@@ -3074,7 +3074,7 @@ public class XuiV3AdminFlowService
 
         try
         {
-            await botClient.EditMessageTextAsync(
+            await botClient.EditMessageText(
                 callbackQuery.Message.Chat.Id,
                 callbackQuery.Message.MessageId,
                 text,
@@ -3144,7 +3144,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         string input,
         CancellationToken cancellationToken)
     {
@@ -3189,7 +3189,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -3197,7 +3197,7 @@ public class XuiV3AdminFlowService
 
         if (!long.TryParse(NormalizeDigits(message.Text?.Trim()), out var targetTelegramUserId) || targetTelegramUserId <= 0)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "تلگرام آیدی معتبر نیست. فقط آیدی عددی کاربر را بفرستید.",
                 cancellationToken: cancellationToken);
@@ -3245,7 +3245,7 @@ public class XuiV3AdminFlowService
             SubLink = JsonConvert.SerializeObject(expiredClients.Select(client => client.Email).ToList())
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: BuildDeleteExpiredConfirmationText(expiredClients, true, targetTelegramUserId),
             parseMode: ParseMode.Html,
@@ -3271,7 +3271,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (message.Text == "No Don't Delete!" || IsCancel(message.Text))
@@ -3282,7 +3282,7 @@ public class XuiV3AdminFlowService
 
         if (message.Text != "Yes Delete Expired!")
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "برای حذف اکانت‌های منقضی، گزینه تایید را بزنید.",
                 replyMarkup: BuildYesNoKeyboard("Yes Delete Expired!", "No Don't Delete!"),
@@ -3302,7 +3302,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "در حال حذف اکانت‌های منقضی کاربر از پنل نسخه ۳...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -3422,7 +3422,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         bool shouldBlock,
         CancellationToken cancellationToken)
     {
@@ -3432,7 +3432,7 @@ public class XuiV3AdminFlowService
         var userIds = ParseTelegramUserIds(message.Text);
         if (userIds.Count == 0)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "هیچ آیدی عددی معتبری پیدا نشد. دوباره آیدی عددی تلگرام را بفرستید.",
                 cancellationToken: cancellationToken);
@@ -3477,7 +3477,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -3486,7 +3486,7 @@ public class XuiV3AdminFlowService
         if (!long.TryParse(NormalizeDigits(message.Text?.Trim()), out var targetTelegramUserId) ||
             targetTelegramUserId <= 0)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "آیدی عددی معتبر نیست. فقط آیدی عددی تلگرام کاربر را بفرستید.",
                 cancellationToken: cancellationToken);
@@ -3502,7 +3502,7 @@ public class XuiV3AdminFlowService
             ConfigLink = targetTelegramUserId.ToString()
         });
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: BuildPrivateMessageTargetText(targetTelegramUserId, targetUser),
             parseMode: ParseMode.Html,
@@ -3521,7 +3521,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (await CancelIfNeededAsync(botClient, message, currentUser, mainMenu, cancellationToken))
@@ -3530,7 +3530,7 @@ public class XuiV3AdminFlowService
         var privateMessage = message.Text?.Trim();
         if (string.IsNullOrWhiteSpace(privateMessage))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "متن پیام خالی است. متن پیام خصوصی را بفرستید.",
                 cancellationToken: cancellationToken);
@@ -3539,7 +3539,7 @@ public class XuiV3AdminFlowService
 
         if (privateMessage.Length > 3900)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "متن پیام خیلی طولانی است. لطفاً پیام را کوتاه‌تر از ۳۹۰۰ کاراکتر بفرستید.",
                 cancellationToken: cancellationToken);
@@ -3561,7 +3561,7 @@ public class XuiV3AdminFlowService
             ? await _credentialsDbContext.GetUserStatusWithId(targetUserId)
             : null;
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: BuildPrivateMessagePreviewText(targetUserId, targetUser, privateMessage),
             parseMode: ParseMode.Html,
@@ -3573,7 +3573,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (message.Text == "No Don't Send!" || IsCancel(message.Text))
@@ -3584,7 +3584,7 @@ public class XuiV3AdminFlowService
 
         if (message.Text != "Yes Send Private!")
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "برای ارسال پیام خصوصی گزینه تایید را بزنید.",
                 replyMarkup: BuildYesNoKeyboard("Yes Send Private!", "No Don't Send!"),
@@ -3612,7 +3612,7 @@ public class XuiV3AdminFlowService
 
         try
         {
-            var sentMessage = await botClient.SendTextMessageAsync(
+            var sentMessage = await botClient.SendMessage(
                 chatId: targetChatId,
                 text: currentUser.SubLink,
                 cancellationToken: cancellationToken);
@@ -3785,7 +3785,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (!IsCancel(message.Text))
@@ -3808,10 +3808,10 @@ public class XuiV3AdminFlowService
         ChatId chatId,
         User currentUser,
         CancellationToken cancellationToken,
-        IReplyMarkup mainMenu = null)
+        ReplyMarkup mainMenu = null)
     {
         await _state.ClearUserStatus(currentUser);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: "عملیات لغو شد.",
             replyMarkup: mainMenu ?? new ReplyKeyboardRemove(),
@@ -3837,7 +3837,7 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         Message message,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         CancellationToken cancellationToken)
     {
         if (!_appConfig.GozargahSiteSyncEnabled)
@@ -3846,7 +3846,7 @@ public class XuiV3AdminFlowService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "Starting Gozargah historical sync. This may take a while...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -5095,16 +5095,16 @@ public class XuiV3AdminFlowService
         ITelegramBotClient botClient,
         ChatId chatId,
         User currentUser,
-        IReplyMarkup mainMenu,
+        ReplyMarkup mainMenu,
         string text,
         CancellationToken cancellationToken,
         ParseMode? parseMode = null)
     {
         await _state.ClearUserStatus(currentUser);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: text,
-            parseMode: parseMode,
+            parseMode: parseMode ?? ParseMode.None,
             replyMarkup: mainMenu,
             cancellationToken: cancellationToken);
     }
@@ -5155,7 +5155,7 @@ public class XuiV3AdminFlowService
         {
             foreach (var client in matches)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: BuildClientInfo(client, serverInfo),
                     parseMode: ParseMode.Html,
@@ -5167,7 +5167,7 @@ public class XuiV3AdminFlowService
 
         foreach (var text in BuildCompactAccountInfoMessages(matches))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: text,
                 parseMode: ParseMode.Html,

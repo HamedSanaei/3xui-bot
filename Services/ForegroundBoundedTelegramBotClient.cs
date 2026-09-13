@@ -15,8 +15,8 @@ using Telegram.Bot.Requests.Abstractions;
 /// <remarks>
 /// <para>
 /// Why this type exists:
-/// Telegram.Bot v19 exposes one generic <see cref="ITelegramBotClient.MakeRequestAsync{TResponse}"/> entry point, and
-/// every convenience method such as <c>SendTextMessageAsync</c> builds a strongly typed request and calls it. That
+/// Telegram.Bot v22 exposes one generic <see cref="ITelegramBotClient.SendRequest{TResponse}"/> entry point, and
+/// every convenience method such as <c>SendMessage</c> builds a strongly typed request and calls it. That
 /// makes one small decorator a complete chokepoint for the interactive surface without touching hundreds of call
 /// sites, and without changing the shared transport timeout used by receivers, long polling, and durable workers.
 /// </para>
@@ -24,7 +24,7 @@ using Telegram.Bot.Requests.Abstractions;
 /// What is bounded:
 /// only explicitly listed interactive request kinds — message sends, photo/album/document sends, message edits,
 /// message deletion, callback acknowledgements, and chat/membership lookups. Everything else, including
-/// <c>getUpdates</c>, webhook management, and <see cref="DownloadFileAsync"/>, is delegated untouched so receiver
+/// <c>getUpdates</c>, webhook management, and <see cref="DownloadFile"/>, is delegated untouched so receiver
 /// polling and durable file relay keep their existing behavior.
 /// </para>
 /// <para>
@@ -70,7 +70,7 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     public bool LocalBotServer => _inner.LocalBotServer;
 
     /// <inheritdoc />
-    public long? BotId => _inner.BotId;
+    public long BotId => _inner.BotId;
 
     /// <summary>
     /// Gets or sets the transport timeout of the inner client. The decorator does not own or change this value.
@@ -106,8 +106,12 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     }
 
     /// <inheritdoc />
-    public Task<bool> TestApiAsync(CancellationToken cancellationToken = default)
-        => _inner.TestApiAsync(cancellationToken);
+    public Task<bool> TestApi(CancellationToken cancellationToken = default)
+        => _inner.TestApi(cancellationToken);
+
+    /// <inheritdoc />
+    public Task DownloadFile(Telegram.Bot.Types.TGFile file, Stream destination, CancellationToken cancellationToken = default)
+        => DownloadFile(file.FilePath, destination, cancellationToken);
 
     /// <summary>
     /// Downloads a Telegram file through the inner client without any foreground budget.
@@ -120,8 +124,8 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// File transfer is deliberately excluded from the foreground policy: receipt relay and configuration export are
     /// durable, size-driven operations whose partial download must not be mistaken for a failed interactive send.
     /// </remarks>
-    public Task DownloadFileAsync(string filePath, Stream destination, CancellationToken cancellationToken = default)
-        => _inner.DownloadFileAsync(filePath, destination, cancellationToken);
+    public Task DownloadFile(string filePath, Stream destination, CancellationToken cancellationToken = default)
+        => _inner.DownloadFile(filePath, destination, cancellationToken);
 
     /// <summary>
     /// Executes one Telegram request, applying the foreground delivery budget only to interactive UX request kinds.
@@ -140,10 +144,10 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// <exception cref="TelegramForegroundDeliveryTimeoutException">
     /// The overall interactive delivery budget expired before Telegram answered.
     /// </exception>
-    public async Task<TResponse> MakeRequestAsync<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+    public async Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
     {
         if (!TryClassifyForegroundRequest(request, out var stage))
-            return await _inner.MakeRequestAsync(request, cancellationToken);
+            return await _inner.SendRequest(request, cancellationToken);
 
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(_policy.OverallBudget);
@@ -151,7 +155,7 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
 
         try
         {
-            return await _inner.MakeRequestAsync(request, budget.Token);
+            return await _inner.SendRequest(request, budget.Token);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && budget.IsCancellationRequested)
         {

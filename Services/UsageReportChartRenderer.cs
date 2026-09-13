@@ -37,7 +37,7 @@ public sealed class UsageReportChartRenderer
     /// </summary>
     /// <param name="currentWeek">Seven completed Tehran-local days, ordered Saturday through Friday.</param>
     /// <param name="previousWeek">The seven completed days immediately preceding <paramref name="currentWeek"/>.</param>
-    /// <returns>High-resolution encoded PNG bytes suitable for Telegram <c>SendPhotoAsync</c>.</returns>
+    /// <returns>High-resolution encoded PNG bytes suitable for Telegram <c>SendPhoto</c>.</returns>
     /// <exception cref="ArgumentException">Thrown when either report does not contain exactly seven daily buckets.</exception>
     /// <remarks>
     /// Both series share one explicit Y-axis scale in each panel. Current-week points display exact values; the prior
@@ -46,7 +46,7 @@ public sealed class UsageReportChartRenderer
     /// <example>
     /// <code>
     /// var png = renderer.RenderWeeklyComparison(currentWeek, previousWeek);
-    /// await botClient.SendPhotoAsync(chatId, InputFile.FromStream(new MemoryStream(png), "usage.png"));
+    /// await botClient.SendPhoto(chatId, InputFile.FromStream(new MemoryStream(png), "usage.png"));
     /// </code>
     /// </example>
     public byte[] RenderWeeklyComparison(UsageAnalyticsReport currentWeek, UsageAnalyticsReport previousWeek)
@@ -84,7 +84,7 @@ public sealed class UsageReportChartRenderer
     /// <example>
     /// <code>
     /// var png = renderer.RenderCompletedPeriod(report, includeSales: false);
-    /// await botClient.SendPhotoAsync(chatId, InputFile.FromStream(new MemoryStream(png), "monthly-usage.png"));
+    /// await botClient.SendPhoto(chatId, InputFile.FromStream(new MemoryStream(png), "monthly-usage.png"));
     /// </code>
     /// </example>
     public byte[] RenderCompletedPeriod(UsageAnalyticsReport report, bool includeSales)

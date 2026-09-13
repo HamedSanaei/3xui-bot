@@ -246,7 +246,7 @@ public class XuiV3AccountExpiryReminderService : IHostedService, IDisposable
             {
                 using (_botContextAccessor.Push(new BotRuntimeContext { Config = bot, Client = botClient }))
                 {
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         chatId: chatId,
                         text: BuildReminderMessage(freshItems),
                         parseMode: ParseMode.Html,

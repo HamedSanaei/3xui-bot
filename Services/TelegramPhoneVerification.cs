@@ -16,11 +16,11 @@ internal static class TelegramPhoneVerification
     /// <remarks>Does not persist profiles or change trial quotas. Callers save a valid number to the shared profile.</remarks>
     /// <example><code>var phone = await TelegramPhoneVerification.ValidateAsync(client, message, support, menu, token);</code></example>
     internal static async Task<string> ValidateAsync(ITelegramBotClient botClient, Message message,
-        string supportHtml, IReplyMarkup mainKeyboard, CancellationToken cancellationToken)
+        string supportHtml, ReplyMarkup mainKeyboard, CancellationToken cancellationToken)
     {
         if (message.From?.Id == null || message.Contact?.UserId == null || message.From.Id != message.Contact.UserId)
         {
-            await botClient.SendTextMessageAsync(message.Chat.Id,
+            await botClient.SendMessage(message.Chat.Id,
                 "شماره ارسالی باید متعلق به همین حساب تلگرام باشد. لطفاً دوباره از دکمه «ارسال شماره تلفن» استفاده کنید.",
                 replyMarkup: new ReplyKeyboardMarkup(new[]
                 {
@@ -36,7 +36,7 @@ internal static class TelegramPhoneVerification
         var supportText = string.IsNullOrWhiteSpace(supportHtml)
             ? "پشتیبانی این ربات هنوز تنظیم نشده است."
             : $"برای بررسی دستی به پشتیبانی همین ربات پیام بدهید: {supportHtml}";
-        await botClient.SendTextMessageAsync(message.Chat.Id,
+        await botClient.SendMessage(message.Chat.Id,
             "شماره‌های غیرایرانی به‌صورت خودکار تأیید نمی‌شوند. فقط شماره موبایل ایران قابل تأیید خودکار است.\n\n" + supportText,
             parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: cancellationToken);
         return null;

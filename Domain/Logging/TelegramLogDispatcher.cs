@@ -52,14 +52,14 @@ namespace Adminbot.Domain.Logging
         /// <param name="message">Bounded message body.</param>
         /// <param name="parseMode">Telegram parse mode; null keeps the text literal.</param>
         /// <param name="cancellationToken">Cancels the HTTP request.</param>
-        Task SendTextMessageAsync(string channelId, string message, ParseMode? parseMode, CancellationToken cancellationToken);
+        Task SendMessage(string channelId, string message, ParseMode? parseMode, CancellationToken cancellationToken);
 
         /// <summary>Sends one document (database backup) to the backup channel.</summary>
         /// <param name="channelId">Target Telegram chat id.</param>
         /// <param name="fileName">Document file name shown in Telegram.</param>
         /// <param name="content">Readable stream consumed by the client; must be readable for the call duration.</param>
         /// <param name="cancellationToken">Cancels the HTTP request.</param>
-        Task SendDocumentAsync(string channelId, string fileName, Stream content, CancellationToken cancellationToken);
+        Task SendDocument(string channelId, string fileName, Stream content, CancellationToken cancellationToken);
     }
 
     /// <summary>
@@ -79,12 +79,12 @@ namespace Adminbot.Domain.Logging
         }
 
         /// <inheritdoc/>
-        public Task SendTextMessageAsync(string channelId, string message, ParseMode? parseMode, CancellationToken cancellationToken)
-            => _client.SendTextMessageAsync(channelId, message, parseMode: parseMode, cancellationToken: cancellationToken);
+        public Task SendMessage(string channelId, string message, ParseMode? parseMode, CancellationToken cancellationToken)
+            => _client.SendMessage(channelId, message, parseMode: parseMode ?? ParseMode.None, cancellationToken: cancellationToken);
 
         /// <inheritdoc/>
-        public Task SendDocumentAsync(string channelId, string fileName, Stream content, CancellationToken cancellationToken)
-            => _client.SendDocumentAsync(channelId, InputFile.FromStream(content, fileName), cancellationToken: cancellationToken);
+        public Task SendDocument(string channelId, string fileName, Stream content, CancellationToken cancellationToken)
+            => _client.SendDocument(channelId, InputFile.FromStream(content, fileName), cancellationToken: cancellationToken);
     }
 
     /// <summary>Configuration for the outbox dispatcher; production values default from <see cref="TelegramRateLimitPolicy"/>.</summary>
@@ -504,7 +504,7 @@ namespace Adminbot.Domain.Logging
             {
                 var parseMode = row.DeliveryKind == TelegramLogDeliveryKind.Plain ? (ParseMode?)null : ParseMode.Html;
                 await PacedSendAsync(
-                    () => _senderFactory(row.BotId).SendTextMessageAsync(
+                    () => _senderFactory(row.BotId).SendMessage(
                         row.LoggerChannelId, row.Message, parseMode, _shutdown.Token));
                 await _outbox.AcknowledgeAsync(row.Id);
                 Interlocked.Increment(ref _deliveredCount);
@@ -599,7 +599,7 @@ namespace Adminbot.Domain.Logging
             try
             {
                 await PacedSendAsync(
-                    () => _senderFactory(item.BotId).SendTextMessageAsync(
+                    () => _senderFactory(item.BotId).SendMessage(
                         item.LoggerChannelId, TruncateForTelegramLog(item.Message), null, ct));
                 Interlocked.Increment(ref _normalSentCount);
             }
@@ -780,7 +780,7 @@ namespace Adminbot.Domain.Logging
                         source.Open(); destination.Open(); source.BackupDatabase(destination);
                     }
                     await using var upload = new FileStream(target.Temp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                    await _senderFactory(botId).SendDocumentAsync(channelId, target.FileName, upload, _shutdown.Token);
+                    await _senderFactory(botId).SendDocument(channelId, target.FileName, upload, _shutdown.Token);
                 }
                 catch { throw; }
             }

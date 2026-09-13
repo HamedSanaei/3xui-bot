@@ -220,7 +220,7 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
         try
         {
             var client = _botClientProvider.GetClient(notification.BotId);
-            var sent = await client.SendTextMessageAsync(
+            var sent = await client.SendMessage(
                 chatId: notification.ChatId,
                 text: notification.MessageText,
                 cancellationToken: cancellationToken);

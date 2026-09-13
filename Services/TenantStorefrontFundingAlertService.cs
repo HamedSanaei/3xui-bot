@@ -231,7 +231,7 @@ public sealed class TenantStorefrontFundingAlertDeliveryService
         var owner = await _credentials.GetUserStatusWithId(alert.OwnerTelegramUserId);
         var chatId = owner?.ChatID > 0 ? owner.ChatID : alert.OwnerTelegramUserId;
         var text = BuildMessage(alert);
-        return (await resolved.Client.SendTextMessageAsync(chatId, text,
+        return (await resolved.Client.SendMessage(chatId, text,
             parseMode: ParseMode.Html, cancellationToken: cancellationToken)).MessageId;
     }
 

@@ -251,13 +251,13 @@ public class XuiV3BotFlowService
         ITelegramBotClient botClient,
         Message message,
         CredUser credUser,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() || !IsMyAccountsCommand(message?.Text))
             return false;
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "لطفاً چند ثانیه صبر کنید. در حال دریافت اکانت‌های شما از پنل نسخه ۳ هستم...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -271,7 +271,7 @@ public class XuiV3BotFlowService
             var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
             if (!response.Success)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: $"دریافت اکانت‌ها ناموفق بود.\n{response.Msg}",
                     replyMarkup: mainReplyMarkup,
@@ -288,7 +288,7 @@ public class XuiV3BotFlowService
 
             if (accounts.Count == 0)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "شما هنوز هیچ اکانتی از مجموعه ما ندارید.",
                     replyMarkup: mainReplyMarkup,
@@ -305,7 +305,7 @@ public class XuiV3BotFlowService
         {
             // The whole foreground panel read exceeded its overall budget. The lane is released immediately with a
             // safe retry prompt; no panel URL, token, or exception detail is ever exposed to the user.
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "دریافت اطلاعات از سرور بیشتر از حد معمول طول کشید. لطفاً چند لحظه دیگر دوباره تلاش کنید.",
                 replyMarkup: mainReplyMarkup,
@@ -325,7 +325,7 @@ public class XuiV3BotFlowService
                     ["panelUrl"] = _appConfig.XuiV3ApiBaseUrl ?? string.Empty
                 },
                 cancellationToken);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "در دریافت وضعیت اکانت‌ها خطا رخ داد. جزئیات در ترمینال ثبت شد.",
                 replyMarkup: mainReplyMarkup,
@@ -364,7 +364,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() ||
@@ -376,7 +376,7 @@ public class XuiV3BotFlowService
             return false;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "در حال جست‌وجوی اکانت نسخه ۳ با شماره اکانت...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -386,7 +386,7 @@ public class XuiV3BotFlowService
         var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
         if (!response.Success)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"دریافت اکانت‌ها ناموفق بود.\n{response.Msg}",
                 replyMarkup: mainReplyMarkup,
@@ -400,7 +400,7 @@ public class XuiV3BotFlowService
 
         if (client == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"اکانتی با شماره <code>{accountCounter}</code> برای حساب شما پیدا نشد.",
                 parseMode: ParseMode.Html,
@@ -409,7 +409,7 @@ public class XuiV3BotFlowService
             return true;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
             parseMode: ParseMode.Html,
@@ -433,7 +433,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() || string.IsNullOrWhiteSpace(message?.Text))
@@ -448,7 +448,7 @@ public class XuiV3BotFlowService
         if (IsCancel(text))
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "جستجوی اکانت لغو شد.",
                 replyMarkup: mainReplyMarkup,
@@ -468,7 +468,7 @@ public class XuiV3BotFlowService
         var query = text.Trim();
         if (string.IsNullOrWhiteSpace(query))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "عبارت جستجو خالی است. نام اکانت، بخشی از کامنت، یا UUID کامل کانفیگ را بفرستید.",
                 cancellationToken: cancellationToken);
@@ -508,7 +508,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() ||
@@ -520,7 +520,7 @@ public class XuiV3BotFlowService
         if (IsCancel(text))
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "تغییر کامنت لغو شد.",
                 replyMarkup: mainReplyMarkup,
@@ -533,7 +533,7 @@ public class XuiV3BotFlowService
 
         if (IsBlankCommentInput(text))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "کامنت نمی‌تواند خالی یا «بدون کامنت» باشد. لطفاً متن کامنت جدید را ارسال کنید یا «انصراف» را بزنید.",
                 cancellationToken: cancellationToken);
@@ -543,7 +543,7 @@ public class XuiV3BotFlowService
         if (!int.TryParse(user.ConfigLink, out var clientId) || clientId <= 0)
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "شناسه اکانت برای تغییر کامنت معتبر نیست. لطفاً دوباره از لیست اکانت‌ها اقدام کنید.",
                 replyMarkup: mainReplyMarkup,
@@ -586,7 +586,7 @@ public class XuiV3BotFlowService
         ITelegramBotClient botClient,
         Message message,
         CredUser credUser,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() || string.IsNullOrWhiteSpace(message?.Text))
@@ -605,7 +605,7 @@ public class XuiV3BotFlowService
         if (string.IsNullOrWhiteSpace(email))
             return false;
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "لطفاً چند لحظه صبر کنید. در حال اعمال تغییر روی پنل نسخه ۳ هستم...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -625,7 +625,7 @@ public class XuiV3BotFlowService
                     operationTiming,
                     accountEmail: email,
                     source: "command");
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
                     replyMarkup: mainReplyMarkup,
@@ -640,7 +640,7 @@ public class XuiV3BotFlowService
                 enable,
                 credUser.TelegramUserId,
                 cancellationToken);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: updateResponse.Success
                     ? "عملیات مورد نظر با موفقیت انجام شد."
@@ -696,7 +696,7 @@ public class XuiV3BotFlowService
                 operationTiming,
                 accountEmail: email,
                 source: "command");
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "در انجام عملیات خطا رخ داد. جزئیات در ترمینال ثبت شد.",
                 replyMarkup: mainReplyMarkup,
@@ -741,7 +741,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() || string.IsNullOrWhiteSpace(message?.Text))
@@ -759,7 +759,7 @@ public class XuiV3BotFlowService
                 if (IsCancel(text))
                 {
                     await _state.ClearUserStatus(user);
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         chatId: message.Chat.Id,
                         text: "تمدید لغو شد.",
                         replyMarkup: mainReplyMarkup,
@@ -779,7 +779,7 @@ public class XuiV3BotFlowService
 
             if (user.LastStep == RenewStepExternalTargetConfirmation)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "برای ادامه تمدید اکانت شخص دیگر، هشدار قبلی را با دکمه «ادامه تمدید همین اکانت» تأیید کنید یا به منوی اصلی برگردید.",
                     replyMarkup: BuildExternalRenewTargetConfirmationKeyboard(),
@@ -806,7 +806,7 @@ public class XuiV3BotFlowService
                 PaymentMethod = "credit"
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "یکی از شناسه‌های اکانت نسخه ۳ را برای تمدید ارسال کنید:\n" +
                       "• نام اکانت (Email)\n" +
@@ -816,7 +816,7 @@ public class XuiV3BotFlowService
                       "تمدید اکانت شخص دیگر ممکن است، اما مالکیت یا دسترسی مدیریتی آن را تغییر نمی‌دهد.",
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "برای خروج از فرایند تمدید از دکمه زیر استفاده کنید.",
                 replyMarkup: BuildRenewHomeKeyboard(),
@@ -876,7 +876,7 @@ public class XuiV3BotFlowService
         CancellationToken cancellationToken)
     {
         var lookupKind = "invalid";
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "لطفاً چند لحظه صبر کنید. اکانت از پنل نسخه ۳ بررسی می‌شود...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -1115,7 +1115,7 @@ public class XuiV3BotFlowService
             ParseMode.Html,
             BuildRenewHomeKeyboard(),
             cancellationToken);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: service.IsUnlimited
                 ? "پلن تمدید نامحدود را انتخاب کنید:"
@@ -1228,7 +1228,7 @@ public class XuiV3BotFlowService
         CancellationToken cancellationToken)
     {
         await _state.ClearUserStatus(user);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: text,
             replyMarkup: BuildRenewHomeKeyboard(),
@@ -1266,7 +1266,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() || string.IsNullOrWhiteSpace(message?.Text))
@@ -1279,7 +1279,7 @@ public class XuiV3BotFlowService
             if (IsCancel(text) || string.Equals(text, "انصراف", StringComparison.OrdinalIgnoreCase))
             {
                 await _state.ClearUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "عملیات حذف اکانت‌های منقضی لغو شد.",
                     replyMarkup: mainReplyMarkup,
@@ -1289,7 +1289,7 @@ public class XuiV3BotFlowService
 
             if (!string.Equals(text, "تایید حذف اکانت های منقضی", StringComparison.OrdinalIgnoreCase))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "برای حذف اکانت‌های منقضی، دکمه تایید را بزنید یا انصراف دهید.",
                     replyMarkup: BuildDeleteExpiredConfirmKeyboard(),
@@ -1297,7 +1297,7 @@ public class XuiV3BotFlowService
                 return true;
             }
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "لطفاً چند لحظه صبر کنید. در حال حذف اکانت‌های منقضی شما از پنل نسخه ۳ هستم...",
                 replyMarkup: new ReplyKeyboardRemove(),
@@ -1310,7 +1310,7 @@ public class XuiV3BotFlowService
                 if (emails.Count == 0)
                 {
                     await _state.ClearUserStatus(user);
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         chatId: message.Chat.Id,
                         text: "لیست اکانت‌های منقضی خالی است. دوباره از منوی مدیریت اکانت اقدام کنید.",
                         replyMarkup: mainReplyMarkup,
@@ -1329,7 +1329,7 @@ public class XuiV3BotFlowService
                         operationTiming,
                         source: "owned-expired-delete");
                     await _state.ClearUserStatus(user);
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         chatId: message.Chat.Id,
                         text: $"دریافت اطلاعات اکانت‌ها ناموفق بود.\n{clientsResponse.Msg}",
                         replyMarkup: mainReplyMarkup,
@@ -1347,7 +1347,7 @@ public class XuiV3BotFlowService
                 if (eligibleClients.Count == 0)
                 {
                     await _state.ClearUserStatus(user);
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         chatId: message.Chat.Id,
                         text: "اکانت منقضی قابل حذفی برای شما پیدا نشد.",
                         replyMarkup: mainReplyMarkup,
@@ -1362,7 +1362,7 @@ public class XuiV3BotFlowService
 
                 await _state.ClearUserStatus(user);
 
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: BuildDeleteExpiredResultText(deleted, failed, false, credUser.TelegramUserId),
                     parseMode: ParseMode.Html,
@@ -1430,7 +1430,7 @@ public class XuiV3BotFlowService
                     operationTiming,
                     source: "owned-expired-delete");
                 await _state.ClearUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "در حذف اکانت‌های منقضی خطا رخ داد. جزئیات در لاگ ثبت شد.",
                     replyMarkup: mainReplyMarkup,
@@ -1442,7 +1442,7 @@ public class XuiV3BotFlowService
         if (!string.Equals(text, "حذف اکانت های منقضی", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "لطفاً چند لحظه صبر کنید. در حال بررسی اکانت‌های منقضی شما روی پنل نسخه ۳ هستم...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -1454,7 +1454,7 @@ public class XuiV3BotFlowService
             var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
             if (!response.Success)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: $"دریافت اطلاعات اکانت‌ها ناموفق بود.\n{response.Msg}",
                     replyMarkup: mainReplyMarkup,
@@ -1470,7 +1470,7 @@ public class XuiV3BotFlowService
 
             if (expiredClients.Count == 0)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "هیچ اکانت منقضی یا تمام‌شده‌ای برای شما پیدا نشد.",
                     replyMarkup: mainReplyMarkup,
@@ -1487,7 +1487,7 @@ public class XuiV3BotFlowService
                 SubLink = JsonConvert.SerializeObject(expiredClients.Select(client => client.Email).ToList())
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: BuildDeleteExpiredConfirmationText(expiredClients, false, credUser.TelegramUserId),
                 parseMode: ParseMode.Html,
@@ -1508,7 +1508,7 @@ public class XuiV3BotFlowService
                     ["telegramUserId"] = credUser.TelegramUserId
                 },
                 cancellationToken);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "در بررسی اکانت‌های منقضی خطا رخ داد. جزئیات در لاگ ثبت شد.",
                 replyMarkup: mainReplyMarkup,
@@ -1562,13 +1562,13 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (IsCancel(message.Text))
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "تمدید لغو شد.",
                 replyMarkup: mainReplyMarkup,
@@ -1592,7 +1592,7 @@ public class XuiV3BotFlowService
         {
             if (!TryGetTrafficGbFromText(message.Text, out var trafficGb) || trafficGb <= 0)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "حجم معتبر نیست. یکی از دکمه‌ها را بزنید یا فقط عدد صحیح بفرستید؛ مثلا 7 یا ۷.",
                     replyMarkup: BuildTrafficReplyKeyboard(service),
@@ -1602,7 +1602,7 @@ public class XuiV3BotFlowService
 
             if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, trafficGb))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: BuildMinimumTrafficMessage(service),
                     replyMarkup: BuildTrafficReplyKeyboard(service),
@@ -1618,7 +1618,7 @@ public class XuiV3BotFlowService
                 TotoalGB = trafficGb.ToString()
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: XuiV3PurchaseService.BuildDurationSelectionText(service, "مدت تمدید را انتخاب کنید:"),
                 replyMarkup: BuildDurationReplyKeyboard(service),
@@ -1631,7 +1631,7 @@ public class XuiV3BotFlowService
             var duration = TryGetDurationFromText(service, message.Text);
             if (duration == null)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: XuiV3PurchaseService.BuildDurationSelectionText(
                         service,
@@ -1688,7 +1688,7 @@ public class XuiV3BotFlowService
                 credUser.TelegramUserId,
                 ResolveRenewPriceToman(refreshedUser, credUser.IsColleague),
                 cancellationToken);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: BuildRenewSummary(refreshedUser, credUser.IsColleague, credUser.TelegramUserId, previewClient),
                 parseMode: ParseMode.Html,
@@ -1702,7 +1702,7 @@ public class XuiV3BotFlowService
             var plan = TryGetUnlimitedPlanFromText(service, message.Text, credUser.IsColleague);
             if (plan == null)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "پلن معتبر نیست. یکی از گزینه‌های لیست را انتخاب کنید.",
                     replyMarkup: BuildUnlimitedPlanReplyKeyboard(service, credUser.IsColleague),
@@ -1756,7 +1756,7 @@ public class XuiV3BotFlowService
                 credUser.TelegramUserId,
                 ResolveRenewPriceToman(refreshedUser, credUser.IsColleague),
                 cancellationToken);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: BuildRenewSummary(refreshedUser, credUser.IsColleague, credUser.TelegramUserId, previewClient),
                 parseMode: ParseMode.Html,
@@ -1770,7 +1770,7 @@ public class XuiV3BotFlowService
             var wantsSiteWalletRenew = message.Text.Trim().Equals("تایید تمدید با کیف پول سایت", StringComparison.OrdinalIgnoreCase);
             if (!message.Text.Trim().Equals("تایید تمدید", StringComparison.OrdinalIgnoreCase) && !wantsSiteWalletRenew)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "برای تمدید، گزینه تایید تمدید را بزنید.",
                     replyMarkup: BuildConfirmReplyKeyboard(),
@@ -1784,7 +1784,7 @@ public class XuiV3BotFlowService
                 user.LastStep = RenewStepDuration;
                 user.SelectedPeriod = string.Empty;
                 await _state.SaveUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: XuiV3PurchaseService.BuildDurationSelectionText(
                         service,
@@ -1806,7 +1806,7 @@ public class XuiV3BotFlowService
                 user.LastStep = RenewStepUnlimitedPlan;
                 user.Type = string.Empty;
                 await _state.SaveUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "پلن نامحدود انتخاب‌شده دیگر فعال نیست. پلن جدید را انتخاب کنید.",
                     replyMarkup: BuildUnlimitedPlanReplyKeyboard(service, credUser.IsColleague),
@@ -1873,7 +1873,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         var service = FindService(user.SelectedCountry);
@@ -1904,7 +1904,7 @@ public class XuiV3BotFlowService
                 cancellationToken);
 
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "⛔️ موجودی کیف پول شما برای تمدید کافی نیست.\n" +
                       $"💳 موجودی فعلی: {credUser.AccountBalance.FormatCurrency()}\n" +
@@ -1925,7 +1925,7 @@ public class XuiV3BotFlowService
             if (!siteWalletEligibility.CanUse && siteWalletEligibility.IsBlocked)
             {
                 await _state.ClearUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: $"پرداخت تمدید با کیف پول سایت گذرگاه ممکن نیست.\n{siteWalletEligibility.Message}",
                     replyMarkup: mainReplyMarkup,
@@ -1934,7 +1934,7 @@ public class XuiV3BotFlowService
             }
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "در حال تمدید اکانت نسخه ۳...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -2383,7 +2383,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         XuiV3ServiceDefinition service,
         XuiV3ResolvedPurchase resolved,
         bool useSiteWallet,
@@ -2458,7 +2458,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         XuiV3ServiceDefinition service,
         XuiV3ResolvedPurchase resolved,
         bool useSiteWallet,
@@ -2522,7 +2522,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         XuiV3ServiceDefinition service,
         XuiV3ResolvedPurchase resolved,
         bool useSiteWallet,
@@ -2651,7 +2651,7 @@ public class XuiV3BotFlowService
 
         try
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 operation.TelegramUserId,
                 "✅ نتیجه تمدید بررسی شد؛ تمدید در پنل اعمال شده بود و تسویه آن با موفقیت تکمیل شد.",
                 cancellationToken: cancellationToken);
@@ -2698,7 +2698,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         XuiV3ServiceDefinition service,
         XuiV3ResolvedPurchase resolved,
         bool useSiteWallet,
@@ -2739,7 +2739,7 @@ public class XuiV3BotFlowService
         if (settlement.InProgress)
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "✅ تمدید با موفقیت انجام شد. پرداخت در حال انجام است و به‌زودی تکمیل می‌شود.",
                 replyMarkup: mainReplyMarkup,
@@ -2750,7 +2750,7 @@ public class XuiV3BotFlowService
         if (settlement.ManualReview)
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "✅ تمدید انجام شد؛ پرداخت در انتظار بررسی دستی است. لطفاً با پشتیبانی تماس بگیرید.",
                 replyMarkup: mainReplyMarkup,
@@ -2773,7 +2773,7 @@ public class XuiV3BotFlowService
             traffic.Down = 0;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "✅ تمدید با موفقیت انجام شد.\n\n" +
                   BuildSelectedWalletBalanceText(
@@ -3223,13 +3223,13 @@ public class XuiV3BotFlowService
         var selection = new XuiV3PurchaseSelection();
         _sessionStore.Set(credUser.TelegramUserId, selection);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "فرایند خرید شروع شد. برای برگشت به منوی اصلی از /start استفاده کنید.",
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: cancellationToken);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "نوع سرویس را انتخاب کنید:",
             replyMarkup: _purchaseService.BuildServiceKeyboard(),
@@ -3301,7 +3301,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() || message?.Text == null || user?.Flow != PurchaseFlowName)
@@ -3311,7 +3311,7 @@ public class XuiV3BotFlowService
         {
             _sessionStore.Clear(credUser.TelegramUserId);
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "فرایند خرید لغو شد.",
                 replyMarkup: mainReplyMarkup,
@@ -3336,7 +3336,7 @@ public class XuiV3BotFlowService
             string.Equals(user.LastStep, PurchaseStepSelectService, StringComparison.Ordinal) &&
             string.IsNullOrWhiteSpace(serviceKey))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "نوع سرویس را از دکمه‌های فعال انتخاب کنید.",
                 replyMarkup: _purchaseService.BuildServiceKeyboard(),
@@ -3368,7 +3368,7 @@ public class XuiV3BotFlowService
         {
             if (!XuiV3PurchaseService.TryResolveDurationInput(service, message.Text, out var duration))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: XuiV3PurchaseService.BuildDurationSelectionText(
                         service,
@@ -3396,7 +3396,7 @@ public class XuiV3BotFlowService
                 PendingUserComment = string.Empty
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"تعداد اکانت مورد نظر را وارد کنید. حداکثر تعداد در هر سفارش {XuiV3PurchaseService.MaxBulkAccountCount} است.",
                 replyMarkup: BuildAccountCountInlineKeyboard(),
@@ -3410,7 +3410,7 @@ public class XuiV3BotFlowService
                 accountCount <= 0 ||
                 accountCount > XuiV3PurchaseService.MaxBulkAccountCount)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: $"تعداد اکانت معتبر نیست. یک عدد بین 1 تا {XuiV3PurchaseService.MaxBulkAccountCount} بفرستید.",
                     replyMarkup: BuildAccountCountReplyKeyboard(),
@@ -3433,7 +3433,7 @@ public class XuiV3BotFlowService
                 PendingAccountCount = accountCount
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "اگر برای این سفارش کامنتی دارید، متن آن را بفرستید. این کامنت روی اکانت ذخیره می‌شود و بعداً در وضعیت اکانت نمایش داده می‌شود.\n\nاگر کامنتی ندارید، گزینه «ادامه بدون کامنت» را بزنید.",
                 replyMarkup: BuildOptionalCommentReplyKeyboard(),
@@ -3469,7 +3469,7 @@ public class XuiV3BotFlowService
                 PendingUserComment = userComment
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: _purchaseService.BuildSummaryText(selection, resolved),
                 parseMode: ParseMode.Html,
@@ -3480,7 +3480,7 @@ public class XuiV3BotFlowService
 
         if (service.IsUnlimited)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "برای سرویس نامحدود، یکی از پلن‌های نمایش داده شده را انتخاب کنید.",
                 replyMarkup: _purchaseService.BuildUnlimitedPlanKeyboard(service.Key, credUser.IsColleague),
@@ -3492,7 +3492,7 @@ public class XuiV3BotFlowService
         {
             if (!TryGetTrafficGbFromText(message.Text, out var trafficGb) || trafficGb <= 0)
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: "حجم معتبر نیست. فقط عدد صحیح وارد کنید؛ مثلا 7 یا ۷. سپس دوباره تلاش کنید.",
                     replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
@@ -3502,7 +3502,7 @@ public class XuiV3BotFlowService
 
             if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, trafficGb))
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: message.Chat.Id,
                     text: BuildMinimumTrafficMessage(service),
                     replyMarkup: _purchaseService.BuildTrafficKeyboard(service.Key),
@@ -3528,7 +3528,7 @@ public class XuiV3BotFlowService
                 PendingUserComment = string.Empty
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: XuiV3PurchaseService.BuildDurationSelectionText(
                     service,
@@ -3538,7 +3538,7 @@ public class XuiV3BotFlowService
             return true;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "برای ادامه از دکمه‌های پیام سفارش استفاده کنید.",
             cancellationToken: cancellationToken);
@@ -3589,7 +3589,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!IsEnabledForPurchaseFlow() || string.IsNullOrWhiteSpace(message?.Text))
@@ -3611,7 +3611,7 @@ public class XuiV3BotFlowService
         if (IsCancel(text))
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "فرایند دریافت اکانت تست لغو شد.",
                 replyMarkup: mainReplyMarkup,
@@ -3621,7 +3621,7 @@ public class XuiV3BotFlowService
 
         if (credUser.IsColleague)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "اکانت تست نسخه ۳ فقط برای کاربران عادی فعال است.",
                 replyMarkup: mainReplyMarkup,
@@ -3642,7 +3642,7 @@ public class XuiV3BotFlowService
                 LastStep = TrialStepSelectService
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "نوع اکانت تست را انتخاب کنید:",
                 replyMarkup: BuildTrialServiceReplyKeyboard(),
@@ -3656,7 +3656,7 @@ public class XuiV3BotFlowService
         var serviceKey = TryGetTrialServiceKey(text);
         if (string.IsNullOrWhiteSpace(serviceKey))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "نوع تست معتبر نیست. یکی از گزینه‌های نمایش داده شده را انتخاب کنید.",
                 replyMarkup: BuildTrialServiceReplyKeyboard(),
@@ -3669,7 +3669,7 @@ public class XuiV3BotFlowService
         if (lastTrial > DateTime.MinValue && (now - lastTrial).TotalDays < 30)
         {
             var remainingDays = Math.Max(1, 30 - (int)Math.Floor((now - lastTrial).TotalDays));
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"شما تست این سرویس را در ۳۰ روز گذشته دریافت کرده‌اید. لطفاً {remainingDays} روز دیگر دوباره تلاش کنید.",
                 replyMarkup: mainReplyMarkup,
@@ -3678,7 +3678,7 @@ public class XuiV3BotFlowService
             return true;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "در حال ساخت اکانت تست نسخه ۳، لطفاً چند لحظه صبر کنید...",
             replyMarkup: new ReplyKeyboardRemove(),
@@ -3722,7 +3722,7 @@ public class XuiV3BotFlowService
                 operationTiming,
                 source: serviceKey);
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: $"ساخت اکانت تست ناموفق بود.\n{XuiV3UserSafeError.ForAccountCreation(creation.Message)}",
                 replyMarkup: mainReplyMarkup,
@@ -3740,7 +3740,7 @@ public class XuiV3BotFlowService
         if (!string.IsNullOrWhiteSpace(creation.SubLink))
         {
             using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(creation.SubLink, 200));
-            await botClient.SendPhotoAsync(
+            await botClient.SendPhoto(
                 chatId: message.Chat.Id,
                 photo: InputFile.FromStream(qrStream, "trial-subscription-qr.png"),
                 caption: "✅ اکانت تست شما ساخته شد.\n\n" + accountText,
@@ -3750,7 +3750,7 @@ public class XuiV3BotFlowService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "✅ اکانت تست شما ساخته شد.\n\n" + accountText,
                 parseMode: ParseMode.Html,
@@ -3785,7 +3785,7 @@ public class XuiV3BotFlowService
         Message message,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(message?.Text))
@@ -3801,7 +3801,7 @@ public class XuiV3BotFlowService
         if (IsCancel(text))
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "درخواست همکاری لغو شد.",
                 replyMarkup: mainReplyMarkup,
@@ -3812,7 +3812,7 @@ public class XuiV3BotFlowService
         if (credUser?.IsColleague == true)
         {
             await _state.ClearUserStatus(user);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "حساب شما هم‌اکنون از نوع همکار است و نیازی به ثبت درخواست جدید نیست.",
                 replyMarkup: mainReplyMarkup,
@@ -3830,7 +3830,7 @@ public class XuiV3BotFlowService
                 LastStep = ColleagueRequestStepConfirm
             });
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "برای ثبت درخواست همکاری باید تایید کنید که فروش هفتگی شما حداقل ۵,۰۰۰,۰۰۰ تومان است.\n\nاگر فروش هفتگی شما کمتر از این مقدار باشد، حساب شما کاربر عادی محسوب می‌شود و امکان خرید با قیمت همکار برای شما فعال نخواهد شد.",
                 replyMarkup: BuildColleagueRequestConfirmKeyboard(),
@@ -3843,7 +3843,7 @@ public class XuiV3BotFlowService
 
         if (!string.Equals(text, "شرایط را قبول دارم و درخواست همکاری می‌فرستم", StringComparison.OrdinalIgnoreCase))
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: message.Chat.Id,
                 text: "برای ثبت درخواست همکاری، دکمه تایید شرایط را بزنید یا انصراف دهید.",
                 replyMarkup: BuildColleagueRequestConfirmKeyboard(),
@@ -3867,7 +3867,7 @@ public class XuiV3BotFlowService
             cancellationToken);
 
         await _state.ClearUserStatus(user);
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: message.Chat.Id,
             text: "درخواست همکاری شما ثبت شد و برای بررسی به سوپرادمین‌ها ارسال شد.\nبعد از بررسی، نتیجه از طریق پشتیبانی یا همین ربات به شما اطلاع داده می‌شود.",
             replyMarkup: mainReplyMarkup,
@@ -3922,7 +3922,7 @@ public class XuiV3BotFlowService
         CallbackQuery callbackQuery,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (!XuiV3PurchaseCallbacks.TryParse(callbackQuery.Data, out var callback))
@@ -4291,7 +4291,7 @@ public class XuiV3BotFlowService
                     cancellationToken: cancellationToken);
             }
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "به منوی اصلی برگشتید.",
                 replyMarkup: mainReplyMarkup,
@@ -4397,7 +4397,7 @@ public class XuiV3BotFlowService
                     cancellationToken: cancellationToken);
             }
 
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اگر برای این سفارش کامنتی دارید بفرستید. این کامنت روی اکانت ذخیره می‌شود و بعداً در وضعیت اکانت نمایش داده می‌شود.",
                 replyMarkup: BuildOptionalCommentReplyKeyboard(),
@@ -5004,7 +5004,7 @@ public class XuiV3BotFlowService
                     if (!string.IsNullOrWhiteSpace(createdAccount.SubLink))
                     {
                         using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(createdAccount.SubLink, 200));
-                        await botClient.SendPhotoAsync(
+                        await botClient.SendPhoto(
                             chatId: chatId,
                             photo: InputFile.FromStream(qrStream, "subscription-qr.png"),
                             caption: createdAccountText,
@@ -5013,7 +5013,7 @@ public class XuiV3BotFlowService
                     }
                     else
                     {
-                        await botClient.SendTextMessageAsync(
+                        await botClient.SendMessage(
                             chatId: chatId,
                             text: createdAccountText,
                             parseMode: ParseMode.Html,
@@ -5025,7 +5025,7 @@ public class XuiV3BotFlowService
 
                 if (bulkResult.Failures.Count > 0)
                 {
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         chatId: chatId,
                         text: BuildBulkFailureText(bulkResult),
                         parseMode: ParseMode.Html,
@@ -5078,7 +5078,7 @@ public class XuiV3BotFlowService
 
                 _sessionStore.Clear(credUser.TelegramUserId);
                 await _state.ClearUserStatus(user);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: "✅ خرید با موفقیت انجام شد.\n\n" +
                           BuildSelectedWalletBalanceText(useSiteWallet, bulkBeforeBalance, bulkResult.TotalSuccessfulPriceToman, bulkAfterBalance, siteWalletDebitResult) +
@@ -5167,7 +5167,7 @@ public class XuiV3BotFlowService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: text,
             replyMarkup: BuildSearchStartKeyboard(),
@@ -5190,7 +5190,7 @@ public class XuiV3BotFlowService
         int messageId,
         CredUser credUser,
         User user,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         if (credUser != null)
@@ -5210,7 +5210,7 @@ public class XuiV3BotFlowService
                 cancellationToken: cancellationToken);
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: "منوی اصلی",
             replyMarkup: mainReplyMarkup,
@@ -5397,7 +5397,7 @@ public class XuiV3BotFlowService
         var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
         if (!response.Success)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: $"دریافت اکانت‌ها ناموفق بود.\n{response.Msg}",
                 cancellationToken: cancellationToken);
@@ -5424,7 +5424,7 @@ public class XuiV3BotFlowService
             }
             else
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: emptyText,
                     cancellationToken: cancellationToken);
@@ -5455,7 +5455,7 @@ public class XuiV3BotFlowService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: text,
                 parseMode: ParseMode.Html,
@@ -5491,7 +5491,7 @@ public class XuiV3BotFlowService
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
                 cancellationToken: cancellationToken);
@@ -5516,7 +5516,7 @@ public class XuiV3BotFlowService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: text,
                 parseMode: ParseMode.Html,
@@ -5626,7 +5626,7 @@ public class XuiV3BotFlowService
         }
         else
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: text,
                 parseMode: ParseMode.Html,
@@ -5634,7 +5634,7 @@ public class XuiV3BotFlowService
                 cancellationToken: cancellationToken);
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: service.IsUnlimited ? "یکی از پلن‌های زیر را انتخاب کنید:" : "یکی از حجم‌های زیر را انتخاب کنید یا عدد دلخواه بفرستید:",
             replyMarkup: service.IsUnlimited
@@ -5655,7 +5655,7 @@ public class XuiV3BotFlowService
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای حذف پیدا نشد یا متعلق به حساب شما نیست.",
                 cancellationToken: cancellationToken);
@@ -5714,7 +5714,7 @@ public class XuiV3BotFlowService
                 credUser,
                 operationTiming,
                 source: "list");
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای حذف پیدا نشد یا قبلاً حذف شده است.",
                 cancellationToken: cancellationToken);
@@ -5815,7 +5815,7 @@ public class XuiV3BotFlowService
     {
         if (clientId == null || clientId <= 0)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "شناسه اکانت معتبر نیست.",
                 cancellationToken: cancellationToken);
@@ -6715,7 +6715,7 @@ public class XuiV3BotFlowService
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
                 cancellationToken: cancellationToken);
@@ -6867,7 +6867,7 @@ public class XuiV3BotFlowService
             backKeyboard,
             cancellationToken);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: service.IsUnlimited
                 ? "یکی از پلن‌های زیر را انتخاب کنید:"
@@ -6890,7 +6890,7 @@ public class XuiV3BotFlowService
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای حذف پیدا نشد یا متعلق به حساب شما نیست.",
                 cancellationToken: cancellationToken);
@@ -6949,7 +6949,7 @@ public class XuiV3BotFlowService
                 credUser,
                 operationTiming,
                 source: "search");
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای حذف پیدا نشد یا قبلاً حذف شده است.",
                 cancellationToken: cancellationToken);
@@ -7057,7 +7057,7 @@ public class XuiV3BotFlowService
                 credUser,
                 operationTiming,
                 source: "search");
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
                 cancellationToken: cancellationToken);
@@ -7148,7 +7148,7 @@ public class XuiV3BotFlowService
         var client = await GetOwnedClientByIdAsync(credUser.TelegramUserId, clientId, cancellationToken);
         if (client == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای تغییر کامنت پیدا نشد یا متعلق به حساب شما نیست.",
                 cancellationToken: cancellationToken);
@@ -7216,7 +7216,7 @@ public class XuiV3BotFlowService
         int page,
         bool fromSearch,
         string newComment,
-        IReplyMarkup mainReplyMarkup,
+        ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
         using var operationTiming = XuiOperationTiming.Start();
@@ -7229,7 +7229,7 @@ public class XuiV3BotFlowService
                 credUser,
                 operationTiming,
                 source: fromSearch ? "search" : "list");
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر برای تغییر کامنت پیدا نشد یا متعلق به حساب شما نیست.",
                 replyMarkup: mainReplyMarkup,
@@ -7249,7 +7249,7 @@ public class XuiV3BotFlowService
                 operationTiming,
                 accountEmail: client.Email,
                 source: fromSearch ? "search" : "list");
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: $"تغییر کامنت ناموفق بود.\n{updateResponse.Msg}",
                 replyMarkup: mainReplyMarkup,
@@ -7274,7 +7274,7 @@ public class XuiV3BotFlowService
             cancellationToken);
 
         client.Comment = payload.Comment;
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: "✅ کامنت اکانت با موفقیت تغییر کرد.\n\n" +
                   BuildV3ClientInfo(client, serverInfo, credUser.IsColleague, IsClientRenewable(client)),
@@ -7341,7 +7341,7 @@ public class XuiV3BotFlowService
                 "XUI v3 account ownership lookup failed before configuration retrieval. clientId={ClientId}, failureType={FailureType}",
                 clientId,
                 ex.GetType().Name);
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "دریافت اطلاعات اکانت موقتاً انجام نشد. لطفاً کمی بعد دوباره تلاش کنید.",
                 cancellationToken: cancellationToken);
@@ -7350,7 +7350,7 @@ public class XuiV3BotFlowService
 
         if (client == null)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
                 cancellationToken: cancellationToken);
@@ -7404,7 +7404,7 @@ public class XuiV3BotFlowService
                 _logger.LogWarning(
                     "XUI v3 account links fallback skipped because the owned client has no email. clientId={ClientId}",
                     client.Id);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: "این اکانت شناسهٔ معتبری برای دریافت کانفیگ ندارد.",
                     cancellationToken: cancellationToken);
@@ -7425,7 +7425,7 @@ public class XuiV3BotFlowService
                         "XUI v3 account links fallback was unsuccessful. clientId={ClientId}, failureType={FailureType}",
                         client.Id,
                         "panel_response");
-                    await botClient.SendTextMessageAsync(
+                    await botClient.SendMessage(
                         chatId: chatId,
                         text: "دریافت کانفیگ‌ها موقتاً انجام نشد. لطفاً کمی بعد دوباره تلاش کنید.",
                         cancellationToken: cancellationToken);
@@ -7445,7 +7445,7 @@ public class XuiV3BotFlowService
                     "XUI v3 account links fallback failed. clientId={ClientId}, failureType={FailureType}",
                     client.Id,
                     ex.GetType().Name);
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: "دریافت کانفیگ‌ها موقتاً انجام نشد. لطفاً کمی بعد دوباره تلاش کنید.",
                     cancellationToken: cancellationToken);
@@ -7458,7 +7458,7 @@ public class XuiV3BotFlowService
             var emptyText = client.Enable
                 ? "پنل برای این اکانت هیچ کانفیگ فعالی برنگرداند. ممکن است اکانت هنوز به ورودی فعالی متصل نباشد."
                 : "این اکانت غیرفعال است و پنل کانفیگ فعالی برای آن برنگرداند. ابتدا اکانت را فعال کنید و دوباره تلاش کنید.";
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: emptyText,
                 cancellationToken: cancellationToken);
@@ -7468,7 +7468,7 @@ public class XuiV3BotFlowService
         var html = BuildAccountConfigsHtml(client.Email, links);
         if (html.Length <= MaxAccountConfigsHtmlLength)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: html,
                 parseMode: ParseMode.Html,
@@ -7478,7 +7478,7 @@ public class XuiV3BotFlowService
 
         var documentBytes = Encoding.UTF8.GetBytes(string.Join(Environment.NewLine, links));
         await using var documentStream = new MemoryStream(documentBytes, writable: false);
-        await botClient.SendDocumentAsync(
+        await botClient.SendDocument(
             chatId: chatId,
             document: InputFile.FromStream(documentStream, $"configs-{client.Id}.txt"),
             caption: "📥 <b>کانفیگ‌های اکانت</b>\n" +
@@ -7508,7 +7508,7 @@ public class XuiV3BotFlowService
     {
         await _state.ClearUserStatus(user);
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId,
             text,
             replyMarkup: BuildSearchEmptyKeyboard(),
@@ -8013,14 +8013,14 @@ public class XuiV3BotFlowService
         List<XuiV3Client> clients,
         CancellationToken cancellationToken)
     {
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: "✅ وضعیت اکانت‌های شما به شرح زیر است:",
             cancellationToken: cancellationToken);
 
         foreach (var client in clients)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: BuildV3ClientInfo(client, serverInfo, isColleague, IsClientRenewable(client)),
                 parseMode: ParseMode.Html,
@@ -9730,7 +9730,7 @@ public class XuiV3BotFlowService
         if (!string.IsNullOrWhiteSpace(credUser?.PhoneNumber))
             return true;
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text:
                 "برای خرید یا تمدید اکانت، ابتدا باید شماره تلفن خودتان را تأیید کنید.\n\n" +
@@ -10195,10 +10195,10 @@ public class XuiV3BotFlowService
             return;
         }
 
-        await botClient.SendTextMessageAsync(
+        await botClient.SendMessage(
             chatId: chatId,
             text: text,
-            parseMode: parseMode,
+            parseMode: parseMode ?? ParseMode.None,
             replyMarkup: replyMarkup,
             cancellationToken: cancellationToken);
     }
@@ -10214,11 +10214,11 @@ public class XuiV3BotFlowService
     {
         try
         {
-            await botClient.EditMessageTextAsync(
+            await botClient.EditMessageText(
                 chatId: chatId,
                 messageId: messageId,
                 text: text,
-                parseMode: parseMode,
+                parseMode: parseMode ?? ParseMode.None,
                 replyMarkup: replyMarkup,
                 cancellationToken: cancellationToken);
         }
@@ -12335,7 +12335,7 @@ public class XuiV3BotFlowService
     {
         if (clientId == null || clientId <= 0)
         {
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "شناسه اکانت معتبر نیست.",
                 cancellationToken: cancellationToken);
@@ -12357,7 +12357,7 @@ public class XuiV3BotFlowService
                     credUser,
                     operationTiming,
                     source: "list");
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: $"دریافت اطلاعات اکانت ناموفق بود.\n{clientsResponse.Msg}",
                     cancellationToken: cancellationToken);
@@ -12373,7 +12373,7 @@ public class XuiV3BotFlowService
                     credUser,
                     operationTiming,
                     source: "list");
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: "اکانت مورد نظر پیدا نشد یا متعلق به حساب شما نیست.",
                     cancellationToken: cancellationToken);
@@ -12410,7 +12410,7 @@ public class XuiV3BotFlowService
                     accountEmail: client.Email,
                     source: "list");
 
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: $"متاسفانه عملیات مورد نظر انجام نشد.\n{updateResponse.Msg}",
                     cancellationToken: cancellationToken);
@@ -12453,7 +12453,7 @@ public class XuiV3BotFlowService
             }
             else
             {
-                await botClient.SendTextMessageAsync(
+                await botClient.SendMessage(
                     chatId: chatId,
                     text: updatedText,
                     parseMode: ParseMode.Html,
@@ -12489,7 +12489,7 @@ public class XuiV3BotFlowService
                 credUser,
                 operationTiming,
                 source: "list");
-            await botClient.SendTextMessageAsync(
+            await botClient.SendMessage(
                 chatId: chatId,
                 text: "در انجام عملیات خطا رخ داد. جزئیات در ترمینال ثبت شد.",
                 cancellationToken: cancellationToken);

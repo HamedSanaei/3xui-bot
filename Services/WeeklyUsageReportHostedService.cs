@@ -352,7 +352,7 @@ public sealed class WeeklyUsageReportHostedService : BackgroundService
 
             var botClient = _botClientProvider.GetClient(defaultBot.Id);
             await using var imageStream = new MemoryStream(png, writable: false);
-            var sentMessage = await botClient.SendPhotoAsync(
+            var sentMessage = await botClient.SendPhoto(
                 chatId: new ChatId(loggerChannel),
                 photo: InputFile.FromStream(imageStream, $"weekly-usage-{periodEndIran:yyyyMMdd}.png"),
                 caption: caption,

@@ -41,7 +41,7 @@ public sealed partial class ConcurrencyTests
                 Id = "sequence-2990",
                 Data = XuiV3PurchaseCallbacks.Home(),
                 From = new Telegram.Bot.Types.User { Id = 711 },
-                Message = new Message { MessageId = 17, Chat = new Chat { Id = 711 } }
+                Message = new Message { Id = 17, Chat = new Chat { Id = 711 } }
             };
             var sw = Stopwatch.StartNew();
             var handled = await flow.TryHandleCallbackAsync(
@@ -513,7 +513,7 @@ public sealed partial class ConcurrencyTests
     {
         public TaskCompletionSource AckStarted { get; } = Signal();
 
-        public override async Task<TResponse> MakeRequestAsync<TResponse>(
+        public override async Task<TResponse> SendRequest<TResponse>(
             IRequest<TResponse> request, CancellationToken cancellationToken = default)
         {
             if (request is AnswerCallbackQueryRequest)
@@ -522,18 +522,18 @@ public sealed partial class ConcurrencyTests
                 await Task.Delay(System.Threading.Timeout.InfiniteTimeSpan, cancellationToken);
                 throw new InvalidOperationException("unreachable");
             }
-            return await base.MakeRequestAsync(request, cancellationToken);
+            return await base.SendRequest(request, cancellationToken);
         }
     }
 
     private sealed class ThrowingAckClient(Exception exception) : StorefrontClient
     {
-        public override Task<TResponse> MakeRequestAsync<TResponse>(
+        public override Task<TResponse> SendRequest<TResponse>(
             IRequest<TResponse> request, CancellationToken cancellationToken = default)
         {
             if (request is AnswerCallbackQueryRequest)
                 return Task.FromException<TResponse>(exception);
-            return base.MakeRequestAsync(request, cancellationToken);
+            return base.SendRequest(request, cancellationToken);
         }
     }
     private sealed class BlockingMembershipClient : StorefrontClient
@@ -541,7 +541,7 @@ public sealed partial class ConcurrencyTests
         public TaskCompletionSource MemberStarted { get; } = Signal();
         public int GetChatMemberCalls;
 
-        public override async Task<TResponse> MakeRequestAsync<TResponse>(
+        public override async Task<TResponse> SendRequest<TResponse>(
             IRequest<TResponse> request, CancellationToken cancellationToken = default)
         {
             if (request is GetChatMemberRequest)
@@ -551,21 +551,21 @@ public sealed partial class ConcurrencyTests
                 await Task.Delay(System.Threading.Timeout.InfiniteTimeSpan, cancellationToken);
                 throw new InvalidOperationException("unreachable");
             }
-            return await base.MakeRequestAsync(request, cancellationToken);
+            return await base.SendRequest(request, cancellationToken);
         }
     }
 
     private sealed class ThrowingMembershipClient(Exception exception) : StorefrontClient
     {
         public int GetChatMemberCalls;
-        public override Task<TResponse> MakeRequestAsync<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+        public override Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
         {
             if (request is GetChatMemberRequest)
             {
                 Interlocked.Increment(ref GetChatMemberCalls);
                 return Task.FromException<TResponse>(exception);
             }
-            return base.MakeRequestAsync(request, cancellationToken);
+            return base.SendRequest(request, cancellationToken);
         }
     }
 }
