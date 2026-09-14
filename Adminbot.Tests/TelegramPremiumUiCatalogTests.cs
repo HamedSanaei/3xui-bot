@@ -17,7 +17,8 @@ using Xunit;
 /// <item>every declared logical key must exist, so feature code can reference constants safely;</item>
 /// <item>a custom-emoji identifier can only be a canonical positive decimal string, because it is an opaque Telegram
 /// value that must never be invented, guessed, or silently reinterpreted; and</item>
-/// <item>the shipped production asset and configuration example stay truthful, with no fabricated identifiers.</item>
+/// <item>the shipped production asset's curated identifiers stay exactly equal to the reviewed mapping, so an
+/// accidental replacement, regeneration, or fabrication of a Telegram custom-emoji identifier cannot ship.</item>
 /// </list>
 /// <para>No test performs a network call.</para>
 /// </remarks>
@@ -93,18 +94,80 @@ public sealed class TelegramPremiumUiCatalogTests
         }
     }
 
-    /// <summary>The production asset ships without curated identifiers so no value is fabricated.</summary>
+    /// <summary>
+    /// The reviewed, human-approved mapping from logical catalog key to Telegram custom-emoji identifier.
+    /// </summary>
     /// <remarks>
-    /// This assertion is deliberately explicit. Curating a real identifier later is a deliberate, reviewable change to
-    /// source-controlled content, and this test forces that change to be visible rather than accidental.
+    /// Every value is copied verbatim from the reviewed <c>Assets/telegram-ui/emoji-map.json</c> content and must never
+    /// be regenerated, reformatted, inferred, or replaced here. When a human re-reviews and changes an identifier in the
+    /// asset, this map must be updated in the same commit so the asset change stays deliberate. Keys use the
+    /// <see cref="TelegramUiEmojiKeys"/> constants so a renamed logical key cannot silently orphan a reviewed entry.
+    /// </remarks>
+    private static readonly IReadOnlyDictionary<string, string> ReviewedCustomEmojiIds = new Dictionary<string, string>
+    {
+        [TelegramUiEmojiKeys.PremiumProbe] = "5451636889717062286",
+        [TelegramUiEmojiKeys.Home] = "5257963315258204021",
+        [TelegramUiEmojiKeys.Back] = "6275800281565369817",
+        [TelegramUiEmojiKeys.Confirm] = "5852871561983299073",
+        [TelegramUiEmojiKeys.Cancel] = "5273914604752216432",
+        [TelegramUiEmojiKeys.Settings] = "5929229483436412274",
+        [TelegramUiEmojiKeys.Wallet] = "5375296873982604963",
+        [TelegramUiEmojiKeys.Shop] = "4970023558068568720",
+        [TelegramUiEmojiKeys.Premium] = "5451636889717062286",
+        [TelegramUiEmojiKeys.Support] = "5260535596941582167",
+        [TelegramUiEmojiKeys.Download] = "4927168846835483197",
+        [TelegramUiEmojiKeys.Android] = "5258093637450866522",
+        [TelegramUiEmojiKeys.Ios] = "5929343849825570075",
+        [TelegramUiEmojiKeys.Windows] = "5951626105797480740",
+        [TelegramUiEmojiKeys.Warning] = "5188463524568926712",
+        [TelegramUiEmojiKeys.Info] = "5258503720928288433",
+        [TelegramUiEmojiKeys.Card] = "5472250091332993630",
+        [TelegramUiEmojiKeys.Crypto] = "5456140674028019486",
+        [TelegramUiEmojiKeys.Gift] = "5429263077927300012",
+        [TelegramUiEmojiKeys.Refresh] = "5258420634785947640"
+    };
+
+    /// <summary>The production asset contains only reviewed, curated custom-emoji identifiers.</summary>
+    /// <remarks>
+    /// <para>
+    /// Phase 1 originally required the production asset to ship zero custom-emoji identifiers, and the old guard test
+    /// deliberately failed the moment a real identifier first appeared, so that curation could never happen by accident.
+    /// Real, human-reviewed identifiers have since been intentionally added to the asset; that guard has fulfilled its
+    /// purpose and is replaced by this regression.
+    /// </para>
+    /// <para>
+    /// The new invariant protects the exact approved mapping: every reviewed key must resolve to precisely the reviewed
+    /// identifier, no other entry may carry an identifier, and entries without a reviewed identifier must remain without
+    /// one (null is still allowed). Loading the asset through the strict loader additionally proves every value is a
+    /// canonical positive decimal <c>string</c> — a JSON number or any other shape is rejected before these assertions
+    /// run. Identifiers are never modified, regenerated, inferred, or substituted by this test.
+    /// </para>
     /// </remarks>
     [Fact]
-    public void Production_asset_contains_no_fabricated_custom_emoji_ids()
+    public void Production_asset_contains_only_reviewed_curated_custom_emoji_ids()
     {
         var catalog = TelegramUiEmojiCatalogLoader.LoadFromDefaultAsset();
 
-        foreach (var key in TelegramUiEmojiKeys.All)
-            Assert.False(catalog.TryGetCustomEmojiId(key, out _), $"unexpected curated identifier for {key}");
+        // Direction 1: every reviewed key resolves to exactly the reviewed identifier, byte-for-byte.
+        foreach (var pair in ReviewedCustomEmojiIds)
+        {
+            Assert.True(
+                catalog.TryGetCustomEmojiId(pair.Key, out var resolved),
+                $"logical key {pair.Key} lost its reviewed curated identifier");
+            Assert.True(
+                string.Equals(pair.Value, resolved, System.StringComparison.Ordinal),
+                $"logical key {pair.Key} must keep the reviewed identifier {pair.Value}, not '{resolved}'");
+        }
+
+        // Direction 2: no entry outside the reviewed map carries an identifier; null entries remain allowed.
+        foreach (var key in catalog.Keys())
+        {
+            if (ReviewedCustomEmojiIds.ContainsKey(key))
+                continue;
+            Assert.False(
+                catalog.TryGetCustomEmojiId(key, out var unexpected),
+                $"logical key {key} carries an unreviewed curated identifier '{unexpected}'");
+        }
     }
 
     /// <summary>A missing catalog file fails closed.</summary>

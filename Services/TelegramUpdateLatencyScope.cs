@@ -77,6 +77,17 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
     private int _disposed;
 
     /// <summary>
+    /// Closed-vocabulary stage currently being executed by this scope, or <c>null</c> while the handler is between
+    /// instrumented stages.
+    /// </summary>
+    /// <remarks>
+    /// Only an enum member name can ever be exposed here, so a callback payload, chat id, bot token, URL, account id,
+    /// or customer text can never reach a diagnostic line through this value. The field records the innermost
+    /// instrumented stage and is written only by <see cref="EnterStage"/> and <see cref="ExitStage"/>.
+    /// </remarks>
+    private TelegramUpdateStage? _currentStage;
+
+    /// <summary>
     /// Initializes one scope for a single Telegram update execution and remembers the enclosing ambient scope.
     /// </summary>
     /// <param name="sequence">Internal inbox sequence of the update being executed; never a secret.</param>
@@ -130,6 +141,34 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
     public static TelegramUpdateLatencyScope Current => Ambient.Value;
 
     /// <summary>
+    /// Gets the closed-vocabulary stage this handler is currently executing, or <c>null</c> between instrumented stages.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The scheduler reads this value when its live long-handler watchdog fires so an operator alert can name the stage
+    /// that is actually blocking the lane (<c>TelegramMembership</c>, <c>TelegramSend</c>, <c>XuiRead</c>, and so on)
+    /// instead of only reporting the whole-handler duration. Without it, a slow probe and a slow panel read are
+    /// indistinguishable at the alert level.
+    /// </para>
+    /// <para>
+    /// Safety:
+    /// the value is an enum member name only. No callback text, chat id, bot token, URL, account id, or payload is ever
+    /// stored, and the property is never used for authorization.
+    /// </para>
+    /// <para>
+    /// Precision:
+    /// when a handler runs instrumented stages concurrently the value reflects the most recently entered stage, which is
+    /// sufficient for attribution but must not be treated as an exact nesting stack.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var stage = TelegramUpdateLatencyScope.Current?.CurrentStage?.ToString() ?? "none";
+    /// </code>
+    /// </example>
+    public TelegramUpdateStage? CurrentStage => _currentStage;
+
+    /// <summary>
     /// Pushes one update-local latency scope and returns it for disposal after the handler finishes.
     /// </summary>
     /// <param name="sequence">Internal inbox sequence of the update being executed.</param>
@@ -174,6 +213,39 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
     /// including a foreground budget expiry.
     /// </remarks>
     public StageTimer Measure(TelegramUpdateStage stage) => new(this, stage);
+
+    /// <summary>
+    /// Records that a closed-vocabulary stage started and returns the stage that was current before it.
+    /// </summary>
+    /// <param name="stage">Closed-vocabulary stage that is starting.</param>
+    /// <returns>
+    /// The stage that was current before this one started, so the caller can restore it when the measurement completes.
+    /// </returns>
+    /// <remarks>
+    /// Called by <see cref="StageTimer"/> creation. It performs no logging and no I/O, so it can be used around every
+    /// awaited external call without measurable cost.
+    /// </remarks>
+    internal TelegramUpdateStage? EnterStage(TelegramUpdateStage stage)
+    {
+        var previous = _currentStage;
+        _currentStage = stage;
+        return previous;
+    }
+
+    /// <summary>
+    /// Restores the previously current stage after a completed measurement.
+    /// </summary>
+    /// <param name="stage">Stage whose measurement just completed.</param>
+    /// <param name="previous">Stage returned by <see cref="EnterStage"/> when that measurement started.</param>
+    /// <remarks>
+    /// The restore is skipped when a different stage became current in the meantime, which is what happens when a
+    /// handler overlaps two instrumented stages. In that case the later stage keeps ownership of the value.
+    /// </remarks>
+    internal void ExitStage(TelegramUpdateStage stage, TelegramUpdateStage? previous)
+    {
+        if (_currentStage == stage)
+            _currentStage = previous;
+    }
 
     /// <summary>Gets the elapsed time since this scope was created.</summary>
     /// <returns>The monotonic elapsed time of the whole update execution.</returns>
@@ -230,18 +302,27 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
         /// <summary>Monotonic start timestamp of the measurement.</summary>
         private readonly long _startedTimestamp;
 
+        /// <summary>Stage that was current before this measurement started, restored on disposal.</summary>
+        private readonly TelegramUpdateStage? _previousStage;
+
         /// <summary>Creates a measurement timer for one stage of one scope.</summary>
         /// <param name="scope">Owning scope; required.</param>
         /// <param name="stage">Closed-vocabulary stage being measured.</param>
+        /// <remarks>
+        /// Creation also publishes the stage as the scope's current stage, so a live long-handler watchdog firing while
+        /// this call is in flight can name the exact stage that is blocking the lane.
+        /// </remarks>
         internal StageTimer(TelegramUpdateLatencyScope scope, TelegramUpdateStage stage)
         {
             _scope = scope;
             _stage = stage;
             _startedTimestamp = Stopwatch.GetTimestamp();
+            _previousStage = scope.EnterStage(stage);
         }
 
         /// <summary>
-        /// Completes the measurement and reports it to the owning scope when it exceeded the stage threshold.
+        /// Completes the measurement, reports it to the owning scope when it exceeded the stage threshold, and restores
+        /// the previously current stage.
         /// </summary>
         /// <remarks>A timer created by a null scope does nothing, so shared code can always dispose it safely.</remarks>
         public void Dispose()
@@ -250,6 +331,7 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
                 return;
 
             _scope.Report(_stage, Stopwatch.GetElapsedTime(_startedTimestamp).TotalMilliseconds);
+            _scope.ExitStage(_stage, _previousStage);
         }
     }
 }

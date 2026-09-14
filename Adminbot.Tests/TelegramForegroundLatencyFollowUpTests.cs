@@ -191,32 +191,80 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>
-    /// A repeated controlled local timeout is delivered to the operator channel at most once per window per key.
+    /// Callback-acknowledgement timeouts are withheld entirely, while isolated mandatory-join timeouts stay local and
+    /// every real guard failure keeps reaching the operator channel.
     /// </summary>
     /// <remarks>
-    /// The first occurrence of a local timeout is information the operator may still want; the following occurrences
-    /// of the same bot/operation/outcome inside the window are the amplification that must stop. Distinct bots keep
-    /// their own notification so one noisy storefront cannot hide another bot's guard activity.
+    /// The callback acknowledgement is a pure UX operation whose only cost is a button spinner, so none of its local
+    /// timeouts are operator incidents. The mandatory-join guard is different: a single isolated timeout is a
+    /// controlled outcome, and only repeated degradation for the same bot may produce one bounded incident. Transport,
+    /// API, and channel-access failures of either guard remain unmodified signals.
     /// </remarks>
     [Fact]
-    public void Operator_channel_rate_limits_repeated_controlled_local_timeouts()
+    public void Operator_channel_withholds_guard_timeouts_without_hiding_guard_failures()
     {
-        static string Message(string botId) =>
+        static string Ack(string botId) =>
             $"Slow Telegram operation. BotId={botId} TelegramUserId=5 Operation=telegram_callback_ack " +
             "ElapsedMs=2001 Outcome=local_timeout ErrorType=OperationCanceledException";
+        static string Join(string botId) =>
+            $"Slow Telegram operation. BotId={botId} TelegramUserId=5 Operation=telegram_mandatory_join " +
+            "ElapsedMs=5001 Outcome=local_timeout ErrorType=OperationCanceledException";
 
-        // First occurrence of this key is informative, so it reaches the channel.
-        Assert.False(TelegramLogSuppression.ShouldSuppress(Message("owned-noise-rl-a"), null));
-        // Repeats inside the ten-minute window are suppressed as amplification.
-        Assert.True(TelegramLogSuppression.ShouldSuppress(Message("owned-noise-rl-a"), null));
-        Assert.True(TelegramLogSuppression.ShouldSuppress(Message("owned-noise-rl-a"), null));
+        // Every acknowledgement timeout is UX-only noise, however often it repeats.
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Ack("owned-noise-rl-a"), null));
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Ack("owned-noise-rl-a"), null));
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Ack("owned-noise-rl-b"), null));
 
-        // A different bot keeps its own slot, so suppression is per key and not global.
-        Assert.False(TelegramLogSuppression.ShouldSuppress(Message("owned-noise-rl-b"), null));
-        // A different operation on the same bot is a separate key.
+        // One isolated mandatory-join timeout for a bot is a controlled guard outcome, not an operator incident.
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Join("owned-noise-rl-c"), null));
+
+        // A different operation on the same bot is not covered by the mandatory-join rule.
         Assert.False(TelegramLogSuppression.ShouldSuppress(
-            "Slow Telegram operation. BotId=owned-noise-rl-a TelegramUserId=5 Operation=telegram_mandatory_join " +
-            "ElapsedMs=5001 Outcome=local_timeout ErrorType=OperationCanceledException", null));
+            "Slow Telegram operation. BotId=owned-noise-rl-a TelegramUserId=5 Operation=telegram_manual_join " +
+            "ElapsedMs=9000 Outcome=local_timeout ErrorType=OperationCanceledException", null));
+    }
+
+    /// <summary>
+    /// Sustained mandatory-join degradation produces exactly one bounded operator incident per bot.
+    /// </summary>
+    /// <remarks>
+    /// Deterministic monotonic timestamps are supplied through the internal overload so the ten-minute degradation
+    /// window and the thirty-minute incident cooldown are proven without waiting. Aggregation is per bot, so one noisy
+    /// storefront cannot mask or trigger another bot's incident, and timeouts spread beyond the window never
+    /// accumulate into a false incident.
+    /// </remarks>
+    [Fact]
+    public void Sustained_mandatory_join_degradation_produces_one_bounded_operator_incident()
+    {
+        const string botId = "owned-noise-sustained";
+        const string otherBotId = "owned-noise-sustained-other";
+        static string Join(string bot) =>
+            $"Slow Telegram operation. BotId={bot} TelegramUserId=5 Operation=telegram_mandatory_join " +
+            "ElapsedMs=5001 Outcome=local_timeout ErrorType=OperationCanceledException";
+
+        // Two isolated timeouts inside the window, and a third one for an unrelated bot, stay local.
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Join(botId), null, 1_000));
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Join(botId), null, 2_000));
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Join(otherBotId), null, 2_000));
+
+        // The third timeout inside the ten-minute window is sustained degradation: one bounded operator incident.
+        Assert.False(TelegramLogSuppression.ShouldSuppress(Join(botId), null, 3_000));
+
+        // The cooldown withholds every later occurrence of the same still-unresolved condition.
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Join(botId), null, 4_000));
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Join(botId), null, 5_000));
+
+        // After the cooldown, degradation that is still sustained reports once more, so a long outage is not silent.
+        var afterCooldown = 3_000 + (long)TelegramMandatoryJoinIncidentAggregator.IncidentCooldown.TotalMilliseconds;
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Join(botId), null, afterCooldown));
+        Assert.True(TelegramLogSuppression.ShouldSuppress(Join(botId), null, afterCooldown + 1));
+        Assert.False(TelegramLogSuppression.ShouldSuppress(Join(botId), null, afterCooldown + 2));
+
+        // Timeouts spread wider than the aggregation window never accumulate into a false incident.
+        const string sparseBotId = "owned-noise-sparse";
+        var sparse = 10_000L;
+        for (var occurrence = 0; occurrence < 4; occurrence++, sparse += (long)TelegramMandatoryJoinIncidentAggregator.DegradationWindow.TotalMilliseconds + 1)
+            Assert.True(TelegramLogSuppression.ShouldSuppress(Join(sparseBotId), null, sparse));
     }
 
     /// <summary>The interaction actor scope restores the enclosing value and normalizes invalid identities.</summary>

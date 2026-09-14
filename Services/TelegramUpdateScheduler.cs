@@ -311,36 +311,45 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             if (wait > LongQueueWaitThreshold.TotalMilliseconds)
                 await ReportLongQueueWaitAsync(item, sequence, wait, token);
 
-            // The watchdog fires once at the threshold. It reports the root blocker instead of the victims that merely
-            // waited behind it, and it never runs when the handler already finished.
-            handlerWarningTimer = new CancellationTokenSource(LongHandlerWarningThreshold);
-            var claimedItem = item;
-            handlerWarningRegistration = handlerWarningTimer.Token.Register(() =>
-            {
-                if (System.Threading.Volatile.Read(ref handlerFinished.Value) != 0)
-                    return;
-                System.Threading.Volatile.Write(ref handlerWarningEmitted.Value, 1);
-                try
-                {
-                    _logger.LogWarning(
-                        "Telegram update handler running unusually long. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} UpdateType={UpdateType} HandlerElapsedMs={HandlerElapsedMs} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}",
-                        claimedItem.Key.BotId, sequence, claimedItem.Update.Id, claimedItem.Update.Type,
-                        LongHandlerWarningThreshold.TotalMilliseconds, ActiveHandlerCount, _concurrency);
-                }
-                catch
-                {
-                    // A diagnostics callback must never fault the handler it is observing.
-                }
-            });
-
+            // The latency scope is pushed before the watchdog so the live warning can name the closed-vocabulary stage
+            // that is actually blocking the lane. The scope is captured explicitly because the watchdog callback runs on
+            // a timer thread whose ambient scope is not the handler's.
             using (TelegramUpdateExecutionScope.Push(sequence))
-            using (TelegramUpdateLatencyScope.Push(
+            using (var latencyScope = TelegramUpdateLatencyScope.Push(
                 sequence,
                 item.Key.BotId,
                 item.Update.Id,
                 SlowStageThreshold,
                 (stage, elapsedMs) => ReportSlowStage(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, stage, elapsedMs)))
+            {
+                // The watchdog fires once at the threshold. It reports the root blocker instead of the victims that
+                // merely waited behind it, and it never runs when the handler already finished.
+                handlerWarningTimer = new CancellationTokenSource(LongHandlerWarningThreshold);
+                var claimedItem = item;
+                var observedScope = latencyScope;
+                handlerWarningRegistration = handlerWarningTimer.Token.Register(() =>
+                {
+                    if (System.Threading.Volatile.Read(ref handlerFinished.Value) != 0)
+                        return;
+                    System.Threading.Volatile.Write(ref handlerWarningEmitted.Value, 1);
+                    try
+                    {
+                        // Stage is a closed enumeration member name or "none", never customer data, so an operator can
+                        // tell a stuck membership probe from a stuck panel read without exposing any payload.
+                        _logger.LogWarning(
+                            "Telegram update handler running unusually long. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} UpdateType={UpdateType} HandlerElapsedMs={HandlerElapsedMs} Stage={Stage} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}",
+                            claimedItem.Key.BotId, sequence, claimedItem.Update.Id, claimedItem.Update.Type,
+                            LongHandlerWarningThreshold.TotalMilliseconds, observedScope?.CurrentStage?.ToString() ?? "none",
+                            ActiveHandlerCount, _concurrency);
+                    }
+                    catch
+                    {
+                        // A diagnostics callback must never fault the handler it is observing.
+                    }
+                });
+
                 await _executor.ExecuteAsync(item, token);
+            }
             token.ThrowIfCancellationRequested();
             if (await _store.HasUnresolvedCreationAsync(sequence, token))
             {

@@ -194,6 +194,12 @@ public class Program
         // One immutable interactive Telegram delivery budget for every scheduled update execution. The bounded client
         // view is created per update, so receivers, long polling, and durable workers keep the unbounded transport.
         services.AddSingleton(TelegramForegroundDeliveryPolicy.Production);
+        // One shared, positive-only membership cache for the mandatory-join gate. Owned bots and tenant storefront
+        // bots resolve the same singleton, so a customer who already passed the join check is not probed again on every
+        // message and callback. Only successful evaluations are stored, and the entry is keyed by the exact bot,
+        // customer, and channel set, so the gate keeps failing closed for non-members and configuration changes
+        // invalidate previous entries naturally.
+        services.AddSingleton<ITelegramMandatoryJoinMembershipCache, TelegramMandatoryJoinMembershipCache>();
         services.AddSingleton<WalletLedgerService>();
         services.AddHostedService<WalletOperationReconciliationService>();
         services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();

@@ -486,10 +486,15 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   `ApiServicev3` foreground reads, and `GozargahSiteApiClient.SendAsync` report stage durations. Only stages above
   `SlowStageThreshold` (default 2 s) are logged, and stage names come from the enum so no email, order id, callback
   payload, URL, or customer text can become a stage string. Background callers have no scope, so instrumentation is a
-  no-op for them.
+  no-op for them. The scope ALSO publishes `CurrentStage` (the innermost instrumented stage, `null` between stages) so
+  the live long-handler watchdog can name what is actually blocking the lane; the value is an enum member name only and
+  is never used for authorization. When two instrumented stages overlap, the later stage keeps ownership of the value,
+  which is sufficient for attribution and must not be read as an exact nesting stack.
 - **Lane diagnostics** (`Services/TelegramUpdateScheduler.cs`): one live watchdog fires at `LongHandlerWarningThreshold`
   (default 10 s, once per execution, via a cancellation timer rather than a polling loop) with
-  `BotId/Sequence/UpdateId/UpdateType/HandlerElapsedMs/ActiveHandlers/MaxConcurrency`; completion above
+  `BotId/Sequence/UpdateId/UpdateType/HandlerElapsedMs/Stage/ActiveHandlers/MaxConcurrency`, where `Stage` is the
+  closed-vocabulary stage from `TelegramUpdateLatencyScope.CurrentStage` or `none` (captured when the scheduler pushes
+  the latency scope, because the timer callback does not inherit the handler's ambient scope); completion above
   `InteractiveHandlerThreshold` (default 5 s) records the final duration and outcome, at Warning only when the live
   warning could not fire, so a slow root handler yields exactly one alert. Queue-wait reporting uses
   `LongQueueWaitThreshold` (default 5 s) and correlates the wait with the **root** blocker via
@@ -514,11 +519,38 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - **Operator-channel latency-noise policy** (`Domain/Logging/TelegramLogSuppression.cs`): production review classified
   the slow-operation families. `Outcome=completed` for the two controlled guard operations (`telegram_callback_ack`,
   `telegram_mandatory_join`) is a success and stays out of the Telegram operator channel while remaining in the daily
-  diagnostic file and structured telemetry; `Outcome=local_timeout` for those two operations is delivered at most once
-  per 10 minutes per `BotId|Operation|Outcome` key, so a slow Telegram API cannot flood the channel. Every other
-  outcome — `transport_error`, `telegram_api_error`, `channel_access_error`, `telegram_timeout` — and every Warning,
-  Error, Critical, delivery-uncertain, manual-review, XUI, payment, and provider failure is still delivered. This is a
-  narrow closed-list rule, not a general log-suppression framework.
+  diagnostic file and structured telemetry. `Outcome=local_timeout` for `telegram_callback_ack` is pure UX noise and is
+  ALWAYS withheld (the business handler continues; the only cost is a button spinner). `Outcome=local_timeout` for
+  `telegram_mandatory_join` is withheld while it stays isolated; sustained degradation for one bot is promoted to ONE
+  bounded operator incident by `Domain/Logging/TelegramMandatoryJoinIncidentAggregator.cs` (3 timeouts inside a
+  10-minute window, then at most one incident per 30-minute cooldown per `BotId`). Every other outcome —
+  `transport_error`, `telegram_api_error`, `channel_access_error`, `telegram_timeout` — and every Warning, Error,
+  Critical, delivery-uncertain, manual-review, XUI, payment, and provider failure is still delivered. This is a narrow
+  closed-list rule, not a general log-suppression framework.
+- **Operator-channel success/telemetry families and repeated-incident limits** (`Domain/Logging/TelegramLogSuppression.cs`):
+  four additional routine success families are withheld from the operator channel and stay fully visible in the daily
+  diagnostic file, the console/structured logger, and the metrics instruments: `Tenant fulfillment timing.`,
+  `Tenant fulfillment post-commit notification completed.` ONLY when `outcome=delivered` (every other outcome —
+  `deferred`, `delivery_uncertain`, `failed`, `manual_review`, `pre_send_route_unavailable` — and an unreadable outcome
+  remain visible), `Pruned expired missing XUI volume reminder state.`, and `XUI v3 renewal applied exactly once.`
+  Two Warning families repeat for as long as one condition lasts and are therefore limited per key by
+  `Domain/Logging/TelegramOperatorNotificationLimiter.cs` with a 10-minute window: `Telegram foreground delivery
+  exceeded its interactive budget` keyed by `botId|requestKind`, and `Telegram update handler running unusually long.`
+  keyed by `BotId|Stage`. The FIRST occurrence of each key is always delivered, so a genuine incident is never hidden;
+  only the repeats of the same still-unresolved condition are withheld. The ambiguous foreground send is still never
+  retried. The limiter is bounded (4096 keys, cleared on overflow), so clearing can only add an alert, never hide one.
+- **Positive mandatory-join membership cache** (`Domain/TelegramMandatoryJoinMembershipCache.cs`): one singleton
+  (registered in `Program.cs`) is injected into BOTH the owned-bot gate (`TelegramBotService.isJoinedToChannel`) and the
+  tenant storefront gate (`TenantBotService.EnsureTenantCustomerJoinAsync`), so a customer who already passed the join
+  check is not probed again on every message and callback. Key = exact bot id (owned: runtime `BotContextAccessor.CurrentBotId`;
+  tenant: persisted `BotInstance.Id`) + numeric Telegram user id + normalized channel set (trimmed, lowercased,
+  de-duplicated, ordinal-sorted), so channel reordering/casing never creates a second entry and a configured channel
+  change invalidates previous entries with no write path. TTL is 30 seconds. **Positive-only:** a non-member, an
+  unknown/left/kicked status, a timeout, a transport failure, an API failure, and a channel-access failure are NEVER
+  stored, so they are re-checked against Telegram every time and the gate keeps failing closed. A cache miss is not
+  evidence of non-membership; it only means Telegram must be asked. Because negatives are never cached, the explicit
+  storefront join-retry callback re-checks whenever nothing verified is cached, which is the normal state after a
+  rejection. Fallback to a private instance when no cache is injected keeps unit-test constructions isolated.
 - **Central Telegram logger channel is actionable, not a telemetry stream** (`Domain/Logging/TelegramLogSuppression.cs`):
   the private channel receives incidents only, while the daily diagnostic file, the console/structured logger, the
   metrics instruments (`telegram.update.handler.duration`, `telegram.update.queue.wait`, stage timers), and the
@@ -1176,8 +1208,11 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   The only new user-visible surface is the storefront owner's `✨ ظاهر پریمیوم` setting plus the one inert capability
   preview. See `docs/telegram-premium-ui.md` for the asset format, enable procedures and Phase 2 guidance.
 - `Assets/telegram-ui/emoji-map.json` is the single source-controlled catalog of logical emoji keys, ordinary Unicode
-  fallbacks and curated `customEmojiId` values. It contains **zero** curated identifiers on purpose: a test asserts the
-  production asset invents nothing. `TelegramUiEmojiCatalogLoader` validates version 1, every required
+  fallbacks and curated `customEmojiId` values. It now carries **human-reviewed curated identifiers for all 20 entries**
+  (added deliberately after Phase 1, which originally shipped zero): the regression test
+  `TelegramPremiumUiCatalogTests.Production_asset_contains_only_reviewed_curated_custom_emoji_ids` pins every reviewed
+  identifier and fails if an entry is replaced, regenerated, or fabricated. `TelegramUiEmojiCatalogLoader` validates
+  version 1, every required
   `TelegramUiEmojiKeys` constant, trimmed lower_snake_case unique keys, non-empty printable fallbacks, canonical
   positive decimal identifiers (via `BigInteger`, so `0`, `-1`, `+1`, `00123`, whitespace and non-digits all fail), and
   duplicate JSON members inside `items`. A malformed asset fails startup instead of degrading at runtime. The file is

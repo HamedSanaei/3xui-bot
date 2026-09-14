@@ -191,6 +191,17 @@ public partial class TenantBotService
     /// without waiting the real production timeout.
     /// </summary>
     private readonly TelegramInteractionTimeouts _interactionTimeouts;
+
+    /// <summary>
+    /// Positive-only cache of recently verified customer forced-join memberships shared with the owned-bot flow.
+    /// </summary>
+    /// <remarks>
+    /// Production injects the singleton registered in <c>Program.cs</c> so one bot's verified customer is not probed
+    /// again on every tap. Tenant channel changes produce a different channel component in the cache key, so the entry
+    /// is invalidated naturally without any write path. When no instance is supplied the service falls back to a
+    /// private cache, which keeps the same fail-closed semantics without sharing state across test constructions.
+    /// </remarks>
+    private readonly ITelegramMandatoryJoinMembershipCache _mandatoryJoinMembershipCache;
     private readonly Dictionary<string, TenantJoinCapabilityCacheEntry> _tenantJoinCapabilityCache = new(StringComparer.Ordinal);
     private readonly object _tenantJoinCapabilitySync = new();
 
@@ -292,7 +303,8 @@ public partial class TenantBotService
         TenantCardProvisionalFinalizationService TenantCardProvisionalFinalization,
         TenantCardProvisionalRevocationService TenantCardProvisionalRevocation,
         ITelegramPremiumUiCapabilityProbe PremiumUiCapabilityProbe = null,
-        TelegramInteractionTimeouts InteractionTimeouts = null)
+        TelegramInteractionTimeouts InteractionTimeouts = null,
+        ITelegramMandatoryJoinMembershipCache MandatoryJoinMembershipCache = null)
     {
         _workflow = UserDbContext;
         _state = stateStore;
@@ -328,6 +340,7 @@ public partial class TenantBotService
         _tenantCardProvisionalRevocation = TenantCardProvisionalRevocation ?? throw new ArgumentNullException(nameof(TenantCardProvisionalRevocation));
         _premiumUiCapabilityProbe = PremiumUiCapabilityProbe;
         _interactionTimeouts = InteractionTimeouts ?? TelegramInteractionTimeouts.Production;
+        _mandatoryJoinMembershipCache = MandatoryJoinMembershipCache ?? new TelegramMandatoryJoinMembershipCache();
     }
 
     /// <summary>
@@ -12935,6 +12948,16 @@ public partial class TenantBotService
         if (Channels.Count == 0)
             return true;
 
+        // The cache key uses the persisted tenant identity rather than the ambient runtime bot id, so a forced-join
+        // result can never be reused by another bot or tenant even if the ambient context was resolved differently.
+        // Only a complete successful evaluation is stored, so a hit means this exact customer already passed every
+        // configured channel. A miss always performs the real Telegram check, which is why the explicit join retry also
+        // re-checks whenever nothing verified is cached. Changing the configured channel list changes the channel
+        // component of the key, so tenant channel edits invalidate previous entries without a write path.
+        var membershipBotId = tenant.Id;
+        if (_mandatoryJoinMembershipCache.TryGetPositive(membershipBotId, telegramUserId, Channels))
+            return true;
+
         foreach (var channel in Channels)
         {
             try
@@ -12976,6 +12999,10 @@ public partial class TenantBotService
             }
         }
 
+        // Reached only when every configured channel accepted the customer, which is the single condition that may
+        // populate the positive cache. Non-members, timeouts, unknown statuses, and every failure outcome return above
+        // and are therefore never cached.
+        _mandatoryJoinMembershipCache.RememberPositive(membershipBotId, telegramUserId, Channels);
         return true;
     }
 

@@ -201,6 +201,16 @@ public partial class TelegramBotService
     /// production budgets, while production always uses <see cref="TelegramInteractionTimeouts.Production"/>.
     /// </summary>
     private readonly TelegramInteractionTimeouts _interactionTimeouts;
+
+    /// <summary>
+    /// Positive-only cache of recently verified mandatory-join memberships shared with the tenant storefront flow.
+    /// </summary>
+    /// <remarks>
+    /// Production injects the singleton registered in <c>Program.cs</c> so both flows share one view. When no instance
+    /// is supplied the service falls back to a private cache, which keeps the same fail-closed semantics without
+    /// sharing state across unrelated test constructions.
+    /// </remarks>
+    private readonly ITelegramMandatoryJoinMembershipCache _mandatoryJoinMembershipCache;
     private ITelegramBotClient ActiveBotClient => _botContextAccessor.Current?.Client ?? _botClient;
     private BotInstanceConfig CurrentBot => _botContextAccessor.Current?.Config;
     private IEnumerable<string> CurrentChannelIds => CurrentBot != null
@@ -353,7 +363,8 @@ public partial class TelegramBotService
         BotRuntimeStatusStore botRuntimeStatusStore,
         BotContextAccessor botContextAccessor,
         ReferralService referralService,
-        TelegramInteractionTimeouts interactionTimeouts = null)
+        TelegramInteractionTimeouts interactionTimeouts = null,
+        ITelegramMandatoryJoinMembershipCache mandatoryJoinMembershipCache = null)
     {
         _botClient = botClient;
         _workflow = dbContext;
@@ -394,6 +405,7 @@ public partial class TelegramBotService
         _botContextAccessor = botContextAccessor;
         _referralService = referralService;
         _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
+        _mandatoryJoinMembershipCache = mandatoryJoinMembershipCache ?? new TelegramMandatoryJoinMembershipCache();
     }
 
     /// <summary>
@@ -8073,6 +8085,19 @@ public partial class TelegramBotService
         long userId,
         CancellationToken cancellationToken)
     {
+        // Materializing the channel list once lets the same set serve both the cache key and the Telegram loop without
+        // enumerating a lazy source twice.
+        var channels = channelIDs?.ToList() ?? new List<string>();
+        var membershipBotId = BotContextAccessor.CurrentBotId;
+
+        // Short positive cache shared with the tenant storefront flow. Only a complete successful evaluation for this
+        // exact bot, customer, and channel set is stored, so a hit proves the same check would pass again right now. A
+        // miss (or any non-membership outcome) always falls through to a real Telegram check, so the gate is never
+        // weakened. An explicit join retry from the customer also lands here and therefore re-checks whenever nothing
+        // verified is cached, which is the normal state after a rejection.
+        if (_mandatoryJoinMembershipCache.TryGetPositive(membershipBotId, userId, channels))
+            return true;
+
         var started = Stopwatch.GetTimestamp();
         var outcome = "completed";
         string errorType = null;
@@ -8083,7 +8108,7 @@ public partial class TelegramBotService
 
         try
         {
-            foreach (var channelId in channelIDs)
+            foreach (var channelId in channels)
             {
                 if (string.IsNullOrWhiteSpace(channelId)) return false;
                 try
@@ -8111,6 +8136,10 @@ public partial class TelegramBotService
                     outcome = "transport_error"; errorType = ex.GetType().Name; return false;
                 }
             }
+
+            // Reached only when every configured channel returned an accepted membership status, which is the single
+            // condition that may populate the positive cache.
+            _mandatoryJoinMembershipCache.RememberPositive(membershipBotId, userId, channels);
             return true;
         }
         finally
@@ -8119,7 +8148,7 @@ public partial class TelegramBotService
             if (elapsed >= 2000 || outcome != "completed")
                 _logger.LogInformation(
                     "Slow Telegram operation. BotId={BotId} TelegramUserId={TelegramUserId} Operation={Operation} ElapsedMs={ElapsedMs:0} Outcome={Outcome} ErrorType={ErrorType}",
-                    BotContextAccessor.CurrentBotId, userId, "telegram_mandatory_join", elapsed, outcome, errorType ?? string.Empty);
+                    membershipBotId, userId, "telegram_mandatory_join", elapsed, outcome, errorType ?? string.Empty);
         }
     }
 

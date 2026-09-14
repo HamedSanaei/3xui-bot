@@ -77,8 +77,11 @@ Rules enforced by the loader (a violation stops startup):
 4. Release and restart. The catalog is loaded and frozen once at startup.
 
 **Identifiers must never be invented, scraped, or learned from arbitrary user messages.** A wrong identifier either
-fails the whole send or renders nothing, and Telegram treats the value as opaque. This phase ships **zero** curated
-identifiers, and a regression test asserts that the production asset contains none.
+fails the whole send or renders nothing, and Telegram treats the value as opaque. The asset now ships **20 human-reviewed
+curated identifiers** (all 20 entries), added deliberately after Phase 1 originally shipped zero. The regression test
+`Production_asset_contains_only_reviewed_curated_custom_emoji_ids` pins the exact approved mapping: replacing,
+regenerating, or fabricating any identifier fails the suite, and a re-reviewed change to an identifier must update that
+expected map in the same commit.
 
 ## 5. Enabling premium visuals
 

@@ -419,12 +419,18 @@ public sealed partial class ConcurrencyTests
     /// Optional immutable interaction budgets. When null production defaults apply, so callback acknowledgement is
     /// bounded at two seconds and mandatory-join verification at one overall five-second budget.
     /// </param>
+    /// <param name="membershipCache">
+    /// Optional positive-only mandatory-join membership cache. When null the service creates its own private cache, so
+    /// tests that only care about the gate's fail-closed behaviour are unaffected. A test that must observe cache hits
+    /// injects its own instance here.
+    /// </param>
     /// <returns>A configured service instance ready for the private callback and mandatory-join paths under test.</returns>
     private static TelegramBotService BuildBareTelegramService(
         Databases databases,
         ITelegramBotClient client,
         out BotContextAccessor accessor,
-        TelegramInteractionTimeouts? timeouts = null)
+        TelegramInteractionTimeouts? timeouts = null,
+        ITelegramMandatoryJoinMembershipCache? membershipCache = null)
     {
         var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
@@ -443,7 +449,7 @@ public sealed partial class ConcurrencyTests
             new UserActivityLogService(configuration),
             // analytics, chart renderer, wallet ledger, notification, gozargah, registry, runtime status.
             null!, null!, null!, null!, null!, null!, null!, null!,
-            accessor, null!, timeouts);
+            accessor, null!, timeouts, membershipCache);
     }
 
     private static Task<bool> InvokeMandatoryJoinAsync(

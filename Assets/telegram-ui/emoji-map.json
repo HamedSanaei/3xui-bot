@@ -3,83 +3,83 @@
   "items": {
     "premium_probe": {
       "fallback": "✨",
-      "customEmojiId": null
+      "customEmojiId": "5451636889717062286"
     },
     "home": {
       "fallback": "🏠",
-      "customEmojiId": null
+      "customEmojiId": "5257963315258204021"
     },
     "back": {
       "fallback": "🔙",
-      "customEmojiId": null
+      "customEmojiId": "6275800281565369817"
     },
     "confirm": {
       "fallback": "✅",
-      "customEmojiId": null
+      "customEmojiId": "5852871561983299073"
     },
     "cancel": {
       "fallback": "❌",
-      "customEmojiId": null
+      "customEmojiId": "5273914604752216432"
     },
     "settings": {
       "fallback": "⚙️",
-      "customEmojiId": null
+      "customEmojiId": "5929229483436412274"
     },
     "wallet": {
       "fallback": "💰",
-      "customEmojiId": null
+      "customEmojiId": "5375296873982604963"
     },
     "shop": {
       "fallback": "🛍️",
-      "customEmojiId": null
+      "customEmojiId": "4970023558068568720"
     },
     "premium": {
       "fallback": "✨",
-      "customEmojiId": null
+      "customEmojiId": "5451636889717062286"
     },
     "support": {
       "fallback": "💬",
-      "customEmojiId": null
+      "customEmojiId": "5260535596941582167"
     },
     "download": {
       "fallback": "📥",
-      "customEmojiId": null
+      "customEmojiId": "4927168846835483197"
     },
     "android": {
       "fallback": "🤖",
-      "customEmojiId": null
+      "customEmojiId": "5258093637450866522"
     },
     "ios": {
       "fallback": "🍎",
-      "customEmojiId": null
+      "customEmojiId": "5929343849825570075"
     },
     "windows": {
       "fallback": "🪟",
-      "customEmojiId": null
+      "customEmojiId": "5951626105797480740"
     },
     "warning": {
       "fallback": "⚠️",
-      "customEmojiId": null
+      "customEmojiId": "5188463524568926712"
     },
     "info": {
       "fallback": "ℹ️",
-      "customEmojiId": null
+      "customEmojiId": "5258503720928288433"
     },
     "card": {
       "fallback": "💳",
-      "customEmojiId": null
+      "customEmojiId": "5472250091332993630"
     },
     "crypto": {
       "fallback": "⚡",
-      "customEmojiId": null
+      "customEmojiId": "5456140674028019486"
     },
     "gift": {
       "fallback": "🎁",
-      "customEmojiId": null
+      "customEmojiId": "5429263077927300012"
     },
     "refresh": {
       "fallback": "🔄",
-      "customEmojiId": null
+      "customEmojiId": "5258420634785947640"
     }
   }
 }
