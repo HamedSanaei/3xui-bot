@@ -1253,6 +1253,20 @@ public class XuiV3AdminFlowService
             return;
 
         var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
+
+        // The reset above is the last panel write of this renewal, so the enable state is checked and repaired after it.
+        // The step is a no-op when the panel already reports the client enabled, and it never runs at all when the
+        // renewal itself failed, because a rejected renewal must never switch an account on.
+        var clientActivation = await XuiV3RenewalClientActivation.EnsureClientEnabledAfterRenewalAsync(
+            new XuiV3RenewalActivationRequest(
+                serverInfo,
+                _configuration,
+                client.Email,
+                RenewalApplied: updateSucceeded,
+                RenewalKind: "admin-renew",
+                ActorTelegramUserId: message.From.Id,
+                Logger: _logger));
+
         await _volumeReminderStateStore.TryBeginNewCycleAfterRenewalAsync(
             serverInfo,
             client,
@@ -1305,6 +1319,9 @@ public class XuiV3AdminFlowService
                 ["durationAddedDays"] = addDays,
                 ["finalDurationDays"] = renewal.FinalDurationDays,
                 ["trafficResetApplied"] = trafficResetApplied,
+                ["panelClientActiveAfterRenew"] = clientActivation.IsActive,
+                ["panelClientActivationStatus"] = clientActivation.Status.ToString(),
+                ["panelClientEnableRepairIssued"] = clientActivation.MutationIssued,
                 ["totalGbAfterRenew"] = GetTotalBytes(client).ConvertBytesToGB(),
                 ["usedGb"] = GetUsedBytes(client).ConvertBytesToGB(),
                 ["expiryShamsi"] = FormatExpiry(client.ExpiryTime),

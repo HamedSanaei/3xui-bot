@@ -13710,6 +13710,14 @@ public partial class TenantBotService
                 operationTiming, cancellationToken);
         }
 
+        // The operation is durably applied here, so the panel client is repaired and re-proven active before the
+        // fulfillment tail. The traffic reset that follows can only ever admit or enable a client, never disable one.
+        await EnsureTenantRenewedClientEnabledAsync(
+            serverInfo,
+            tenantRenewalOperation,
+            order.CustomerTelegramUserId,
+            cancellationToken);
+
         return await CompleteTenantRenewalFulfillmentAsync(
             order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
             client, renewal, tenantRenewalOperation, operationTiming, cancellationToken);
@@ -13827,6 +13835,12 @@ public partial class TenantBotService
                     recoveredClient.Comment = payload.Comment;
                 }
 
+                await EnsureTenantRenewedClientEnabledAsync(
+                    serverInfo,
+                    operation,
+                    order.CustomerTelegramUserId,
+                    cancellationToken);
+
                 return await CompleteTenantRenewalFulfillmentAsync(
                     order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
                     recoveredClient, renewal, operation, operationTiming, cancellationToken);
@@ -13859,6 +13873,12 @@ public partial class TenantBotService
         var appliedClient = readComparison.Outcome == XuiV3RenewalOperationStore.RecoveryOutcome.Applied && readClient != null
             ? readClient
             : BuildTenantMirroredClientForPayload(RebuildTenantPayloadForOperation(operation));
+        await EnsureTenantRenewedClientEnabledAsync(
+            serverInfo,
+            operation,
+            order.CustomerTelegramUserId,
+            cancellationToken);
+
         return await CompleteTenantRenewalFulfillmentAsync(
             order, owner, customer, tenant, selection, source, debitOwnerBaseCost,
             appliedClient, RebuildTenantRenewalForOperation(operation), operation, operationTiming, cancellationToken);
@@ -13945,6 +13965,51 @@ public partial class TenantBotService
             : panelMessage.Trim();
         return value.Length <= 500 ? value : value[..500];
     }
+
+    /// <summary>
+    /// Runs the shared post-renewal activation step for one tenant storefront renewal so a renewed customer account is
+    /// never left disabled in the panel that already holds the new expiry and quota.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel descriptor used for the renewal that just applied.</param>
+    /// <param name="operation">
+    /// Durable tenant renewal operation whose tenant-scoped <c>TargetEmail</c> identifies the tenant's panel client and
+    /// whose status is the authoritative "the panel accepted this renewal" signal. A non-applied operation makes the
+    /// step a no-op so a rejected renewal can never switch a customer account on.
+    /// </param>
+    /// <param name="actorTelegramUserId">
+    /// Numeric Telegram id of the paying customer who triggered the renewal, or <c>0</c> for a background path. It is
+    /// recorded for audit only.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the panel reads and the enable update.</param>
+    /// <returns>
+    /// The activation result. <see cref="XuiV3RenewalActivationResult.IsActive" /> is <c>true</c> only when the panel was
+    /// proven to hold the client enabled; every other outcome leaves the tenant order financially settled exactly as
+    /// before and is reported to operators as a warning.
+    /// </returns>
+    /// <remarks>
+    /// The enable update preserves the panel client's existing owner, so a tenant customer who renews an account that
+    /// belongs to another Telegram user never becomes its owner. The target email comes from the tenant-scoped operation
+    /// row, so the step can only ever touch the account of the tenant that owns that operation, and no wallet, ledger,
+    /// order, reminder, or notification state is written. The step is idempotent, so a repeated payment callback or a
+    /// recovery retry performs no second enable when the panel already reports the client enabled.
+    /// </remarks>
+    private Task<XuiV3RenewalActivationResult> EnsureTenantRenewedClientEnabledAsync(
+        ServerInfo serverInfo,
+        XuiV3RenewalOperation operation,
+        long actorTelegramUserId,
+        CancellationToken cancellationToken)
+        => XuiV3RenewalClientActivation.EnsureClientEnabledAfterRenewalAsync(
+            new XuiV3RenewalActivationRequest(
+                serverInfo,
+                _configuration,
+                operation.TargetEmail,
+                RenewalApplied: string.Equals(
+                    operation.Status,
+                    XuiV3RenewalOperationStatuses.Applied,
+                    StringComparison.Ordinal),
+                RenewalKind: "tenant-renew",
+                ActorTelegramUserId: actorTelegramUserId,
+                Logger: _logger));
 
     /// <summary>
     /// Completes the one-time tenant renewal fulfillment after the XUI mutation is applied exactly once.

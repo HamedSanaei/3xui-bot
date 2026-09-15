@@ -2530,6 +2530,14 @@ public class XuiV3BotFlowService
         XuiOperationTiming operationTiming,
         CancellationToken cancellationToken)
     {
+        // A duplicate executor or crash take-over reaches this reconciliation with the renewal already applied, so the
+        // account is re-proven active before the one-time settlement is allowed to move money.
+        await EnsureRenewedClientEnabledAsync(
+            BuildConfiguredPanelServerInfo(),
+            operation,
+            credUser.TelegramUserId,
+            cancellationToken);
+
         var settlement = await SettleOwnedRenewalAsync(
             operation, credUser, resolved, useSiteWallet, null, operation.TargetEmail, cancellationToken);
         if (settlement.InProgress)
@@ -2586,7 +2594,9 @@ public class XuiV3BotFlowService
     /// </returns>
     /// <remarks>
     /// This entry point exists outside the Telegram callback state machine so a delayed panel commit can be charged
-    /// after restart. It never calls UpdateClient. The same atomic settlement claim and wallet-ledger idempotency key
+    /// after restart. It never re-sends the renewal update; the only panel write it may issue is the idempotent
+    /// post-renewal activation that clears a remaining disable flag through <c>XuiV3RenewalClientActivation</c>. The
+    /// same atomic settlement claim and wallet-ledger idempotency key
     /// used by callbacks protect the debit. Telegram delivery failure does not undo a completed settlement.
     /// </remarks>
     /// <example><code>await flow.SettleRecoveredOwnedRenewalAsync(botClient, operation, stoppingToken)</code></example>
@@ -2620,6 +2630,15 @@ public class XuiV3BotFlowService
             operation.PaymentMethod,
             "gozargah_site_wallet",
             StringComparison.OrdinalIgnoreCase);
+        // Crash recovery settles an already-applied renewal, and the crash window can sit between the panel update and
+        // the activation step. Repair and verify the enable state before the one-time settlement, because a settled
+        // operation is never revisited: leaving it disabled here would leave a paid customer switched off for good.
+        await EnsureRenewedClientEnabledAsync(
+            BuildConfiguredPanelServerInfo(),
+            operation,
+            actorTelegramUserId: 0,
+            cancellationToken);
+
         var settlement = await SettleOwnedRenewalAsync(
             operation,
             credUser,
@@ -2668,6 +2687,49 @@ public class XuiV3BotFlowService
     }
 
     /// <summary>
+    /// Runs the shared post-renewal activation step for one owned-bot renewal so a renewed account is never left
+    /// disabled in the panel that already holds the new expiry and quota.
+    /// </summary>
+    /// <param name="serverInfo">Configured XUI v3 panel descriptor used for the renewal that just applied.</param>
+    /// <param name="operation">
+    /// Durable renewal operation whose immutable target email identifies the panel client and whose status is the
+    /// authoritative "the panel accepted this renewal" signal. A non-applied operation makes the step a no-op so a
+    /// rejected renewal can never switch an account on.
+    /// </param>
+    /// <param name="actorTelegramUserId">
+    /// Numeric Telegram id of the renewing customer, or <c>0</c> for a background recovery path. It is recorded for
+    /// audit only and never replaces the account owner.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the panel reads and the enable update.</param>
+    /// <returns>
+    /// The activation result. <see cref="XuiV3RenewalActivationResult.IsActive" /> is <c>true</c> only when the panel was
+    /// proven to hold the client enabled; every other outcome means the state is unproven or still disabled and is
+    /// reported to operators as a warning rather than as a renewal failure.
+    /// </returns>
+    /// <remarks>
+    /// Ownership is preserved rather than invented: the underlying enable update keeps whatever owner and metadata the
+    /// panel client already carries, so paying for a renewal cannot transfer the account to the payer. The step is
+    /// idempotent, so a duplicate renewal confirmation or a crash take-over re-runs it without issuing a second enable.
+    /// </remarks>
+    private Task<XuiV3RenewalActivationResult> EnsureRenewedClientEnabledAsync(
+        ServerInfo serverInfo,
+        XuiV3RenewalOperation operation,
+        long actorTelegramUserId,
+        CancellationToken cancellationToken)
+        => XuiV3RenewalClientActivation.EnsureClientEnabledAfterRenewalAsync(
+            new XuiV3RenewalActivationRequest(
+                serverInfo,
+                _configuration,
+                operation.TargetEmail,
+                RenewalApplied: string.Equals(
+                    operation.Status,
+                    XuiV3RenewalOperationStatuses.Applied,
+                    StringComparison.Ordinal),
+                RenewalKind: "user-renew",
+                ActorTelegramUserId: actorTelegramUserId,
+                Logger: _logger));
+
+    /// <summary>
     /// Runs the post-apply renewal flow exactly once: traffic reset, volume cycle, guarded settlement, success
     /// message, single central log, activity audit, and Gozargah sync.
     /// </summary>
@@ -2713,6 +2775,18 @@ public class XuiV3BotFlowService
         var serverInfo = BuildConfiguredPanelServerInfo();
 
         var trafficResetApplied = await ResetRenewedTrafficIfNeededAsync(serverInfo, client.Email, renewal, cancellationToken);
+
+        // The reset above is the last panel write of this renewal, so the activation step now proves the state the
+        // customer will actually connect with. It runs before settlement so a renewed, paid account is never left
+        // disabled while the money moves; an unproven result is an operator warning, never a renewal failure.
+        var clientActivation = await EnsureRenewedClientEnabledAsync(
+            serverInfo,
+            renewalOperation,
+            credUser.TelegramUserId,
+            cancellationToken);
+        if (clientActivation.IsActive)
+            client.Enable = true;
+
         await _volumeReminderStateStore.TryBeginNewCycleAfterRenewalAsync(
             serverInfo,
             client,
@@ -2836,6 +2910,9 @@ public class XuiV3BotFlowService
                 ["durationAddedDays"] = resolved.DurationDays,
                 ["finalDurationDays"] = renewal.FinalDurationDays,
                 ["trafficResetApplied"] = trafficResetApplied,
+                ["panelClientActiveAfterRenew"] = clientActivation.IsActive,
+                ["panelClientActivationStatus"] = clientActivation.Status.ToString(),
+                ["panelClientEnableRepairIssued"] = clientActivation.MutationIssued,
                 ["priceToman"] = resolved.PriceToman,
                 ["balanceBeforeToman"] = siteWalletDebitResult?.Success == true
                     ? siteWalletDebitResult.BeforeWallet

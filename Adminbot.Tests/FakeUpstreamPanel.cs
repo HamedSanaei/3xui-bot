@@ -72,6 +72,17 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
     /// <summary>Gets the number of runtime <c>RemoveUser</c> admissions the panel would have performed.</summary>
     public int RuntimeRemoveUserCount { get; private set; }
 
+    /// <summary>
+    /// Gets or sets whether a client update applies every field except the admission flag.
+    /// </summary>
+    /// <remarks>
+    /// This reproduces the production symptom the renewal activation step exists for: the panel answers the renewal
+    /// update successfully and stores the new quota and expiry, but the client stays disabled, so paying for a renewal
+    /// does not restore service. The switch is opt-in and defaults to <c>false</c>, so every other test keeps the
+    /// ordinary 3x-ui behavior where an update carrying <c>enable = true</c> does admit the client.
+    /// </remarks>
+    public bool IgnoreClientEnableWrites { get; set; }
+
     /// <summary>Starts the fake panel on an ephemeral loopback port.</summary>
     /// <returns>The started panel.</returns>
     public static async Task<FakeUpstreamPanel> StartAsync()
@@ -332,6 +343,14 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
                             continue;
                         }
 
+                        // When enable writes are ignored the envelope is still accepted and every other field is applied,
+                        // which models a panel that keeps a depleted client disabled across a renewal update.
+                        if (IgnoreClientEnableWrites &&
+                            string.Equals(property.Name, "enable", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
                         // `id` is the protocol UUID in the update contract, not the numeric record id.
                         if (string.Equals(property.Name, "id", StringComparison.OrdinalIgnoreCase))
                         {
@@ -369,7 +388,14 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
 
         if (path.Contains("/get/", StringComparison.OrdinalIgnoreCase))
         {
-            await WriteSuccessAsync(context, ReadClient(email));
+            // An unknown email models the panel's "client not found" envelope: a successful response carrying no object.
+            // Returning an empty payload instead of throwing keeps callers honest about a missing client, which is a
+            // state the renewal activation step must classify instead of mutating.
+            JToken? found;
+            lock (_sync)
+                found = _clients.TryGetValue(email, out var stored) ? stored.DeepClone() : null;
+
+            await WriteSuccessAsync(context, found);
             return;
         }
 
@@ -420,7 +446,7 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
     /// <param name="context">Request being served.</param>
     /// <param name="obj">Object to place in the envelope's <c>obj</c> property.</param>
     /// <returns>A task that completes when the response has been written.</returns>
-    private static async Task WriteSuccessAsync(HttpContext context, JToken obj)
+    private static async Task WriteSuccessAsync(HttpContext context, JToken? obj)
     {
         context.Response.ContentType = "application/json";
         context.Response.StatusCode = StatusCodes.Status200OK;

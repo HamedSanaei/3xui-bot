@@ -142,6 +142,12 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   both `/start` and `/refresh` whenever their runtime starts.
 - Owned purchase/renewal insufficient-balance messages expose `wallet:charge`. The dispatcher trusts only the callback sender, clears that bot's persisted state plus its in-memory XUI selection, edits the source message, and opens the same live-gateway charge menu as `💰شارژ حساب کاربری`; tenant storefronts never receive this shortcut.
 - `Services/XuiV3RenewalPolicy.cs`: central renewal payload calculation for metered, national, and unlimited accounts.
+- `Services/XuiV3RenewalClientActivation.cs`: the single post-renewal activation step shared by owned-bot customer,
+  tenant storefront, and super-admin renewals plus both crash-recovery settlements. It reads the panel client after the
+  accepted renewal mutation, does nothing when the client is already enabled, and otherwise clears a remaining disable
+  flag through the ordinary enable update, then proves the state by read-back. A renewal the panel did not accept, an
+  unreadable client, and a panel failure never mutate anything; the outcome is a closed-vocabulary status recorded in
+  audit fields and operator warnings. Quota, expiry, identity, and ownership are preserved and the step is idempotent.
 - `Services/XuiV3RenewalOperationStore.cs` + `Domain/XuiV3RenewalOperation.cs`: durable exactly-once renewal saga in
   `users.db`. `MutationStartedAtUtc` is persisted immediately before the only permitted `UpdateClient` POST; processing
   or ambiguous operations are never replayed, even when GET temporarily shows the target absent. A filtered unique
@@ -346,6 +352,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   it must never create a second wallet credit or ledger entry. Tenant orders and terminal HooshPay failures are never
   eligible for provisional approval.
 - Super-admin manual NOWPayments checks are provider re-checks only: local code must not set `finished` or credit balances unless NOWPayments returns a paid status (`finished`, `confirmed`, or `sending`).
+- 3x-ui disables a client when it expires or exhausts its quota, and `enable` is the panel's only instantaneous
+  admission gate, so a renewal that merely raised quota and expiry could leave a paid account switched off. Every v3
+  renewal entry point (owned customer, tenant storefront, super-admin, and both crash-recovery settlements) therefore
+  runs the shared `XuiV3RenewalClientActivation` step after the accepted panel mutation and before the financial tail.
+  An unproven activation is a warning plus audit evidence only: it never changes renewal, settlement, or Telegram
+  outcomes, and the traffic reset that may follow can only enable or admit a client, never disable one. The legacy v2
+  renewal path in `Services/ApiService.cs` already sends `Enable = true` and is outside this v3 step.
 - Unlimited renewal no longer infers a target fair-usage quota from the final duration. While active, it adds the
   selected plan's exact traffic to `TotalGB` and adds the exact plan days while preserving positive absolute-expiry or
   negative first-connection-expiry mode. When expired, it replaces `TotalGB`, resets counters, and writes only the
