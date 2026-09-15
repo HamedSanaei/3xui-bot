@@ -60,6 +60,14 @@
     <!-- Production Data is shared state and must never be copied into an immutable release artifact. -->
     <Content Update="Data\**" CopyToPublishDirectory="Never" />
     <None Update="Data\**" CopyToPublishDirectory="Never" />
+    <!-- Untracked developer scratch output (`artifacts/`, gitignored) must never enter a release artifact either. It
+         holds stale copies of Data/configuration.json produced by earlier verification runs plus a redacted secrets
+         dump, so publishing it would leak state into the release and trip the deployment's artifact-content preflight.
+         The GitHub release is published from a clean checkout, where the directory does not exist, and the production
+         host no longer publishes at all; this exclusion makes the guarantee explicit instead of incidental for anyone
+         who still runs `dotnet publish` in a working copy. -->
+    <Content Update="artifacts\**" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <None Update="artifacts\**" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
   </ItemGroup>
 
 </Project>

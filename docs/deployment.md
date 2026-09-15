@@ -48,15 +48,13 @@ preflight starts no web server, Telegram receiver, hosted worker, or remote logg
   --credentials-source /opt/vpnetiran/shared/Data/credentials.db
 ```
 
-## Synchronized-deployment gate (`scripts/deploy-production.sh`)
+## Artifact deployment gate (`scripts/deploy-production.sh`)
 
-The GitHub production workflow streams `scripts/deploy-production.sh` to the host, which clones the exact pushed SHA and
-synchronizes it into `/root/vpnetiran` before restarting `vpnetiranbot.service`. That path must clear the same gates as
-the immutable-release path; `dotnet publish` alone is explicitly **not** sufficient, because it compiles the application
-but never runs the suite or the EF model checks.
+The GitHub Actions pipeline builds once on the runner and deploys exactly that artifact. Production never clones the
+repository and never runs `dotnet restore`, `dotnet build`, `dotnet test`, `dotnet publish`, or `dotnet ef`.
 
-Against the freshly cloned staging checkout, and before any source or publish synchronization and before systemd is
-touched, the script now runs, in order:
+`.github/workflows/ci.yml` is the single build pipeline. It runs on push and pull requests, and it is also callable as a
+reusable workflow. It performs, in order:
 
 ```bash
 dotnet tool restore
@@ -65,16 +63,44 @@ dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=<sha>"
 dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
 dotnet ef migrations has-pending-model-changes --no-build --context UserDbContext
 dotnet ef migrations has-pending-model-changes --no-build --context CredentialsDbContext
+bash scripts/deploy-production.tests.sh
+dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false -o <tmp>
 ```
 
-It then publishes with the same `SourceRevisionId` stamp, and runs the published executable's migration preflight twice:
-once against fresh databases, then against online-backup copies of `.../publish/Data/users.db` and
-`.../publish/Data/credentials.db`. Only after every gate passes does it synchronize source and publish and restart the
-service; a failing gate exits before the protected `Data` directory or systemd is touched.
+It then refuses to package anything that is not a runtime-only release: `Data/`, `*.db`, `*.db-*`, and
+`configuration.json` are rejected, while `Adminbot`, `Adminbot.dll`, `Assets/telegram-ui/emoji-map.json`, and all three
+`Assets/tutorials/*` image directories are required. The packaged `vpnetiranbot-release` artifact (tarball plus
+`.sha256`, with the digest exposed as a job output) is the only thing that may reach production.
 
-`scripts/deploy-production.tests.sh` asserts the *ordering* structurally (restore/build/tests/EF checks and the
-preflight all precede synchronization, and synchronization precedes the restart) so the gate cannot be dropped or moved
-by a later edit on a machine without rsync or systemd.
+`.github/workflows/deploy-production.yml` calls that workflow as job `ci`, downloads its artifact, verifies the digest,
+copies it to `/root/.deploy/incoming/<sha>/`, and streams `scripts/deploy-production.sh` to the host with the SHA,
+artifact path, digest, run id/attempt, live root, and service name. The host then, in order:
+
+1. verifies tooling, the .NET 10 runtime, and that the service's `ExecStart` still points at the expected live executable;
+2. captures the protected `Data` directory identity (realpath plus device:inode);
+3. verifies the transferred archive's SHA-256 against the runner's digest;
+4. verifies the archive's entry list contains no `Data/`, database, configuration, or `.git` entry, and does contain the
+   executable and its assembly;
+5. extracts into a unique staging directory, re-checks for `Data/`, requires the runtime assets, and runs the
+   tutorial-asset preflight;
+6. runs the published executable's `--migration-check` against fresh databases and then against online-backup copies of
+   `Data/users.db` and `Data/credentials.db`;
+7. activates the release with a sequence of same-filesystem renames (live -> `publish.prev`, staged -> `publish`, then
+   `publish.prev/Data` -> `publish/Data`), so the protected `Data` directory keeps its inode and no database,
+   `configuration.json`, or log file is ever copied, replaced, or truncated;
+8. restarts the service and waits for it to become active, rolling back to the retained previous release (Data renamed
+   back, service restarted again) when it does not.
+
+`assert_data_unchanged` re-checks the `Data` identity before and after every step that touches the filesystem, and
+`activate_release` refuses to run when staging and the live publish directory are on different filesystems, because the
+renames would then silently degrade into copies.
+
+`scripts/deploy-production.tests.sh` proves the switch and the rollback functionally against temporary directories
+(Data content **and inode** preserved across both), proves a recreated `Data` directory is detected, proves the artifact
+preflight refuses archives carrying protected state and accepts a runtime-only archive, and asserts structurally that the
+script contains no `dotnet restore/build/test/publish/ef/tool`, no `git clone`, and that digest checks precede
+extraction, completeness and tutorial checks precede the preflight, the preflight precedes activation, activation precedes
+the restart, and rollback is reachable only after the restart and health check.
 
 ## Test schema policy
 

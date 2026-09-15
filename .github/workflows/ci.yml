@@ -1,0 +1,154 @@
+name: CI
+
+# The complete build, test, migration, and packaging pipeline. It runs on every push and pull request, and it is also
+# callable as a reusable workflow so the production deployment can consume exactly the artifact this job verified instead
+# of rebuilding anything on the server.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+  RELEASE_ARTIFACT_NAME: vpnetiranbot-release
+
+jobs:
+  build:
+    name: Build, test, verify, package
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      # SHA-256 of the packaged release artifact. The production deploy job verifies the transferred file against this
+      # value before the host is allowed to extract or activate anything.
+      digest: ${{ steps.package.outputs.digest }}
+    steps:
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '.config/dotnet-tools.json') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Restore pinned tools and packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          dotnet tool restore
+          dotnet restore Adminbot.sln
+
+      - name: Build Release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=$GITHUB_SHA"
+
+      - name: Run full test suite
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
+
+      # Both EF contexts must prove that the model and the migrations agree. This is the check that previously ran on the
+      # production host, where a pending model change would have been discovered only after the server had spent minutes
+      # building the release.
+      - name: Verify EF model has no pending changes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          dotnet ef migrations has-pending-model-changes --no-build \
+            --project Adminbot.csproj --startup-project Adminbot.csproj \
+            --context UserDbContext --configuration Release
+          dotnet ef migrations has-pending-model-changes --no-build \
+            --project Adminbot.csproj --startup-project Adminbot.csproj \
+            --context CredentialsDbContext --configuration Release
+
+      - name: Validate deployment scripts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n scripts/deploy-production.sh
+          bash -n scripts/deploy-production.tests.sh
+          bash scripts/deploy-production.tests.sh
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/deploy-production.sh scripts/deploy-production.tests.sh
+          else
+            echo "shellcheck is not installed on this runner; syntax and preservation tests already passed."
+          fi
+
+      - name: Publish linux-x64 release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false \
+            "/p:SourceRevisionId=$GITHUB_SHA" -o "$RUNNER_TEMP/publish"
+
+      # The artifact is refused when it carries production state. Data/ holds users.db, credentials.db,
+      # configuration.json, and the daily logs, and every one of them is owned by the host, never by a release.
+      - name: Verify publish output is runtime files only
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          publish="$RUNNER_TEMP/publish"
+          test -f "$publish/Adminbot"
+          test -f "$publish/Adminbot.dll"
+          test -f "$publish/Assets/telegram-ui/emoji-map.json"
+          for dir in android_v2rayng windows_v2rayn ios_android_v2box; do
+            test -d "$publish/Assets/tutorials/$dir" || { echo "publish output is missing Assets/tutorials/$dir." >&2; exit 1; }
+            find "$publish/Assets/tutorials/$dir" -maxdepth 1 -type f \
+              \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | grep -q . \
+              || { echo "Assets/tutorials/$dir contains no supported image." >&2; exit 1; }
+          done
+          if [ -e "$publish/Data" ]; then
+            echo "publish output unexpectedly contains Data/." >&2
+            exit 1
+          fi
+          if find "$publish" -maxdepth 3 \( -name '*.db' -o -name '*.db-*' -o -name 'configuration.json' \) | grep -q .; then
+            echo "publish output unexpectedly contains protected state." >&2
+            exit 1
+          fi
+
+      - name: Package release artifact
+        id: package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive="$RUNNER_TEMP/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
+          tar -czf "$archive" -C "$RUNNER_TEMP/publish" .
+          digest="$(sha256sum -- "$archive" | awk '{print $1}')"
+          printf '%s\n' "$digest" > "$archive.sha256"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Release artifact %s packaged with digest %s.\n' "$archive" "$digest"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: |
+            ${{ runner.temp }}/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz
+            ${{ runner.temp }}/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30

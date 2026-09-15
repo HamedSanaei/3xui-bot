@@ -1,5 +1,9 @@
 name: Deploy production
 
+# Production deployment of an artifact that GitHub Actions already built, tested, migration-checked, and packaged.
+# The production host never runs dotnet restore, build, test, or publish: it receives a digest-verified release archive,
+# validates it, preflights migrations against copies of the live databases, switches the release atomically, restarts the
+# service, and rolls back automatically when the restarted service does not become healthy.
 on:
   push:
     branches:
@@ -14,18 +18,27 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  REPO_URL: https://github.com/HamedSanaei/3xui-bot.git
   DEPLOY_PATH: /root/vpnetiran
   SERVICE_NAME: vpnetiranbot.service
+  INCOMING_BASE: /root/.deploy/incoming
+  RELEASE_ARTIFACT_NAME: vpnetiranbot-release
 
 jobs:
+  # Reuses the exact CI pipeline that any pull request runs, so a release cannot be packaged by a different set of steps
+  # than the ones reviewers and the branch protection rule already trust.
+  ci:
+    if: github.ref == 'refs/heads/main'
+    name: Build verified release
+    uses: ./.github/workflows/ci.yml
+
   deploy:
     if: github.ref == 'refs/heads/main'
-    name: Deploy Production
+    name: Deploy prebuilt release
+    needs: ci
     runs-on: ubuntu-latest
     environment:
       name: production
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: Checkout exact workflow commit
         uses: actions/checkout@v5
@@ -33,18 +46,23 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
 
-      - name: Validate deployment scripts
+      - name: Download verified release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/release
+
+      - name: Verify artifact digest from the CI job
         shell: bash
+        env:
+          EXPECTED_DIGEST: ${{ needs.ci.outputs.digest }}
         run: |
           set -Eeuo pipefail
-          bash -n scripts/deploy-production.sh
-          bash -n scripts/deploy-production.tests.sh
-          bash scripts/deploy-production.tests.sh
-          if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck scripts/deploy-production.sh scripts/deploy-production.tests.sh
-          else
-            echo "shellcheck is not installed on this runner; syntax and preservation tests already passed."
-          fi
+          [[ "$EXPECTED_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "The CI job did not report a usable artifact digest." >&2; exit 64; }
+          archive="$RUNNER_TEMP/release/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
+          [[ -f "$archive" ]] || { echo "The downloaded release artifact is missing." >&2; exit 64; }
+          printf '%s  %s\n' "$EXPECTED_DIGEST" "$archive" | sha256sum -c -
+          echo "ARTIFACT_DIGEST=$EXPECTED_DIGEST" >> "$GITHUB_ENV"
 
       - name: Configure production SSH
         shell: bash
@@ -96,7 +114,7 @@ jobs:
             exit 64
           }
 
-      - name: Deploy exact pushed commit
+      - name: Transfer release artifact to production
         shell: bash
         env:
           PROD_HOST: ${{ secrets.PROD_HOST }}
@@ -104,17 +122,52 @@ jobs:
           PROD_USER: ${{ secrets.PROD_USER }}
         run: |
           set -Eeuo pipefail
-          remote_cmd="$(printf 'bash -s -- %q %q %q %q %q %q' \
-            "$GITHUB_SHA" "$REPO_URL" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$DEPLOY_PATH" "$SERVICE_NAME")"
-          ssh \
-            -i "$RUNNER_TEMP/prod_deploy_key" \
-            -p "$PROD_PORT" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
+          archive="$RUNNER_TEMP/release/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
+          remote_dir="${{ env.INCOMING_BASE }}/$GITHUB_SHA"
+          ssh -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -- "$PROD_USER@$PROD_HOST" "install -d -m 700 '$remote_dir'"
+          scp -i "$RUNNER_TEMP/prod_deploy_key" -P "$PROD_PORT" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -- "$archive" "$PROD_USER@$PROD_HOST:$remote_dir/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
+          echo "Transferred $archive to $remote_dir on production."
+
+      - name: Deploy exact pushed commit from the verified artifact
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+        run: |
+          set -Eeuo pipefail
+          remote_artifact="${{ env.INCOMING_BASE }}/$GITHUB_SHA/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
+          remote_cmd="$(printf 'bash -s -- %q %q %q %q %q %q %q' \
+            "$GITHUB_SHA" "$remote_artifact" "$ARTIFACT_DIGEST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "${{ env.DEPLOY_PATH }}" "${{ env.SERVICE_NAME }}")"
+          ssh -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -- "$PROD_USER@$PROD_HOST" "$remote_cmd" \
             < scripts/deploy-production.sh
+
+      # The host removes the archive itself after a healthy deployment; this clears the incoming directory either way so a
+      # cancelled or failed transfer cannot accumulate unreferenced release archives on the server.
+      - name: Clear transferred artifact from production
+        if: always()
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -f "$RUNNER_TEMP/prod_deploy_key" ]]; then
+            ssh -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+              -- "$PROD_USER@$PROD_HOST" "rm -rf -- '${{ env.INCOMING_BASE }}/$GITHUB_SHA'" || true
+          fi
 
       - name: Remove temporary SSH key
         if: always()

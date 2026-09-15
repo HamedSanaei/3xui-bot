@@ -1,22 +1,107 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-CANONICAL_REPO_URL="https://github.com/HamedSanaei/3xui-bot.git"
+# Production deployment entry point. It is streamed over SSH by the GitHub Actions deploy job and consumes an
+# already-built release artifact, so the production host never restores, builds, tests, or publishes anything.
+#
+# WHY THIS SHAPE
+# The previous revision cloned the repository on the host and ran restore, build, the full test suite, both EF
+# pending-model checks, and publish there. That made every release cost the server's CPU and disk for several minutes,
+# and it made the deployment's correctness depend on the SDK installed on the production machine. The expensive
+# verification work now happens on the GitHub runner, whose result is an immutable artifact plus its SHA-256 digest.
+# Production keeps only the checks that must run against the real machine: artifact integrity, artifact completeness,
+# migration preflight against the live databases, and the health of the restarted service.
+#
+# WHAT MUST NOT REGRESS
+# Production state lives in the protected Data directory, which sits inside the live publish directory because the
+# application resolves its paths relative to the process working directory (./Data/users.db, ./Data/configuration.json,
+# ./Data/Logs/...). It therefore holds both SQLite databases, the deployment's only configuration.json, and the daily
+# diagnostic logs. The switch below is a sequence of atomic renames in which the Data directory keeps its inode and is
+# simply moved between two release parents, so no database, configuration file, or log file is ever copied, replaced,
+# truncated, or deleted by a deployment.
+
+CANONICAL_ARTIFACT_PREFIX="vpnetiranbot-release"
 EXPECTED_LIVE_ROOT="/root/vpnetiran"
 EXPECTED_SERVICE_NAME="vpnetiranbot.service"
 STAGING_BASE="/root/.deploy/vpnetiran"
+INCOMING_BASE="/root/.deploy/incoming"
 LOCK_FILE="/var/lock/vpnetiran-deploy.lock"
 CURRENT_STAGE_ROOT=""
+PROTECTED_DATA_DIR=""
+PROTECTED_DATA_REAL=""
+PROTECTED_DATA_IDENTITY=""
 
 fail() {
   printf 'Deployment refused: %s\n' "$1" >&2
   exit 64
 }
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Protected production state
+# ----------------------------------------------------------------------------------------------------------------------
+
+# Captures the identity of the protected Data directory so every later step can prove it was neither replaced nor
+# recreated. The identity is a device:inode pair, which survives a rename between release parents but changes if the
+# directory is copied, deleted, or recreated.
+protected_data_identity() {
+  local live_data="$1"
+  [[ -d "$live_data" ]] || fail "protected production Data directory is missing."
+  [[ ! -L "$live_data" ]] || fail "protected production Data must be a real directory, not a symlink."
+  PROTECTED_DATA_DIR="$live_data"
+  PROTECTED_DATA_REAL="$(realpath -e -- "$live_data")" || fail "protected production Data path could not be resolved."
+  [[ "$PROTECTED_DATA_REAL" == "$live_data" ]] || fail "protected Data path resolves somewhere unexpected."
+  PROTECTED_DATA_IDENTITY="$(stat -Lc '%d:%i' -- "$live_data")"
+}
+
+assert_data_unchanged() {
+  [[ -d "$PROTECTED_DATA_DIR" && ! -L "$PROTECTED_DATA_DIR" ]] || fail "protected production Data directory disappeared or changed type."
+  [[ "$(realpath -e -- "$PROTECTED_DATA_DIR")" == "$PROTECTED_DATA_REAL" ]] || fail "protected production Data path identity changed."
+  [[ "$(stat -Lc '%d:%i' -- "$PROTECTED_DATA_DIR")" == "$PROTECTED_DATA_IDENTITY" ]] || fail "protected production Data directory was replaced."
+}
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Artifact validation
+# ----------------------------------------------------------------------------------------------------------------------
+
+# Proves the transferred archive carries runtime files only. A release that shipped users.db, credentials.db,
+# configuration.json, or any Data/ entry could overwrite or shadow production state once extracted, so such an archive is
+# refused before it is unpacked.
+assert_artifact_archive() {
+  local archive="$1"
+  local entries entry lower
+  entries="$(tar -tzf "$archive")" || fail "release artifact is not a readable gzip tar archive."
+
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    lower="${entry,,}"
+    case "$lower" in
+      data|data/*|./data|./data/*)
+        fail "release artifact contains protected state (Data/) and will not be deployed." ;;
+      *.db|*.db-*|*.db-wal|*.db-shm|*configuration.json)
+        fail "release artifact contains a database or configuration file and will not be deployed." ;;
+      .git|.git/*|./.git|./.git/*)
+        fail "release artifact contains version-control metadata and will not be deployed." ;;
+    esac
+  done <<< "$entries"
+
+  grep -Eq '(^|/)Adminbot$' <<< "$entries" || fail "release artifact does not contain the Adminbot executable."
+  grep -Eq '(^|/)Adminbot\.dll$' <<< "$entries" || fail "release artifact does not contain Adminbot.dll."
+}
+
+# Proves the extracted release is complete enough to run. This runs after extraction and before the switch, so an
+# incomplete artifact can never replace a working release.
+assert_release_complete() {
+  local publish_root="$1"
+  [[ -f "$publish_root/Adminbot" ]] || fail "staged release is missing the Adminbot executable."
+  [[ -f "$publish_root/Adminbot.dll" ]] || fail "staged release is missing Adminbot.dll."
+  [[ -f "$publish_root/Assets/telegram-ui/emoji-map.json" ]] \
+    || fail "staged release is missing the Telegram premium-UI emoji asset."
+}
+
 # Built-in installation tutorials are shipped as ordinary publish files beside the application. The tenant customer flow
 # exposes the tutorial buttons unconditionally, so a release whose images were never copied would ship a guide that fails
 # at send time. This preflight inspects ONLY the staged publish artifact - never the developer source tree - so it proves
-# both that the asset copy rules work and that the artifact about to be synchronized is complete.
+# both that the asset copy rules work and that the artifact about to be activated is complete.
 REQUIRED_TUTORIAL_ASSET_DIRS=(
   "android_v2rayng"
   "windows_v2rayn"
@@ -45,76 +130,158 @@ assert_tutorial_assets() {
   done
 }
 
-sync_source() {
-  local source_dir="$1"
-  local live_root="$2"
-  rsync -a --delete --checksum \
-    --filter='P bin/Release/net10.0/linux-x64/publish/Data/***' \
-    --exclude='.git/' \
-    --exclude='bin/' \
-    --exclude='obj/' \
-    --exclude='Adminbot.Tests/bin/' \
-    --exclude='Adminbot.Tests/obj/' \
-    --exclude='Data/configuration.json' \
-    --exclude='*.db' --exclude='*.db-*' \
-    "$source_dir/" "$live_root/"
+# ----------------------------------------------------------------------------------------------------------------------
+# Atomic release switch
+# ----------------------------------------------------------------------------------------------------------------------
+
+# Swaps a staged release into the live publish path and carries the protected Data directory across unchanged.
+#
+# The four steps below are renames inside one filesystem, so none of them copies a byte:
+#   1. the live release moves aside to the rollback slot;
+#   2. the staged release becomes the live release;
+#   3. the protected Data directory is renamed from the rollback slot into the new live release, keeping its inode;
+#   4. the rollback slot without Data is discarded by the caller after a healthy deployment.
+# The service is never restarted by this function and never observes a partially installed tree, which is what makes the
+# switch atomic from the running process's point of view.
+activate_release() {
+  local staged="$1"
+  local live_publish="$2"
+  local slot parent_device staged_device
+
+  [[ -d "$staged" ]] || fail "staged release directory does not exist."
+  [[ -d "$live_publish" ]] || fail "live publish directory does not exist."
+  slot="$(dirname -- "$live_publish")"
+  parent_device="$(stat -Lc '%d' -- "$slot")"
+  staged_device="$(stat -Lc '%d' -- "$staged")"
+  if [[ "$parent_device" != "$staged_device" ]]; then
+    fail "staged release and live publish directory are on different filesystems, so the switch could not be atomic."
+  fi
+
+  rm -rf -- "${live_publish}.next" "${live_publish}.failed"
+  mv -- "$staged" "${live_publish}.next"
+  mv -- "$live_publish" "${live_publish}.prev"
+  mv -- "${live_publish}.next" "$live_publish"
+  mv -- "${live_publish}.prev/Data" "$live_publish/Data"
 }
 
-sync_publish() {
-  local stage_publish="$1"
-  local live_publish="$2"
-  rsync -a --delete --checksum \
-    --filter='P Data/***' \
-    --exclude='Data/' \
-    "$stage_publish/" "$live_publish/"
+# Restores the previous release after a failed health check. The new release and the protected Data directory are swapped
+# back in the reverse order, so Data again keeps its inode and the previously healthy payload is live before the service
+# is restarted a second time.
+rollback_release() {
+  local live_publish="$1"
+  [[ -d "${live_publish}.prev" ]] || fail "no previous release is retained, so a rollback is not possible."
+
+  rm -rf -- "${live_publish}.failed"
+  mv -- "$live_publish" "${live_publish}.failed"
+  mv -- "${live_publish}.prev" "$live_publish"
+  mv -- "${live_publish}.failed/Data" "$live_publish/Data"
 }
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Migration preflight and service health
+# ----------------------------------------------------------------------------------------------------------------------
+
+# Runs the published executable's own migration preflight. It starts no web server, Telegram receiver, or background
+# worker, and it reads the live databases only through online-backup copies, so a schema change that cannot apply to real
+# production data aborts the deployment before the switch.
+run_migration_preflight() {
+  local publish_root="$1"
+  local live_data="$2"
+
+  printf 'Running migration preflight against fresh databases.\n'
+  "$publish_root/Adminbot" --migration-check \
+    || fail "migration preflight failed against fresh databases."
+  printf 'Running migration preflight against production database copies.\n'
+  "$publish_root/Adminbot" --migration-check \
+    --users-source "$live_data/users.db" \
+    --credentials-source "$live_data/credentials.db" \
+    || fail "migration preflight failed against production database copies."
+}
+
+# Shows a bounded slice of the service journal so a failed restart is diagnosable from the workflow log alone.
+show_recent_journal() {
+  local service_name="$1"
+  journalctl -u "$service_name" --since "15 minutes ago" -n 300 --no-pager || true
+}
+
+# Restarts the service and waits for it to become active. Returns non-zero instead of exiting so the caller can decide
+# between a rollback and a hard failure.
+restart_and_verify() {
+  local service_name="$1"
+  local attempt
+
+  if ! systemctl restart "$service_name"; then
+    printf 'Service restart command failed. Showing bounded journal output.\n' >&2
+    show_recent_journal "$service_name"
+    return 1
+  fi
+
+  for attempt in {1..10}; do
+    if systemctl is-active --quiet "$service_name"; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  printf 'Service did not become active. Showing bounded journal output.\n' >&2
+  show_recent_journal "$service_name"
+  return 1
+}
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------------------------------------------------
 
 main() {
   local deploy_sha="${1:-}"
-  local repo_url="${2:-}"
-  local run_id="${3:-manual}"
-  local run_attempt="${4:-1}"
-  local live_root="${5:-$EXPECTED_LIVE_ROOT}"
-  local service_name="${6:-$EXPECTED_SERVICE_NAME}"
+  local artifact_path="${2:-}"
+  local artifact_digest="${3:-}"
+  local run_id="${4:-manual}"
+  local run_attempt="${5:-1}"
+  local live_root="${6:-$EXPECTED_LIVE_ROOT}"
+  local service_name="${7:-$EXPECTED_SERVICE_NAME}"
 
   [[ "$deploy_sha" =~ ^[0-9a-fA-F]{40}$ ]] || fail "deployment SHA must be exactly 40 hexadecimal characters."
-  [[ "$run_id" =~ ^[0-9]+$ ]] || fail "GitHub run id must be numeric."
+  [[ "$artifact_digest" =~ ^[0-9a-fA-F]{64}$ ]] || fail "artifact digest must be exactly 64 hexadecimal characters."
+  [[ "$run_id" =~ ^[0-9]+$ || "$run_id" == "manual" ]] || fail "GitHub run id must be numeric."
   [[ "$run_attempt" =~ ^[0-9]+$ ]] || fail "GitHub run attempt must be numeric."
-  [[ "$repo_url" == "$CANONICAL_REPO_URL" ]] || fail "repository URL does not match the canonical origin."
   [[ "$live_root" == "$EXPECTED_LIVE_ROOT" ]] || fail "live root must remain $EXPECTED_LIVE_ROOT."
   [[ "$service_name" == "$EXPECTED_SERVICE_NAME" ]] || fail "service name must remain $EXPECTED_SERVICE_NAME."
-  command -v git >/dev/null || fail "git is required on the production host."
-  command -v dotnet >/dev/null || fail "dotnet is required on the production host."
-  command -v rsync >/dev/null || fail "rsync is required on the production host."
+
+  # Only tools that exist for validation, locking, and service control are required. No compiler, SDK, or package
+  # restore is needed because the release arrives fully built.
+  command -v tar >/dev/null || fail "tar is required on the production host."
   command -v flock >/dev/null || fail "flock is required on the production host."
   command -v realpath >/dev/null || fail "realpath is required on the production host."
   command -v stat >/dev/null || fail "stat is required on the production host."
+  command -v sha256sum >/dev/null || fail "sha256sum is required on the production host."
   command -v systemctl >/dev/null || fail "systemctl is required on the production host."
   command -v journalctl >/dev/null || fail "journalctl is required on the production host."
-  dotnet --info >/dev/null || fail "dotnet --info failed on the production host."
-  dotnet --list-sdks | awk '{print $1}' | grep -Eq '^10\.' || fail ".NET 10 SDK is required to publish net10.0."
+  command -v dotnet >/dev/null || fail "the .NET runtime is required on the production host to run the migration preflight."
+  dotnet --list-runtimes | awk '{print $1, $2}' | grep -Eq '^Microsoft\.NETCore\.App 10\.' \
+    || fail ".NET 10 runtime is required to run the published net10.0 application."
+
+  [[ -f "$artifact_path" ]] || fail "release artifact does not exist on the production host."
+  local artifact_real incoming_real
+  artifact_real="$(realpath -e -- "$artifact_path")" || fail "release artifact path could not be resolved."
+  incoming_real="$(realpath -m -- "$INCOMING_BASE")"
+  [[ "$artifact_real" == "$incoming_real/"* ]] || fail "release artifact must be transferred into $INCOMING_BASE."
+  [[ "$(basename -- "$artifact_real")" == "$CANONICAL_ARTIFACT_PREFIX.tar.gz" ]] \
+    || fail "release artifact must be named $CANONICAL_ARTIFACT_PREFIX.tar.gz."
+  [[ "$(basename -- "$(dirname -- "$artifact_real")")" == "$deploy_sha" ]] \
+    || fail "release artifact directory must be named after the exact deployment commit."
 
   local live_publish="$live_root/bin/Release/net10.0/linux-x64/publish"
   local live_data="$live_publish/Data"
   [[ -d "$live_root" ]] || fail "live root does not exist."
   [[ -d "$live_publish" ]] || fail "live publish directory does not exist."
-  [[ -d "$live_data" ]] || fail "protected production Data directory is missing."
-  [[ ! -L "$live_data" ]] || fail "protected production Data must be a real directory, not a symlink."
   systemctl cat "$service_name" >/dev/null || fail "systemd service does not exist or cannot be read."
   local service_exec
   service_exec="$(systemctl show "$service_name" -p ExecStart --value)"
   [[ "$service_exec" == *"$live_publish/Adminbot"* ]] || fail "systemd ExecStart does not point to the expected live Adminbot executable."
 
-  local data_real data_identity
-  data_real="$(realpath -e -- "$live_data")"
-  [[ "$data_real" == "$live_data" ]] || fail "protected Data path resolves somewhere unexpected."
-  data_identity="$(stat -Lc '%d:%i' -- "$live_data")"
-
-  assert_data_unchanged() {
-    [[ -d "$live_data" && ! -L "$live_data" ]] || fail "protected production Data directory disappeared or changed type."
-    [[ "$(realpath -e -- "$live_data")" == "$data_real" ]] || fail "protected production Data path identity changed."
-    [[ "$(stat -Lc '%d:%i' -- "$live_data")" == "$data_identity" ]] || fail "protected production Data directory was replaced."
-  }
+  protected_data_identity "$live_data"
+  assert_data_unchanged
 
   mkdir -p "$STAGING_BASE"
   exec 9>"$LOCK_FILE"
@@ -123,7 +290,6 @@ main() {
   fi
 
   local stage_root="$STAGING_BASE/${deploy_sha}-${run_id}-${run_attempt}"
-  local stage_source="$stage_root/source"
   local stage_publish="$stage_root/publish"
   local canonical_stage
   canonical_stage="$(realpath -m -- "$stage_root")"
@@ -144,96 +310,56 @@ main() {
   }
   trap cleanup_stage EXIT
 
-  mkdir -p "$stage_root"
-  printf 'Cloning exact deployment source into staging.\n'
-  git clone --no-checkout "$repo_url" "$stage_source"
-  git -C "$stage_source" fetch --no-tags origin "$deploy_sha"
-  git -C "$stage_source" checkout --detach "$deploy_sha"
-
-  local actual_sha
-  actual_sha="$(git -C "$stage_source" rev-parse HEAD)"
-  [[ "$actual_sha" == "$deploy_sha" ]] || fail "fresh clone HEAD does not match requested GitHub SHA."
-  [[ -z "$(git -C "$stage_source" status --porcelain)" ]] || fail "fresh staging checkout is unexpectedly dirty."
-
-  # Repository-required release gates. These run against the freshly checked-out staging clone BEFORE any source or
-  # publish synchronization and BEFORE systemd is touched, so a commit that does not build, does not pass its tests, or
-  # leaves either EF context with pending model changes can never reach production. Publish alone is deliberately not
-  # treated as a sufficient gate: it compiles the application but never runs the suite or the EF model checks.
-  printf 'Running release gates for commit %s.\n' "$actual_sha"
-  (
-    cd "$stage_source"
-    dotnet tool restore
-    dotnet restore Adminbot.sln
-    dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=$actual_sha"
-    dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
-    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context UserDbContext --configuration Release
-    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context CredentialsDbContext --configuration Release
-  ) || fail "release gates failed for commit $actual_sha; production was not synchronized or restarted."
-  printf 'Release gates passed for commit %s.\n' "$actual_sha"
+  # Artifact integrity is verified before anything is extracted, so a truncated or substituted transfer is refused
+  # before it can reach the filesystem the service reads.
+  printf 'Verifying release artifact digest for commit %s.\n' "$deploy_sha"
+  local actual_digest
+  actual_digest="$(sha256sum -- "$artifact_real" | awk '{print $1}')"
+  [[ "${actual_digest,,}" == "${artifact_digest,,}" ]] || fail "release artifact digest does not match the GitHub runner's digest."
+  assert_artifact_archive "$artifact_real"
+  printf 'Release artifact integrity and content checks passed.\n'
 
   mkdir -p "$stage_publish"
-  printf 'Publishing verified commit %s in staging.\n' "$actual_sha"
-  (
-    cd "$stage_source"
-    dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false \
-      "/p:SourceRevisionId=$actual_sha" -o "$stage_publish"
-  )
+  printf 'Extracting verified release artifact %s.\n' "$deploy_sha"
+  tar -xzf "$artifact_real" -C "$stage_publish" --no-same-owner
 
-  [[ -x "$stage_publish/Adminbot" ]] || fail "staged publish is missing the Adminbot executable."
-
-  # Built-in tutorial images must exist in the artifact before anything is synchronized or restarted. This runs after
-  # publish and before the migration preflight and any source/publish synchronization, so an incomplete release can never
-  # replace a working one.
-  printf 'Verifying built-in tutorial assets in the staged publish artifact.\n'
+  # The extracted tree is re-checked for protected state. The archive entry list above already refuses Data/, a database,
+  # or a configuration file, so this is defense in depth against an archive that hides entries behind a longer path.
+  if [[ -e "$stage_publish/Data" ]]; then
+    fail "staged release unexpectedly contains a Data directory."
+  fi
+  assert_release_complete "$stage_publish"
+  printf 'Verifying built-in tutorial assets in the staged release.\n'
   assert_tutorial_assets "$stage_publish"
-  printf 'Built-in tutorial assets verified in the staged publish artifact.\n'
+  printf 'Built-in tutorial assets verified in the staged release.\n'
 
-  # Migration preflight on the exact published executable: fresh databases first, then online-backup copies of the
-  # live production databases. This starts no web server, Telegram receiver, or worker, and it only reads the live
-  # database files, so a schema change that cannot apply to real production data aborts the deployment here.
-  printf 'Running migration preflight against fresh databases.\n'
-  "$stage_publish/Adminbot" --migration-check \
-    || fail "migration preflight failed against fresh databases."
-  printf 'Running migration preflight against production database copies.\n'
-  "$stage_publish/Adminbot" --migration-check \
-    --users-source "$live_data/users.db" \
-    --credentials-source "$live_data/credentials.db" \
-    || fail "migration preflight failed against production database copies."
+  chmod +x "$stage_publish/Adminbot" || fail "staged Adminbot executable could not be marked executable."
+  run_migration_preflight "$stage_publish" "$live_data"
   assert_data_unchanged
 
-  printf 'Synchronizing repository source into live tree.\n'
-  sync_source "$stage_source" "$live_root"
+  printf 'Activating the staged release with an atomic switch.\n'
+  activate_release "$stage_publish" "$live_publish"
   assert_data_unchanged
+  printf 'Release activated. Restarting %s.\n' "$service_name"
 
-  printf 'Synchronizing staged publish into live publish directory.\n'
-  sync_publish "$stage_publish" "$live_publish"
-  assert_data_unchanged
-
-  printf 'Restarting %s after successful synchronization.\n' "$service_name"
-  if ! systemctl restart "$service_name"; then
-    printf 'Service restart command failed. Showing bounded journal output.\n' >&2
-    journalctl -u "$service_name" --since "15 minutes ago" -n 300 --no-pager || true
-    fail "systemd restart failed after deployment."
-  fi
-
-  local active=false
-  for _ in {1..10}; do
-    if systemctl is-active --quiet "$service_name"; then
-      active=true
-      break
+  if ! restart_and_verify "$service_name"; then
+    printf 'Health verification failed after activation. Rolling back to the previous release.\n' >&2
+    rollback_release "$live_publish"
+    assert_data_unchanged
+    if restart_and_verify "$service_name"; then
+      fail "deployment of commit $deploy_sha failed and the previous release was restored."
     fi
-    sleep 2
-  done
-  if [[ "$active" != true ]]; then
-    printf 'Service did not become active. Showing bounded journal output.\n' >&2
-    journalctl -u "$service_name" --since "15 minutes ago" -n 300 --no-pager || true
-    fail "service health verification failed after restart."
+    fail "deployment of commit $deploy_sha failed and the previous release could not be restarted either; operator action required."
   fi
 
   assert_data_unchanged
-  printf 'Deployment health check passed. Recent bounded service logs follow.\n'
+  # One previous release is retained as the rollback slot; a failed attempt directory from an earlier run is discarded now
+  # that the service is verified healthy.
+  rm -rf -- "${live_publish}.failed"
+  rm -f -- "$artifact_real"
+  printf 'Deployment health check passed for commit %s. Recent bounded service logs follow.\n' "$deploy_sha"
   journalctl -u "$service_name" --since "5 minutes ago" -n 150 --no-pager || true
-  printf 'Production deployment completed for commit %s.\n' "$deploy_sha"
+  printf 'Production deployment completed for commit %s using a prebuilt GitHub artifact.\n' "$deploy_sha"
 }
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then

@@ -7,130 +7,149 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$script_dir/deploy-production.sh"
 
 test_root="$(mktemp -d)"
-outside_marker="$(mktemp)"
 cleanup_test() {
   rm -rf -- "$test_root"
-  rm -f -- "$outside_marker"
 }
 trap cleanup_test EXIT
 
-live_root="$test_root/live"
-live_publish="$live_root/bin/Release/net10.0/linux-x64/publish"
+deploy_script="$script_dir/deploy-production.sh"
+live_publish="$test_root/live/bin/Release/net10.0/linux-x64/publish"
 stage_publish="$test_root/stage/publish"
-stage_source="$test_root/stage/source"
-mkdir -p "$live_publish/Data" "$stage_publish/Data" "$stage_source"
+mkdir -p "$live_publish/Data" "$live_publish/Assets/tutorials" "$stage_publish/Assets/tutorials"
 
+# Production state: the two databases, the only configuration.json, and the daily logs all live inside the protected Data
+# directory. Every assertion below exists to prove a deployment cannot replace, empty, or recreate it.
 printf 'persistent-production-state\n' > "$live_publish/Data/preserve.txt"
-printf 'outside-test-sentinel\n' > "$outside_marker"
-printf 'old-app\n' > "$live_publish/app.dll"
+printf 'live-database\n' > "$live_publish/Data/users.db"
+printf 'live-credentials\n' > "$live_publish/Data/credentials.db"
+printf 'live-configuration\n' > "$live_publish/Data/configuration.json"
+printf 'old-app\n' > "$live_publish/Adminbot"
+printf 'old-app-dll\n' > "$live_publish/Adminbot.dll"
 printf 'obsolete-app\n' > "$live_publish/obsolete.dll"
-printf 'new-app\n' > "$stage_publish/app.dll"
+
+printf 'new-app\n' > "$stage_publish/Adminbot"
+printf 'new-app-dll\n' > "$stage_publish/Adminbot.dll"
 printf 'new-library\n' > "$stage_publish/new-library.dll"
-printf 'must-never-enter-live-data\n' > "$stage_publish/Data/injected.txt"
+mkdir -p "$stage_publish/Assets/telegram-ui"
+printf '{}\n' > "$stage_publish/Assets/telegram-ui/emoji-map.json"
 
-sync_publish "$stage_publish" "$live_publish"
+protected_data_identity "$live_publish/Data"
+live_data_inode_before="$(stat -Lc '%i' -- "$live_publish/Data")"
 
+activate_release "$stage_publish" "$live_publish"
+
+# The switch is a set of renames, so Data keeps its inode: it was never copied, recreated, or truncated.
+assert_data_unchanged
+[[ "$(stat -Lc '%i' -- "$live_publish/Data")" == "$live_data_inode_before" ]]
 [[ "$(cat "$live_publish/Data/preserve.txt")" == "persistent-production-state" ]]
-[[ ! -e "$live_publish/Data/injected.txt" ]]
-[[ "$(cat "$live_publish/app.dll")" == "new-app" ]]
+[[ "$(cat "$live_publish/Data/users.db")" == "live-database" ]]
+[[ "$(cat "$live_publish/Data/credentials.db")" == "live-credentials" ]]
+[[ "$(cat "$live_publish/Data/configuration.json")" == "live-configuration" ]]
+
+# The new release is complete and contains no leftover file from the previous one.
+[[ "$(cat "$live_publish/Adminbot")" == "new-app" ]]
 [[ -f "$live_publish/new-library.dll" ]]
 [[ ! -e "$live_publish/obsolete.dll" ]]
 
-# A release may never replace, delete, or overwrite the live SQLite databases. The exclusions below are the only
-# thing that stops publish/source synchronization from touching them, so they are asserted structurally: removing
-# one of them must fail this test instead of silently shipping a release that can wipe production data.
-grep -Fq -- "--exclude='*.db'" "$script_dir/deploy-production.sh" \
-  || { echo 'Missing *.db synchronization exclusion in deploy-production.sh.' >&2; exit 1; }
-grep -Fq -- "--exclude='*.db-*'" "$script_dir/deploy-production.sh" \
-  || { echo 'Missing *.db-* synchronization exclusion in deploy-production.sh.' >&2; exit 1; }
-grep -Fq -- "--exclude='Data/'" "$script_dir/deploy-production.sh" \
-  || { echo 'Missing Data/ synchronization exclusion in deploy-production.sh.' >&2; exit 1; }
-grep -Fq 'assert_data_unchanged()' "$script_dir/deploy-production.sh" \
-  || { echo 'Missing assert_data_unchanged guard in deploy-production.sh.' >&2; exit 1; }
+# The previous release is retained without Data, which is what makes a rollback possible while Data stays unique.
+[[ -d "${live_publish}.prev" ]]
+[[ -f "${live_publish}.prev/Adminbot" ]]
+[[ ! -e "${live_publish}.prev/Data" ]]
+printf 'Production atomic-switch and Data preservation test: PASS\n'
+printf '  preserved Data content and inode across the switch\n'
+printf '  installed the new release payload and removed stale files\n'
+printf '  retained one previous release as the rollback slot\n'
 
-# A live users.db must survive a synchronization that carries a staged database file with the same name.
-printf 'live-database\n' > "$live_publish/Data/users.db"
-printf 'staged-database\n' > "$stage_publish/Data/users.db"
-sync_publish "$stage_publish" "$live_publish"
+rollback_release "$live_publish"
+
+assert_data_unchanged
+[[ "$(stat -Lc '%i' -- "$live_publish/Data")" == "$live_data_inode_before" ]]
+[[ "$(cat "$live_publish/Adminbot")" == "old-app" ]]
 [[ "$(cat "$live_publish/Data/users.db")" == "live-database" ]]
-printf '  protected live users.db from staged replacement\n'
+[[ ! -e "$live_publish/new-library.dll" ]]
+printf 'Production rollback test: PASS\n'
+printf '  restored the previous release payload\n'
+printf '  carried the same Data inode back with it\n'
 
-printf 'tracked-source\n' > "$stage_source/README.deploy-test"
-printf 'stale-source\n' > "$live_root/stale-source.txt"
-sync_source "$stage_source" "$live_root"
-
-[[ -f "$live_root/README.deploy-test" ]]
-[[ ! -e "$live_root/stale-source.txt" ]]
-[[ "$(cat "$live_publish/Data/preserve.txt")" == "persistent-production-state" ]]
-[[ "$(cat "$outside_marker")" == "outside-test-sentinel" ]]
-
-printf 'Production Data preservation test: PASS\n'
-printf '  preserved Data/preserve.txt content\n'
-printf '  rejected staged Data injection\n'
-printf '  removed stale non-Data publish/source files\n'
-printf '  installed new publish/source files\n'
-printf '  left outside-of-test marker unchanged\n'
-
-if streamed_output="$(bash -s -- invalid-sha "$CANONICAL_REPO_URL" 1 1 "$EXPECTED_LIVE_ROOT" "$EXPECTED_SERVICE_NAME" \
-  < "$script_dir/deploy-production.sh" 2>&1)"; then
-  echo "Expected streamed deployment entrypoint to reject an invalid SHA." >&2
+# A replaced Data directory must be detected, because that is exactly the accident this whole flow exists to prevent.
+replaced_root="$test_root/replaced"
+mkdir -p "$replaced_root/Data"
+protected_data_identity "$replaced_root/Data"
+rm -rf -- "$replaced_root/Data"
+mkdir -p "$replaced_root/Data"
+if ( assert_data_unchanged ) 2>/dev/null; then
+  echo "Expected assert_data_unchanged to reject a recreated Data directory." >&2
   exit 1
 fi
-grep -Fq "deployment SHA must be exactly 40 hexadecimal characters" <<< "$streamed_output"
-[[ "$streamed_output" != *"BASH_SOURCE"* ]]
-printf '  streamed bash -s entrypoint safely rejected invalid SHA\n'
+printf '  detected a recreated Data directory\n'
 
-# Release-gate ordering assertions. The production synchronizer must not rely on `dotnet publish` alone: the pinned EF
-# tool, restore, build, the full test suite, and both EF pending-model checks have to run, and every one of them - plus
-# the published executable's migration preflight - has to run before any source or publish synchronization and before
-# systemd is touched. This is asserted structurally because exercising the real path needs a Linux host, rsync, and
-# systemd, none of which are available to this repository test.
-deploy_script="$script_dir/deploy-production.sh"
+# ----------------------------------------------------------------------------------------------------------------------
+# Artifact validation
+# ----------------------------------------------------------------------------------------------------------------------
 
-first_gate_line="$(grep -n -m1 -F -- 'dotnet tool restore' "$deploy_script" | cut -d: -f1)"
-test_line="$(grep -n -m1 -F -- 'dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build' "$deploy_script" | cut -d: -f1)"
-user_context_line="$(grep -n -m1 -F -- '--context UserDbContext' "$deploy_script" | cut -d: -f1)"
-credentials_context_line="$(grep -n -m1 -F -- '--context CredentialsDbContext' "$deploy_script" | cut -d: -f1)"
-publish_line="$(grep -n -m1 -F -- 'dotnet publish Adminbot.csproj' "$deploy_script" | cut -d: -f1)"
-last_preflight_line="$(grep -n -F -- '--migration-check' "$deploy_script" | tail -n 1 | cut -d: -f1)"
-# Search for the literal deploy-source expression; $stage_source must not expand in this structural assertion.
-# shellcheck disable=SC2016
-first_sync_line="$(grep -n -m1 -F -- 'sync_source "$stage_source"' "$deploy_script" | cut -d: -f1)"
-restart_line="$(grep -n -m1 -F -- 'systemctl restart' "$deploy_script" | cut -d: -f1)"
+good_archive="$test_root/good.tar.gz"
+good_tree="$test_root/good-tree"
+mkdir -p "$good_tree"
+printf 'app\n' > "$good_tree/Adminbot"
+printf 'dll\n' > "$good_tree/Adminbot.dll"
+tar -czf "$good_archive" -C "$good_tree" .
+assert_artifact_archive "$good_archive"
 
-for required_variable in first_gate_line test_line user_context_line credentials_context_line publish_line last_preflight_line first_sync_line restart_line; do
-  if [[ -z "${!required_variable}" ]]; then
-    printf 'Release-gate assertion could not locate %s in deploy-production.sh.\n' "$required_variable" >&2
+for forbidden in Data/users.db configuration.json credentials.db-log; do
+  bad_tree="$test_root/bad-$(echo "$forbidden" | tr '/.' '--')"
+  mkdir -p "$bad_tree"
+  printf 'app\n' > "$bad_tree/Adminbot"
+  printf 'dll\n' > "$bad_tree/Adminbot.dll"
+  mkdir -p "$bad_tree/$(dirname -- "$forbidden")"
+  printf 'state\n' > "$bad_tree/$forbidden"
+  bad_archive="$test_root/bad-$(echo "$forbidden" | tr '/.' '--').tar.gz"
+  tar -czf "$bad_archive" -C "$bad_tree" .
+  if ( assert_artifact_archive "$bad_archive" ) 2>/dev/null; then
+    printf 'Expected the artifact preflight to refuse an archive containing %s.\n' "$forbidden" >&2
     exit 1
   fi
 done
 
-if ((first_gate_line >= publish_line)); then
-  echo "Release gates must run before the publish step." >&2
-  exit 1
-fi
-if ((test_line >= first_sync_line || user_context_line >= first_sync_line || credentials_context_line >= first_sync_line)); then
-  echo "Tests and both EF pending-model checks must run before the source synchronization." >&2
-  exit 1
-fi
-if ((publish_line >= last_preflight_line || last_preflight_line >= first_sync_line)); then
-  echo "Migration preflight must run after publish and before the source synchronization." >&2
-  exit 1
-fi
-if ((first_sync_line >= restart_line)); then
-  echo "Synchronization must complete before systemd is restarted." >&2
+mkdir -p "$test_root/Data" && printf 'db\n' > "$test_root/Data/users.db"
+tar -czf "$test_root/with-data.tar.gz" -C "$test_root" Data
+if ( assert_artifact_archive "$test_root/with-data.tar.gz" ) 2>/dev/null; then
+  echo "Expected the artifact preflight to refuse an archive containing a Data directory." >&2
   exit 1
 fi
 
-printf 'Production release-gate ordering test: PASS\n'
-printf '  restore, build, tests, and both EF pending-model checks run before any synchronization\n'
-printf '  migration preflight runs on the published executable before any synchronization\n'
-printf '  systemd is only restarted after the synchronized release passes every gate\n'
+incomplete_tree="$test_root/incomplete-tree"
+mkdir -p "$incomplete_tree"
+printf 'dll\n' > "$incomplete_tree/Adminbot.dll"
+tar -czf "$test_root/incomplete.tar.gz" -C "$incomplete_tree" .
+if ( assert_artifact_archive "$test_root/incomplete.tar.gz" ) 2>/dev/null; then
+  echo "Expected the artifact preflight to refuse an archive without the Adminbot executable." >&2
+  exit 1
+fi
+printf 'Production artifact preflight test: PASS\n'
+printf '  accepts a runtime-only archive\n'
+printf '  refuses Data/, database files, and configuration.json\n'
+printf '  refuses an archive without the application executable\n'
+
+# A release missing any shipped runtime asset must be refused before it replaces a working one.
+complete_release="$test_root/complete-release"
+mkdir -p "$complete_release/Assets/telegram-ui"
+printf 'app\n' > "$complete_release/Adminbot"
+printf 'dll\n' > "$complete_release/Adminbot.dll"
+printf '{}\n' > "$complete_release/Assets/telegram-ui/emoji-map.json"
+assert_release_complete "$complete_release"
+missing_asset_release="$test_root/missing-asset-release"
+mkdir -p "$missing_asset_release"
+printf 'app\n' > "$missing_asset_release/Adminbot"
+printf 'dll\n' > "$missing_asset_release/Adminbot.dll"
+if ( assert_release_complete "$missing_asset_release" ) 2>/dev/null; then
+  echo "Expected the release completeness check to refuse a release without the premium-UI emoji asset." >&2
+  exit 1
+fi
 
 # Built-in tutorial asset preflight. The tenant customer flow always offers the three installation tutorials, so a
 # release whose images were never copied would ship buttons that always answer with an "unavailable" message. The
 # preflight is asserted functionally (it must reject a missing or empty tutorial directory and accept a complete set) and
-# structurally (it must run after publish and before any synchronization), so it cannot be silently removed later.
+# structurally (it must run after extraction and before any activation), so it cannot be silently removed later.
 asset_stage="$test_root/asset-stage"
 mkdir -p "$asset_stage"
 for required_dir in android_v2rayng windows_v2rayn ios_android_v2box; do
@@ -139,7 +158,6 @@ for required_dir in android_v2rayng windows_v2rayn ios_android_v2box; do
 done
 assert_tutorial_assets "$asset_stage"
 
-# A publish artifact that is missing one entire tutorial directory must be refused.
 missing_assets="$test_root/asset-stage-missing"
 mkdir -p "$missing_assets/Assets/tutorials/android_v2rayng" "$missing_assets/Assets/tutorials/windows_v2rayn"
 printf 'image\n' > "$missing_assets/Assets/tutorials/android_v2rayng/1.png"
@@ -149,7 +167,6 @@ if ( assert_tutorial_assets "$missing_assets" ) 2>/dev/null; then
   exit 1
 fi
 
-# Present but image-less tutorial directory must be refused.
 empty_assets="$test_root/asset-stage-empty"
 mkdir -p "$empty_assets/Assets/tutorials"
 for required_dir in android_v2rayng windows_v2rayn ios_android_v2box; do
@@ -160,25 +177,82 @@ if ( assert_tutorial_assets "$empty_assets" ) 2>/dev/null; then
   echo "Expected the tutorial asset preflight to reject a tutorial directory with no images." >&2
   exit 1
 fi
+printf 'Production tutorial-asset preflight test: PASS\n'
+printf '  accepts a release containing all three tutorial directories with images\n'
+printf '  rejects a release missing a required tutorial directory\n'
+printf '  rejects a tutorial directory that contains no supported image\n'
 
-# Search for the literal preflight expression; $stage_publish must not expand in this structural assertion.
+# ----------------------------------------------------------------------------------------------------------------------
+# Structural guarantees
+# ----------------------------------------------------------------------------------------------------------------------
+
+# The production host must never build. These assertions are structural because exercising the real path needs a Linux
+# host, systemd, and a real transfer, none of which are available to this repository test.
+for forbidden_command in 'dotnet restore' 'dotnet build' 'dotnet test' 'dotnet publish' 'dotnet ef' 'dotnet tool' 'git clone'; do
+  if grep -Fq -- "$forbidden_command" "$deploy_script"; then
+    printf 'Production deployment must not run %s.\n' "$forbidden_command" >&2
+    exit 1
+  fi
+done
+
+for required_command in 'sha256sum' 'assert_artifact_archive' 'assert_data_unchanged' 'assert_tutorial_assets' 'activate_release' 'rollback_release' 'systemctl restart'; do
+  if ! grep -Fq -- "$required_command" "$deploy_script"; then
+    printf 'Production deployment is missing its %s guard.\n' "$required_command" >&2
+    exit 1
+  fi
+done
+
+digest_line="$(grep -n -m1 -F -- 'Verifying release artifact digest' "$deploy_script" | cut -d: -f1)"
+archive_line="$(grep -n -m1 -F -- 'assert_artifact_archive "$artifact_real"' "$deploy_script" | cut -d: -f1)"
+extract_line="$(grep -n -m1 -F -- 'tar -xzf' "$deploy_script" | cut -d: -f1)"
+complete_line="$(grep -n -m1 -F -- 'assert_release_complete "$stage_publish"' "$deploy_script" | cut -d: -f1)"
+# Search for the literal expression; $stage_publish must not expand in this structural assertion.
 # shellcheck disable=SC2016
 asset_line="$(grep -n -m1 -F -- 'assert_tutorial_assets "$stage_publish"' "$deploy_script" | cut -d: -f1)"
-if [[ -z "$asset_line" ]]; then
-  echo "The tutorial asset preflight is missing from deploy-production.sh." >&2
+preflight_line="$(grep -n -m1 -F -- 'run_migration_preflight "$stage_publish"' "$deploy_script" | cut -d: -f1)"
+activate_line="$(grep -n -m1 -F -- 'activate_release "$stage_publish"' "$deploy_script" | cut -d: -f1)"
+restart_line="$(grep -n -F -- 'restart_and_verify "$service_name"' "$deploy_script" | head -n 1 | cut -d: -f1)"
+rollback_line="$(grep -n -m1 -F -- 'rollback_release "$live_publish"' "$deploy_script" | cut -d: -f1)"
+
+for required_variable in digest_line archive_line extract_line complete_line asset_line preflight_line activate_line restart_line rollback_line; do
+  if [[ -z "${!required_variable}" ]]; then
+    printf 'Deployment ordering assertion could not locate %s in deploy-production.sh.\n' "$required_variable" >&2
+    exit 1
+  fi
+done
+
+if ((digest_line >= extract_line || archive_line >= extract_line)); then
+  echo "Artifact digest and content checks must run before the archive is extracted." >&2
   exit 1
 fi
-if ((asset_line <= publish_line)); then
-  echo "The tutorial asset preflight must run after the publish step." >&2
+if ((complete_line >= preflight_line || asset_line >= preflight_line)); then
+  echo "Release completeness and tutorial asset checks must run before the migration preflight." >&2
   exit 1
 fi
-if ((asset_line >= first_sync_line || asset_line >= restart_line)); then
-  echo "The tutorial asset preflight must run before any synchronization or systemd restart." >&2
+if ((preflight_line >= activate_line)); then
+  echo "Migration preflight must run before the release is activated." >&2
+  exit 1
+fi
+if ((activate_line >= restart_line)); then
+  echo "The service must only be restarted after the release is activated." >&2
+  exit 1
+fi
+if ((rollback_line <= restart_line)); then
+  echo "Rollback must be reachable only after the restart and health check." >&2
   exit 1
 fi
 
-printf 'Production tutorial-asset preflight test: PASS\n'
-printf '  accepts a publish artifact containing all three tutorial directories with images\n'
-printf '  rejects a publish artifact missing a required tutorial directory\n'
-printf '  rejects a tutorial directory that contains no supported image\n'
-printf '  runs after publish and before any synchronization or restart\n'
+printf 'Production release-ordering test: PASS\n'
+printf '  artifact digest and content checks run before extraction\n'
+printf '  completeness and tutorial checks run before the migration preflight\n'
+printf '  migration preflight runs before the atomic switch\n'
+printf '  systemd is restarted only after the switch, with rollback after health checks\n'
+
+if streamed_output="$(bash -s -- invalid-sha "$test_root/good.tar.gz" "$(printf 'a%.0s' {1..64})" 1 1 "$EXPECTED_LIVE_ROOT" "$EXPECTED_SERVICE_NAME" \
+  < "$deploy_script" 2>&1)"; then
+  echo "Expected streamed deployment entrypoint to reject an invalid SHA." >&2
+  exit 1
+fi
+grep -Fq "deployment SHA must be exactly 40 hexadecimal characters" <<< "$streamed_output"
+[[ "$streamed_output" != *"BASH_SOURCE"* ]]
+printf '  streamed bash -s entrypoint safely rejected invalid SHA\n'

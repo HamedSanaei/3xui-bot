@@ -692,6 +692,16 @@ public sealed class BotRuntimeStatusStore
 /// Hosted service that starts one Telegram receiver per enabled bot.
 /// All receivers dispatch updates into the shared TelegramBotService with a bot-specific runtime context.
 /// </summary>
+/// <remarks>
+/// Per-bot isolation is the reason this type exists in this shape. Every enabled bot gets its own cancellation source,
+/// its own tracked <c>ReceiveAsync</c> generation, its own startup lifecycle gate, and its own transient-polling backoff
+/// entry, so a Telegram timeout, a revoked tenant token, or a restart loop on one storefront cannot cancel, stall, or
+/// back off any other bot. Isolation continues past admission: the shared scheduler serializes a bot/user lane and caps
+/// how many of its workers one bot may occupy, and the shared sender serializes delivery per bot and selects ready bots
+/// round-robin, so no single tenant can consume another tenant's interactive capacity. A callback acknowledgement is
+/// offered before any of that work starts, on its own bounded lane with its own transport budget, so the tap a customer
+/// sees is never charged to business work or to another bot's output backlog.
+/// </remarks>
 public class MultiBotHostedService : IHostedService
 {
     private readonly TelegramSenderService _sender;
@@ -997,7 +1007,18 @@ public class MultiBotHostedService : IHostedService
                     var received = System.Diagnostics.Stopwatch.StartNew();
                     _logger.LogInformation("Telegram update received. BotId={BotId} UpdateId={UpdateId} ReceivedAtUtc={ReceivedAtUtc}", bot.Id, update.Id, DateTime.UtcNow);
                     if (update.CallbackQuery != null)
-                        _sender?.TryAcknowledge(bot.Id, update.CallbackQuery.Id, update.CallbackQuery.Message?.Chat.Id);
+                    {
+                        // The acknowledgement is offered here, before any business work, database access, panel call, or
+                        // reply rendering, so the tap clears as soon as Telegram delivers the update. The measurement
+                        // therefore covers local cost only: a value that grows means the realtime lane was unavailable,
+                        // never that a handler was slow. A refusal is a spinner-only UX miss and never stops the update.
+                        var acknowledged = _sender?.TryAcknowledge(bot.Id, update.CallbackQuery.Id, update.CallbackQuery.Message?.Chat.Id);
+                        var callbackReceivedMs = received.Elapsed.TotalMilliseconds;
+                        TelegramLatencyMetrics.Record(TelegramLatencyMetrics.CallbackReceivedMs, callbackReceivedMs);
+                        if (acknowledged != true)
+                            _logger.LogDebug("Telegram callback was not acknowledged at receipt; the update still proceeds. BotId={BotId} UserId={UserId} callback_received_ms={CallbackReceivedMs}",
+                                bot.Id, update.CallbackQuery.From?.Id, callbackReceivedMs);
+                    }
                     // The tracked receiver owns this bounded super-admin control path, which must remain usable
                     // when durable customer capacity is full. It never replays a terminal handler receipt.
                     var admin = _scopeFactory.CreateScope();

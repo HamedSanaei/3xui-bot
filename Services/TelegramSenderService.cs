@@ -34,10 +34,35 @@ public sealed class TelegramSenderService : BackgroundService
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _rateGate = new();
     private long _nextSend;
+    /// <summary>
+    /// Transport pacing gate reserved exclusively for callback acknowledgements.
+    /// </summary>
+    /// <remarks>
+    /// It is deliberately not the ordinary <see cref="_rateGate"/>. Sharing one gate meant a bulk broadcast or a reminder
+    /// scan could occupy every slot in the shared budget and delay a customer's button response by exactly as long as the
+    /// bulk backlog needed, which is one of the reported production symptoms.
+    /// </remarks>
+    private readonly object _ackRateGate = new();
+    private long _nextAck;
+    /// <summary>Coalesced notices for refused acknowledgements, keyed by bot and refusal reason.</summary>
+    private readonly MemoryCache _ackRejectionNotices = new(new MemoryCacheOptions { SizeLimit = 10000 });
+    /// <summary>Coalesced notices for refused ordinary output lanes, keyed by lane.</summary>
+    private readonly MemoryCache _laneRefusalNotices = new(new MemoryCacheOptions { SizeLimit = 64 });
     private string _lastBot = "";
     private volatile bool _stopping;
     private volatile bool _underPressure;
     private readonly MemoryCache _pressureNotices = new(new MemoryCacheOptions { SizeLimit = 10000 });
+
+    /// <summary>Interactive target for one callback acknowledgement. Production value: 500 milliseconds.</summary>
+    /// <remarks>
+    /// The metric is recorded for every attempt. This value only decides whether the attempt is also reported at
+    /// Information: a healthy acknowledgement stays at Debug so the operator channel is not turned into a latency
+    /// dashboard, while a breach is visible exactly where an operator already looks.
+    /// </remarks>
+    private const double CallbackAckTargetMs = 500;
+
+    /// <summary>Delay before a pump pass retries after a full output lane refused a durable job.</summary>
+    private static readonly TimeSpan OutputLaneRetryDelay = TimeSpan.FromMilliseconds(100);
 
     /// <summary>Creates delivery infrastructure without opening a database or starting network calls.</summary>
     /// <param name="factory">Operation-local users.db factory.</param>
@@ -51,7 +76,9 @@ public sealed class TelegramSenderService : BackgroundService
     {
         _factory = factory; _clients = clients; _registry = registry; _options = options; _queue = queue; _logger = logger;
         _slots = new(options.WorkerCount, options.WorkerCount);
-        _callbacks = Channel.CreateBounded<(string, AnswerCallbackQueryRequest, long?, long)>(new BoundedChannelOptions(options.QueueSize)
+        // The acknowledgement lane has its own capacity, sized independently of the ordinary output handoff, so a bulk
+        // output burst can never consume the room a button response needs.
+        _callbacks = Channel.CreateBounded<(string, AnswerCallbackQueryRequest, long?, long)>(new BoundedChannelOptions(options.CallbackAcknowledgementCapacity)
         { FullMode = BoundedChannelFullMode.Wait, AllowSynchronousContinuations = false });
     }
 
@@ -145,10 +172,56 @@ public sealed class TelegramSenderService : BackgroundService
     /// <remarks>This is solely spinner dismissal, never a statement that business work was saved or succeeded.</remarks>
     public bool TryAcknowledge(string botId, string callbackId, long? chatId = null)
     {
-        if (_stopping || !_options.CallbackAckImmediately) return false;
+        var refused = ResolveAcknowledgementRefusal(botId, callbackId);
+        if (refused != null) return false;
         _answered.Set((botId, callbackId), (Answered: false, ChatId: chatId),
             new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10) });
-        return _callbacks.Writer.TryWrite((botId, new AnswerCallbackQueryRequest { CallbackQueryId = callbackId }, chatId, Stopwatch.GetTimestamp()));
+        if (_callbacks.Writer.TryWrite((botId, new AnswerCallbackQueryRequest { CallbackQueryId = callbackId }, chatId, Stopwatch.GetTimestamp())))
+            return true;
+        ReportAcknowledgementRefusal(botId, "ack_lane_full");
+        return false;
+    }
+
+    /// <summary>Resolves why a callback acknowledgement cannot be offered, without logging anything yet.</summary>
+    /// <param name="botId">Internal bot id owning the callback; used only for the coalesced notice key.</param>
+    /// <param name="callbackId">Opaque callback id; used only to detect malformed input and never logged.</param>
+    /// <returns>A closed-vocabulary refusal reason, or null when the acknowledgement may be offered.</returns>
+    /// <remarks>
+    /// A missing callback id and a disabled realtime lane are permanent conditions, so they are reported once per bot
+    /// rather than on every callback; only the transient <c>ack_lane_full</c> condition is decided by the bounded write
+    /// itself. The callback id is never placed in a reason string.
+    /// </remarks>
+    private string ResolveAcknowledgementRefusal(string botId, string callbackId)
+    {
+        if (string.IsNullOrWhiteSpace(callbackId))
+        {
+            // Malformed input rather than pressure: recorded quietly because it points at a caller bug, not an incident.
+            _logger.LogDebug("Telegram callback acknowledgement was skipped because the callback id was empty. BotId={BotId}", botId);
+            return "callback_id_missing";
+        }
+
+        if (!_options.CallbackAckImmediately) return "realtime_lane_disabled";
+        if (_stopping) return "delivery_stopping";
+
+        return null;
+    }
+
+    /// <summary>Emits one coalesced operator notice for a callback acknowledgement refused by a full lane.</summary>
+    /// <param name="botId">Internal bot id whose acknowledgement was refused; never a token.</param>
+    /// <param name="reason">Closed-vocabulary refusal reason with no payload data.</param>
+    /// <remarks>
+    /// Only genuine capacity pressure is reported, because a deliberately disabled lane or a shutdown does not need an
+    /// operator alert. The refusal is a UX-only miss, so one notice per bot and reason per minute is enough to make a
+    /// sustained problem visible without turning a burst of refused callbacks into a log storm.
+    /// </remarks>
+    private void ReportAcknowledgementRefusal(string botId, string reason)
+    {
+        if (_ackRejectionNotices.TryGetValue((botId, reason), out _)) return;
+        _ackRejectionNotices.Set((botId, reason), true,
+            new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(1) });
+        _logger.LogWarning(
+            "Telegram callback acknowledgement lane is full; the tap is left unacknowledged and the business update still runs. BotId={BotId} Reason={Reason} LaneCapacity={LaneCapacity}",
+            botId, reason, _options.CallbackAcknowledgementCapacity);
     }
 
     /// <summary>Offers a handler acknowledgement to the realtime lane without waiting for Telegram.</summary>
@@ -156,7 +229,12 @@ public sealed class TelegramSenderService : BackgroundService
     /// <param name="request">Private callback response; only this request type may bypass per-bot send ordering.</param>
     /// <returns>Whether the bounded realtime queue accepted the acknowledgement; false is a best-effort UX miss.</returns>
     public bool QueueAcknowledgement(string botId, AnswerCallbackQueryRequest request)
-        => !_stopping && _callbacks.Writer.TryWrite((botId, request, null, Stopwatch.GetTimestamp()));
+    {
+        if (request == null || ResolveAcknowledgementRefusal(botId, request.CallbackQueryId) != null) return false;
+        if (_callbacks.Writer.TryWrite((botId, request, null, Stopwatch.GetTimestamp()))) return true;
+        ReportAcknowledgementRefusal(botId, "ack_lane_full");
+        return false;
+    }
 
     /// <summary>Queues a coalesced pressure notice only after the receiver committed the business input.</summary>
     /// <param name="botId">Internal bot that durably accepted the update.</param>
@@ -242,8 +320,16 @@ public sealed class TelegramSenderService : BackgroundService
                     {
                         _activeBots.TryAdd(selected.BotId, 0);
                         _lastBot = selected.BotId;
-                        await _queue.EnqueueAsync(selected, token);
-                        handedOff = true;
+                        // A full lane refuses instead of waiting. The job is not lost: its durable row stays queued and the
+                        // next pass offers it again once the lane drains, so an output backlog can never stall this pump or
+                        // the update handler that produced the job.
+                        var admission = _queue.TryEnqueue(selected);
+                        handedOff = admission.Accepted;
+                        if (!handedOff)
+                        {
+                            ReportOutputLaneRefusal(admission);
+                            await Task.Delay(OutputLaneRetryDelay, token);
+                        }
                     }
                     if (now >= maintenance)
                     {
@@ -367,10 +453,15 @@ public sealed class TelegramSenderService : BackgroundService
         }
     }
 
-    /// <summary>Runs acknowledgements independently of ordinary per-bot send serialization.</summary>
+    /// <summary>Runs acknowledgements independently of ordinary per-bot send serialization and pacing.</summary>
     /// <param name="token">Host shutdown cancellation.</param>
     /// <returns>A tracked bounded callback worker lifetime.</returns>
-    /// <remarks>Only AnswerCallbackQuery can use this path. A one-second attempt cannot guarantee network delivery.</remarks>
+    /// <remarks>
+    /// Only AnswerCallbackQuery can use this path. A one-second attempt cannot guarantee network delivery. The lane is
+    /// paced by its own reserved transport budget and never by the ordinary send gate, so no amount of bulk or reminder
+    /// traffic can slow a button response. Every attempt records <c>callback_ack_ms</c>, and only an attempt that misses the
+    /// interactive target is also logged at Information.
+    /// </remarks>
     private async Task AcknowledgeAsync(CancellationToken token)
     {
         await foreach (var item in _callbacks.Reader.ReadAllAsync(token))
@@ -386,16 +477,84 @@ public sealed class TelegramSenderService : BackgroundService
                         await EnqueueAsync(item.BotId, new SendMessageRequest { ChatId = state.ChatId.Value, Text = item.Request.Text }, true, token);
                     continue;
                 }
-                await RateLimitAsync(token);
+                await RateLimitAcknowledgementAsync(token);
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
                 timeout.CancelAfter(TimeSpan.FromSeconds(1));
                 await _clients.GetRawClient(item.BotId).SendRequest(item.Request, timeout.Token);
                 _answered.Set((item.BotId, item.Request.CallbackQueryId), (Answered: true, ChatId: item.ChatId ?? state.ChatId),
                     new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10) });
+                RecordAcknowledgementLatency(item.BotId, item.Request.CallbackQueryId, item.Received, "completed");
             }
             catch (Exception ex)
-            { _logger.LogDebug("Telegram realtime acknowledgement failed. BotId={BotId} ErrorType={ErrorType}", item.BotId, ex.GetType().Name); }
+            {
+                RecordAcknowledgementLatency(item.BotId, item.Request?.CallbackQueryId, item.Received, "failed");
+                _logger.LogDebug("Telegram realtime acknowledgement failed. BotId={BotId} ErrorType={ErrorType}", item.BotId, ex.GetType().Name);
+            }
         }
+    }
+
+    /// <summary>Records one acknowledgement's age and reports it only when it missed the interactive target.</summary>
+    /// <param name="botId">Internal bot id that owned the callback; never a token.</param>
+    /// <param name="callbackId">Opaque callback id, used only to resolve the ambient customer for attribution.</param>
+    /// <param name="receivedTimestamp">Monotonic timestamp taken when the acknowledgement entered the realtime lane.</param>
+    /// <param name="outcome">Closed-vocabulary outcome label: <c>completed</c> or <c>failed</c>.</param>
+    /// <remarks>
+    /// The metric is recorded for every attempt so an operator can chart the real distribution, while the log line is
+    /// emitted only above 500ms. The callback id itself is never logged; only the actor id already published by
+    /// <see cref="TelegramInteractionActor"/> is used for attribution.
+    /// </remarks>
+    private void RecordAcknowledgementLatency(string botId, string callbackId, long receivedTimestamp, string outcome)
+    {
+        var elapsed = Stopwatch.GetElapsedTime(receivedTimestamp).TotalMilliseconds;
+        TelegramLatencyMetrics.Record(TelegramLatencyMetrics.CallbackAckMs, elapsed);
+        if (elapsed < CallbackAckTargetMs)
+        {
+            _logger.LogDebug("Telegram callback acknowledged. BotId={BotId} callback_ack_ms={CallbackAckMs} outcome={Outcome}", botId, elapsed, outcome);
+            return;
+        }
+
+        _logger.LogInformation(
+            "Telegram callback acknowledgement exceeded its interactive target. BotId={BotId} UserId={UserId} callback_ack_ms={CallbackAckMs} outcome={Outcome}",
+            botId, TelegramInteractionActor.Current, elapsed, outcome);
+    }
+
+    /// <summary>Reserves one acknowledgement transport slot from the lane's own budget, never the ordinary send gate.</summary>
+    /// <param name="token">Acknowledgement worker cancellation.</param>
+    /// <returns>Completion when the reserved slot becomes available.</returns>
+    /// <remarks>
+    /// The budget is <see cref="TelegramPerformanceOptions.CallbackAcknowledgementPerSecond"/>, which defaults to
+    /// Telegram's documented 25 requests per second. It is a separate counter from <see cref="RateLimitAsync"/>, so ordinary
+    /// sends and acknowledgements cannot consume each other's capacity.
+    /// </remarks>
+    private Task RateLimitAcknowledgementAsync(CancellationToken token)
+    {
+        double delay;
+        lock (_ackRateGate)
+        {
+            var now = Stopwatch.GetTimestamp();
+            var slot = Math.Max(now, _nextAck);
+            _nextAck = slot + Stopwatch.Frequency / Math.Max(1, _options.CallbackAcknowledgementPerSecond);
+            delay = (slot - now) * 1000.0 / Stopwatch.Frequency;
+        }
+        return delay <= 0 ? Task.CompletedTask : Task.Delay(TimeSpan.FromMilliseconds(delay), token);
+    }
+
+    /// <summary>Emits one coalesced operator notice when a bounded output lane refused a durable job.</summary>
+    /// <param name="admission">Refused admission carrying the lane and its closed-vocabulary reason.</param>
+    /// <remarks>
+    /// One notice per lane per thirty seconds. The job itself is only delayed, never discarded, so this is a capacity
+    /// observation rather than an incident-worthy event.
+    /// </remarks>
+    private void ReportOutputLaneRefusal(TelegramQueueAdmission admission)
+    {
+        var key = admission.Lane.ToString();
+        if (_laneRefusalNotices.TryGetValue(key, out _)) return;
+        _laneRefusalNotices.Set(key, true,
+            new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(30) });
+        _logger.LogWarning(
+            "Telegram output lane is full; the durable job stays queued for a later attempt. Lane={Lane} Reason={RejectionReason} LaneCapacity={LaneCapacity} PendingLaneJobs={PendingLaneJobs} Workers={Workers}",
+            admission.Lane, admission.RejectionReason, _queue.CapacityOf(admission.Lane),
+            _queue.PendingCount(admission.Lane), _options.WorkerCount);
     }
 
     /// <summary>Reserves one global 25-request/second transport slot without holding a lock during delay.</summary>

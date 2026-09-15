@@ -100,20 +100,36 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   HTTP listener, Telegram receiver, hosted worker, or remote logger. The same non-serving shape is used by
   `--recover-missed-tenant-card-receipts` (see the tenant receipt recovery notes below).
 - Production deployment uses immutable `/opt/vpnetiran/releases/<commit>/` directories, shared persistent Data,
-  atomic `current`/`previous` symlinks, and rollback-aware systemd activation through `scripts/deploy-release.sh`.
-  The GitHub workflow uses the OTHER path: it streams `scripts/deploy-production.sh` to the host, which clones the exact
-  pushed SHA into staging and rsyncs it into the live tree before restarting. That path now runs the full gate against
-  the staged clone BEFORE any synchronization or systemd action: `dotnet tool restore`, `dotnet restore Adminbot.sln`,
-  `dotnet build Adminbot.sln -c Release --no-restore`, `dotnet test Adminbot.Tests ... --no-build`, both
-  `dotnet ef migrations has-pending-model-changes` contexts, then publish with `SourceRevisionId`, then the published
-  executable's `--migration-check` against fresh databases AND online-backup copies of the live
-  `Data/users.db` + `Data/credentials.db`. `dotnet publish` alone was previously the only check on that path and is
-  explicitly not sufficient. `scripts/deploy-production.tests.sh` asserts this ordering structurally.
-  See `docs/deployment.md`. A dirty or SHA-mismatched checkout is rejected before build, and systemd is untouched until
-  every build/test/EF/artifact check succeeds. Release assemblies log their embedded commit and build configuration.
+  atomic `current`/`previous` symlinks, and rollback-aware systemd activation through `scripts/deploy-release.sh`
+  (the manual/legacy immutable-release path).
+- GitHub Actions path (current automated pipeline). `.github/workflows/ci.yml` is the single build pipeline: it runs on
+  push/PR and is also callable as a reusable workflow, so the deploy job consumes exactly the artifact CI verified. It
+  does `dotnet tool restore`, `dotnet restore Adminbot.sln`, a Release build with `SourceRevisionId=<sha>`, the full test
+  suite, both `dotnet ef migrations has-pending-model-changes` checks, the deployment-script syntax/preservation tests,
+  and `dotnet publish` into a temporary directory; it then **refuses to package** a publish output containing `Data/`,
+  `*.db`, `*.db-*`, or `configuration.json`, and uploads `vpnetiranbot-release` (tarball plus `.sha256`, digest exposed
+  as the job output `digest`). `.github/workflows/deploy-production.yml` calls that workflow as job `ci`, then in job
+  `deploy` downloads the artifact, verifies the digest, transfers it to `/root/.deploy/incoming/<sha>/`, and streams
+  `scripts/deploy-production.sh` to the host with the SHA, artifact path, digest, run id/attempt, live root, and service.
+- Production never builds: `scripts/deploy-production.sh` contains no `dotnet restore/build/test/publish/ef/tool` and no
+  `git clone`, and `scripts/deploy-production.tests.sh` asserts that structurally alongside the ordering below. The host
+  runs only: tool/runtime and service-shape checks, artifact integrity (`sha256sum`) and content checks, extraction,
+  release completeness (`Adminbot`, `Adminbot.dll`, `Assets/telegram-ui/emoji-map.json`), the tutorial-asset preflight,
+  the migration preflight on the staged executable (fresh databases, then online-backup copies of the live
+  `Data/users.db` + `Data/credentials.db`), the atomic switch, `systemctl restart`, the health check, and rollback.
+- Atomic switch and rollback (`activate_release` / `rollback_release`). Production state lives in `.../publish/Data`
+  (both SQLite databases, the deployment's only `configuration.json`, and `Data/Logs`). The switch is a sequence of
+  renames inside one filesystem: live release -> `publish.prev`, staged release -> `publish`, then
+  `publish.prev/Data` -> `publish/Data`. Because Data is only renamed it keeps its inode, so no database, configuration
+  file, or log file is ever copied, replaced, or truncated; `assert_data_unchanged` checks the realpath and device:inode
+  identity before and after every filesystem step, and `activate_release` refuses cross-filesystem staging so the renames
+  cannot silently degrade into copies. One previous release is retained as the rollback slot; a failed health check
+  restores it (Data renamed back) and restarts the service. See `docs/deployment.md`.
 - Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
   `Data/**` is excluded because databases, production configuration, certificates, and the runtime plan catalog are
-  shared state rather than release artifacts.
+  shared state rather than release artifacts. The gitignored developer scratch directory `artifacts/**` is excluded from
+  both build output and publish as well: it holds stale `Data/configuration.json` copies from earlier verification runs
+  plus a redacted secrets dump, and it must never enter a release artifact.
 - The solution contains the production `Adminbot` project plus `Adminbot.Tests` (xunit, added explicitly for the
   Telegram concurrency/reliability task). Tests never ship: `Adminbot.Tests` is `IsPublishable=false`, the app does not
   reference it, and the Release publish output contains no test assemblies.

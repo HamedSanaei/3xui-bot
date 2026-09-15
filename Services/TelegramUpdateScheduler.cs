@@ -319,6 +319,9 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             if (item == null) return;
             var wait = (DateTime.UtcNow - item.AcceptedAtUtc).TotalMilliseconds;
             QueueWait.Record(wait);
+            // The same observation is published under the canonical queue_wait_ms instrument so an operator can chart
+            // "how long did the customer wait" without knowing the older internal instrument name.
+            TelegramLatencyMetrics.Record(TelegramLatencyMetrics.QueueWaitMs, wait);
             var active = Interlocked.Increment(ref _activeCount);
             counted = true;
             _logger.LogDebug("Telegram update started. BotId={BotId} TelegramUserId={TelegramUserId} UpdateId={UpdateId} UpdateType={UpdateType} QueueWaitMs={QueueWaitMs} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}",
@@ -366,12 +369,13 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                 try { await _executor.ExecuteAsync(item, token); }
                 finally
                 {
-                    _logger.LogInformation("Telegram update stages. BotId={BotId} UserId={UserId} UpdateId={UpdateId} DBMs={DBMs} XuiMs={XuiMs} TelegramEnqueueMs={TelegramEnqueueMs} BusinessMs={BusinessMs} TotalHandlerMs={TotalHandlerMs}",
+                    _logger.LogInformation("Telegram update stages. BotId={BotId} UserId={UserId} UpdateId={UpdateId} DBMs={DBMs} XuiMs={XuiMs} TelegramEnqueueMs={TelegramEnqueueMs} BusinessMs={BusinessMs} TotalHandlerMs={TotalHandlerMs} handler_total_ms={HandlerTotalMs} queue_wait_ms={QueueWaitMs}",
                         item.Key.BotId, item.Key.TelegramUserId, item.Update.Id,
                         latencyScope.TotalMilliseconds(TelegramUpdateStage.DatabaseWait),
                         latencyScope.TotalMilliseconds(TelegramUpdateStage.XuiRead),
                         latencyScope.TotalMilliseconds(TelegramUpdateStage.TelegramEnqueue),
-                        latencyScope.TotalMilliseconds(TelegramUpdateStage.BusinessLogic), latencyScope.Elapsed.TotalMilliseconds);
+                        latencyScope.TotalMilliseconds(TelegramUpdateStage.BusinessLogic), latencyScope.Elapsed.TotalMilliseconds,
+                        latencyScope.Elapsed.TotalMilliseconds, wait);
                 }
             }
             token.ThrowIfCancellationRequested();
@@ -406,6 +410,9 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             if (counted) Interlocked.Decrement(ref _activeCount);
             var duration = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             Duration.Record(duration);
+            // Canonical handler duration instrument: "what did the handler cost in total", independent of the older
+            // histogram name and of which component is asking.
+            TelegramLatencyMetrics.Record(TelegramLatencyMetrics.HandlerTotalMs, duration);
             RecordHandlerDurationDiagnostic(
                 duration,
                 failure,
