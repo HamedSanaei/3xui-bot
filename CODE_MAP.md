@@ -12,6 +12,9 @@
   `QueueAndSendAsync` and retries share UUID/email admission; unchanged updates create no event or HTTP mutation.
   `Sync Gozargah Site` reports aggregate changed/unchanged counts. Retry cycles compact <=100 terminal rows older
   than `GozargahSiteSyncRetentionDays` (30 default), retaining latest success/deletion state; unresolved rows never purge.
+  The daily `DatabaseCleanupService` pass now drives the same compaction through `ITerminalOutboxCompactor` and also
+  nulls `RequestJson`/`ResponseJson` on old `succeeded`/`skipped` rows (never on `pending`/`failed`, whose request JSON
+  is the retry payload).
   No schema/index change; see `docs/gozargah-sync-retention.md` for audit and optional manual VACUUM guidance.
 
 - Owner access/debt: `TenantAccessService` gates every tenant message/callback before business actions, without stopping
@@ -1279,3 +1282,51 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   to the exact storefront, and is deliberately not wired into every customer send yet; ambiguous failures never disable
   anything. Owned-bot rejections are runtime-only so a restart retries after the owner fixes Premium or the catalog, and
   no failure ever edits `configuration.json`.
+
+## SQLite Growth and Daily Retention (DatabaseCleanup)
+
+- Why it exists: every Telegram update creates an inbox row, every purchase/renewal creates an operation row, and every
+  payment callback stores provider JSON three times over (request/response/IPN). SQLite never returns freed pages to the
+  operating system by itself, so the file keeps the high-water mark of whatever the database once held. The measured
+  dev-database profile was dominated by duplicated blobs: `GozargahSiteSyncEvents.RequestJson` (489 KB over 711 rows),
+  `HooshPayPaymentInfos.RawResponseJson` (257 KB over 298 rows), `TenantBotOrders.CreatedAccountJson`,
+  `XuiV3CreationOperations.ClientJson`, and `XuiV3RenewalOperations.MutationPayloadJson`.
+- Components: `Domain/DatabaseCleanupOptions.cs` (config `DatabaseCleanup` section: `Enabled` default true,
+  `RetentionDays` 30, `PayloadRetentionDays` 2, `InboxRetentionDays` 7, `BatchSize` 2000, `MaxBatchesPerTable` 20,
+  `MaintenanceEnabled`, `InitialDelay` 10 min, `Interval` 1 day; invalid values fail startup),
+  `Services/DatabaseCleanupService.cs` (hosted, daily, one DI scope per pass for the scoped outbox compactor),
+  `Services/DatabaseCleanupRunner.cs` (`RunOnceAsync(nowUtc, ITerminalOutboxCompactor, token)` -> `DatabaseCleanupReport`;
+  owns every predicate), `Services/SqliteDatabaseMaintenance.cs` (file/WAL/shm size probe plus
+  `PRAGMA wal_checkpoint(TRUNCATE)` + `VACUUM` + `ANALYZE`, returning `false` on busy instead of throwing).
+- Two invariants for any future change: only terminal rows are candidates (queued/running `TelegramUpdateInbox`, and
+  `Reserved`/`PostStarted`/`Ambiguous` creation, `pending`/`processing`/`ambiguous` renewal, `awaiting_confirmation`/
+  `processing`/`recovery_pending`/`manual_review` link change, and uncredited payment rows are excluded at any age), and
+  every delete/update is bounded by `BatchSize` x `MaxBatchesPerTable` per table per pass so `users.db` never holds a
+  long write lock.
+- Per-table policy: `TelegramUpdateInbox` delete `completed%` older than `InboxRetentionDays` (via the new
+  `TelegramUpdateInboxStore.PruneAsync(retentionDays, nowUtc, batchSize, token)` overload; the one-argument overload still
+  uses the 7-day default). `XuiV3CreationOperations` clear `ClientJson`/`InboundIdsJson`/`BusinessParametersJson` then
+  delete `Applied`/`DefinitiveRejected` rows older than `RetentionDays`; the private client JSON is cleared first so the
+  long-lived row holds no credentials. `XuiV3RenewalOperations` are never deleted (exactly-once + wallet-debit audit) and
+  only `applied` + `settled` rows lose `MutationPayloadJson`/`PreMutationSnapshotJson` after `PayloadRetentionDays`; every
+  recovery path reads those two columns only before settlement, so the compaction cannot disable reconciliation.
+  `XuiV3LinkChangeOperations` terminal statuses are compacted then deleted while the four active/review statuses stay
+  forever (their filtered unique `(PanelKey, ClientId)` index is the account lock). `GozargahSiteSyncEvents` reuse
+  `GozargahSiteSyncService.CompactTerminalEventsAsync` (now exposed as `ITerminalOutboxCompactor`) and trim provider JSON
+  on `succeeded`/`skipped` rows only. Payment rows are never deleted; `HooshPayPaymentInfos`,
+  `SwapinoPaymentInfos`, `UniquePayPaymentInfos`, and `TetraminatorPaymentInfos` lose their raw request/response/IPN JSON
+  only when the money reached a balance or the provider status is final and unpayable, so a `paid`-but-uncredited row
+  keeps the evidence reconciliation needs. `ZibalPaymentInfos` and `AtlasPayPaymentInfos` store no raw payload columns
+  and are intentionally not touched. `XuiV3VolumeReminderStates`, `BotUserStates`, `Users`, wallet/ledger,
+  referral, order, notification, and identity tables are permanent state and are never age-deleted here; the reminder
+  table already has its own conservative presence-based prune, and age-deleting it would re-arm duplicate reminders.
+- Logging: one `Database cleanup started` line, one `Database cleanup applied retention` line per table that changed
+  anything, one `Database cleanup table step failed and was skipped` line per failed table (safe label only, never SQL or
+  payload), and one `Database cleanup finished` line carrying `deletedRows`, `compactedRows`, `usersBytesBefore`,
+  `usersBytesAfter`, `usersBytesFreed`, `credentialsBytesBefore`, `credentialsBytesAfter`, `maintenanceRan`, `elapsedMs`.
+  VACUUM/ANALYZE runs only when a pass actually changed rows. This retention layer is independent of
+  `TelegramLogSuppression` and of the Telegram operator channel; it neither suppresses nor emits Telegram messages.
+- Tests: `Adminbot.Tests/DatabaseCleanupTests.cs` (11 cases) covers terminal-only creation deletion, renewal compaction
+  without deletion, active link-change preservation, per-pass batching bounds, inbox terminal-only pruning, financially
+  terminal payment compaction, website-outbox payload trimming, idempotence plus maintenance-only-after-change, the
+  disabled switch, invalid retention rejection, and unreachable-database deferral. No migration is required.

@@ -7,6 +7,16 @@ using Telegram.Bot.Types;
 /// <remarks>All transactions are local and short. No receiver or handler executes while a write transaction is held.</remarks>
 public sealed partial class TelegramUpdateInboxStore
 {
+    /// <summary>Deduplication window applied by the periodic scheduler maintenance call, in days.</summary>
+    /// <remarks>Seven days matches the documented Telegram Bot API redelivery window and the receipt contract.</remarks>
+    public const int DefaultReceiptRetentionDays = 7;
+
+    /// <summary>Rows removed per delete statement when the caller does not supply a batch size.</summary>
+    private const int MaximumPruneBatchSize = 1000;
+
+    /// <summary>Maximum batches one prune call performs, bounding a single call to ten thousand rows.</summary>
+    private const int MaximumPruneBatches = 10;
+
     private readonly UserDbContextFactory _factory;
     /// <summary>Post-commit readiness notification; subscribers must never throw or treat signals as durable work.</summary>
     public event Action ReadyChanged;
@@ -191,13 +201,81 @@ public sealed partial class TelegramUpdateInboxStore
     /// <summary>Expires all terminal Telegram receipts after the seven-day deduplication window.</summary>
     /// <param name="token">Cancellation of the short maintenance write.</param>
     /// <returns>The number of completed deduplication records older than seven days removed.</returns>
-    /// <remarks>Payloads have already been erased at completion; this runs periodically during long uptimes.</remarks>
-    public Task<int> PruneAsync(CancellationToken token) => SqliteOperation.RunAsync(async ct =>
+    /// <remarks>
+    /// Payloads have already been erased at completion; this overload is the periodic maintenance call the Telegram
+    /// scheduler makes during long uptimes and delegates to the configurable retention overload with the documented
+    /// Bot API redelivery window.
+    /// </remarks>
+    /// <example><code>var removed = await store.PruneAsync(token);</code></example>
+    public Task<int> PruneAsync(CancellationToken token) => PruneAsync(DefaultReceiptRetentionDays, DateTime.UtcNow, MaximumPruneBatchSize, token);
+
+    /// <summary>Expires terminal Telegram receipts after a caller-supplied deduplication window.</summary>
+    /// <param name="retentionDays">
+    /// Positive number of days a completed receipt is kept for Telegram redelivery deduplication. The cleanup service
+    /// supplies the configured inbox window; the scheduled maintenance call supplies the seven-day default.
+    /// </param>
+    /// <param name="nowUtc">UTC reference instant the window is measured back from; a non-UTC value is converted.</param>
+    /// <param name="token">Cancellation of the short maintenance write.</param>
+    /// <returns>The number of completed deduplication records older than the window that were removed.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="retentionDays" /> is not positive.</exception>
+    /// <remarks>Used by tests and by the cleanup runner; deletion stays bounded to one batch per call.</remarks>
+    public Task<int> PruneAsync(int retentionDays, DateTime nowUtc, CancellationToken token) =>
+        PruneAsync(retentionDays, nowUtc, MaximumPruneBatchSize, token);
+
+    /// <summary>Expires terminal Telegram receipts after a caller-supplied window using a bounded batch size.</summary>
+    /// <param name="retentionDays">
+    /// Positive number of days a completed receipt is kept for Telegram redelivery deduplication.
+    /// </param>
+    /// <param name="nowUtc">UTC reference instant the window is measured back from; a non-UTC value is converted.</param>
+    /// <param name="batchSize">
+    /// Positive maximum number of rows removed per statement. Small batches keep the write lock short so a large
+    /// backlog cannot stall a Telegram handler waiting to deliver a user-visible answer.
+    /// </param>
+    /// <param name="token">Cancellation of the short maintenance write.</param>
+    /// <returns>The number of completed deduplication records older than the window that were removed.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when a day or batch value is not positive.</exception>
+    /// <remarks>
+    /// Only receipts whose status starts with <c>completed</c> are candidates, which excludes queued work, a running
+    /// handler, and an uncertain row awaiting operator review. Payloads were already erased when the receipt became
+    /// terminal, so deletion removes metadata only. Deletion repeats in batches until a batch is not full, giving one
+    /// call the same total effect as one unbounded statement while holding the lock for only a fraction of the time.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var removed = await store.PruneAsync(options.InboxRetentionDays, DateTime.UtcNow, options.BatchSize, token);
+    /// </code>
+    /// </example>
+    public Task<int> PruneAsync(int retentionDays, DateTime nowUtc, int batchSize, CancellationToken token)
     {
-        await using var db = _factory.CreateDbContext();
-        var cutoff = DateTime.UtcNow.AddDays(-7);
-        return await db.TelegramUpdateInbox.Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff).ExecuteDeleteAsync(ct);
-    }, token);
+        if (retentionDays <= 0)
+            throw new ArgumentOutOfRangeException(nameof(retentionDays), "A positive retention window in days is required.");
+        if (batchSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batchSize), "A positive batch size is required.");
+
+        return SqliteOperation.RunAsync(async ct =>
+        {
+            var now = nowUtc.Kind == DateTimeKind.Utc ? nowUtc : nowUtc.ToUniversalTime();
+            var cutoff = now.AddDays(-retentionDays);
+            var removed = 0;
+            for (var batch = 0; batch < MaximumPruneBatches; batch++)
+            {
+                await using var db = _factory.CreateDbContext();
+                var candidates = db.TelegramUpdateInbox
+                    .Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff)
+                    .OrderBy(x => x.Sequence)
+                    .Select(x => x.Sequence)
+                    .Take(batchSize);
+                var deleted = await db.TelegramUpdateInbox
+                    .Where(x => candidates.Contains(x.Sequence))
+                    .ExecuteDeleteAsync(ct);
+                removed += deleted;
+                if (deleted < batchSize)
+                    break;
+            }
+
+            return removed;
+        }, token);
+    }
 
     /// <summary>Detects linked XUI attempts whose outcome is still ambiguous despite a handled user-facing failure.</summary>
     /// <param name="sequence">Internal inbox sequence of the handler that just returned.</param>

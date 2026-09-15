@@ -245,6 +245,15 @@ public class Program
         services.AddHostedService(sp => sp.GetRequiredService<UniquePayReconciliationHostedService>());
         services.AddSingleton<AtlasPayReconciliationHostedService>();
         services.AddHostedService(sp => sp.GetRequiredService<AtlasPayReconciliationHostedService>());
+        // Daily retention and SQLite maintenance. Telegram receipts, terminal panel operations, and terminal payment
+        // rows are kept for the audit window and their bulky JSON payload copies are compacted after a shorter window,
+        // then VACUUM/ANALYZE returns the freed pages to the operating system. The outbox compactor is resolved from a
+        // per-pass scope because the website sync service is scoped; the runner itself is a singleton because it only
+        // holds factories. Invalid retention values fail startup instead of silently keeping (or deleting) too much.
+        DatabaseCleanupOptions.FromConfiguration(configuration);
+        services.AddSingleton<DatabaseCleanupRunner>();
+        services.AddScoped<ITerminalOutboxCompactor>(sp => sp.GetRequiredService<GozargahSiteSyncService>());
+        services.AddHostedService<DatabaseCleanupService>();
 
         services.AddScoped<TelegramBotService>();
         TelegramUpdateScheduler.ValidateConfiguration(appConfig);

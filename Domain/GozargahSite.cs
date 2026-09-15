@@ -854,7 +854,7 @@ namespace Adminbot.Domain
     /// <summary>
     /// Builds and sends Gozargah website sync events for XUI v3 account lifecycle changes.
     /// </summary>
-    public class GozargahSiteSyncService
+    public class GozargahSiteSyncService : ITerminalOutboxCompactor
     {
         private const int NationalPlanId = 1;
         private const int NormalPlanId = 2;
@@ -1616,7 +1616,11 @@ namespace Adminbot.Domain
         /// <summary>Compacts one bounded batch of expired terminal outbox events, retaining each account's latest successful state.</summary>
         /// <param name="cancellationToken">Cancellation of the short SQLite cleanup statement.</param>
         /// <returns>Number removed, at most 100. Pending, failed and other unresolved states are never candidates.</returns>
-        /// <remarks>UUID is preferred, email is the fallback. Successful deletes remain tombstones. No financial tables or VACUUM are touched.</remarks>
+        /// <remarks>
+        /// UUID is preferred, email is the fallback. Successful deletes remain tombstones. No financial tables or VACUUM
+        /// are touched. This implements <see cref="ITerminalOutboxCompactor"/> so the daily database cleanup pass can
+        /// drive website-outbox retention through one definition of the rule instead of duplicating it.
+        /// </remarks>
         public async Task<int> CompactTerminalEventsAsync(CancellationToken cancellationToken)
         {
             if (_appConfig.GozargahSiteSyncRetentionDays <= 0)

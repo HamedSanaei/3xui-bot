@@ -1,6 +1,17 @@
 {
   "adminsUserIds": [],
   "tenantMaxStoresPerOwner": 5,
+  "DatabaseCleanup": {
+    "Enabled": true,
+    "RetentionDays": 30,
+    "PayloadRetentionDays": 2,
+    "InboxRetentionDays": 7,
+    "BatchSize": 2000,
+    "MaxBatchesPerTable": 20,
+    "MaintenanceEnabled": true,
+    "InitialDelay": "00:10:00",
+    "Interval": "1.00:00:00"
+  },
   "gozargahSiteSyncRetentionDays": 30,
   "tenantOrderNotificationRetentionDays": 30,
   "tenantMinimumSiteWalletToman": 200000,
