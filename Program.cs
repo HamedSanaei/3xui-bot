@@ -168,7 +168,7 @@ public class Program
         {
             var clientProvider = sp.GetRequiredService<BotClientProvider>();
             return new TelegramLogDispatcher(
-                botId => new TelegramBotLogSender(clientProvider.GetClient(botId)),
+                botId => new TelegramBotLogSender(clientProvider.GetDeliveryClient(botId, TelegramWorkPriority.Low)),
                 TelegramLogDispatcherOptions.CreateDefault(
                     telegramOutboxDatabasePath,
                     appConfig.UserDatabasePath,
@@ -191,9 +191,15 @@ public class Program
         // and the single overall mandatory-join membership budget (5s). Registered as a shared immutable
         // instance so bounded-timeout behaviour cannot be raised by deployment configuration or raced by tests.
         services.AddSingleton(TelegramInteractionTimeouts.Production);
-        // One immutable interactive Telegram delivery budget for every scheduled update execution. The bounded client
-        // view is created per update, so receivers, long polling, and durable workers keep the unbounded transport.
-        services.AddSingleton(TelegramForegroundDeliveryPolicy.Production);
+        // Output jobs share bounded transport attempts. Polling and streamed files retain separate finite deadlines.
+        var telegramPerformance = appConfig.Performance?.Telegram ?? new TelegramPerformanceOptions();
+        telegramPerformance.Validate();
+        services.AddSingleton(telegramPerformance);
+        services.AddSingleton(new TelegramForegroundDeliveryPolicy { OverallBudget = TimeSpan.FromSeconds(telegramPerformance.SendTimeoutSeconds) });
+        services.AddSingleton<TelegramWorkQueue>();
+        services.AddSingleton<TelegramSenderService>();
+        // Registered before business workers/receivers: they stop first, leaving committed output recoverable.
+        services.AddHostedService(sp => sp.GetRequiredService<TelegramSenderService>());
         // One shared, positive-only membership cache for the mandatory-join gate. Owned bots and tenant storefront
         // bots resolve the same singleton, so a customer who already passed the join check is not probed again on every
         // message and callback. Only successful evaluations are stored, and the entry is keyed by the exact bot,

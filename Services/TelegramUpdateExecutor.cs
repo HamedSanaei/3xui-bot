@@ -10,6 +10,7 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
     private readonly BotClientProvider _clients;
     private readonly BotContextAccessor _context;
     private readonly TelegramForegroundDeliveryPolicy _foregroundDelivery;
+    private readonly TelegramSenderService _sender;
     /// <summary>Creates an executor without capturing a mutable handler or database context.</summary>
     /// <param name="scopes">Application scope factory for one logical Telegram execution.</param>
     /// <param name="registry">Current owned, tenant, and assistant bot definitions.</param>
@@ -17,22 +18,28 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
     /// <param name="context">Ambient bot scope accessor, restored after each execution.</param>
     /// <param name="foregroundDelivery">
     /// Immutable interactive Telegram delivery budget applied to this execution's UX calls. A missing value keeps the
-    /// production eight-second budget, so production wiring stays unchanged and tests can inject millisecond windows.
+    /// default five-second budget; host wiring supplies validated configuration and isolated callers may inject shorter windows.
     /// </param>
     /// <remarks>The executor is a singleton holding factories and runtime registries; each invocation owns its context scope and restores ambient bot identity on exit.</remarks>
+    /// <param name="sender">Optional durable Telegram output service; production always supplies it.</param>
     public TelegramUpdateExecutor(
         IServiceScopeFactory scopes,
         BotRegistry registry,
         BotClientProvider clients,
         BotContextAccessor context,
-        TelegramForegroundDeliveryPolicy foregroundDelivery = null)
+        TelegramForegroundDeliveryPolicy foregroundDelivery = null,
+        TelegramSenderService sender = null)
     {
         _scopes = scopes;
         _registry = registry;
         _clients = clients;
         _context = context;
         _foregroundDelivery = foregroundDelivery ?? TelegramForegroundDeliveryPolicy.Production;
+        _sender = sender;
     }
+
+    /// <inheritdoc />
+    public string[] AvailableBotIds => _registry.Bots.Where(x => x.Enabled && !string.IsNullOrWhiteSpace(x.Token)).Select(x => x.Id).ToArray();
 
     /// <inheritdoc />
     public bool IsAvailable(string botId)
@@ -48,10 +55,9 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
         var bot = _registry.GetById(item.Key.BotId);
         if (bot == null || !string.Equals(bot.Id, item.Key.BotId, StringComparison.OrdinalIgnoreCase) || !bot.Enabled)
             throw new InvalidOperationException("Bot became unavailable after the update claim.");
-        // Only this update execution receives the bounded client view. The receiver and every background worker keep
-        // the raw client, so long polling, durable outbox delivery, and file relay are unaffected by the interactive
-        // budget. The decorator wraps the shared instance and never disposes it.
-        var client = new ForegroundBoundedTelegramBotClient(_clients.GetClient(bot.Id), _foregroundDelivery);
+        // Interaction replies use normal priority; existing financial outboxes resolve critical-priority views.
+        // Both share one sender and the same raw transport without transferring bot context to the output worker.
+        var client = new ForegroundBoundedTelegramBotClient(_clients.GetRawClient(bot.Id), _foregroundDelivery, _sender, bot.Id);
         var runtime = new BotRuntimeContext { Config = RuntimeSnapshot.Copy(bot), Client = client };
         using (_context.Push(runtime))
         // The interaction actor is resolved once from the durable update and published for the whole execution, so
@@ -60,6 +66,7 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
         using (TelegramInteractionActor.Push(ResolveActor(item.Update)))
         {
             await using var scope = _scopes.CreateAsyncScope();
+            using var business = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.BusinessLogic) ?? default;
             await scope.ServiceProvider.GetRequiredService<TelegramBotService>()
                 .DispatchUpdateAsync(client, item.Update, runtime, cancellationToken);
         }

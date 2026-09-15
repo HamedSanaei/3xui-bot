@@ -8,31 +8,35 @@ using Telegram.Bot.Types.Enums;
 /// <summary>Accepts durable bounded updates independently of handler execution.</summary>
 public interface ITelegramUpdateScheduler
 {
+    /// <summary>Whether the latest durable backlog sample reached the bounded in-memory read window.</summary>
+    bool IsUnderPressure => false;
     /// <summary>Closes new admission and wakes blocked receivers before shutdown draining starts.</summary>
     /// <remarks>Called by the receiver host before it cancels and joins its tracked polling generations.</remarks>
     void StopAdmission();
-    /// <summary>Waits for capacity and durable acceptance, never for the customer's full handler.</summary>
+    /// <summary>Waits only for durable acceptance, never for business or transport worker capacity.</summary>
     /// <param name="botId">Required configured runtime bot id.</param>
     /// <param name="update">Required private Telegram update.</param>
     /// <param name="cancellationToken">Receiver cancellation before durable acceptance.</param>
     /// <returns>A task completing only after persistence or duplicate recognition.</returns>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Eligible bot/user heads enter bounded workers; excess receiver input remains durable on disk.</remarks>
     Task EnqueueAsync(string botId, Update update, CancellationToken cancellationToken);
 }
 
 /// <summary>Resolves current bot runtime state and executes one isolated update.</summary>
 public interface ITelegramUpdateExecutor
 {
+    /// <summary>Currently enabled internal bot ids; null lets isolated executors use the store's unfiltered window.</summary>
+    string[] AvailableBotIds => null;
     /// <summary>Determines whether a configured bot can currently execute accepted work.</summary>
     /// <param name="botId">Canonical internal bot id.</param>
     /// <returns>False for disabled or unavailable bots; their queued work remains deferred.</returns>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Eligible bot/user heads enter bounded workers; excess receiver input remains durable on disk.</remarks>
     bool IsAvailable(string botId);
     /// <summary>Executes one claimed update with its own bot context.</summary>
     /// <param name="item">Private claimed update and its durable identity.</param>
     /// <param name="cancellationToken">Handler cancellation after the drain deadline.</param>
     /// <returns>A task representing all handler work; exceptions must be observed by the scheduler.</returns>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Eligible bot/user heads enter bounded workers; excess receiver input remains durable on disk.</remarks>
     Task ExecuteAsync(TelegramUpdateWorkItem item, CancellationToken cancellationToken);
 }
 
@@ -127,6 +131,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     private readonly ITelegramUpdateExecutor _executor;
     private readonly ILogger<TelegramUpdateScheduler> _logger;
     private readonly int _concurrency;
+    /// <summary>Per-bot business limit; a slow tenant cannot occupy every global handler slot.</summary>
+    private readonly int _botConcurrency;
     private readonly int _capacity;
     private readonly TimeSpan _drainTimeout;
     private readonly CancellationTokenSource _admission = new();
@@ -136,7 +142,9 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     private volatile bool _draining;
     private string _lastBot;
     private int _activeCount;
-    private long _lastPressureWarning;
+    private int _sampledQueueDepth;
+    /// <inheritdoc />
+    public bool IsUnderPressure => Volatile.Read(ref _sampledQueueDepth) >= _capacity;
     private int _disposed;
 
     /// <summary>Builds a scheduler using validated application limits.</summary>
@@ -144,13 +152,14 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <param name="executor">Runtime resolution and handler execution boundary.</param>
     /// <param name="config">Application settings: positive concurrency, capacity, and drain duration in seconds.</param>
     /// <param name="logger">Structured logger; update payloads and exception messages are excluded.</param>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Eligible bot/user heads enter bounded workers; excess receiver input remains durable on disk.</remarks>
     public TelegramUpdateScheduler(TelegramUpdateInboxStore store, ITelegramUpdateExecutor executor, AppConfig config, ILogger<TelegramUpdateScheduler> logger)
     {
         ValidateConfiguration(config);
         _store = store; _executor = executor; _logger = logger;
         _store.ReadyChanged += Wake;
         _concurrency = config.TelegramUpdateMaxConcurrency;
+        _botConcurrency = Math.Min(_concurrency, config.Performance?.Telegram?.WorkerCount ?? 4);
         _capacity = config.TelegramUpdateQueueCapacity;
         _drainTimeout = TimeSpan.FromSeconds(config.TelegramUpdateShutdownDrainSeconds);
     }
@@ -164,10 +173,11 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <summary>Rejects configuration that defeats bounded execution or admission.</summary>
     /// <param name="config">Required application configuration.</param>
     /// <exception cref="ArgumentOutOfRangeException">A scheduler limit is outside the supported range.</exception>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Eligible bot/user heads enter bounded workers; excess receiver input remains durable on disk.</remarks>
     public static void ValidateConfiguration(AppConfig config)
     {
         ArgumentNullException.ThrowIfNull(config);
+        (config.Performance?.Telegram ?? new TelegramPerformanceOptions()).Validate();
         if (config.TelegramUpdateMaxConcurrency is < 1 or > 256) throw new ArgumentOutOfRangeException(nameof(config.TelegramUpdateMaxConcurrency));
         if (config.TelegramUpdateQueueCapacity is < 1 or > 100000) throw new ArgumentOutOfRangeException(nameof(config.TelegramUpdateQueueCapacity));
         if (config.TelegramUpdateShutdownDrainSeconds is < 1 or > 600) throw new ArgumentOutOfRangeException(nameof(config.TelegramUpdateShutdownDrainSeconds));
@@ -176,7 +186,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <summary>Recovers interrupted claims before starting the tracked coordinator.</summary>
     /// <param name="cancellationToken">Host startup cancellation.</param>
     /// <returns>A task completing after startup recovery and scheduler readiness.</returns>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Eligible bot/user heads enter bounded workers; excess receiver input remains durable on disk.</remarks>
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         var recovered = await _store.RecoverAsync(cancellationToken);
@@ -193,14 +203,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _admission.Token);
         var token = linked.Token;
         token.ThrowIfCancellationRequested();
-        while (!await _store.TryAcceptAsync(botId, update, _capacity, token))
-        {
-            var now = Environment.TickCount64;
-            var previous = Interlocked.Read(ref _lastPressureWarning);
-            if (now - previous > 10000 && Interlocked.CompareExchange(ref _lastPressureWarning, now, previous) == previous)
-                _logger.LogWarning("Telegram admission waiting for capacity. BotId={BotId} QueueDepth={QueueDepth} MaxConcurrency={MaxConcurrency}", botId, _capacity, _concurrency);
-            await Task.Delay(100, token);
-        }
+        // SQLite is the overflow queue. Never acknowledge acceptance without this commit, or discard financial input.
+        await _store.TryAcceptAsync(botId, update, _capacity, token, allowDurableOverflow: true);
     }
 
     /// <summary>Runs eligible lane heads while maintaining a fixed upper bound on tracked handler tasks.</summary>
@@ -210,6 +214,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     private async Task RunAsync(CancellationToken token)
     {
         var active = new Dictionary<long, Task>();
+        var activeBots = new Dictionary<long, string>();
         var userCursors = new Dictionary<string, long>(StringComparer.Ordinal);
         var nextMaintenance = DateTime.UtcNow;
         var nextPressureSample = DateTime.UtcNow;
@@ -221,13 +226,15 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                 {
                     await pair.Value;
                     active.Remove(pair.Key);
+                    activeBots.Remove(pair.Key);
                 }
                 try
                 {
                     Interlocked.Increment(ref _readyQueryCount);
                     ReadyQueries.Add(1);
-                    var ready = await _store.ReadReadyAsync(_capacity, token);
-                    foreach (var idleBot in userCursors.Keys.Where(bot => !ready.Any(x => x.BotId == bot)).ToArray())
+                    var saturated = activeBots.Values.GroupBy(x => x).Where(x => x.Count() >= _botConcurrency).Select(x => x.Key).ToArray();
+                    var ready = await _store.ReadReadyAsync(_capacity, token, saturated, _executor.AvailableBotIds);
+                    foreach (var idleBot in userCursors.Keys.Where(bot => !activeBots.Values.Contains(bot) && !ready.Any(x => x.BotId == bot)).ToArray())
                         userCursors.Remove(idleBot);
                     if (DateTime.UtcNow >= nextMaintenance)
                     {
@@ -237,13 +244,16 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     if (DateTime.UtcNow >= nextPressureSample)
                     {
                         var depth = await _store.CountPendingAsync(token);
+                        Volatile.Write(ref _sampledQueueDepth, depth);
                         QueueDepth.Record(depth);
                         await RecordRecoveryMetricsAsync(token);
                         if (depth >= _capacity * 0.8)
                             _logger.LogWarning("Telegram queue pressure. QueueDepth={QueueDepth} Capacity={Capacity} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}", depth, _capacity, ActiveHandlerCount, _concurrency);
                         nextPressureSample = DateTime.UtcNow.AddSeconds(10);
                     }
-                    var eligible = ready.Where(x => !active.ContainsKey(x.Sequence) && _executor.IsAvailable(x.BotId)).ToList();
+                    var eligible = ready.Where(x => !active.ContainsKey(x.Sequence) && _executor.IsAvailable(x.BotId)
+                        && activeBots.Values.Count(bot => bot == x.BotId) < _botConcurrency).ToList();
+                    var scheduled = false;
                     while (active.Count < _concurrency && eligible.Count > 0)
                     {
                         var bots = eligible.Select(x => x.BotId).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
@@ -257,10 +267,15 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                         _lastBot = bot;
                         var execution = ProcessAsync(head.Sequence, _handlers.Token);
                         active.Add(head.Sequence, execution);
+                        activeBots.Add(head.Sequence, bot);
+                        scheduled = true;
+                        if (activeBots.Values.Count(id => id == bot) >= _botConcurrency)
+                            eligible.RemoveAll(x => x.BotId == bot);
                         // Notify after task completion, not merely after its final DB write, so slot reaping cannot miss a wake.
                         execution.GetAwaiter().OnCompleted(Wake);
                     }
                     if (_draining && active.Count == 0 && eligible.Count == 0) break;
+                    if (scheduled && active.Count < _concurrency) Wake();
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
                 catch (Exception ex)
@@ -284,7 +299,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <param name="sequence">Internal inbox sequence; no secret data.</param>
     /// <param name="token">Cancellation propagated to the handler after drain expiry.</param>
     /// <returns>A tracked task that observes handler failures and attempts independent final persistence.</returns>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Eligible bot/user heads enter bounded workers; excess receiver input remains durable on disk.</remarks>
     private async Task ProcessAsync(long sequence, CancellationToken token)
     {
         _store.Executing.TryAdd(sequence, 0);
@@ -348,7 +363,16 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     }
                 });
 
-                await _executor.ExecuteAsync(item, token);
+                try { await _executor.ExecuteAsync(item, token); }
+                finally
+                {
+                    _logger.LogInformation("Telegram update stages. BotId={BotId} UserId={UserId} UpdateId={UpdateId} DBMs={DBMs} XuiMs={XuiMs} TelegramEnqueueMs={TelegramEnqueueMs} BusinessMs={BusinessMs} TotalHandlerMs={TotalHandlerMs}",
+                        item.Key.BotId, item.Key.TelegramUserId, item.Update.Id,
+                        latencyScope.TotalMilliseconds(TelegramUpdateStage.DatabaseWait),
+                        latencyScope.TotalMilliseconds(TelegramUpdateStage.XuiRead),
+                        latencyScope.TotalMilliseconds(TelegramUpdateStage.TelegramEnqueue),
+                        latencyScope.TotalMilliseconds(TelegramUpdateStage.BusinessLogic), latencyScope.Elapsed.TotalMilliseconds);
+                }
             }
             token.ThrowIfCancellationRequested();
             if (await _store.HasUnresolvedCreationAsync(sequence, token))
@@ -569,7 +593,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     }
 
     /// <summary>Disposes scheduler cancellation resources after the host has awaited StopAsync.</summary>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Eligible bot/user heads enter bounded workers; excess receiver input remains durable on disk.</remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;

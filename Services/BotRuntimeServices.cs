@@ -282,6 +282,7 @@ public sealed class BotTransportUnavailableException : InvalidOperationException
 /// </summary>
 public class BotClientProvider
 {
+    private IServiceProvider _services;
     private readonly BotRegistry _registry;
     /// <summary>Creates a fresh client after first use or explicit invalidation without changing cache semantics.</summary>
     private readonly Func<BotInstanceConfig, ITelegramBotClient> _clientFactory;
@@ -293,9 +294,11 @@ public class BotClientProvider
     /// </summary>
     /// <param name="registry">Runtime bot registry.</param>
     /// <remarks>Disables v22 automatic rate-limit retries so the application's existing delivery/recovery policy remains authoritative.</remarks>
-    public BotClientProvider(BotRegistry registry)
+    /// <param name="services">Optional application root used to resolve delivery scheduling after provider construction.</param>
+    public BotClientProvider(BotRegistry registry, IServiceProvider services = null)
         : this(registry, bot => new TelegramBotClient(new TelegramBotClientOptions(bot.Token) { RetryCount = 0 }))
     {
+        _services = services;
     }
 
     /// <summary>
@@ -341,9 +344,29 @@ public class BotClientProvider
     /// Gets or creates a Telegram client for a BotId.
     /// </summary>
     /// <param name="botId">Internal bot id.</param>
-    /// <returns>Cached or newly created TelegramBotClient.</returns>
+    /// <returns>A queued critical-priority transport view retaining actual results for durable notification callers.</returns>
     /// <exception cref="InvalidOperationException">Thrown when the bot has no configured token.</exception>
     public ITelegramBotClient GetClient(string botId)
+        => GetDeliveryClient(botId, TelegramWorkPriority.Critical);
+
+    /// <summary>Gets a queued view of the current bot transport, preserving actual results for durable callers.</summary>
+    /// <param name="botId">Internal bot id; null resolves the configured default owned bot.</param>
+    /// <param name="priority">Critical for business outboxes, Normal for interactions, Low for operator logging.</param>
+    /// <returns>A lightweight immutable decorator, or the raw client in isolated provider fixtures.</returns>
+    /// <remarks>Polling and metadata requests pass through. Output scheduling never captures a bot token.</remarks>
+    public ITelegramBotClient GetDeliveryClient(string botId, TelegramWorkPriority priority)
+    {
+        var raw = GetRawClient(botId);
+        var sender = _services?.GetService<TelegramSenderService>();
+        return sender == null ? raw : new ForegroundBoundedTelegramBotClient(raw,
+            _services.GetRequiredService<TelegramForegroundDeliveryPolicy>(), sender, _registry.GetById(botId)?.Id, priority);
+    }
+
+    /// <summary>Resolves the shared transport without delivery scheduling, exclusively for sender execution and polling.</summary>
+    /// <param name="botId">Internal bot id; null resolves the configured default.</param>
+    /// <returns>The cached raw client for the current bot token; never dispose it at a call site.</returns>
+    /// <exception cref="BotTransportUnavailableException">The bot is absent, disabled or lacks a token.</exception>
+    internal ITelegramBotClient GetRawClient(string botId)
     {
         var requestedBotId = botId?.Trim();
         var bot = _registry.GetById(requestedBotId);
@@ -671,6 +694,7 @@ public sealed class BotRuntimeStatusStore
 /// </summary>
 public class MultiBotHostedService : IHostedService
 {
+    private readonly TelegramSenderService _sender;
     private readonly BotRegistry _registry;
     private readonly BotClientProvider _clientProvider;
     private readonly ITelegramUpdateScheduler _scheduler;
@@ -733,6 +757,7 @@ public class MultiBotHostedService : IHostedService
     /// </param>
     /// <param name="logger">Logger for receiver lifecycle events.</param>
     /// <remarks>The host tracks receiver, initialization, and recovery lifetimes; each replacement waits for the previous receiver generation to terminate.</remarks>
+    /// <param name="sender">Optional realtime callback lane; production injects the shared delivery service.</param>
     public MultiBotHostedService(
         BotRegistry registry,
         BotClientProvider clientProvider,
@@ -741,7 +766,8 @@ public class MultiBotHostedService : IHostedService
         BotContextAccessor botContextAccessor,
         BotRuntimeStatusStore runtimeStatusStore,
         IConfiguration configuration,
-        ILogger<MultiBotHostedService> logger)
+        ILogger<MultiBotHostedService> logger,
+        TelegramSenderService sender = null)
     {
         _registry = registry;
         _clientProvider = clientProvider;
@@ -752,6 +778,7 @@ public class MultiBotHostedService : IHostedService
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         _startupProbeTimeout = TimeSpan.FromSeconds(Math.Clamp(appConfig.TelegramBotStartupProbeTimeoutSeconds, 5, 60));
         _logger = logger;
+        _sender = sender;
     }
 
     /// <summary>
@@ -967,6 +994,10 @@ public class MultiBotHostedService : IHostedService
             var receiverTask = client.ReceiveAsync(
                 updateHandler: async (_, update, token) =>
                 {
+                    var received = System.Diagnostics.Stopwatch.StartNew();
+                    _logger.LogInformation("Telegram update received. BotId={BotId} UpdateId={UpdateId} ReceivedAtUtc={ReceivedAtUtc}", bot.Id, update.Id, DateTime.UtcNow);
+                    if (update.CallbackQuery != null)
+                        _sender?.TryAcknowledge(bot.Id, update.CallbackQuery.Id, update.CallbackQuery.Message?.Chat.Id);
                     // The tracked receiver owns this bounded super-admin control path, which must remain usable
                     // when durable customer capacity is full. It never replays a terminal handler receipt.
                     var admin = _scopeFactory.CreateScope();
@@ -974,6 +1005,9 @@ public class MultiBotHostedService : IHostedService
                         if (await admin.ServiceProvider.GetRequiredService<TelegramInboxAdminService>()
                             .TryHandleAsync(bot.Id, client, update, token)) return;
                     await _scheduler.EnqueueAsync(bot.Id, update, token);
+                    _logger.LogInformation("Telegram update durably admitted. BotId={BotId} UpdateId={UpdateId} AdmissionMs={AdmissionMs}", bot.Id, update.Id, received.Elapsed.TotalMilliseconds);
+                    if (_sender != null)
+                        await _sender.NotifyAcceptedPressureAsync(bot.Id, update, token, _scheduler.IsUnderPressure);
                 },
                 errorHandler: (_, exception, token) => HandleBotPollingErrorAsync(bot.Id, exception, token),
                 receiverOptions: new ReceiverOptions

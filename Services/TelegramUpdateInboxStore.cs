@@ -30,21 +30,23 @@ public sealed partial class TelegramUpdateInboxStore
     public TelegramUpdateInboxStore(UserDbContextFactory factory, CredentialsDbContextFactory credentials = null)
     { _factory = factory; _credentials = credentials; }
 
-    /// <summary>Attempts durable admission without exceeding the configured unfinished-work limit.</summary>
+    /// <summary>Commits a deduplicated input, optionally spilling past the memory window into durable storage.</summary>
     /// <param name="botId">Required canonical runtime bot id; never a token.</param>
     /// <param name="update">Required private Telegram update.</param>
     /// <param name="capacity">Positive maximum queued or currently running Telegram executions.</param>
     /// <param name="token">Receiver cancellation before acceptance.</param>
+    /// <param name="allowDurableOverflow">True for production receivers: excess work stays on disk rather than blocking polling on worker capacity.</param>
     /// <returns>True when committed or already accepted; false when admission must wait for capacity.</returns>
-    /// <remarks>Duplicate delivery succeeds even when full. The count stops at capacity inside the admission transaction. Cancellation after commit is resolved by durable deduplication.
+    /// <remarks>Duplicate delivery succeeds even when full. Strict mode counts inside the transaction; production overflow mode retains all inputs on disk.
+    /// Cancellation after commit is resolved by durable deduplication.
     /// Telegram's native serializer retains the Bot API wire format now that v22 uses System.Text.Json attributes.</remarks>
     /// <example><code>while (!await store.TryAcceptAsync(botId, update, capacity, token)) await Task.Delay(100, token);</code></example>
-    public Task<bool> TryAcceptAsync(string botId, Update update, int capacity, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
+    public Task<bool> TryAcceptAsync(string botId, Update update, int capacity, CancellationToken token, bool allowDurableOverflow = false) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
         if (await db.TelegramUpdateInbox.AnyAsync(x => x.BotId == botId && x.UpdateId == update.Id, ct)) return true;
-        if (await db.TelegramUpdateInbox.Where(x => x.Status == "queued" || x.Status == "running")
+        if (!allowDurableOverflow && await db.TelegramUpdateInbox.Where(x => x.Status == "queued" || x.Status == "running")
             .Select(x => x.Sequence).Take(capacity).CountAsync(ct) >= capacity) return false;
         db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry
         {
@@ -60,12 +62,18 @@ public sealed partial class TelegramUpdateInboxStore
     /// <summary>Loads only the oldest queued row behind any currently queued or running work for its bot/user key.</summary>
     /// <param name="capacity">Maximum rows to materialize; equals the validated admission capacity.</param>
     /// <param name="token">Cancellation of the read.</param>
+    /// <param name="excludedBots">Optional internal bot ids already at their active execution limit.</param>
+    /// <param name="availableBots">Optional enabled internal bot ids; filtering precedes the bounded query window.</param>
     /// <returns>Detached queued lane heads ordered by acceptance, possibly empty; payloads are not materialized.</returns>
     /// <remarks>Only live Telegram execution states participate in FIFO ordering. Terminal error/review receipts and linked business recovery records never block later user input.</remarks>
-    public async Task<List<TelegramUpdateInboxEntry>> ReadReadyAsync(int capacity, CancellationToken token)
+    public async Task<List<TelegramUpdateInboxEntry>> ReadReadyAsync(int capacity, CancellationToken token, string[] excludedBots = null, string[] availableBots = null)
     {
         await using var db = _factory.CreateDbContext();
-        return await db.TelegramUpdateInbox.AsNoTracking().Where(x => x.Status == "queued"
+        excludedBots ??= Array.Empty<string>();
+        var filterAvailable = availableBots != null;
+        availableBots ??= Array.Empty<string>();
+        return await db.TelegramUpdateInbox.AsNoTracking().Where(x => x.Status == "queued" && !excludedBots.Contains(x.BotId)
+            && (!filterAvailable || availableBots.Contains(x.BotId))
             && !db.TelegramUpdateInbox.Any(prior => prior.BotId == x.BotId && prior.TelegramUserId == x.TelegramUserId
                 && prior.Sequence < x.Sequence && (prior.Status == "queued" || prior.Status == "running")))
             .OrderBy(x => x.Sequence).Take(capacity).Select(x => new TelegramUpdateInboxEntry

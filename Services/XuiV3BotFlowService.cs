@@ -5462,6 +5462,15 @@ public class XuiV3BotFlowService
             cancellationToken);
     }
 
+    /// <summary>Renders the requesting user's account list from a detached ten-second display snapshot.</summary>
+    /// <param name="botClient">Current owned or tenant Telegram client.</param>
+    /// <param name="chatId">Destination Telegram chat in this bot.</param>
+    /// <param name="page">Zero-based display page, clamped to the available page range.</param>
+    /// <param name="credUser">Authenticated global profile used to filter account ownership.</param>
+    /// <param name="cancellationToken">Cancellation of display reads and reply admission.</param>
+    /// <param name="messageId">Existing Telegram message id to edit; zero sends a new reply.</param>
+    /// <returns>Completion after display output admission; no financial mutation is performed.</returns>
+    /// <remarks>Mutation and renewal validation reload fresh data independently of this display cache.</remarks>
     private async Task SendV3AccountListPageAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -5471,13 +5480,14 @@ public class XuiV3BotFlowService
         int messageId = 0)
     {
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken,
+            XuiV3RequestExecutionPolicy.ForegroundRead, cacheDisplayRead: true);
         if (!response.Success)
         {
-            await botClient.SendMessage(
+            await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
                 chatId: chatId,
                 text: $"دریافت اکانت‌ها ناموفق بود.\n{response.Msg}",
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken));
             return;
         }
 
@@ -5501,10 +5511,10 @@ public class XuiV3BotFlowService
             }
             else
             {
-                await botClient.SendMessage(
+                await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
                     chatId: chatId,
                     text: emptyText,
-                    cancellationToken: cancellationToken);
+                    cancellationToken: cancellationToken));
             }
             return;
         }
@@ -5532,12 +5542,12 @@ public class XuiV3BotFlowService
         }
         else
         {
-            await botClient.SendMessage(
+            await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
                 chatId: chatId,
                 text: text,
                 parseMode: ParseMode.Html,
                 replyMarkup: keyboard,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken));
         }
     }
 
@@ -10250,6 +10260,16 @@ public class XuiV3BotFlowService
                userComment.Contains(normalizedQuery, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>Queues a normal navigation response without occupying the update lane during Telegram delivery.</summary>
+    /// <param name="botClient">Active owned/tenant runtime client; owner transformations run before persistence.</param>
+    /// <param name="chatId">Destination Telegram chat id in this bot.</param>
+    /// <param name="messageId">Existing Telegram message id to edit, or zero to send a new message.</param>
+    /// <param name="text">Private user-visible text; never logged.</param>
+    /// <param name="parseMode">Optional Telegram formatting mode.</param>
+    /// <param name="replyMarkup">Optional bot-scoped navigation keyboard.</param>
+    /// <param name="cancellationToken">Cancellation of durable output admission.</param>
+    /// <returns>Completion after persistence; no Telegram message id is required by these callers.</returns>
+    /// <remarks>Financial delivery callers continue using their existing durable notification paths.</remarks>
     private static async Task SendOrEditTextAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -10272,14 +10292,24 @@ public class XuiV3BotFlowService
             return;
         }
 
-        await botClient.SendMessage(
+        await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
             chatId: chatId,
             text: text,
             parseMode: parseMode ?? ParseMode.None,
             replyMarkup: replyMarkup,
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken));
     }
 
+    /// <summary>Persists a navigation edit for deferred Telegram delivery.</summary>
+    /// <param name="botClient">Active runtime client for the bot that owns the message.</param>
+    /// <param name="chatId">Destination Telegram chat id.</param>
+    /// <param name="messageId">Positive Telegram message id, not an order or local database id.</param>
+    /// <param name="text">Private replacement text; never logged.</param>
+    /// <param name="parseMode">Optional Telegram formatting mode.</param>
+    /// <param name="replyMarkup">Optional replacement inline keyboard.</param>
+    /// <param name="cancellationToken">Cancellation of local durable admission.</param>
+    /// <returns>Completion after admission; actual transport failures belong to the output job.</returns>
+    /// <remarks>Edits do not advance payment state; a definite unchanged-message rejection is harmless.</remarks>
     private static async Task SafeEditMessageTextAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -10291,13 +10321,13 @@ public class XuiV3BotFlowService
     {
         try
         {
-            await botClient.EditMessageText(
+            await TelegramQueuedDelivery.EnqueueAsync(() => botClient.EditMessageText(
                 chatId: chatId,
                 messageId: messageId,
                 text: text,
                 parseMode: parseMode ?? ParseMode.None,
                 replyMarkup: replyMarkup,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken));
         }
         catch (ApiRequestException ex) when (
             ex.ErrorCode == 400 &&

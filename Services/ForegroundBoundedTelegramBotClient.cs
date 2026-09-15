@@ -9,8 +9,7 @@ using Telegram.Bot.Requests;
 using Telegram.Bot.Requests.Abstractions;
 
 /// <summary>
-/// Decorates one bot client for a single Telegram update execution and bounds only that update's non-durable
-/// interactive UX calls with <see cref="TelegramForegroundDeliveryPolicy"/>.
+/// Routes output through the shared sender while preserving real responses for result-dependent callers.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -18,21 +17,18 @@ using Telegram.Bot.Requests.Abstractions;
 /// Telegram.Bot v22 exposes one generic <see cref="ITelegramBotClient.SendRequest{TResponse}"/> entry point, and
 /// every convenience method such as <c>SendMessage</c> builds a strongly typed request and calls it. That
 /// makes one small decorator a complete chokepoint for the interactive surface without touching hundreds of call
-/// sites, and without changing the shared transport timeout used by receivers, long polling, and durable workers.
+/// sites. Only explicit admission-only reply builders return before network delivery.
 /// </para>
 /// <para>
 /// What is bounded:
-/// only explicitly listed interactive request kinds — message sends, photo/album/document sends, message edits,
-/// message deletion, callback acknowledgements, and chat/membership lookups. Everything else, including
-/// <c>getUpdates</c>, webhook management, and <see cref="DownloadFile"/>, is delegated untouched so receiver
-/// polling and durable file relay keep their existing behavior.
+/// Text and keyboard output is snapshotted into SQLite; stream-backed sends are tracked live while their caller owns
+/// the stream. Callback acknowledgements alone bypass ordinary send ordering. Metadata, polling and downloads use
+/// separate finite deadlines. No fake Telegram message ids are returned to workflows.
 /// </para>
 /// <para>
 /// Ambiguous sends:
-/// If the budget expires, the call is abandoned and reported as
-/// <see cref="TelegramForegroundDeliveryTimeoutException"/>. It is never retried automatically, because Telegram may
-/// already have accepted the message. The scheduled update completes with a stable non-error outcome and the customer
-/// presses the button again, which generates a new update.
+/// Sender timeouts become <see cref="TelegramDeliveryUncertainException"/> and are never automatically replayed.
+/// Clients without a sender retain the local <see cref="TelegramForegroundDeliveryTimeoutException"/> policy.
 /// </para>
 /// <para>
 /// Thread safety and lifetime:
@@ -47,6 +43,9 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
 
     /// <summary>Immutable overall budget applied to each bounded interactive delivery.</summary>
     private readonly TelegramForegroundDeliveryPolicy _policy;
+    private readonly TelegramSenderService _sender;
+    private readonly string _botId;
+    private readonly Adminbot.Domain.TelegramWorkPriority _priority;
 
     /// <summary>
     /// Creates a foreground-bounded view over an existing bot client.
@@ -60,10 +59,18 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// tests pass millisecond budgets.
     /// </param>
     /// <exception cref="ArgumentNullException">The inner client or the policy is null.</exception>
-    public ForegroundBoundedTelegramBotClient(ITelegramBotClient inner, TelegramForegroundDeliveryPolicy policy)
+    /// <param name="sender">Optional durable output scheduler; missing only in isolated clients and existing fixtures.</param>
+    /// <param name="botId">Internal runtime bot id required with the sender, never a token.</param>
+    /// <param name="priority">Critical for existing durable notification workers; normal for update replies.</param>
+    public ForegroundBoundedTelegramBotClient(ITelegramBotClient inner, TelegramForegroundDeliveryPolicy policy,
+        TelegramSenderService sender = null, string botId = null,
+        Adminbot.Domain.TelegramWorkPriority priority = Adminbot.Domain.TelegramWorkPriority.Normal)
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
+        _sender = sender;
+        _botId = botId;
+        _priority = priority;
     }
 
     /// <inheritdoc />
@@ -106,26 +113,33 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     }
 
     /// <inheritdoc />
-    public Task<bool> TestApi(CancellationToken cancellationToken = default)
-        => _inner.TestApi(cancellationToken);
+    public async Task<bool> TestApi(CancellationToken cancellationToken = default)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(_policy.OverallBudget);
+        return await _inner.TestApi(timeout.Token);
+    }
 
     /// <inheritdoc />
     public Task DownloadFile(Telegram.Bot.Types.TGFile file, Stream destination, CancellationToken cancellationToken = default)
         => DownloadFile(file.FilePath, destination, cancellationToken);
 
     /// <summary>
-    /// Downloads a Telegram file through the inner client without any foreground budget.
+    /// Downloads a Telegram file with a separate finite two-minute transfer deadline.
     /// </summary>
     /// <param name="filePath">Telegram file path returned by <c>GetFile</c>.</param>
     /// <param name="destination">Destination stream owned by the caller.</param>
-    /// <param name="cancellationToken">Caller cancellation; never replaced by a foreground budget.</param>
+    /// <param name="cancellationToken">Caller cancellation, linked to the transfer deadline.</param>
     /// <returns>A task completing after the file has been copied into <paramref name="destination"/>.</returns>
     /// <remarks>
-    /// File transfer is deliberately excluded from the foreground policy: receipt relay and configuration export are
-    /// durable, size-driven operations whose partial download must not be mistaken for a failed interactive send.
+    /// File transfer is size-driven and uses a longer deadline than text send/edit; it never waits indefinitely.
     /// </remarks>
-    public Task DownloadFile(string filePath, Stream destination, CancellationToken cancellationToken = default)
-        => _inner.DownloadFile(filePath, destination, cancellationToken);
+    public async Task DownloadFile(string filePath, Stream destination, CancellationToken cancellationToken = default)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromMinutes(2));
+        await _inner.DownloadFile(filePath, destination, timeout.Token);
+    }
 
     /// <summary>
     /// Executes one Telegram request, applying the foreground delivery budget only to interactive UX request kinds.
@@ -135,19 +149,29 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// <param name="cancellationToken">The caller's own lane cancellation token.</param>
     /// <returns>The inner client's response for the request.</returns>
     /// <remarks>
-    /// Non-interactive requests pass through unchanged. For interactive requests one linked token adds the overall
-    /// budget, and a stage measurement reports elapsed time to the ambient
-    /// <see cref="TelegramUpdateLatencyScope"/>. When only the budget expired — the caller's own token is still live —
-    /// the typed <see cref="TelegramForegroundDeliveryTimeoutException"/> is raised and no retry is attempted. Caller
-    /// cancellation and Telegram errors keep their original exception identity.
+    /// Supported output enters the shared per-bot sender. Explicit menu builders await durable admission only;
+    /// other callers receive the real response. Only AnswerCallbackQuery bypasses ordinary output ordering.
+    /// Without sender injection, the existing local foreground timeout remains in effect.
     /// </remarks>
     /// <exception cref="TelegramForegroundDeliveryTimeoutException">
     /// The overall interactive delivery budget expired before Telegram answered.
     /// </exception>
     public async Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
     {
+        if (_sender != null && request is AnswerCallbackQueryRequest answer)
+            return (TResponse)(object)_sender.QueueAcknowledgement(_botId, answer);
+        if (_sender != null && TelegramSenderService.Supports(request))
+            return await _sender.EnqueueAsync(_botId, request, TelegramQueuedDelivery.AdmissionOnly, cancellationToken, _priority);
+        if (_sender != null && request is SendPhotoRequest or SendDocumentRequest or SendMediaGroupRequest
+            or EditMessageMediaRequest or EditMessageCaptionRequest)
+            return await _sender.SendLiveAsync(_botId, request, cancellationToken, _priority);
+
         if (!TryClassifyForegroundRequest(request, out var stage))
-            return await _inner.SendRequest(request, cancellationToken);
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(request is GetUpdatesRequest ? TimeSpan.FromSeconds(90) : TimeSpan.FromSeconds(30));
+            return await _inner.SendRequest(request, timeout.Token);
+        }
 
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(_policy.OverallBudget);

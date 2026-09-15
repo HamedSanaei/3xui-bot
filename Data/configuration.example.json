@@ -1,4 +1,7 @@
 {
+  "Performance": {
+    "telegram": { "workerCount": 4, "sendTimeoutSeconds": 5, "queueSize": 1000, "callbackAckImmediately": true }
+  },
   "adminsUserIds": [],
   "tenantMaxStoresPerOwner": 5,
   "DatabaseCleanup": {

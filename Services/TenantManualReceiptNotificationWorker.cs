@@ -131,6 +131,11 @@ public sealed class TenantManualReceiptNotificationWorker : BackgroundService
         return claimed;
     }
 
+    /// <summary>Relays one claimed receipt while preserving uncertain Telegram outcomes for review.</summary>
+    /// <param name="notification">Detached users.db receipt-notification claim; not an order settlement command.</param>
+    /// <param name="cancellationToken">Worker shutdown cancellation for reads and delivery.</param>
+    /// <returns>Completion after recording delivery, retry or uncertainty; never approves or debits the order.</returns>
+    /// <remarks>A potentially accepted shared-sender response must not trigger another receipt notification.</remarks>
     private async Task DeliverAsync(TenantManualReceiptNotification notification, CancellationToken cancellationToken)
     {
         TenantManualPaymentReceipt receipt;
@@ -161,6 +166,11 @@ public sealed class TenantManualReceiptNotificationWorker : BackgroundService
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
+        }
+        catch (TelegramDeliveryUncertainException)
+        {
+            await MarkTerminalAsync(notification, TenantManualReceiptNotificationStatuses.DeliveryUncertain,
+                "telegram_delivery_uncertain", cancellationToken);
         }
         catch (Exception ex)
         {

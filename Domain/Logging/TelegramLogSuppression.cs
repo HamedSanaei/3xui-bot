@@ -153,6 +153,15 @@ namespace Adminbot.Domain.Logging
         /// </remarks>
         internal static bool ShouldSuppress(string message, Exception exception, long nowTicks)
         {
+            // Delivery infrastructure cannot report itself through its own Telegram queue (recursive log amplification).
+            // These exact telemetry families remain visible in local structured logs, including queue pressure/failures.
+            if (message?.StartsWith("Telegram output ", StringComparison.Ordinal) == true
+                || message?.StartsWith("Telegram realtime acknowledgement ", StringComparison.Ordinal) == true
+                || message?.StartsWith("Telegram update durably admitted.", StringComparison.Ordinal) == true
+                || message?.StartsWith("Telegram update received.", StringComparison.Ordinal) == true)
+                return true;
+            if (message?.StartsWith("Telegram update stages.", StringComparison.Ordinal) == true)
+                return true;
             // A Telegram 429 is itself the failure being reported. Forwarding it to the Telegram channel would issue
             // another send that is subject to the same rate limit, amplifying the 429 storm instead of quieting it.
             if (TelegramRateLimitPolicy.IsRateLimited(exception))

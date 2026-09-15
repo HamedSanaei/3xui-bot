@@ -1,5 +1,25 @@
 # CODE_MAP.md
 
+- Telegram delivery scheduling: `TelegramSenderService` + `TelegramWorkQueue` persist text/edit/delete jobs in
+  `users.db` (`TelegramDeliveryJobs`, migration `20260915221456_TelegramDeliveryQueue`). `BotClientProvider` supplies
+  queued critical-priority clients to existing financial workers; update clients use normal priority and logs use low.
+  One active send per bot, global configurable workers (4), bounded memory (1000), global pacing (25 requests/s),
+  text/edit timeout (5s), streamed media (60s), downloads (120s). Only callback acknowledgement has a separate realtime
+  lane (1s attempts). Late callback alert text becomes a queued chat reply when early acknowledgement already succeeded.
+  `TelegramQueuedDelivery.EnqueueAsync` is explicit admission-only UI; never use around financial workflows or message-id consumers.
+  429 text retries are bounded to three with persisted retry-after/backoff; ambiguous sends never replay.
+  Existing financial outboxes own recovery; live response/stream jobs are not replayed after restart. Terminal payloads
+  clear immediately; sent/failed metadata retains seven days; uncertain metadata remains for review.
+  Owned settlement and tenant receipt workers retain sender uncertainty; the Sales Assistant must not send a photo
+  fallback after an ambiguous delivery. Startup admission waits until previous-process claims have been recovered.
+  Receiver admission now spills to disk without waiting for worker capacity; memory windows stay bounded. Per-bot business
+  execution is capped by workerCount, within the existing global update limit. See `docs/telegram-performance.md` for
+  operational limits, checks and deployment notes; latency acceptance scenarios have not been executed.
+- Database factories now lease pooled contexts (64 each); parameterless legacy users.db construction is internal and
+  its ephemeral compatibility factories do not allocate pools. Existing wallet transaction/retry boundaries are unchanged.
+  `XuiClientCache` opt-in display reads cache immutable JSON for ten seconds (16 MiB bound); mutations invalidate it
+  before/after HTTP. Fresh recovery/authorization/financial reads remain uncached.
+
 - Telegram.Bot is pinned to 22.10.3. API methods no longer use Async suffixes (`SendMessage`, `SendRequest`);
   markup uses `ReplyMarkup`, files use `TGFile`, and client BotId is non-nullable. Decorators retain delivery budgets.
   Runtime clients disable SDK automatic retries (`RetryCount=0`) to preserve application retry ownership.
@@ -430,8 +450,8 @@ and the main menu.
 
 - Lifecycle: `TelegramUpdateScheduler.EnqueueAsync` (called by each bot receiver) durably persists the full update in
   `users.db` (`TelegramUpdateInbox`) BEFORE the receiver moves on; if the row already exists for `BotId + UpdateId` it
-  is recognized as a duplicate and accepted without capacity. Admission is bounded by unfinished rows
-  (`telegramUpdateQueueCapacity`, default 1000) and waits with backpressure rather than dropping. The scheduler then
+  is recognized as a duplicate. `telegramUpdateQueueCapacity` (default 1000) bounds the ready-read memory window;
+  excess admissions now remain on disk without waiting for handler capacity. The scheduler then
   claims rows with an atomic `queued -> running` conditional update and executes them. Every handler exit is terminal:
   `completed`, `completed_with_error`, or `completed_with_review`; all erase the private payload immediately and retain
   only coarse metadata needed for seven-day deduplication and review correlation.
@@ -486,16 +506,11 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   reconciliation, and recovery workers keep `BackgroundRead`. **Mutation safety is unchanged:** explicit retry modes
   still win, `NoAutomaticRetry` still performs exactly one POST, and a timeout never makes an ambiguous mutation
   replayable (a regression test asserts one POST against a transient status).
-- **Foreground Telegram delivery budget** (`Services/TelegramForegroundDeliveryPolicy.cs`,
-  `Services/ForegroundBoundedTelegramBotClient.cs`): one immutable 8 s overall budget per non-durable interactive
-  delivery (message/photo/album/document send, edits, deletes, callback acknowledgement, chat/membership lookups).
-  `TelegramUpdateExecutor` wraps the resolved client in this decorator **per update execution only**; receivers, long
-  polling, background workers, and `DownloadFileAsync` keep the raw unbounded client, so the shared transport timeout
-  is never changed globally. On expiry the send is abandoned with `TelegramForegroundDeliveryTimeoutException` and is
-  **never automatically re-sent** (an ambiguous send may already have been accepted); `TelegramBotService`
-  (`HandleUpdateAsync`) records one `handle_update_foreground_delivery_timeout` activity entry, logs one warning, and
-  releases the lane as a stable non-error outcome. Existing 2 s callback-ack and 5 s mandatory-join budgets are
-  untouched, and durable outbox delivery keeps its own `delivery_uncertain` semantics.
+- **Telegram delivery budget** (`TelegramForegroundDeliveryPolicy`, `ForegroundBoundedTelegramBotClient`): production
+  text/edit output now goes through `TelegramSenderService` with configured five-second attempts and explicit durable
+  admission-only UI calls. Awaited workflows retain real responses. Stream-backed output has a sixty-second attempt;
+  polling and downloads have separate finite deadlines. Sender ambiguity raises `TelegramDeliveryUncertainException`.
+  Isolated clients without sender injection retain the local foreground timeout policy.
 - **Stage attribution** (`Services/TelegramUpdateLatencyScope.cs`): closed vocabulary `XuiRead`, `TelegramSend`,
   `TelegramEdit`, `TelegramMembership`, `SiteLookup`, `ProviderRead`, `DatabaseWait`, `BusinessRecovery`, carried by
   `AsyncLocal` for one update execution only. The scheduler pushes one scope per execution; the bounded client wrapper,
@@ -598,12 +613,10 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   a pure database read — two bounded audience reads, no per-user Telegram or network call — and is measured as
   `DatabaseWait` so a very large audience is visible in stage telemetry instead of hiding inside the owner callback.
   Actual fan-out belongs to the background broadcast manager and is unchanged.
-- **Durable delivery is excluded from the UX budget**: `Services/TenantOrderNotificationWorker.cs` (worker and
-  `TenantOrderNotificationDeliveryService`) and `Services/TenantManualReceiptNotificationWorker.cs` use the raw
-  `BotClientProvider` transport and never reference `ForegroundBoundedTelegramBotClient` /
-  `TelegramForegroundDeliveryPolicy`. An account delivery that legitimately takes ~28 s still completes with
-  `outcome=delivered`, and `SendStarted` / `Delivered` / `DeliveryUncertain` / `ManualReview` semantics are unchanged, so
-  an ambiguous send can never become a blind duplicate account delivery.
+- **Durable financial delivery**: tenant/owned notification workers now share critical-priority sender admission.
+  Their own `SendStarted` / `Delivered` / `DeliveryUncertain` / `ManualReview` records remain recovery authorities.
+  Text attempts are bounded to five seconds; stream-backed delivery has a separate sixty-second limit. The owned
+  payment notifier treats shared-sender uncertainty as terminal instead of retrying a potentially accepted message.
 - **Queue-wait correlation fields** (`Services/TelegramUpdateScheduler.cs`): the single root queue-wait warning carries
   `BotId`, `TelegramUserId`, `WaitingSequence`, `WaitingUpdateId`, `WaitingUpdateType`, `QueueWaitMs`,
   `PreviousSequence`, `PreviousUpdateId`, `PreviousUpdateType`, and `PreviousHandlerDurationMs`; the deduplicated

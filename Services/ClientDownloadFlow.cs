@@ -39,7 +39,7 @@ internal static class ClientDownloadFlow
     /// <param name="botClient">Telegram client of the bot that received the customer's request.</param>
     /// <param name="chatId">Chat that should receive the selector.</param>
     /// <param name="cancellationToken">Cancellation token for the Telegram send.</param>
-    /// <returns>A task that completes after the selector message is sent.</returns>
+    /// <returns>A task that completes after the selector message is durably queued by the active bot.</returns>
     /// <remarks>
     /// The inline buttons carry only the three compile-time platform payloads, so no customer input can influence which
     /// repository, tag, asset, or URL is resolved.
@@ -62,11 +62,11 @@ internal static class ClientDownloadFlow
                 ClientDownloadCallbacks.Build(ClientDownloadPlatform.Windows)) }
         };
 
-        return botClient.SendMessage(
+        return TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
             chatId,
             "📲 دریافت آخرین نسخه نرم‌افزار\nسیستم‌عامل خود را انتخاب کنید:",
             replyMarkup: new InlineKeyboardMarkup(rows),
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken));
     }
 
     /// <summary>
@@ -77,7 +77,7 @@ internal static class ClientDownloadFlow
     /// <param name="releases">Shared release resolver used identically by owned and tenant bots.</param>
     /// <param name="platform">Platform selected by an inline button.</param>
     /// <param name="cancellationToken">Cancellation token for provider and Telegram work.</param>
-    /// <returns>A task that completes after a link or a friendly unavailability notice is sent.</returns>
+    /// <returns>A task that completes after a link or unavailability notice is durably queued.</returns>
     /// <remarks>
     /// The archive and APK are never uploaded or proxied through Telegram: only the vendor's own absolute HTTPS URL is
     /// sent, which keeps server bandwidth and Telegram file-size limits out of the picture. A resolution failure is
@@ -102,19 +102,19 @@ internal static class ClientDownloadFlow
         catch (Exception)
         {
             // A provider outage must never escape into the Telegram update pipeline.
-            await botClient.SendMessage(
+            await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
                 chatId,
                 BuildUnavailableMessage(platform),
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken));
             return;
         }
 
         if (!resolution.Success || resolution.Link == null)
         {
-            await botClient.SendMessage(
+            await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
                 chatId,
                 BuildUnavailableMessage(platform),
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken));
             return;
         }
 
@@ -153,14 +153,14 @@ internal static class ClientDownloadFlow
             ? "📥 دریافت از App Store"
             : $"📥 دانلود {link.FileName}";
 
-        await botClient.SendMessage(
+        await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
             chatId,
             builder.ToString(),
             replyMarkup: new InlineKeyboardMarkup(new[]
             {
                 new[] { InlineKeyboardButton.WithUrl(buttonLabel, link.DownloadUrl) }
             }),
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken));
     }
 
     /// <summary>Builds the friendly notice used when a platform's download cannot be resolved right now.</summary>

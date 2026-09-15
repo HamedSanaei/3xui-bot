@@ -15,10 +15,12 @@ public static class SqliteOperation
     /// <param name="cancellationToken">Cancellation of database work and retry delays.</param>
     /// <returns>The operation result after a successful commit; no additional save is required.</returns>
     /// <exception cref="SqliteException">The final BUSY/LOCKED error or any non-retryable SQLite error.</exception>
-    /// <remarks>Only SQLite primary codes 5 and 6 are retried. A failed commit must have been rolled back by disposal.</remarks>
+    /// <remarks>Only SQLite primary codes 5 and 6 are retried. A failed commit must have been rolled back by disposal.
+    /// The ambient update records database elapsed time including bounded contention delays, without logging SQL or values.</remarks>
     /// <example><code>await SqliteOperation.RunAsync(async token =&gt; { await using var db = factory.CreateDbContext(); return await db.Users.CountAsync(token); }, token);</code></example>
     public static async Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken = default)
     {
+        using var stage = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.DatabaseWait) ?? default;
         for (var attempt = 0; ; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();

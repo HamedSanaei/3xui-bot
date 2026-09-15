@@ -12,6 +12,10 @@ using System.Threading;
 /// </remarks>
 public enum TelegramUpdateStage
 {
+    /// <summary>Local durable output admission, excluding subsequent Telegram delivery and queue wait.</summary>
+    TelegramEnqueue,
+    /// <summary>Total background business execution; nested database/XUI/output stages explain its components.</summary>
+    BusinessLogic,
     /// <summary>A user-facing XUI panel read (account list, search, detail reload, renewal target discovery).</summary>
     XuiRead,
 
@@ -52,8 +56,8 @@ public enum TelegramUpdateStage
 /// <para>
 /// Cost:
 /// Creating the scope is one object allocation per update and taking a stage measurement is a monotonic timestamp pair,
-/// so the instrumentation is negligible next to a network call. Only stages that exceed the configured threshold are
-/// reported, and the scope deliberately does not persist or log payloads.
+/// so the instrumentation is small next to a network call. All stages contribute cumulative timing; only stages
+/// exceeding the configured threshold raise individual warnings. The scope never records payloads.
 /// </para>
 /// <para>
 /// Lifetime:
@@ -64,6 +68,12 @@ public enum TelegramUpdateStage
 /// </remarks>
 public sealed class TelegramUpdateLatencyScope : IDisposable
 {
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<TelegramUpdateStage, double> _totals = new();
+
+    /// <summary>Reads cumulative elapsed time for a stage, including fast calls below warning thresholds.</summary>
+    /// <param name="stage">Closed-vocabulary stage to inspect.</param>
+    /// <returns>Elapsed milliseconds, or zero when no such stage ran. Nested stages may overlap.</returns>
+    public double TotalMilliseconds(TelegramUpdateStage stage) => _totals.GetValueOrDefault(stage);
     /// <summary>Holds the scope for the current asynchronous update execution context.</summary>
     private static readonly AsyncLocal<TelegramUpdateLatencyScope> Ambient = new();
 
@@ -260,6 +270,7 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
     /// </remarks>
     private void Report(TelegramUpdateStage stage, double elapsedMilliseconds)
     {
+        _totals.AddOrUpdate(stage, elapsedMilliseconds, (_, total) => total + elapsedMilliseconds);
         if (elapsedMilliseconds < StageThreshold.TotalMilliseconds)
             return;
 

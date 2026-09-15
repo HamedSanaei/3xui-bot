@@ -667,14 +667,14 @@ public partial class TelegramBotService
     /// <param name="cancellationToken">Cancellation token for the bot-scoped state reset and the Telegram send.</param>
     /// <returns>
     /// <c>true</c> only when the message was the Admin entry and the actor is a configured super-admin inside an
-    /// owned bot (the panel was opened and state cleared); otherwise <c>false</c> so normal routing continues.
+    /// owned bot (the panel was durably queued and state cleared); otherwise <c>false</c> so normal routing continues.
     /// </returns>
     /// <remarks>
     /// Called from the message router BEFORE <see cref="XuiV3AdminFlowService.TryHandleMessageAsync"/> and every other
     /// stateful customer/XUI/renewal/colleague handler. The route authorizes against the configuration-controlled
     /// <c>adminsUserIds</c> list only (a colleague or tenant owner is never enough), verifies the current bot is owned
     /// (tenant bots never expose this panel), clears the current BotId/user conversation (abandoning stale
-    /// <c>xui-v3-admin</c>, purchase, renewal, and legacy sub-flow state for that bot only), and then sends the panel.
+    /// <c>xui-v3-admin</c>, purchase, renewal, and legacy sub-flow state for that bot only), and then queues the panel.
     /// A missing service-plan file or unavailable XUI panel cannot prevent the panel from opening because nothing
     /// outside this local route is evaluated. Role precedence is super-admin first: a super-admin who is also a
     /// colleague still receives only the super-admin keyboard, and <c>CredUser.IsColleague</c> is never modified.
@@ -703,7 +703,7 @@ public partial class TelegramBotService
         // High-priority navigation: abandon any stale bot-scoped conversation (XUI admin/customer/renewal/purchase/
         // colleague sub-flow) for THIS bot+user before sending the panel. Zero service-plan/panel/payment work happens.
         await ResetCurrentBotConversationAsync(message.From.Id, cancellationToken);
-        await SendAdminPanelAsync(botClient, message.Chat.Id, cancellationToken);
+        await TelegramQueuedDelivery.EnqueueAsync(() => SendAdminPanelAsync(botClient, message.Chat.Id, cancellationToken));
         return true;
     }
 
@@ -755,7 +755,7 @@ public partial class TelegramBotService
     /// <param name="cancellationToken">Cancellation token for the bot-scoped state reset and the Telegram send.</param>
     /// <returns>
     /// <c>true</c> only when the message was the panel menu exit and the actor is a configured super-admin inside an
-    /// owned bot (state was cleared and the owned-bot main menu was shown); otherwise <c>false</c>.
+    /// owned bot (state was cleared and the owned-bot main menu was durably queued); otherwise <c>false</c>.
     /// </returns>
     /// <remarks>
     /// Evaluated at the same high-priority layer as the Admin entry, before any XUI/admin sub-flow can consume the
@@ -779,7 +779,7 @@ public partial class TelegramBotService
             return false;
 
         await ResetCurrentBotConversationAsync(message.From.Id, cancellationToken);
-        await SendMainMenuAsync(botClient, message.Chat.Id, cancellationToken);
+        await TelegramQueuedDelivery.EnqueueAsync(() => SendMainMenuAsync(botClient, message.Chat.Id, cancellationToken));
         return true;
     }
 
@@ -823,6 +823,7 @@ public partial class TelegramBotService
     /// menu can be displayed. Reset never mutates credentials, wallet balances, ledgers, payments, orders, referrals,
     /// XUI accounts, or another bot's state. Known payment and referral start payloads continue through their existing
     /// handlers after the transient reset.
+    /// Navigation replies explicitly enqueue output; result-dependent messages retain their actual Telegram responses.
     /// </remarks>
     /// <example>
     /// <code>
@@ -992,10 +993,10 @@ public partial class TelegramBotService
 
         if (isSuperAdmin && hasNavigationCommand)
         {
-            await botClient.CustomSendTextMessageAsync(
+            await TelegramQueuedDelivery.EnqueueAsync(() => botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "Main Menu",
-                replyMarkup: GetMainMenuKeyboard());
+                replyMarkup: GetMainMenuKeyboard()));
             return;
         }
 
@@ -4722,7 +4723,7 @@ public partial class TelegramBotService
     /// <param name="botClient">Telegram client that received the super-admin command.</param>
     /// <param name="chatId">Telegram chat id where the status report should be sent.</param>
     /// <param name="cancellationToken">Cancellation token for Telegram send operations.</param>
-    /// <returns>A task that completes after one or more status message chunks are sent.</returns>
+    /// <returns>A task that completes after status chunks are durably queued in order for this bot.</returns>
     /// <remarks>
     /// The report is generated from in-memory receiver status plus <see cref="BotRegistry" /> configuration. It does
     /// not call Telegram or expose bot tokens, so it is safe to run while Telegram is unstable or while some bots are
@@ -4738,11 +4739,11 @@ public partial class TelegramBotService
 
         foreach (var chunk in SplitTelegramPlainText(report, 3800))
         {
-            await botClient.SendMessage(
+            await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
                 chatId: chatId,
                 text: chunk,
                 replyMarkup: GetMainMenuKeyboard(),
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken));
         }
     }
 
@@ -4752,7 +4753,7 @@ public partial class TelegramBotService
     /// <param name="botClient">Telegram client for the current owned bot.</param>
     /// <param name="chatId">Super-admin Telegram chat id.</param>
     /// <param name="cancellationToken">Cancellation token for the Telegram send operation.</param>
-    /// <returns>A task that completes after the panel message is sent.</returns>
+    /// <returns>A task that completes after the panel message is durably queued for this owned bot.</returns>
     /// <remarks>
     /// The panel exposes only enabled state, exact configuration key names, and credential readiness. Secret values
     /// and partial masks are deliberately absent. Each callback carries a revision and expires after ten minutes.
@@ -4762,12 +4763,12 @@ public partial class TelegramBotService
         ChatId chatId,
         CancellationToken cancellationToken)
     {
-        await botClient.SendMessage(
+        await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
             chatId,
             BuildPaymentGatewayPanelText(),
             parseMode: ParseMode.Html,
             replyMarkup: BuildPaymentGatewayPanelMarkup(),
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken));
     }
 
     /// <summary>
@@ -6030,12 +6031,12 @@ public partial class TelegramBotService
         if (hasNavigationCommand)
         {
             var registrationText = BuildReferralRegistrationMessage(referralRegistration);
-            await botClient.CustomSendTextMessageAsync(
+            await TelegramQueuedDelivery.EnqueueAsync(() => botClient.CustomSendTextMessageAsync(
                chatId: message.Chat.Id,
                text: string.IsNullOrWhiteSpace(registrationText)
                    ? "به ربات خوش آمدید!"
                    : $"به ربات خوش آمدید!\n\n{registrationText}",
-                replyMarkup: MainReplyMarkupKeyboardFa());
+                replyMarkup: MainReplyMarkupKeyboardFa()));
             return;
         }
         else if (await TryHandleReferralMenuCommandAsync(

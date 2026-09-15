@@ -6305,18 +6305,20 @@ public partial class TenantBotService
     /// <param name="ChatId">customer chat Id.</param>
     /// <param name="tenant">current tenant Bot row.</param>
     /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <returns>Completion after the storefront home reply is durably queued, not after network delivery.</returns>
+    /// <remarks>Uses the current tenant's welcome text and keyboard; contains no financial delivery effect.</remarks>
     private async Task SendTenantHomeAsync(ITelegramBotClient botClient, ChatId ChatId, BotInstance tenant, CancellationToken CancellationToken)
     {
         var WELCOME = string.IsNullOrWhiteSpace(tenant.TenantWelcomeText)
             ? $"به فروشگاه {tenant.BrandName ?? tenant.Username} خوش آمدید."
             : tenant.TenantWelcomeText;
 
-        await botClient.SendMessage(
+        await TelegramQueuedDelivery.EnqueueAsync(() => botClient.SendMessage(
             chatId: ChatId,
             text: $"{Html(WELCOME)}\n\nبرای خرید اکانت یا دیدن تعرفه‌ها از دکمه‌های پایین استفاده کنید.",
             parseMode: ParseMode.Html,
             replyMarkup: BuildTenantReplyKeyboard(),
-            cancellationToken: CancellationToken);
+            cancellationToken: CancellationToken));
     }
 
     /// <summary>
@@ -12740,7 +12742,7 @@ public partial class TenantBotService
     /// <param name="chatId">Owner panel Telegram chat id.</param>
     /// <param name="owner">Authenticated colleague profile; shared wallet identity.</param>
     /// <param name="token">Cancellation of reads and the Telegram response.</param>
-    /// <returns>A task completing after the store list is sent.</returns>
+    /// <returns>A task completing after the store list is durably queued for this owned bot.</returns>
     /// <remarks>Does not select a default store. Disabled/reset rows remain listed and count toward the global limit.</remarks>
     private async Task ShowOwnerStoreListAsync(ITelegramBotClient client, long chatId, CredUser owner, CancellationToken token)
     {
@@ -12751,9 +12753,9 @@ public partial class TenantBotService
         if (stores.Count < _appConfig.TenantMaxStoresPerOwner)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("➕ افزودن فروشگاه", $"TBM:add:{DateTimeOffset.UtcNow.ToUnixTimeSeconds():X}:" + Guid.NewGuid().ToString("N")) });
         var balance = await _credentialsDbContext.GetAccountBalance(owner.TelegramUserId);
-        await client.SendMessage(chatId,
+        await TelegramQueuedDelivery.EnqueueAsync(() => client.SendMessage(chatId,
             $"🏪 فروشگاه‌های شما ({stores.Count}/{_appConfig.TenantMaxStoresPerOwner})\n\nکیف پول مشترک مالک: {balance.FormatCurrency()} تومان\nتمام فروشگاه‌ها از یک حساب گذرگاه متعلق به شما استفاده می‌کنند.\nفروشگاه مورد نظر را انتخاب کنید.",
-            replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: token);
+            replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: token));
     }
 
     /// <summary>

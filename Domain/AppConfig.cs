@@ -10,6 +10,8 @@ namespace Adminbot.Domain
     /// <remarks>Tenant settings live on BotInstance; global gateway credentials and storefront allocation limits are not copied between stores.</remarks>
     public class AppConfig
     {
+        /// <summary>Optional startup scheduling and transport settings; defaults preserve bounded operation.</summary>
+        public PerformanceOptions Performance { get; set; } = new();
         public AppConfig()
         {
 
@@ -143,7 +145,7 @@ namespace Adminbot.Domain
         public int TelegramBotStartupProbeTimeoutSeconds { get; set; } = 12;
         /// <summary>Global maximum simultaneously executing Telegram updates, from 1 to 256.</summary>
         public int TelegramUpdateMaxConcurrency { get; set; } = 16;
-        /// <summary>Maximum unfinished durable inbox rows, from 1 to 100000; full admission applies backpressure.</summary>
+        /// <summary>Maximum durable inbox heads materialized per scheduler read, from 1 to 100000; excess inputs remain on disk.</summary>
         public int TelegramUpdateQueueCapacity { get; set; } = 1000;
         /// <summary>Shutdown drain deadline in seconds, from 1 to 600, before cooperative handler cancellation.</summary>
         public int TelegramUpdateShutdownDrainSeconds { get; set; } = 90;

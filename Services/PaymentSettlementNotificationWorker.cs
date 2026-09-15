@@ -293,6 +293,7 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     /// <param name="exception">Telegram or transport exception; its raw message is never persisted.</param>
     /// <param name="cancellationToken">Host token for the state transition.</param>
     /// <returns>A task that completes after the claim is released or quarantined.</returns>
+    /// <remarks>A shared-sender uncertain outcome is terminal for delivery; it never retries a potentially accepted send.</remarks>
     private async Task HandleDeliveryFailureAsync(
         PaymentSettlementNotification notification,
         Exception exception,
@@ -331,6 +332,13 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
             }
         }
 
+        if (exception is TelegramDeliveryUncertainException)
+        {
+            // The shared sender may have delivered before a timeout or persistence failure; never send twice.
+            await MarkTerminalAsync(notification, PaymentSettlementNotificationStatuses.DeliveryUncertain,
+                "telegram_delivery_uncertain", cancellationToken);
+            return;
+        }
         if (exception is TaskCanceledException or TimeoutException or HttpRequestException or RequestException)
         {
             await RetryOrExhaustAsync(

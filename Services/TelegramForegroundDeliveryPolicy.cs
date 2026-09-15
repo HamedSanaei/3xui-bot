@@ -14,11 +14,8 @@ using System;
 /// </para>
 /// <para>
 /// Scope:
-/// This policy deliberately covers only the interactive UX surface. It is NOT a transport-wide timeout and must never
-/// be applied globally to <see cref="Telegram.Bot.TelegramBotClient"/>, because the same client instance also serves
-/// long-polling receivers and durable background workers. Durable business delivery — account delivery, payment
-/// settlement notices, owner receipt notifications, and the durable tenant notification outbox — keeps its own
-/// outbox and <c>delivery_uncertain</c> semantics and is never converted into best-effort foreground sending.
+/// The shared sender applies the configured deadline to text send/edit attempts; long polling and file transfer have
+/// separate finite deadlines. Durable business delivery keeps its own financial outbox and uncertain-delivery semantics.
 /// </para>
 /// <para>
 /// Ambiguous-send rule:
@@ -29,22 +26,20 @@ using System;
 /// </para>
 /// <para>
 /// Production value:
-/// <see cref="Production"/> uses a single overall eight-second budget. The value is intentionally not bound to
-/// <c>configuration.json</c>: it is a UX guarantee, not an operator-tunable provider setting, and the hosting
-/// environment must not be able to raise interactive replies back to pathological values. Tests construct their own
-/// instance with millisecond budgets so timeout behaviour is deterministic.
+/// <see cref="Production"/> defaults to five seconds. Host wiring supplies the validated
+/// <c>Performance:telegram:sendTimeoutSeconds</c> value. Isolated callers may construct shorter budgets.
 /// </para>
 /// </remarks>
 public sealed class TelegramForegroundDeliveryPolicy
 {
     /// <summary>
-    /// Gets the shared production instance. One overall eight-second budget covers a single interactive Telegram
+    /// Gets the default instance. One overall five-second budget covers a single interactive Telegram
     /// delivery, including connection setup, upload, and response reading.
     /// </summary>
     public static TelegramForegroundDeliveryPolicy Production { get; } = new();
 
     /// <summary>
-    /// Gets the overall wall-clock budget for one interactive foreground Telegram delivery. Production value: eight
+    /// Gets the overall wall-clock budget for one interactive foreground Telegram delivery. Default value: five
     /// seconds.
     /// </summary>
     /// <remarks>
@@ -52,7 +47,7 @@ public sealed class TelegramForegroundDeliveryPolicy
     /// <see cref="TelegramForegroundDeliveryPolicy"/>-aware interactive calls are affected; durable outbox delivery
     /// and receiver polling keep their own configured behavior.
     /// </remarks>
-    public TimeSpan OverallBudget { get; init; } = TimeSpan.FromSeconds(8);
+    public TimeSpan OverallBudget { get; init; } = TimeSpan.FromSeconds(5);
 }
 
 /// <summary>

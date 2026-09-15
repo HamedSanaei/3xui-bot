@@ -26,8 +26,8 @@ public class UserDbContext : DbContext
     /// <summary>
     /// Creates a users.db context that resolves its SQLite path from <see cref="ConfigureDatabasePath"/>.
     /// </summary>
-    /// <remarks>This constructor is retained for explicitly owned legacy background operations.</remarks>
-    public UserDbContext()
+    /// <remarks>Internal legacy path only. The single public options constructor is required for EF context pooling.</remarks>
+    internal UserDbContext()
     {
     }
 
@@ -45,6 +45,8 @@ public class UserDbContext : DbContext
     public DbSet<User> Users { get; set; }
     /// <summary>Private durable Telegram inputs and terminal deduplication receipts, isolated by runtime bot id.</summary>
     public DbSet<TelegramUpdateInboxEntry> TelegramUpdateInbox { get; set; }
+    /// <summary>Private durable text/edit/delete output intents, isolated by runtime bot id.</summary>
+    public DbSet<TelegramDeliveryJob> TelegramDeliveryJobs { get; set; }
     /// <summary>Private durable XUI creation identities that prevent a second addClient after a restart.</summary>
     public DbSet<XuiV3CreationOperation> XuiV3CreationOperations { get; set; }
     /// <summary>Restart-safe step state for tenant card-to-card provisional finalize and revoke sagas.</summary>
@@ -147,9 +149,18 @@ public class UserDbContext : DbContext
     /// scheduled-report delivery, and durable per-client XUI volume-reminder cycles and claims.
     /// </summary>
     /// <param name="modelBuilder">EF Core model builder used by migrations and runtime metadata.</param>
-    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    /// <remarks>Conversation helpers use BotId plus TelegramUserId. Output jobs use a status/bot/priority/sequence index,
+    /// have no cross-database foreign key, and clear private payloads at terminal delivery while retaining uncertain metadata.</remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<TelegramDeliveryJob>(entity =>
+        {
+            entity.HasKey(x => x.Id);
+            entity.HasIndex(x => new { x.Status, x.BotId, x.Priority, x.Id });
+            entity.Property(x => x.BotId).IsRequired();
+            entity.Property(x => x.Kind).IsRequired();
+            entity.Property(x => x.Status).IsRequired();
+        });
         // Exact inbox links complement the existing bot/user fallback for historical recovery records.
         modelBuilder.Entity<XuiV3RenewalOperation>().HasIndex(x => x.InboxSequence);
         modelBuilder.Entity<XuiV3LinkChangeOperation>().HasIndex(x => x.InboxSequence);
@@ -732,7 +743,7 @@ public class UserDbContext : DbContext
 
     /// <summary>Creates a factory-backed compatibility store; it never reuses this context's tracker.</summary>
     private UserStateStore StateStore => new(new UserDbContextFactory(_operationOptions ??
-        new DbContextOptionsBuilder<UserDbContext>().UseSqlite(SqliteOperation.ConnectionString(_databasePath)).Options));
+        new DbContextOptionsBuilder<UserDbContext>().UseSqlite(SqliteOperation.ConnectionString(_databasePath)).Options, usePooling: false));
 
     /// <summary>Applies partial state for the active bot and Telegram user through an isolated context.</summary>
     /// <param name="user">Detached state; null fields preserve existing values.</param>
@@ -782,22 +793,25 @@ public class UserDbContext : DbContext
 /// </remarks>
 public sealed class UserDbContextFactory
 {
-    /// <summary>Immutable EF options reused to create independent contexts for the same migrated users.db file.</summary>
+    /// <summary>Shared pool for production operation leases; legacy ephemeral factories do not allocate their own pools.</summary>
+    private readonly Microsoft.EntityFrameworkCore.Infrastructure.PooledDbContextFactory<UserDbContext> _pool;
     private readonly DbContextOptions<UserDbContext> _options;
 
     /// <summary>
     /// Creates a factory from fully configured users.db options.
     /// </summary>
     /// <param name="options">EF Core SQLite options for the same users.db file migrated at application startup.</param>
-    public UserDbContextFactory(DbContextOptions<UserDbContext> options)
+    /// <param name="usePooling">False only for a short-lived compatibility factory; the application singleton uses true.</param>
+    public UserDbContextFactory(DbContextOptions<UserDbContext> options, bool usePooling = true)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        if (usePooling) _pool = new(options, poolSize: 64);
     }
 
     /// <summary>
-    /// Creates a new users.db context owned by the caller.
+    /// Leases a users.db context owned exclusively by the caller until disposal returns it to the pool.
     /// </summary>
-    /// <returns>A new disposable context with an independent change tracker.</returns>
+    /// <returns>A disposable lease with an independent, reset change tracker; never share it across operations.</returns>
     /// <remarks>Callers must dispose the returned context after completing one logical operation.</remarks>
     /// <example>
     /// <code>
@@ -807,6 +821,6 @@ public sealed class UserDbContextFactory
     /// </example>
     public UserDbContext CreateDbContext()
     {
-        return new UserDbContext(_options);
+        return _pool?.CreateDbContext() ?? new UserDbContext(_options);
     }
 }

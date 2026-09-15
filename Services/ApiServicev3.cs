@@ -885,6 +885,7 @@ public class ApiServicev3
     /// and transient retry budget for background/recovery readers.
     /// </param>
     /// <returns>The panel response envelope as a client list; callers must check <c>Success</c>.</returns>
+    /// <param name="cacheDisplayRead">True only for lists/search display; false for selection validation, mutations and recovery.</param>
     /// <remarks>
     /// <see cref="XuiV3ForegroundReadTimeoutException"/> is thrown when a foreground read exceeds its overall budget;
     /// no further retry is started and the handler must release the Telegram lane.
@@ -893,8 +894,9 @@ public class ApiServicev3
         ServerInfo serverInfo,
         IConfiguration configuration,
         CancellationToken cancellationToken = default,
-        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
-        => SendAsync<List<XuiV3Client>>(serverInfo, configuration, HttpMethod.Get, "/panel/api/clients/list", null, true, cancellationToken, executionPolicy: executionPolicy);
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead,
+        bool cacheDisplayRead = false)
+        => SendAsync<List<XuiV3Client>>(serverInfo, configuration, HttpMethod.Get, "/panel/api/clients/list", null, true, cancellationToken, executionPolicy: executionPolicy, cacheDisplayRead: cacheDisplayRead);
 
     /// <summary>GET /panel/api/clients/list/paged. Server-side filtering, sorting and paging for clients.</summary>
     /// <param name="serverInfo">Panel descriptor supplying base URL, root path, and bearer token.</param>
@@ -2362,9 +2364,12 @@ public class ApiServicev3
     /// <paramref name="retryMode"/> is supplied. The default respects the supplied <paramref name="retryMode"/>.
     /// </param>
     /// <returns>The deserialized XUI response envelope.</returns>
+    /// <param name="cacheDisplayRead">Opt-in display-only cache. Never enable for financial decisions or mutation recovery.</param>
     /// <remarks>
     /// A successful HTTP status can still contain <c>success=false</c>; callers remain responsible for checking the
     /// panel envelope. Exceptions retain endpoint detail only for private diagnostics and must not be shown to users.
+    /// Explicit display reads may reuse detached ten-second snapshots. Mutations invalidate before and after the call;
+    /// default reads remain fresh for financial validation and ambiguous-creation recovery.
     /// </remarks>
     public static async Task<XuiV3ApiResponse<T>> SendAsync<T>(
         ServerInfo serverInfo,
@@ -2376,9 +2381,29 @@ public class ApiServicev3
         CancellationToken cancellationToken = default,
         IDictionary<string, string> query = null,
         XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly,
-        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
+        XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead,
+        bool cacheDisplayRead = false)
     {
-        var raw = await SendRawAsync(serverInfo, configuration, method, relativePath, body, authenticate, cancellationToken, query, EffectiveRetryMode(retryMode, executionPolicy), executionPolicy);
+        // Only explicit display reads may use the short cache; recovery and financial decisions stay fresh.
+        var cacheable = cacheDisplayRead && method == HttpMethod.Get && executionPolicy == XuiV3RequestExecutionPolicy.ForegroundRead
+            && (relativePath.StartsWith("/panel/api/clients/", StringComparison.Ordinal)
+                || relativePath.StartsWith("/panel/api/inbounds/", StringComparison.Ordinal));
+        var mutation = method != HttpMethod.Get;
+        string raw;
+        if (mutation) XuiClientCache.Invalidate();
+        try
+        {
+            if (cacheable)
+            {
+                var identity = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                    Encoding.UTF8.GetBytes(ResolveBearerToken(serverInfo, configuration) ?? "")));
+                raw = await XuiClientCache.ReadAsync(BuildPanelUri(serverInfo, relativePath, query) + "|" + authenticate + "|" + identity,
+                    () => SendRawAsync(serverInfo, configuration, method, relativePath, body, authenticate, cancellationToken, query, EffectiveRetryMode(retryMode, executionPolicy), executionPolicy));
+            }
+            else
+                raw = await SendRawAsync(serverInfo, configuration, method, relativePath, body, authenticate, cancellationToken, query, EffectiveRetryMode(retryMode, executionPolicy), executionPolicy);
+        }
+        finally { if (mutation) XuiClientCache.Invalidate(); }
         var result = JsonConvert.DeserializeObject<XuiV3ApiResponse<T>>(raw);
         if (result == null)
             throw new XuiV3ApiException(method.ToString(), BuildPanelUri(serverInfo, relativePath, query).ToString(), 0, raw, null);

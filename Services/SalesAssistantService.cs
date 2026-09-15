@@ -154,6 +154,7 @@ public class SalesAssistantService
     /// final confirmation DELEGATES to <see cref="TenantBotService.APPROVEMANUALRECEIPTASYNC" />.
     /// the receipt photo is first DOWNLOADED through the tenant Bot that received it and then UPLOADED Again
     /// through the sales assistant Bot because Telegram file IDENTIFIERS are not safely REUSABLE across bots.
+    /// A shared-sender uncertain result propagates to the durable receipt outbox; it cannot trigger a fallback send.
     /// </remarks>
     /// <returns>A task completing after the owner receipt notification attempt; the receipt approval state is unchanged.</returns>
     public async Task<int?> NOTIFYMANUALRECEIPTASYNC(TenantManualPaymentReceipt receipt, CancellationToken CancellationToken)
@@ -216,6 +217,7 @@ public class SalesAssistantService
                 cancellationToken: CancellationToken);
             return sent.MessageId;
         }
+        catch (TelegramDeliveryUncertainException) { throw; }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "sales assistant receipt notification failed. RECEIPTID={RECEIPTID}", receipt.Id);
