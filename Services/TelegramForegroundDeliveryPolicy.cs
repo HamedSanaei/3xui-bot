@@ -47,7 +47,7 @@ public sealed class TelegramForegroundDeliveryPolicy
     /// <see cref="TelegramForegroundDeliveryPolicy"/>-aware interactive calls are affected; durable outbox delivery
     /// and receiver polling keep their own configured behavior.
     /// </remarks>
-    public TimeSpan OverallBudget { get; init; } = TimeSpan.FromSeconds(5);
+    public TimeSpan OverallBudget { get; init; } = TimeSpan.FromSeconds(8);
 }
 
 /// <summary>

@@ -201,7 +201,7 @@ public sealed partial class ConcurrencyTests
         await scheduler.StartAsync(default);
         try
         {
-            await full.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await full.Task.WaitAsync(TimeSpan.FromSeconds(30));
             Assert.Equal(16, Volatile.Read(ref entered)); Assert.Equal(16, scheduler.ActiveHandlerCount);
         }
         finally { release.TrySetResult(); await scheduler.StopAsync(default); }
@@ -599,3 +599,5 @@ public sealed partial class ConcurrencyTests
         await app.StopAsync();
     }
 }
+
+

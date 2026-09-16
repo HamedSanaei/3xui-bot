@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 using Adminbot.Domain;
@@ -695,9 +695,10 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(
             new[]
             {
-                "XuiRead", "TelegramSend", "TelegramEdit", "TelegramMembership",
+                "TelegramEnqueue", "BusinessLogic", "XuiRead", "TelegramSend", "TelegramEdit", "TelegramMembership",
                 "SiteLookup", "ProviderRead", "DatabaseWait", "BusinessRecovery"
             },
             names);
     }
 }
+

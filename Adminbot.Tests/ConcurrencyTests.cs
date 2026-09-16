@@ -178,8 +178,10 @@ public sealed partial class ConcurrencyTests
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await scheduler.EnqueueAsync("a", Update(1, 1), default);
         var waiting = scheduler.EnqueueAsync("a", Update(2, 2), default);
-        Assert.False(waiting.IsCompleted);
-        Assert.Equal(1, await databases.Inbox.CountPendingAsync(default));
+        // Durable overflow is intentional: admission commits to SQLite instead of blocking the caller when the
+        // in-memory scheduler capacity is saturated.
+        await waiting.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(2, await databases.Inbox.CountPendingAsync(default));
         release.TrySetResult();
         await waiting.WaitAsync(TimeSpan.FromSeconds(10));
         await scheduler.StopAsync(default);
@@ -388,7 +390,7 @@ public sealed partial class ConcurrencyTests
     /// <returns>An unstarted scheduler with a sixty-second wait bound; the test must stop it before disposing its databases.</returns>
     /// <remarks>Test callers own all barriers and lifetimes; dispose database fixtures only after every asynchronous operation has stopped.</remarks>
     private static TelegramUpdateScheduler Create(Databases db, Executor executor, Channel<bool> wakes, int concurrency = 4) =>
-        new(db.Inbox, executor, new AppConfig { TelegramUpdateMaxConcurrency = concurrency, TelegramUpdateQueueCapacity = 1000, TelegramUpdateShutdownDrainSeconds = 10 }, NullLogger<TelegramUpdateScheduler>.Instance)
+        new(db.Inbox, executor, new AppConfig { TelegramUpdateMaxConcurrency = concurrency, TelegramUpdateQueueCapacity = 1000, TelegramUpdateShutdownDrainSeconds = 10, Performance = new PerformanceOptions { Telegram = new TelegramPerformanceOptions { WorkerCount = concurrency } } }, NullLogger<TelegramUpdateScheduler>.Instance)
         { WaitAsync = (signal, _, token) => RecordWakeAsync(signal, wakes, token) };
 
     /// <summary>Creates the actual scheduler with isolated persistence and controlled handlers.</summary>
@@ -400,7 +402,7 @@ public sealed partial class ConcurrencyTests
     /// <returns>An unstarted scheduler; the test must stop it before disposing its databases.</returns>
     /// <remarks>Test callers own all barriers and lifetimes; dispose database fixtures only after every asynchronous operation has stopped.</remarks>
     private static TelegramUpdateScheduler Create(Databases db, Executor executor, int concurrency = 4, int capacity = 1000, int drainSeconds = 10) =>
-        new(db.Inbox, executor, new AppConfig { TelegramUpdateMaxConcurrency = concurrency, TelegramUpdateQueueCapacity = capacity, TelegramUpdateShutdownDrainSeconds = drainSeconds }, NullLogger<TelegramUpdateScheduler>.Instance);
+        new(db.Inbox, executor, new AppConfig { TelegramUpdateMaxConcurrency = concurrency, TelegramUpdateQueueCapacity = capacity, TelegramUpdateShutdownDrainSeconds = drainSeconds, Performance = new PerformanceOptions { Telegram = new TelegramPerformanceOptions { WorkerCount = concurrency } } }, NullLogger<TelegramUpdateScheduler>.Instance);
     /// <summary>Observes an eventual diagnostic condition with a bounded failure deadline.</summary>
     /// <param name="predicate">Thread-safe condition expected to become true.</param>
     /// <returns>A task completing when the condition is true; throws after ten seconds.</returns>

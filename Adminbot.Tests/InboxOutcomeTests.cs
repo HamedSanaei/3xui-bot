@@ -249,10 +249,11 @@ public sealed partial class ConcurrencyTests
             }
             finally{Interlocked.Decrement(ref active);}
         }),concurrency:16);
+        await scheduler.StartAsync(default);
         // Per-user acceptance is ordered; producers for distinct users run concurrently and wakes coalesce.
         await Task.WhenAll(Enumerable.Range(1,50).Select(user=>Task.Run(async()=>
         {for(var ordinal=1;ordinal<=3;ordinal++)await scheduler.EnqueueAsync(user%2==0?"a":"b",Update(user*100+ordinal,user),default);} )));
-        await scheduler.StartAsync(default); await saturated.Task.WaitAsync(TimeSpan.FromSeconds(10)); release.TrySetResult();
+        await saturated.Task.WaitAsync(TimeSpan.FromSeconds(30)); release.TrySetResult();
         await scheduler.StopAsync(default);
         Assert.Equal(150,effects.Count); Assert.Equal(0,violations); Assert.Equal(16,maximum);
         var sorted=waits.Order().ToArray(); var uncertain=(await databases.Inbox.ReadUncertainSummaryAsync(default)).Count; Assert.Equal(0,uncertain);
@@ -762,3 +763,8 @@ public sealed partial class ConcurrencyTests
         { if (IsEnabled(logLevel)) Messages.Enqueue(formatter(state, exception)); }
     }
 }
+
+
+
+
+

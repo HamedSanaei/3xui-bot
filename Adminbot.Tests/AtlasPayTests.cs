@@ -819,7 +819,7 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("20260912005131_AddTenantReceiptUploadTarget", applied);
         // Latest applied migration only adds one non-null boolean column with a constant false default to BotInstances,
         // so every existing storefront stays opted out and no balance, receipt, fulfillment, or wallet value can change.
-        Assert.Equal("20260913065454_AddTenantPremiumUiEnabled", applied[^1]);
+        Assert.Equal("20260915221456_TelegramDeliveryQueue", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1544,7 +1544,7 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("20260912005131_AddTenantReceiptUploadTarget", applied);
         // Latest applied migration only adds one non-null boolean column with a constant false default to BotInstances,
         // so every existing storefront stays opted out and no balance, receipt, fulfillment, or wallet value can change.
-        Assert.Equal("20260913065454_AddTenantPremiumUiEnabled", applied[^1]);
+        Assert.Equal("20260915221456_TelegramDeliveryQueue", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1567,7 +1567,7 @@ public sealed partial class ConcurrencyTests
             Assert.Contains("20260912005131_AddTenantReceiptUploadTarget", history);
             // Latest applied migration only adds one non-null boolean column defaulting to false, so it cannot rewrite
             // balances, receipts, fulfillment state, or the still-empty provisional saga table.
-            Assert.Equal("20260913065454_AddTenantPremiumUiEnabled", history[^1]);
+            Assert.Equal("20260915221456_TelegramDeliveryQueue", history[^1]);
             command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='TenantCardProvisionalOperations';";
             Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
             command.CommandText = "SELECT COUNT(*) FROM TenantCardProvisionalOperations;";
@@ -1904,3 +1904,4 @@ public sealed partial class ConcurrencyTests
         return TenantOwnerCallback.Encode(store, "set-setting:AtlasPay:" + (enabled ? 1 : 0));
     }
 }
+
