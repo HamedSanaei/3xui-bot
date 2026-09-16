@@ -94,15 +94,19 @@ artifact path, digest, run id/attempt, live root, and service name. The host the
 6. runs the published executable's `--migration-check` against fresh databases and then against online-backup copies of
    `Data/users.db` and `Data/credentials.db`;
 7. activates the release with a sequence of same-filesystem renames (the retained rollback slot is emptied and its
-   occupant parked, live -> `publish.prev`, staged -> `publish`, then `publish.prev/Data` -> `publish/Data`), so the
+   occupant parked, live -> `publish.prev`, staged -> `publish`, then `publish.prev/Data` -> `publish/Data`), refusing a
+   staged release that already contains `Data` and re-checking the Data destination immediately before the move, because
+   `mv` into an existing directory would nest production state at `Data/Data`, so the
    protected `Data` directory keeps its inode and no database, `configuration.json`, or log file is ever copied, replaced,
    or truncated; the parked release is discarded only after the Data move succeeded, and a release left without Data by an
    interrupted switch is repaired from the retained slot when exactly one plausible candidate exists;
-8. restarts the service, waits for it to become active, and then proves the activated release can open the production
-   databases with the published executable's read-only `--migration-check`. Both the restart/health step and this database
-   check are required before the deployment is declared successful, and either failure rolls back to the retained previous
-   release (Data renamed back, service restarted again) - a running unit alone is not evidence that the application can
-   reach its databases.
+8. restarts the service, waits for it to become active, proves the activated release can open the production databases with
+   the published executable's read-only `--migration-check`, and then proves the service *process* resolved its databases
+   inside that same release, by reading the `[Database] users.db path: ...` / `credentials.db path: ...` lines the
+   application logs at startup for the unit's current main pid. All three are required before the deployment is declared
+   successful, and any failure rolls back to the retained previous release (Data renamed back, service restarted again) - a
+   running unit is neither evidence that the application can reach its databases nor evidence that the databases it reaches
+   belong to the release that was just activated.
 
 `assert_data_unchanged` re-checks the `Data` identity before and after every step that touches the filesystem, and
 `activate_release` refuses to run when staging and the live publish directory are on different filesystems, because the
@@ -110,10 +114,13 @@ renames would then silently degrade into copies.
 
 `scripts/deploy-production.tests.sh` proves the switch and the rollback functionally against temporary directories
 (Data content **and inode** preserved across both), proves a recreated `Data` directory is detected, proves the artifact
-preflight refuses archives carrying protected state and accepts a runtime-only archive, and asserts structurally that the
-script contains no `dotnet restore/build/test/publish/ef/tool`, no `git clone`, and that digest checks precede
-extraction, completeness and tutorial checks precede the preflight, the preflight precedes activation, activation precedes
-the restart, and rollback is reachable only after the restart and health check.
+preflight refuses archives carrying protected state and accepts a runtime-only archive, proves a release that already
+contains `Data` is refused instead of nesting production state, proves the service database-path parsing and the refusal of
+a service reporting a database outside the activated release (with stubbed `systemctl`/`journalctl`, no real unit,
+listener, or database), and asserts structurally that the script contains no `dotnet restore/build/test/publish/ef/tool`,
+no `git clone`, and that digest checks precede extraction, completeness and tutorial checks precede the preflight, the
+preflight precedes activation, activation precedes the restart, and rollback is reachable only after the restart and
+health check.
 
 ## Test schema policy
 

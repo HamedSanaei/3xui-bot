@@ -118,7 +118,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   runs only: tool/runtime and service-shape checks, artifact integrity (`sha256sum`) and content checks, extraction,
   release completeness (`Adminbot`, `Adminbot.dll`, `Assets/telegram-ui/emoji-map.json`), the tutorial-asset preflight,
   the migration preflight on the staged executable (fresh databases, then online-backup copies of the live
-  `Data/users.db` + `Data/credentials.db`), the atomic switch, `systemctl restart`, the health check, and rollback.
+  `Data/users.db` + `Data/credentials.db`), the atomic switch, `systemctl restart`, the persistence health gate, and rollback.
 - Deployment lock and interruption safety. The host-side deploy takes an exclusive `flock` on
   `/var/lock/vpnetiran-deploy.lock` (the systemd alias of `/run/lock/vpnetiran-deploy.lock`) with a bounded 300 s wait, so
   a held lock refuses the release with a clear reason instead of stalling it silently. The advisory lock lives on the
@@ -135,8 +135,12 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `publish.prev/Data` -> `publish/Data`. Because Data is only renamed it keeps its inode, so no database, configuration
   file, or log file is ever copied, replaced, or truncated; `assert_data_unchanged` checks the realpath and device:inode
   identity before and after every filesystem step, and `activate_release` refuses cross-filesystem staging so the renames
-  cannot silently degrade into copies. The retained rollback slot is emptied and its occupant parked before the live
-  release moves into it, because `mv` onto an existing directory nests instead of replacing - which once put Data at
+  cannot silently degrade into copies. The staged release is refused outright when it already contains a `Data` directory,
+  and the Data destination is re-checked immediately before the move, because `mv` into an existing directory nests: that
+  layout would bury production state at `Data/Data` and leave the live release with an empty `Data` directory for the
+  application to repopulate with fresh databases (reproduced against real `mv` semantics). The retained rollback slot is
+  emptied and its occupant parked before the live release moves into it, because `mv` onto an existing directory nests
+  instead of replacing - which once put Data at
   `publish.prev/publish/Data` and made the Data move fail on every deployment after the first. The parked release is
   discarded only once the Data move has succeeded and only while the live release holds database files of its own, and
   `recover_stranded_protected_data` puts Data back when a switch left a release without it, acting only on a single
@@ -148,8 +152,16 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `SQLite Error 14: unable to open database file` while systemd still reports the unit active - the exact production
   symptom after the half-applied switch. The deployment therefore validates the protected state before anything moves
   (`assert_protected_data_ready`: real `Data` directory, both databases present, non-empty, and writable, release parent
-  writable) and, after the restart, runs the published executable's own `--migration-check` against the live databases
-  (`release_opens_databases`); failing that check rolls back to the retained previous release.
+  writable, followed by `show_protected_state_details`, which prints the unit's service account plus the mode, owner, size,
+  and inode of that state and of the release parent - every permission check in this flow runs as root, where the
+  permission bits constrain nothing, so the identity is what makes a permissions question answerable from the workflow
+  log), proves after the restart that the activated release can open the live databases (`release_opens_databases`, the
+  published executable's own read-only `--migration-check`), and finally proves that the service process resolved its
+  databases inside that same release (`assert_service_reports_release_databases`, which reads the
+  `[Database] users.db path: ...` lines the application logs at startup for the unit's current main pid and fails the gate
+  on any path outside the activated release's `Data`). That last check is the only one that can see a wrong
+  `WorkingDirectory`, which the pre-switch `ExecStart` check cannot, because the resolved paths follow the process working
+  directory rather than the executable's location. Any failure of the three rolls back to the retained previous release.
 - Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
   `Data/**` is excluded because databases, production configuration, certificates, and the runtime plan catalog are
   shared state rather than release artifacts. The gitignored developer scratch directory `artifacts/**` is excluded from

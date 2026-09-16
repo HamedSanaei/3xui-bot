@@ -40,6 +40,11 @@ LOCK_WAIT_SECONDS=300
 # it is the one operation that could otherwise keep the deploy - and with it the deployment lock - alive long after the
 # GitHub-managed SSH session has gone away.
 PREFLIGHT_TIMEOUT_SECONDS=300
+# Upper bound for waiting until the restarted service has reported the database paths it resolved. The application logs
+# both paths unconditionally as its first startup lines, so this window only absorbs journald flush latency; exhausting it
+# means the deployment cannot prove persistence health and must not declare success.
+SERVICE_REPORT_ATTEMPTS=15
+SERVICE_REPORT_DELAY_SECONDS=2
 CURRENT_STAGE_ROOT=""
 PROTECTED_DATA_DIR=""
 PROTECTED_DATA_REAL=""
@@ -141,6 +146,28 @@ assert_protected_data_ready() {
   # writable and traversable for the switch to remain a rename rather than a copy.
   [[ -d "$live_publish" && -x "$live_publish" ]] || fail "live publish directory cannot be traversed."
   [[ -w "$(dirname -- "$live_publish")" ]] || fail "release parent directory is not writable, so a switch could not be atomic."
+}
+
+# Prints the identity the deployment just validated: the service account systemd will run, and the mode, owner, and size of
+# the protected directory, both production databases, and the release parent. Why it exists: every check above runs as
+# root, so its permission tests cannot distinguish a tree the service account can write from one only root can write. This
+# evidence is captured in the workflow log on every release, which is what makes a permissions question answerable after
+# the fact instead of requiring an interactive look at the host.
+show_protected_state_details() {
+  local live_publish="$1"
+  local live_data="$2"
+  local service_name="$3"
+  local service_user database_name
+
+  service_user="$(systemctl show "$service_name" -p User --value 2>/dev/null || true)"
+  [[ -n "$service_user" ]] || service_user="(unset; systemd runs the unit as root)"
+  printf 'Protected state identity (service account: %s):\n' "$service_user"
+  stat -Lc '  %n type=%F mode=%A owner=%U:%G size=%s inode=%i' \
+    -- "$live_data" "$(dirname -- "$live_publish")" 2>/dev/null || true
+  for database_name in users.db credentials.db; do
+    [[ -e "$live_data/$database_name" ]] || continue
+    stat -Lc '  %n type=%F mode=%A owner=%U:%G size=%s inode=%i' -- "$live_data/$database_name" 2>/dev/null || true
+  done
 }
 
 # Restores the protected Data directory to the live release after a switch that could not finish carrying it across.
@@ -299,6 +326,13 @@ activate_release() {
   # the same thing through protected_data_identity; repeating it here keeps the guarantee next to the move that needs it.
   [[ -d "$live_publish/Data" ]] || fail "the live release does not contain the protected Data directory, so nothing could be carried across the switch."
 
+  # The protected Data directory is moved into the release activated below, and `mv directory existing-directory` nests the
+  # source inside the destination instead of replacing it. A release that already contained a Data directory - shipped that
+  # way in the artifact, or touched by a service restart or an operator run against the staged tree - would therefore bury
+  # production state one level too deep and leave the live release with an empty Data directory, which the application
+  # repopulates with fresh databases. The same invariant is re-checked immediately before the move to cover that window.
+  [[ ! -e "$staged/Data" ]] || fail "the staged release already contains a Data directory, so production state could not be moved into place without nesting it."
+
   rm -rf -- "$next_slot" "$failed_slot" "$displaced_slot"
   mv -- "$staged" "$next_slot"
 
@@ -318,6 +352,8 @@ activate_release() {
   fi
   mv -- "$live_publish" "$prev_slot"
   mv -- "$next_slot" "$live_publish"
+  [[ ! -e "$live_publish/Data" ]] \
+    || fail "the activated release already contains a Data directory; refusing to nest the protected production state inside it."
   [[ -d "$prev_slot/Data" ]] || fail "internal error: the release moved aside lost the protected Data directory during the switch."
   mv -- "$prev_slot/Data" "$live_publish/Data"
   rm -rf -- "$displaced_slot"
@@ -390,6 +426,81 @@ release_opens_databases() {
   "$publish_root/Adminbot" --migration-check \
     --users-source "$live_data/users.db" \
     --credentials-source "$live_data/credentials.db"
+}
+
+# Extracts the database paths a service instance reported for itself from raw journal text, keeping the last value seen for
+# each database name so the newest startup wins over any earlier instance still inside the queried window.
+#
+# The parser is deliberately independent of the journal query so the matching rules can be tested against captured text.
+reported_database_paths() {
+  printf '%s\n' "$1" | awk '
+    {
+      marker = index($0, "[Database] ")
+      if (marker == 0) next
+      entry = substr($0, marker + 11)
+      separator = index(entry, " path: ")
+      if (separator == 0) next
+      name = substr(entry, 1, separator - 1)
+      path = substr(entry, separator + 7)
+      sub(/\r$/, "", path)
+      if (name == "" || path == "") next
+      last[name] = path
+    }
+    END { for (name in last) printf "%s=%s\n", name, last[name] }
+  ' | LC_ALL=C sort
+}
+
+# Reads the log of the service process that is running right now. It is filtered by the unit's current main pid so the
+# answer describes this deployment's service instance rather than a previous one that is still inside the time window; a
+# host whose systemd cannot report a pid falls back to a bounded time window.
+service_startup_journal() {
+  local service_name="$1"
+  local main_pid
+
+  main_pid="$(systemctl show "$service_name" -p MainPID --value 2>/dev/null || true)"
+  if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+    journalctl -u "$service_name" _PID="$main_pid" -n 200 --no-pager || true
+    return 0
+  fi
+  journalctl -u "$service_name" --since "5 minutes ago" -n 200 --no-pager || true
+}
+
+# Proves that the restarted service resolved its own database paths inside the release this deployment just activated. It is
+# the only check that closes the loop on the failure agent in SQLite error 14: because the application turns ./Data/users.db
+# into an absolute path once at startup, a service can be running, can hold locks, and can still be reading a different
+# release's directory after a switch, which systemd reports as a healthy unit.
+#
+# Returns non-zero instead of exiting so the caller can roll back, and reports every path it could not accept.
+assert_service_reports_release_databases() {
+  local service_name="$1"
+  local live_publish="$2"
+  local expected_data="$live_publish/Data"
+  local attempts=0 reported entry reported_path
+
+  while [[ "$attempts" -lt "$SERVICE_REPORT_ATTEMPTS" ]]; do
+    reported="$(reported_database_paths "$(service_startup_journal "$service_name")")"
+    if [[ -n "$reported" ]]; then
+      printf 'Database paths reported by the running service:\n'
+      while IFS= read -r entry; do
+        printf '  %s\n' "$entry"
+      done <<< "$reported"
+      while IFS= read -r entry; do
+        reported_path="${entry#*=}"
+        if [[ "$reported_path" != "$expected_data/"* ]]; then
+          printf 'The running service resolves %s to %s, which is outside the activated release (%s).\n' \
+            "${entry%%=*}" "$reported_path" "$expected_data" >&2
+          return 1
+        fi
+      done <<< "$reported"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep "$SERVICE_REPORT_DELAY_SECONDS"
+  done
+
+  printf 'The restarted service reported no database path within %s seconds, so its persistence health could not be proven.\n' \
+    "$((SERVICE_REPORT_ATTEMPTS * SERVICE_REPORT_DELAY_SECONDS))" >&2
+  return 1
 }
 
 # Shows a bounded slice of the service journal so a failed restart is diagnosable from the workflow log alone.
@@ -515,6 +626,7 @@ main() {
   protected_data_identity "$live_data"
   assert_data_unchanged
   assert_protected_data_ready "$live_publish" "$live_data"
+  show_protected_state_details "$live_publish" "$live_data" "$service_name"
 
   local stage_root="$STAGING_BASE/${deploy_sha}-${run_id}-${run_attempt}"
   local stage_publish="$stage_root/publish"
@@ -556,11 +668,13 @@ main() {
   assert_data_unchanged
   printf 'Release activated. Restarting %s.\n' "$service_name"
 
-  # A restarted unit is not yet a healthy deployment. The activated release must also prove that it can open the
-  # production databases, because the failure this guards against produces a running service whose every worker logs
-  # SQLite error 14 while systemd still reports the unit as active.
-  if ! restart_and_verify "$service_name" || ! release_opens_databases "$live_publish"; then
-    printf 'Health verification failed after activation (service restart or production database access). Rolling back to the previous release.\n' >&2
+  # A restarted unit is not yet a healthy deployment. The activated release must also prove that it can open the production
+  # databases, and the running service must report that it resolved those same databases, because the failure this guards
+  # against produces a service whose every worker logs SQLite error 14 while systemd still reports the unit as active.
+  if ! restart_and_verify "$service_name" \
+    || ! release_opens_databases "$live_publish" \
+    || ! assert_service_reports_release_databases "$service_name" "$live_publish"; then
+    printf 'Health verification failed after activation (service restart, production database access, or the service database paths). Rolling back to the previous release.\n' >&2
     rollback_release "$live_publish"
     assert_data_unchanged
     if restart_and_verify "$service_name"; then

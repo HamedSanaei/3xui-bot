@@ -363,6 +363,33 @@ if [[ "$(id -u)" != "0" ]]; then
   fi
   chmod 700 "$ready_live/Data"
 fi
+# The switch is a rename inside the release parent, so that parent has to stay writable and the live release has to stay
+# traversable. These two checks sit at the end of the same function and are exactly what a joined or reordered line would
+# silently drop, which is why they are asserted on their own.
+parent_root="$test_root/release-parent"
+parent_live="$parent_root/release/bin/Release/net10.0/linux-x64/publish"
+mkdir -p "$parent_live/Data"
+printf 'live-database\n' > "$parent_live/Data/users.db"
+printf 'live-credentials\n' > "$parent_live/Data/credentials.db"
+assert_protected_data_ready "$parent_live" "$parent_live/Data"
+# Permission bits only constrain a non-root process, so these cases are skipped when the suite itself runs as root.
+if [[ "$(id -u)" != "0" ]]; then
+  chmod 500 "$(dirname -- "$parent_live")"
+  if ( assert_protected_data_ready "$parent_live" "$parent_live/Data" ) 2>/dev/null; then
+    echo "Expected the deployment to refuse a release parent it could not rename inside." >&2
+    exit 1
+  fi
+  chmod 700 "$(dirname -- "$parent_live")"
+  chmod 000 "$parent_live"
+  if ( assert_protected_data_ready "$parent_live" "$parent_live/Data" ) 2>/dev/null; then
+    echo "Expected the deployment to refuse a live release it could not traverse." >&2
+    exit 1
+  fi
+  chmod 700 "$parent_live"
+fi
+printf 'Production release-parent validation test: PASS\n'
+printf '  accepted a usable layout and refused an unrenameable parent and an untraversable release\n'
+
 printf 'Production protected-state validation test: PASS\n'
 printf '  refused a missing database file and an empty database file\n'
 printf '  refused a Data directory that could not be written\n'
@@ -417,3 +444,134 @@ fi
 grep -Fq "deployment SHA must be exactly 40 hexadecimal characters" <<< "$streamed_output"
 [[ "$streamed_output" != *"BASH_SOURCE"* ]]
 printf '  streamed bash -s entrypoint safely rejected invalid SHA\n'
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Service-reported database paths
+# ----------------------------------------------------------------------------------------------------------------------
+
+# The application turns ./Data/users.db into an absolute path once at startup and keeps using it, so "the unit restarted"
+# is not proof that the running service reads the release this deployment activated. That is what made the production
+# incident possible: the service stayed up, systemd reported it as active, and every worker logged SQLite error 14 because
+# its cached path pointed at a release whose Data directory had been moved away. The deployment now reads the paths the
+# service reported for itself. No real unit, listener, socket, or database is involved in these assertions.
+journal_sample='Sep 16 01:48:05 host Adminbot[2440726]: [Database] users.db path: /root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Data/users.db
+Sep 16 01:48:05 host Adminbot[2440726]: [Database] credentials.db path: /root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Data/credentials.db'
+parsed_paths="$(reported_database_paths "$journal_sample")"
+grep -Fq 'users.db=/root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Data/users.db' <<< "$parsed_paths" \
+  || { echo "Expected the resolved users.db path to be parsed from the service log." >&2; exit 1; }
+grep -Fq 'credentials.db=/root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Data/credentials.db' <<< "$parsed_paths" \
+  || { echo "Expected the resolved credentials.db path to be parsed from the service log." >&2; exit 1; }
+
+if [[ -n "$(reported_database_paths 'Sep 16 01:48:05 host Adminbot[1]: nothing about databases here')" ]]; then
+  echo "Expected a log without resolved database paths to yield nothing." >&2
+  exit 1
+fi
+
+# A query window can still contain the previous instance, so the newest reported resolution has to win.
+newest_sample='Sep 16 01:40:00 host Adminbot[111]: [Database] users.db path: /root/vpnetiran/bin/Release/net10.0/linux-x64/publish.prev/Data/users.db
+Sep 16 01:48:05 host Adminbot[222]: [Database] users.db path: /root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Data/users.db'
+[[ "$(reported_database_paths "$newest_sample")" == 'users.db=/root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Data/users.db' ]] \
+  || { echo "Expected the newest reported database path to win." >&2; exit 1; }
+printf 'Production service database-path parsing test: PASS\n'
+printf '  parsed both resolved database paths, ignored unrelated lines, and kept the newest instance\n'
+
+# The refusal itself: a service reporting a database outside the activated release has to fail the health gate, and a
+# service reporting nothing at all must not be accepted as healthy either. systemd and journalctl are stubbed so the wiring
+# is exercised without a real unit.
+report_root="$test_root/service-report"
+report_live="$report_root/bin/Release/net10.0/linux-x64/publish"
+report_stub="$report_root/stub-bin"
+journal_stub_file="$report_root/journal.txt"
+mkdir -p "$report_live/Data" "$report_stub"
+printf 'live-database\n' > "$report_live/Data/users.db"
+printf 'live-credentials\n' > "$report_live/Data/credentials.db"
+cat > "$report_stub/journalctl" <<'JOURNAL_STUB'
+#!/usr/bin/env bash
+exec cat "$JOURNAL_STUB_FILE"
+JOURNAL_STUB
+cat > "$report_stub/systemctl" <<'SYSTEMCTL_STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "show" ]]; then
+  printf '4242\n'
+fi
+exit 0
+SYSTEMCTL_STUB
+chmod +x "$report_stub/journalctl" "$report_stub/systemctl"
+
+printf '%s\n' \
+  "Sep 16 01:48:05 host Adminbot[4242]: [Database] users.db path: $report_live/Data/users.db" \
+  "Sep 16 01:48:05 host Adminbot[4242]: [Database] credentials.db path: $report_live/Data/credentials.db" > "$journal_stub_file"
+if ! ( JOURNAL_STUB_FILE="$journal_stub_file" PATH="$report_stub:$PATH" \
+  assert_service_reports_release_databases "$EXPECTED_SERVICE_NAME" "$report_live" ); then
+  echo "Expected the health gate to pass when the service reports databases inside the activated release." >&2
+  exit 1
+fi
+
+printf '%s\n' \
+  "Sep 16 01:48:05 host Adminbot[4242]: [Database] users.db path: ${report_live}.prev/Data/users.db" > "$journal_stub_file"
+if ( JOURNAL_STUB_FILE="$journal_stub_file" PATH="$report_stub:$PATH" \
+  assert_service_reports_release_databases "$EXPECTED_SERVICE_NAME" "$report_live" ) 2>/dev/null; then
+  echo "Expected the health gate to refuse a service resolving a database outside the activated release." >&2
+  exit 1
+fi
+
+: > "$journal_stub_file"
+if ( JOURNAL_STUB_FILE="$journal_stub_file" PATH="$report_stub:$PATH" SERVICE_REPORT_ATTEMPTS=2 SERVICE_REPORT_DELAY_SECONDS=0 \
+  assert_service_reports_release_databases "$EXPECTED_SERVICE_NAME" "$report_live" ) 2>/dev/null; then
+  echo "Expected the health gate to refuse a service that reported no database path." >&2
+  exit 1
+fi
+printf 'Production service database-path health-check test: PASS\n'
+printf '  accepted a service reporting databases inside the activated release\n'
+printf '  refused a service resolving a database outside it, and one that reported nothing\n'
+
+# The permission checks in this flow run as root, where the permission bits constrain nothing. The protected state identity
+# is printed on every release instead, so a later permissions question is answerable from the workflow log alone.
+diagnostics_output="$(show_protected_state_details "$report_live" "$report_live/Data" "$EXPECTED_SERVICE_NAME")"
+grep -Fq 'users.db' <<< "$diagnostics_output" \
+  || { echo "Expected the protected-state details to include users.db." >&2; exit 1; }
+grep -Fq 'credentials.db' <<< "$diagnostics_output" \
+  || { echo "Expected the protected-state details to include credentials.db." >&2; exit 1; }
+grep -Fq 'mode=' <<< "$diagnostics_output" \
+  || { echo "Expected the protected-state details to include the mode and ownership." >&2; exit 1; }
+printf 'Production protected-state diagnostics test: PASS\n'
+printf '  reported the service account, mode, ownership, size, and inode of the protected state\n'
+
+# A release that already contains a Data directory when it reaches the switch would make `mv Data <release>/Data` nest
+# production state one level too deep, leaving the live release with an empty Data directory that the application would
+# repopulate with fresh databases. The switch must refuse it and leave production state exactly where it was.
+nested_root="$test_root/nested"
+nested_live="$nested_root/bin/Release/net10.0/linux-x64/publish"
+nested_stage="$nested_root/stage-publish"
+mkdir -p "$nested_live/Data" "$nested_stage/Data"
+printf 'live-database\n' > "$nested_live/Data/users.db"
+printf 'live-credentials\n' > "$nested_live/Data/credentials.db"
+printf 'staged-payload\n' > "$nested_stage/Adminbot"
+nested_inode_before="$(stat -Lc '%i' -- "$nested_live/Data")"
+
+if ( activate_release "$nested_stage" "$nested_live" ) 2>/dev/null; then
+  echo "Expected the switch to refuse a staged release that already contains a Data directory." >&2
+  exit 1
+fi
+[[ "$(stat -Lc '%i' -- "$nested_live/Data")" == "$nested_inode_before" ]] \
+  || { echo "Expected the refusal to leave the protected Data directory in place." >&2; exit 1; }
+[[ "$(cat "$nested_live/Data/users.db")" == 'live-database' ]] \
+  || { echo "Expected the refusal to leave production database content untouched." >&2; exit 1; }
+[[ ! -e "$nested_live/Data/Data" ]] \
+  || { echo "Expected production state never to be nested inside itself." >&2; exit 1; }
+printf 'Production Data-destination test: PASS\n'
+printf '  refused a release that already contained Data instead of nesting production state\n'
+
+# Structural guarantees: both new checks have to sit in the post-switch health gate that decides between a rollback and a
+# successful deployment, and the staging guard has to run before anything moves.
+health_gate="$(awk '/if ! restart_and_verify /{capture=1} capture{print} capture && /; then/{exit}' "$deploy_script")"
+grep -Fq -- "release_opens_databases \"\$live_publish\"" <<< "$health_gate" \
+  || { echo "Expected the post-switch health gate to prove database access on the activated release." >&2; exit 1; }
+grep -Fq -- "assert_service_reports_release_databases \"\$service_name\" \"\$live_publish\"" <<< "$health_gate" \
+  || { echo "Expected the post-switch health gate to prove the service resolved the activated release." >&2; exit 1; }
+grep -Fq -- "[[ ! -e \"\$staged/Data\" ]]" "$deploy_script" \
+  || { echo "Expected the switch to refuse a staged release that already contains Data." >&2; exit 1; }
+grep -Fq -- "refusing to nest the protected production state inside it" "$deploy_script" \
+  || { echo "Expected the switch to re-check the Data destination immediately before the move." >&2; exit 1; }
+printf 'Production persistence-health wiring test: PASS\n'
+printf '  the activated release and the running service are both proven before success is reported\n'
