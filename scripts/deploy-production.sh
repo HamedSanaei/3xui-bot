@@ -97,6 +97,65 @@ assert_data_unchanged() {
   [[ "$(stat -Lc '%d:%i' -- "$PROTECTED_DATA_DIR")" == "$PROTECTED_DATA_IDENTITY" ]] || fail "protected production Data directory was replaced."
 }
 
+# Reports whether a directory can only be the protected production Data directory: a real directory, never a symlink,
+# holding at least one SQLite database file. An empty scaffolding directory must never qualify, because mistaking one for
+# production state is the accident this whole deployment flow exists to prevent.
+is_protected_data_candidate() {
+  local candidate="$1"
+  [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+  local entry
+  for entry in "$candidate"/*; do
+    case "$entry" in
+      *.db|*.db-wal|*.db-shm) [[ -f "$entry" ]] && return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Restores the protected Data directory to the live release after a switch that could not finish carrying it across.
+#
+# Why this exists: a switch moves the live release aside first and renames Data into the new release afterwards. If that
+# sequence is interrupted in between - or if an earlier revision nested the live release inside the rollback slot - the live
+# release is left without Data, and the application would then start against newly created, empty databases.
+#
+# The repair deliberately refuses to guess: it acts only when exactly one plausible candidate is found among the retained
+# slots, and reports ambiguity as a refusal instead of picking one of several candidates.
+recover_stranded_protected_data() {
+  local live_publish="$1"
+  local live_data="$live_publish/Data"
+  local slot_base candidate found="" matches=0
+
+  # A path that already exists is left to protected_data_identity to judge; this only fills in a missing directory.
+  if [[ -e "$live_data" ]]; then
+    return 0
+  fi
+
+  slot_base="$(basename -- "$live_publish")"
+  for candidate in \
+    "$live_publish.prev/Data" \
+    "$live_publish.prev/$slot_base/Data" \
+    "$live_publish.failed/Data" \
+    "$live_publish.failed/$slot_base/Data"; do
+    is_protected_data_candidate "$candidate" || continue
+    found="$candidate"
+    matches=$((matches + 1))
+  done
+
+  case "$matches" in
+    0)
+      # Nothing to repair here; the ordinary Data validation reports the missing directory.
+      return 0
+      ;;
+    1)
+      printf 'Recovering the protected Data directory from %s.\n' "$found"
+      mv -- "$found" "$live_data" || fail "protected Data directory could not be recovered into the live release."
+      ;;
+    *)
+      fail "$matches candidate Data directories were found outside the live release; refusing to guess which one is production state."
+      ;;
+  esac
+}
+
 # ----------------------------------------------------------------------------------------------------------------------
 # Artifact validation
 # ----------------------------------------------------------------------------------------------------------------------
@@ -176,17 +235,21 @@ assert_tutorial_assets() {
 
 # Swaps a staged release into the live publish path and carries the protected Data directory across unchanged.
 #
-# The four steps below are renames inside one filesystem, so none of them copies a byte:
-#   1. the live release moves aside to the rollback slot;
-#   2. the staged release becomes the live release;
-#   3. the protected Data directory is renamed from the rollback slot into the new live release, keeping its inode;
-#   4. the rollback slot without Data is discarded by the caller after a healthy deployment.
+# The steps below are renames inside one filesystem, so none of them copies a byte:
+#   1. the rollback slot is freed and whichever release still occupied it is parked under a temporary name, because
+#      `mv live slot` onto an existing directory nests the live release inside the slot instead of replacing it;
+#   2. the live release moves aside to the rollback slot;
+#   3. the staged release becomes the live release;
+#   4. the protected Data directory is renamed from the rollback slot into the new live release, keeping its inode;
+#   5. the parked release is discarded, and the rollback slot - now without Data - is retained by the caller as the
+#      rollback point until the next deployment replaces it.
 # The service is never restarted by this function and never observes a partially installed tree, which is what makes the
 # switch atomic from the running process's point of view.
 activate_release() {
   local staged="$1"
   local live_publish="$2"
   local slot parent_device staged_device
+  local next_slot prev_slot failed_slot displaced_slot
 
   [[ -d "$staged" ]] || fail "staged release directory does not exist."
   [[ -d "$live_publish" ]] || fail "live publish directory does not exist."
@@ -196,12 +259,37 @@ activate_release() {
   if [[ "$parent_device" != "$staged_device" ]]; then
     fail "staged release and live publish directory are on different filesystems, so the switch could not be atomic."
   fi
+  next_slot="${live_publish}.next"
+  prev_slot="${live_publish}.prev"
+  failed_slot="${live_publish}.failed"
+  displaced_slot="${live_publish}.prev.displaced"
 
-  rm -rf -- "${live_publish}.next" "${live_publish}.failed"
-  mv -- "$staged" "${live_publish}.next"
-  mv -- "$live_publish" "${live_publish}.prev"
-  mv -- "${live_publish}.next" "$live_publish"
-  mv -- "${live_publish}.prev/Data" "$live_publish/Data"
+  # The Data directory is carried across from the release being replaced, so that release has to own it. The caller proves
+  # the same thing through protected_data_identity; repeating it here keeps the guarantee next to the move that needs it.
+  [[ -d "$live_publish/Data" ]] || fail "the live release does not contain the protected Data directory, so nothing could be carried across the switch."
+
+  rm -rf -- "$next_slot" "$failed_slot" "$displaced_slot"
+  mv -- "$staged" "$next_slot"
+
+  # The rollback slot must be free before the live release moves into it. Leaving a retained slot in place made
+  # `mv live slot` nest the live release inside it, which put Data at slot/live/Data, pointed the move below at a path
+  # that no longer existed, and stranded the new release with no Data at all.
+  #
+  # The displaced release is parked instead of deleted and is only discarded once the protected Data has been carried into
+  # the new live release, so a slot that still held the only copy of that Data survives a switch that fails midway.
+  if [[ -e "$prev_slot" ]]; then
+    # A slot is only ever discarded when the live release demonstrably holds production database files of its own. Without
+    # that proof the switch would delete what could be the only copy of production data and leave the application to start
+    # against empty databases, so the situation is reported as a refusal for an operator to inspect instead.
+    is_protected_data_candidate "$live_publish/Data" \
+      || fail "$prev_slot still contains production state while the live release holds no database files; refusing to discard it."
+    mv -- "$prev_slot" "$displaced_slot"
+  fi
+  mv -- "$live_publish" "$prev_slot"
+  mv -- "$next_slot" "$live_publish"
+  [[ -d "$prev_slot/Data" ]] || fail "internal error: the release moved aside lost the protected Data directory during the switch."
+  mv -- "$prev_slot/Data" "$live_publish/Data"
+  rm -rf -- "$displaced_slot"
 }
 
 # Restores the previous release after a failed health check. The new release and the protected Data directory are swapped
@@ -364,9 +452,6 @@ main() {
   service_exec="$(systemctl show "$service_name" -p ExecStart --value)"
   [[ "$service_exec" == *"$live_publish/Adminbot"* ]] || fail "systemd ExecStart does not point to the expected live Adminbot executable."
 
-  protected_data_identity "$live_data"
-  assert_data_unchanged
-
   mkdir -p "$STAGING_BASE"
   printf 'Acquiring the server-side deployment lock (giving up after %ss).\n' "$LOCK_WAIT_SECONDS"
   exec 9>"$LOCK_FILE"
@@ -374,6 +459,12 @@ main() {
     fail "another deployment is already running: $LOCK_FILE stayed locked for ${LOCK_WAIT_SECONDS}s."
   fi
   printf 'Server-side deployment lock acquired.\n'
+
+  # The protected Data directory is repaired and then identified inside the lock, so neither the repair nor the captured
+  # identity can race a concurrent manual deployment.
+  recover_stranded_protected_data "$live_publish"
+  protected_data_identity "$live_data"
+  assert_data_unchanged
 
   local stage_root="$STAGING_BASE/${deploy_sha}-${run_id}-${run_attempt}"
   local stage_publish="$stage_root/publish"

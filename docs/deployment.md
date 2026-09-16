@@ -92,9 +92,11 @@ artifact path, digest, run id/attempt, live root, and service name. The host the
    tutorial-asset preflight;
 6. runs the published executable's `--migration-check` against fresh databases and then against online-backup copies of
    `Data/users.db` and `Data/credentials.db`;
-7. activates the release with a sequence of same-filesystem renames (live -> `publish.prev`, staged -> `publish`, then
-   `publish.prev/Data` -> `publish/Data`), so the protected `Data` directory keeps its inode and no database,
-   `configuration.json`, or log file is ever copied, replaced, or truncated;
+7. activates the release with a sequence of same-filesystem renames (the retained rollback slot is emptied and its
+   occupant parked, live -> `publish.prev`, staged -> `publish`, then `publish.prev/Data` -> `publish/Data`), so the
+   protected `Data` directory keeps its inode and no database, `configuration.json`, or log file is ever copied, replaced,
+   or truncated; the parked release is discarded only after the Data move succeeded, and a release left without Data by an
+   interrupted switch is repaired from the retained slot when exactly one plausible candidate exists;
 8. restarts the service and waits for it to become active, rolling back to the retained previous release (Data renamed
    back, service restarted again) when it does not.
 

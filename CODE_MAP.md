@@ -135,8 +135,13 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `publish.prev/Data` -> `publish/Data`. Because Data is only renamed it keeps its inode, so no database, configuration
   file, or log file is ever copied, replaced, or truncated; `assert_data_unchanged` checks the realpath and device:inode
   identity before and after every filesystem step, and `activate_release` refuses cross-filesystem staging so the renames
-  cannot silently degrade into copies. One previous release is retained as the rollback slot; a failed health check
-  restores it (Data renamed back) and restarts the service. See `docs/deployment.md`.
+  cannot silently degrade into copies. The retained rollback slot is emptied and its occupant parked before the live
+  release moves into it, because `mv` onto an existing directory nests instead of replacing - which once put Data at
+  `publish.prev/publish/Data` and made the Data move fail on every deployment after the first. The parked release is
+  discarded only once the Data move has succeeded and only while the live release holds database files of its own, and
+  `recover_stranded_protected_data` puts Data back when a switch left a release without it, acting only on a single
+  unambiguous candidate and refusing when several could be production state. One previous release is retained as the
+  rollback slot; a failed health check restores it (Data renamed back) and restarts the service. See `docs/deployment.md`.
 - Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
   `Data/**` is excluded because databases, production configuration, certificates, and the runtime plan catalog are
   shared state rather than release artifacts. The gitignored developer scratch directory `artifacts/**` is excluded from

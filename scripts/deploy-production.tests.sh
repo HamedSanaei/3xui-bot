@@ -71,6 +71,69 @@ printf 'Production rollback test: PASS\n'
 printf '  restored the previous release payload\n'
 printf '  carried the same Data inode back with it\n'
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Repeat deployment
+# ----------------------------------------------------------------------------------------------------------------------
+
+# Every healthy deployment retains the rollback slot on purpose, and that slot never holds Data. So a second switch has to
+# take the slot over. It could not before: `mv live slot` onto the already existing slot nested the live release inside
+# it, which put Data at slot/live/Data, pointed the Data move at slot/Data, and left the newly activated release with no
+# protected Data at all - the exact production failure this test now pins down.
+repeat_root="$test_root/repeat"
+repeat_live="$repeat_root/bin/Release/net10.0/linux-x64/publish"
+repeat_stage_one="$repeat_root/stage-one"
+repeat_stage_two="$repeat_root/stage-two"
+mkdir -p "$repeat_live/Data" "$repeat_stage_one" "$repeat_stage_two"
+printf 'live-database\n' > "$repeat_live/Data/users.db"
+printf 'live-credentials\n' > "$repeat_live/Data/credentials.db"
+printf 'first-release\n' > "$repeat_stage_one/Adminbot"
+printf 'second-release\n' > "$repeat_stage_two/Adminbot"
+
+protected_data_identity "$repeat_live/Data"
+repeat_data_inode="$(stat -Lc '%i' -- "$repeat_live/Data")"
+
+activate_release "$repeat_stage_one" "$repeat_live"
+# Left exactly as a healthy deployment leaves it: the previous release retained without Data.
+[[ -d "${repeat_live}.prev" && ! -e "${repeat_live}.prev/Data" ]]
+
+activate_release "$repeat_stage_two" "$repeat_live"
+
+[[ "$(cat "$repeat_live/Adminbot")" == "second-release" ]]
+[[ "$(stat -Lc '%i' -- "$repeat_live/Data")" == "$repeat_data_inode" ]]
+[[ "$(cat "$repeat_live/Data/users.db")" == "live-database" ]]
+[[ "$(cat "$repeat_live/Data/credentials.db")" == "live-credentials" ]]
+[[ "$(cat "${repeat_live}.prev/Adminbot")" == "first-release" ]]
+[[ ! -e "${repeat_live}.prev/Data" ]]
+[[ ! -e "${repeat_live}.prev/$(basename -- "$repeat_live")" ]]
+[[ ! -e "${repeat_live}.prev.displaced" ]]
+printf 'Production repeat-deployment test: PASS\n'
+printf '  took over the retained rollback slot instead of nesting the live release inside it\n'
+printf '  carried the protected Data into the second release with its inode intact\n'
+
+# A switch interrupted between moving the live release aside and moving Data back leaves the live release without Data. The
+# repair must restore it, and must refuse rather than guess when several candidates could be production state.
+recover_root="$test_root/recover"
+recover_live="$recover_root/bin/Release/net10.0/linux-x64/publish"
+recover_nested="${recover_live}.prev/$(basename -- "$recover_live")/Data"
+mkdir -p "$recover_live" "$recover_nested"
+printf 'recovered-database\n' > "$recover_nested/users.db"
+printf 'old-release\n' > "${recover_live}.prev/Adminbot"
+recover_stranded_protected_data "$recover_live"
+[[ "$(cat "$recover_live/Data/users.db")" == "recovered-database" ]]
+printf 'Production stranded-Data recovery test: PASS\n'
+printf '  restored the protected Data directory from the retained slot\n'
+
+recover_ambiguous_live="$test_root/recover-ambiguous/bin/Release/net10.0/linux-x64/publish"
+mkdir -p "$recover_ambiguous_live" "${recover_ambiguous_live}.prev/Data" "${recover_ambiguous_live}.failed/Data"
+printf 'first-candidate\n' > "${recover_ambiguous_live}.prev/Data/users.db"
+printf 'second-candidate\n' > "${recover_ambiguous_live}.failed/Data/users.db"
+if ( recover_stranded_protected_data "$recover_ambiguous_live" ) 2>/dev/null; then
+  echo "Expected the stranded-Data repair to refuse an ambiguous layout." >&2
+  exit 1
+fi
+[[ ! -e "$recover_ambiguous_live/Data" ]]
+printf '  refused an ambiguous layout instead of guessing which Data directory is production state\n'
+
 # A replaced Data directory must be detected, because that is exactly the accident this whole flow exists to prevent.
 replaced_root="$test_root/replaced"
 mkdir -p "$replaced_root/Data"
