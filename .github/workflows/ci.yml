@@ -9,7 +9,14 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+  # Reusable-workflow entry point. A called workflow's job outputs stay invisible to the caller unless
+  # workflow_call.outputs maps them, and the production deploy job verifies the transferred archive against exactly
+  # this digest before the host is allowed to extract or activate anything.
   workflow_call:
+    outputs:
+      digest:
+        description: SHA-256 of the packaged release artifact.
+        value: ${{ jobs.build.outputs.digest }}
 
 permissions:
   contents: read
