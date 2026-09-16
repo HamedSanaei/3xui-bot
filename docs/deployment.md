@@ -84,7 +84,8 @@ copies it to `/root/.deploy/incoming/<sha>/`, and streams `scripts/deploy-produc
 artifact path, digest, run id/attempt, live root, and service name. The host then, in order:
 
 1. verifies tooling, the .NET 10 runtime, and that the service's `ExecStart` still points at the expected live executable;
-2. captures the protected `Data` directory identity (realpath plus device:inode);
+2. captures the protected `Data` directory identity (realpath plus device:inode) and refuses to continue unless that
+   directory really holds both production databases, non-empty and writable, inside a writable release parent;
 3. verifies the transferred archive's SHA-256 against the runner's digest;
 4. verifies the archive's entry list contains no `Data/`, database, configuration, or `.git` entry, and does contain the
    executable and its assembly;
@@ -97,8 +98,11 @@ artifact path, digest, run id/attempt, live root, and service name. The host the
    protected `Data` directory keeps its inode and no database, `configuration.json`, or log file is ever copied, replaced,
    or truncated; the parked release is discarded only after the Data move succeeded, and a release left without Data by an
    interrupted switch is repaired from the retained slot when exactly one plausible candidate exists;
-8. restarts the service and waits for it to become active, rolling back to the retained previous release (Data renamed
-   back, service restarted again) when it does not.
+8. restarts the service, waits for it to become active, and then proves the activated release can open the production
+   databases with the published executable's read-only `--migration-check`. Both the restart/health step and this database
+   check are required before the deployment is declared successful, and either failure rolls back to the retained previous
+   release (Data renamed back, service restarted again) - a running unit alone is not evidence that the application can
+   reach its databases.
 
 `assert_data_unchanged` re-checks the `Data` identity before and after every step that touches the filesystem, and
 `activate_release` refuses to run when staging and the live publish directory are on different filesystems, because the

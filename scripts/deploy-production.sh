@@ -112,6 +112,37 @@ is_protected_data_candidate() {
   return 1
 }
 
+# Verifies the protected state a switch depends on before anything moves: the Data directory with both production
+# databases exists and is usable, and the directories involved in the renames can be traversed and written.
+#
+# Why this exists: the application resolves its database paths to absolute values once at startup and then keeps running
+# while every access fails, so a release that reaches production without its Data directory does not crash - it degrades
+# into SQLite error 14 ("unable to open database file") for every worker. Missing or empty database files are the same
+# class of accident: SQLite would happily create them and the bot would appear to have lost all of its state.
+#
+# The deployment runs as root, so the permission checks below catch a release tree whose ownership or mode changed rather
+# than acting as a security boundary.
+assert_protected_data_ready() {
+  local live_publish="$1"
+  local live_data="$2"
+  local database_name
+
+  [[ -d "$live_data" && ! -L "$live_data" ]] || fail "protected Data directory is missing or is not a real directory."
+  [[ -x "$live_data" ]] || fail "protected Data directory cannot be traversed."
+  [[ -w "$live_data" ]] || fail "protected Data directory is not writable, so the application could not persist state."
+
+  for database_name in users.db credentials.db; do
+    [[ -f "$live_data/$database_name" ]] || fail "protected Data directory is missing $database_name."
+    [[ -r "$live_data/$database_name" ]] || fail "protected $database_name is not readable."
+    [[ -s "$live_data/$database_name" ]] || fail "protected $database_name is empty, which SQLite would treat as a fresh database."
+  done
+
+  # The switch renames the live release and the staged release inside the release parent, so that parent has to stay
+  # writable and traversable for the switch to remain a rename rather than a copy.
+  [[ -d "$live_publish" && -x "$live_publish" ]] || fail "live publish directory cannot be traversed."
+  [[ -w "$(dirname -- "$live_publish")" ]] || fail "release parent directory is not writable, so a switch could not be atomic."
+}
+
 # Restores the protected Data directory to the live release after a switch that could not finish carrying it across.
 #
 # Why this exists: a switch moves the live release aside first and renames Data into the new release afterwards. If that
@@ -344,6 +375,23 @@ run_migration_preflight() {
     || fail "migration preflight failed or exceeded ${PREFLIGHT_TIMEOUT_SECONDS}s against production database copies."
 }
 
+# Proves that a release can actually open the production databases, which a successful restart does not prove: systemd
+# reports the unit as active while the application resolves its database paths to absolute values captured once at startup,
+# so a release whose Data directory never arrived keeps running with every database access failing as SQLite error 14.
+#
+# The published executable's own non-serving preflight mode is used because it opens both production databases read-only
+# through SQLite and copies them with the online backup API, so this check never modifies production data.
+release_opens_databases() {
+  local publish_root="$1"
+  local live_data="$publish_root/Data"
+
+  [[ -x "$publish_root/Adminbot" ]] || return 1
+  is_protected_data_candidate "$live_data" || return 1
+  "$publish_root/Adminbot" --migration-check \
+    --users-source "$live_data/users.db" \
+    --credentials-source "$live_data/credentials.db"
+}
+
 # Shows a bounded slice of the service journal so a failed restart is diagnosable from the workflow log alone.
 show_recent_journal() {
   local service_name="$1"
@@ -461,10 +509,12 @@ main() {
   printf 'Server-side deployment lock acquired.\n'
 
   # The protected Data directory is repaired and then identified inside the lock, so neither the repair nor the captured
-  # identity can race a concurrent manual deployment.
+  # identity can race a concurrent manual deployment. Everything the switch depends on is validated here, before any
+  # artifact work, so a release that could not carry working production state is refused instead of installed.
   recover_stranded_protected_data "$live_publish"
   protected_data_identity "$live_data"
   assert_data_unchanged
+  assert_protected_data_ready "$live_publish" "$live_data"
 
   local stage_root="$STAGING_BASE/${deploy_sha}-${run_id}-${run_attempt}"
   local stage_publish="$stage_root/publish"
@@ -506,8 +556,11 @@ main() {
   assert_data_unchanged
   printf 'Release activated. Restarting %s.\n' "$service_name"
 
-  if ! restart_and_verify "$service_name"; then
-    printf 'Health verification failed after activation. Rolling back to the previous release.\n' >&2
+  # A restarted unit is not yet a healthy deployment. The activated release must also prove that it can open the
+  # production databases, because the failure this guards against produces a running service whose every worker logs
+  # SQLite error 14 while systemd still reports the unit as active.
+  if ! restart_and_verify "$service_name" || ! release_opens_databases "$live_publish"; then
+    printf 'Health verification failed after activation (service restart or production database access). Rolling back to the previous release.\n' >&2
     rollback_release "$live_publish"
     assert_data_unchanged
     if restart_and_verify "$service_name"; then

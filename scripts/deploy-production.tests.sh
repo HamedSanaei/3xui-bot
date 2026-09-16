@@ -321,6 +321,77 @@ printf '  completeness and tutorial checks run before the migration preflight\n'
 printf '  migration preflight runs before the atomic switch\n'
 printf '  systemd is restarted only after the switch, with rollback after health checks\n'
 
+# Database access has to be proven on the activated release, and the protected state has to be validated before anything
+# moves. A release that resolves its database paths at startup keeps running while every worker logs SQLite error 14, so
+# "the unit restarted" was never a sufficient health signal.
+database_health_line="$(grep -n -m1 -F -- "release_opens_databases \"\$live_publish\"" "$deploy_script" | cut -d: -f1)"
+if [[ -z "$database_health_line" || "$database_health_line" -le "$activate_line" ]]; then
+  echo "The activated release must prove database access after the switch." >&2
+  exit 1
+fi
+if ! grep -Fq -- "assert_protected_data_ready \"\$live_publish\" \"\$live_data\"" "$deploy_script"; then
+  echo "The protected Data directory must be validated before the switch." >&2
+  exit 1
+fi
+printf '  the activated release proves database access, after the protected state was validated before the switch\n'
+
+# The protected state a switch depends on must be refused when it is not usable, because SQLite would otherwise create the
+# missing database file and the bot would appear to have lost all of its production state.
+ready_live="$test_root/ready/bin/Release/net10.0/linux-x64/publish"
+mkdir -p "$ready_live/Data"
+printf 'live-database\n' > "$ready_live/Data/users.db"
+printf 'live-credentials\n' > "$ready_live/Data/credentials.db"
+assert_protected_data_ready "$ready_live" "$ready_live/Data"
+
+rm -f "$ready_live/Data/credentials.db"
+if ( assert_protected_data_ready "$ready_live" "$ready_live/Data" ) 2>/dev/null; then
+  echo "Expected the deployment to refuse a Data directory without credentials.db." >&2
+  exit 1
+fi
+: > "$ready_live/Data/credentials.db"
+if ( assert_protected_data_ready "$ready_live" "$ready_live/Data" ) 2>/dev/null; then
+  echo "Expected the deployment to refuse an empty credentials.db." >&2
+  exit 1
+fi
+printf 'live-credentials\n' > "$ready_live/Data/credentials.db"
+# Permission bits only constrain a non-root process, so this case is skipped when the suite itself runs as root.
+if [[ "$(id -u)" != "0" ]]; then
+  chmod 500 "$ready_live/Data"
+  if ( assert_protected_data_ready "$ready_live" "$ready_live/Data" ) 2>/dev/null; then
+    echo "Expected the deployment to refuse a Data directory the service could not write." >&2
+    exit 1
+  fi
+  chmod 700 "$ready_live/Data"
+fi
+printf 'Production protected-state validation test: PASS\n'
+printf '  refused a missing database file and an empty database file\n'
+printf '  refused a Data directory that could not be written\n'
+
+# The database health check must follow what the deployed executable really reports. A stub stands in for the published
+# binary so the wiring is verified without building a release.
+health_live="$test_root/health/bin/Release/net10.0/linux-x64/publish"
+mkdir -p "$health_live/Data"
+printf 'live-database\n' > "$health_live/Data/users.db"
+printf 'live-credentials\n' > "$health_live/Data/credentials.db"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$health_live/Adminbot"
+chmod +x "$health_live/Adminbot"
+if ! release_opens_databases "$health_live"; then
+  echo "Expected the database health check to pass when the release opens the databases." >&2
+  exit 1
+fi
+printf '#!/usr/bin/env bash\nexit 1\n' > "$health_live/Adminbot"
+if ( release_opens_databases "$health_live" ) 2>/dev/null; then
+  echo "Expected the database health check to fail when the release cannot open the databases." >&2
+  exit 1
+fi
+rm -f "$health_live/Adminbot"
+if ( release_opens_databases "$health_live" ) 2>/dev/null; then
+  echo "Expected the database health check to fail when the release has no executable." >&2
+  exit 1
+fi
+printf 'Production database health-check test: PASS\n'
+printf '  passed on a release that opens the databases and failed on one that cannot\n'
+
 # The deployment lock must be bounded and must be released by the deploy's own teardown. Otherwise one interrupted run
 # leaves an orphaned process holding /run/lock/vpnetiran-deploy.lock, and every later release stalls on flock instead of
 # failing with a reason - the wedge observed in production.

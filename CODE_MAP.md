@@ -142,6 +142,14 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `recover_stranded_protected_data` puts Data back when a switch left a release without it, acting only on a single
   unambiguous candidate and refusing when several could be production state. One previous release is retained as the
   rollback slot; a failed health check restores it (Data renamed back) and restarts the service. See `docs/deployment.md`.
+- Why a restarted unit is not a healthy deployment. The application resolves its database paths to absolute values once at
+  startup (`ResolveContentPath` in `Program.cs`, then `UserDbContext.ConfigureDatabasePath`) and keeps them for its whole
+  lifetime, so a release that reaches the live path without its `Data` directory does not crash: every worker keeps logging
+  `SQLite Error 14: unable to open database file` while systemd still reports the unit active - the exact production
+  symptom after the half-applied switch. The deployment therefore validates the protected state before anything moves
+  (`assert_protected_data_ready`: real `Data` directory, both databases present, non-empty, and writable, release parent
+  writable) and, after the restart, runs the published executable's own `--migration-check` against the live databases
+  (`release_opens_databases`); failing that check rolls back to the retained previous release.
 - Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
   `Data/**` is excluded because databases, production configuration, certificates, and the runtime plan catalog are
   shared state rather than release artifacts. The gitignored developer scratch directory `artifacts/**` is excluded from
