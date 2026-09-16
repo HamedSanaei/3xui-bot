@@ -193,3 +193,7 @@ Data/Logs.rar
 
 Data/Data.rar
 Data/Data.zip
+patch_tests.ps1
+fix_timeouts.ps1
+fix_ci.ps1
+fix_backtick.ps1

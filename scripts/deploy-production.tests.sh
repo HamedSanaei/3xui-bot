@@ -76,12 +76,15 @@ replaced_root="$test_root/replaced"
 mkdir -p "$replaced_root/Data"
 protected_data_identity "$replaced_root/Data"
 rm -rf -- "$replaced_root/Data"
-mkdir -p "$replaced_root/Data"
+# Use a symlink replacement here rather than relying on inode reuse behaviour, which varies by filesystem.
+# The production guard must reject any Data replacement, including a path that no longer refers to the original
+# protected directory.
+ln -s "$replaced_root/recreated-target" "$replaced_root/Data"
 if ( assert_data_unchanged ) 2>/dev/null; then
-  echo "Expected assert_data_unchanged to reject a recreated Data directory." >&2
+  echo "Expected assert_data_unchanged to reject a replaced Data directory." >&2
   exit 1
 fi
-printf '  detected a recreated Data directory\n'
+printf '  detected a replaced Data directory\n'
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Artifact validation
