@@ -124,11 +124,13 @@ jobs:
           set -Eeuo pipefail
           archive="$RUNNER_TEMP/release/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
           remote_dir="${{ env.INCOMING_BASE }}/$GITHUB_SHA"
-          ssh -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
+          ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+            -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -- "$PROD_USER@$PROD_HOST" "install -d -m 700 '$remote_dir'"
-          scp -i "$RUNNER_TEMP/prod_deploy_key" -P "$PROD_PORT" \
+          scp -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+            -i "$RUNNER_TEMP/prod_deploy_key" -P "$PROD_PORT" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -- "$archive" "$PROD_USER@$PROD_HOST:$remote_dir/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
@@ -145,7 +147,10 @@ jobs:
           remote_artifact="${{ env.INCOMING_BASE }}/$GITHUB_SHA/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
           remote_cmd="$(printf 'bash -s -- %q %q %q %q %q %q %q' \
             "$GITHUB_SHA" "$remote_artifact" "$ARTIFACT_DIGEST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "${{ env.DEPLOY_PATH }}" "${{ env.SERVICE_NAME }}")"
-          ssh -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
+          # Keepalives matter here: this session can sit silent for minutes while the host runs the migration preflight,
+          # and an idle connection torn down mid-deploy is reported only as a broken pipe with exit 255.
+          ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+            -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -- "$PROD_USER@$PROD_HOST" "$remote_cmd" \
@@ -163,7 +168,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           if [[ -f "$RUNNER_TEMP/prod_deploy_key" ]]; then
-            ssh -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
+            ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+              -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
               -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
               -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
               -- "$PROD_USER@$PROD_HOST" "rm -rf -- '${{ env.INCOMING_BASE }}/$GITHUB_SHA'" || true

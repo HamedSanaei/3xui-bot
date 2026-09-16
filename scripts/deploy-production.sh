@@ -26,6 +26,10 @@ EXPECTED_SERVICE_NAME="vpnetiranbot.service"
 STAGING_BASE="/root/.deploy/vpnetiran"
 INCOMING_BASE="/root/.deploy/incoming"
 LOCK_FILE="/var/lock/vpnetiran-deploy.lock"
+# Upper bound for waiting on the exclusive deployment lock. An unbounded `flock -x` turned a held lock into a silent
+# stall with no output at all, which GitHub's SSH client only reported minutes later as a broken pipe and exit 255, so
+# the wait is capped and announced before it can block.
+LOCK_WAIT_SECONDS=120
 CURRENT_STAGE_ROOT=""
 PROTECTED_DATA_DIR=""
 PROTECTED_DATA_REAL=""
@@ -285,10 +289,12 @@ main() {
   assert_data_unchanged
 
   mkdir -p "$STAGING_BASE"
+  printf 'Acquiring the server-side deployment lock (giving up after %ss).\n' "$LOCK_WAIT_SECONDS"
   exec 9>"$LOCK_FILE"
-  if ! flock -x 9; then
-    fail "could not acquire the server-side deployment lock."
+  if ! flock -w "$LOCK_WAIT_SECONDS" -x 9; then
+    fail "another deployment is already running: $LOCK_FILE stayed locked for ${LOCK_WAIT_SECONDS}s."
   fi
+  printf 'Server-side deployment lock acquired.\n'
 
   local stage_root="$STAGING_BASE/${deploy_sha}-${run_id}-${run_attempt}"
   local stage_publish="$stage_root/publish"
