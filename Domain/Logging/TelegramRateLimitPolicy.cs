@@ -1,4 +1,5 @@
 using System;
+using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -112,16 +113,25 @@ namespace Adminbot.Domain.Logging
         /// Exception raised by Telegram polling, update handling, or Telegram log delivery. May be null.
         /// </param>
         /// <returns>
-        /// <c>true</c> when the exception is an <see cref="ApiRequestException"/> with error code 429; otherwise
-        /// <c>false</c>.
+        /// <c>true</c> when the exception is an <see cref="ApiRequestException"/> with error code 429, or a plain
+        /// <see cref="RequestException"/> whose HTTP status is <c>429 Too Many Requests</c>; otherwise <c>false</c>.
         /// </returns>
         /// <remarks>
         /// This check is used to pause receivers, to swallow update-handler rate limits without killing the receiver,
-        /// and to keep rate-limit failures out of the Telegram log channel.
+        /// and to keep rate-limit failures out of the Telegram log channel. Both exception shapes are recognized because
+        /// Telegram's edge can return a 429 with a body that is not parseable Telegram JSON, which arrives as a plain
+        /// <see cref="RequestException"/>; missing that shape meant the receiver retried immediately instead of waiting.
         /// </remarks>
         public static bool IsRateLimited(Exception exception)
         {
-            return exception is ApiRequestException { ErrorCode: 429 };
+            if (exception is ApiRequestException { ErrorCode: 429 })
+                return true;
+
+            // Telegram's edge can answer a rate limit with a response body that is not parseable Telegram JSON, which
+            // Telegram.Bot surfaces as a plain RequestException carrying only the HTTP status. Recognizing that shape here
+            // keeps the authoritative RetryAfter policy in charge: without it the 429 fell through to the generic polling
+            // logger and the receiver retried immediately instead of honoring the rate limit.
+            return exception is RequestException { HttpStatusCode: HttpStatusCode.TooManyRequests };
         }
 
         /// <summary>

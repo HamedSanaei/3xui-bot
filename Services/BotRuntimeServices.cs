@@ -27,6 +27,13 @@ public class BotRegistry
     /// Creates the registry from AppConfig.Bots and determines the default bot.
     /// </summary>
     /// <param name="configuration">Application configuration loaded from configuration.json.</param>
+    /// <remarks>
+    /// This type deliberately holds no logger. The production logging pipeline registers a provider that resolves
+    /// <see cref="BotRegistry" /> itself, so depending on <c>ILogger&lt;BotRegistry&gt;</c> here would close a dependency cycle
+    /// (registry to logger factory to provider to registry) and deadlock the container. Membership diagnostics are
+    /// therefore produced by callers that already own a logger - application startup, the receiver manager, and the sender
+    /// - using the read-only <see cref="Describe" /> snapshot below.
+    /// </remarks>
     public BotRegistry(IConfiguration configuration)
     {
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
@@ -34,6 +41,81 @@ public class BotRegistry
             _bots[bot.Id] = bot;
 
         _defaultBot = _bots.Values.FirstOrDefault(b => b.IsDefault) ?? _bots.Values.FirstOrDefault();
+    }
+
+    /// <summary>
+    /// Registered bot counts by type and availability.
+    /// </summary>
+    /// <param name="Total">Every runtime bot currently registered, owned, assistant, and tenant.</param>
+    /// <param name="Owned">Bots of type <see cref="BotInstanceTypes.Owned" /> loaded from configuration.</param>
+    /// <param name="Tenant">Storefront bots hydrated from users.db or added by an owner at runtime.</param>
+    /// <param name="SalesAssistant">Assistant bots configured alongside the owned bots.</param>
+    /// <param name="Enabled">Registered bots whose configuration currently allows receiving updates.</param>
+    /// <param name="EnabledTenant">Enabled storefront bots only, which is what the shared output pipeline may deliver to.</param>
+    /// <remarks>
+    /// Counts are process-local and contain no token, chat id, or customer data, so a census can be logged or shown to a
+    /// super-admin as-is. A tenant missing from <paramref name="Tenant" /> is the exact shape of "the receiver started but
+    /// the shared pipeline never learned about it".
+    /// </remarks>
+    public readonly record struct BotRegistryCensus(
+        int Total,
+        int Owned,
+        int Tenant,
+        int SalesAssistant,
+        int Enabled,
+        int EnabledTenant);
+
+    /// <summary>
+    /// Snapshots the registry by type and availability for a startup or maintenance diagnostic.
+    /// </summary>
+    /// <returns>Counts of registered, owned, tenant, assistant, and enabled bots at the moment of the call.</returns>
+    /// <remarks>Read-only and lock-protected; never mutates membership or availability.</remarks>
+    public BotRegistryCensus Describe()
+    {
+        lock (_syncRoot)
+        {
+            var bots = _bots.Values.ToList();
+            var tenants = bots.Where(b => string.Equals(b.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase)).ToList();
+            return new BotRegistryCensus(
+                bots.Count,
+                bots.Count(b => string.Equals(b.Type, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase)),
+                tenants.Count,
+                bots.Count(b => string.Equals(b.Type, BotInstanceTypes.SalesAssistant, StringComparison.OrdinalIgnoreCase)),
+                bots.Count(b => b.Enabled),
+                tenants.Count(b => b.Enabled));
+        }
+    }
+
+    /// <summary>
+    /// Lists the internal ids of every registered bot of one type, for a membership diagnostic.
+    /// </summary>
+    /// <param name="type">
+    /// Bot type filter such as <see cref="BotInstanceTypes.Tenant" />, or <c>null</c> to list every registered bot.
+    /// </param>
+    /// <returns>
+    /// Ids ordered ordinally so two diagnostics can be compared directly; empty when nothing matches. Ids are internal
+    /// runtime identities and contain no token, chat id, or customer data.
+    /// </returns>
+    /// <remarks>
+    /// Callers log this. The registry itself never logs, because the production logging pipeline resolves the registry and
+    /// would otherwise form a dependency cycle through the logger factory.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var tenants = registry.DescribeIds(BotInstanceTypes.Tenant);
+    /// logger.LogInformation("Registered storefronts. Count={Count} BotIds={BotIds}", tenants.Count, string.Join(",", tenants));
+    /// </code>
+    /// </example>
+    public IReadOnlyList<string> DescribeIds(string type = null)
+    {
+        lock (_syncRoot)
+        {
+            return _bots.Values
+                .Where(bot => type == null || string.Equals(bot.Type, type, StringComparison.OrdinalIgnoreCase))
+                .Select(bot => bot.Id)
+                .OrderBy(id => id, StringComparer.Ordinal)
+                .ToArray();
+        }
     }
 
     /// <summary>
@@ -79,25 +161,75 @@ public class BotRegistry
             .Where(x => x.Type == BotInstanceTypes.Tenant)
             .ToListAsync(cancellationToken);
 
+        var added = new List<BotInstanceConfig>();
+        var replaced = new List<BotInstanceConfig>();
         lock (_syncRoot)
         {
             foreach (var tenant in tenants)
-                _bots[tenant.Id] = ToConfig(tenant);
+            {
+                var config = ToConfig(tenant);
+                if (_bots.ContainsKey(config.Id))
+                    replaced.Add(config);
+                else
+                    added.Add(config);
+
+                _bots[config.Id] = config;
+            }
         }
+
+        // The result is exposed to the caller instead of being logged here: the caller owns a logger and the registry must
+        // not depend on the logging pipeline. A storefront that exists in users.db but never appears in the caller's line is
+        // not registered, which is a different failure from a storefront whose receiver failed to start.
+        LastLoadAddedIds = added.Select(bot => bot.Id).ToArray();
+        LastLoadReplacedIds = replaced.Select(bot => bot.Id).ToArray();
     }
+
+    /// <summary>
+    /// Internal ids of the storefronts the most recent database hydration added to the registry.
+    /// </summary>
+    /// <remarks>
+    /// Empty before the first hydration. Used by the startup diagnostic so "which tenants entered the registry from
+    /// users.db" is answerable from a log line rather than inferred from receiver behaviour.
+    /// </remarks>
+    public IReadOnlyList<string> LastLoadAddedIds { get; private set; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Internal ids of the storefronts the most recent database hydration overwrote in the registry.
+    /// </summary>
+    /// <remarks>
+    /// A replacement is the fixed-key overwrite signal: hydration is idempotent by design, so a non-empty value means an
+    /// entry already existed for that id. Logged by the caller because the registry holds no logger.
+    /// </remarks>
+    public IReadOnlyList<string> LastLoadReplacedIds { get; private set; } = Array.Empty<string>();
 
     /// <summary>
     /// Adds or updates a bot instance in the runtime registry after an owner edits tenant settings.
     /// </summary>
     /// <param name="instance">Persisted bot instance to convert into runtime configuration.</param>
-    public void Upsert(BotInstance instance)
+    /// <returns>
+    /// <c>true</c> when an entry already existed for that identical id and was overwritten; <c>false</c> when this call
+    /// created a new entry. The caller logs this because the registry holds no logger.
+    /// </returns>
+    /// <remarks>
+    /// Owners enable, disable, and reconfigure storefronts at runtime; each of those is a registry write that decides
+    /// whether the shared output pipeline may deliver to that bot. Every write is keyed by the bot's own id, so the return
+    /// value is also the fixed-key overwrite signal callers record.
+    /// </remarks>
+    public bool Upsert(BotInstance instance)
     {
         if (instance == null || string.IsNullOrWhiteSpace(instance.Id))
-            return;
+            return false;
 
+        var config = ToConfig(instance);
+        bool replaced;
         lock (_syncRoot)
-            _bots[instance.Id] = ToConfig(instance);
+        {
+            replaced = _bots.ContainsKey(config.Id);
+            _bots[config.Id] = config;
+        }
+
         AvailabilityChanged?.Invoke();
+        return replaced;
     }
 
     /// <summary>
@@ -714,9 +846,21 @@ public class MultiBotHostedService : IHostedService
     private readonly ILogger<MultiBotHostedService> _logger;
     private readonly TimeSpan _startupProbeTimeout;
     private CancellationTokenSource _receivingCts;
-    private readonly Dictionary<string, CancellationTokenSource> _botReceivers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, ReceiverGeneration> _botReceivers = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Tracked receiver generations; a replacement waits for its predecessor to exit.</summary>
     private readonly Dictionary<string, Task> _receiverTasks = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Process-local single-flight guard that allows exactly one long-polling loop per internal bot and per Telegram token.
+    /// </summary>
+    /// <remarks>
+    /// The per-bot lifecycle gate serializes start attempts, but it cannot see two different internal bot ids configured
+    /// with the same credential. That shape produced two <c>getUpdates</c> loops over one token, which Telegram answers with
+    /// its 409 conflict, so this registry rejects the duplicate attempt and reports who already holds the token instead of
+    /// letting it surface as unrelated polling noise on several storefronts at once.
+    /// </remarks>
+    private readonly TelegramPollingLeaseRegistry _pollingLeases = new();
+    /// <summary>Monotonic process-local generation counter used to identify one polling loop for its whole lifetime.</summary>
+    private long _receiverGeneration;
     /// <summary>Live receiver, initialization, and recovery tasks observed through host shutdown.</summary>
     private readonly HashSet<Task> _backgroundTasks = new();
     private readonly Dictionary<string, SemaphoreSlim> _lifecycleGates = new(StringComparer.OrdinalIgnoreCase);
@@ -808,12 +952,27 @@ public class MultiBotHostedService : IHostedService
         _receivingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var nonRetryableBotIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Configuration is audited before the first receiver starts so a token shared by two runtime bots is reported as one
+        // concrete finding before it can surface later as Telegram's 409 conflict on several unrelated storefronts at once.
+        LogConfiguredPollingIdentityAudit();
+
         foreach (var bot in _registry.Bots)
         {
             var result = await StartBotAttemptSerializedAsync(bot.Id, cancellationToken);
             if (IsNonRetryableStartupResult(result))
                 nonRetryableBotIds.Add(bot.Id);
         }
+
+        // Startup census: the registry membership and the receiver registrations are reported together, because the two
+        // can legitimately differ and every difference has a different cause (disabled bot, missing token, duplicate
+        // credential). A bot present here but missing from the sender lane later is a delivery registration problem; a bot
+        // absent here never started receiving at all.
+        BotRegistry.BotRegistryCensus census = _registry.Describe();
+        int receiversRegistered;
+        lock (_syncRoot) receiversRegistered = _botReceivers.Count;
+        _logger.LogInformation(
+            "Telegram receiver startup census. registryTotal={RegistryTotal} registryTenants={RegistryTenants} registryEnabled={RegistryEnabled} registryEnabledTenants={RegistryEnabledTenants} receiversRegistered={ReceiversRegistered} nonRetryableBots={NonRetryableBots}",
+            census.Total, census.Tenant, census.Enabled, census.EnabledTenant, receiversRegistered, nonRetryableBotIds.Count);
 
         TrackBackgroundTask(Task.Run(
             () => RecoverMissingStartupReceiversAsync(nonRetryableBotIds, _receivingCts.Token),
@@ -967,12 +1126,58 @@ public class MultiBotHostedService : IHostedService
 
         await DisableTenantConflictsWonByAsync(bot, cancellationToken);
 
+        // Single-flight acquisition happens before any Telegram call, so a duplicate attempt is refused before a second
+        // getUpdates loop can exist. The refusal names the internal bot and token fingerprint that already own the
+        // credential, which is what turns an invisible duplicate poller into a directly actionable log line.
+        var tokenFingerprint = TelegramBotTokenIdentity.FingerprintPrefix(bot.Token);
+        var generation = Interlocked.Increment(ref _receiverGeneration);
+        var processId = Environment.ProcessId;
+        var lease = _pollingLeases.TryAcquire(bot.Id, tokenFingerprint, generation, processId, "receiver_start");
+        if (!lease.Acquired && lease.Lease?.Stopping == true)
+        {
+            // The holder has begun an intentional stop, so this is a legitimate restart rather than a duplicate poller. Wait
+            // for that predecessor's loop to actually leave getUpdates - never for a live duplicate - and then retry once.
+            //
+            // The release is performed here rather than left to the predecessor's own completion continuation because
+            // continuation ordering is not guaranteed: a waiter can resume before the inline post-completion continuation
+            // runs, which would leave the lease briefly held after its loop had already ended and make a legitimate restart
+            // fail intermittently. This caller holds the per-bot lifecycle gate and has just awaited that loop, so it has
+            // provable evidence the loop ended; the generation check on the release keeps it from touching any other owner.
+            Task holderLoop;
+            lock (_syncRoot) _receiverTasks.TryGetValue(lease.HeldByBotId, out holderLoop);
+            await TelegramReceiverLifetime.ObservePreviousAsync(holderLoop, cancellationToken);
+            _pollingLeases.Release(lease.HeldByBotId, lease.HeldByGeneration, "predecessor loop ended");
+            lease = _pollingLeases.TryAcquire(bot.Id, tokenFingerprint, generation, processId, "receiver_start_after_predecessor");
+        }
+
+        if (!lease.Acquired)
+        {
+            _logger.LogWarning(
+                "Telegram polling attempt rejected because a polling loop already owns this identity. botId={BotId} tokenHashPrefix={TokenHashPrefix} pollingGeneration={PollingGeneration} processId={ProcessId} rejectionReason={RejectionReason} heldByBotId={HeldByBotId} heldByTokenHashPrefix={HeldByTokenHashPrefix} heldByGeneration={HeldByGeneration} heldByProcessId={HeldByProcessId}",
+                bot.Id,
+                tokenFingerprint,
+                generation,
+                processId,
+                lease.RejectionReason,
+                lease.HeldByBotId,
+                lease.HeldByTokenFingerprint,
+                lease.HeldByGeneration,
+                lease.HeldByProcessId);
+            _runtimeStatusStore.MarkFailed(bot, "duplicate_polling", $"polling already owned by {lease.HeldByBotId} ({lease.RejectionReason})");
+            return lease.RejectionReason == TelegramPollingLeaseRejection.BotAlreadyPolling
+                ? BotStartupResult.AlreadyRunning
+                : BotStartupResult.DuplicateConflict;
+        }
+
         CancellationTokenSource botCts = null;
+        ReceiverGeneration receiver = null;
+        var receiverRegistered = false;
         try
         {
             // Each bot receives with its own token but dispatches through the shared TelegramBotService.
             var parentToken = _receivingCts?.Token ?? cancellationToken;
             botCts = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
+            receiver = new ReceiverGeneration(bot.Id, tokenFingerprint, generation, botCts);
             var client = _clientProvider.GetClient(bot.Id);
             Telegram.Bot.Types.User me = null;
             Exception transientProbeError = null;
@@ -1037,11 +1242,22 @@ public class MultiBotHostedService : IHostedService
                 },
                 cancellationToken: botCts.Token);
 
+            receiver.Loop = receiverTask;
             lock (_syncRoot) _receiverTasks[bot.Id] = receiverTask;
             TrackBackgroundTask(receiverTask);
 
             lock (_syncRoot)
-                _botReceivers[bot.Id] = botCts;
+                _botReceivers[bot.Id] = receiver;
+            receiverRegistered = true;
+
+            // The lease, the receiver registration, and the cancellation source all end with the loop itself. Doing this on
+            // the loop's own completion is what guarantees that a replacement never starts while its predecessor is still
+            // inside getUpdates, and that the cancellation source is never disposed while the loop is still using it.
+            _ = receiverTask.ContinueWith(
+                _ => OnReceiverLoopCompleted(receiver),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
 
             if (transientProbeError == null)
             {
@@ -1057,9 +1273,13 @@ public class MultiBotHostedService : IHostedService
             }
 
             _logger.LogInformation(
-                "Started Telegram bot receiver. botId={BotId}, username=@{Username}",
+                "Started Telegram bot receiver. botId={BotId} username=@{Username} tokenHashPrefix={TokenHashPrefix} pollingGeneration={PollingGeneration} processId={ProcessId} pollingTaskId={PollingTaskId}",
                 bot.Id,
-                me?.Username ?? bot.Username);
+                me?.Username ?? bot.Username,
+                tokenFingerprint,
+                generation,
+                processId,
+                receiverTask.Id);
             if (IsTenant(bot))
                 LogTenantRuntimeEvent(
                     bot,
@@ -1078,20 +1298,23 @@ public class MultiBotHostedService : IHostedService
         }
         catch (Exception ex)
         {
-            // If a post-registration log/status action throws, remove only this exact CTS. A newer receiver
-            // generation must never be removed by cleanup from an older failed start attempt.
-            lock (_syncRoot)
+            if (receiverRegistered)
             {
-                if (botCts != null &&
-                    _botReceivers.TryGetValue(bot.Id, out var registeredCts) &&
-                    ReferenceEquals(registeredCts, botCts))
-                {
-                    _botReceivers.Remove(bot.Id);
-                }
+                // The receiver was already registered and its polling loop is live, so teardown follows the one normal stop
+                // path: the loop's own completion releases the lease, unregisters the generation, and disposes the
+                // cancellation source. Hand-rolling teardown here is what could dispose a token the loop was still using and
+                // leave an orphan loop polling after its bot had been marked failed.
+                StopBotCore(bot.Id, "receiver start failed after registration", generation);
+            }
+            else
+            {
+                // The lease is released for this failed attempt only. Release is generation-checked, so this can never free a
+                // lease that a replacement generation has already acquired.
+                _pollingLeases.Release(bot.Id, generation, "receiver_start_failed");
+                botCts?.Cancel();
+                botCts?.Dispose();
             }
 
-            botCts?.Cancel();
-            botCts?.Dispose();
             _clientProvider.Invalidate(bot.Id);
 
             if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
@@ -1508,6 +1731,46 @@ public class MultiBotHostedService : IHostedService
         if (cancellationToken.IsCancellationRequested || exception is OperationCanceledException)
             return;
 
+        // The failure is classified once, before any branch, so every log line below reports the same identity fields: the
+        // internal bot id, the token fingerprint prefix (never the token), the polling generation, the polling task instance
+        // id, the process id, the inner exception type, the resolved status code, and the redacted response text. That set is
+        // what turns "errorType=RequestException" into an answerable question: which loop, which token, which code.
+        var failure = TelegramPollingFailureDiagnostics.Describe(exception);
+        var lease = _pollingLeases.Current(botId);
+
+        // Conflict handling is deliberately hoisted above the rate-limit, delivery, and transient branches. A duplicate
+        // poller or an active webhook is a permanent condition for this receiver generation, and the previous ordering meant
+        // a conflict arriving as a plain RequestException could be answered with a retry delay instead, turning one conflict
+        // into a sustained conflict loop across every bot sharing that token.
+        var conflictBot = _registry.GetById(botId);
+        if (conflictBot != null &&
+            string.Equals(conflictBot.Id, botId, StringComparison.OrdinalIgnoreCase) &&
+            failure.IsConflict)
+        {
+            if (IsTelegramWebhookPollingConflict(exception))
+            {
+                ScheduleWebhookConflictRecovery(conflictBot);
+                return;
+            }
+
+            if (IsTelegramGetUpdatesConflict(exception))
+            {
+                await StopBotAsync(botId);
+                _logger.LogCritical(
+                    "Telegram receiver stopped because another getUpdates poller is using the same token. botId={BotId} username=@{Username} tokenHashPrefix={TokenHashPrefix} pollingGeneration={PollingGeneration} pollingTaskId={PollingTaskId} processId={ProcessId} statusCode={StatusCode} innerException={InnerException} responseText={ResponseText}",
+                    conflictBot.Id,
+                    conflictBot.Username,
+                    lease?.TokenFingerprint ?? "none",
+                    lease?.Generation ?? 0,
+                    TryGetReceiverTaskForDiagnostics(botId)?.Id ?? 0,
+                    Environment.ProcessId,
+                    TelegramPollingFailureDiagnostics.FormatStatusCode(failure.StatusCode),
+                    string.IsNullOrEmpty(failure.InnerExceptionType) ? "none" : failure.InnerExceptionType,
+                    string.IsNullOrEmpty(failure.ResponseText) ? "none" : failure.ResponseText);
+                return;
+            }
+        }
+
         if (TelegramRateLimitPolicy.IsRateLimited(exception))
         {
             // A 429 proves Telegram's HTTP path is reachable, so the current transient-5xx incident is over; the wasted
@@ -1516,10 +1779,21 @@ public class MultiBotHostedService : IHostedService
             _transientPollingBackoff.RecordHealthyPolling(botId);
 
             var retryDelay = TelegramRateLimitPolicy.GetRetryDelay(exception);
-            _logger.LogDebug(
-                "Telegram polling rate limited; pausing this receiver before the next getUpdates call. botId={BotId}, retryAfterSeconds={RetryAfterSeconds}",
+
+            // Raised from debug to information deliberately: a 429 is the one failure that proves the HTTP path to Telegram
+            // works, so seeing it at the normal journal level distinguishes "we are being rate limited" from "we cannot reach
+            // Telegram at all". Volume stays bounded because Telegram spaces these responses by its own RetryAfter window.
+            _logger.LogInformation(
+                "Telegram polling rate limited; pausing this receiver before the next getUpdates call. botId={BotId} tokenHashPrefix={TokenHashPrefix} pollingGeneration={PollingGeneration} pollingTaskId={PollingTaskId} processId={ProcessId} failureKind={FailureKind} statusCode={StatusCode} retryAfterSeconds={RetryAfterSeconds} innerException={InnerException}",
                 botId,
-                retryDelay.TotalSeconds);
+                lease?.TokenFingerprint ?? "none",
+                lease?.Generation ?? 0,
+                TryGetReceiverTaskForDiagnostics(botId)?.Id ?? 0,
+                Environment.ProcessId,
+                failure.Kind,
+                TelegramPollingFailureDiagnostics.FormatStatusCode(failure.StatusCode ?? 429),
+                retryDelay.TotalSeconds,
+                string.IsNullOrEmpty(failure.InnerExceptionType) ? "none" : failure.InnerExceptionType);
             try
             {
                 await Task.Delay(retryDelay, cancellationToken);
@@ -1559,11 +1833,20 @@ public class MultiBotHostedService : IHostedService
                 // intentionally not logged so a provider payload can never leak into local or forwarded logs, and this
                 // message text is suppressed from the Telegram logger channel by TelegramLogSuppression.
                 _logger.LogInformation(
-                    "Telegram polling degraded. botId={BotId} consecutiveFailures={ConsecutiveFailures} delaySeconds={DelaySeconds} errorType={ErrorType}",
+                    "Telegram polling degraded. botId={BotId} tokenHashPrefix={TokenHashPrefix} pollingGeneration={PollingGeneration} pollingTaskId={PollingTaskId} processId={ProcessId} consecutiveFailures={ConsecutiveFailures} delaySeconds={DelaySeconds} failureKind={FailureKind} errorType={ErrorType} innerException={InnerException} statusCode={StatusCode} responseText={ResponseText} cancellationReason={CancellationReason}",
                     botId,
+                    lease?.TokenFingerprint ?? "none",
+                    lease?.Generation ?? 0,
+                    TryGetReceiverTaskForDiagnostics(botId)?.Id ?? 0,
+                    Environment.ProcessId,
                     decision.ConsecutiveFailures,
                     Math.Round(decision.Delay.TotalSeconds, 2),
-                    exception.GetType().Name);
+                    failure.Kind,
+                    failure.ExceptionType,
+                    string.IsNullOrEmpty(failure.InnerExceptionType) ? "none" : failure.InnerExceptionType,
+                    TelegramPollingFailureDiagnostics.FormatStatusCode(failure.StatusCode),
+                    string.IsNullOrEmpty(failure.ResponseText) ? "none" : failure.ResponseText,
+                    _receivingCts?.IsCancellationRequested == true ? "host_shutdown" : "not_requested");
             }
             else
             {
@@ -1580,27 +1863,12 @@ public class MultiBotHostedService : IHostedService
             return;
         }
 
-        var bot = _registry.GetById(botId);
-        if (bot != null &&
-            string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) &&
-            IsTelegramWebhookPollingConflict(exception))
-        {
-            ScheduleWebhookConflictRecovery(bot);
-            return;
-        }
+        // Nothing above recognized this failure shape, so the structured diagnostic is written exactly here - once - before
+        // the existing shared dispatcher handles it. This is the branch the production report saw as the opaque
+        // "Telegram polling degraded errorType=RequestException" line with no way to tell a conflict from a gateway fault.
+        LogPollingFailureDiagnostic("unclassified", botId, lease, failure);
 
-        if (bot != null &&
-            string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) &&
-            IsTelegramGetUpdatesConflict(exception))
-        {
-            await StopBotAsync(botId);
-            _logger.LogCritical(
-                "Telegram receiver stopped because another getUpdates poller is using the same token. botId={BotId}, username=@{Username}, telegramError={TelegramError}",
-                bot.Id,
-                bot.Username,
-                exception.Message);
-            return;
-        }
+        var bot = _registry.GetById(botId);
 
         if (bot != null &&
             string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) &&
@@ -1756,13 +2024,10 @@ public class MultiBotHostedService : IHostedService
     /// </remarks>
     private static bool IsTelegramWebhookPollingConflict(Exception exception)
     {
-        if (exception is not ApiRequestException apiException || apiException.ErrorCode != 409)
-            return false;
-
-        var message = apiException.Message ?? string.Empty;
-        return message.Contains("webhook is active", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("use deleteWebhook", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("can't use getUpdates method while webhook", StringComparison.OrdinalIgnoreCase);
+        // Delegates to the shared diagnostics classifier. The previous implementation required a typed ApiRequestException,
+        // so a webhook conflict surfaced as a plain RequestException escaped both conflict classifiers and was then handled by
+        // the generic polling logger, which is how a repairable conflict looked like unrelated polling instability.
+        return TelegramPollingFailureDiagnostics.IsWebhookConflict(exception);
     }
 
     /// <summary>
@@ -1780,13 +2045,10 @@ public class MultiBotHostedService : IHostedService
     /// </remarks>
     private static bool IsTelegramGetUpdatesConflict(Exception exception)
     {
-        if (exception is not ApiRequestException apiException)
-            return false;
-
-        var message = apiException.Message ?? string.Empty;
-        return !IsTelegramWebhookPollingConflict(exception) &&
-               (message.Contains("terminated by other getUpdates request", StringComparison.OrdinalIgnoreCase) ||
-                message.Contains("only one bot instance is running", StringComparison.OrdinalIgnoreCase));
+        // Delegates to the shared diagnostics classifier so the error code, the documented conflict text, and a bare HTTP 409
+        // are all treated as the same duplicate-poller condition. That is what turns "several unrelated bots started failing
+        // shortly after startup" into one actionable duplicate-token finding instead of repeated degraded-polling noise.
+        return TelegramPollingFailureDiagnostics.IsGetUpdatesConflict(exception);
     }
 
     /// <summary>
@@ -1835,6 +2097,12 @@ public class MultiBotHostedService : IHostedService
         // Delegates to the shared classifier so owned, assistant, and tenant receivers all agree on what is transient.
         // A Telegram edge 502 can arrive as a plain RequestException carrying only an HTTP status, which previously fell
         // through to the noisy legacy polling logger instead of the bounded backoff path.
+        //
+        // A polling conflict is excluded explicitly as well as by classification: a 409 must never be answered with a
+        // retry delay, because retrying a duplicate poller is what turns one conflict into a permanent conflict loop.
+        if (TelegramPollingFailureDiagnostics.Describe(exception).IsConflict)
+            return false;
+
         return TelegramPollingBackoffPolicy.IsTransientGatewayFailure(exception);
     }
 
@@ -2349,31 +2617,49 @@ public class MultiBotHostedService : IHostedService
     /// </summary>
     /// <param name="botId">Internal runtime bot id whose registered receiver should be removed.</param>
     /// <param name="reason">Non-secret stop reason recorded in process-local runtime status.</param>
+    /// <param name="expectedGeneration">
+    /// Optional monotonically increasing polling generation that must still be the registered one for the stop to apply.
+    /// Pass the generation of the caller's own failed start attempt so cleanup can never stop a replacement, or omit it when
+    /// the caller deliberately stops whatever is currently registered for the bot.
+    /// </param>
     /// <returns><c>true</c> when a receiver existed and was cancelled; otherwise <c>false</c>.</returns>
     /// <remarks>
     /// Callers must hold the bot lifecycle gate, except host shutdown after the shared parent token has already been
-    /// cancelled. This helper never touches another bot's CTS.
+    /// cancelled. This helper never touches another bot's cancellation source.
     /// </remarks>
-    private bool StopBotCore(string botId, string reason)
+    private bool StopBotCore(string botId, string reason, long? expectedGeneration = null)
     {
-        CancellationTokenSource cts = null;
+        ReceiverGeneration receiver;
         lock (_syncRoot)
         {
-            if (_botReceivers.TryGetValue(botId, out cts))
-                _botReceivers.Remove(botId);
-        }
+            if (!_botReceivers.TryGetValue(botId, out receiver))
+                return false;
 
-        if (cts == null)
-            return false;
+            if (expectedGeneration.HasValue && receiver.Generation != expectedGeneration.Value)
+                return false;
+
+            _botReceivers.Remove(botId);
+        }
 
         // Receiver lifecycle ended: drop this bot's transient backoff state so a later, unrelated incident starts again
         // at the first step and so historical tenant bot ids cannot accumulate unbounded in-memory state.
         _transientPollingBackoff.Remove(botId);
 
-        cts.Cancel();
-        cts.Dispose();
+        // The stop is advertised before the token is cancelled so a legitimate restart can tell "this generation is leaving
+        // getUpdates" apart from a live duplicate poller. The lease is still released only by this generation's own loop
+        // completion, which is what guarantees a replacement can never poll while this loop is inside getUpdates.
+        _pollingLeases.MarkStopping(botId, receiver.Generation);
+        receiver.StopReason = reason ?? string.Empty;
+        receiver.CancelLoop();
         _runtimeStatusStore.MarkStopped(botId, reason);
-        _logger.LogInformation("Stopped Telegram bot receiver. botId={BotId}, reason={Reason}", botId, reason);
+        _logger.LogInformation(
+            "Stopped Telegram bot receiver. botId={BotId} reason={Reason} tokenHashPrefix={TokenHashPrefix} pollingGeneration={PollingGeneration} processId={ProcessId} pollingTaskId={PollingTaskId}",
+            botId,
+            reason,
+            receiver.TokenFingerprint,
+            receiver.Generation,
+            Environment.ProcessId,
+            receiver.Loop?.Id ?? 0);
         return true;
     }
 
@@ -2386,15 +2672,22 @@ public class MultiBotHostedService : IHostedService
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _scheduler.StopAdmission();
+        ReceiverGeneration[] receivers;
         lock (_syncRoot)
         {
-            foreach (var receiver in _botReceivers.ToList())
-            {
-                receiver.Value.Cancel();
-                receiver.Value.Dispose();
-                _runtimeStatusStore.MarkStopped(receiver.Key, "host shutdown");
-            }
+            receivers = _botReceivers.Values.ToArray();
             _botReceivers.Clear();
+        }
+
+        foreach (var receiver in receivers)
+        {
+            // Cancellation is requested for every generation, but disposal and lease release wait for the loop to finish.
+            // Disposing a cancellation source while its loop is still inside getUpdates is what produced orphan polling
+            // attempts, so shutdown now follows the same ordered teardown as a normal stop.
+            _pollingLeases.MarkStopping(receiver.BotId, receiver.Generation);
+            receiver.StopReason = "host shutdown";
+            receiver.CancelLoop();
+            _runtimeStatusStore.MarkStopped(receiver.BotId, "host shutdown");
         }
 
         _receivingCts?.Cancel();
@@ -2403,7 +2696,217 @@ public class MultiBotHostedService : IHostedService
         try { await Task.WhenAll(pending).WaitAsync(cancellationToken); }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception ex) { _logger.LogWarning("Receiver task ended during shutdown. ErrorType={ErrorType}", ex.GetType().Name); }
+
+        // A loop that completed already released its own lease and disposed its own source. Anything still owned here is a
+        // loop that did not exit within the shutdown budget; its lease and source are reclaimed now so the invariant is not
+        // left half-applied, and the count is logged so a slow shutdown is visible instead of silent.
+        var reclaimed = 0;
+        foreach (var receiver in receivers)
+        {
+            if (_pollingLeases.Release(receiver.BotId, receiver.Generation, "host shutdown") != null)
+                reclaimed++;
+
+            receiver.DisposeCancellation();
+        }
+
         _receivingCts?.Dispose();
+        _logger.LogInformation(
+            "Telegram polling loops stopped for host shutdown. stoppedLoops={StoppedLoops} reclaimedLeases={ReclaimedLeases} remainingActiveLeases={RemainingActiveLeases} processId={ProcessId}",
+            receivers.Length,
+            reclaimed,
+            _pollingLeases.ActiveCount,
+            Environment.ProcessId);
+    }
+
+    /// <summary>
+    /// Verifies that no two configured runtime bots share one Telegram token before any receiver starts polling.
+    /// </summary>
+    /// <remarks>
+    /// This is the configuration-level half of the single-flight guarantee: the lease registry rejects a duplicate at
+    /// runtime, and this audit names the duplicate configuration up front, which is what explains a production pattern of
+    /// "several unrelated bots degraded shortly after startup" as one shared credential instead of several coincidences.
+    /// Only internal bot ids and token fingerprint prefixes are logged; no token text, chat id, or payload appears here.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// LogConfiguredPollingIdentityAudit();
+    /// </code>
+    /// </example>
+    private void LogConfiguredPollingIdentityAudit()
+    {
+        var configured = _registry.Bots;
+        var byFingerprint = configured
+            .Where(bot => !string.IsNullOrWhiteSpace(bot.Token))
+            .GroupBy(bot => TelegramBotTokenIdentity.FingerprintPrefix(bot.Token), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var duplicateGroups = byFingerprint.Where(group => group.Count() > 1).ToArray();
+
+        _logger.LogInformation(
+            "Telegram polling identity audit. configuredBots={ConfiguredBots} distinctTokenFingerprints={DistinctTokenFingerprints} duplicateTokenGroups={DuplicateTokenGroups} activePollingLeases={ActivePollingLeases} processId={ProcessId}",
+            configured.Count,
+            byFingerprint.Length,
+            duplicateGroups.Length,
+            _pollingLeases.ActiveCount,
+            Environment.ProcessId);
+
+        foreach (var group in duplicateGroups)
+        {
+            _logger.LogWarning(
+                "Two or more configured runtime bots share one Telegram token, so only the first can poll it. tokenHashPrefix={TokenHashPrefix} botIds={BotIds} botCount={BotCount}",
+                group.Key,
+                string.Join(",", group.Select(bot => bot.Id)),
+                group.Count());
+        }
+    }
+
+    /// <summary>
+    /// Writes one structured polling-failure diagnostic line for a failure shape no dedicated branch recognized.
+    /// </summary>
+    /// <param name="outcome">
+    /// Closed-vocabulary outcome label produced by this class, such as <c>unclassified</c>. Never user input.
+    /// </param>
+    /// <param name="botId">Internal runtime bot id whose receiver reported the failure; never a Telegram id.</param>
+    /// <param name="lease">Current polling lease for that bot, or <c>null</c> when the bot is not polling in this process.</param>
+    /// <param name="failure">Redacted failure description from <see cref="TelegramPollingFailureDiagnostics.Describe" />.</param>
+    /// <remarks>
+    /// Every field is an internal identity, a monotonic counter, or text that already passed token redaction, so the line is
+    /// safe for the journal, the daily diagnostic file, and the forwarded operator channel. It is emitted once per failure
+    /// and never per retry, so a repeated condition cannot flood the operator channel.
+    /// </remarks>
+    private void LogPollingFailureDiagnostic(string outcome, string botId, TelegramPollingLease lease, TelegramPollingFailure failure)
+    {
+        _logger.LogWarning(
+            "Telegram polling failure classified. outcome={Outcome} botId={BotId} tokenHashPrefix={TokenHashPrefix} pollingGeneration={PollingGeneration} pollingTaskId={PollingTaskId} processId={ProcessId} failureKind={FailureKind} errorType={ErrorType} innerException={InnerException} statusCode={StatusCode} responseText={ResponseText} cancellationReason={CancellationReason}",
+            outcome,
+            botId,
+            lease?.TokenFingerprint ?? "none",
+            lease?.Generation ?? 0,
+            TryGetReceiverTaskForDiagnostics(botId)?.Id ?? 0,
+            Environment.ProcessId,
+            failure.Kind,
+            failure.ExceptionType,
+            string.IsNullOrEmpty(failure.InnerExceptionType) ? "none" : failure.InnerExceptionType,
+            TelegramPollingFailureDiagnostics.FormatStatusCode(failure.StatusCode),
+            string.IsNullOrEmpty(failure.ResponseText) ? "none" : failure.ResponseText,
+            _receivingCts?.IsCancellationRequested == true ? "host_shutdown" : "not_requested");
+    }
+
+    /// <summary>
+    /// Reads the tracked polling task for one bot so a diagnostic can name the exact loop instance.
+    /// </summary>
+    /// <param name="botId">Internal runtime bot id whose polling task instance id is needed.</param>
+    /// <returns>The tracked polling task, or <c>null</c> when the bot is not polling in this process.</returns>
+    /// <remarks>
+    /// Used only for logging. The returned task is never awaited here, so a diagnostic can never block a polling error
+    /// handler or change receiver lifetime.
+    /// </remarks>
+    private Task TryGetReceiverTaskForDiagnostics(string botId)
+    {
+        lock (_syncRoot)
+        {
+            return _receiverTasks.TryGetValue(botId, out var task) ? task : null;
+        }
+    }
+
+    /// <summary>
+    /// Releases everything owned by one polling generation once its loop task has actually completed.
+    /// </summary>
+    /// <param name="receiver">Generation whose loop task just completed; never null.</param>
+    /// <remarks>
+    /// <para>
+    /// Ordering is the whole point of this method. The single-flight lease and the tracked task registration are released
+    /// only after the loop task has completed, so a replacement generation can never begin polling while its predecessor is
+    /// still inside <c>getUpdates</c>, and the cancellation source is never disposed while the loop is still using it. That
+    /// window - a disposed or replaced source with an orphan loop still polling - is what produced duplicate
+    /// <c>getUpdates</c> calls and Telegram's 409 conflict on this deployment.
+    /// </para>
+    /// <para>
+    /// Every removal is identity-checked, so a late-exiting predecessor can neither unregister nor release a replacement.
+    /// </para>
+    /// </remarks>
+    private void OnReceiverLoopCompleted(ReceiverGeneration receiver)
+    {
+        var reason = string.IsNullOrEmpty(receiver.StopReason) ? "loop_ended" : receiver.StopReason;
+
+        // Read the flag before the source is disposed: querying a disposed CancellationTokenSource throws, which in a task
+        // continuation is silently swallowed and would abort the rest of this teardown log without releasing anything.
+        var cancellationRequested = ReadCancellationRequested(receiver.Cancellation);
+        var released = _pollingLeases.Release(receiver.BotId, receiver.Generation, reason);
+
+        lock (_syncRoot)
+        {
+            if (_receiverTasks.TryGetValue(receiver.BotId, out var tracked) && ReferenceEquals(tracked, receiver.Loop))
+                _receiverTasks.Remove(receiver.BotId);
+
+            if (_botReceivers.TryGetValue(receiver.BotId, out var current) && ReferenceEquals(current, receiver))
+                _botReceivers.Remove(receiver.BotId);
+        }
+
+        receiver.DisposeCancellation();
+
+        _logger.LogInformation(
+            "Telegram polling loop ended. botId={BotId} tokenHashPrefix={TokenHashPrefix} pollingGeneration={PollingGeneration} processId={ProcessId} pollingTaskId={PollingTaskId} cancellationReason={CancellationReason} cancellationRequested={CancellationRequested} loopStatus={LoopStatus} leaseReleased={LeaseReleased} activePollingLeases={ActivePollingLeases}",
+            receiver.BotId,
+            receiver.TokenFingerprint,
+            receiver.Generation,
+            Environment.ProcessId,
+            receiver.Loop?.Id ?? 0,
+            reason,
+            cancellationRequested,
+            DescribePollingTaskStatus(receiver.Loop),
+            released != null,
+            _pollingLeases.ActiveCount);
+    }
+
+    /// <summary>
+    /// Reads whether a generation's cancellation was requested, tolerating an already-disposed source.
+    /// </summary>
+    /// <param name="cancellation">Cancellation source owned by the generation whose loop just ended.</param>
+    /// <returns>
+    /// <c>true</c> when cancellation was requested, and <c>false</c> when it was not or the source was already disposed.
+    /// </returns>
+    /// <remarks>
+    /// Used only by the loop-end diagnostic. A disposed source means the shutdown is already complete, so reporting
+    /// "not requested" keeps the log line truthful enough for triage without risking an exception in a continuation.
+    /// </remarks>
+    private static bool ReadCancellationRequested(CancellationTokenSource cancellation)
+    {
+        try
+        {
+            return cancellation?.IsCancellationRequested == true;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Describes a polling task's terminal status for diagnostics without exposing exception payload text.
+    /// </summary>
+    /// <param name="task">Polling task to describe; a <c>null</c> value returns <c>not_tracked</c>.</param>
+    /// <returns>
+    /// One of <c>completed</c>, <c>cancelled</c>, <c>faulted:&lt;exception type&gt;</c>, <c>running</c>, or <c>not_tracked</c>.
+    /// </returns>
+    /// <remarks>
+    /// Only the exception type name is reported, never the message, because a transport message can contain a request URI.
+    /// </remarks>
+    private static string DescribePollingTaskStatus(Task task)
+    {
+        if (task == null)
+            return "not_tracked";
+
+        if (task.IsCompletedSuccessfully)
+            return "completed";
+
+        if (task.IsCanceled)
+            return "cancelled";
+
+        if (task.IsFaulted)
+            return $"faulted:{task.Exception?.GetBaseException().GetType().Name ?? "unknown"}";
+
+        return "running";
     }
 
     /// <summary>Tracks a bot-lifecycle task and observes failures without keeping completed task history.</summary>
@@ -2418,6 +2921,82 @@ public class MultiBotHostedService : IHostedService
                 _logger.LogError("Bot lifecycle task failed. ErrorType={ErrorType}", task.Exception?.GetBaseException().GetType().Name);
             lock (_syncRoot) _backgroundTasks.Remove(task);
         });
+    }
+
+    /// <summary>
+    /// One running polling generation: the single-flight lease it owns, its cancellation source, and its tracked loop.
+    /// </summary>
+    /// <remarks>
+    /// The generation number is what makes stop and release idempotent and safe: a late-exiting predecessor can neither
+    /// unregister nor release the lease belonging to the replacement that already replaced it. The cancellation source is
+    /// disposed only after the loop has actually exited, so an in-flight <c>getUpdates</c> is always cancelled through a
+    /// live token rather than an already-disposed one.
+    /// </remarks>
+    private sealed class ReceiverGeneration
+    {
+        /// <summary>Internal runtime bot id owning this loop; never a Telegram bot id.</summary>
+        public string BotId { get; }
+
+        /// <summary>Truncated SHA-256 fingerprint prefix of the token being polled; never the token itself.</summary>
+        public string TokenFingerprint { get; }
+
+        /// <summary>Monotonic process-local generation number identifying this loop.</summary>
+        public long Generation { get; }
+
+        /// <summary>Cancellation source whose token ends this loop; disposed only after the loop task completes.</summary>
+        public CancellationTokenSource Cancellation { get; }
+
+        /// <summary>Tracked polling task returned by the Telegram client for this generation.</summary>
+        public Task Loop { get; set; }
+
+        /// <summary>Non-secret reason recorded when this generation was stopped, used for the loop-end diagnostic.</summary>
+        public string StopReason { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Requests cancellation of this generation's polling loop through a live token.
+        /// </summary>
+        /// <remarks>
+        /// Disposal is deliberately not performed here. The source is disposed by the generation's own loop completion, so
+        /// an in-flight <c>getUpdates</c> is always cancelled through a live token rather than an already-disposed one, and
+        /// a restarting caller can still await the predecessor's loop before acquiring its lease.
+        /// </remarks>
+        public void CancelLoop()
+        {
+            try
+            {
+                Cancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The loop already ended and released this source; stopping it again is a no-op.
+            }
+        }
+
+        /// <summary>Disposes this generation's cancellation source once its loop can no longer use it.</summary>
+        /// <remarks>Idempotent: a second call after disposal is ignored instead of throwing.</remarks>
+        public void DisposeCancellation()
+        {
+            try
+            {
+                Cancellation.Dispose();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        /// <summary>Creates a generation handle around one freshly created cancellation source.</summary>
+        /// <param name="botId">Internal runtime bot id owning the loop.</param>
+        /// <param name="tokenFingerprint">Truncated token fingerprint prefix; empty only when the token was missing.</param>
+        /// <param name="generation">Process-local generation number.</param>
+        /// <param name="cancellation">Cancellation source linked to the shared parent receiver token.</param>
+        public ReceiverGeneration(string botId, string tokenFingerprint, long generation, CancellationTokenSource cancellation)
+        {
+            BotId = botId;
+            TokenFingerprint = tokenFingerprint;
+            Generation = generation;
+            Cancellation = cancellation;
+        }
     }
 
     /// <summary>

@@ -110,4 +110,36 @@ public static class TelegramBotTokenIdentity
         var botId = ExtractBotId(token);
         return botId.HasValue ? $"{botId.Value}:***" : "***";
     }
+
+    /// <summary>
+    /// Produces a stable, non-reversible fingerprint prefix for a bot token so polling log lines can be correlated
+    /// across bots, generations, and processes without ever writing the credential.
+    /// </summary>
+    /// <param name="token">
+    /// Raw BotFather token taken from the registry for an owned, assistant, or tenant bot. Null, empty, and whitespace
+    /// values are accepted and produce an empty fingerprint rather than throwing, because a missing token must still be
+    /// loggable during startup diagnostics.
+    /// </param>
+    /// <returns>
+    /// The first eight lowercase hexadecimal characters of the token's SHA-256 hash, or an empty string when no token was
+    /// supplied. The same token always yields the same prefix and a different token yields a different one with
+    /// overwhelming probability, so it is usable as a deduplication and correlation key.
+    /// </returns>
+    /// <remarks>
+    /// This exists because the duplicate-poller investigation needed to prove that two receivers were polling the same
+    /// token without any log line revealing it: the masked label in <see cref="MaskToken" /> keeps only the public numeric
+    /// bot id, which is identical for two storefronts that were mistakenly given the same credential. The fingerprint is
+    /// truncated so it cannot be used to test guesses against the hash, and it must never be treated as a secret or as an
+    /// authorization value: it is a log correlation identifier only.
+    /// </remarks>
+    public static string FingerprintPrefix(string token)
+    {
+        var normalized = NormalizeToken(token);
+        if (normalized.Length == 0)
+            return string.Empty;
+
+        var hash = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(normalized));
+        return Convert.ToHexString(hash)[..8].ToLowerInvariant();
+    }
 }

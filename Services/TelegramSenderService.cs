@@ -23,6 +23,27 @@ public sealed class TelegramSenderService : BackgroundService
     private readonly TelegramWorkQueue _queue;
     private readonly ILogger<TelegramSenderService> _logger;
     private readonly ConcurrentDictionary<string, byte> _activeBots = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Every internal bot id this shared pipeline has ever carried a job for, in this process.
+    /// </summary>
+    /// <remarks>
+    /// This is the registration signal an operator needs and <see cref="_activeBots" /> is not: <c>_activeBots</c> only
+    /// holds the bots with a job in flight at one instant, so a quiet storefront legitimately reports
+    /// <c>ActiveBots=1</c> while the owned bot carries the operator-log stream. A lane entry is added once per bot and is
+    /// never removed except at process exit, so "is this storefront part of the shared output pipeline at all?" becomes
+    /// answerable from a single log line.
+    /// </remarks>
+    private readonly ConcurrentDictionary<string, byte> _lanes = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Coalesced notices for output queued for a bot the registry cannot deliver to, keyed by bot id.</summary>
+    private readonly MemoryCache _undeliverableNotices = new(new MemoryCacheOptions { SizeLimit = 4096 });
+    /// <summary>
+    /// Fingerprint of the last reported output census.
+    /// </summary>
+    /// <remarks>
+    /// The census is emitted at Information when it changes and at Debug when it is unchanged, so an operator sees every
+    /// real move in the registry/lane/queue shape once without turning a ten-second maintenance tick into a log stream.
+    /// </remarks>
+    private string _lastCensus = string.Empty;
     private readonly ConcurrentDictionary<string, (TaskCompletionSource<object> Completion, CancellationToken Token)> _waiters = new();
     /// <summary>Live stream-backed requests; never persisted or retained beyond the caller's awaited invocation.</summary>
     private readonly ConcurrentDictionary<string, LiveRequest> _liveRequests = new();
@@ -353,6 +374,14 @@ public sealed class TelegramSenderService : BackgroundService
                     {
                         _activeBots.TryAdd(selected.BotId, 0);
                         _lastBot = selected.BotId;
+
+                        // First job ever handed off for this bot: this is the moment the bot becomes a first-class member of
+                        // the shared output pipeline, which is what "registered" means for delivery. Logged once per bot per
+                        // process so the line is evidence rather than a heartbeat.
+                        if (_lanes.TryAdd(selected.BotId, 0))
+                            _logger.LogInformation(
+                                "Telegram sender lane registered. BotId={BotId} registeredLanes={RegisteredLanes} knownRegistryBots={KnownRegistryBots} ActiveBots={ActiveBots}",
+                                selected.BotId, _lanes.Count, _registry.Bots.Count, _activeBots.Count);
                         // A full lane refuses instead of waiting. The job is not lost: its durable row stays queued and the
                         // next pass offers it again once the lane drains, so an output backlog can never stall this pump or
                         // the update handler that produced the job.
@@ -384,6 +413,23 @@ public sealed class TelegramSenderService : BackgroundService
                         _underPressure = depth >= _options.QueueSize;
                         if (depth >= _options.QueueSize)
                             _logger.LogWarning("Telegram output pressure. DurableQueueDepth={QueueDepth} MemoryCapacity={Capacity} Workers={Workers}", depth, _options.QueueSize, _options.WorkerCount);
+
+                        // Delivery census: which bots the registry exposes, which of them this pipeline has ever carried, and
+                        // which bots currently hold queued output. A queued bot that is missing here or is not deliverable is
+                        // the exact "receiver started but never appears in the shared pipeline" condition, so it is also
+                        // reported explicitly below instead of being discovered only as output that never arrives.
+                        var queuedByBot = await db.TelegramDeliveryJobs.Where(x => x.Status == "queued")
+                            .GroupBy(x => x.BotId)
+                            .Select(g => new { BotId = g.Key, Count = g.Count() })
+                            .ToListAsync(token);
+                        var undeliverable = queuedByBot
+                            .Select(x => new { x.BotId, x.Count, Reason = DescribeLaneIneligibility(x.BotId, _registry) })
+                            .Where(x => x.Reason != null)
+                            .ToArray();
+
+                        ReportOutputCensus(depth, queuedByBot.Count, undeliverable.Length);
+                        foreach (var stalled in undeliverable)
+                            ReportUndeliverableOutput(stalled.BotId, stalled.Reason, stalled.Count);
                         var cutoff = now.AddDays(-7);
                         var expired = db.TelegramDeliveryJobs.Where(x => (x.Status == "sent" || x.Status == "failed") && x.CreatedAtUtc < cutoff)
                             .OrderBy(x => x.Id).Select(x => x.Id).Take(1000);
@@ -546,6 +592,111 @@ public sealed class TelegramSenderService : BackgroundService
                 Wake();
             }
         }
+    }
+
+    /// <summary>
+    /// Explains why queued output for one internal bot can or cannot be handed to a worker.
+    /// </summary>
+    /// <param name="botId">
+    /// Internal runtime bot id stored on the durable delivery job, for example <c>vpnetiranbot</c> or
+    /// <c>tenant-6052930127</c>. This is the registry identity, never a Telegram id or token.
+    /// </param>
+    /// <param name="registry">Runtime registry that owns bot membership, type, and the enabled flag.</param>
+    /// <returns>
+    /// <c>null</c> when the registry exposes exactly that bot id and the bot is enabled, so the pump may select it;
+    /// otherwise a closed-vocabulary reason string: <c>bot_not_registered</c>, <c>bot_id_mismatch</c>, or
+    /// <c>bot_disabled</c>.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// The pump selects jobs only for bots the registry exposes as enabled, so a bot whose receiver started successfully
+    /// but that never reached the registry would accept updates and then silently accumulate undeliverable output. This
+    /// helper is the single place that names that condition, so the same explanation is used for the census log and for the
+    /// bounded per-bot warning, and so the rule is directly testable without starting a sender.
+    /// </para>
+    /// <para>
+    /// <c>bot_id_mismatch</c> exists because <see cref="BotRegistry.GetById" /> returns the default owned bot for an
+    /// unknown id; that fallback must never be mistaken for membership of the requested bot.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// var reason = TelegramSenderService.DescribeLaneIneligibility("tenant-6052930127", registry);
+    /// // null when the tenant is registered and enabled; "bot_not_registered" when it is absent.
+    /// </code>
+    /// </example>
+    internal static string DescribeLaneIneligibility(string botId, BotRegistry registry)
+    {
+        if (registry == null)
+            return "registry_unavailable";
+
+        if (string.IsNullOrWhiteSpace(botId))
+            return "bot_id_missing";
+
+        var bot = registry.GetById(botId);
+        if (bot == null)
+            return "bot_not_registered";
+
+        // GetById falls back to the default owned bot for an unknown id, so identity must be verified explicitly.
+        if (!string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase))
+            return "bot_id_mismatch";
+
+        return bot.Enabled ? null : "bot_disabled";
+    }
+
+    /// <summary>
+    /// Number of distinct internal bots this process has carried output for.
+    /// </summary>
+    /// <remarks>Exposed for the delivery census and for tests that assert tenants are first-class pipeline members.</remarks>
+    internal int RegisteredLaneCount => _lanes.Count;
+
+    /// <summary>Reports the delivery census at Information when it changed and at Debug when it did not.</summary>
+    /// <param name="queueDepth">Durable queued job count for the whole process.</param>
+    /// <param name="botsWithQueuedOutput">Distinct bots currently holding at least one queued job.</param>
+    /// <param name="undeliverableBots">Bots holding queued output that the registry cannot deliver to.</param>
+    /// <remarks>
+    /// The fingerprint covers the registry/lane/queue shape, so a storefront being enabled, disabled, registered, or
+    /// getting its first output each produce exactly one Information line while a steady state stays at Debug.
+    /// </remarks>
+    private void ReportOutputCensus(int queueDepth, int botsWithQueuedOutput, int undeliverableBots)
+    {
+        var registryBots = _registry.Bots;
+        var enabled = registryBots.Count(x => x.Enabled);
+        var tenants = registryBots.Count(x => string.Equals(x.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase));
+        var fingerprint = $"{registryBots.Count}/{enabled}/{tenants}/{_lanes.Count}/{botsWithQueuedOutput}/{undeliverableBots}/{queueDepth}";
+        var changed = !string.Equals(fingerprint, _lastCensus, StringComparison.Ordinal);
+        _lastCensus = fingerprint;
+
+        const string template =
+            "Telegram output census. RegistryBots={RegistryBots} EnabledRegistryBots={EnabledRegistryBots} TenantRegistryBots={TenantRegistryBots} RegisteredLanes={RegisteredLanes} BotsWithQueuedOutput={BotsWithQueuedOutput} UndeliverableBots={UndeliverableBots} DurableQueueDepth={QueueDepth} ActiveBots={ActiveBots} Workers={Workers}";
+
+        if (changed)
+            _logger.LogInformation(template, registryBots.Count, enabled, tenants, _lanes.Count,
+                botsWithQueuedOutput, undeliverableBots, queueDepth, _activeBots.Count, _options.WorkerCount);
+        else
+            _logger.LogDebug(template, registryBots.Count, enabled, tenants, _lanes.Count,
+                botsWithQueuedOutput, undeliverableBots, queueDepth, _activeBots.Count, _options.WorkerCount);
+    }
+
+    /// <summary>
+    /// Reports queued output for a bot the shared pipeline cannot deliver to, at most once per bot per window.
+    /// </summary>
+    /// <param name="botId">Internal runtime bot id holding the queued jobs.</param>
+    /// <param name="reason">Closed-vocabulary reason from <see cref="DescribeLaneIneligibility" />.</param>
+    /// <param name="queuedJobs">Number of queued jobs currently waiting for that bot.</param>
+    /// <remarks>
+    /// This logs and never mutates. The rows stay queued, because enabling or re-registering the bot must still deliver
+    /// them; deleting or failing them would silently drop customer output that a configuration fix could have sent.
+    /// </remarks>
+    private void ReportUndeliverableOutput(string botId, string reason, int queuedJobs)
+    {
+        var key = $"{botId}|{reason}";
+        if (_undeliverableNotices.TryGetValue(key, out _)) return;
+        _undeliverableNotices.Set(key, true,
+            new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5) });
+        _logger.LogWarning(
+            "Telegram output is queued for a bot this pipeline cannot deliver to. BotId={BotId} Reason={Reason} QueuedJobs={QueuedJobs} Retained=true RegistryBots={RegistryBots}",
+            botId, reason, queuedJobs, _registry.Bots.Count);
     }
 
     /// <summary>Runs acknowledgements independently of ordinary per-bot send serialization and pacing.</summary>

@@ -100,6 +100,23 @@ public class Program
             // Sync configured brand bots first, then hydrate runtime-created tenant bots from users.db.
             await SyncBotInstancesAsync(userDb, botRegistry);
             await botRegistry.LoadTenantBotsFromDatabaseAsync(userDb);
+
+            // Registry membership diagnostic. The registry deliberately holds no logger, because the production logging
+            // pipeline resolves that same singleton and a logger dependency inside it would close a dependency cycle; this
+            // call site owns a logger instead. It reports which storefronts entered the registry from users.db and how many
+            // bots can currently receive, so "the receiver started but the pipeline never learned about the bot" is
+            // distinguishable from "the bot is disabled" before any receiver starts.
+            var registryLogger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("Adminbot.BotRegistry");
+            var registryCensus = botRegistry.Describe();
+            registryLogger.LogInformation(
+                "Telegram bot registry hydrated. total={Total} owned={Owned} tenants={Tenants} salesAssistant={SalesAssistant} enabled={Enabled} enabledTenants={EnabledTenants} tenantsAdded={TenantsAdded} tenantsReplaced={TenantsReplaced}",
+                registryCensus.Total, registryCensus.Owned, registryCensus.Tenant, registryCensus.SalesAssistant,
+                registryCensus.Enabled, registryCensus.EnabledTenant,
+                botRegistry.LastLoadAddedIds.Count, botRegistry.LastLoadReplacedIds.Count);
+            if (botRegistry.LastLoadAddedIds.Count > 0)
+                registryLogger.LogInformation(
+                    "Telegram tenant bots entered the runtime registry. botIds={BotIds}",
+                    string.Join(",", botRegistry.LastLoadAddedIds));
             await using var credentialsDb = scope.ServiceProvider.GetRequiredService<CredentialsDbContextFactory>().CreateDbContext();
             credentialsDb.Database.Migrate();
             await credentialsDb.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
