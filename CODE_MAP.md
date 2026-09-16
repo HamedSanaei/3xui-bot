@@ -105,7 +105,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - GitHub Actions path (current automated pipeline). `.github/workflows/ci.yml` is the single build pipeline: it runs on
   push/PR and is also callable as a reusable workflow, so the deploy job consumes exactly the artifact CI verified. It
   does `dotnet tool restore`, `dotnet restore Adminbot.sln`, a Release build with `SourceRevisionId=<sha>`, the full test
-  suite, both `dotnet ef migrations has-pending-model-changes` checks, the deployment-script syntax/preservation tests,
+  suite, both `dotnet ef migrations has-pending-model-changes` checks, the deployment-script syntax/preservation tests
+  (`bash -n` plus `scripts/deploy-production.tests.sh`) followed by `shellcheck` on both scripts at its default severity,
+  where warnings and info findings fail the job,
   and `dotnet publish` into a temporary directory; it then **refuses to package** a publish output containing `Data/`,
   `*.db`, `*.db-*`, or `configuration.json`, and uploads `vpnetiranbot-release` (tarball plus `.sha256`, digest exposed
   as the job output `digest`). `.github/workflows/deploy-production.yml` calls that workflow as job `ci`, then in job

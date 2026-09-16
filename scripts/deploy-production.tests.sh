@@ -206,15 +206,22 @@ for required_command in 'sha256sum' 'assert_artifact_archive' 'assert_data_uncha
 done
 
 digest_line="$(grep -n -m1 -F -- 'Verifying release artifact digest' "$deploy_script" | cut -d: -f1)"
+# Every marker below is literal text copied out of deploy-production.sh and matched with -F, so the $name
+# fragments must not expand. SC2016 is therefore disabled for exactly those search strings.
+# shellcheck disable=SC2016
 archive_line="$(grep -n -m1 -F -- 'assert_artifact_archive "$artifact_real"' "$deploy_script" | cut -d: -f1)"
 extract_line="$(grep -n -m1 -F -- 'tar -xzf' "$deploy_script" | cut -d: -f1)"
+# shellcheck disable=SC2016
 complete_line="$(grep -n -m1 -F -- 'assert_release_complete "$stage_publish"' "$deploy_script" | cut -d: -f1)"
-# Search for the literal expression; $stage_publish must not expand in this structural assertion.
 # shellcheck disable=SC2016
 asset_line="$(grep -n -m1 -F -- 'assert_tutorial_assets "$stage_publish"' "$deploy_script" | cut -d: -f1)"
+# shellcheck disable=SC2016
 preflight_line="$(grep -n -m1 -F -- 'run_migration_preflight "$stage_publish"' "$deploy_script" | cut -d: -f1)"
+# shellcheck disable=SC2016
 activate_line="$(grep -n -m1 -F -- 'activate_release "$stage_publish"' "$deploy_script" | cut -d: -f1)"
+# shellcheck disable=SC2016
 restart_line="$(grep -n -F -- 'restart_and_verify "$service_name"' "$deploy_script" | head -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016
 rollback_line="$(grep -n -m1 -F -- 'rollback_release "$live_publish"' "$deploy_script" | cut -d: -f1)"
 
 for required_variable in digest_line archive_line extract_line complete_line asset_line preflight_line activate_line restart_line rollback_line; do

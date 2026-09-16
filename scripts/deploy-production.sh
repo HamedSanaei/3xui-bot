@@ -77,7 +77,9 @@ assert_artifact_archive() {
     case "$lower" in
       data|data/*|./data|./data/*)
         fail "release artifact contains protected state (Data/) and will not be deployed." ;;
-      *.db|*.db-*|*.db-wal|*.db-shm|*configuration.json)
+      # *.db-* already refuses the SQLite sidecars of a live database (-wal, -shm, -journal), so listing
+      # them separately would only repeat a refusal this pattern has already made.
+      *.db|*.db-*|*configuration.json)
         fail "release artifact contains a database or configuration file and will not be deployed." ;;
       .git|.git/*|./.git|./.git/*)
         fail "release artifact contains version-control metadata and will not be deployed." ;;
@@ -208,7 +210,6 @@ show_recent_journal() {
 # between a rollback and a hard failure.
 restart_and_verify() {
   local service_name="$1"
-  local attempt
 
   if ! systemctl restart "$service_name"; then
     printf 'Service restart command failed. Showing bounded journal output.\n' >&2
@@ -216,7 +217,7 @@ restart_and_verify() {
     return 1
   fi
 
-  for attempt in {1..10}; do
+  for _ in {1..10}; do
     if systemctl is-active --quiet "$service_name"; then
       return 0
     fi

@@ -63,9 +63,16 @@ dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=<sha>"
 dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
 dotnet ef migrations has-pending-model-changes --no-build --context UserDbContext
 dotnet ef migrations has-pending-model-changes --no-build --context CredentialsDbContext
+bash -n scripts/deploy-production.sh
+bash -n scripts/deploy-production.tests.sh
 bash scripts/deploy-production.tests.sh
+shellcheck scripts/deploy-production.sh scripts/deploy-production.tests.sh
 dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false -o <tmp>
 ```
+
+`shellcheck` runs at its default severity, so warnings and info-level findings fail the pipeline as well. Both scripts
+are kept lint-clean; the structural assertions in `scripts/deploy-production.tests.sh` single-quote `$name` markers on
+purpose and disable `SC2016` for exactly those search strings.
 
 It then refuses to package anything that is not a runtime-only release: `Data/`, `*.db`, `*.db-*`, and
 `configuration.json` are rejected, while `Adminbot`, `Adminbot.dll`, `Assets/telegram-ui/emoji-map.json`, and all three
