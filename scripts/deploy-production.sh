@@ -25,19 +25,53 @@ EXPECTED_LIVE_ROOT="/root/vpnetiran"
 EXPECTED_SERVICE_NAME="vpnetiranbot.service"
 STAGING_BASE="/root/.deploy/vpnetiran"
 INCOMING_BASE="/root/.deploy/incoming"
+# Exclusive deployment lock. The advisory flock lives on the open file description, which this shell shares with every
+# child it starts, so the lock is released only once all of those processes have exited. A deploy that is killed while
+# its migration preflight still runs therefore leaves the lock held by the surviving child - the wedge that was observed
+# in production - which is why the wait below is bounded and the teardown below kills that child.
+# On this host /var/lock is the systemd alias of /run/lock, so this is the same file an operator sees as
+# /run/lock/vpnetiran-deploy.lock.
 LOCK_FILE="/var/lock/vpnetiran-deploy.lock"
-# Upper bound for waiting on the exclusive deployment lock. An unbounded `flock -x` turned a held lock into a silent
-# stall with no output at all, which GitHub's SSH client only reported minutes later as a broken pipe and exit 255, so
-# the wait is capped and announced before it can block.
-LOCK_WAIT_SECONDS=120
+# Upper bound for waiting on that lock. An unbounded `flock -x` turned a held lock into a silent stall with no output at
+# all, which GitHub's SSH client only reported minutes later as a broken pipe and exit 255, and it let one failed release
+# block every later one. The wait is now capped and announced before it can block.
+LOCK_WAIT_SECONDS=300
+# Upper bound for a single migration preflight run. The preflight is the only long-running child this script starts, and
+# it is the one operation that could otherwise keep the deploy - and with it the deployment lock - alive long after the
+# GitHub-managed SSH session has gone away.
+PREFLIGHT_TIMEOUT_SECONDS=300
 CURRENT_STAGE_ROOT=""
 PROTECTED_DATA_DIR=""
 PROTECTED_DATA_REAL=""
 PROTECTED_DATA_IDENTITY=""
+PREFLIGHT_CHILD_PID=""
 
 fail() {
   printf 'Deployment refused: %s\n' "$1" >&2
   exit 64
+}
+
+# Stops the migration preflight this deploy started, if it is still running. This is what prevents an interrupted deploy
+# (dropped SSH session, cancelled workflow, expired step timeout) from leaving an orphaned child behind that keeps the
+# deployment lock occupied and stalls every later release.
+terminate_preflight_child() {
+  local child_pid="$PREFLIGHT_CHILD_PID"
+  [[ -n "$child_pid" ]] || return 0
+  PREFLIGHT_CHILD_PID=""
+  kill -TERM "$child_pid" 2>/dev/null || true
+  local waited=0
+  while kill -0 "$child_pid" 2>/dev/null && [[ "$waited" -lt 10 ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  kill -KILL "$child_pid" 2>/dev/null || true
+}
+
+# Releases the lock explicitly rather than relying on the process exit alone. Closing the descriptor on exit already
+# releases it, but releasing it here keeps the intent visible in the teardown path an operator reads. A descriptor that
+# was never opened is ignored, so this is safe on failure paths that abort before the lock is taken.
+release_deployment_lock() {
+  flock -u 9 2>/dev/null || true
 }
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -187,6 +221,24 @@ rollback_release() {
 # Migration preflight and service health
 # ----------------------------------------------------------------------------------------------------------------------
 
+# Runs one migration preflight under a hard time limit while remembering its pid, so the teardown trap can stop it.
+# The background/`wait` pair exists only to make that pid killable; the returned status is still the preflight's own, and
+# a preflight that outlives its budget is reported the same way as a preflight that fails.
+#
+# The preflight is the only step of a deployment that can block indefinitely on the published application, so bounding it
+# here is what guarantees the deploy process always reaches its teardown and therefore always releases the lock.
+run_bounded_preflight() {
+  local publish_root="$1"
+  shift
+  timeout --signal=TERM --kill-after=30 "$PREFLIGHT_TIMEOUT_SECONDS" \
+    "$publish_root/Adminbot" --migration-check "$@" &
+  PREFLIGHT_CHILD_PID=$!
+  local status=0
+  wait "$PREFLIGHT_CHILD_PID" || status=$?
+  PREFLIGHT_CHILD_PID=""
+  return "$status"
+}
+
 # Runs the published executable's own migration preflight. It starts no web server, Telegram receiver, or background
 # worker, and it reads the live databases only through online-backup copies, so a schema change that cannot apply to real
 # production data aborts the deployment before the switch.
@@ -195,13 +247,13 @@ run_migration_preflight() {
   local live_data="$2"
 
   printf 'Running migration preflight against fresh databases.\n'
-  "$publish_root/Adminbot" --migration-check \
-    || fail "migration preflight failed against fresh databases."
+  run_bounded_preflight "$publish_root" \
+    || fail "migration preflight failed or exceeded ${PREFLIGHT_TIMEOUT_SECONDS}s against fresh databases."
   printf 'Running migration preflight against production database copies.\n'
-  "$publish_root/Adminbot" --migration-check \
+  run_bounded_preflight "$publish_root" \
     --users-source "$live_data/users.db" \
     --credentials-source "$live_data/credentials.db" \
-    || fail "migration preflight failed against production database copies."
+    || fail "migration preflight failed or exceeded ${PREFLIGHT_TIMEOUT_SECONDS}s against production database copies."
 }
 
 # Shows a bounded slice of the service journal so a failed restart is diagnosable from the workflow log alone.
@@ -253,10 +305,37 @@ main() {
   [[ "$live_root" == "$EXPECTED_LIVE_ROOT" ]] || fail "live root must remain $EXPECTED_LIVE_ROOT."
   [[ "$service_name" == "$EXPECTED_SERVICE_NAME" ]] || fail "service name must remain $EXPECTED_SERVICE_NAME."
 
-  # Only tools that exist for validation, locking, and service control are required. No compiler, SDK, or package
-  # restore is needed because the release arrives fully built.
+  # Every exit path runs the teardown: a clean success, a refusal, a TERM from a cancelled workflow, or a HUP from a
+  # dropped SSH session. Without the signal traps an interrupted deploy would leave its migration preflight running and
+  # the deployment lock occupied, which is exactly the wedge that stalled later releases.
+  teardown() {
+    terminate_preflight_child
+    if [[ -n "$CURRENT_STAGE_ROOT" && -e "$CURRENT_STAGE_ROOT" ]]; then
+      local cleanup_target
+      cleanup_target="$(realpath -m -- "$CURRENT_STAGE_ROOT")"
+      if [[ "$cleanup_target" == "$STAGING_BASE/"* ]]; then
+        rm -rf -- "$CURRENT_STAGE_ROOT"
+      else
+        printf 'Refusing unsafe staging cleanup: %s\n' "$cleanup_target" >&2
+      fi
+    fi
+    release_deployment_lock
+  }
+  on_exit() {
+    local exit_status=$?
+    teardown
+    exit "$exit_status"
+  }
+  trap on_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  # Only tools that exist for validation, locking, service control, and bounding the preflight are required. No compiler,
+  # SDK, or package restore is needed because the release arrives fully built.
   command -v tar >/dev/null || fail "tar is required on the production host."
   command -v flock >/dev/null || fail "flock is required on the production host."
+  command -v timeout >/dev/null || fail "timeout is required on the production host to bound the migration preflight."
   command -v realpath >/dev/null || fail "realpath is required on the production host."
   command -v stat >/dev/null || fail "stat is required on the production host."
   command -v sha256sum >/dev/null || fail "sha256sum is required on the production host."
@@ -303,19 +382,6 @@ main() {
   [[ "$canonical_stage" == "$STAGING_BASE/"* ]] || fail "staging path escaped the validated deployment root."
   [[ ! -e "$stage_root" ]] || fail "unique staging directory already exists."
   CURRENT_STAGE_ROOT="$stage_root"
-
-  cleanup_stage() {
-    if [[ -n "$CURRENT_STAGE_ROOT" && -e "$CURRENT_STAGE_ROOT" ]]; then
-      local cleanup_target
-      cleanup_target="$(realpath -m -- "$CURRENT_STAGE_ROOT")"
-      if [[ "$cleanup_target" == "$STAGING_BASE/"* ]]; then
-        rm -rf -- "$CURRENT_STAGE_ROOT"
-      else
-        printf 'Refusing unsafe staging cleanup: %s\n' "$cleanup_target" >&2
-      fi
-    fi
-  }
-  trap cleanup_stage EXIT
 
   # Artifact integrity is verified before anything is extracted, so a truncated or substituted transfer is refused
   # before it can reach the filesystem the service reads.

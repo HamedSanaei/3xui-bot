@@ -258,6 +258,23 @@ printf '  completeness and tutorial checks run before the migration preflight\n'
 printf '  migration preflight runs before the atomic switch\n'
 printf '  systemd is restarted only after the switch, with rollback after health checks\n'
 
+# The deployment lock must be bounded and must be released by the deploy's own teardown. Otherwise one interrupted run
+# leaves an orphaned process holding /run/lock/vpnetiran-deploy.lock, and every later release stalls on flock instead of
+# failing with a reason - the wedge observed in production.
+grep -Fq -- "flock -w \"\$LOCK_WAIT_SECONDS\" -x 9" "$deploy_script" \
+  || { echo "The deployment lock must be acquired with a bounded wait." >&2; exit 1; }
+for teardown_trap in "trap on_exit EXIT" "trap 'exit 130' INT" "trap 'exit 143' TERM" "trap 'exit 129' HUP"; do
+  grep -Fq -- "$teardown_trap" "$deploy_script" \
+    || { printf 'Missing deployment teardown trap: %s\n' "$teardown_trap" >&2; exit 1; }
+done
+for bounded_child in "terminate_preflight_child" "timeout --signal=TERM --kill-after=30"; do
+  grep -Fq -- "$bounded_child" "$deploy_script" \
+    || { printf 'The deploy must bound and reap its long-running child: %s\n' "$bounded_child" >&2; exit 1; }
+done
+printf 'Production deployment lock-safety test: PASS\n'
+printf '  the deployment lock is acquired with a bounded wait\n'
+printf '  EXIT, INT, TERM, and HUP run a teardown that reaps the preflight and releases the lock\n'
+
 if streamed_output="$(bash -s -- invalid-sha "$test_root/good.tar.gz" "$(printf 'a%.0s' {1..64})" 1 1 "$EXPECTED_LIVE_ROOT" "$EXPECTED_SERVICE_NAME" \
   < "$deploy_script" 2>&1)"; then
   echo "Expected streamed deployment entrypoint to reject an invalid SHA." >&2

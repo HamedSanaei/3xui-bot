@@ -119,6 +119,16 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   release completeness (`Adminbot`, `Adminbot.dll`, `Assets/telegram-ui/emoji-map.json`), the tutorial-asset preflight,
   the migration preflight on the staged executable (fresh databases, then online-backup copies of the live
   `Data/users.db` + `Data/credentials.db`), the atomic switch, `systemctl restart`, the health check, and rollback.
+- Deployment lock and interruption safety. The host-side deploy takes an exclusive `flock` on
+  `/var/lock/vpnetiran-deploy.lock` (the systemd alias of `/run/lock/vpnetiran-deploy.lock`) with a bounded 300 s wait, so
+  a held lock refuses the release with a clear reason instead of stalling it silently. The advisory lock lives on the
+  open file description the deploy shares with its children, so a killed deploy would otherwise leave the migration
+  preflight alive still holding the lock and wedge every later release - reproduced locally against the real flock
+  semantics. The script therefore bounds each preflight run at 300 s and its EXIT/INT/TERM/HUP teardown kills that child,
+  removes the staging directory, and releases the lock. The workflow adds `ServerAliveInterval`,
+  `ServerAliveCountMax`, and `ConnectTimeout` to every SSH call, wraps the streamed deploy in `timeout --kill-after` so
+  the whole remote process group dies with the session, and bounds the deploy step at 14 minutes inside the 20-minute
+  job.
 - Atomic switch and rollback (`activate_release` / `rollback_release`). Production state lives in `.../publish/Data`
   (both SQLite databases, the deployment's only `configuration.json`, and `Data/Logs`). The switch is a sequence of
   renames inside one filesystem: live release -> `publish.prev`, staged release -> `publish`, then

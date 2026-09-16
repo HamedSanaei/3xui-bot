@@ -22,6 +22,9 @@ env:
   SERVICE_NAME: vpnetiranbot.service
   INCOMING_BASE: /root/.deploy/incoming
   RELEASE_ARTIFACT_NAME: vpnetiranbot-release
+  # Upper bound for the host-side deployment itself. It stays below the deploy step's timeout-minutes on purpose, so the
+  # host-side timeout fires first and the host's own teardown - never a killed SSH client - releases the deployment lock.
+  DEPLOY_TIMEOUT_SECONDS: '720'
 
 jobs:
   # Reuses the exact CI pipeline that any pull request runs, so a release cannot be packaged by a different set of steps
@@ -124,12 +127,12 @@ jobs:
           set -Eeuo pipefail
           archive="$RUNNER_TEMP/release/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
           remote_dir="${{ env.INCOMING_BASE }}/$GITHUB_SHA"
-          ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+          ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 -o ConnectTimeout=30 \
             -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -- "$PROD_USER@$PROD_HOST" "install -d -m 700 '$remote_dir'"
-          scp -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+          scp -o ServerAliveInterval=15 -o ServerAliveCountMax=20 -o ConnectTimeout=30 \
             -i "$RUNNER_TEMP/prod_deploy_key" -P "$PROD_PORT" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
@@ -138,6 +141,8 @@ jobs:
 
       - name: Deploy exact pushed commit from the verified artifact
         shell: bash
+        # Bounds the step as well as the remote command, so a wedged SSH session can never consume the whole job budget.
+        timeout-minutes: 14
         env:
           PROD_HOST: ${{ secrets.PROD_HOST }}
           PROD_PORT: ${{ secrets.PROD_PORT }}
@@ -145,11 +150,16 @@ jobs:
         run: |
           set -Eeuo pipefail
           remote_artifact="${{ env.INCOMING_BASE }}/$GITHUB_SHA/${{ env.RELEASE_ARTIFACT_NAME }}.tar.gz"
-          remote_cmd="$(printf 'bash -s -- %q %q %q %q %q %q %q' \
+          # `timeout` runs the streamed deploy in its own process group and signals that whole group, so a deploy that
+          # outlives this session - cancelled runner, expired step timeout, dead connection - is killed together with the
+          # children it started. That is what stops an abandoned release from holding the host-side deployment lock for
+          # every later run.
+          remote_cmd="$(printf 'exec timeout --signal=TERM --kill-after=60 %s bash -s -- %q %q %q %q %q %q %q' \
+            "${{ env.DEPLOY_TIMEOUT_SECONDS }}" \
             "$GITHUB_SHA" "$remote_artifact" "$ARTIFACT_DIGEST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "${{ env.DEPLOY_PATH }}" "${{ env.SERVICE_NAME }}")"
-          # Keepalives matter here: this session can sit silent for minutes while the host runs the migration preflight,
+          # Keepalives matter here too: this session sits silent for minutes while the host runs the migration preflight,
           # and an idle connection torn down mid-deploy is reported only as a broken pipe with exit 255.
-          ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+          ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 -o ConnectTimeout=30 \
             -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
@@ -168,7 +178,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           if [[ -f "$RUNNER_TEMP/prod_deploy_key" ]]; then
-            ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+            ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 -o ConnectTimeout=30 \
               -i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT" \
               -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
               -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
