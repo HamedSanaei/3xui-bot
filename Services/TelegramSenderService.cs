@@ -125,7 +125,36 @@ public sealed class TelegramSenderService : BackgroundService
             _logger.LogDebug("Telegram output admitted. BotId={BotId} JobId={JobId} UpdateId={UpdateId} UserId={UserId} EnqueueMs={EnqueueMs}",
                 botId, job.Id, TelegramUpdateLatencyScope.Current?.UpdateId, TelegramInteractionActor.Current, timer.Elapsed.TotalMilliseconds);
             Wake();
-            return waiter == null ? default : (T)await waiter.Task.WaitAsync(token);
+            if (waiter == null) return default;
+
+            // The job is durable from here on, so the caller's own deadline or lane token no longer decides whether the
+            // output is delivered: the sender owns execution and keeps its attempt. A caller that stops waiting gets a
+            // truthful outcome when the worker already reported one, and otherwise stops waiting without a failure - the
+            // reported symptom was an interactive update failing because its wait expired after a successful admission.
+            // Nothing on this path replays, duplicates, or re-admits the send.
+            var wait = Stopwatch.StartNew();
+            try
+            {
+                var completed = await waiter.Task.WaitAsync(token);
+                TelegramLatencyMetrics.Record(TelegramLatencyMetrics.EnqueueWaitMs, wait.Elapsed.TotalMilliseconds);
+                return (T)completed;
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                TelegramLatencyMetrics.Record(TelegramLatencyMetrics.EnqueueWaitMs, wait.Elapsed.TotalMilliseconds);
+                if (waiter.Task.IsCompleted)
+                {
+                    // The worker already established the real outcome, so report it instead of masking it as cancellation.
+                    return (T)await waiter.Task;
+                }
+
+                TelegramLatencyMetrics.RecordCancellation(TelegramCancellationSources.CallerToken);
+                _logger.LogInformation(
+                    "Telegram output caller stopped waiting after durable admission. BotId={BotId} JobId={JobId} UpdateId={UpdateId} enqueue_wait_ms={EnqueueWaitMs} cancellation_source={CancellationSource}",
+                    botId, job.Id, TelegramUpdateLatencyScope.Current?.UpdateId, wait.Elapsed.TotalMilliseconds,
+                    TelegramCancellationSources.CallerToken);
+                return default;
+            }
         }
         finally { if (waiter != null) _waiters.TryRemove(job.CompletionKey, out _); }
     }
@@ -277,8 +306,12 @@ public sealed class TelegramSenderService : BackgroundService
             // Sending at process death is ambiguous. Never resend a possibly accepted Telegram message.
             await db.TelegramDeliveryJobs.Where(x => x.Status == "sending").ExecuteUpdateAsync(
                 set => set.SetProperty(x => x.Status, "uncertain").SetProperty(x => x.Payload, (string)null), stoppingToken);
-            // A lost caller cannot consume a response. Its existing financial saga/outbox owns recovery, not this transport.
-            await db.TelegramDeliveryJobs.Where(x => x.Status == "queued" && x.RequiresLiveCaller).ExecuteUpdateAsync(
+            // A lost caller cannot consume a response, and only some jobs have another delivery path. A critical claim is
+            // re-sent by the financial outbox that admitted it, an operator-log row by its own outbox, and a live stream job
+            // cannot run at all without its caller's streams. A normal-priority reply has no other path, so it is kept and
+            // delivered: discarding it here would lose the reply the customer was already owed.
+            await db.TelegramDeliveryJobs.Where(x => x.Status == "queued" && x.RequiresLiveCaller
+                && x.Priority != (int)TelegramWorkPriority.Normal).ExecuteUpdateAsync(
                 set => set.SetProperty(x => x.Status, "failed").SetProperty(x => x.Payload, (string)null), stoppingToken);
             _ready.TrySetResult();
         }
@@ -339,7 +372,11 @@ public sealed class TelegramSenderService : BackgroundService
                             .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "uncertain")
                                 .SetProperty(x => x.Payload, (string)null), token);
                         var liveCallers = _waiters.Keys.ToArray();
+                        // Only output that another component re-delivers is abandoned when its caller disappears (critical
+                        // claims and operator-log rows). A normal-priority reply has no other delivery path, so an abandoned
+                        // caller must not destroy it - a foreground reply whose wait expired was otherwise discarded un-sent.
                         await db.TelegramDeliveryJobs.Where(x => x.Status == "queued" && x.RequiresLiveCaller
+                            && x.Priority != (int)TelegramWorkPriority.Normal
                             && !liveCallers.Contains(x.CompletionKey) && !currentActive.Contains(x.BotId))
                             .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "failed")
                                 .SetProperty(x => x.Payload, (string)null), token);
@@ -386,18 +423,36 @@ public sealed class TelegramSenderService : BackgroundService
             Exception failure = null;
             var status = "uncertain";
             var retryAt = DateTime.UtcNow;
+            var cancellationSource = TelegramCancellationSources.None;
+            var workerStartDelayMs = 0.0;
+            var apiElapsedMs = 0.0;
+            // True once the transport attempt has begun. It is the line between "Telegram's outcome is unknown" and
+            // "the request was never sent", which is what decides between uncertain and a safe first attempt.
+            var apiStarted = false;
+            CancellationTokenSource attemptTimeout = null;
             try
             {
+                workerStartDelayMs = (DateTime.UtcNow - job.CreatedAtUtc).TotalMilliseconds;
+                TelegramLatencyMetrics.Record(TelegramLatencyMetrics.WorkerStartDelayMs, workerStartDelayMs);
                 var callerToken = CancellationToken.None;
                 LiveRequest live = null;
                 if (job.RequiresLiveCaller)
                 {
-                    if (!_waiters.TryGetValue(job.CompletionKey, out var caller) || caller.Token.IsCancellationRequested)
-                    { status = "failed"; continue; }
-                    callerToken = caller.Token;
+                    var callerPresent = _waiters.TryGetValue(job.CompletionKey, out var caller)
+                        && !caller.Token.IsCancellationRequested;
+                    // A caller that stopped waiting only disqualifies output another component will re-deliver: financial
+                    // outboxes select Critical and operator logs select Low, and both re-send their own row, so delivering
+                    // here as well could duplicate a receipt or an audit message. A normal-priority foreground reply is the
+                    // opposite case - nothing re-delivers it - so its durable job is executed and the abandoned caller merely
+                    // never receives a result.
+                    if (!callerPresent && job.Priority != (int)TelegramWorkPriority.Normal)
+                    { status = "failed"; cancellationSource = TelegramCancellationSources.CallerToken; continue; }
+                    // Only a stream-backed job keeps the caller's token, because the caller owns those streams and disposing
+                    // them has to stop the transfer. A snapshotted job is independent of whoever admitted it.
+                    if (callerPresent && job.Kind == "live") callerToken = caller.Token;
                 }
                 if (job.Kind == "live" && (!_liveRequests.TryGetValue(job.CompletionKey, out live) || !live.TryStart()))
-                { status = "failed"; continue; }
+                { status = "failed"; cancellationSource = TelegramCancellationSources.LiveCallerReleased; continue; }
                 using var execution = CancellationTokenSource.CreateLinkedTokenSource(token, callerToken);
                 var claimed = await SqliteOperation.RunAsync(async ct =>
                 {
@@ -408,10 +463,21 @@ public sealed class TelegramSenderService : BackgroundService
                 }, execution.Token);
                 if (claimed != 1) { status = "failed"; continue; }
                 await RateLimitAsync(execution.Token);
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(execution.Token);
-                timeout.CancelAfter(TimeSpan.FromSeconds(job.Kind == "live" ? Math.Max(60, _options.SendTimeoutSeconds) : _options.SendTimeoutSeconds));
+                attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(execution.Token);
+                attemptTimeout.CancelAfter(TimeSpan.FromSeconds(job.Kind == "live" ? Math.Max(60, _options.SendTimeoutSeconds) : _options.SendTimeoutSeconds));
                 var client = _clients.GetRawClient(job.BotId);
-                result = live != null ? await live.Send(client, timeout.Token) : await SendAsync(client, job, timeout.Token);
+                var apiWatch = Stopwatch.StartNew();
+                apiStarted = true;
+                try
+                {
+                    result = live != null ? await live.Send(client, attemptTimeout.Token) : await SendAsync(client, job, attemptTimeout.Token);
+                }
+                finally
+                {
+                    apiWatch.Stop();
+                    apiElapsedMs = apiWatch.Elapsed.TotalMilliseconds;
+                    TelegramLatencyMetrics.Record(TelegramLatencyMetrics.TelegramApiMs, apiElapsedMs);
+                }
                 status = "sent";
             }
             catch (ApiRequestException ex) when (ex.ErrorCode == 429 && job.Attempts < 2 && job.Kind != "live")
@@ -421,12 +487,32 @@ public sealed class TelegramSenderService : BackgroundService
                 failure = ex;
             }
             catch (ApiRequestException ex) when (ex.ErrorCode < 500) { status = "failed"; failure = ex; }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                // Host shutdown is the one cancellation that leaves Telegram's answer genuinely unseen.
+                failure = new OperationCanceledException("Telegram output was cancelled by host shutdown.", token);
+                cancellationSource = TelegramCancellationSources.HostShutdown;
+                status = apiStarted ? "uncertain" : "queued";
+            }
+            catch (OperationCanceledException) when (attemptTimeout?.IsCancellationRequested == true)
+            {
+                failure = new OperationCanceledException("Telegram output exceeded its transport deadline.");
+                cancellationSource = TelegramCancellationSources.SendTimeout;
+                status = apiStarted ? "uncertain" : "queued";
+            }
+            catch (OperationCanceledException ex)
+            {
+                failure = ex;
+                cancellationSource = TelegramCancellationSources.Unknown;
+                status = apiStarted ? "uncertain" : "queued";
+            }
             catch (Exception ex) { failure = ex; }
             finally
             {
+                attemptTimeout?.Dispose();
                 try
                 {
-                    // Independent bounded persistence records uncertainty even when the host cancelled the HTTP call.
+                    // Independent bounded persistence records the outcome even when the host cancelled the HTTP call.
                     using var save = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                     await SqliteOperation.RunAsync(async ct =>
                     {
@@ -436,16 +522,25 @@ public sealed class TelegramSenderService : BackgroundService
                                 .SetProperty(x => x.Payload, status == "queued" ? job.Payload : null), ct);
                     }, save.Token);
                 }
-                catch (Exception ex) { failure ??= ex; status = "uncertain"; }
+                catch (Exception ex)
+                {
+                    // A failed terminal write cannot disprove an outcome Telegram already confirmed, so the status keeps what
+                    // the attempt established and only the durable row is reconciled by the ordinary sweep. Replacing a
+                    // confirmed send with "uncertain" was the reported defect: a fast, successful send was reported as an
+                    // ambiguous delivery and its caller received TelegramDeliveryUncertainException.
+                    _logger.LogWarning("Telegram output status persistence failed. Outcome={Outcome} ErrorType={ErrorType}",
+                        status, ex.GetType().Name);
+                }
                 if (status != "queued" && _waiters.TryGetValue(job.CompletionKey, out var waiter))
                 {
                     if (status == "sent") waiter.Completion.TrySetResult(result);
                     else waiter.Completion.TrySetException(status == "uncertain" ? new TelegramDeliveryUncertainException()
                         : failure ?? new InvalidOperationException("Telegram delivery did not complete."));
                 }
-                _logger.LogInformation("Telegram output completed. BotId={BotId} JobId={JobId} Status={Status} QueueWaitMs={QueueWaitMs} SendMs={SendMs} Workers={Workers} ActiveBots={ActiveBots}",
+                _logger.LogInformation("Telegram output completed. BotId={BotId} JobId={JobId} Status={Status} QueueWaitMs={QueueWaitMs} SendMs={SendMs} worker_start_delay_ms={WorkerStartDelayMs} telegram_api_ms={TelegramApiMs} cancellation_source={CancellationSource} Workers={Workers} ActiveBots={ActiveBots}",
                     job.BotId, job.Id, status, (DateTime.UtcNow - job.CreatedAtUtc).TotalMilliseconds - started.Elapsed.TotalMilliseconds,
-                    started.Elapsed.TotalMilliseconds, _options.WorkerCount, _activeBots.Count);
+                    started.Elapsed.TotalMilliseconds, workerStartDelayMs, apiElapsedMs, cancellationSource,
+                    _options.WorkerCount, _activeBots.Count);
                 _activeBots.TryRemove(job.BotId, out _);
                 _slots.Release();
                 Wake();

@@ -58,6 +58,13 @@ stream-backed media attempts have 60 seconds, downloads 120 seconds, metadata ca
 429 text responses get at most three attempts, honoring RetryAfter and exponential backoff. Live stream-backed 429
 responses return to their existing caller's delivery policy; the sender never retries consumed streams.
 Transport timeouts, ambiguous 5xx responses and process interruption become uncertain and are not replayed by the sender.
+A caller's own deadline or lane token is not one of those cases: the worker owns the attempt, so a caller that stops waiting
+after durable admission returns without a delivery failure, the in-flight snapshot send still completes, and a cancellation
+that happened before the HTTP call leaves the job queued for a first attempt. Uncertainty is therefore reserved for an
+attempt whose call had started and whose answer was never seen; the attributing source is the closed vocabulary in
+`Domain/TelegramCancellationSources.cs`, exported as `telegram_delivery_cancellation_total{source}` together with
+`enqueue_wait_ms`, `worker_start_delay_ms` and `telegram_api_ms`. A failed terminal status write no longer relabels a
+confirmed send as uncertain.
 Owned settlement and tenant receipt notification workers retain this uncertainty; the Sales Assistant does not send
 a text fallback after an ambiguous receipt-photo result. Existing operator-log outbox delivery remains at-least-once
 under its separate recovery policy; duplicate audit messages do not replay a financial operation.
@@ -79,9 +86,11 @@ slow calls from four different bots can still occupy all four output workers.
 
 - Additive migration `20260915221456_TelegramDeliveryQueue` creates an empty output table and a
   `(Status, BotId, Priority, Id)` index. No historical payment or balance is replayed or modified.
-- `sending` at restart becomes `uncertain`. Unstarted result-dependent rows become `failed`; the original workflow
-  owns recovery. Queued admission-only UI resumes. Terminal payloads are immediately cleared. Sent/failed metadata
-  is pruned in bounded batches after seven days; uncertain metadata is retained for operator review.
+- `sending` at restart becomes `uncertain`. Unstarted rows are only discarded when another component owns their recovery:
+  critical claims the financial outboxes re-send, and live stream jobs whose caller released its streams. A queued
+  normal-priority reply whose caller disappeared is delivered, because nothing else would deliver it. Queued
+  admission-only UI resumes. Terminal payloads are immediately cleared. Sent/failed metadata is pruned in bounded batches
+  after seven days; uncertain metadata is retained for operator review.
 - The sender is registered before business workers and receivers, so it stops after them. Existing input/business
   shutdown drains first; output then gets up to twenty seconds within the remaining host deadline. Queued output
   remains durable; active interrupted output is uncertain.

@@ -12,6 +12,18 @@
   clear immediately; sent/failed metadata retains seven days; uncertain metadata remains for review.
   Owned settlement and tenant receipt workers retain sender uncertainty; the Sales Assistant must not send a photo
   fallback after an ambiguous delivery. Startup admission waits until previous-process claims have been recovered.
+  Delivery-outcome ownership: the worker owns the transport attempt, so an interactive caller's deadline or lane token
+  never cancels an in-flight Telegram call for a snapshotted job - only host shutdown, the sender's own five-second attempt
+  deadline, or a released stream (live jobs) can end it. A caller that stops waiting after durable admission returns without
+  a delivery failure and is never told a send it merely stopped observing is ambiguous. `uncertain` is reserved for an
+  attempt whose HTTP call had started and whose answer was never seen; a cancellation before the call leaves the job queued
+  for a first attempt (never a replay), and a failure of the terminal status write can no longer relabel a confirmed
+  `sent`. Abandoned jobs are discarded only when another component owns their recovery (critical claims the financial
+  outboxes re-send, and live stream jobs); a normal-priority reply whose caller disappeared is still delivered because
+  nothing else would deliver it. Cancellations are attributed through the closed vocabulary in
+  `Domain/TelegramCancellationSources.cs` (`caller_token`, `host_shutdown`, `send_timeout`, `live_caller_released`, `none`,
+  `unknown`), and the four delivery phases are exported as `enqueue_wait_ms`, `worker_start_delay_ms`, `telegram_api_ms`,
+  and `telegram_delivery_cancellation_total{source}` from `TelegramLatencyMetrics`.
   Receiver admission now spills to disk without waiting for worker capacity; memory windows stay bounded. Per-bot business
   execution is capped by workerCount, within the existing global update limit. See `docs/telegram-performance.md` for
   operational limits, checks and deployment notes; latency acceptance scenarios have not been executed.

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Diagnostics.Metrics;
 
 /// <summary>
@@ -73,6 +74,71 @@ public static class TelegramLatencyMetrics
     /// </remarks>
     public static readonly Histogram<double> QueueWaitMs =
         Meter.CreateHistogram<double>("queue_wait_ms", "ms");
+
+    /// <summary>
+    /// Milliseconds a caller waited for its real Telegram result after the output job was durably committed.
+    /// </summary>
+    /// <remarks>
+    /// This is a post-admission wait, not an admission cost: the durable write has already succeeded when the timer
+    /// starts. It is the number that separates "the job could not be stored" from "the job was stored and the response
+    /// was slow", which is what the uncertain-delivery complaint needed.
+    /// </remarks>
+    public static readonly Histogram<double> EnqueueWaitMs =
+        Meter.CreateHistogram<double>("enqueue_wait_ms", "ms");
+
+    /// <summary>
+    /// Milliseconds between an output job being durably committed and a sender worker starting its attempt.
+    /// </summary>
+    /// <remarks>
+    /// A high value means the job is waiting for a worker, a per-bot serialization slot, or the global transport pace,
+    /// so it is the queue-side half of delivery latency and the value a caller deadline competes against.
+    /// </remarks>
+    public static readonly Histogram<double> WorkerStartDelayMs =
+        Meter.CreateHistogram<double>("worker_start_delay_ms", "ms");
+
+    /// <summary>
+    /// Milliseconds spent inside the Telegram HTTP call itself, measured around the send and excluding claim, pacing,
+    /// and status persistence.
+    /// </summary>
+    /// <remarks>
+    /// Only this instrument measures Telegram's own latency. Comparing it with <see cref="WorkerStartDelayMs"/> tells an
+    /// operator whether a slow delivery was Telegram's fault or the sender's queue.
+    /// </remarks>
+    public static readonly Histogram<double> TelegramApiMs =
+        Meter.CreateHistogram<double>("telegram_api_ms", "ms");
+
+    /// <summary>
+    /// Counts which token ended an output attempt that did not reach a definite outcome.
+    /// </summary>
+    /// <remarks>
+    /// The only dimension is a <c>source</c> tag drawn from the closed vocabulary in
+    /// <see cref="TelegramCancellationSources"/>: no bot id, chat id, update id, payload, or token ever appears on this
+    /// instrument. It exists because "the send was cancelled" is not actionable until an operator can tell a caller
+    /// deadline from host shutdown from the sender's own transport deadline.
+    /// </remarks>
+    public static readonly Counter<long> CancellationSource =
+        Meter.CreateCounter<long>("telegram_delivery_cancellation_total");
+
+    /// <summary>Records one cancellation attribution against the closed-vocabulary source.</summary>
+    /// <param name="source">
+    /// One value of <see cref="TelegramCancellationSources"/>; an unmapped value is recorded as <c>unknown</c> so the
+    /// vocabulary cannot be widened by a caller typo or a future code path.
+    /// </param>
+    /// <remarks>
+    /// Recording is best-effort and never throws, exactly like <see cref="Record"/>.
+    /// </remarks>
+    public static void RecordCancellation(string source)
+    {
+        try
+        {
+            CancellationSource.Add(1, new KeyValuePair<string, object>("source",
+                TelegramCancellationSources.IsKnown(source) ? source : TelegramCancellationSources.Unknown));
+        }
+        catch
+        {
+            // A diagnostics listener must never break the delivery path it is measuring.
+        }
+    }
 
     /// <summary>Records one observation while guaranteeing that instrumentation can never fail a caller.</summary>
     /// <param name="instrument">One of the four latency instruments declared by this type; null is ignored.</param>
