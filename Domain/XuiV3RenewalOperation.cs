@@ -73,6 +73,35 @@ namespace Adminbot.Domain
     }
 
     /// <summary>
+    /// Closed vocabulary of administrator resolutions for one locked manual-review renewal.
+    /// </summary>
+    /// <remarks>
+    /// The values are persisted in <see cref="XuiV3RenewalOperation.ManualReviewResolution"/> for audit and are never
+    /// shown to customers. Only a resolution that actually transitioned the row is recorded, so the column always
+    /// matches the terminal state of the operation.
+    /// </remarks>
+    public static class XuiV3RenewalManualReviewResolutions
+    {
+        /// <summary>
+        /// An administrator proved with a fresh read-only panel comparison that the renewal was applied, and the
+        /// operation continued through the existing exactly-once settlement path.
+        /// </summary>
+        public const string ConfirmedApplied = "confirmed_applied";
+
+        /// <summary>
+        /// An administrator abandoned the operation as not applied after a recovery-eligible operation produced a
+        /// fresh definitely-pre-mutation comparison.
+        /// </summary>
+        public const string AbandonedNotApplied = "abandoned_not_applied";
+
+        /// <summary>
+        /// An administrator abandoned a historical recovery-ineligible operation whose panel state can never be
+        /// re-proven, using an explicit super-admin override.
+        /// </summary>
+        public const string AbandonedNotAppliedLegacyOverride = "abandoned_not_applied_legacy_override";
+    }
+
+    /// <summary>
     /// Durable exactly-once record for one intended XUI v3 renewal.
     /// </summary>
     /// <remarks>
@@ -278,6 +307,38 @@ namespace Adminbot.Domain
 
         /// <summary>UTC time when bounded automatic reconciliation escalated the operation to manual review.</summary>
         public DateTime? ManualReviewAtUtc { get; set; }
+
+        /// <summary>
+        /// UTC time when the single operator notification for the current manual-review escalation was durably claimed.
+        /// </summary>
+        /// <remarks>
+        /// The marker is written with the same conditional UPDATE that decides which executor owns the notification, so
+        /// repeated reconciliation scans of the same locked row can never alert twice. It is reset to null only when a
+        /// fresh escalation follows a resolution, so one operation produces at most one alert per unresolved state.
+        /// </remarks>
+        public DateTime? ManualReviewNotifiedAtUtc { get; set; }
+
+        /// <summary>
+        /// UTC time when an administrator resolved the manual review by confirming the panel application or by
+        /// abandoning the operation as not applied.
+        /// </summary>
+        public DateTime? ManualReviewResolvedAtUtc { get; set; }
+
+        /// <summary>
+        /// Telegram user id of the configured super-admin who resolved the manual review.
+        /// </summary>
+        /// <remarks>Recorded for audit; it never replaces the payer or the account owner.</remarks>
+        public long? ManualReviewResolvedByTelegramUserId { get; set; }
+
+        /// <summary>
+        /// Bounded resolution category from <see cref="XuiV3RenewalManualReviewResolutions"/> recorded by the resolving
+        /// administrator.
+        /// </summary>
+        /// <remarks>
+        /// This is a closed-vocabulary audit value, never free text, and must not contain an account identity, panel
+        /// reference, or customer-supplied reason.
+        /// </remarks>
+        public string ManualReviewResolution { get; set; }
 
         /// <summary>UTC creation time of the operation row.</summary>
         public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;

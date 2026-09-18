@@ -695,6 +695,10 @@ public class UserDbContext : DbContext
             entity.Property(x => x.LastError).HasMaxLength(2000);
             entity.Property(x => x.LastComparisonOutcome).HasMaxLength(40);
             entity.Property(x => x.LastMismatchSummary).HasMaxLength(1000);
+            // Closed-vocabulary administrator resolution, never free text or account identity.
+            entity.Property(x => x.ManualReviewResolution).HasMaxLength(64);
+            // Serves both the administrator pending list and the one-shot notification sweep without a table scan.
+            entity.HasIndex(x => new { x.Status, x.ManualReviewNotifiedAtUtc });
             // The unique key is the database-level duplicate guard for repeated confirmations.
             entity.HasIndex(x => x.OperationKey).IsUnique();
             entity.HasIndex(x => x.TenantBotOrderId)

@@ -44,6 +44,15 @@ public partial class TelegramBotService
     /// </remarks>
     private const string AdminPanelEntryAction = "🗽 Admin";
 
+    /// <summary>
+    /// Super-admin reply-keyboard action that opens the XUI v3 renewal manual-review screen.
+    /// </summary>
+    /// <remarks>
+    /// The action is owned-bot and configured-super-admin only. It renders a read-only screen, so opening it changes no
+    /// conversation, wallet, order, or panel state.
+    /// </remarks>
+    private const string AdminManualReviewAction = "🧾 بررسی دستی تمدید";
+
     /// <summary>Fixed Persian greeting shown when the super-admin panel opens.</summary>
     private const string AdminPanelGreetingText = "پنل مدیریت";
 
@@ -180,6 +189,7 @@ public partial class TelegramBotService
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
     private readonly XuiV3PurchaseSessionStore _xuiV3PurchaseSessionStore;
     private readonly XuiV3AdminFlowService _xuiV3AdminFlowService;
+    private readonly XuiV3RenewalManualReviewAdminService _xuiV3RenewalManualReviewAdminService;
     private readonly TenantBotService _tenantBotService;
     private readonly SalesAssistantService _salesAssistantService;
     private readonly UserActivityLogService _userActivityLog;
@@ -350,6 +360,7 @@ public partial class TelegramBotService
         XuiV3BotFlowService xuiV3BotFlowService,
         XuiV3PurchaseSessionStore xuiV3PurchaseSessionStore,
         XuiV3AdminFlowService xuiV3AdminFlowService,
+        XuiV3RenewalManualReviewAdminService xuiV3RenewalManualReviewAdminService,
         TenantBotService tenantBotService,
         SalesAssistantService salesAssistantService,
         UserActivityLogService userActivityLog,
@@ -391,6 +402,7 @@ public partial class TelegramBotService
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _xuiV3PurchaseSessionStore = xuiV3PurchaseSessionStore;
         _xuiV3AdminFlowService = xuiV3AdminFlowService;
+        _xuiV3RenewalManualReviewAdminService = xuiV3RenewalManualReviewAdminService;
         _tenantBotService = tenantBotService;
         _salesAssistantService = salesAssistantService;
         _userActivityLog = userActivityLog;
@@ -898,6 +910,18 @@ public partial class TelegramBotService
                 return;
             }
 
+            // Manual-review resolution callbacks are gated on the configured super-admin allow-list before dispatch, and
+            // the handler rechecks authorization internally because callback data is client-supplied.
+            if (callbackIsSuperAdmin &&
+                XuiV3RenewalManualReviewAdminService.IsManualReviewCallback(callbackQuery.Data) &&
+                await _xuiV3RenewalManualReviewAdminService.TryHandleCallbackAsync(
+                    botClient,
+                    callbackQuery,
+                    cancellationToken))
+            {
+                return;
+            }
+
             if (callbackQuery.Data != null && callbackQuery.Data.StartsWith("x3:"))
             {
                 var callbackMainKeyboard = callbackIsSuperAdmin
@@ -971,6 +995,19 @@ public partial class TelegramBotService
         // admin sub-flow and return to the owned-bot main menu without touching super-admin authorization.
         if (isOwnedBot && await TryHandleSuperAdminMenuExitAsync(botClient, message, cancellationToken))
             return;
+
+        // The manual-review screen lists XUI v3 renewals that bounded automatic reconciliation could not decide. It is
+        // read-only, owned-bot and super-admin only, and it is routed at the same high-priority layer as the Admin entry
+        // so a locked operation can never be reported through a stale customer or admin sub-flow state.
+        if (isOwnedBot && isSuperAdmin &&
+            string.Equals(message.Text, AdminManualReviewAction, StringComparison.Ordinal))
+        {
+            await _xuiV3RenewalManualReviewAdminService.ShowPendingListAsync(
+                botClient,
+                message.Chat.Id,
+                cancellationToken);
+            return;
+        }
 
         // Tenant bots answer as storefronts only; they do not expose the main brand menus.
         if (isTenantBot)
@@ -5728,6 +5765,7 @@ public partial class TelegramBotService
             AdminPaymentGatewayAction,
             AdminClientDownloadAction,
             "🤖 وضعیت ربات‌ها",
+            AdminManualReviewAction,
             "📑 Menu"
         };
         return actions;

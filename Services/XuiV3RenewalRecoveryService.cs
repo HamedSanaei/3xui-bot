@@ -16,11 +16,11 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(15);
 
+    /// <summary>Maximum manual-review rows announced by one notification sweep.</summary>
+    private const int ManualReviewNotificationBatchSize = 25;
+
     private readonly XuiV3RenewalOperationStore _operationStore;
-    private readonly IServiceScopeFactory _scopeFactory;
-    private readonly BotRegistry _botRegistry;
-    private readonly BotClientProvider _botClientProvider;
-    private readonly BotContextAccessor _botContextAccessor;
+    private readonly XuiV3RenewalAppliedSettlementRouter _settlementRouter;
     private readonly IConfiguration _configuration;
     private readonly AppConfig _appConfig;
     private readonly ILogger<XuiV3RenewalRecoveryService> _logger;
@@ -29,27 +29,21 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
     /// Creates the renewal reconciliation worker.
     /// </summary>
     /// <param name="operationStore">Durable users.db operation, account-lock, lease, and backoff store.</param>
-    /// <param name="scopeFactory">Creates an isolated service graph for each recovered settlement.</param>
-    /// <param name="botRegistry">Runtime registry used to restore the operation's originating owned bot.</param>
-    /// <param name="botClientProvider">Provider used to notify the payer after recovered owned settlement.</param>
-    /// <param name="botContextAccessor">Accessor that scopes recovered logs and ledger metadata to the original bot.</param>
+    /// <param name="settlementRouter">
+    /// Router to the existing owned/tenant exactly-once settlement implementation. The worker never settles directly,
+    /// so an operator-confirmed operation and a worker-recovered operation always reach the same settlement code.
+    /// </param>
     /// <param name="configuration">Runtime XUI base URL, root path, token, and request timeout configuration.</param>
     /// <param name="logger">Local operational logger; UUID, normalized email, token, payload, and response body are omitted.</param>
-    /// <remarks>Each recovered renewal resolves a scoped owned or tenant settlement handler. Existing durable leases and GET-only recovery rules remain authoritative.</remarks>
+    /// <remarks>Existing durable leases and GET-only recovery rules remain authoritative.</remarks>
     public XuiV3RenewalRecoveryService(
         XuiV3RenewalOperationStore operationStore,
-        IServiceScopeFactory scopeFactory,
-        BotRegistry botRegistry,
-        BotClientProvider botClientProvider,
-        BotContextAccessor botContextAccessor,
+        XuiV3RenewalAppliedSettlementRouter settlementRouter,
         IConfiguration configuration,
         ILogger<XuiV3RenewalRecoveryService> logger)
     {
         _operationStore = operationStore;
-        _scopeFactory = scopeFactory;
-        _botRegistry = botRegistry;
-        _botClientProvider = botClientProvider;
-        _botContextAccessor = botContextAccessor;
+        _settlementRouter = settlementRouter;
         _configuration = configuration;
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         _logger = logger;
@@ -73,6 +67,10 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
                 var operations = await _operationStore.ClaimDueReconciliationAsync(10, stoppingToken);
                 foreach (var operation in operations)
                     await RecoverOneAsync(operation, stoppingToken);
+
+                // Announce manual reviews that were escalated by an earlier process or already existed before this
+                // deployment. The durable notification marker makes the sweep safe to run on every scan.
+                await AnnounceUnnotifiedManualReviewsAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -123,6 +121,11 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
                             operation.OperationId,
                             comparison.Outcome,
                             comparison.Summary);
+
+                        // Durable one-shot notification: the condition guarantees exactly one operator alert per
+                        // escalation even though every subsequent scan sees the same locked row.
+                        if (await _operationStore.TryClaimManualReviewNotificationAsync(operation, cancellationToken))
+                            LogManualReviewOperatorAlert(operation);
                     }
                     else if (disposition == XuiV3RenewalOperationStore.ReconciliationDisposition.DefinitivelyFailed)
                     {
@@ -191,36 +194,61 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
     }
 
     /// <summary>
-    /// Routes one applied operation to its existing owned or tenant exactly-once settlement boundary.
+    /// Routes one applied operation to the shared owned or tenant exactly-once settlement implementation.
     /// </summary>
     /// <param name="operation">Applied operation that remains account-locked until settlement completes.</param>
     /// <param name="cancellationToken">Host shutdown token.</param>
     /// <returns><c>true</c> when settlement is durably complete; otherwise <c>false</c>.</returns>
     /// <remarks>
-    /// Tenant operations retain the order-level fulfillment gate; owned operations restore the originating bot context
-    /// before the shared settlement service writes ledger/log metadata.
+    /// Delegating to <see cref="XuiV3RenewalAppliedSettlementRouter" /> keeps a single settlement implementation shared
+    /// with the administrator manual-review confirmation path, so neither caller can debit twice.
     /// </remarks>
-    private async Task<bool> SettleAppliedAsync(
+    private Task<bool> SettleAppliedAsync(
         XuiV3RenewalOperation operation,
         CancellationToken cancellationToken)
+        => _settlementRouter.SettleAppliedAsync(operation, cancellationToken);
+
+    /// <summary>
+    /// Emits the single operator alert for one newly escalated manual-review operation.
+    /// </summary>
+    /// <param name="operation">Operation whose notification marker this process just claimed.</param>
+    /// <returns>A task that completes after the alert is written.</returns>
+    /// <remarks>
+    /// The alert carries only internal ids and fixed state categories. Account email, UUID, panel URL, token, mutation
+    /// payload, and raw panel error text are deliberately absent, because the operator channel is a Telegram surface.
+    /// </remarks>
+    private void LogManualReviewOperatorAlert(XuiV3RenewalOperation operation)
     {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        if (!string.IsNullOrWhiteSpace(operation.TenantBotOrderId))
-            return await scope.ServiceProvider.GetRequiredService<TenantBotService>().SettleRecoveredTenantRenewalAsync(operation, cancellationToken);
+        _logger.LogError(
+            "XUI v3 renewal requires administrator manual review. renewalOperationId={RenewalOperationId}, botId={BotId}, telegramUserId={TelegramUserId}, settlementStatus={SettlementStatus}, recoveryEligible={RecoveryEligible}, reconcileAttempts={ReconcileAttempts}, comparisonOutcome={ComparisonOutcome}",
+            operation.OperationId,
+            operation.BotId,
+            operation.TelegramUserId,
+            operation.SettlementStatus,
+            operation.RecoveryEligible,
+            operation.ReconcileAttemptCount,
+            operation.LastComparisonOutcome);
+    }
 
-        var bot = _botRegistry.Bots.FirstOrDefault(x =>
-            string.Equals(x.Id, operation.BotId, StringComparison.OrdinalIgnoreCase));
-        if (bot == null || !bot.Enabled || string.IsNullOrWhiteSpace(bot.Token))
-            return false;
-
-        var botClient = _botClientProvider.GetClient(bot.Id);
-        using (_botContextAccessor.Push(new BotRuntimeContext { Config = bot, Client = botClient }))
-        {
-            return await scope.ServiceProvider.GetRequiredService<XuiV3BotFlowService>().SettleRecoveredOwnedRenewalAsync(
-                botClient,
-                operation,
-                cancellationToken);
-        }
+    /// <summary>
+    /// Announces every manual-review operation whose notification was never delivered.
+    /// </summary>
+    /// <param name="cancellationToken">Host shutdown token that cancels the sweep.</param>
+    /// <returns>A task that completes after one bounded sweep.</returns>
+    /// <remarks>
+    /// This covers the two cases the escalation-time alert cannot: a process that stopped between escalating an
+    /// operation and announcing it, and historical rows that were already locked in manual review before this feature
+    /// existed. It includes recovery-ineligible rows, which no other code path can ever release, so an operator is told
+    /// about every account lock that needs a human. Repeated sweeps produce no duplicate alert because the marker is
+    /// claimed atomically.
+    /// </remarks>
+    private async Task AnnounceUnnotifiedManualReviewsAsync(CancellationToken cancellationToken)
+    {
+        var unannounced = await _operationStore.ClaimUnnotifiedManualReviewsAsync(
+            ManualReviewNotificationBatchSize,
+            cancellationToken);
+        foreach (var operation in unannounced)
+            LogManualReviewOperatorAlert(operation);
     }
 
     /// <summary>
@@ -229,21 +257,5 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
     /// <returns>The configured panel URL, root path, API token, and subscription base.</returns>
     /// <exception cref="InvalidOperationException">Thrown when <c>XuiV3ApiBaseUrl</c> is absent.</exception>
     /// <remarks>The descriptor is used only by authenticated GET reconciliation and is never logged or user-visible.</remarks>
-    private ServerInfo BuildConfiguredPanelServerInfo()
-    {
-        if (string.IsNullOrWhiteSpace(_appConfig.XuiV3ApiBaseUrl))
-            throw new InvalidOperationException("XuiV3ApiBaseUrl is not configured.");
-
-        return new ServerInfo
-        {
-            ApiVersion = "v3",
-            ApiToken = _appConfig.XuiV3ApiToken,
-            Url = _appConfig.XuiV3ApiBaseUrl.TrimEnd('/'),
-            RootPath = (_appConfig.XuiV3ApiRootPath ?? string.Empty).Trim('/'),
-            SubLinkUrl = string.IsNullOrWhiteSpace(_appConfig.XuiV3SubLinkBaseUrl)
-                ? null
-                : _appConfig.XuiV3SubLinkBaseUrl.TrimEnd('/'),
-            Name = "Configured V3 Panel"
-        };
-    }
+    private ServerInfo BuildConfiguredPanelServerInfo() => XuiV3RenewalPanelDescriptor.Build(_appConfig);
 }

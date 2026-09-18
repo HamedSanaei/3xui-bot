@@ -78,6 +78,7 @@ public sealed class AdminPanelRoutingTests
                 xuiV3BotFlowService: null,
                 xuiV3PurchaseSessionStore: sessions,
                 xuiV3AdminFlowService: null,
+                xuiV3RenewalManualReviewAdminService: null,
                 tenantBotService: null,
                 salesAssistantService: null,
                 userActivityLog: null,

@@ -164,6 +164,22 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   Gotchas for the five-state comparator, identity-safe direct/list read, ten-minute proven-pre-state unlock, and the
   exact renewal-controlled fields. New operations still use a unique full-list identity snapshot before mutation, but
   inbound attachment membership is valid when empty and is not changed or compared by renewal.
+- Manual-review lifecycle: `Services/XuiV3RenewalManualReviewService.cs` (durable resolution workflow),
+  `Services/XuiV3RenewalManualReviewAdminService.cs` (super-admin screen), `Services/XuiV3RenewalAppliedSettlementRouter.cs`
+  (the single owned/tenant settlement entry shared with background recovery), and `Domain/XuiV3RenewalBlockingNotice.cs`
+  (state-aware customer wording). An operation locked in `manual_review` can be re-checked read-only (`ReprobeAsync`),
+  confirmed applied only from a fresh GET comparison of `Applied` and then settled through the existing exactly-once
+  path, or abandoned as not applied. Abandonment requires `manual_review` + `pending` settlement, no wallet-ledger row,
+  no credentials wallet receipt, and no `site:{userId}:xui-v3-client:{operationId}` website receipt; a recovery-eligible
+  row additionally needs a fresh `DefinitelyPreMutation` comparison, while a `RecoveryEligible=false` historical row
+  needs an explicit super-admin override. Success writes `failed`, clears `AccountLockKey`, the recovery claim and its
+  schedule, and records the resolving admin plus a closed-vocabulary resolution; rows are never deleted. Migration
+  `20260919210134_AddXuiV3RenewalManualReviewLifecycle` adds only nullable columns plus one index. The single operator
+  alert per escalation is claimed atomically through `ManualReviewNotifiedAtUtc`, and `XuiV3RenewalRecoveryService`
+  sweeps unnotified rows (including legacy recovery-ineligible locks) so a crash between escalation and alerting, or a
+  pre-deployment lock, still surfaces exactly once. The administrator entry is the owned-bot super-admin reply action
+  `🧾 بررسی دستی تمدید` and the callbacks under the `x3mr:` prefix (`x3mr:a:` is only the confirmation prompt; the
+  second, separate press uses `x3mr:a2:` or the override `x3mr:a3:`).
 - `Services/XuiV3RenewalTargetParser.cs` + `XuiV3RenewalTargetResolver.cs`: shared side-effect-free exact renewal lookup
   for email, raw SubId/full subscription link, UUID, and VLESS/VMess/Trojan/Shadowsocks/Hysteria configurations. One
   fresh `clients/list` snapshot must produce exactly one client; configuration matching trusts only embedded UUID or
@@ -359,6 +375,12 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   An unproven activation is a warning plus audit evidence only: it never changes renewal, settlement, or Telegram
   outcomes, and the traffic reset that may follow can only enable or admit a client, never disable one. The legacy v2
   renewal path in `Services/ApiService.cs` already sends `Enable = true` and is outside this v3 step.
+- Never say "automatic review" for a state that cannot resolve automatically. Every blocking renewal now renders
+  `XuiV3RenewalBlockingNoticeBuilder.Build(blockingOperation)`: `manual_review` (and any `RecoveryEligible=false` row)
+  asks the customer to contact support, `applied` + unsettled says the renewal was applied and settlement is finishing,
+  and only a recovery-eligible ambiguous/processing row still says automatic verification is in progress. The notice
+  never contains an operation id, account email, UUID, panel URL, token, or stored error text. Keep every
+  `FindBlockingOperationAsync` call site using this builder instead of a literal sentence.
 - Unlimited renewal no longer infers a target fair-usage quota from the final duration. While active, it adds the
   selected plan's exact traffic to `TotalGB` and adds the exact plan days while preserving positive absolute-expiry or
   negative first-connection-expiry mode. When expired, it replaces `TotalGB`, resets counters, and writes only the

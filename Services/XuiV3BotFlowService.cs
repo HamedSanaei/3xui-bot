@@ -1669,16 +1669,19 @@ public class XuiV3BotFlowService
                 return;
             }
 
-            if (await _renewalOperationStore.FindBlockingOperationAsync(
-                    previewClient.Uuid,
-                    previewClient.Email,
-                    cancellationToken: cancellationToken) != null)
+            var blockingPreviewRenewal = await _renewalOperationStore.FindBlockingOperationAsync(
+                previewClient.Uuid,
+                previewClient.Email,
+                cancellationToken: cancellationToken);
+            if (blockingPreviewRenewal != null)
             {
+                // The explanation is derived from the durable blocking state so an operation that needs support is never
+                // described to the customer as an automatic process that will resolve on its own.
                 await SendOwnedRenewTerminalAsync(
                     botClient,
                     message.Chat.Id,
                     refreshedUser,
-                    "یک تمدید قبلی برای این اکانت در حال بررسی خودکار است. تمدید جدید تا مشخص‌شدن نتیجه موقتاً قفل است.",
+                    XuiV3RenewalBlockingNoticeBuilder.Build(blockingPreviewRenewal).Text,
                     cancellationToken);
                 return;
             }
@@ -1737,16 +1740,19 @@ public class XuiV3BotFlowService
                 return;
             }
 
-            if (await _renewalOperationStore.FindBlockingOperationAsync(
-                    previewClient.Uuid,
-                    previewClient.Email,
-                    cancellationToken: cancellationToken) != null)
+            var blockingPreviewRenewal = await _renewalOperationStore.FindBlockingOperationAsync(
+                previewClient.Uuid,
+                previewClient.Email,
+                cancellationToken: cancellationToken);
+            if (blockingPreviewRenewal != null)
             {
+                // The explanation is derived from the durable blocking state so an operation that needs support is never
+                // described to the customer as an automatic process that will resolve on its own.
                 await SendOwnedRenewTerminalAsync(
                     botClient,
                     message.Chat.Id,
                     refreshedUser,
-                    "یک تمدید قبلی برای این اکانت در حال بررسی خودکار است. تمدید جدید تا مشخص‌شدن نتیجه موقتاً قفل است.",
+                    XuiV3RenewalBlockingNoticeBuilder.Build(blockingPreviewRenewal).Text,
                     cancellationToken);
                 return;
             }
@@ -2003,7 +2009,7 @@ public class XuiV3BotFlowService
                 botClient,
                 message.Chat.Id,
                 user,
-                "یک تمدید قبلی برای این اکانت هنوز در حال بررسی خودکار است. برای جلوگیری از تمدید تکراری، تمدید جدید این اکانت موقتاً قفل شده است.",
+                XuiV3RenewalBlockingNoticeBuilder.Build(blockingOperation).Text,
                 cancellationToken);
             return;
         }
@@ -2036,12 +2042,13 @@ public class XuiV3BotFlowService
         }
         catch (XuiV3RenewalOperationStore.AccountRenewalLockedException)
         {
-            // The filtered unique account index is the final guard when two different confirmation sessions race.
+            // The filtered unique account index is the final guard when two different confirmation sessions race. The
+            // losing confirmation has no operation object, so it uses the conservative automatic-verification wording.
             await SendOwnedRenewTerminalAsync(
                 botClient,
                 message.Chat.Id,
                 user,
-                "یک تمدید قبلی برای این اکانت هنوز در حال بررسی خودکار است. برای جلوگیری از تمدید تکراری، تمدید جدید این اکانت موقتاً قفل شده است.",
+                XuiV3RenewalBlockingNoticeBuilder.Build(null).Text,
                 cancellationToken);
             return;
         }
@@ -2406,11 +2413,13 @@ public class XuiV3BotFlowService
                 return;
 
             case XuiV3RenewalOperationStatuses.ManualReview:
+                // Manual review is a human decision, so the customer is told that support review is required instead of
+                // being told to wait for an automatic process that will never resolve this lock.
                 await SendOwnedRenewTerminalAsync(
                     botClient,
                     message.Chat.Id,
                     user,
-                    "نتیجه تمدید قبلی پس از بررسی خودکار قطعی نشده و برای بررسی دستی ثبت شده است. تمدید جدید این اکانت تا تعیین نتیجه قفل می‌ماند.",
+                    XuiV3RenewalBlockingNoticeBuilder.Build(operation).Text,
                     cancellationToken);
                 return;
 

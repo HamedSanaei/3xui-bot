@@ -817,9 +817,12 @@ public sealed partial class ConcurrencyTests
         // The receipt-upload target migration only added one nullable bot-scoped column used to bind a receipt upload to
         // its exact order.
         Assert.Contains("20260912005131_AddTenantReceiptUploadTarget", applied);
-        // Latest applied migration only adds one non-null boolean column with a constant false default to BotInstances,
-        // so every existing storefront stays opted out and no balance, receipt, fulfillment, or wallet value can change.
-        Assert.Equal("20260913065454_AddTenantPremiumUiEnabled", applied[^1]);
+        // The premium-UI migration only added one non-null boolean column with a constant false default to BotInstances,
+        // so every existing storefront stays opted out and no balance, receipt, fulfillment, or wallet value changed.
+        Assert.Contains("20260913065454_AddTenantPremiumUiEnabled", applied);
+        // Latest applied migration only adds nullable manual-review columns plus one index to XuiV3RenewalOperations, so
+        // every existing balance, receipt, fulfillment, wallet, and renewal row keeps its exact value.
+        Assert.Equal("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1542,9 +1545,12 @@ public sealed partial class ConcurrencyTests
         // The receipt-upload target migration only added one nullable bot-scoped column used to bind a receipt upload to
         // its exact order.
         Assert.Contains("20260912005131_AddTenantReceiptUploadTarget", applied);
-        // Latest applied migration only adds one non-null boolean column with a constant false default to BotInstances,
-        // so every existing storefront stays opted out and no balance, receipt, fulfillment, or wallet value can change.
-        Assert.Equal("20260913065454_AddTenantPremiumUiEnabled", applied[^1]);
+        // The premium-UI migration only added one non-null boolean column with a constant false default to BotInstances,
+        // so every existing storefront stays opted out and no balance, receipt, fulfillment, or wallet value changed.
+        Assert.Contains("20260913065454_AddTenantPremiumUiEnabled", applied);
+        // Latest applied migration only adds nullable manual-review columns plus one index to XuiV3RenewalOperations, so
+        // every existing balance, receipt, fulfillment, wallet, and renewal row keeps its exact value.
+        Assert.Equal("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1565,9 +1571,12 @@ public sealed partial class ConcurrencyTests
             Assert.Contains("20260911023015_AddTenantCardProvisionalOperation", history);
             Assert.Contains("20260911035150_AddProvisionalFinalizationFreeze", history);
             Assert.Contains("20260912005131_AddTenantReceiptUploadTarget", history);
-            // Latest applied migration only adds one non-null boolean column defaulting to false, so it cannot rewrite
+            // The premium-UI migration only added one non-null boolean column defaulting to false, so it did not rewrite
             // balances, receipts, fulfillment state, or the still-empty provisional saga table.
-            Assert.Equal("20260913065454_AddTenantPremiumUiEnabled", history[^1]);
+            Assert.Contains("20260913065454_AddTenantPremiumUiEnabled", history);
+            // Latest applied migration only adds nullable manual-review columns plus one index, so it cannot rewrite
+            // balances, receipts, fulfillment state, or the still-empty provisional saga table either.
+            Assert.Equal("20260919210134_AddXuiV3RenewalManualReviewLifecycle", history[^1]);
             command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='TenantCardProvisionalOperations';";
             Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
             command.CommandText = "SELECT COUNT(*) FROM TenantCardProvisionalOperations;";

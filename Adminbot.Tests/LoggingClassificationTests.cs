@@ -352,6 +352,7 @@ public sealed class LoggingClassificationTests
             xuiV3BotFlowService: null,
             xuiV3PurchaseSessionStore: null,
             xuiV3AdminFlowService: null,
+            xuiV3RenewalManualReviewAdminService: null,
             tenantBotService: null,
             salesAssistantService: null,
             userActivityLog: null,

@@ -187,6 +187,16 @@ public class Program
         services.AddSingleton<UsageReportDispatchStore>();
         services.AddSingleton<XuiV3VolumeReminderStateStore>();
         services.AddSingleton<XuiV3RenewalOperationStore>();
+        // One shared router to the existing owned/tenant exactly-once settlement implementation. Background recovery and
+        // administrator manual-review confirmation both go through it, so an operator-confirmed renewal can never debit
+        // through a second financial path. It is a singleton because it holds no state beyond the registry snapshot and
+        // creates its own scope per settlement.
+        services.AddSingleton<XuiV3RenewalAppliedSettlementRouter>();
+        // Durable manual-review resolution workflow for operations that bounded automatic reconciliation could not decide.
+        // Registered as a singleton so the administrator UI and the background notification sweep share one instance and
+        // one set of conditional-transition rules.
+        services.AddSingleton<XuiV3RenewalManualReviewService>();
+        services.AddScoped<XuiV3RenewalManualReviewAdminService>();
         // Immutable, non-configurable budgets for UX-only Telegram interactions: callback acknowledgement (2s)
         // and the single overall mandatory-join membership budget (5s). Registered as a shared immutable
         // instance so bounded-timeout behaviour cannot be raised by deployment configuration or raced by tests.

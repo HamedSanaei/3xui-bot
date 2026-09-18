@@ -1429,6 +1429,368 @@ public class XuiV3RenewalOperationStore
         return "renew:" + (operation?.OperationId ?? string.Empty);
     }
 
+    // ------------------------------------------------------------------
+    // Manual-review lifecycle
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Loads one operation by its internal users.db primary key for administrator review.
+    /// </summary>
+    /// <param name="operationId">
+    /// Internal <see cref="XuiV3RenewalOperation.Id" /> value. This is a local database identifier, never a Telegram
+    /// update id, order id, panel id, or account identity.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the users.db read.</param>
+    /// <returns>The detached operation row, or null when no operation has that key.</returns>
+    /// <remarks>
+    /// The returned row is untracked, so every later transition must go through a conditional store method and must
+    /// never be written back as a tracked entity.
+    /// </remarks>
+    /// <example><code>var operation = await store.GetByIdAsync(42, stoppingToken);</code></example>
+    public async Task<XuiV3RenewalOperation> GetByIdAsync(
+        int operationId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = _userDbContextFactory.CreateDbContext();
+        return await context.XuiV3RenewalOperations
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == operationId, cancellationToken);
+    }
+
+    /// <summary>
+    /// Lists the operations that are still parked in manual review with an active account lock.
+    /// </summary>
+    /// <param name="maximumCount">Maximum rows to return; clamped to the range 1 through 50.</param>
+    /// <param name="cancellationToken">Token that cancels the users.db read.</param>
+    /// <returns>
+    /// Detached rows ordered by escalation time then internal key. Recovery-ineligible historical rows are included as
+    /// well, because they hold a real account lock even though no automatic reconciliation can resolve them.
+    /// </returns>
+    /// <remarks>
+    /// The query reads only the metadata an operator needs and never loads the mutation payload, the pre-mutation
+    /// snapshot, or the account identity columns.
+    /// </remarks>
+    /// <example><code>var pending = await store.ListPendingManualReviewsAsync(10, stoppingToken);</code></example>
+    public async Task<IReadOnlyList<XuiV3RenewalOperation>> ListPendingManualReviewsAsync(
+        int maximumCount,
+        CancellationToken cancellationToken = default)
+    {
+        maximumCount = Math.Clamp(maximumCount, 1, 50);
+        await using var context = _userDbContextFactory.CreateDbContext();
+        return await context.XuiV3RenewalOperations
+            .AsNoTracking()
+            .Where(x => x.Status == XuiV3RenewalOperationStatuses.ManualReview &&
+                        x.AccountLockKey != null)
+            .OrderBy(x => x.ManualReviewAtUtc ?? x.CreatedAtUtc)
+            .ThenBy(x => x.Id)
+            .Take(maximumCount)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Durably claims the single operator notification for one manual-review operation.
+    /// </summary>
+    /// <param name="operation">Detached manual-review operation that should produce one alert.</param>
+    /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
+    /// <returns>
+    /// <c>true</c> only for the executor that moved <see cref="XuiV3RenewalOperation.ManualReviewNotifiedAtUtc" /> from
+    /// null to a timestamp and may therefore send the alert; <c>false</c> when it was already notified, is no longer in
+    /// manual review, or another executor won the race.
+    /// </returns>
+    /// <remarks>
+    /// The marker is the durable half of the notification: repeated reconciliation scans and repeated sweeps observe
+    /// the same row and can never produce a second alert. Nothing financial is touched here.
+    /// </remarks>
+    /// <example><code>if (await store.TryClaimManualReviewNotificationAsync(op, token)) AlertOperator(op);</code></example>
+    public async Task<bool> TryClaimManualReviewNotificationAsync(
+        XuiV3RenewalOperation operation,
+        CancellationToken cancellationToken = default)
+    {
+        var now = DateTime.UtcNow;
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var updated = await context.XuiV3RenewalOperations
+            .Where(x => x.Id == operation.Id &&
+                        x.Status == XuiV3RenewalOperationStatuses.ManualReview &&
+                        x.ManualReviewNotifiedAtUtc == null)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.ManualReviewNotifiedAtUtc, now)
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+
+        if (updated != 1)
+            return false;
+
+        operation.ManualReviewNotifiedAtUtc = now;
+        operation.UpdatedAtUtc = now;
+        return true;
+    }
+
+    /// <summary>
+    /// Claims the notification marker for every manual-review operation that has not been announced yet.
+    /// </summary>
+    /// <param name="maximumCount">Maximum rows to claim in one sweep; clamped to the range 1 through 50.</param>
+    /// <param name="cancellationToken">Token that cancels the users.db reads and conditional updates.</param>
+    /// <returns>
+    /// Detached rows whose notification marker this call set. An empty list means every pending manual review was
+    /// already announced.
+    /// </returns>
+    /// <remarks>
+    /// This sweep is the safety net for two cases the escalation-time notification cannot cover: a process that crashed
+    /// between the escalation and its alert, and historical rows that were already in manual review before deployment.
+    /// It deliberately does not filter on <see cref="XuiV3RenewalOperation.RecoveryEligible" />, because a
+    /// recovery-ineligible row still holds a real account lock that only a human can release.
+    /// </remarks>
+    /// <example><code>foreach (var row in await store.ClaimUnnotifiedManualReviewsAsync(10, token)) AlertOperator(row);</code></example>
+    public async Task<IReadOnlyList<XuiV3RenewalOperation>> ClaimUnnotifiedManualReviewsAsync(
+        int maximumCount,
+        CancellationToken cancellationToken = default)
+    {
+        maximumCount = Math.Clamp(maximumCount, 1, 50);
+        var now = DateTime.UtcNow;
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var candidateIds = await context.XuiV3RenewalOperations
+            .AsNoTracking()
+            .Where(x => x.Status == XuiV3RenewalOperationStatuses.ManualReview &&
+                        x.ManualReviewNotifiedAtUtc == null)
+            .OrderBy(x => x.ManualReviewAtUtc ?? x.CreatedAtUtc)
+            .ThenBy(x => x.Id)
+            .Select(x => x.Id)
+            .Take(maximumCount)
+            .ToListAsync(cancellationToken);
+
+        var claimed = new List<XuiV3RenewalOperation>(candidateIds.Count);
+        foreach (var id in candidateIds)
+        {
+            // Each row is claimed on its own so one row resolved by an administrator mid-sweep cannot fail the batch.
+            var updated = await context.XuiV3RenewalOperations
+                .Where(x => x.Id == id &&
+                            x.Status == XuiV3RenewalOperationStatuses.ManualReview &&
+                            x.ManualReviewNotifiedAtUtc == null)
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(x => x.ManualReviewNotifiedAtUtc, now)
+                        .SetProperty(x => x.UpdatedAtUtc, now),
+                    cancellationToken);
+            if (updated != 1)
+                continue;
+
+            claimed.Add(await context.XuiV3RenewalOperations
+                .AsNoTracking()
+                .FirstAsync(x => x.Id == id, cancellationToken));
+        }
+
+        return claimed;
+    }
+
+    /// <summary>
+    /// Persists the sanitized evidence of one administrator-triggered read-only re-check.
+    /// </summary>
+    /// <param name="operation">Detached manual-review operation that was re-checked.</param>
+    /// <param name="comparison">GET-only comparison produced by <see cref="RecoverByReadBackAsync" />.</param>
+    /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
+    /// <returns><c>true</c> when the evidence was written; <c>false</c> when the row is no longer in manual review.</returns>
+    /// <remarks>
+    /// This records evidence only. It never changes the status, the settlement status, or the account lock, so a
+    /// re-check can never resolve an operation on its own and can never move money.
+    /// </remarks>
+    /// <example><code>await store.RecordManualReviewReprobeAsync(op, comparison, token);</code></example>
+    public async Task<bool> RecordManualReviewReprobeAsync(
+        XuiV3RenewalOperation operation,
+        RenewalComparisonResult comparison,
+        CancellationToken cancellationToken = default)
+    {
+        if (comparison == null)
+            throw new ArgumentNullException(nameof(comparison));
+
+        var now = DateTime.UtcNow;
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var updated = await context.XuiV3RenewalOperations
+            .Where(x => x.Id == operation.Id &&
+                        x.Status == XuiV3RenewalOperationStatuses.ManualReview &&
+                        x.RecoveryClaimToken == null)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.LastComparisonOutcome, comparison.Outcome.ToString())
+                    .SetProperty(x => x.LastMismatchSummary, comparison.Summary)
+                    .SetProperty(x => x.LastReconcileAtUtc, now)
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+        return updated == 1;
+    }
+
+    /// <summary>
+    /// Resolves a manual-review operation as applied after an administrator-verified panel comparison.
+    /// </summary>
+    /// <param name="operation">Detached manual-review operation being confirmed.</param>
+    /// <param name="comparison">
+    /// Fresh GET-only comparison that must already be <see cref="RecoveryOutcome.Applied" />. Its sanitized summary is
+    /// stored as the audit evidence for the decision.
+    /// </param>
+    /// <param name="adminTelegramUserId">
+    /// Numeric Telegram id of the configured super-admin who made the decision. Recorded for audit only; it never
+    /// replaces the payer or the account owner.
+    /// </param>
+    /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
+    /// <returns>
+    /// <c>true</c> when this call performed the manual_review to applied transition and is therefore the only caller
+    /// allowed to continue into settlement; <c>false</c> when another administrator or the row state already decided it.
+    /// </returns>
+    /// <remarks>
+    /// The conditional UPDATE accepts only a row that is still in manual review, so two concurrent confirmations can
+    /// never both continue into settlement. The settlement status is deliberately left untouched: the existing
+    /// exactly-once settlement claim in the caller decides whether the debit still has to happen, and a settlement that
+    /// was already parked for financial review stays parked.
+    /// </remarks>
+    /// <exception cref="ArgumentException">Thrown when the comparison is not an applied comparison.</exception>
+    public async Task<bool> ResolveManualReviewAsAppliedAsync(
+        XuiV3RenewalOperation operation,
+        RenewalComparisonResult comparison,
+        long adminTelegramUserId,
+        CancellationToken cancellationToken = default)
+    {
+        if (comparison?.Outcome != RecoveryOutcome.Applied)
+            throw new ArgumentException("An Applied comparison is required.", nameof(comparison));
+
+        var now = DateTime.UtcNow;
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var updated = await context.XuiV3RenewalOperations
+            .Where(x => x.Id == operation.Id &&
+                        x.Status == XuiV3RenewalOperationStatuses.ManualReview &&
+                        x.SettlementStatus != XuiV3RenewalSettlementStatuses.Settled)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Applied)
+                    .SetProperty(x => x.LastComparisonOutcome, comparison.Outcome.ToString())
+                    .SetProperty(x => x.LastMismatchSummary, comparison.Summary)
+                    .SetProperty(x => x.LastReconcileAtUtc, now)
+                    .SetProperty(x => x.NextReconcileAtUtc, (DateTime?)null)
+                    .SetProperty(x => x.ManualReviewResolvedAtUtc, now)
+                    .SetProperty(x => x.ManualReviewResolvedByTelegramUserId, adminTelegramUserId)
+                    .SetProperty(x => x.ManualReviewResolution, XuiV3RenewalManualReviewResolutions.ConfirmedApplied)
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+
+        if (updated != 1)
+            return false;
+
+        operation.Status = XuiV3RenewalOperationStatuses.Applied;
+        operation.LastComparisonOutcome = comparison.Outcome.ToString();
+        operation.ManualReviewResolvedAtUtc = now;
+        operation.ManualReviewResolvedByTelegramUserId = adminTelegramUserId;
+        operation.ManualReviewResolution = XuiV3RenewalManualReviewResolutions.ConfirmedApplied;
+        operation.UpdatedAtUtc = now;
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves a manual-review operation as definitively not applied and releases its account lock.
+    /// </summary>
+    /// <param name="operation">Detached manual-review operation being abandoned.</param>
+    /// <param name="adminTelegramUserId">Numeric Telegram id of the super-admin who authorized the abandonment.</param>
+    /// <param name="resolution">
+    /// Resolution category from <see cref="XuiV3RenewalManualReviewResolutions" />. It must be the abandoned-not-applied
+    /// value or its legacy-override variant.
+    /// </param>
+    /// <param name="reason">Sanitized English audit sentence; it is bounded and must never contain account identity.</param>
+    /// <param name="cancellationToken">Token that cancels the conditional users.db update.</param>
+    /// <returns>
+    /// <c>true</c> when this call moved the row to failed and cleared the lock; <c>false</c> when the row is no longer an
+    /// abandonable manual review (another administrator already resolved it, or settlement is not pending).
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// The conditional UPDATE requires <c>manual_review</c> plus <c>pending</c> settlement. A non-pending settlement
+    /// means a wallet debit may already exist for this operation, so the row is never unlocked by this path. The row is
+    /// updated, never deleted, so the audit trail and the settlement ledger key remain inspectable forever.
+    /// </para>
+    /// <para>
+    /// Clearing the lock is what lets the customer start a fresh renewal, and it is also why this method must only ever
+    /// be called after the caller has proven that no financial effect exists for the operation.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentException">Thrown when the resolution is not an abandonment category.</exception>
+    public async Task<bool> AbandonManualReviewAsNotAppliedAsync(
+        XuiV3RenewalOperation operation,
+        long adminTelegramUserId,
+        string resolution,
+        string reason,
+        CancellationToken cancellationToken = default)
+    {
+        if (resolution != XuiV3RenewalManualReviewResolutions.AbandonedNotApplied &&
+            resolution != XuiV3RenewalManualReviewResolutions.AbandonedNotAppliedLegacyOverride)
+        {
+            throw new ArgumentException("An abandonment resolution category is required.", nameof(resolution));
+        }
+
+        var now = DateTime.UtcNow;
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var updated = await context.XuiV3RenewalOperations
+            .Where(x => x.Id == operation.Id &&
+                        x.Status == XuiV3RenewalOperationStatuses.ManualReview &&
+                        x.SettlementStatus == XuiV3RenewalSettlementStatuses.Pending)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Failed)
+                    .SetProperty(x => x.AccountLockKey, (string)null)
+                    .SetProperty(x => x.RecoveryLeaseUntilUtc, (DateTime?)null)
+                    .SetProperty(x => x.RecoveryClaimToken, (string)null)
+                    .SetProperty(x => x.NextReconcileAtUtc, (DateTime?)null)
+                    .SetProperty(x => x.ManualReviewResolvedAtUtc, now)
+                    .SetProperty(x => x.ManualReviewResolvedByTelegramUserId, adminTelegramUserId)
+                    .SetProperty(x => x.ManualReviewResolution, resolution)
+                    .SetProperty(x => x.LastError, Truncate(reason))
+                    .SetProperty(x => x.UpdatedAtUtc, now),
+                cancellationToken);
+
+        if (updated != 1)
+            return false;
+
+        operation.Status = XuiV3RenewalOperationStatuses.Failed;
+        operation.AccountLockKey = null;
+        operation.RecoveryLeaseUntilUtc = null;
+        operation.RecoveryClaimToken = null;
+        operation.NextReconcileAtUtc = null;
+        operation.ManualReviewResolvedAtUtc = now;
+        operation.ManualReviewResolvedByTelegramUserId = adminTelegramUserId;
+        operation.ManualReviewResolution = resolution;
+        operation.UpdatedAtUtc = now;
+        return true;
+    }
+
+    /// <summary>
+    /// Reports whether any durable financial artifact already exists for one renewal operation.
+    /// </summary>
+    /// <param name="operation">Operation whose settlement idempotency key is checked.</param>
+    /// <param name="cancellationToken">Token that cancels the users.db read.</param>
+    /// <returns>
+    /// <c>true</c> when a wallet ledger row or a website wallet debit receipt already carries this operation's
+    /// settlement key, which forbids abandoning the operation.
+    /// </returns>
+    /// <remarks>
+    /// The website receipt is inspected in every state, including <c>sending</c>: a committed remote intent is itself a
+    /// financial artifact even when its final outcome is unknown, and unlocking the account would let the same customer
+    /// be charged twice.
+    /// </remarks>
+    /// <example><code>if (await store.HasSettlementArtifactAsync(op, token)) Refuse();</code></example>
+    public async Task<bool> HasSettlementArtifactAsync(
+        XuiV3RenewalOperation operation,
+        CancellationToken cancellationToken = default)
+    {
+        var ledgerKey = BuildSettlementLedgerKey(operation);
+        var siteReceiptId = "site:" + operation.TelegramUserId + ":xui-v3-client:" + operation.OperationId;
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var hasLedgerRow = await context.WalletLedgerEntries
+            .AsNoTracking()
+            .AnyAsync(x => x.IdempotencyKey == ledgerKey, cancellationToken);
+        if (hasLedgerRow)
+            return true;
+
+        return await context.Set<SiteWalletDebitOperation>()
+            .AsNoTracking()
+            .AnyAsync(x => x.Id == siteReceiptId, cancellationToken);
+    }
+
     private static long ReadTotalBytes(XuiV3Client client)
     {
         if (client == null)

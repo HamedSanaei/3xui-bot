@@ -5217,16 +5217,19 @@ public partial class TenantBotService
         var price = CalculateTenantPrice(tenant, selection);
         var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
 
-        if (await _renewalOperationStore.FindBlockingOperationAsync(
-                client.Uuid,
-                client.Email,
-                cancellationToken: cancellationToken) != null)
+        var blockingPreviewRenewal = await _renewalOperationStore.FindBlockingOperationAsync(
+            client.Uuid,
+            client.Email,
+            cancellationToken: cancellationToken);
+        if (blockingPreviewRenewal != null)
         {
+            // The storefront explains the exact durable reason, so a support-only lock is not presented as an automatic
+            // process that will resolve itself.
             await SendTenantRenewTerminalAsync(
                 botClient,
                 chatId,
                 customer.TelegramUserId,
-                "یک تمدید قبلی برای این اکانت در حال بررسی خودکار است. تمدید جدید تا مشخص‌شدن نتیجه موقتاً قفل است.",
+                XuiV3RenewalBlockingNoticeBuilder.Build(blockingPreviewRenewal).Text,
                 allowSearchRestart: true,
                 cancellationToken);
             return;
@@ -5369,16 +5372,18 @@ public partial class TenantBotService
             await _state.SaveUserStatus(user);
         }
 
-        if (await _renewalOperationStore.FindBlockingOperationAsync(
-                client.Uuid,
-                client.Email,
-                cancellationToken: cancellationToken) != null)
+        var blockingOrderRenewal = await _renewalOperationStore.FindBlockingOperationAsync(
+            client.Uuid,
+            client.Email,
+            cancellationToken: cancellationToken);
+        if (blockingOrderRenewal != null)
         {
+            // No new payment order is created while the account lock is held; the message states the real reason.
             await SendTenantRenewTerminalAsync(
                 botClient,
                 chatId,
                 customer.TelegramUserId,
-                "یک تمدید قبلی برای این اکانت در حال بررسی خودکار است. هیچ سفارش پرداخت جدیدی ساخته نشد و تمدید این اکانت موقتاً قفل است.",
+                XuiV3RenewalBlockingNoticeBuilder.Build(blockingOrderRenewal).Text,
                 allowSearchRestart: true,
                 cancellationToken);
             return;
@@ -13574,7 +13579,7 @@ public partial class TenantBotService
         if (blockingOperation != null)
         {
             order.PaymentStatus = TenantBotOrderStatuses.Pending;
-            order.ErrorMessage = "تمدید قبلی این اکانت در حال بررسی خودکار است و تمدید جدید موقتاً قفل شده است.";
+            order.ErrorMessage = XuiV3RenewalBlockingNoticeBuilder.Build(blockingOperation).ShortText;
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
             await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, order.ErrorMessage, cancellationToken);
@@ -13606,8 +13611,10 @@ public partial class TenantBotService
         }
         catch (XuiV3RenewalOperationStore.AccountRenewalLockedException)
         {
+            // The unique account index rejected the insert, so the losing fulfillment has no operation object and uses
+            // the conservative automatic-verification wording.
             order.PaymentStatus = TenantBotOrderStatuses.Pending;
-            order.ErrorMessage = "تمدید قبلی این اکانت در حال بررسی خودکار است و تمدید جدید موقتاً قفل شده است.";
+            order.ErrorMessage = XuiV3RenewalBlockingNoticeBuilder.Build(null).ShortText;
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
             await NOTIFYTENANTCUSTOMERRETRYABLEFULFILLMENTASYNC(order, order.ErrorMessage, cancellationToken);

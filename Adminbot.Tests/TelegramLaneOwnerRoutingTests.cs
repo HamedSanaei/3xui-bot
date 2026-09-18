@@ -444,8 +444,8 @@ public sealed partial class ConcurrencyTests
             // broadcast/nowpayments/hooshpay/tetraminator/uniquepay/atlaspay pairs plus the two availability seams.
             null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!,
             null!, null!,
-            // x-ui purchase/session/admin flows, tenant and sales-assistant services.
-            null!, null!, null!, null!, null!, null!,
+            // x-ui purchase/session/admin flows, the renewal manual-review screen, tenant and sales-assistant services.
+            null!, null!, null!, null!, null!, null!, null!,
             new UserActivityLogService(configuration),
             // analytics, chart renderer, wallet ledger, notification, gozargah, registry, runtime status.
             null!, null!, null!, null!, null!, null!, null!, null!,
