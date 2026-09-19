@@ -47,7 +47,7 @@ public sealed class LoggingClassificationTests
 
             var row = Assert.Single(await ReadRowsAsync(fixture.Options.OutboxDatabasePath));
             Assert.Equal((int)TelegramLogDeliveryKind.Html, row.DeliveryKind);
-            Assert.Equal("log", row.Channel);
+            Assert.Equal("-1001234567890", row.Channel);
             Assert.Contains("تأیید دستی شماره تلفن", row.Message);
             Assert.Contains("091*****567", row.Message);
             Assert.Equal(0, await RequestedGenerationsAsync(fixture.Options.OutboxDatabasePath));
@@ -320,7 +320,7 @@ public sealed class LoggingClassificationTests
     {
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
         var registry = new BotRegistry(configuration);
-        return new TelegramLogger("classification-test", null, registry, new BotContextAccessor(), "log", "backup", dispatcher);
+        return new TelegramLogger("classification-test", null, registry, new BotContextAccessor(), "-1001234567890", "-1001234567891", dispatcher);
     }
 
     /// <summary>Builds a production service instance whose private audit methods only need the injected logger.</summary>

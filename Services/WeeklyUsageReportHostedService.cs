@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using Adminbot.Domain;
+using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
 using Telegram.Bot.Types;
@@ -344,11 +345,12 @@ public sealed class WeeklyUsageReportHostedService : BackgroundService
             var caption = BuildCaption(currentWeek, previousWeek);
             var defaultBot = _botRegistry.DefaultBot
                              ?? throw new InvalidOperationException("Default owned bot is not available for weekly report delivery.");
-            var loggerChannel = string.IsNullOrWhiteSpace(defaultBot.LoggerChannel)
-                ? config.LoggerChannel
-                : defaultBot.LoggerChannel;
-            if (string.IsNullOrWhiteSpace(loggerChannel))
-                throw new InvalidOperationException("Central logger channel is not configured for weekly usage reports.");
+            // Resolved through the shared destination contract so a malformed legacy value fails with the same clear
+            // error as a missing one, instead of reaching ChatId and throwing a local argument error whose text would
+            // include the configured value. The per-bot channel keeps precedence over the global legacy key.
+            var loggerChannel = TelegramDestination.SelectValid(defaultBot.LoggerChannel, config.LoggerChannel);
+            if (loggerChannel.Length == 0)
+                throw new InvalidOperationException("Central logger channel is not configured or is not a valid Telegram destination for weekly usage reports.");
 
             var botClient = _botClientProvider.GetClient(defaultBot.Id);
             await using var imageStream = new MemoryStream(png, writable: false);

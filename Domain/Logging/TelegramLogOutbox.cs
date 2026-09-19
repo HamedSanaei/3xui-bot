@@ -143,12 +143,44 @@ namespace Adminbot.Domain.Logging
                 Bind(command, item);
                 var id = (long)(await command.ExecuteScalarAsync() ?? 0L);
                 if (item.DeliveryKind == TelegramLogDeliveryKind.Payment)
-                {
-                    command.CommandText = "UPDATE DatabaseBackupState SET Requested=Requested+1, BotId=CASE WHEN BotId='' THEN $bot ELSE BotId END, ChannelId=CASE WHEN ChannelId='' THEN $backup ELSE ChannelId END WHERE Id=1";
-                    await command.ExecuteNonQueryAsync();
-                }
+                    await IncrementBackupRequestAsync(connection, transaction, item.BotId, item.BackupChannelId);
                 transaction.Commit();
                 return id;
+            }
+            finally { _writeGate.Release(); }
+        }
+
+        /// <summary>
+        /// Records one durable database-backup request without creating a delivery row.
+        /// </summary>
+        /// <param name="botId">
+        /// Internal bot registry id whose client must perform the upload; filled only when the global watermark has
+        /// no sender yet. Never a bot token.
+        /// </param>
+        /// <param name="backupChannelId">
+        /// Pre-validated backup destination; filled only when the global watermark has no destination yet.
+        /// </param>
+        /// <returns>The durable commit of the incremented generation, or of the first destination captured.</returns>
+        /// <remarks>
+        /// This path exists so payment backup freshness survives a logger-channel misconfiguration. A Payment log
+        /// whose logger destination is missing must not be queued as a row that can never be delivered, yet the
+        /// database snapshot it would have requested is still required. The same global watermark as
+        /// <see cref="EnqueueAsync"/> is used, so the backup worker cannot distinguish the two producers and no
+        /// second backup mechanism exists.
+        ///
+        /// Ordering: the UPDATE commits before the caller signals the backup worker, matching the durability barrier
+        /// of <see cref="EnqueueAsync"/>. A crash between commit and signal is recovered by the worker's periodic scan.
+        /// </remarks>
+        public async Task RequestBackupAsync(string botId, string backupChannelId)
+        {
+            await _writeGate.WaitAsync();
+            try
+            {
+                await using var connection = Open();
+                await connection.OpenAsync();
+                using var transaction = connection.BeginTransaction();
+                await IncrementBackupRequestAsync(connection, transaction, botId, backupChannelId);
+                transaction.Commit();
             }
             finally { _writeGate.Release(); }
         }
@@ -368,6 +400,28 @@ namespace Adminbot.Domain.Logging
             await using var optimize = connection.CreateCommand();
             optimize.CommandText = "PRAGMA optimize";
             await optimize.ExecuteNonQueryAsync();
+        }
+
+        /// <summary>Increments the singleton backup generation and captures the first destination seen.</summary>
+        /// <param name="connection">Open outbox connection; the caller owns its lifetime.</param>
+        /// <param name="transaction">Active transaction, so a payment row and its backup request commit together.</param>
+        /// <param name="botId">Sender bot id captured only while the watermark has none.</param>
+        /// <param name="backupChannelId">Backup destination captured only while the watermark has none.</param>
+        /// <returns>A task completing after the generation bump is part of the caller's transaction.</returns>
+        /// <remarks>Shared by <see cref="EnqueueAsync"/> and <see cref="RequestBackupAsync"/> so the two producers
+        /// cannot drift apart and the persisted fallback destination keeps its existing first-writer-wins rule.</remarks>
+        private static async Task IncrementBackupRequestAsync(
+            SqliteConnection connection,
+            SqliteTransaction transaction,
+            string botId,
+            string backupChannelId)
+        {
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "UPDATE DatabaseBackupState SET Requested=Requested+1, BotId=CASE WHEN BotId='' THEN $bot ELSE BotId END, ChannelId=CASE WHEN ChannelId='' THEN $backup ELSE ChannelId END WHERE Id=1";
+            command.Parameters.AddWithValue("$bot", botId ?? string.Empty);
+            command.Parameters.AddWithValue("$backup", backupChannelId ?? string.Empty);
+            await command.ExecuteNonQueryAsync();
         }
 
         private static async Task<int> ScalarCountAsync(SqliteConnection connection, int status)

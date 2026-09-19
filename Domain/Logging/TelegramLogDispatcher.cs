@@ -343,6 +343,49 @@ namespace Adminbot.Domain.Logging
         }
 
         /// <summary>
+        /// Records a durable database-backup request for a payment whose logger destination cannot be resolved.
+        /// </summary>
+        /// <param name="botId">
+        /// Internal bot registry id that must perform the upload, normally <see cref="BotInstanceConfig.Id"/> of the
+        /// default owned bot. Never a bot token.
+        /// </param>
+        /// <param name="backupChannelId">
+        /// Resolved backup destination for this payment. It is captured only while the global watermark has no
+        /// destination yet.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> when the generation bump was committed and the backup worker was signalled; <c>false</c> when
+        /// the commit failed or the dispatcher is already disposed.
+        /// </returns>
+        /// <remarks>
+        /// Called by <see cref="TelegramLogger"/> for a Payment event whose logger channel is missing or malformed.
+        /// The audit line itself is not queued, because a row whose destination can never be delivered would only
+        /// occupy the outbox and hide the configuration failure. The database snapshot it implies is still requested
+        /// here, so a logging misconfiguration can never silently stop payment backups.
+        ///
+        /// Payment and wallet settlement never observe this method's result: a failed backup request is reported on
+        /// the console only and must never propagate into the settlement path.
+        /// </remarks>
+        public bool RequestBackupIntent(string botId, string backupChannelId)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return false;
+            try
+            {
+                _outbox.RequestBackupAsync(botId ?? string.Empty, backupChannelId ?? string.Empty).GetAwaiter().GetResult();
+                // Commit first, then signal: a lost signal is covered by the backup worker's periodic scan.
+                SignalBackupWorker();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // Configured destination only: never echo a raw destination or credential here.
+                Console.WriteLine($"[DatabaseBackup] durable backup intent could not be recorded: {ex.GetType().Name}: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Queues a best-effort plain-text log into the bounded memory-only channel, dropping and counting on overflow.
         /// </summary>
         /// <param name="item">Delivery snapshot; null values are ignored.</param>
@@ -502,10 +545,16 @@ namespace Adminbot.Domain.Logging
             var now = _options.UtcNow();
             try
             {
+                // Re-validate at dispatch time: rows written by an older build, by a different producer, or while a
+                // destination was misconfigured can still be sitting in the outbox. A destination that local
+                // validation rejects can never produce a Telegram response, so it must not enter the retry loop.
+                if (!TelegramDestination.TryNormalize(row.LoggerChannelId, out var destination, out var destinationReason))
+                    throw new TelegramDestinationInvalidException(destinationReason);
+
                 var parseMode = row.DeliveryKind == TelegramLogDeliveryKind.Plain ? (ParseMode?)null : ParseMode.Html;
                 await PacedSendAsync(
                     () => _senderFactory(row.BotId).SendMessage(
-                        row.LoggerChannelId, row.Message, parseMode, _shutdown.Token));
+                        destination, row.Message, parseMode, _shutdown.Token));
                 await _outbox.AcknowledgeAsync(row.Id);
                 Interlocked.Increment(ref _deliveredCount);
                 // Backup intent was committed with enqueue; replaying delivery never requests another snapshot.
@@ -514,6 +563,22 @@ namespace Adminbot.Domain.Logging
             {
                 // Crash/shutdown mid-send: the row keeps its Sending lease. Startup reset or the periodic lease
                 // recovery re-queues it, which is the explicit at-least-once duplicate window.
+            }
+            catch (TelegramDestinationInvalidException ex)
+            {
+                // Deterministic configuration error: dead-letter immediately instead of spending the permanent-error
+                // budget, because retrying cannot change the outcome and would keep the row Pending forever.
+                // Only the stable sanitized code is persisted; the raw destination is never stored or logged.
+                try
+                {
+                    await _outbox.FailAsync(row.Id, now, TelegramDestinationInvalidException.FailureCode, now, deadLetter: true);
+                }
+                catch (Exception persistEx)
+                {
+                    Console.WriteLine($"[TelegramOutbox] dead-letter persistence failed id={row.Id}: {persistEx.Message}");
+                }
+                Interlocked.Increment(ref _deadLetteredCount);
+                Console.WriteLine($"[TelegramOutbox] DEAD-LETTERED id={row.Id} reason={TelegramDestinationInvalidException.FailureCode} detail={ex.Reason}; configure the logger channel before re-running this log.");
             }
             catch (Exception ex) when (TelegramRateLimitPolicy.IsRateLimited(ex))
             {
@@ -596,11 +661,21 @@ namespace Adminbot.Domain.Logging
         /// <param name="ct">Shutdown token.</param>
         private async Task SendNormalAsync(TelegramLogItem item, CancellationToken ct)
         {
+            // Validate before the transport: Telegram.Bot throws a local ArgumentException for a blank or malformed
+            // chat, and that exception must never be produced for a log destination that was never configured.
+            if (!TelegramDestination.TryNormalize(item.LoggerChannelId, out var destination, out _))
+            {
+                // Counted and dropped: the startup preflight and the durable-admission diagnostic are the
+                // operator-facing signals for a misconfigured logger channel. Plain logs are never durable.
+                Interlocked.Increment(ref _droppedNormalCount);
+                return;
+            }
+
             try
             {
                 await PacedSendAsync(
                     () => _senderFactory(item.BotId).SendMessage(
-                        item.LoggerChannelId, TruncateForTelegramLog(item.Message), null, ct));
+                        destination, TruncateForTelegramLog(item.Message), null, ct));
                 Interlocked.Increment(ref _normalSentCount);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
@@ -726,14 +801,20 @@ namespace Adminbot.Domain.Logging
                     // This read is the snapshot boundary: any later durable request remains above Covered.
                     state = await ReadBackupStateAsync();
                     _backupBotId = TelegramLogDispatcherOptions.SelectDestination(_options.BackupBotId, state.BotId);
-                    _backupChannelId = TelegramLogDispatcherOptions.SelectDestination(_options.BackupChannelId, state.ChannelId);
-                    if (string.IsNullOrWhiteSpace(_backupBotId) || string.IsNullOrWhiteSpace(_backupChannelId))
+                    var resolvedBackupChannel = TelegramLogDispatcherOptions.SelectDestination(_options.BackupChannelId, state.ChannelId);
+                    // The persisted destination is validated, not merely checked for blankness: an existing outbox can
+                    // still carry the historical "0" sentinel or an unedited malformed value, and uploading to it
+                    // would throw locally instead of producing a Telegram response. The durable generation is left
+                    // pending, exactly as for a missing destination, so no backup is silently dropped or duplicated.
+                    var backupChannelValid = TelegramDestination.TryNormalize(resolvedBackupChannel, out var normalizedBackupChannel, out _);
+                    if (string.IsNullOrWhiteSpace(_backupBotId) || !backupChannelValid)
                     {
                         _options.BackupWarning("[DatabaseBackup] destination unavailable; durable generation remains pending.");
                         // Ignore producer wakes during configuration failure to bound warnings and database activity.
                         await Task.Delay(_options.BackupRecoveryInterval, token);
                         continue;
                     }
+                    _backupChannelId = normalizedBackupChannel;
                     var generation = state.Requested;
                     Interlocked.Exchange(ref _backupRequests, generation);
                     Interlocked.Add(ref _backupRequestsCoalesced, Math.Max(0, generation - state.Covered - 1));

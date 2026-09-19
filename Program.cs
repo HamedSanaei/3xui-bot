@@ -79,6 +79,11 @@ public class Program
         ValidateAtlasPayConfiguration(appConfig);
         ValidateTenantStorefrontConfiguration(appConfig);
         ValidateTenantOrderNotificationConfiguration(appConfig);
+        // Cross-cutting fatal checks that no single feature validator owns: an explicitly enabled feature whose
+        // required panel URL is missing or unusable, a structurally invalid panel URL, and two application databases
+        // pointed at the same file. Telegram log destinations are deliberately NOT checked here: they are reported as
+        // sanitized warnings after bot hydration so a logging misconfiguration can never stop the process from starting.
+        ConfigurationPreflight.ValidateEnabledFeatures(appConfig);
 
         ConfigureDatabasePaths(builder.Environment.ContentRootPath, appConfig);
         // Telegrams logs use their own SQLite outbox next to the runtime databases. The path is resolved against
@@ -100,6 +105,18 @@ public class Program
             // Sync configured brand bots first, then hydrate runtime-created tenant bots from users.db.
             await SyncBotInstancesAsync(userDb, botRegistry);
             await botRegistry.LoadTenantBotsFromDatabaseAsync(userDb);
+            // Report degraded (but usable) configuration once, before any receiver starts. This is sanitized and never
+            // a hard failure: the process must keep settling payments, running XUI work, and answering customers even
+            // when the log destinations or the panel URL are missing. It never prints a chat id, bot id, token, or URL.
+            foreach (var startupReportLine in ConfigurationPreflight.DescribeStartupReport(
+                configuration["loggerChannel"],
+                botRegistry.DefaultBot?.LoggerChannel,
+                configuration["backupChannel"],
+                botRegistry.DefaultBot?.BackupChannel,
+                appConfig.XuiV3ApiBaseUrl))
+            {
+                Console.WriteLine(startupReportLine);
+            }
             await using var credentialsDb = scope.ServiceProvider.GetRequiredService<CredentialsDbContextFactory>().CreateDbContext();
             credentialsDb.Database.Migrate();
             await credentialsDb.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
@@ -175,7 +192,12 @@ public class Program
                     appConfig.CredentialsDatabasePath) with
                 {
                     BackupBotId = sp.GetRequiredService<BotRegistry>().DefaultBot?.Id,
-                    BackupChannelId = TelegramLogDispatcherOptions.SelectDestination(configuration["backupChannel"], sp.GetRequiredService<BotRegistry>().DefaultBot?.BackupChannel)
+                    // Both candidates are validated before precedence is applied. The first payment row captures the
+                    // persisted fallback destination, so a malformed or zero-sentinel value must never win over a valid
+                    // one, and the historical "0" sentinel must never be stored as a real Telegram destination.
+                    BackupChannelId = TelegramLogDispatcherOptions.SelectDestination(
+                        TelegramDestination.Sanitize(configuration["backupChannel"]),
+                        TelegramDestination.Sanitize(sp.GetRequiredService<BotRegistry>().DefaultBot?.BackupChannel))
                 });
         });
         services.AddSingleton<BotRuntimeStatusStore>();
@@ -307,8 +329,11 @@ public class Program
             loggingBuilder.Services.AddSingleton<ILoggerProvider>(sp => new TelegramLoggerProvider(ShouldSendTelegramLog,
                 sp.GetRequiredService<BotRegistry>(),
                 sp.GetRequiredService<BotContextAccessor>(),
-                configuration["loggerChannel"],
-                configuration["backupChannel"],
+                // Sanitized so a blank, zero-sentinel, or malformed legacy key resolves to "not configured" instead of
+                // reaching the transport. The logger reports a missing destination through one bounded local
+                // diagnostic rather than a durable row that can never be delivered.
+                TelegramDestination.Sanitize(configuration["loggerChannel"]),
+                TelegramDestination.Sanitize(configuration["backupChannel"]),
                 sp.GetRequiredService<TelegramLogDispatcher>()
                 ));
             // Keep the complete operational diagnostic trail on disk even when the Telegram channel suppresses noise.

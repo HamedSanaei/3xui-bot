@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Microsoft.Extensions.Logging;
 using Adminbot.Domain;
 
@@ -24,6 +25,17 @@ namespace Adminbot.Domain.Logging
         private readonly string _fallbackChannelId;
         private readonly string _fallbackBackupChannelId;
         private readonly TelegramLogDispatcher _dispatcher;
+
+        /// <summary>Minimum spacing between two local diagnostics for the same missing-destination reason.</summary>
+        private static readonly TimeSpan DestinationDiagnosticInterval = TimeSpan.FromMinutes(1);
+
+        /// <summary>Hard cap on tracked reasons, keeping the diagnostic state strictly bounded.</summary>
+        private const int MaximumTrackedDestinationReasons = 4;
+
+        private static readonly object DestinationDiagnosticGate = new();
+
+        /// <summary>Last emission time per reason; only written while <see cref="DestinationDiagnosticGate"/> is held.</summary>
+        private static readonly Dictionary<string, DateTime> LastDestinationDiagnosticUtc = new(StringComparer.Ordinal);
 
         /// <summary>
         /// Creates a Telegram-backed logger that can post operational logs and request database backups.
@@ -82,6 +94,14 @@ namespace Adminbot.Domain.Logging
         /// memory-only queue so arbitrary application logs cannot be interpreted as Telegram markup and cannot grow
         /// disk usage. A failed outbox commit is counted and printed to console/file only; it never crashes the
         /// caller and is never re-logged through Telegram.
+        ///
+        /// Destination admission:
+        /// a durable event is queued only when the resolved logger channel is a destination Telegram can accept
+        /// (numeric chat id or <c>@username</c>). A missing or malformed destination produces one throttled local
+        /// diagnostic instead of a durable row, because such a row can never be delivered and would only retry until
+        /// it dead-lettered while masking the configuration fault. Payment events keep their durable database-backup
+        /// request even when the audit line is not queued, so a logging misconfiguration never stops payment backups.
+        /// This method never throws: settlement and Telegram update handling are protected from logging failure.
         /// </remarks>
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
         {
@@ -104,17 +124,79 @@ namespace Adminbot.Domain.Logging
                     ? TelegramLogDeliveryKind.Html
                     : TelegramLogDeliveryKind.Plain;
 
+            var loggingBotId = CurrentLoggingBotConfig?.Id ?? string.Empty;
+            // The backup destination is sanitized before it is captured: the persisted backup watermark stores the first
+            // destination it ever sees, so the historical "0" sentinel or any malformed value must never be written
+            // there. An unusable value becomes empty, which leaves the column free for a later valid configuration and
+            // keeps the backup worker on its existing "destination unavailable, generation stays pending" path.
+            var backupChannelId = TelegramDestination.Sanitize(CurrentBackupChannelId);
+
             if (delivery == TelegramLogDeliveryKind.Plain)
             {
                 _dispatcher.EnqueueNormal(new TelegramLogItem(
-                    delivery, message, CurrentLoggingBotConfig?.Id ?? string.Empty,
-                    CurrentLoggerChannelId, CurrentBackupChannelId));
+                    delivery, message, loggingBotId, CurrentLoggerChannelId, backupChannelId));
+                return;
+            }
+
+            // Admit a durable row only with a destination Telegram can accept. Blank, zero, and malformed
+            // destinations are rejected here rather than at the transport, where Telegram.Bot would raise a local
+            // ArgumentException that has no attachable Telegram response to classify.
+            if (!TelegramDestination.TryNormalize(CurrentLoggerChannelId, out var loggerChannelId, out var failureReason))
+            {
+                ReportUnusableDurableDestination(failureReason);
+
+                // A Payment event also owns the durable database-backup request. Keep that request even though the
+                // audit line cannot be delivered, so a logger misconfiguration can never stop payment backups.
+                // Failure is contained: RequestBackupIntent never throws and is never awaited here.
+                if (delivery == TelegramLogDeliveryKind.Payment)
+                    _dispatcher.RequestBackupIntent(loggingBotId, backupChannelId);
                 return;
             }
 
             _dispatcher.EnqueueDurable(new TelegramLogItem(
-                delivery, message, CurrentLoggingBotConfig?.Id ?? string.Empty,
-                CurrentLoggerChannelId, CurrentBackupChannelId));
+                delivery, message, loggingBotId, loggerChannelId, backupChannelId));
+        }
+
+        /// <summary>
+        /// Writes one throttled local diagnostic when a durable event has no deliverable logger destination.
+        /// </summary>
+        /// <param name="reason">
+        /// Closed-vocabulary reason produced by <see cref="TelegramDestination.TryNormalize"/>: <c>blank</c>,
+        /// <c>zero</c>, or <c>malformed</c>. Never the rejected destination value, which may be arbitrary input.
+        /// </param>
+        /// <remarks>
+        /// A missing destination can persist for as long as an operator takes to fix it, so an unthrottled
+        /// diagnostic would turn every audit and payment event into journal noise. Output goes to the console and
+        /// therefore to systemd/journalctl only; it is never routed back through Telegram, because the log channel is
+        /// the component that is misconfigured. The tracked key set is a closed vocabulary capped at
+        /// <see cref="MaximumTrackedDestinationReasons"/> entries. This method never throws, so it cannot fail payment
+        /// settlement, wallet mutation, order fulfillment, or renewal settlement.
+        /// </remarks>
+        private static void ReportUnusableDurableDestination(string reason)
+        {
+            try
+            {
+                var key = string.IsNullOrEmpty(reason) ? "unknown" : reason;
+                var now = DateTime.UtcNow;
+                lock (DestinationDiagnosticGate)
+                {
+                    if (LastDestinationDiagnosticUtc.TryGetValue(key, out var lastEmitted) &&
+                        now - lastEmitted < DestinationDiagnosticInterval)
+                        return;
+                    if (!LastDestinationDiagnosticUtc.ContainsKey(key) &&
+                        LastDestinationDiagnosticUtc.Count >= MaximumTrackedDestinationReasons)
+                        return;
+                    LastDestinationDiagnosticUtc[key] = now;
+                }
+
+                Console.WriteLine(
+                    $"[TelegramLogDestination] reason={key} action=skipped; configure the global loggerChannel or the default owned bot logger channel. " +
+                    "The audit line was NOT queued; payment settlement and customer handling continue unaffected.");
+            }
+            catch
+            {
+                // A diagnostic must never surface as an exception into settlement or update handling.
+            }
         }
 
         /// <summary>

@@ -76,6 +76,43 @@ service; a failing gate exits before the protected `Data` directory or systemd i
 preflight all precede synchronization, and synchronization precedes the restart) so the gate cannot be dropped or moved
 by a later edit on a machine without rsync or systemd.
 
+## Configuration change safety
+
+`Data/configuration.json` is persistent runtime state, not a build artifact. It is excluded from publish and from
+release synchronization, it is the only file that carries real panel credentials and deployment-specific values, and
+no script in this repository writes, prunes, or regenerates it.
+
+An outage was caused by a human pruning this file against a `configuration.example.json` taken from a different branch.
+That procedure is now explicitly forbidden:
+
+- **Never prune a real configuration against the example.** The example is an illustrative template, not a schema, and
+  it deliberately omits deployment-specific sections. Pruning against it deletes keys production depends on; in the
+  observed incident it removed `xuiV3ApiBaseUrl` and the per-bot `loggerChannel` / `backupChannel` values, which left
+  the durable Telegram log outbox with unusable destinations.
+- **Never rebuild the file from a key list.** `jq '{known keys}' production/configuration.json > new-file` silently
+  drops every key that is not in the list. `jq` also rejects `//` comments, so it cannot be pointed at a documented
+  template at all.
+- **Make changes additive and targeted.** Edit only the keys you intend to change and leave every other line untouched.
+
+`Data/configuration.example.json` states these rules in its own `_readme` block, which is the first key in the file. That
+block is documentation rather than configuration: the configuration binder ignores keys it does not know, and the
+application never reads the example at runtime.
+
+Startup validation in `Domain/ConfigurationPreflight.cs` covers the failure class this incident exposed:
+
+- `ValidateEnabledFeatures` is **fatal** and runs beside the per-feature validators in `Program.Main`, before dependency
+  injection and before any database migration. It rejects an explicitly enabled feature whose required panel URL is
+  missing or unusable, a structurally invalid `xuiV3ApiBaseUrl`, and `userDatabasePath` / `credentialsDatabasePath`
+  resolving to the same file.
+- `DescribeStartupReport` is **warn-only** and runs after bot hydration. It reports a missing Telegram logger channel, a
+  missing backup channel, and a missing panel URL. These are warnings by design: the process must keep settling
+  payments, running XUI work, and answering customers even when logging is misconfigured.
+
+The validator never reads, rewrites, prunes, or backfills a configuration file, and it never rejects a key it does not
+know: unknown keys are ignored by the configuration binder, so a newer configuration stays usable by an older build and
+an older configuration stays usable by a newer build. Every message it produces names a configuration key and never
+echoes a configured value, a chat id, a bot token, or a panel secret.
+
 ## Test schema policy
 
 The general concurrency fixture in `Adminbot.Tests/ConcurrencyTests.cs` uses `EnsureCreated` only for short-lived unit

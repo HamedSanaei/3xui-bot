@@ -285,8 +285,8 @@ public sealed partial class ConcurrencyTests
             null,
             new BotRegistry(new ConfigurationBuilder().Build()),
             new BotContextAccessor(),
-            "log",
-            "backup",
+            "-1001234567890",
+            "-1001234567891",
             dispatcher);
         var localSink = new ConcurrentQueue<string>();
 

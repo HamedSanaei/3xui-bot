@@ -185,9 +185,17 @@ namespace Adminbot.Domain.Logging
         /// <see cref="IOException"/>, or a Telegram 5xx <see cref="ApiRequestException"/>, unless the operation was
         /// cancelled by shutdown; otherwise <c>false</c>.
         /// </returns>
+        /// <remarks>
+        /// A <see cref="TelegramDestinationInvalidException"/> is never transient. The check is explicit rather than
+        /// incidental so a future edit cannot accidentally route a misconfigured destination back into exponential
+        /// backoff, which is the exact defect that produced endlessly Pending outbox rows.
+        /// </remarks>
         public static bool IsTransientFailure(Exception exception, bool cancellationRequested)
         {
             if (exception == null || (exception is OperationCanceledException && cancellationRequested))
+                return false;
+
+            if (exception is TelegramDestinationInvalidException)
                 return false;
 
             return exception is HttpRequestException ||
@@ -198,20 +206,29 @@ namespace Adminbot.Domain.Logging
         }
 
         /// <summary>
-        /// Classifies an exception as a permanent Telegram API rejection that should eventually dead-letter.
+        /// Classifies an exception as a permanent Telegram delivery rejection that must not be retried as transient.
         /// </summary>
         /// <param name="exception">Exception raised during Telegram delivery; may be null.</param>
         /// <returns>
         /// <c>true</c> for <see cref="ApiRequestException"/> codes 400 (bad request, chat not found, can't parse
-        /// entities), 401 (invalid token), 403 (bot blocked), or 410 (channel removed); otherwise <c>false</c>.
+        /// entities), 401 (invalid token), 403 (bot blocked), or 410 (channel removed), and for
+        /// <see cref="TelegramDestinationInvalidException"/>; otherwise <c>false</c>.
         /// </returns>
         /// <remarks>
         /// Permanent errors are retried with short backoff up to <see cref="PermanentFailureMaxAttempts"/> attempts
-        /// and then become inspectable DeadLetter rows; they are never deleted and never retried forever.
+        /// and then become inspectable DeadLetter rows; they are never deleted and never retried forever. The outbox
+        /// dispatcher dead-letters an invalid destination immediately instead of waiting out that threshold, because
+        /// the outcome is already certain and no attachable Telegram response can ever exist for it.
+        ///
+        /// Only the dedicated <see cref="TelegramDestinationInvalidException"/> type is treated as permanently
+        /// invalid. A plain <see cref="ArgumentException"/> is deliberately excluded: an argument error raised
+        /// elsewhere may be a programming bug, and classifying it here would silently bury that bug in the
+        /// dead-letter table.
         /// </remarks>
         public static bool IsPermanentFailure(Exception exception)
         {
-            return exception is ApiRequestException api && api.ErrorCode is 400 or 401 or 403 or 410;
+            return exception is TelegramDestinationInvalidException ||
+                   (exception is ApiRequestException api && api.ErrorCode is 400 or 401 or 403 or 410);
         }
     }
 }

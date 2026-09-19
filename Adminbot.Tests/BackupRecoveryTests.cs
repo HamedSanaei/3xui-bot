@@ -38,7 +38,7 @@ public sealed class BackupRecoveryTests
         await using var fixture = new Fixture(); var sender = new Sender();
         await using (var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options))
         {
-            for (var i = 0; i < 20; i++) Assert.True(dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "test", multiBot ? "bot" + i : "a", "log", "backup")));
+            for (var i = 0; i < 20; i++) Assert.True(dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "test", multiBot ? "bot" + i : "a", "-1001234567890", "-1001234567891")));
             await Until(() => sender.Texts == 20 && sender.Documents == 2);
         }
         Assert.Equal(2, sender.Documents);
@@ -52,9 +52,9 @@ public sealed class BackupRecoveryTests
         var sender = new Sender { DocumentBarrier = release.Task };
         await using (var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options))
         {
-            dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "first", "a", "log", "backup"));
+            dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "first", "a", "-1001234567890", "-1001234567891"));
             await Until(() => sender.Documents == 1);
-            for (var i = 0; i < 20; i++) dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "later", "b", "log", "backup"));
+            for (var i = 0; i < 20; i++) dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "later", "b", "-1001234567890", "-1001234567891"));
             release.TrySetResult(); await Until(() => sender.Documents == 4);
         }
         Assert.Equal(4, sender.Documents);
@@ -68,7 +68,7 @@ public sealed class BackupRecoveryTests
         long elapsed = 0; var origin = DateTime.UtcNow;
         await using (var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options with { UtcNow = () => origin.AddMilliseconds(Interlocked.Read(ref elapsed)), BackupDebounce = TimeSpan.FromMilliseconds(150), BackupMaxDelay = TimeSpan.FromSeconds(2) }))
         {
-            for (var i = 0; i < 8; i++) { dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "test", "a", "log", "backup")); await Task.Delay(20); }
+            for (var i = 0; i < 8; i++) { dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "test", "a", "-1001234567890", "-1001234567891")); await Task.Delay(20); }
             Assert.Equal(0, sender.Documents);
             Interlocked.Exchange(ref elapsed, 3000);
             await Until(() => sender.Documents == 2);
@@ -87,7 +87,7 @@ public sealed class BackupRecoveryTests
         await using (var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options))
         {
             await Until(() => sender.Texts == 1); Assert.Equal(0, sender.Documents);
-            dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "new", "a", "log", "backup"));
+            dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "new", "a", "-1001234567890", "-1001234567891"));
             await Until(() => sender.Documents == 2);
         }
         Assert.Equal(2, sender.Documents);
@@ -121,7 +121,7 @@ public sealed class BackupRecoveryTests
         await using var fixture = new Fixture(); var sender = new Sender { FailFirst = true };
         await using (var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options))
         {
-            dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "retry", "a", "log", "backup"));
+            dispatcher.EnqueueDurable(new(TelegramLogDeliveryKind.Payment, "retry", "a", "-1001234567890", "-1001234567891"));
             await Until(() => sender.Texts >= 2 && sender.Documents == 2);
         }
         Assert.Equal(2, sender.Documents);
@@ -138,7 +138,7 @@ public sealed class BackupRecoveryTests
         await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
         var registry = new BotRegistry(configuration);
-        var logger = new TelegramLogger("lifecycle", null, registry, new Adminbot.Domain.BotContextAccessor(), "log", "backup", dispatcher);
+        var logger = new TelegramLogger("lifecycle", null, registry, new Adminbot.Domain.BotContextAccessor(), "-1001234567890", "-1001234567891", dispatcher);
         var service = new MultiBotHostedService(null, null, null, null, null, null, configuration,
             new TypedLogger(logger));
         var method = typeof(MultiBotHostedService).GetMethod("LogTenantRuntimeEvent",
@@ -159,7 +159,7 @@ public sealed class BackupRecoveryTests
                 while (await reader.ReadAsync())
                 {
                     Assert.Equal((int)TelegramLogDeliveryKind.Html, reader.GetInt32(0));
-                    Assert.Equal("log", reader.GetString(1));
+                    Assert.Equal("-1001234567890", reader.GetString(1));
                     Assert.Contains("tenant-", reader.GetString(2));
                     Assert.Contains("<b>روشن شد</b>", reader.GetString(2));
                     Assert.Contains("error &lt;test&gt;", reader.GetString(2));
@@ -232,9 +232,9 @@ public sealed class BackupRecoveryTests
         var bots = new System.Collections.Concurrent.ConcurrentBag<string>();
         await using (var outbox = new TelegramLogOutbox(fixture.Options.OutboxDatabasePath)) await outbox.EnqueueAsync(Item(1));
         await using (var dispatcher = new TelegramLogDispatcher(bot => { bots.Add(bot); return sender; }, fixture.Options with
-        { BackupBotId = useOwned ? "owned" : "   ", BackupChannelId = useOwned ? "owned-channel" : "" }))
+        { BackupBotId = useOwned ? "owned" : "   ", BackupChannelId = useOwned ? "-1001234567892" : "" }))
             await Until(() => sender.Documents == 2);
-        Assert.All(sender.Channels, channel => Assert.Equal(useOwned ? "owned-channel" : "backup", channel));
+        Assert.All(sender.Channels, channel => Assert.Equal(useOwned ? "-1001234567892" : "-1001234567891", channel));
         Assert.Contains(useOwned ? "owned" : "a", bots);
         if (useOwned) Assert.Equal(2, bots.Count(bot => bot == "owned"));
     }
@@ -276,7 +276,7 @@ public sealed class BackupRecoveryTests
 
     /// <summary>Builds a non-secret durable payment row for restart seeding.</summary>
     private static TelegramLogOutboxItem Item(int id) => new(0, DateTime.UtcNow, TelegramLogDeliveryKind.Payment, TelegramLogDeliveryKind.Payment,
-        "a", "log", "backup", "test" + id, 0, DateTime.UtcNow, null, TelegramLogOutboxStatus.Pending, null, null);
+        "a", "-1001234567890", "-1001234567891", "test" + id, 0, DateTime.UtcNow, null, TelegramLogOutboxStatus.Pending, null, null);
 
     /// <summary>Waits for a controlled observable boundary with a finite failure deadline.</summary>
     internal static async Task Until(Func<bool> ready)

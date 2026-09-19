@@ -6,6 +6,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
+using System.Globalization;
 using System.Net;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
@@ -115,8 +116,12 @@ public class BotRegistry
             BrandName = string.IsNullOrWhiteSpace(bot.BrandName) ? bot.Username : bot.BrandName,
             ChannelIds = DeserializeStringList(bot.ChannelIdsJson),
             SupportAccount = bot.SupportAccount,
-            LoggerChannel = bot.LoggerChannel,
-            BackupChannel = bot.BackupChannel,
+            // Rows written by an older build can still carry the historical "0" backup sentinel, because the previous
+            // normalizer converted a missing long configuration value into the non-blank string "0". Normalizing on
+            // read means every runtime consumer of a tenant row sees the same "not configured" representation as the
+            // configuration path, and the next configuration sync rewrites the corrected empty value.
+            LoggerChannel = TelegramDestination.NormalizeStoredChannel(bot.LoggerChannel),
+            BackupChannel = TelegramDestination.NormalizeStoredChannel(bot.BackupChannel),
             IosTutorial = DeserializeStringList(bot.IosTutorialJson).ToArray(),
             AndroidTutorial = DeserializeStringList(bot.AndroidTutorialJson).ToArray(),
             WindowsTutorial = DeserializeStringList(bot.WindowsTutorialJson).ToArray(),
@@ -208,11 +213,19 @@ public class BotRegistry
     }
 
     /// <summary>
-    /// Applies fallback values and normalizes BotId and username for one configured bot.
+    /// Applies fallback values and normalizes BotId, username, and Telegram channel destinations for one bot.
     /// </summary>
     /// <param name="bot">Raw bot config item from configuration.json.</param>
     /// <param name="fallback">App-level fallback config.</param>
     /// <returns>A complete runtime bot configuration.</returns>
+    /// <remarks>
+    /// Channel normalization follows the shared <see cref="TelegramDestination"/> contract: a blank value and the
+    /// numeric zero sentinel both become an empty string meaning "not configured". A value of 0 in
+    /// <see cref="AppConfig.BackupChannel"/> must never become the string "0", because downstream Telegram code
+    /// cannot distinguish a non-blank string from a configured destination. Malformed non-empty values are preserved
+    /// verbatim and rejected later by destination validation, so a sync can never silently discard an operator
+    /// setting. This method performs no validation and no network call.
+    /// </remarks>
     private static BotInstanceConfig NormalizeBot(BotInstanceConfig bot, AppConfig fallback)
     {
         var username = string.IsNullOrWhiteSpace(bot.Username)
@@ -236,8 +249,16 @@ public class BotRegistry
                          ?? fallback.ChannelIds
                          ?? new List<string>(),
             SupportAccount = string.IsNullOrWhiteSpace(bot.SupportAccount) ? fallback.SupportAccount : bot.SupportAccount,
-            LoggerChannel = string.IsNullOrWhiteSpace(bot.LoggerChannel) ? fallback.LoggerChannel : bot.LoggerChannel,
-            BackupChannel = string.IsNullOrWhiteSpace(bot.BackupChannel) ? fallback.BackupChannel.ToString() : bot.BackupChannel,
+            // One stored representation for "not configured": an empty string. AppConfig.BackupChannel is a long whose
+            // missing default is 0, and the previous code turned that 0 into the non-blank string "0", which later
+            // code treated as a real Telegram destination. The shared normalizer applies the zero sentinel to both the
+            // fallback and the explicitly configured value, so "0" can never become a deliverable destination again.
+            LoggerChannel = TelegramDestination.NormalizeStoredChannel(
+                string.IsNullOrWhiteSpace(bot.LoggerChannel) ? fallback.LoggerChannel : bot.LoggerChannel),
+            BackupChannel = TelegramDestination.NormalizeStoredChannel(
+                string.IsNullOrWhiteSpace(bot.BackupChannel)
+                    ? fallback.BackupChannel.ToString(CultureInfo.InvariantCulture)
+                    : bot.BackupChannel),
             IosTutorial = bot.IosTutorial ?? fallback.IosTutorial,
             AndroidTutorial = bot.AndroidTutorial ?? fallback.AndroidTutorial,
             WindowsTutorial = bot.WindowsTutorial ?? fallback.WindowsTutorial,
