@@ -1,7 +1,7 @@
 namespace Adminbot.Domain;
 
 /// <summary>
-/// Defines the durable delivery states of an owned-wallet settlement notification.
+/// Defines the durable delivery states of a platform-wallet settlement notification.
 /// </summary>
 /// <remarks>
 /// These states govern Telegram delivery only. They never authorize, repeat, reverse, or otherwise mutate a wallet,
@@ -31,7 +31,7 @@ public static class PaymentSettlementNotificationStatuses
 }
 
 /// <summary>
-/// Persists one customer-facing Telegram notification created by a successful owned-wallet settlement.
+/// Persists one customer-facing Telegram notification created by a successful platform-wallet settlement or proven refund.
 /// </summary>
 /// <remarks>
 /// The row is inserted into <c>users.db</c> in the same save that records the provider payment's first-credit marker.
@@ -45,11 +45,44 @@ public static class PaymentSettlementNotificationStatuses
 /// </remarks>
 public sealed class PaymentSettlementNotification
 {
+    /// <summary>Creates an origin-aware wallet-credit delivery intent while retaining historical owned keys.</summary>
+    /// <param name="provider">Stable central provider label without secrets.</param>
+    /// <param name="providerPaymentId">Local provider payment row id.</param>
+    /// <param name="botId">Persisted originating runtime bot id.</param>
+    /// <param name="telegramUserId">Customer's global Telegram identity.</param>
+    /// <param name="chatId">Original payment's destination Telegram chat id.</param>
+    /// <param name="amountToman">Positive credited amount in toman.</param>
+    /// <param name="messageText">Safe customer-facing plain text, without provider payloads.</param>
+    /// <param name="createdAtUtc">Original settlement timestamp in UTC.</param>
+    /// <param name="botType">Immutable payment origin: owned for historical rows, tenant for approved tenant invoices.</param>
+    /// <param name="balanceAfter">Optional authoritative post-credit receipt balance in toman, displayed for tenant charges.</param>
+    /// <param name="walletOriginTelegramBotId">Exact numeric BotFather identity captured from the approved tenant storefront when the invoice was created.</param>
+    /// <returns>A detached outbox intent for insertion with the payment settlement marker.</returns>
+    /// <remarks>
+    /// The worker remains delivery-only. Owned notification keys never change; tenant keys cannot collide with them.
+    /// Historical tenant rows that predate numeric identity capture are never rebound to the current token; delivery is
+    /// parked for manual review while the already-committed financial settlement remains final.
+    /// </remarks>
+    public static PaymentSettlementNotification CreateWalletCredit(string provider, int providerPaymentId, string botId,
+        long telegramUserId, long chatId, long amountToman, string messageText, DateTime createdAtUtc, string botType,
+        long? balanceAfter = null, long? walletOriginTelegramBotId = null)
+    {
+        var result = CreateOwnedWalletCredit(provider, providerPaymentId, botId, telegramUserId, chatId, amountToman, messageText, createdAtUtc);
+        result.WalletOriginBotType = botType == BotInstanceTypes.Tenant ? BotInstanceTypes.Tenant : BotInstanceTypes.Owned;
+        if (botType == BotInstanceTypes.Tenant)
+        {
+            result.NotificationKey = $"tenant-wallet:{result.Provider}:{providerPaymentId}";
+            result.WalletOriginTelegramBotId = walletOriginTelegramBotId;
+            if (balanceAfter.HasValue) result.MessageText += $"\nموجودی جدید: {balanceAfter.Value:N0} تومان";
+        }
+        return result;
+    }
+
     /// <summary>Auto-generated users.db primary key.</summary>
     public int Id { get; set; }
 
     /// <summary>
-    /// Globally unique idempotency key formed from the owned-wallet provider and local payment-row id.
+    /// Globally unique idempotency key formed from origin, provider and local payment-row id, or a tenant refund order id.
     /// </summary>
     public string NotificationKey { get; set; }
 
@@ -65,7 +98,13 @@ public sealed class PaymentSettlementNotification
     /// </summary>
     public string BotId { get; set; }
 
-    /// <summary>Numeric Telegram user id whose owned wallet received the credit.</summary>
+    /// <summary>Immutable wallet origin family; existing rows default to owned for backward compatibility.</summary>
+    public string WalletOriginBotType { get; set; } = BotInstanceTypes.Owned;
+
+    /// <summary>Exact numeric BotFather identity for tenant-origin delivery; null means historical identity was not recorded.</summary>
+    public long? WalletOriginTelegramBotId { get; set; }
+
+    /// <summary>Numeric Telegram user id whose global platform wallet received the credit.</summary>
     public long TelegramUserId { get; set; }
 
     /// <summary>Numeric Telegram chat id that receives the settlement message.</summary>
@@ -159,6 +198,7 @@ public sealed class PaymentSettlementNotification
             Provider = normalizedProvider,
             ProviderPaymentId = providerPaymentId,
             BotId = botId,
+            WalletOriginBotType = BotInstanceTypes.Owned,
             TelegramUserId = telegramUserId,
             ChatId = chatId,
             AmountToman = amountToman,

@@ -365,6 +365,18 @@ public class BotClientProvider
     /// <returns>Cached or newly created TelegramBotClient.</returns>
     /// <exception cref="InvalidOperationException">Thrown when the bot has no configured token.</exception>
     public ITelegramBotClient GetClient(string botId)
+        => GetClientCore(botId, expectedTelegramBotId: null);
+
+    /// <summary>Gets the current transport only when it still belongs to the recorded BotFather identity.</summary>
+    /// <param name="botId">Persisted internal bot id of the historical work item.</param>
+    /// <param name="expectedTelegramBotId">Immutable numeric Telegram bot id captured when that work was created.</param>
+    /// <returns>The cached or newly created client for the same BotFather bot, including after secret-token rotation.</returns>
+    /// <exception cref="BotTransportUnavailableException">Thrown when the bot is unavailable or now identifies a different Telegram bot.</exception>
+    public ITelegramBotClient GetClient(string botId, long expectedTelegramBotId)
+        => GetClientCore(botId, expectedTelegramBotId);
+
+    /// <summary>Resolves one transport while optionally binding it to an immutable Telegram bot identity.</summary>
+    private ITelegramBotClient GetClientCore(string botId, long? expectedTelegramBotId)
     {
         var requestedBotId = botId?.Trim();
         var bot = _registry.GetById(requestedBotId);
@@ -378,6 +390,12 @@ public class BotClientProvider
             (string.Equals(bot.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) && !bot.Enabled))
         {
             throw new BotTransportUnavailableException("bot_disabled_or_token_missing");
+        }
+
+        if (expectedTelegramBotId.HasValue &&
+            TelegramBotTokenIdentity.ExtractBotId(bot.Token) != expectedTelegramBotId.Value)
+        {
+            throw new BotTransportUnavailableException("bot_identity_changed");
         }
 
         lock (_syncRoot)
@@ -1918,7 +1936,7 @@ public class MultiBotHostedService : IHostedService
     /// <returns>A task that completes after best-effort cleanup and owner notification.</returns>
     /// <remarks>
     /// The tenant username and settings are preserved for the owner panel, but <c>Token</c> is cleared and
-    /// <c>Enabled</c> is set to <c>false</c>. This prevents one revoked tenant token from breaking the whole process.
+    /// <c>Enabled</c> is set to <c>false</c>. Customer-wallet approval evidence is also revoked, so a replacement identity cannot inherit trust. This prevents one revoked tenant token from breaking the whole process.
     /// </remarks>
     private async Task DisableTenantTokenAsync(
         BotInstanceConfig bot,
@@ -1944,6 +1962,7 @@ public class MultiBotHostedService : IHostedService
 
         tenant.Enabled = false;
         tenant.Token = null;
+        TenantCustomerWalletPolicy.Revoke(tenant);
         tenant.TelegramBotId = null;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await db.SaveChangesAsync(cleanupToken);

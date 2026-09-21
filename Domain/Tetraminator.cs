@@ -44,6 +44,10 @@ public sealed class TetraminatorPaymentInfo
     /// <summary>Optional Telegram invoice message id.</summary>
     public long? TelMsgId { get; set; }
     /// <summary>Internal owned or tenant bot id that originated the invoice.</summary>
+    /// <summary>Immutable wallet-charge origin type; historical rows default to owned. Tenant origin never grants owned referral rewards.</summary>
+    public string WalletOriginBotType { get; set; } = BotInstanceTypes.Owned;
+    /// <summary>Immutable numeric BotFather identity of a tenant-origin wallet invoice; null for legacy or owned rows.</summary>
+    public long? WalletOriginTelegramBotId { get; set; }
     public string BotId { get; set; } = BotContextAccessor.DefaultBotId;
     /// <summary>Bot username captured for audit without a token.</summary>
     public string BotUsername { get; set; } = BotContextAccessor.DefaultBotId;
@@ -444,7 +448,7 @@ public sealed class TetraminatorSettlementService
     }
 
     /// <summary>
-    /// Credits an officially paid owned-bot wallet invoice exactly once.
+    /// Credits an officially paid platform-wallet invoice exactly once using its immutable owned or tenant origin.
     /// </summary>
     /// <param name="payment">Locally persisted payment already verified against provider pay id and amount.</param>
     /// <param name="source">Audit source such as callback, customer check, or super-admin check.</param>
@@ -518,9 +522,9 @@ public sealed class TetraminatorSettlementService
             payment.SettledAtUtc ??= DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
             // Persist the notification with the first-credit marker before ledger/referral follow-up work.
-            var notificationChatId = notifyChatId ?? user.ChatID;
+            var notificationChatId = notifyChatId ?? (payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : user.ChatID);
             _workflow.Add(
-                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                PaymentSettlementNotification.CreateWalletCredit(
                     provider: "tetraminator",
                     providerPaymentId: payment.Id,
                     botId: payment.BotId,
@@ -528,7 +532,8 @@ public sealed class TetraminatorSettlementService
                     chatId: notificationChatId,
                     amountToman: payment.AmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
-                    createdAtUtc: payment.SettledAtUtc.Value));
+                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                    walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
             await _workflow.SaveAsync(cancellationToken);
             await EnsureOfficialLedgerAsync(payment, before, after, cancellationToken);
             await ProcessReferralAsync(payment, cancellationToken);
@@ -603,9 +608,9 @@ public sealed class TetraminatorSettlementService
             payment.SettledAtUtc = DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
             // Official reconciliation after this provisional credit cannot enqueue a duplicate notification.
-            var notificationChatId = notifyChatId ?? user.ChatID;
+            var notificationChatId = notifyChatId ?? (payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : user.ChatID);
             _workflow.Add(
-                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                PaymentSettlementNotification.CreateWalletCredit(
                     provider: "tetraminator",
                     providerPaymentId: payment.Id,
                     botId: payment.BotId,
@@ -613,7 +618,8 @@ public sealed class TetraminatorSettlementService
                     chatId: notificationChatId,
                     amountToman: payment.AmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت.",
-                    createdAtUtc: payment.SettledAtUtc.Value));
+                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                    walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
             await _workflow.SaveAsync(cancellationToken);
 
             await EnsureProvisionalLedgerAsync(payment, before, after, cancellationToken);
@@ -656,7 +662,7 @@ public sealed class TetraminatorSettlementService
             description: "Tetraminator wallet charge",
             botId: payment.BotId,
             botUsername: payment.BotUsername,
-            botType: BotInstanceTypes.Owned,
+            botType: payment.WalletOriginBotType,
             idempotencyKey: $"payment:tetraminator:{payment.Id}:credit",
             cancellationToken: cancellationToken);
     }
@@ -692,14 +698,14 @@ public sealed class TetraminatorSettlementService
             description: $"Tetraminator provisional wallet charge approved by {payment.ProvisionalApprovedByTelegramUserId}",
             botId: payment.BotId,
             botUsername: payment.BotUsername,
-            botType: BotInstanceTypes.Owned,
+            botType: payment.WalletOriginBotType,
             idempotencyKey: $"payment:tetraminator:{payment.Id}:credit",
             cancellationToken: cancellationToken);
 
     /// <summary>
     /// Sends an official, non-provisional owned-wallet payment to the existing global referral engine.
     /// </summary>
-    /// <param name="payment">Officially paid and locally credited owned-wallet payment.</param>
+    /// <param name="payment">Officially paid wallet payment; its immutable origin excludes tenant credits from owned referrals.</param>
     /// <param name="cancellationToken">Cancellation token for referral persistence and notifications.</param>
     /// <returns>A task that completes after reward application or durable retry state is recorded.</returns>
     private Task ProcessReferralAsync(TetraminatorPaymentInfo payment, CancellationToken cancellationToken)
@@ -709,7 +715,7 @@ public sealed class TetraminatorSettlementService
                 payment.PaymentPurpose,
                 GetStablePaymentId(payment),
                 payment.BotId,
-                BotInstanceTypes.Owned,
+                payment.WalletOriginBotType,
                 payment.TelegramUserId,
                 payment.AmountToman,
                 payment.SettledAtUtc ?? payment.PaidAtUtc ?? DateTime.UtcNow,

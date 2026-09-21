@@ -795,6 +795,8 @@ public partial class TenantBotService
     /// <remarks>
     /// Fresh shared-owner suspension and funding are checked before all message/callback actions. Receivers remain
     /// active to report restrictions; existing paid webhook fulfillment does not enter this customer access gate.
+    /// Customer-wallet navigation and funding recheck persisted exact-store approval. Existing wallet-charge inquiry
+    /// callbacks verify stored customer/bot/purpose before using shared provider settlement, even after approval revocation.
     /// Account renewal callbacks are intercepted before the shared XUI dispatcher so tenant customers always create a
     /// tenant-priced order and never enter the owned-wallet flow. State cleanup and UUID target lock remain scoped to the
     /// current tenant bot plus Telegram user; no other bot's state is read or changed.
@@ -841,6 +843,15 @@ public partial class TenantBotService
                 return true;
             }
         }
+        if (update.CallbackQuery?.Data is { } walletCheck &&
+            (walletCheck.StartsWith("hpchk_", StringComparison.Ordinal) || walletCheck.StartsWith("tmchk_", StringComparison.Ordinal)
+             || walletCheck.StartsWith("upchk_", StringComparison.Ordinal) || walletCheck.StartsWith("apchk_", StringComparison.Ordinal)
+             || walletCheck.StartsWith("check_crypto_payment_", StringComparison.Ordinal)
+             || walletCheck.StartsWith("settle_crypto_partial_", StringComparison.Ordinal)) && await _serviceProvider.GetRequiredService<TelegramBotService>()
+            .TryHandleTenantWalletPaymentCheckAsync(update.CallbackQuery, CancellationToken))
+            return true;
+        if (await TryHandleCustomerWalletAsync(botClient, update, CredUser, User, CancellationToken))
+            return true;
         if (update.CallbackQuery is { } CallbackQuery)
         {
             var tenant = await GetCurrentTenantBotAsync(CancellationToken);
@@ -884,7 +895,7 @@ public partial class TenantBotService
                 CallbackQuery,
                 CredUser,
                 User,
-                BuildTenantReplyKeyboard(),
+                BuildTenantReplyKeyboardForStore(tenant),
                 CancellationToken);
             return true;
         }
@@ -1801,10 +1812,11 @@ public partial class TenantBotService
     /// <remarks>
     /// This method deliberately does not delete tenant orders, receipts, ledger entries, customer states, or payment
     /// rows. Those records are separate audit history and must survive both owner-requested resets and revoked-token
-    /// cleanup.
+    /// cleanup. Both paths revoke customer-wallet approval and all identity-bound approval evidence.
     /// </remarks>
     private static void ResetTenantStorefrontSettings(BotInstance tenant, bool clearAllStorefrontSettings)
     {
+        TenantCustomerWalletPolicy.Revoke(tenant);
         tenant.Enabled = false;
         tenant.Token = null;
         tenant.TelegramBotId = null;
@@ -1991,6 +2003,7 @@ public partial class TenantBotService
     /// <returns>A task completing after token validation, tenant persistence, runtime refresh and the owner response.</returns>
     /// <remarks>The returned numeric identity must match the token and be unique across tenant, owned and assistant bots.
     /// Stops only the selected receiver before replacement. The unique database identity closes concurrent registration races.
+    /// A changed numeric bot or owner identity revokes all customer-wallet approval evidence before persistence.
     /// Raw tokens and probe exception text are never sent to logs or replies. All financial history is preserved.</remarks>
     private async Task SAVETENANTBOTTOKENASYNC(
         ITelegramBotClient botClient,
@@ -2058,6 +2071,8 @@ public partial class TenantBotService
 
         var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
+        if (tenant.TelegramBotId != me.Id || tenant.OwnerTelegramUserId != owner.TelegramUserId)
+            TenantCustomerWalletPolicy.Revoke(tenant);
         tenant.Token = Token;
         tenant.TelegramBotId = me.Id;
         tenant.Username = Username;
@@ -3791,13 +3806,13 @@ public partial class TenantBotService
             await botClient.SendMessage(
                 Message.Chat.Id,
                 "❌ فایل رسید باید تصویر باشد. لطفاً رسید را به صورت عکس (JPG، PNG یا WebP) ارسال کنید.",
-                replyMarkup: BuildTenantReplyKeyboard(),
+                replyMarkup: BuildTenantReplyKeyboardForStore(tenant),
                 cancellationToken: CancellationToken);
             return;
         }
 
         var Text = Message.Text?.Trim() ?? string.Empty;
-        var tenantReplyKeyboard = BuildTenantReplyKeyboard();
+        var tenantReplyKeyboard = BuildTenantReplyKeyboardForStore(tenant);
 
         if (Message.Contact != null)
         {
@@ -3858,7 +3873,7 @@ public partial class TenantBotService
                 Message.Chat.Id,
                 BUILDTENANTTARIFFSTEXT(tenant),
                 parseMode: ParseMode.Html,
-                replyMarkup: BuildTenantReplyKeyboard(),
+                replyMarkup: BuildTenantReplyKeyboardForStore(tenant),
                 cancellationToken: CancellationToken);
             return;
         }
@@ -3871,7 +3886,7 @@ public partial class TenantBotService
                 Message.Chat.Id,
                 $"برای پشتیبانی فروشگاه به این آیدی پیام بدهید:\n{support}",
                 parseMode: ParseMode.Html,
-                replyMarkup: BuildTenantReplyKeyboard(),
+                replyMarkup: BuildTenantReplyKeyboardForStore(tenant),
                 cancellationToken: CancellationToken);
             return;
         }
@@ -3979,7 +3994,7 @@ public partial class TenantBotService
             await botClient.SendMessage(
                 message.Chat.Id,
                 "فرایند خرید لغو شد.",
-                replyMarkup: BuildTenantReplyKeyboard(),
+                replyMarkup: BuildTenantReplyKeyboardForStore(tenant),
                 cancellationToken: cancellationToken);
             return true;
         }
@@ -6320,16 +6335,27 @@ public partial class TenantBotService
             chatId: ChatId,
             text: $"{Html(WELCOME)}\n\nبرای خرید اکانت یا دیدن تعرفه‌ها از دکمه‌های پایین استفاده کنید.",
             parseMode: ParseMode.Html,
-            replyMarkup: BuildTenantReplyKeyboard(),
+            replyMarkup: BuildTenantReplyKeyboardForStore(tenant),
             cancellationToken: CancellationToken);
     }
 
     /// <summary>
     /// Builds the SMALL Reply keyboard shown to tenant customers.
     /// </summary>
-    /// <returns>Storefront menu displaying «اکانت تست» for the shared owned-policy trial entry.</returns>
+    /// <returns>Storefront menu displaying «اکانت تست» without granting wallet navigation from stale runtime data.</returns>
     /// <remarks>All actions execute under the current store; trial history remains bot/user scoped.</remarks>
-    private ReplyKeyboardMarkup BuildTenantReplyKeyboard()
+    private ReplyKeyboardMarkup BuildTenantReplyKeyboard() => BuildTenantReplyKeyboardForStore(null);
+
+    /// <summary>Builds a tenant reply keyboard from a fresh persisted storefront row instead of runtime configuration.</summary>
+    /// <param name="cancellationToken">Token for the users.db storefront read.</param>
+    /// <returns>A keyboard that exposes wallet actions only while the exact persisted storefront remains approved.</returns>
+    private async Task<ReplyKeyboardMarkup> BuildCurrentTenantReplyKeyboardAsync(CancellationToken cancellationToken)
+        => BuildTenantReplyKeyboardForStore(await GetCurrentTenantBotAsync(cancellationToken));
+
+    /// <summary>Builds the tenant home keyboard with customer-wallet navigation only for a freshly approved store.</summary>
+    /// <param name="store">Fresh storefront snapshot; null never displays wallet actions.</param>
+    /// <returns>A reply keyboard whose actions remain subject to fresh callback/message authorization.</returns>
+    private ReplyKeyboardMarkup BuildTenantReplyKeyboardForStore(BotInstance store)
     {
         // The latest-client-download button is global and read from the live switch on every render, so a super-admin
         // toggle affects newly drawn tenant keyboards immediately and no tenant can override it. Tenant owners have no
@@ -6342,6 +6368,8 @@ public partial class TenantBotService
             new KeyboardButton[] { "🌟اکانت تست", "💬 پشتیبانی" }
         };
 
+        if (TenantCustomerWalletPolicy.IsApproved(store))
+            rows.Add(new KeyboardButton[] { "💰 کیف پول", "📒 تراکنش‌های من" });
         if (_clientDownloadAvailability.Snapshot.Enabled)
             rows.Add(new KeyboardButton[] { ClientDownloadCallbacks.OpenCommand });
 
@@ -6851,7 +6879,8 @@ public partial class TenantBotService
     /// show traffic and daily components using customer-visible effective tenant rates; markup pricing never exposes
     /// the owner's raw colleague cost. Unlimited selections are tenant-authorized again, and fixed-public-price policy
     /// changes only the displayed sale amount. This method sends UI only and does not create an order, invoice, wallet
-    /// movement, ledger entry, or XUI account.
+    /// movement, ledger entry, or XUI account. Customer-wallet payment is displayed only for current persisted approval;
+    /// the callback rechecks permission and authoritative prices before order admission or a sufficient-balance debit.
     ///
     /// Every enabled online gateway is displayed as instant and includes its customer-facing fee percentage:
     /// HooshPay 15%, Tetraminator 12%, UniquePay 12%, AtlasPay card-to-card, and NOWPayments 0%. Rial methods - the four
@@ -6878,6 +6907,8 @@ public partial class TenantBotService
                    BuildTenantPaymentTimingNotice(isRenewal: false);
 
         var PAYMENTROWS = new List<InlineKeyboardButton[]>();
+        if (TenantCustomerWalletPolicy.IsApproved(tenant))
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("💰 کیف پول مشتری", CUSTOMERCALLBACKPREFIX + "PAYWALLET:" + BUILDPAYACTION(selection)) });
         if (IsTenantHooshPayAvailable(tenant, Price.SalePriceToman))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ هوش‌پی آنی | کارمزد ۱۵٪ | ریالی", CUSTOMERCALLBACKPREFIX + "PAYHP:" + BUILDPAYACTION(selection)) });
         if (IsTenantTetraminatorAvailable(tenant, Price.SalePriceToman))
@@ -8167,11 +8198,24 @@ public partial class TenantBotService
     /// A null evidence mode on a historical order is accepted only when live metadata or a deterministic legacy rule
     /// proves the stored service. Ambiguous historical orders cannot create a payment/provider row and must be recreated.
     /// </remarks>
-    private async Task<TenantBotOrder> GetPendingTenantRenewOrderAsync(
+    private Task<TenantBotOrder> GetPendingTenantRenewOrderAsync(
+        int orderDbId, BotInstance tenant, CredUser customer, CancellationToken cancellationToken)
+        => GetPendingTenantRenewOrderCoreAsync(orderDbId, tenant, customer, cancellationToken, allowCustomerWallet: false);
+
+    /// <summary>Revalidates an unpaid renewal's exact account and current price, including a previously insufficient wallet attempt.</summary>
+    /// <param name="orderDbId">Internal users.db renewal order id from the customer callback.</param>
+    /// <param name="tenant">Freshly loaded storefront owning the order.</param>
+    /// <param name="customer">Authenticated customer's global profile.</param>
+    /// <param name="cancellationToken">Cancellation of detached reads and read-only XUI lookup.</param>
+    /// <param name="allowCustomerWallet">True only for wallet revalidation before a first debit; false prevents gateway switching on wallet orders.</param>
+    /// <returns>The authorized workflow snapshot, or null when ownership, identity, live eligibility or price changed.</returns>
+    /// <remarks>No money or XUI state changes. Paid wallet recovery uses receipt proof instead and never re-enters this unpaid admission check.</remarks>
+    private async Task<TenantBotOrder> GetPendingTenantRenewOrderCoreAsync(
         int orderDbId,
         BotInstance tenant,
         CredUser customer,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool allowCustomerWallet)
     {
         var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == orderDbId &&
@@ -8181,7 +8225,7 @@ public partial class TenantBotService
                   !x.IsFulfilled &&
                   (x.PaymentStatus == TenantBotOrderStatuses.Pending || x.PaymentStatus == TenantBotOrderStatuses.Failed),
             cancellationToken));
-        if (order == null)
+        if (order == null || (order.PaymentProvider == "wallet" && !allowCustomerWallet))
             return null;
 
         XuiV3Client client;
@@ -8891,14 +8935,17 @@ public partial class TenantBotService
     /// <param name="order">Detached purchase order whose provider and linked payment ids identify users.db evidence.</param>
     /// <param name="cancellationToken">Cancellation token for read-only users.db queries.</param>
     /// <returns>
-    /// <c>true</c> only when the order has a paid timestamp and its linked provider row (or approved manual receipt)
-    /// independently records a final paid state; otherwise <c>false</c>.
+    /// <c>true</c> for an exact committed customer-wallet debit, even if its paid timestamp has not yet been repaired;
+    /// other providers require a paid timestamp and a linked final provider row or approved manual receipt.
     /// </returns>
-    /// <remarks>No provider request or write occurs. Unknown providers fail closed.</remarks>
+    /// <remarks>No provider request or write occurs. Wallet proof checks amount, debit sign, customer, store and business key
+    /// in credentials.db; refund-authorized orders and unknown providers fail closed.</remarks>
     private async Task<bool> HasDurablePaidTenantOrderEvidenceAsync(
         TenantBotOrder order,
         CancellationToken cancellationToken)
     {
+        if (order.PaymentProvider == "wallet")
+            return await _serviceProvider.GetRequiredService<TenantCustomerWalletFunding>().ReadPaidEvidenceAsync(order, cancellationToken) != null;
         if (!order.PaidAtUtc.HasValue)
             return false;
 
@@ -8987,6 +9034,8 @@ public partial class TenantBotService
     /// Purchase fulfillment delegates attempt selection to <see cref="TenantProvisioningAttemptCoordinator" /> so the
     /// original <c>tenant-create:{orderId}</c> operation is never reused with changed parameters after a definitive
     /// rejection and no automatic callback can silently advance the attempt generation.
+    /// Wallet-funded orders require immutable customer debit proof and always disable owner base-cost debit. The existing
+    /// order gate also protects definitive-rejection compensation; ambiguous/applied XUI operations prohibit refunds.
     /// Timing begins only after the paid order, tenant, owner, customer, and plan are ready for execution. The central
     /// audit reports accumulated panel API time and total fulfillment time and never includes gateway waiting time.
     /// </remarks>
@@ -9010,6 +9059,13 @@ public partial class TenantBotService
             await _workflow.ReloadAsync(order, CancellationToken);
             if (order.IsFulfilled)
                 return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
+            if (order.PaymentProvider == "wallet")
+            {
+                if (!await HasDurablePaidTenantOrderEvidenceAsync(order, CancellationToken))
+                    return NowPaymentsSettlementResult.ProviderNotPaid();
+                DEBITOWNERBASECOST = false;
+            }
 
         order.PaymentStatus = TenantBotOrderStatuses.Paid;
         order.PaidAtUtc ??= DateTime.UtcNow;
@@ -9260,6 +9316,11 @@ public partial class TenantBotService
     }
         finally
         {
+            if (order?.PaymentProvider == "wallet")
+            {
+                try { await _serviceProvider.GetRequiredService<TenantCustomerWalletFunding>().RefundRejectedAsync(order.Id, CancellationToken); }
+                catch (Exception ex) { _logger.LogWarning("Customer wallet compensation remains pending. OrderId={OrderId} ErrorType={ErrorType}", order.Id, ex.GetType().Name); }
+            }
             tenantFulfillmentGateLease.Dispose();
         }
     }
@@ -9577,7 +9638,7 @@ public partial class TenantBotService
             chatId,
             text,
             parseMode: ParseMode.Html,
-            replyMarkup: BuildTenantReplyKeyboard(),
+            replyMarkup: await BuildCurrentTenantReplyKeyboardAsync(CancellationToken),
             cancellationToken: CancellationToken);
     }
 
@@ -11637,6 +11698,7 @@ public partial class TenantBotService
     /// <example><code>var label = TenantPaymentProviderLabel(order.PaymentProvider);</code></example>
     private static string TenantPaymentProviderLabel(string provider) => provider?.Trim().ToLowerInvariant() switch
     {
+        "wallet" => "کیف پول مشتری",
         "tenant_card" => "کارت‌به‌کارت شخصی فروشگاه",
         "hooshpay" => "هوش‌پی",
         "tetraminator" => "تترامیناتور",
@@ -12264,16 +12326,19 @@ public partial class TenantBotService
     /// </summary>
     /// <param name="order">Tenant renewal order whose database id is embedded in callbacks.</param>
     /// <param name="tenant">Tenant bot whose enabled gateway settings decide which buttons are visible.</param>
-    /// <returns>Inline keyboard containing instant online providers, administrator-reviewed card payment, and status check.</returns>
+    /// <returns>Inline keyboard containing enabled providers, card payment, approved customer-wallet funding, and status check.</returns>
     /// <remarks>
     /// Labels explain timing and currency only: the rial methods (HooshPay, Tetraminator, UniquePay, AtlasPay, and the
     /// tenant owner's personal card-to-card option) end with a <c>ریالی</c> marker, while the NOWPayments cryptocurrency
     /// button deliberately does not. Stable callback values, gateway amount policies, provider fees, settlement checks,
-    /// wallet idempotency, and XUI fulfillment behavior are unchanged. This builder has no external side effects.
+    /// wallet idempotency, and XUI fulfillment behavior are unchanged. Wallet callbacks revalidate persisted approval
+    /// and never switch an already-funded order to another provider. This builder has no external side effects.
     /// </remarks>
     private InlineKeyboardMarkup BuildTenantRenewPaymentProviderKeyboard(TenantBotOrder order, BotInstance tenant)
     {
         var rows = new List<InlineKeyboardButton[]>();
+        if (TenantCustomerWalletPolicy.IsApproved(tenant))
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("💰 کیف پول مشتری", CUSTOMERCALLBACKPREFIX + $"RNWALLET:{order.Id}") });
         if (IsTenantHooshPayAvailable(tenant, order.SalePriceToman))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ هوش‌پی آنی | ریالی", CUSTOMERCALLBACKPREFIX + $"RNHP:{order.Id}") });
         if (IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))

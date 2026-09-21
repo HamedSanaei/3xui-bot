@@ -1300,6 +1300,8 @@ public sealed class ReferralReconciliationHostedService : BackgroundService
     /// </summary>
     /// <param name="cancellationToken">Host shutdown token for database reads and referral processing.</param>
     /// <returns>A task that completes after every locally final owned-bot payment has been inspected.</returns>
+    /// <remarks>Immutable payment origin must be owned as well as its current runtime identity. A tenant wallet charge
+    /// remains excluded after restart or bot reconfiguration; historical owned rows retain their migration default.</remarks>
     private async Task ReplaySettledPaymentsAsync(CancellationToken cancellationToken)
     {
         var ownedBotIds = _botRegistry.Bots
@@ -1314,24 +1316,24 @@ public sealed class ReferralReconciliationHostedService : BackgroundService
         {
             var nowPayments = await context.SwapinoPaymentInfos
                 .AsNoTracking()
-                .Where(x => x.IsAddedToBalance &&
+                .Where(x => x.IsAddedToBalance && x.WalletOriginBotType == BotInstanceTypes.Owned &&
                             x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge &&
                             x.ErrorCode != "partial_settlement")
                 .ToListAsync(cancellationToken);
             var hooshPay = await context.HooshPayPaymentInfos
                 .AsNoTracking()
-                .Where(x => x.IsAddedToBalance &&
+                .Where(x => x.IsAddedToBalance && x.WalletOriginBotType == BotInstanceTypes.Owned &&
                             !x.IsProvisionallyApproved &&
                             x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge)
                 .ToListAsync(cancellationToken);
             var uniquePay = await context.UniquePayPaymentInfos
                 .AsNoTracking()
-                .Where(x => x.IsAddedToBalance &&
+                .Where(x => x.IsAddedToBalance && x.WalletOriginBotType == BotInstanceTypes.Owned &&
                             x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge)
                 .ToListAsync(cancellationToken);
             var atlasPay = await context.AtlasPayPaymentInfos
                 .AsNoTracking()
-                .Where(x => x.IsAddedToBalance &&
+                .Where(x => x.IsAddedToBalance && x.WalletOriginBotType == BotInstanceTypes.Owned &&
                             x.PaymentPurpose == TenantBotPaymentPurposes.WalletCharge)
                 .ToListAsync(cancellationToken);
             var zibal = await context.ZibalPaymentInfos

@@ -30,6 +30,8 @@ using Newtonsoft.Json.Linq;
 /// </remarks>
 public partial class TelegramBotService
 {
+    /// <summary>Shared central wallet-charge admission and invoice transport used by owned and approved tenant storefronts.</summary>
+    private readonly WalletChargeApplicationService _walletCharges;
     private const string BroadcastAudienceAll = "all";
     private const string BroadcastAudienceCustomers = "customers";
     private const string BroadcastAudienceColleagues = "colleagues";
@@ -383,6 +385,8 @@ public partial class TelegramBotService
         _credentialsDbContext = credentialsDb;
         _configuration = configuration;
         _appConfig = _configuration.Get<AppConfig>();
+        _walletCharges = new WalletChargeApplicationService(dbContext, _appConfig, gatewayAvailability, null,
+            hooshPay, tetraminator, uniquePay, atlasPay, nowPayments);
         _logger = logger;
         _broadcastManager = broadcastManager;
         _nowPayments = nowPayments;
@@ -894,6 +898,9 @@ public partial class TelegramBotService
                 return;
             }
 
+            if (await _tenantBotService.TryHandleWalletAdminAsync(botClient, update, cancellationToken))
+                return;
+
             // Owner callbacks configure a colleague storefront from inside the main brand bot.
             if (_tenantBotService.IsOwnerCallback(callbackQuery.Data))
             {
@@ -985,6 +992,10 @@ public partial class TelegramBotService
             await SendBlockedUserMessageAsync(botClient, message.Chat.Id, cancellationToken);
             return;
         }
+
+        // Approval commands preempt stale conversation flows; the shared policy rechecks sender authority.
+        if (isOwnedBot && await _tenantBotService.TryHandleWalletAdminAsync(botClient, update, cancellationToken))
+            return;
 
         // "🗽 Admin" is privileged high-priority navigation for configured super-admins in owned bots only. It must
         // preempt every stale XUI/customer/renewal/colleague sub-flow BEFORE any stateful handler or service-plan/
@@ -6869,11 +6880,8 @@ public partial class TelegramBotService
 
                         Console.WriteLine($"[NOWPayments] Creating invoice for user={credUser.TelegramUserId}, amount={amount}, orderId={payment.OrderId}, priceCurrency={priceCurrency}, payCurrency=all");
 
-                        var nowPayment = await _nowPayments.CreateInvoiceAsync(
-                            amount,
-                            payment.OrderId,
-                            $"Wallet charge {payment.OrderId}",
-                            null,
+                        var nowPayment = await _walletCharges.CreateNowPaymentsAsync(
+                            payment,
                             priceCurrency,
                             CurrentNowPaymentsSuccessUrl,
                             CurrentNowPaymentsCancelUrl,
@@ -9166,13 +9174,7 @@ public partial class TelegramBotService
 
             Console.WriteLine($"[HooshPay] Creating invoice for user={credUser.TelegramUserId}, amount={amount}, orderId={payment.OrderId}, feeMode={HooshPayFeeModes.Buyer}");
 
-            var invoice = await _hooshPay.CreateInvoiceAsync(
-                amount,
-                payment.OrderId,
-                $"Wallet charge {payment.OrderId}",
-                _appConfig.HooshPayIpnUrl,
-                CurrentHooshPayReturnUrl,
-                cancellationToken);
+            var invoice = await _walletCharges.CreateHooshPayAsync(payment, cancellationToken);
 
             payment.RawResponseJson = JsonConvert.SerializeObject(invoice);
             if (invoice?.data == null)
@@ -9305,8 +9307,7 @@ public partial class TelegramBotService
         await _workflow.SaveAsync(cancellationToken);
         try
         {
-            var created = await _atlasPay.CreateOrderAsync(payment.MerchantOrderRef, payment.BaseAmountToman,
-                payment.TelegramUserId, cancellationToken);
+            var created = await _walletCharges.CreateAtlasPayAsync(payment, cancellationToken);
             payment.ApplyCreate(created, DateTime.UtcNow,
                 DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600)));
             await _workflow.SaveAsync(cancellationToken);
@@ -9471,9 +9472,8 @@ public partial class TelegramBotService
 
         try
         {
-            var invoice = await _uniquePay.CreateInvoiceAsync(
-                payment.HashId,
-                payment.BaseAmountToman,
+            var invoice = await _walletCharges.CreateUniquePayAsync(
+                payment,
                 returnUrl,
                 callbackUrl,
                 cancellationToken);
@@ -9722,7 +9722,7 @@ public partial class TelegramBotService
 
         try
         {
-            var invoice = await _tetraminator.CreateInvoiceAsync(amount, payment.CallbackUrl, cancellationToken);
+            var invoice = await _walletCharges.CreateTetraminatorAsync(payment, cancellationToken);
             payment.RawResponseJson = JsonConvert.SerializeObject(invoice);
             payment.Apply(invoice);
             await _workflow.SaveAsync(cancellationToken);
@@ -10153,15 +10153,17 @@ public partial class TelegramBotService
         return value;
     }
     /// <summary>
-    /// Builds the Persian owned-bot main reply keyboard including global referral access and the account-test label.
+    /// Builds the Persian owned-bot main keyboard or a minimal tenant return action after shared payment inquiry.
     /// </summary>
     /// <returns>A resized reply keyboard whose final row is the single full-width main-menu button.</returns>
     /// <remarks>
-    /// The referral button is available only in owned routing; tenant storefronts construct their own customer menu
-    /// and do not use this keyboard for referral registration or reporting.
+    /// The referral button is available only in owned routing. Tenant payment inquiry receives only /start,
+    /// which reloads its fresh storefront menu and cannot expose owned wallet or referral navigation.
     /// </remarks>
     ReplyKeyboardMarkup MainReplyMarkupKeyboardFa()
     {
+        if (BotContextAccessor.CurrentBotType == BotInstanceTypes.Tenant)
+            return new ReplyKeyboardMarkup(new[] { new KeyboardButton[] { "/start" } }) { ResizeKeyboard = true };
         // The latest-client-download row is global and re-read from the live switch on every render, so a super-admin
         // toggle shows up on the next keyboard the customer receives. Only the customer menu carries it; the super-admin
         // keyboard is built separately and is unaffected.

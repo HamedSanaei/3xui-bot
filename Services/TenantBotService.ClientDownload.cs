@@ -48,7 +48,7 @@ public partial class TenantBotService
             await botClient.SendMessage(
                 message.Chat.Id,
                 ClientDownloadCallbacks.DisabledMessage,
-                replyMarkup: BuildTenantReplyKeyboard(),
+                replyMarkup: await BuildCurrentTenantReplyKeyboardAsync(cancellationToken),
                 cancellationToken: cancellationToken);
             return true;
         }

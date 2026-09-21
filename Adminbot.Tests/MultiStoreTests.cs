@@ -438,6 +438,8 @@ public sealed partial class ConcurrencyTests
         public List<string> Labels { get; } = new();
         /// <summary>Callback alerts captured for authorization and stale-button assertions.</summary>
         public List<string> Answers { get; } = new();
+        /// <summary>Reply-keyboard button labels captured from customer-facing messages.</summary>
+        public List<string> ReplyButtons { get; } = new();
         /// <summary>
         /// Ordered request-kind log used to prove that a callback is acknowledged before slower work starts.
         /// </summary>
@@ -483,7 +485,14 @@ public sealed partial class ConcurrencyTests
         {
             InlineKeyboardMarkup? keyboard = null;
             if (request is AnswerCallbackQueryRequest answer) { Events.Add("answer"); if (answer.Text != null) Answers.Add(answer.Text); }
-            if (request is SendMessageRequest send) { Events.Add("text"); Texts.Add(send.Text); keyboard = send.ReplyMarkup as InlineKeyboardMarkup; }
+            if (request is SendMessageRequest send)
+            {
+                Events.Add("text");
+                Texts.Add(send.Text);
+                keyboard = send.ReplyMarkup as InlineKeyboardMarkup;
+                if (send.ReplyMarkup is ReplyKeyboardMarkup replyKeyboard)
+                    ReplyButtons.AddRange(replyKeyboard.Keyboard.SelectMany(row => row).Select(button => button.Text));
+            }
             if (request is EditMessageTextRequest edit) { Events.Add("text"); Texts.Add(edit.Text); keyboard = edit.ReplyMarkup; }
             if (request is SendMediaGroupRequest mediaGroup)
             {

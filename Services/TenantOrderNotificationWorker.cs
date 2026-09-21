@@ -104,6 +104,13 @@ public sealed class TenantOrderNotificationDeliveryService
         return (await client.SendMessage(chatId, text, parseMode: ParseMode.Html,
             cancellationToken: cancellationToken)).MessageId;
     }
+    /// <summary>Delivers a fulfilled sale summary through the owner's selected management bot.</summary>
+    /// <param name="order">Persisted tenant order containing sale amount, profit and owner balances; never customer wallet balances.</param>
+    /// <param name="cancellationToken">Cancellation of route/profile reads and Telegram delivery.</param>
+    /// <returns>The Telegram message id used to acknowledge the delivery-only outbox intent.</returns>
+    /// <remarks>Wallet sales explicitly identify customer-wallet funding. Only owner financial snapshots are exposed;
+    /// delivery does not debit, credit, provision or repeat settlement.</remarks>
+    /// <exception cref="OwnerNotificationTransportUnavailableException">The persisted storefront owner or delivery route is unavailable.</exception>
     private async Task<int?> SendOwnerSaleAsync(TenantBotOrder order, CancellationToken cancellationToken)
     {
         await using var db = _userDbContextFactory.CreateDbContext();
@@ -119,6 +126,7 @@ public sealed class TenantOrderNotificationDeliveryService
             "✅ فروش ربات فروشگاهی انجام شد.\n\n" +
             $"ربات: @{Html(order.TenantBotUsername)}\n" +
             $"شماره سفارش: <code>{Html(order.OrderId)}</code>\n" +
+            (order.PaymentProvider == "wallet" ? "روش پرداخت مشتری: <code>کیف پول مشتری</code>\n" : string.Empty) +
             $"مبلغ فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
             $"هزینه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
             $"سود/تغییر موجودی: <code>{Html(order.OwnerWalletDelta.FormatCurrency())}</code>\n" +

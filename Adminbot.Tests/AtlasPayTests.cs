@@ -820,9 +820,11 @@ public sealed partial class ConcurrencyTests
         // The premium-UI migration only added one non-null boolean column with a constant false default to BotInstances,
         // so every existing storefront stays opted out and no balance, receipt, fulfillment, or wallet value changed.
         Assert.Contains("20260913065454_AddTenantPremiumUiEnabled", applied);
-        // Latest applied migration only adds nullable manual-review columns plus one index to XuiV3RenewalOperations, so
+        // The wallet migration adds opt-in permission, origin and order admission fields, so
         // every existing balance, receipt, fulfillment, wallet, and renewal row keeps its exact value.
-        Assert.Equal("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied[^1]);
+        Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied);
+        Assert.Contains("20260923083845_TenantCustomerWallet", applied);
+        Assert.Equal("20260923100853_TenantCustomerWalletBotIdentityBinding", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1527,6 +1529,9 @@ public sealed partial class ConcurrencyTests
             await users.Database.MigrateAsync();
             var bot = await users.BotInstances.AsNoTracking().SingleAsync(x => x.Id == "tenant-legacy-atlas");
             Assert.True(bot.TenantAtlasPayEnabled, "Legacy tenants must inherit the Atlas default switch.");
+            Assert.False(bot.TenantCustomerWalletEnabled);
+            Assert.Null(bot.TenantCustomerWalletApprovedAtUtc);
+            Assert.Null(bot.TenantCustomerWalletApprovedByTelegramUserId);
             Assert.Equal(20, bot.TenantPriceMarkupPercent); Assert.Equal(711, bot.OwnerTelegramUserId);
             var order = await users.TenantBotOrders.AsNoTracking().SingleAsync(x => x.OrderId == "legacy-atlas-order");
             Assert.Null(order.AtlasPayPaymentInfoId);
@@ -1548,9 +1553,11 @@ public sealed partial class ConcurrencyTests
         // The premium-UI migration only added one non-null boolean column with a constant false default to BotInstances,
         // so every existing storefront stays opted out and no balance, receipt, fulfillment, or wallet value changed.
         Assert.Contains("20260913065454_AddTenantPremiumUiEnabled", applied);
-        // Latest applied migration only adds nullable manual-review columns plus one index to XuiV3RenewalOperations, so
+        // The wallet migration adds opt-in permission, origin and order admission fields, so
         // every existing balance, receipt, fulfillment, wallet, and renewal row keeps its exact value.
-        Assert.Equal("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied[^1]);
+        Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied);
+        Assert.Contains("20260923083845_TenantCustomerWallet", applied);
+        Assert.Equal("20260923100853_TenantCustomerWalletBotIdentityBinding", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1574,9 +1581,11 @@ public sealed partial class ConcurrencyTests
             // The premium-UI migration only added one non-null boolean column defaulting to false, so it did not rewrite
             // balances, receipts, fulfillment state, or the still-empty provisional saga table.
             Assert.Contains("20260913065454_AddTenantPremiumUiEnabled", history);
-            // Latest applied migration only adds nullable manual-review columns plus one index, so it cannot rewrite
+            // The wallet migration is additive and defaults permission off, so it cannot rewrite
             // balances, receipts, fulfillment state, or the still-empty provisional saga table either.
-            Assert.Equal("20260919210134_AddXuiV3RenewalManualReviewLifecycle", history[^1]);
+            Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", history);
+            Assert.Contains("20260923083845_TenantCustomerWallet", history);
+            Assert.Equal("20260923100853_TenantCustomerWalletBotIdentityBinding", history[^1]);
             command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='TenantCardProvisionalOperations';";
             Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
             command.CommandText = "SELECT COUNT(*) FROM TenantCardProvisionalOperations;";

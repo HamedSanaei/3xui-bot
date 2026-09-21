@@ -43,7 +43,9 @@ public sealed class WalletOperationReconciliationService : BackgroundService
     /// <param name="token">Cancellation of database-only recovery.</param>
     /// <returns>Number of receipts whose ledger and supported settlement metadata were reconciled.</returns>
     /// <remarks>Receipts younger than one minute remain with their active caller. No history is inferred from current balances.
-    /// Confirmed website debt transfers first repair their idempotent local credit; no website mutation is retried.</remarks>
+    /// Confirmed website debt transfers first repair their idempotent local credit; no website mutation is retried.
+    /// Tenant customer receipts reconstruct exact order-linked debit/refund metadata; charge origin comes from persisted
+    /// provider rows so a background worker cannot mislabel tenant credit as owned or redirect its notification.</remarks>
     /// <example><code>var repaired = await reconciliation.ReconcileAsync(token);</code></example>
     public async Task<int> ReconcileAsync(CancellationToken token = default)
     {
@@ -72,13 +74,27 @@ public sealed class WalletOperationReconciliationService : BackgroundService
             try
             {
                 var credit = receipt.AmountToman > 0;
-                // A receipt's key links directly to the order/payment or referral event even when notification failed.
-                await _ledger.RecordAsync(receipt.TelegramUserId, credit ? WalletLedgerDirections.Credit : WalletLedgerDirections.Debit,
-                    Math.Abs(receipt.AmountToman), receipt.BeforeBalance, receipt.AfterBalance,
-                    ResolveReason(receipt.OperationKey), provider: "wallet-reconciliation", referenceType: nameof(WalletOperation),
-                    referenceId: receipt.OperationKey, description: "Recovered committed wallet operation",
-                    botId: receipt.BotId, idempotencyKey: receipt.OperationKey, cancellationToken: token);
-                await RepairSettlementAsync(receipt, token);
+                if (receipt.OperationKey.StartsWith("tenant-customer-wallet:", StringComparison.Ordinal))
+                {
+                    var parts = receipt.OperationKey.Split(':');
+                    if (parts.Length != 3 || !int.TryParse(parts[1], out var orderId))
+                        throw new InvalidOperationException("Invalid tenant customer wallet receipt identity.");
+                    await using var orders = _users.CreateDbContext();
+                    var order = await orders.TenantBotOrders.AsNoTracking().SingleAsync(x => x.Id == orderId, token);
+                    await new TenantCustomerWalletFunding(_users, new CredentialsStore(_credentials), _ledger)
+                        .ReconcileReceiptAsync(order, receipt, token);
+                }
+                else
+                {
+                    var origin = await ReadChargeOriginAsync(receipt.OperationKey, token);
+                    // A receipt's key links directly to the order/payment or referral event even when notification failed.
+                    await _ledger.RecordAsync(receipt.TelegramUserId, credit ? WalletLedgerDirections.Credit : WalletLedgerDirections.Debit,
+                        Math.Abs(receipt.AmountToman), receipt.BeforeBalance, receipt.AfterBalance,
+                        ResolveReason(receipt.OperationKey), provider: origin?.Provider ?? "wallet-reconciliation", referenceType: nameof(WalletOperation),
+                        referenceId: receipt.OperationKey, description: "Recovered committed wallet operation",
+                        botId: receipt.BotId, botUsername: origin?.Username, botType: origin?.BotType, idempotencyKey: receipt.OperationKey, cancellationToken: token);
+                    await RepairSettlementAsync(receipt, token);
+                }
                 await SqliteOperation.RunAsync(async ct =>
                 {
                     await using var db = _credentials.CreateDbContext();
@@ -116,6 +132,32 @@ public sealed class WalletOperationReconciliationService : BackgroundService
         : key.StartsWith("purchase:", StringComparison.Ordinal) || key.StartsWith("legacy-purchase:", StringComparison.Ordinal) ? WalletLedgerReasons.AccountPurchase
         : key.StartsWith("admin:", StringComparison.Ordinal) ? WalletLedgerReasons.AdminAdjustment : "wallet_recovery";
 
+    /// <summary>Immutable non-secret attribution recovered from a central wallet-charge payment row.</summary>
+    /// <param name="Provider">Stable existing provider key from the wallet receipt.</param>
+    /// <param name="Username">Nullable originating bot username saved at invoice creation.</param>
+    /// <param name="BotType">Persisted owned/tenant origin; never inferred from a recovery worker's ambient context.</param>
+    private sealed record ChargeOrigin(string Provider, string Username, string BotType);
+
+    /// <summary>Reads saved payment origin instead of inferring it from the worker's ambient owned bot.</summary>
+    /// <param name="key">Stable credentials receipt key.</param>
+    /// <param name="token">Cancellation of the detached users.db read.</param>
+    /// <returns>Payment origin for supported central charges, or null for other financial event families.</returns>
+    private async Task<ChargeOrigin> ReadChargeOriginAsync(string key, CancellationToken token)
+    {
+        var parts = key.Split(':');
+        if (parts.Length != 4 || parts[0] != "payment" || !int.TryParse(parts[2], out var id)) return null;
+        await using var db = _users.CreateDbContext();
+        return parts[1] switch
+        {
+            "hooshpay" => await db.HooshPayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("hooshpay", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
+            "tetraminator" => await db.TetraminatorPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("tetraminator", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
+            "uniquepay" => await db.UniquePayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("uniquepay", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
+            "atlaspay" => await db.AtlasPayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("atlaspay", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
+            "nowpayments" => await db.SwapinoPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("nowpayments", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
+            _ => null
+        };
+    }
+
     /// <summary>Completes local payment/referral metadata using the receipt without repeating the financial event.</summary>
     /// <param name="receipt">Detached proof of a committed balance change.</param>
     /// <param name="token">Cancellation of the short users.db transaction.</param>
@@ -131,7 +173,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
             var parts = receipt.OperationKey.Split(':');
             if (parts.Length == 4 && parts[0] == "payment" && int.TryParse(parts[2], out var id))
             {
-                string botId = null; long chatId = 0;
+                string botId = null; long chatId = 0; string botType = BotInstanceTypes.Owned; long? walletOriginTelegramBotId = null;
                 switch (parts[1])
                 {
                     case "hooshpay":
@@ -141,7 +183,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                         if (hoosh != null && !hoosh.IsAddedToBalance)
                         {
                             hoosh.IsAddedToBalance = true; hoosh.BalanceBefore = receipt.BeforeBalance; hoosh.BalanceAfter = receipt.AfterBalance;
-                            hoosh.SettledAtUtc ??= receipt.CreatedAtUtc; botId = hoosh.BotId; chatId = hoosh.ChatId;
+                            hoosh.SettledAtUtc ??= receipt.CreatedAtUtc; botId = hoosh.BotId; chatId = hoosh.ChatId; botType = hoosh.WalletOriginBotType; walletOriginTelegramBotId = hoosh.WalletOriginTelegramBotId;
                             if (receipt.ApprovalKind == "provisional")
                             {
                                 hoosh.IsProvisionallyApproved = true; hoosh.ProvisionalApprovedAtUtc = receipt.CreatedAtUtc;
@@ -156,7 +198,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                         if (now != null && !now.IsAddedToBalance)
                         {
                             now.IsAddedToBalance = true; now.BalanceBefore = receipt.BeforeBalance; now.BalanceAfter = receipt.AfterBalance;
-                            now.SettledAtUtc ??= receipt.CreatedAtUtc; botId = now.BotId; chatId = now.ChatId;
+                            now.SettledAtUtc ??= receipt.CreatedAtUtc; botId = now.BotId; chatId = now.ChatId; botType = now.WalletOriginBotType; walletOriginTelegramBotId = now.WalletOriginTelegramBotId;
                             if (receipt.ApprovalKind == "partial")
                             {
                                 now.AmountToman = receipt.AmountToman; now.ErrorCode = "partial_settlement";
@@ -171,7 +213,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                         if (tetra != null && !tetra.IsAddedToBalance)
                         {
                             tetra.IsAddedToBalance = true; tetra.BalanceBefore = receipt.BeforeBalance; tetra.BalanceAfter = receipt.AfterBalance;
-                            tetra.SettledAtUtc ??= receipt.CreatedAtUtc; botId = tetra.BotId; chatId = tetra.ChatId;
+                            tetra.SettledAtUtc ??= receipt.CreatedAtUtc; botId = tetra.BotId; chatId = tetra.ChatId; botType = tetra.WalletOriginBotType; walletOriginTelegramBotId = tetra.WalletOriginTelegramBotId;
                             if (receipt.ApprovalKind == "provisional")
                             {
                                 tetra.IsProvisionallyApproved = true; tetra.ProvisionalApprovedAtUtc = receipt.CreatedAtUtc;
@@ -188,7 +230,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                             unique.IsAddedToBalance = true; unique.BalanceBefore = receipt.BeforeBalance; unique.BalanceAfter = receipt.AfterBalance;
                             unique.SettledAtUtc ??= receipt.CreatedAtUtc; unique.SettlementState = UniquePaySettlementStates.Settled;
                             unique.SettlementAttemptId = null; unique.SettlementStartedAtUtc = null;
-                            botId = unique.BotId; chatId = unique.ChatId;
+                            botId = unique.BotId; chatId = unique.ChatId; botType = unique.WalletOriginBotType; walletOriginTelegramBotId = unique.WalletOriginTelegramBotId;
                             if (receipt.ApprovalKind == "provisional")
                             {
                                 unique.IsProvisionallyApproved = true; unique.ProvisionalApprovedAtUtc = receipt.CreatedAtUtc;
@@ -202,12 +244,25 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                             throw new InvalidOperationException("Committed wallet receipt has no matching payment target; operator review is required.");
                         if (zibal != null) zibal.IsAddedToBallance = true;
                         break;
+                    case "atlaspay":
+                        var atlas = await db.AtlasPayPaymentInfos.SingleOrDefaultAsync(x => x.Id == id, ct);
+                        if (atlas == null || atlas.TelegramUserId != receipt.TelegramUserId || receipt.AmountToman != atlas.BaseAmountToman)
+                            throw new InvalidOperationException("Committed wallet receipt has no matching payment target.");
+                        if (!atlas.IsAddedToBalance)
+                        {
+                            atlas.IsAddedToBalance = true; atlas.BalanceBefore = receipt.BeforeBalance; atlas.BalanceAfter = receipt.AfterBalance;
+                            atlas.SettledAtUtc ??= receipt.CreatedAtUtc; atlas.SettlementState = AtlasPaySettlementStates.Settled;
+                            atlas.SettlementAttemptId = null; atlas.SettlementStartedAtUtc = null;
+                            botId = atlas.BotId; chatId = atlas.ChatId; botType = atlas.WalletOriginBotType; walletOriginTelegramBotId = atlas.WalletOriginTelegramBotId;
+                        }
+                        break;
                 }
                 if (botId != null)
                 {
-                    var notification = PaymentSettlementNotification.CreateOwnedWalletCredit(parts[1], id, botId,
+                    var notification = PaymentSettlementNotification.CreateWalletCredit(parts[1], id, botId,
                         receipt.TelegramUserId, chatId, receipt.AmountToman,
-                        "اعتبار کیف پول شما افزایش یافت. اکنون می‌توانید خرید یا تمدید اکانت را ادامه دهید.", receipt.CreatedAtUtc);
+                        "اعتبار کیف پول شما افزایش یافت. اکنون می‌توانید خرید یا تمدید اکانت را ادامه دهید.", receipt.CreatedAtUtc, botType, receipt.AfterBalance,
+                        walletOriginTelegramBotId);
                     if (!await db.PaymentSettlementNotifications.AnyAsync(x => x.NotificationKey == notification.NotificationKey, ct))
                         db.PaymentSettlementNotifications.Add(notification);
                 }

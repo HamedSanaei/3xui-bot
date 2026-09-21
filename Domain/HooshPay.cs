@@ -78,6 +78,10 @@ namespace Adminbot.Domain
         /// must preserve this value and must not create another wallet ledger credit or another confirmation log.
         /// </remarks>
         public DateTime? ProviderConfirmedAfterProvisionalAtUtc { get; set; }
+        /// <summary>Immutable wallet-charge origin type; historical rows default to owned. Tenant origin never grants owned referral rewards.</summary>
+        public string WalletOriginBotType { get; set; } = BotInstanceTypes.Owned;
+        /// <summary>Immutable numeric BotFather identity of a tenant-origin wallet invoice; null for legacy or owned rows.</summary>
+        public long? WalletOriginTelegramBotId { get; set; }
         public string BotId { get; set; } = BotContextAccessor.DefaultBotId;
         public string BotUsername { get; set; } = BotContextAccessor.DefaultBotId;
         // Distinguishes wallet top-ups from tenant storefront orders during IPN settlement.
@@ -494,9 +498,9 @@ namespace Adminbot.Domain
                 payment.BalanceAfter = afterBalance;
                 payment.SettledAtUtc ??= DateTime.UtcNow;
                 // Persist delivery with the first-credit marker; the delivery-only worker cannot re-enter settlement.
-                var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
+                var notificationChatId = notifyChatId.GetValueOrDefault(payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : credUser.ChatID);
                 _workflow.Add(
-                    PaymentSettlementNotification.CreateOwnedWalletCredit(
+                    PaymentSettlementNotification.CreateWalletCredit(
                         provider: "hooshpay",
                         providerPaymentId: payment.Id,
                         botId: payment.BotId,
@@ -505,7 +509,8 @@ namespace Adminbot.Domain
                         amountToman: payment.AmountToman,
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
                                      "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
-                        createdAtUtc: payment.SettledAtUtc.Value));
+                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                        walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
                 await _workflow.SaveAsync(cancellationToken);
 
                 await EnsureOriginalLedgerAsync(
@@ -603,9 +608,9 @@ namespace Adminbot.Domain
                 payment.BalanceAfter = afterBalance;
                 payment.SettledAtUtc = DateTime.UtcNow;
                 // A later official confirmation reuses this credit and must not enqueue a second customer message.
-                var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
+                var notificationChatId = notifyChatId.GetValueOrDefault(payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : credUser.ChatID);
                 _workflow.Add(
-                    PaymentSettlementNotification.CreateOwnedWalletCredit(
+                    PaymentSettlementNotification.CreateWalletCredit(
                         provider: "hooshpay",
                         providerPaymentId: payment.Id,
                         botId: payment.BotId,
@@ -614,7 +619,8 @@ namespace Adminbot.Domain
                         amountToman: payment.AmountToman,
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر تایید و افزایش یافت.\n" +
                                      "پس از تایید نهایی HooshPay، وضعیت درگاه نیز ثبت می‌شود.",
-                        createdAtUtc: payment.SettledAtUtc.Value));
+                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                        walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
                 await _workflow.SaveAsync(cancellationToken);
 
                 await _walletLedgerService.RecordAsync(
@@ -631,7 +637,7 @@ namespace Adminbot.Domain
                     description: $"HooshPay provisional wallet charge approved by {approvedByTelegramUserId}",
                     botId: payment.BotId,
                     botUsername: payment.BotUsername,
-                    botType: BotInstanceTypes.Owned,
+                    botType: payment.WalletOriginBotType,
                     idempotencyKey: $"payment:hooshpay:{payment.Id}:credit",
                     cancellationToken: cancellationToken);
                 using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
@@ -657,7 +663,7 @@ namespace Adminbot.Domain
         /// <summary>
         /// Presents one officially paid HooshPay wallet charge to the global owned-bot referral engine.
         /// </summary>
-        /// <param name="payment">Officially paid, non-tenant, non-provisional wallet row.</param>
+        /// <param name="payment">Officially paid wallet row whose immutable origin is passed through so tenant charges cannot earn owned referral rewards.</param>
         /// <param name="cancellationToken">Cancellation token for referral persistence and fail-soft notifications.</param>
         /// <returns>A task that completes after rewards are applied or safely persisted for reconciliation.</returns>
         private Task ProcessReferralAsync(HooshPayPaymentInfo payment, CancellationToken cancellationToken)
@@ -668,7 +674,7 @@ namespace Adminbot.Domain
                     payment.PaymentPurpose,
                     GetReferralProviderPaymentId(payment),
                     payment.BotId,
-                    BotInstanceTypes.Owned,
+                    payment.WalletOriginBotType,
                     payment.TelegramUserId,
                     payment.AmountToman,
                     payment.SettledAtUtc ?? payment.PaidAtUtc ?? DateTime.UtcNow,
@@ -714,7 +720,7 @@ namespace Adminbot.Domain
                 description: "HooshPay wallet charge",
                 botId: payment.BotId,
                 botUsername: payment.BotUsername,
-                botType: BotInstanceTypes.Owned,
+                botType: payment.WalletOriginBotType,
                 idempotencyKey: $"payment:hooshpay:{payment.Id}:credit",
                 cancellationToken: cancellationToken);
         }

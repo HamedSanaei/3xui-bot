@@ -39,6 +39,51 @@ public sealed class CredentialsStore
         return await db.WalletOperations.AsNoTracking().SingleOrDefaultAsync(x => x.OperationKey == operationKey, token);
     }
 
+    /// <summary>Debits the global customer wallet only when its persisted balance covers the entire sale.</summary>
+    /// <param name="telegramUserId">Positive Telegram customer id, never the storefront owner's id.</param>
+    /// <param name="amountToman">Strictly positive authoritative sale amount in Iranian toman.</param>
+    /// <param name="operationKey">Required business event key, at most 240 characters; reuse across retries and restarts.</param>
+    /// <param name="botId">Originating internal storefront id; attribution only, never a separate balance.</param>
+    /// <param name="cancellationToken">Cancellation of the local credentials.db transaction.</param>
+    /// <returns>The detached immutable debit receipt, or null if the user is absent or funds are insufficient. Null creates no receipt or balance change.</returns>
+    /// <exception cref="ArgumentException">An identity, amount or operation key is invalid.</exception>
+    /// <exception cref="InvalidOperationException">The key already proves a different user, amount or storefront.</exception>
+    /// <remarks>Receipt and balance commit atomically under SQLite's writer transaction. BUSY/LOCKED retries use fresh contexts.
+    /// No external calls occur inside this transaction. This does not change the legacy overdraft-capable Pay API.</remarks>
+    /// <example><code>var receipt = await store.TryDebitWalletIfSufficientAsync(customerId, sale, $"tenant-customer-wallet:{orderId}:debit", tenantId, token);</code></example>
+    public Task<WalletOperation> TryDebitWalletIfSufficientAsync(long telegramUserId, long amountToman,
+        string operationKey, string botId, CancellationToken cancellationToken = default)
+    {
+        if (telegramUserId <= 0 || amountToman <= 0 || string.IsNullOrWhiteSpace(operationKey) || operationKey.Length > 240
+            || string.IsNullOrWhiteSpace(botId))
+            throw new ArgumentException("A positive customer, amount, storefront and stable operation key are required.");
+        return SqliteOperation.RunAsync(async token =>
+        {
+            await using var db = _factory.CreateDbContext();
+            await using var transaction = await db.Database.BeginTransactionAsync(token);
+            var existing = await db.WalletOperations.AsNoTracking().SingleOrDefaultAsync(x => x.OperationKey == operationKey, token);
+            if (existing != null)
+            {
+                if (existing.TelegramUserId != telegramUserId || existing.AmountToman != -amountToman || existing.BotId != botId)
+                    throw new InvalidOperationException("Wallet operation key conflicts with its committed financial parameters.");
+                return existing;
+            }
+            var user = await db.Users.SingleOrDefaultAsync(x => x.TelegramUserId == telegramUserId, token);
+            if (user == null || user.AccountBalance < amountToman) return null;
+            var receipt = new WalletOperation
+            {
+                OperationKey = operationKey, TelegramUserId = telegramUserId, AmountToman = -amountToman,
+                BeforeBalance = user.AccountBalance, AfterBalance = checked(user.AccountBalance - amountToman),
+                BotId = botId, CreatedAtUtc = DateTime.UtcNow, InboxSequence = TelegramUpdateExecutionScope.CurrentSequence
+            };
+            user.AccountBalance = receipt.AfterBalance;
+            db.WalletOperations.Add(receipt);
+            await db.SaveChangesAsync(token);
+            await transaction.CommitAsync(token);
+            return receipt;
+        }, cancellationToken);
+    }
+
     /// <summary>Reads the minimal global identity mapping used to route authorized broadcasts.</summary>
     /// <param name="token">Cancellation of the database projection.</param>
     /// <returns>Detached identity-only snapshots; possibly empty, and never including balances or contact details.</returns>

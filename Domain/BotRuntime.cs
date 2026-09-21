@@ -80,6 +80,17 @@ namespace Adminbot.Domain
     /// </summary>
     public class BotInstance
     {
+        /// <summary>Super-admin admission permission to expose the global customer wallet through this storefront; defaults false.</summary>
+        /// <remarks>Revocation blocks new work, never settlement of paid invoices or recovery of committed debits.</remarks>
+        public bool TenantCustomerWalletEnabled { get; set; }
+        /// <summary>UTC approval time, cleared when permission is revoked or storefront identity changes.</summary>
+        public DateTime? TenantCustomerWalletApprovedAtUtc { get; set; }
+        /// <summary>Configured super administrator's Telegram user id that granted this permission.</summary>
+        public long? TenantCustomerWalletApprovedByTelegramUserId { get; set; }
+        /// <summary>Exact BotFather numeric bot identity approved; mismatches fail closed even during concurrent identity replacement.</summary>
+        public long? TenantCustomerWalletApprovedBotId { get; set; }
+        /// <summary>Exact global owner Telegram id approved; reassignment requires fresh approval.</summary>
+        public long? TenantCustomerWalletApprovedOwnerId { get; set; }
         /// <summary>Stable one-based storefront number within OwnerTelegramUserId; null for non-tenant bots.</summary>
         /// <remarks>Unique with the owner. Resetting a store retains its number, id, orders and financial history.</remarks>
         public int? TenantStoreNumber { get; set; }
@@ -251,6 +262,11 @@ namespace Adminbot.Domain
     /// </summary>
     public class TenantBotOrder
     {
+        /// <summary>Unique storefront/customer/confirmation identity for wallet admission; null on historical and gateway orders.</summary>
+        public string CustomerWalletAdmissionKey { get; set; }
+        /// <summary>Customer funding state: admitted, paid, refund_pending or refunded; null for non-wallet orders.</summary>
+        /// <remarks>Refund authorization is terminal for provisioning. The credentials receipt, not this marker, proves payment.</remarks>
+        public string CustomerWalletState { get; set; }
         public int Id { get; set; }
         public string OrderId { get; set; }
         public string TenantBotId { get; set; }

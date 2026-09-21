@@ -1,5 +1,16 @@
 # CODE_MAP.md
 
+- Tenant customer wallet: per-store super-admin approval via owned `/tenantwallet [search]`, bound to verified bot/owner,
+  revision and expiring confirmation. Reset/replacement revokes trust; new work checks persisted approval, while paid
+  recovery ignores revocation. This exposes the existing GLOBAL TelegramUserId wallet, never a tenant balance.
+  `WalletChargeApplicationService` shares central gateway creation with owned flow; personal tenant cards cannot top up.
+  Five providers persist immutable origin, exclude tenant referrals and enqueue delivery through the original tenant.
+  `TenantCustomerWalletFunding` uses atomic sufficient-balance debit `tenant-customer-wallet:{orderId}:debit`, existing
+  tenant creation/renewal sagas and owner profit only (no owner base debit). Proven rejection refunds once with `:refund`;
+  ambiguity never refunds. Recovery repairs independent database commits and never initiates an unpaid debit.
+  Migration `20260923083845_TenantCustomerWallet` defaults approval false; adds order admission uniqueness and payment origin,
+  with no credentials schema/balance changes. Down refuses to erase wallet history. See `docs/tenant-customer-wallet.md`.
+
 - Telegram.Bot is pinned to 22.10.3. API methods no longer use Async suffixes (`SendMessage`, `SendRequest`);
   markup uses `ReplyMarkup`, files use `TGFile`, and client BotId is non-nullable. Decorators retain delivery budgets.
   Runtime clients disable SDK automatic retries (`RetryCount=0`) to preserve application retry ownership.
@@ -774,6 +785,23 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 ## Current Gotchas
 
 - Persian/RTL Telegram text and emoji are production UI; edit surgically and verify diffs for mojibake.
+- Storefront mandatory join is an ADMISSION policy only. New customer-wallet navigation, top-up, amount entry,
+  gateway selection, `TN:PAYWALLET:*` and `TN:RNWALLET:*` all pass the tenant storefront's existing
+  `EnsureTenantCustomerJoinAsync` gate (including the positive membership cache) before any wallet work runs, but
+  payment inquiry (`hpchk_`/`tmchk_`/`upchk_`/`apchk_`/`check_crypto_payment_`/`settle_crypto_partial_`), provider
+  settlement and `WalletOperationReconciliationService` receipt recovery must NEVER consult current membership. An
+  already-created invoice still settles after the customer leaves the channel, and a committed debit still reconciles.
+  Do not duplicate the join check or add one to settlement/recovery paths.
+- Tenant-origin settlement notifications are bound to the exact BotFather identity captured when the invoice was
+  created (`WalletOriginTelegramBotId`, migration `20260923100853_TenantCustomerWalletBotIdentityBinding`). If the
+  storefront token is replaced, delivery parks as `manual_review` / `bot_identity_changed` instead of being sent
+  through the replacement bot; the wallet credit, ledger entry and settlement stay final and are never repeated,
+  rolled back, or re-credited for a delivery failure. Owned and historical rows without the field use the owned
+  path unchanged.
+- Tenant customer replies must build their reply keyboard from a freshly persisted storefront row via
+  `BuildTenantReplyKeyboardForStore(freshRow)` or `BuildCurrentTenantReplyKeyboardAsync`. The parameterless
+  `BuildTenantReplyKeyboard()` renders a deliberately wallet-less keyboard and is kept only because
+  `ClientDownloadTests` reflects on it, so new customer-facing tenant replies must not call it.
 - Super-admin `📊 آمار هفتگی` and `📈 آمار ماهانه` use only the latest 7/30 completed Tehran days through yesterday.
   Daily users are globally distinct across all owned/tenant bots, interactions include messages and callbacks, and
   configured super-admin ids are excluded. Both commands send a readable PNG line chart plus a concise caption rather

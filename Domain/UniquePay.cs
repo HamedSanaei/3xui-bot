@@ -100,6 +100,10 @@ public sealed class UniquePayPaymentInfo
     public long? TelMsgId { get; set; }
 
     /// <summary>Internal owned or tenant bot id that originated the invoice.</summary>
+    /// <summary>Immutable wallet-charge origin type; historical rows default to owned. Tenant origin never grants owned referral rewards.</summary>
+    public string WalletOriginBotType { get; set; } = BotInstanceTypes.Owned;
+    /// <summary>Immutable numeric BotFather identity of a tenant-origin wallet invoice; null for legacy or owned rows.</summary>
+    public long? WalletOriginTelegramBotId { get; set; }
     public string BotId { get; set; } = BotContextAccessor.DefaultBotId;
 
     /// <summary>Originating bot username captured for safe audit attribution.</summary>
@@ -1142,7 +1146,7 @@ public sealed class UniquePaySettlementService
     }
 
     /// <summary>
-    /// Applies a fully verified owned-wallet UniquePay payment exactly once.
+    /// Applies a fully verified platform-wallet UniquePay payment exactly once with immutable origin attribution.
     /// </summary>
     /// <param name="payment">Tracked payment already verified against an authoritative check response.</param>
     /// <param name="source">Safe audit source such as customer-check, return-trigger, or reconciliation-worker.</param>
@@ -1283,7 +1287,7 @@ public sealed class UniquePaySettlementService
             // The unique outbox row shares the same users.db save as the exactly-once settlement marker.
             var notificationChatId = notifyChatId ?? tracked.ChatId;
             context.Add(
-                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                PaymentSettlementNotification.CreateWalletCredit(
                     provider: "uniquepay",
                     providerPaymentId: tracked.Id,
                     botId: tracked.BotId,
@@ -1291,7 +1295,8 @@ public sealed class UniquePaySettlementService
                     chatId: notificationChatId,
                     amountToman: tracked.BaseAmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.",
-                    createdAtUtc: tracked.SettledAtUtc.Value));
+                    createdAtUtc: tracked.SettledAtUtc.Value, botType: tracked.WalletOriginBotType, balanceAfter: tracked.BalanceAfter,
+                    walletOriginTelegramBotId: tracked.WalletOriginTelegramBotId));
             await context.SaveAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, before, after, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
@@ -1423,7 +1428,7 @@ public sealed class UniquePaySettlementService
             // Later official provider confirmation audits this credit only; it cannot enqueue another message.
             var notificationChatId = notifyChatId ?? tracked.ChatId;
             context.Add(
-                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                PaymentSettlementNotification.CreateWalletCredit(
                     provider: "uniquepay",
                     providerPaymentId: tracked.Id,
                     botId: tracked.BotId,
@@ -1431,7 +1436,8 @@ public sealed class UniquePaySettlementService
                     chatId: notificationChatId,
                     amountToman: tracked.BaseAmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت.",
-                    createdAtUtc: tracked.SettledAtUtc.Value));
+                    createdAtUtc: tracked.SettledAtUtc.Value, botType: tracked.WalletOriginBotType, balanceAfter: tracked.BalanceAfter,
+                    walletOriginTelegramBotId: tracked.WalletOriginTelegramBotId));
             await context.SaveAsync(cancellationToken);
 
             await EnsureProvisionalLedgerAsync(tracked, before, after, cancellationToken);
@@ -1552,7 +1558,7 @@ public sealed class UniquePaySettlementService
             description: "UniquePay wallet charge",
             botId: payment.BotId,
             botUsername: payment.BotUsername,
-            botType: BotInstanceTypes.Owned,
+            botType: payment.WalletOriginBotType,
             idempotencyKey: $"payment:uniquepay:{payment.Id}:credit",
             cancellationToken: cancellationToken);
     }
@@ -1590,7 +1596,7 @@ public sealed class UniquePaySettlementService
             description: $"UniquePay provisional wallet charge approved by {payment.ProvisionalApprovedByTelegramUserId}",
             botId: payment.BotId,
             botUsername: payment.BotUsername,
-            botType: BotInstanceTypes.Owned,
+            botType: payment.WalletOriginBotType,
             idempotencyKey: $"payment:uniquepay:{payment.Id}:credit",
             cancellationToken: cancellationToken);
     }
@@ -1598,7 +1604,7 @@ public sealed class UniquePaySettlementService
     /// <summary>
     /// Presents one settled official UniquePay wallet payment to the global referral engine.
     /// </summary>
-    /// <param name="payment">Final owned-wallet payment with durable local credit.</param>
+    /// <param name="payment">Final wallet payment with durable credit; immutable origin excludes tenant charges from referral rewards.</param>
     /// <param name="cancellationToken">Cancellation token for referral event processing.</param>
     /// <returns>A task that completes after reward work succeeds or is durably left retryable.</returns>
     private Task ProcessReferralAsync(UniquePayPaymentInfo payment, CancellationToken cancellationToken)
@@ -1608,7 +1614,7 @@ public sealed class UniquePaySettlementService
                 payment.PaymentPurpose,
                 GetStableProviderId(payment),
                 payment.BotId,
-                BotInstanceTypes.Owned,
+                payment.WalletOriginBotType,
                 payment.TelegramUserId,
                 payment.BaseAmountToman,
                 payment.SettledAtUtc ?? payment.PaidAtUtc ?? DateTime.UtcNow,
@@ -1741,7 +1747,7 @@ public sealed class UniquePaySettlementService
                 : payment.Id.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>
-    /// Restricts this settlement service to owned wallet-charge rows.
+    /// Restricts settlement to global wallet-charge rows, including approved tenant-origin charges; direct tenant orders remain separate.
     /// </summary>
     /// <param name="payment">Payment proposed for wallet settlement.</param>
     /// <returns><c>true</c> for wallet charges and <c>false</c> for tenant orders.</returns>

@@ -318,6 +318,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.NotificationKey).IsRequired().HasMaxLength(220);
             entity.Property(x => x.Provider).IsRequired().HasMaxLength(48);
             entity.Property(x => x.BotId).HasMaxLength(64);
+            entity.Property(x => x.WalletOriginBotType).IsRequired().HasMaxLength(32).HasDefaultValue(BotInstanceTypes.Owned);
             entity.Property(x => x.MessageText).IsRequired().HasMaxLength(4096);
             entity.Property(x => x.Status)
                 .IsRequired()
@@ -330,6 +331,13 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.TelegramUserId);
             entity.HasIndex(x => x.BotId);
         });
+
+        // Historical wallet charges were owned-origin. New tenant charges persist their origin before provider I/O.
+        modelBuilder.Entity<HooshPayPaymentInfo>().Property(x => x.WalletOriginBotType).HasDefaultValue(BotInstanceTypes.Owned);
+        modelBuilder.Entity<TetraminatorPaymentInfo>().Property(x => x.WalletOriginBotType).HasDefaultValue(BotInstanceTypes.Owned);
+        modelBuilder.Entity<UniquePayPaymentInfo>().Property(x => x.WalletOriginBotType).HasDefaultValue(BotInstanceTypes.Owned);
+        modelBuilder.Entity<AtlasPayPaymentInfo>().Property(x => x.WalletOriginBotType).HasDefaultValue(BotInstanceTypes.Owned);
+        modelBuilder.Entity<SwapinoPaymentInfo>().Property(x => x.WalletOriginBotType).HasDefaultValue(BotInstanceTypes.Owned);
 
         modelBuilder.Entity<BotInstance>(entity =>
         {
@@ -353,6 +361,8 @@ public class UserDbContext : DbContext
             // silently opt a tenant in. The column is written only by the owner-panel toggle and the durable
             // auto-disable path; owned-bot synchronization never touches it.
             entity.Property(x => x.TenantPremiumUiEnabled).HasDefaultValue(false);
+            // Independent super-admin trust: owner settings and runtime token changes cannot grant this capability.
+            entity.Property(x => x.TenantCustomerWalletEnabled).HasDefaultValue(false);
             entity.Property(x => x.TenantOwnerNotificationBotId).HasMaxLength(64);
             entity.HasIndex(x => x.Username);
             entity.HasIndex(x => x.OwnerTelegramUserId);
@@ -371,6 +381,10 @@ public class UserDbContext : DbContext
 
         modelBuilder.Entity<TenantBotOrder>(entity =>
         {
+            // One persisted order per customer confirmation, before the independent credentials.db debit commit.
+            entity.Property(x => x.CustomerWalletAdmissionKey).HasMaxLength(240);
+            entity.HasIndex(x => x.CustomerWalletAdmissionKey).IsUnique();
+            entity.Property(x => x.CustomerWalletState).HasMaxLength(32);
             entity.ToTable("TenantBotOrders");
             entity.HasKey(x => x.Id);
             entity.Property(x => x.Id).ValueGeneratedOnAdd();

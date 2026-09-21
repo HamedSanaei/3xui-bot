@@ -61,6 +61,10 @@ namespace Adminbot.Domain
         public long? TelMsgId { get; set; }
         public string ErrorCode { get; set; }
         public string ErrorMessage { get; set; }
+        /// <summary>Immutable wallet-charge origin type; historical rows default to owned. Tenant origin never grants owned referral rewards.</summary>
+        public string WalletOriginBotType { get; set; } = BotInstanceTypes.Owned;
+        /// <summary>Immutable numeric BotFather identity of a tenant-origin wallet invoice; null for legacy or owned rows.</summary>
+        public long? WalletOriginTelegramBotId { get; set; }
         public string BotId { get; set; } = BotContextAccessor.DefaultBotId;
         public string BotUsername { get; set; } = BotContextAccessor.DefaultBotId;
         public string PaymentPurpose { get; set; } = TenantBotPaymentPurposes.WalletCharge;
@@ -813,7 +817,7 @@ namespace Adminbot.Domain
         }
 
         /// <summary>
-        /// Applies one final provider-paid owned-bot wallet charge under the payment-row guard and then processes referral rewards.
+        /// Applies one final provider-paid origin-attributed wallet charge under the payment-row guard and then processes referral rewards.
         /// </summary>
         /// <param name="payment">Tracked NOWPayments wallet-charge row with a final paid provider status.</param>
         /// <param name="source">Non-secret settlement source such as IPN, return check, or admin provider re-check.</param>
@@ -884,9 +888,9 @@ namespace Adminbot.Domain
                 payment.BalanceAfter = afterBalance;
                 payment.SettledAtUtc ??= DateTime.UtcNow;
                 // Persist delivery with the first-credit marker; retries never call this financial service.
-                var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
+                var notificationChatId = notifyChatId.GetValueOrDefault(payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : credUser.ChatID);
                 _workflow.Add(
-                    PaymentSettlementNotification.CreateOwnedWalletCredit(
+                    PaymentSettlementNotification.CreateWalletCredit(
                         provider: "nowpayments",
                         providerPaymentId: payment.Id,
                         botId: payment.BotId,
@@ -895,7 +899,8 @@ namespace Adminbot.Domain
                         amountToman: payment.AmountToman,
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
                                      "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
-                        createdAtUtc: payment.SettledAtUtc.Value));
+                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                        walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
                 await _workflow.SaveAsync(cancellationToken);
 
                 await EnsureOriginalLedgerAsync(
@@ -999,9 +1004,9 @@ namespace Adminbot.Domain
             }, Formatting.None);
 
             // Partial settlement is still a one-time wallet credit and owns exactly one durable customer message.
-            var notificationChatId = notifyChatId.GetValueOrDefault(credUser.ChatID);
+            var notificationChatId = notifyChatId.GetValueOrDefault(payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : credUser.ChatID);
             _workflow.Add(
-                PaymentSettlementNotification.CreateOwnedWalletCredit(
+                PaymentSettlementNotification.CreateWalletCredit(
                     provider: "nowpayments",
                     providerPaymentId: payment.Id,
                     botId: payment.BotId,
@@ -1010,7 +1015,8 @@ namespace Adminbot.Domain
                     amountToman: payment.AmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
                                  "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
-                    createdAtUtc: payment.SettledAtUtc.Value));
+                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                        walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
 
             await _workflow.SaveAsync(cancellationToken);
 
@@ -1028,7 +1034,7 @@ namespace Adminbot.Domain
                 description: "NOWPayments partial wallet charge",
                 botId: payment.BotId,
                 botUsername: payment.BotUsername,
-                botType: BotInstanceTypes.Owned,
+                botType: payment.WalletOriginBotType,
                 idempotencyKey: $"payment:nowpayments:{payment.Id}:credit",
                 cancellationToken: cancellationToken);
             using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
@@ -1057,7 +1063,7 @@ namespace Adminbot.Domain
                     payment.PaymentPurpose,
                     GetReferralProviderPaymentId(payment),
                     payment.BotId,
-                    BotInstanceTypes.Owned,
+                    payment.WalletOriginBotType,
                     payment.TelegramUserId,
                     payment.AmountToman,
                     payment.SettledAtUtc ?? payment.PaidAtUtc ?? DateTime.UtcNow,
@@ -1103,7 +1109,7 @@ namespace Adminbot.Domain
                 description: "NOWPayments wallet charge",
                 botId: payment.BotId,
                 botUsername: payment.BotUsername,
-                botType: BotInstanceTypes.Owned,
+                botType: payment.WalletOriginBotType,
                 idempotencyKey: $"payment:nowpayments:{payment.Id}:credit",
                 cancellationToken: cancellationToken);
         }

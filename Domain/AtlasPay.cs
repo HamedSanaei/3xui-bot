@@ -167,6 +167,10 @@ public sealed class AtlasPayPaymentInfo
     public long TelegramUserId { get; set; }
     public long ChatId { get; set; }
     public int? TelMsgId { get; set; }
+    /// <summary>Immutable wallet-charge origin type; historical rows default to owned. Tenant origin never grants owned referral rewards.</summary>
+    public string WalletOriginBotType { get; set; } = BotInstanceTypes.Owned;
+    /// <summary>Immutable numeric BotFather identity of a tenant-origin wallet invoice; null for legacy or owned rows.</summary>
+    public long? WalletOriginTelegramBotId { get; set; }
     public string BotId { get; set; }
     public string BotUsername { get; set; }
     public string PaymentPurpose { get; set; }
@@ -524,6 +528,9 @@ public static class AtlasPayManualCheckPolicy
     }
 }
 
+/// <summary>Settles verified central AtlasPay charges into the global customer wallet with immutable owned/tenant origin.</summary>
+/// <remarks>Uses existing receipt keys and independent database commits. Customer delivery is an outbox intent;
+/// tenant-origin payments never qualify for owned referral rewards or direct tenant-order fulfillment.</remarks>
 public sealed class AtlasPaySettlementService
 {
     private static readonly AsyncKeyedGate SettlementGate = new();
@@ -533,10 +540,24 @@ public sealed class AtlasPaySettlementService
     private readonly ReferralService _referrals;
     private readonly ILogger<AtlasPaySettlementService> _logger;
 
+    /// <summary>Creates a scoped settlement service without retaining an EF context.</summary>
+    /// <param name="factory">Factory for provider settlement rows and outbox intents in users.db.</param>
+    /// <param name="credentials">Global wallet and immutable receipt authority in credentials.db.</param>
+    /// <param name="ledger">Idempotent customer ledger writer.</param>
+    /// <param name="referrals">Owned-only referral policy, which rejects immutable tenant origins.</param>
+    /// <param name="logger">Central financial audit logger.</param>
     public AtlasPaySettlementService(UserDbContextFactory factory, CredentialsStore credentials,
         WalletLedgerService ledger, ReferralService referrals, ILogger<AtlasPaySettlementService> logger)
     { _factory = factory; _credentials = credentials; _ledger = ledger; _referrals = referrals; _logger = logger; }
 
+    /// <summary>Credits one officially verified wallet charge and preserves the originating bot for audit and notification.</summary>
+    /// <param name="payment">Persisted local payment identity, reloaded under its invoice gate; null yields NotFound.</param>
+    /// <param name="source">Non-secret caller category for financial audit, never a provider response body.</param>
+    /// <param name="cancellationToken">Cancellation of independent database commits and referral reconciliation.</param>
+    /// <returns>Applied with receipt balances, AlreadyAdded for a duplicate, or a non-applied validation result.</returns>
+    /// <remarks>Only a verified paid wallet_charge can settle. Receipt and balance commit atomically in credentials.db;
+    /// marker and notification commit separately in users.db. Repeated calls repair the ledger without another credit.
+    /// Approval revocation does not block a previously created invoice's legitimate settlement.</remarks>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(AtlasPayPaymentInfo payment, string source,
         CancellationToken cancellationToken = default)
     {
@@ -587,9 +608,10 @@ public sealed class AtlasPaySettlementService
             tracked.SettlementAttemptId = null; tracked.SettlementStartedAtUtc = null;
             tracked.BalanceBefore = receipt.BeforeBalance; tracked.BalanceAfter = receipt.AfterBalance;
             tracked.SettledAtUtc ??= DateTime.UtcNow; tracked.NextInquiryAtUtc = null; tracked.ErrorCode = null; tracked.ErrorMessage = null; tracked.UpdatedAtUtc = DateTime.UtcNow;
-            context.Add(PaymentSettlementNotification.CreateOwnedWalletCredit("atlaspay", tracked.Id, tracked.BotId,
+            context.Add(PaymentSettlementNotification.CreateWalletCredit("atlaspay", tracked.Id, tracked.BotId,
                 tracked.TelegramUserId, tracked.ChatId, tracked.BaseAmountToman,
-                $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.", tracked.SettledAtUtc.Value));
+                $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.", tracked.SettledAtUtc.Value, tracked.WalletOriginBotType, tracked.BalanceAfter,
+                tracked.WalletOriginTelegramBotId));
             await context.SaveAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, receipt.BeforeBalance, receipt.AfterBalance, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
@@ -605,17 +627,27 @@ public sealed class AtlasPaySettlementService
         finally { lease.Dispose(); }
     }
 
+    /// <summary>Appends the receipt-backed wallet-charge audit using the persisted payment origin.</summary>
+    /// <param name="payment">Settled local payment with immutable customer, amount and originating bot.</param>
+    /// <param name="before">Balance before credit in toman, from its immutable receipt.</param>
+    /// <param name="after">Balance after credit in toman, from the same receipt.</param>
+    /// <param name="token">Cancellation of the idempotent users.db ledger write.</param>
+    /// <returns>The existing or inserted detached ledger entry; no balance is changed.</returns>
     private Task<WalletLedgerEntry> EnsureLedgerAsync(AtlasPayPaymentInfo payment, long before, long after, CancellationToken token)
         => _ledger.RecordAsync(payment.TelegramUserId, WalletLedgerDirections.Credit, payment.BaseAmountToman, before, after,
             WalletLedgerReasons.WalletCharge, provider: "atlaspay", referenceType: nameof(AtlasPayPaymentInfo),
             referenceId: payment.Id.ToString(CultureInfo.InvariantCulture), orderId: payment.MerchantOrderRef,
             description: "AtlasPay wallet charge", botId: payment.BotId, botUsername: payment.BotUsername,
-            botType: BotInstanceTypes.Owned, idempotencyKey: $"payment:atlaspay:{payment.Id}:credit", cancellationToken: token);
+            botType: payment.WalletOriginBotType, idempotencyKey: $"payment:atlaspay:{payment.Id}:credit", cancellationToken: token);
 
+    /// <summary>Passes immutable origin to the owned referral engine so tenant charges cannot award referrals.</summary>
+    /// <param name="payment">Official settled wallet charge; never a direct storefront order.</param>
+    /// <param name="token">Cancellation of referral persistence and notifications.</param>
+    /// <returns>A task completing after eligible owned rewards or a tenant-origin no-op.</returns>
     private Task ProcessReferralAsync(AtlasPayPaymentInfo payment, CancellationToken token)
         => _referrals.ProcessFinalOwnedWalletPaymentAsync(new ReferralPaymentSource("atlaspay", payment.PaymentPurpose,
             payment.ProviderOrderId?.ToString(CultureInfo.InvariantCulture) ?? payment.MerchantOrderRef, payment.BotId,
-            BotInstanceTypes.Owned, payment.TelegramUserId, payment.BaseAmountToman,
+            payment.WalletOriginBotType, payment.TelegramUserId, payment.BaseAmountToman,
             payment.SettledAtUtc ?? payment.PaidAtUtc ?? DateTime.UtcNow, payment.IsAddedToBalance,
             AtlasPayStatuses.IsSuccess(payment.ProviderStatus), IsProvisional: false), token);
 }

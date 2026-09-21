@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -9,9 +10,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Adminbot.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    partial class UserDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260923083845_TenantCustomerWallet")]
+    partial class TenantCustomerWallet
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.8");
@@ -180,9 +183,6 @@ namespace Adminbot.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT")
                         .HasDefaultValue("owned");
-
-                    b.Property<long?>("WalletOriginTelegramBotId")
-                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
@@ -696,9 +696,6 @@ namespace Adminbot.Migrations
                         .HasColumnType("TEXT")
                         .HasDefaultValue("owned");
 
-                    b.Property<long?>("WalletOriginTelegramBotId")
-                        .HasColumnType("INTEGER");
-
                     b.HasKey("Id");
 
                     b.HasIndex("BotId");
@@ -793,16 +790,6 @@ namespace Adminbot.Migrations
 
                     b.Property<DateTime>("UpdatedAtUtc")
                         .HasColumnType("TEXT");
-
-                    b.Property<string>("WalletOriginBotType")
-                        .IsRequired()
-                        .ValueGeneratedOnAdd()
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT")
-                        .HasDefaultValue("owned");
-
-                    b.Property<long?>("WalletOriginTelegramBotId")
-                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
@@ -1234,9 +1221,6 @@ namespace Adminbot.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT")
                         .HasDefaultValue("owned");
-
-                    b.Property<long?>("WalletOriginTelegramBotId")
-                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
@@ -2182,9 +2166,6 @@ namespace Adminbot.Migrations
                         .HasColumnType("TEXT")
                         .HasDefaultValue("owned");
 
-                    b.Property<long?>("WalletOriginTelegramBotId")
-                        .HasColumnType("INTEGER");
-
                     b.HasKey("Id");
 
                     b.HasIndex("BotId");
@@ -2378,9 +2359,6 @@ namespace Adminbot.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT")
                         .HasDefaultValue("owned");
-
-                    b.Property<long?>("WalletOriginTelegramBotId")
-                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 

@@ -34,7 +34,7 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
 
     /// <summary>Factory for independent users.db claim and state-transition contexts.</summary>
     private readonly UserDbContextFactory _contextFactory;
-    /// <summary>Resolves the originating owned Telegram bot without exposing its token to the outbox.</summary>
+    /// <summary>Resolves the originating owned or tenant Telegram bot without exposing its token to the outbox.</summary>
     private readonly BotClientProvider _botClientProvider;
     /// <summary>Structured delivery diagnostics; notification bodies and secrets are never logged.</summary>
     private readonly ILogger<PaymentSettlementNotificationWorker> _logger;
@@ -46,7 +46,7 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     /// Factory for independent users.db contexts used to claim and update notification rows atomically.
     /// </param>
     /// <param name="botClientProvider">
-    /// Runtime provider that resolves the originating owned bot client from the persisted internal bot id.
+    /// Runtime provider that resolves the originating owned or tenant bot client from the persisted internal bot id.
     /// </param>
     /// <param name="logger">Structured logger that never receives bot tokens or notification message bodies.</param>
     public PaymentSettlementNotificationWorker(
@@ -217,9 +217,40 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
             return;
         }
 
+        if (string.Equals(notification.WalletOriginBotType, BotInstanceTypes.Tenant, StringComparison.Ordinal))
+        {
+            if (notification.WalletOriginTelegramBotId is not > 0)
+            {
+                await MarkTerminalAsync(
+                    notification,
+                    PaymentSettlementNotificationStatuses.ManualReview,
+                    "bot_identity_unrecorded",
+                    cancellationToken);
+                return;
+            }
+
+            await using var identityContext = _contextFactory.CreateDbContext();
+            var currentTelegramBotId = await identityContext.BotInstances
+                .AsNoTracking()
+                .Where(bot => bot.Id == notification.BotId && bot.Type == BotInstanceTypes.Tenant)
+                .Select(bot => bot.TelegramBotId)
+                .SingleOrDefaultAsync(cancellationToken);
+            if (currentTelegramBotId != notification.WalletOriginTelegramBotId)
+            {
+                await MarkTerminalAsync(
+                    notification,
+                    PaymentSettlementNotificationStatuses.ManualReview,
+                    "bot_identity_changed",
+                    cancellationToken);
+                return;
+            }
+        }
+
         try
         {
-            var client = _botClientProvider.GetClient(notification.BotId);
+            var client = string.Equals(notification.WalletOriginBotType, BotInstanceTypes.Tenant, StringComparison.Ordinal)
+                ? _botClientProvider.GetClient(notification.BotId, notification.WalletOriginTelegramBotId!.Value)
+                : _botClientProvider.GetClient(notification.BotId);
             var sent = await client.SendMessage(
                 chatId: notification.ChatId,
                 text: notification.MessageText,
@@ -244,6 +275,14 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
             // Keep the processing claim intact. Its lease will become delivery-uncertain after restart because the
             // cancellation may have raced with Telegram accepting the request.
             throw;
+        }
+        catch (BotTransportUnavailableException ex) when (ex.ReasonCode == "bot_identity_changed")
+        {
+            await MarkTerminalAsync(
+                notification,
+                PaymentSettlementNotificationStatuses.ManualReview,
+                "bot_identity_changed",
+                cancellationToken);
         }
         catch (Exception ex)
         {
