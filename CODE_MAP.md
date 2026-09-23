@@ -305,13 +305,17 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - UniquePay `feePayer` is controlled by the business-level `gatewayFee`/`feePayer` settings in the provider panel; the documented create-invoice form has no fee-payer field. Keep verification support for `user`/`buyer` and `owner` so existing invoices remain settleable; the provider currently reports `user` when the customer bears the configured 12% fee.
 - Tenant UniquePay availability is `global UniquePay enabled && TenantUniquePayEnabled`; the tenant owner panel shows `سراسری خاموش` when the global switch is off and refuses local enabling until global configuration is ready.
 - AtlasPay is a toman card-to-card provider (`Domain/AtlasPay.cs`) using `X-API-Key` over HTTPS with `POST /orders`, `GET /orders/{id}`, `POST /orders/{id}/verify`; the customer-visible reference is `trackingCode` and the charged amount is `totalAmountToman`, while settlement always credits/stores the immutable `BaseAmountToman`. Migration `20260910012628_AddAtlasPayGateway` adds `AtlasPayPaymentInfos`, `TenantBotOrders.AtlasPayPaymentInfoId`, and `BotInstances.TenantAtlasPayEnabled` (default true); no other table changes. The API key is restart-loaded only (never persisted or logged); full provider card numbers are never stored, only `CardNumberMasked`. Invoice creation is single-attempt: the local payment row and order FK are persisted before `POST /orders`, and HTTP 400/401 are definitive while 5xx/timeout/transport/malformed-success are ambiguous and never auto-retried. Reconciliation/verify only inquire (`GET`/`verify`) and never re-create. Settlement is `IsVerifiedForAutomaticSettlement` fail-closed on identity (provider order id, merchant ref, tracking code, total amount), known status (`confirmed`/`settled` eligible), and `requiresManualDelivery` (never auto-settles; moves to `manual_review`). Owned wallet credits use operation key `payment:atlaspay:{id}:credit`; tenant fulfillment reuses the common purchase/renewal pipeline with an atomic `pending -> processing -> settled` claim and tenant/order linkage checks. Tenant AtlasPay availability is `global AtlasPay enabled && TenantAtlasPayEnabled`; the owner panel refuses local enabling while the global switch is off, and both switches govern creation only (existing payments keep settling). Referral eligibility includes `atlaspay`.
-- **AtlasPay has no provider callback.** The authoritative vendor guide (`api_docs/atlaspay-sdk.md`) documents only
-  `POST /orders`, `GET /orders/{id}`, and `POST /orders/{id}/verify`, and states explicitly that polling needs no public
-  endpoint and no signature verification. There is therefore no webhook route, no callback URL, no callback secret, no
-  event id, and no replay protection to implement; `PaymentController` intentionally has no AtlasPay endpoint. The three
-  real triggers are: the background poller (primary), the customer "check payment" button (`apchk_<id>` for owned bots
-  and the tenant store link, both authoritative `verify`), and the super-admin verification action. All three converge on
-  `AtlasPayReconciliationHostedService.ReconcilePaymentAsync`, so no second financial path exists.
+- AtlasPay supports the optional signed webhook documented in section 3.8 of `api_docs/atlaspay-sdk.md`. The public
+  endpoint is `POST /atlaspay-webhook`; `atlasPayWebhookSecret` is the one-time secret returned when the merchant webhook
+  is registered and must stay outside source control/logs/Telegram. `PaymentController.ReceiveAtlasPayWebhook` verifies
+  `X-Webhook-Signature` as HMAC-SHA256 over the exact raw request bytes, accepts only the documented confirmed/rejected
+  event shape, and binds the event to the immutable local provider order id + merchant ref + provider total. Even a valid
+  signed body is only a low-latency hint: it never credits a wallet or fulfills XUI directly. The controller queues the
+  local payment id into the bounded in-memory webhook-hint channel on `AtlasPayReconciliationHostedService` and returns
+  quickly; the worker performs authoritative `GET /orders/{id}` and then the same existing fail-closed settlement path.
+  Periodic polling remains the recovery/source-of-truth fallback because AtlasPay webhook delivery has no retry. Customer
+  `apchk_<id>`/tenant checks and super-admin verification still converge on `ReconcilePaymentAsync`, so there is no second
+  financial path and duplicate webhook deliveries remain idempotent.
 - AtlasPay super-admin verification: type `AP:<localId>` in the admin payment-status screen
   (`XuiV3AdminFlowService.TryHandleAtlasPayStatusAsync`). `AP:` is mandatory and bare ids are rejected, the row must
   exist locally (a raw provider order id can never be settled), and the action only calls the shared verification

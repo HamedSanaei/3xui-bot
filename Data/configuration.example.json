@@ -93,6 +93,7 @@
   "uniquePayReconciliationBatchSize": 50,
   "atlasPayEnabled": false,
   "atlasPayApiKey": "",
+  "atlasPayWebhookSecret": "",
   "atlasPayBaseUrl": "https://api.atlaspay.space/api/v1",
   "atlasPayRequestTimeoutSeconds": 15,
   "atlasPayInquiryRetryCount": 3,

@@ -1,3 +1,4 @@
+using System.Text;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Microsoft.AspNetCore.Mvc;
@@ -32,6 +33,7 @@ public class PaymentController : ControllerBase
     private readonly Tetraminator _tetraminator;
     private readonly TetraminatorSettlementService _tetraminatorSettlementService;
     private readonly UniquePayReconciliationHostedService _uniquePayReconciliation;
+    private readonly AtlasPayReconciliationHostedService _atlasPayReconciliation;
     private readonly TenantBotService _tenantBotService;
     private readonly ILogger<PaymentController> _logger;
 
@@ -49,6 +51,10 @@ public class PaymentController : ControllerBase
     /// <param name="uniquePayReconciliation">
     /// Shared polling coordinator that always performs authoritative UniquePay inquiry before settlement.
     /// </param>
+    /// <param name="atlasPayReconciliation">
+    /// Shared AtlasPay polling coordinator. Signed webhooks only enqueue a fast reconciliation hint here; the callback
+    /// body never directly credits a wallet or fulfills a tenant order.
+    /// </param>
     /// <param name="tenantBotService">Tenant storefront fulfillment service for direct HooshPay orders.</param>
     /// <param name="logger">Controller logger.</param>
     public PaymentController(
@@ -59,6 +65,7 @@ public class PaymentController : ControllerBase
         Tetraminator tetraminator,
         TetraminatorSettlementService tetraminatorSettlementService,
         UniquePayReconciliationHostedService uniquePayReconciliation,
+        AtlasPayReconciliationHostedService atlasPayReconciliation,
         TenantBotService tenantBotService,
         ILogger<PaymentController> logger)
     {
@@ -69,6 +76,7 @@ public class PaymentController : ControllerBase
         _tetraminator = tetraminator;
         _tetraminatorSettlementService = tetraminatorSettlementService;
         _uniquePayReconciliation = uniquePayReconciliation;
+        _atlasPayReconciliation = atlasPayReconciliation;
         _tenantBotService = tenantBotService;
         _logger = logger;
     }
@@ -264,6 +272,80 @@ public class PaymentController : ControllerBase
         {
             callbackLease.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Receives AtlasPay's optional signed webhook and queues an authoritative provider inquiry.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token for reading the request and locating the local payment row.</param>
+    /// <returns>
+    /// HTTP 200 after a valid notification is accepted, 401 for an invalid HMAC, 400 for malformed payloads, 404 when
+    /// the provider order is unknown locally, 409 for immutable order-identity mismatches, or 503 when no webhook secret
+    /// has been configured.
+    /// </returns>
+    /// <remarks>
+    /// The HMAC-SHA256 signature is verified over the exact request bytes before JSON is parsed. Even a valid signed body
+    /// is only a low-latency hint: amount/status fields never directly credit a wallet or fulfill a tenant order. The
+    /// existing reconciliation worker performs <c>GET /orders/{id}</c> and all established amount, manual-delivery,
+    /// idempotency, tenant, wallet, and XUI guards. The action returns quickly so it stays within AtlasPay's five-second
+    /// webhook timeout; periodic polling remains the fallback if the bounded hint queue is temporarily full.
+    /// </remarks>
+    [HttpPost("/atlaspay-webhook")]
+    [RequestSizeLimit(16 * 1024)]
+    public async Task<IActionResult> ReceiveAtlasPayWebhook(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_appConfig?.AtlasPayWebhookSecret))
+        {
+            _logger.LogWarning("AtlasPay webhook received while webhook verification is not configured.");
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new { status = false, message = "webhook not configured" });
+        }
+
+        using var buffer = new MemoryStream();
+        await Request.Body.CopyToAsync(buffer, cancellationToken);
+        var rawBody = buffer.ToArray();
+        var signature = Request.Headers["X-Webhook-Signature"].FirstOrDefault();
+        if (!AtlasPayWebhookSignature.Verify(rawBody, signature, _appConfig.AtlasPayWebhookSecret))
+        {
+            _logger.LogWarning("Rejected AtlasPay webhook with an invalid signature.");
+            return Unauthorized(new { status = false, message = "invalid signature" });
+        }
+
+        AtlasPayWebhookPayload payload;
+        try { payload = JsonConvert.DeserializeObject<AtlasPayWebhookPayload>(Encoding.UTF8.GetString(rawBody)); }
+        catch (JsonException)
+        {
+            return BadRequest(new { status = false, message = "invalid payload" });
+        }
+        if (payload == null || !payload.IsStructurallyValid())
+            return BadRequest(new { status = false, message = "invalid payload" });
+
+        await using var db = _userDbContextFactory.CreateDbContext();
+        var payment = await db.AtlasPayPaymentInfos.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.ProviderOrderId == payload.OrderId, cancellationToken);
+        if (payment == null)
+            return NotFound(new { status = false, message = "payment not found" });
+
+        if (!string.Equals(payment.MerchantOrderRef, payload.MerchantOrderRef, StringComparison.Ordinal) ||
+            !payment.TotalAmountToman.HasValue || payment.TotalAmountToman.Value != payload.TotalAmountToman)
+        {
+            _logger.LogCritical(
+                "AtlasPay webhook identity mismatch. paymentId={PaymentId}, providerOrderId={ProviderOrderId}",
+                payment.Id, payload.OrderId);
+            return Conflict(new { status = false, message = "payment identity mismatch" });
+        }
+
+        if (payment.IsAddedToBalance || string.Equals(payment.SettlementState, AtlasPaySettlementStates.Settled, StringComparison.Ordinal))
+            return Ok(new { status = true, accepted = true, queued = false, alreadySettled = true });
+
+        var queued = _atlasPayReconciliation.TryQueueWebhookTrigger(payment.Id);
+        if (!queued)
+        {
+            _logger.LogWarning(
+                "AtlasPay webhook hint queue is full; periodic polling remains responsible for paymentId={PaymentId}.",
+                payment.Id);
+        }
+
+        return Ok(new { status = true, accepted = true, queued, pollingFallback = true });
     }
 
     /// <summary>

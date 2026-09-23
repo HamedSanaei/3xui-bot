@@ -328,6 +328,14 @@ namespace Adminbot.Domain
         /// </remarks>
         public bool AtlasPayEnabled { get; set; } = false;
         public string AtlasPayApiKey { get; set; }
+        /// <summary>
+        /// Secret returned once by AtlasPay when the optional merchant webhook is registered.
+        /// </summary>
+        /// <remarks>
+        /// The value authenticates <c>POST /atlaspay-webhook</c> with HMAC-SHA256. It is optional because polling remains
+        /// the recovery/source-of-truth path, and it must never be logged, sent to Telegram, or committed to source control.
+        /// </remarks>
+        public string AtlasPayWebhookSecret { get; set; }
         public string AtlasPayBaseUrl { get; set; } = "https://api.atlaspay.space/api/v1";
         public int AtlasPayRequestTimeoutSeconds { get; set; } = 15;
         public int AtlasPayInquiryRetryCount { get; set; } = 3;
@@ -340,8 +348,8 @@ namespace Adminbot.Domain
         /// the customer presses the check button.
         /// </summary>
         /// <remarks>
-        /// AtlasPay's authoritative guide recommends polling and provides no server callback, so every customer check is
-        /// a real provider request. This cooldown is measured from the last inquiry, which the background reconciliation
+        /// AtlasPay polling remains the authoritative fallback even when the optional signed webhook is configured, so every
+        /// customer check is still a real provider request. This cooldown is measured from the last inquiry, which the background reconciliation
         /// worker also writes, so pressing the button cannot be used to bypass the provider rate limit. Values are
         /// clamped to 0..3600 seconds; 0 disables the cooldown. While the cooldown is active the user is answered from
         /// local state and no financial state changes.

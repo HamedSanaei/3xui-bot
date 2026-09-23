@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Channels;
 using Adminbot.Utils;
 using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
@@ -299,6 +301,63 @@ public sealed class AtlasPayOrderStatusResponse
     [JsonProperty("createdAt")] public DateTimeOffset? CreatedAt { get; set; }
 }
 
+/// <summary>
+/// Signed AtlasPay webhook notification. The payload is only a low-latency trigger; authoritative payment state is
+/// always re-read through <c>GET /orders/{id}</c> before any wallet credit or tenant fulfillment.
+/// </summary>
+public sealed class AtlasPayWebhookPayload
+{
+    [JsonProperty("event")] public string Event { get; set; }
+    [JsonProperty("orderId")] public int OrderId { get; set; }
+    [JsonProperty("merchantOrderRef")] public string MerchantOrderRef { get; set; }
+    [JsonProperty("totalAmountToman")] public long TotalAmountToman { get; set; }
+    [JsonProperty("status")] public string Status { get; set; }
+    [JsonProperty("timestamp")] public DateTimeOffset Timestamp { get; set; }
+    [JsonProperty("reason")] public string Reason { get; set; }
+
+    /// <summary>Returns whether the notification has the documented event shape.</summary>
+    /// <returns><c>true</c> only for confirmed/rejected order notifications with stable order identity and amount.</returns>
+    public bool IsStructurallyValid()
+        => (string.Equals(Event, "order.confirmed", StringComparison.Ordinal) ||
+            string.Equals(Event, "order.rejected", StringComparison.Ordinal)) &&
+           OrderId > 0 && !string.IsNullOrWhiteSpace(MerchantOrderRef) && TotalAmountToman > 0 &&
+           !string.IsNullOrWhiteSpace(Status) && Timestamp != default;
+}
+
+/// <summary>Verifies AtlasPay's <c>X-Webhook-Signature</c> over the exact raw HTTP request body.</summary>
+public static class AtlasPayWebhookSignature
+{
+    /// <summary>Checks an HMAC-SHA256 hexadecimal signature without leaking timing information.</summary>
+    /// <param name="rawBody">Exact UTF-8 webhook request body received from AtlasPay.</param>
+    /// <param name="signature">Hexadecimal value from the <c>X-Webhook-Signature</c> header.</param>
+    /// <param name="secret">Merchant webhook secret returned once when the webhook is registered.</param>
+    /// <returns><c>true</c> only when the signature exactly matches the raw body and configured secret.</returns>
+    /// <remarks>
+    /// The body must not be deserialized and reserialized before verification because whitespace/property ordering would
+    /// change the signed bytes. Malformed hexadecimal signatures fail closed and secrets are never logged.
+    /// </remarks>
+    public static bool Verify(string rawBody, string signature, string secret)
+        => !string.IsNullOrEmpty(rawBody) && Verify(Encoding.UTF8.GetBytes(rawBody), signature, secret);
+
+    /// <summary>Checks an HMAC-SHA256 hexadecimal signature against the exact received request bytes.</summary>
+    /// <param name="rawBody">Exact HTTP entity bytes received from AtlasPay.</param>
+    /// <param name="signature">Hexadecimal value from the <c>X-Webhook-Signature</c> header.</param>
+    /// <param name="secret">Merchant webhook secret returned once when the webhook is registered.</param>
+    /// <returns><c>true</c> only when the signature matches the exact body bytes and configured secret.</returns>
+    public static bool Verify(byte[] rawBody, string signature, string secret)
+    {
+        if (rawBody == null || rawBody.Length == 0 || string.IsNullOrWhiteSpace(signature) || string.IsNullOrEmpty(secret))
+            return false;
+
+        byte[] provided;
+        try { provided = Convert.FromHexString(signature.Trim()); }
+        catch (FormatException) { return false; }
+
+        var expected = HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), rawBody);
+        return provided.Length == expected.Length && CryptographicOperations.FixedTimeEquals(provided, expected);
+    }
+}
+
 public sealed class AtlasPayApiException : Exception
 {
     public int StatusCode { get; }
@@ -477,8 +536,8 @@ public static class AtlasPayPaymentVerifier
 /// Applies the throttle that protects AtlasPay from customer-initiated check-button spam.
 /// </summary>
 /// <remarks>
-/// The AtlasPay contract explicitly recommends polling instead of a provider callback, so every customer check costs a
-/// real provider request. A per-payment cooldown keeps one impatient customer from generating a burst of consecutive
+/// AtlasPay polling remains the authoritative fallback even when the optional signed webhook is configured, so every
+/// customer check still costs a real provider request. A per-payment cooldown keeps one impatient customer from generating a burst of consecutive
 /// inquiries while still allowing the background reconciliation worker to run normally. The cooldown is advisory and
 /// financial-safe: while it is active no provider call is made and no financial state changes.
 /// </remarks>
@@ -655,6 +714,12 @@ public sealed class AtlasPaySettlementService
 public sealed class AtlasPayReconciliationHostedService : BackgroundService
 {
     private static readonly AsyncKeyedGate Gate = new();
+    private readonly Channel<int> _webhookTriggers = Channel.CreateBounded<int>(new BoundedChannelOptions(256)
+    {
+        SingleReader = true,
+        SingleWriter = false,
+        FullMode = BoundedChannelFullMode.Wait
+    });
     private readonly AppConfig _configuration;
     private readonly UserDbContextFactory _factory;
     private readonly AtlasPay _atlasPay;
@@ -665,15 +730,39 @@ public sealed class AtlasPayReconciliationHostedService : BackgroundService
         IServiceScopeFactory scopeFactory, ILogger<AtlasPayReconciliationHostedService> logger)
     { _configuration = configuration.Get<AppConfig>() ?? new AppConfig(); _factory = factory; _atlasPay = atlasPay; _scopeFactory = scopeFactory; _logger = logger; }
 
+    /// <summary>Queues one authenticated AtlasPay webhook as an immediate reconciliation hint.</summary>
+    /// <param name="paymentId">Local <see cref="AtlasPayPaymentInfo.Id"/> already bound to the signed provider payload.</param>
+    /// <returns><c>true</c> when the bounded queue accepted the hint; otherwise <c>false</c> and normal polling remains the fallback.</returns>
+    /// <remarks>
+    /// The webhook payload is never payment proof. The worker still performs the official AtlasPay order inquiry and then
+    /// enters the existing idempotent wallet/tenant settlement path. Duplicate hints are financially harmless because the
+    /// payment-keyed gate and durable settlement keys already prevent duplicate balance changes or XUI fulfillment.
+    /// </remarks>
+    public bool TryQueueWebhookTrigger(int paymentId)
+        => paymentId > 0 && _webhookTriggers.Writer.TryWrite(paymentId);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var delay = TimeSpan.FromSeconds(Math.Clamp(_configuration.AtlasPayReconciliationIntervalSeconds, 10, 3600));
         while (!stoppingToken.IsCancellationRequested)
         {
-            try { await ReconcileDueAsync(stoppingToken); }
+            try
+            {
+                while (_webhookTriggers.Reader.TryRead(out var paymentId))
+                    await ReconcilePaymentAsync(paymentId, "atlaspay-webhook", false, stoppingToken);
+
+                await ReconcileDueAsync(stoppingToken);
+            }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception ex) { _logger.LogError(ex, "AtlasPay reconciliation scan failed."); }
-            await Task.Delay(delay, stoppingToken);
+
+            try
+            {
+                var webhookReady = _webhookTriggers.Reader.WaitToReadAsync(stoppingToken).AsTask();
+                var pollDue = Task.Delay(delay, stoppingToken);
+                await Task.WhenAny(webhookReady, pollDue);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
         }
     }
 

@@ -9372,8 +9372,8 @@ public partial class TelegramBotService
         else if (!string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.WalletCharge, StringComparison.OrdinalIgnoreCase))
             return;
 
-        // Provider-traffic guard: AtlasPay documents polling and provides no server callback, so every customer check is
-        // a real provider request. The cooldown is measured from the last inquiry, which the background reconciliation
+        // Provider-traffic guard: AtlasPay polling remains the authoritative fallback even when the signed webhook is enabled,
+        // so every customer check is a real provider request. The cooldown is measured from the last inquiry, which the background reconciliation
         // worker also writes, so pressing the button cannot bypass the provider rate limit. While it is active no
         // provider call is made and no financial state changes.
         if (AtlasPayManualCheckPolicy.IsWithinCooldown(payment, _appConfig.AtlasPayManualCheckMinIntervalSeconds,

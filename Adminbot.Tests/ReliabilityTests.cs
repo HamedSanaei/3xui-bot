@@ -72,8 +72,8 @@ public sealed partial class ConcurrencyTests
         var gateway = new Tetraminator(config);
         await using (var db = databases.Users.CreateDbContext())
         { db.TetraminatorPaymentInfos.AddRange(new TetraminatorPaymentInfo { OrderId = "one", PayId = "one", AmountToman = 100 }, new TetraminatorPaymentInfo { OrderId = "two", PayId = "two", AmountToman = 100 }); await db.SaveChangesAsync(); }
-        var firstController = new PaymentController(databases.Users, config, null!, null!, gateway, null!, null!, null!, NullLogger<PaymentController>.Instance);
-        var secondController = new PaymentController(databases.Users, config, null!, null!, gateway, null!, null!, null!, NullLogger<PaymentController>.Instance);
+        var firstController = new PaymentController(databases.Users, config, null!, null!, gateway, null!, null!, null!, null!, NullLogger<PaymentController>.Instance);
+        var secondController = new PaymentController(databases.Users, config, null!, null!, gateway, null!, null!, null!, null!, NullLogger<PaymentController>.Instance);
         var first = firstController.ReceiveTetraminator("one", default);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
         try { await secondController.ReceiveTetraminator("two", default).WaitAsync(TimeSpan.FromSeconds(5)); Assert.False(first.IsCompleted); }
