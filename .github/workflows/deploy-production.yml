@@ -111,6 +111,9 @@ jobs:
             -p "$PROD_PORT" \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -o TCPKeepAlive=yes \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -- "$PROD_USER@$PROD_HOST" "$remote_cmd" \
