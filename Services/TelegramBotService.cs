@@ -9035,10 +9035,10 @@ public partial class TelegramBotService
         builder.AppendLine("دریافت تست دوره‌ای برای بررسی کیفیت سرویس‌ها، در صورت داشتن شرایط.");
         builder.AppendLine();
         builder.AppendLine("📥 <b>دانلود نرم‌افزارهای پیشنهادی</b>");
-        builder.AppendLine("دریافت آخرین نسخه مناسب کلاینت‌های Windows و Android و لینک iOS، هر زمان این قابلیت توسط مدیر فعال باشد.");
+        builder.AppendLine("از زیرمنوی مدیریت اکانت، آخرین نسخه مناسب کلاینت‌های Windows و Android و لینک iOS را دریافت می‌کنید؛ این گزینه وقتی مدیر قابلیت دانلود را فعال کرده باشد نمایش داده می‌شود.");
         builder.AppendLine();
-        builder.AppendLine("📱 <b>ساخت پروفایل APN آیفون</b>");
-        builder.AppendLine("ساخت مستقیم فایل mobileconfig برای APN سفارشی با حالت IPv4، IPv6 یا IPv4 + IPv6 بدون ارسال اطلاعات به سرویس ثالث.");
+        builder.AppendLine("📱 <b>ساخت پروفایل APN آیفون برای IPv6</b>");
+        builder.AppendLine("از زیرمنوی مدیریت اکانت، اپراتور همراه اول، ایرانسل، رایتل یا شاتل موبایل را انتخاب می‌کنید و فایل mobileconfig همیشه به‌صورت IPv4 + IPv6 ساخته می‌شود؛ برای APN سفارشی هم فقط خود APN را وارد می‌کنید و سؤال جداگانه‌ای برای نوع IP یا نام پروفایل وجود ندارد.");
         builder.AppendLine();
         builder.AppendLine("🎁 <b>دعوت از دوستان</b>");
         builder.AppendLine("دریافت لینک معرفی، مشاهده آمار دعوت و دریافت پاداش طبق قوانین فعال سیستم.");
@@ -10271,13 +10271,18 @@ public partial class TelegramBotService
     /// <summary>Builds the owned-bot account-management submenu with stable two-column customer actions.</summary>
     /// <param name="credUser">Current owned-bot customer; colleague status controls the lower management rows.</param>
     /// <returns>The reply keyboard shown after the customer opens account management.</returns>
-    private static ReplyKeyboardMarkup BuildOwnedAccountManagementKeyboard(CredUser credUser)
+    private ReplyKeyboardMarkup BuildOwnedAccountManagementKeyboard(CredUser credUser)
     {
         var rows = new List<KeyboardButton[]>
         {
             new KeyboardButton[] { OwnedWalletViewAction, OwnedRenewAction },
             new KeyboardButton[] { OwnedMyConfigsAction, "🔎 جستجوی اکانت" },
         };
+
+        if (_clientDownloadAvailability.Snapshot.Enabled)
+            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand, ClientDownloadCallbacks.OpenCommand });
+        else
+            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand });
 
         if (credUser?.IsColleague != true)
             rows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "🤝 درخواست همکاری" });
@@ -10308,9 +10313,8 @@ public partial class TelegramBotService
     {
         if (BotContextAccessor.CurrentBotType == BotInstanceTypes.Tenant)
             return new ReplyKeyboardMarkup(new[] { new KeyboardButton[] { "/start" } }) { ResizeKeyboard = true };
-        // The latest-client-download row is global and re-read from the live switch on every render, so a super-admin
-        // toggle shows up on the next keyboard the customer receives. Only the customer menu carries it; the super-admin
-        // keyboard is built separately and is unaffected.
+        // Latest-client download and iOS APN setup live under account management so the home keyboard stays compact.
+        // The download switch is re-read when that submenu is rendered; the APN generator itself is always locally available.
         var rows = new List<KeyboardButton[]>
         {
             new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
@@ -10319,11 +10323,6 @@ public partial class TelegramBotService
             new KeyboardButton[] { "🌟اکانت تست", "💡راهنما نصب" },
             new KeyboardButton[] { "🎁 دعوت از دوستان", "💻 ارتباط با ادمین" }
         };
-
-        if (_clientDownloadAvailability.Snapshot.Enabled)
-            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand, ClientDownloadCallbacks.OpenCommand });
-        else
-            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand });
 
         rows.Add(new KeyboardButton[] { "🏠منو" });
 

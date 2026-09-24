@@ -592,14 +592,10 @@ public sealed partial class ConcurrencyTests
     // ---------------------------------------------------------------------------------------------------------------
 
     /// <summary>
-    /// The owned customer keyboard must expose the download row only while the live switch is on.
+    /// The owned home keyboard stays compact while account management tracks the live download switch.
     /// </summary>
-    /// <remarks>
-    /// The toggle is not persisted per user or per bot, so newly rendered keyboards must track the live snapshot instead of
-    /// the startup configuration value.
-    /// </remarks>
     [Fact]
-    public void Owned_customer_keyboard_tracks_the_live_switch()
+    public void Owned_account_management_tracks_the_live_download_switch()
     {
         using var databases = new Databases();
         var flag = new ClientDownloadAvailabilityProbe(enabled: false);
@@ -607,9 +603,14 @@ public sealed partial class ConcurrencyTests
         var service = BuildClientDownloadTelegramService(databases, flag, new CountingReleaseService(), client);
 
         Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, OwnedKeyboardLabels(service));
+        Assert.DoesNotContain(AppleMobileConfigText.MenuCommand, OwnedKeyboardLabels(service));
+        Assert.Contains(AppleMobileConfigText.MenuCommand, OwnedAccountManagementLabels(service, new CredUser()));
+        Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, OwnedAccountManagementLabels(service, new CredUser()));
 
         flag.SetEnabled(true);
-        Assert.Contains(ClientDownloadCallbacks.OpenCommand, OwnedKeyboardLabels(service));
+        Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, OwnedKeyboardLabels(service));
+        Assert.Contains(ClientDownloadCallbacks.OpenCommand, OwnedAccountManagementLabels(service, new CredUser()));
+        Assert.Contains(AppleMobileConfigText.MenuCommand, OwnedAccountManagementLabels(service, new CredUser()));
     }
 
     /// <summary>The owned home keyboard exposes renewal directly and keeps account management at normal half width.</summary>
@@ -626,7 +627,8 @@ public sealed partial class ConcurrencyTests
         var rows = OwnedKeyboardRows(service);
         var accountRow = Assert.Single(rows, row => row.Contains("⚙️ مدیریت اکانت"));
         Assert.Equal(2, accountRow.Length);
-        Assert.Contains(AppleMobileConfigText.MenuCommand, rows.SelectMany(row => row));
+        Assert.DoesNotContain(AppleMobileConfigText.MenuCommand, rows.SelectMany(row => row));
+        Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, rows.SelectMany(row => row));
         Assert.Contains(TelegramBotService.OwnedRenewAction, accountRow);
 
         var renewDetector = typeof(XuiV3BotFlowService).GetMethod(
@@ -639,13 +641,18 @@ public sealed partial class ConcurrencyTests
     [Fact]
     public void Owned_account_management_uses_wallet_and_my_configs_labels()
     {
-        var builder = typeof(TelegramBotService).GetMethod(
-            "BuildOwnedAccountManagementKeyboard", BindingFlags.Static | BindingFlags.NonPublic)!;
-        var markup = (ReplyKeyboardMarkup)builder.Invoke(null, new object[] { new CredUser() })!;
-        var rows = markup.Keyboard.Select(row => row.Select(button => button.Text).ToArray()).ToList();
+        using var databases = new Databases();
+        var service = BuildClientDownloadTelegramService(
+            databases,
+            new ClientDownloadAvailabilityProbe(enabled: true),
+            new CountingReleaseService(),
+            new GatewayTelegramClient());
+        var rows = OwnedAccountManagementRows(service, new CredUser());
 
         Assert.Equal(new[] { TelegramBotService.OwnedWalletViewAction, TelegramBotService.OwnedRenewAction }, rows[0]);
         Assert.Equal(new[] { TelegramBotService.OwnedMyConfigsAction, "🔎 جستجوی اکانت" }, rows[1]);
+        Assert.Contains(AppleMobileConfigText.MenuCommand, rows.SelectMany(x => x));
+        Assert.Contains(ClientDownloadCallbacks.OpenCommand, rows.SelectMany(x => x));
         Assert.DoesNotContain(rows.SelectMany(x => x), x => x == "مشاهده وضعیت حساب" || x == "وضعیت اکانت های من");
 
         var myAccountsDetector = typeof(XuiV3BotFlowService).GetMethod(
@@ -686,7 +693,9 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("AtlasPay", text, StringComparison.Ordinal);
         Assert.Contains("شماره‌کارت، صاحب کارت، بانک و مبلغ دقیق تومان/ریال", text, StringComparison.Ordinal);
         Assert.Contains("ارسال رسید یا رفع مشکل تأیید", text, StringComparison.Ordinal);
-        Assert.Contains("ساخت پروفایل APN آیفون", text, StringComparison.Ordinal);
+        Assert.Contains("ساخت پروفایل APN آیفون برای IPv6", text, StringComparison.Ordinal);
+        Assert.Contains("همراه اول، ایرانسل، رایتل یا شاتل موبایل", text, StringComparison.Ordinal);
+        Assert.Contains("همیشه به‌صورت IPv4 + IPv6", text, StringComparison.Ordinal);
         Assert.Contains("مجوز سوپرادمین", text, StringComparison.Ordinal);
         Assert.Contains("فعال‌سازی صریح مالک", text, StringComparison.Ordinal);
     }
@@ -934,6 +943,19 @@ public sealed partial class ConcurrencyTests
         var markup = (ReplyKeyboardMarkup)method.Invoke(service, Array.Empty<object>())!;
         return markup.Keyboard.Select(row => row.Select(button => button.Text).ToArray()).ToList();
     }
+
+    /// <summary>Reads the owned account-management submenu preserving its row layout.</summary>
+    private static List<string[]> OwnedAccountManagementRows(TelegramBotService service, CredUser user)
+    {
+        var method = typeof(TelegramBotService).GetMethod(
+            "BuildOwnedAccountManagementKeyboard", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var markup = (ReplyKeyboardMarkup)method.Invoke(service, new object[] { user })!;
+        return markup.Keyboard.Select(row => row.Select(button => button.Text).ToArray()).ToList();
+    }
+
+    /// <summary>Flattens the owned account-management submenu into labels.</summary>
+    private static List<string> OwnedAccountManagementLabels(TelegramBotService service, CredUser user)
+        => OwnedAccountManagementRows(service, user).SelectMany(row => row).ToList();
 
     /// <summary>Flattens the tenant storefront reply keyboard into its button labels.</summary>
     /// <param name="service">Storefront service under test.</param>

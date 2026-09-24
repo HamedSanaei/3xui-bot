@@ -13,14 +13,14 @@ public sealed class AppleMobileConfigTelegramFlow
     public const string FlowName = "apple-mobileconfig";
     private const string StepMenu = "menu";
     private const string StepApn = "apn";
-    private const string StepProtocol = "protocol";
     private const string CallbackPrefix = "IOSAPN:";
     private const string CallbackCustom = CallbackPrefix + "CUSTOM";
     private const string CallbackBack = CallbackPrefix + "BACK";
     private const string CallbackCancel = CallbackPrefix + "CANCEL";
-    private const string CallbackIp4 = CallbackPrefix + "IP:4";
-    private const string CallbackIp6 = CallbackPrefix + "IP:6";
-    private const string CallbackIp46 = CallbackPrefix + "IP:46";
+    private const string CallbackMci = CallbackPrefix + "CARRIER:MCI";
+    private const string CallbackIrancell = CallbackPrefix + "CARRIER:IRANCELL";
+    private const string CallbackRightel = CallbackPrefix + "CARRIER:RIGHTEL";
+    private const string CallbackShatelMobile = CallbackPrefix + "CARRIER:SHATEL";
 
     private readonly IAppleMobileConfigGenerator _generator;
     private readonly global::UserStateStore _state;
@@ -54,7 +54,8 @@ public sealed class AppleMobileConfigTelegramFlow
         if (message?.From == null || message.Text == null)
             return false;
         var text = message.Text.Trim();
-        if (string.Equals(text, AppleMobileConfigText.MenuCommand, StringComparison.Ordinal))
+        if (string.Equals(text, AppleMobileConfigText.MenuCommand, StringComparison.Ordinal) ||
+            string.Equals(text, AppleMobileConfigText.LegacyMenuCommand, StringComparison.Ordinal))
         {
             await _state.ResetUserStatus(new global::User
             {
@@ -100,18 +101,13 @@ public sealed class AppleMobileConfigTelegramFlow
             return true;
         }
 
-        await _state.ResetUserStatus(new global::User
-        {
-            Id = message.From.Id,
-            Flow = FlowName,
-            LastStep = StepProtocol,
-            ConfigLink = apn
-        });
-        await botClient.SendMessage(
+        await GenerateAndSendAsync(
+            botClient,
             message.Chat.Id,
-            AppleMobileConfigText.ProtocolTitle,
-            replyMarkup: BuildProtocolKeyboard(),
-            cancellationToken: cancellationToken);
+            message.From.Id,
+            apn,
+            homeKeyboard,
+            cancellationToken);
         return true;
     }
 
@@ -146,8 +142,34 @@ public sealed class AppleMobileConfigTelegramFlow
             return true;
         }
 
-        if (string.Equals(callbackQuery.Data, CallbackCustom, StringComparison.Ordinal) ||
-            string.Equals(callbackQuery.Data, CallbackBack, StringComparison.Ordinal))
+        if (string.Equals(callbackQuery.Data, CallbackBack, StringComparison.Ordinal))
+        {
+            await _state.ResetUserStatus(new global::User
+            {
+                Id = callbackQuery.From.Id,
+                Flow = FlowName,
+                LastStep = StepMenu
+            });
+            await botClient.SendMessage(
+                chatId,
+                AppleMobileConfigText.Intro,
+                replyMarkup: BuildMenuKeyboard(),
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        if (!IsActive(user) || !string.Equals(user.LastStep, StepMenu, StringComparison.Ordinal))
+        {
+            await _state.ClearUserStatus(new global::User { Id = callbackQuery.From.Id });
+            await botClient.SendMessage(
+                chatId,
+                AppleMobileConfigText.ExpiredStep,
+                replyMarkup: homeKeyboard,
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
+        if (string.Equals(callbackQuery.Data, CallbackCustom, StringComparison.Ordinal))
         {
             await _state.ResetUserStatus(new global::User
             {
@@ -163,31 +185,38 @@ public sealed class AppleMobileConfigTelegramFlow
             return true;
         }
 
-        if (!TryParseProtocol(callbackQuery.Data, out var protocol))
-            return true;
-
-        if (!IsActive(user) ||
-            !string.Equals(user.LastStep, StepProtocol, StringComparison.Ordinal) ||
-            string.IsNullOrWhiteSpace(user.ConfigLink))
+        if (TryResolveCarrierApn(callbackQuery.Data, out var carrierApn))
         {
-            await _state.ClearUserStatus(new global::User { Id = callbackQuery.From.Id });
-            await botClient.SendMessage(
+            await GenerateAndSendAsync(
+                botClient,
                 chatId,
-                AppleMobileConfigText.ExpiredStep,
-                replyMarkup: homeKeyboard,
-                cancellationToken: cancellationToken);
-            return true;
+                callbackQuery.From.Id,
+                carrierApn,
+                homeKeyboard,
+                cancellationToken);
         }
 
+        return true;
+    }
+
+    private async Task GenerateAndSendAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        long userId,
+        string apn,
+        ReplyMarkup homeKeyboard,
+        CancellationToken cancellationToken)
+    {
+        const IpProtocolMode protocol = IpProtocolMode.IPv4AndIPv6;
         try
         {
             var options = new ApnProfileOptions
             {
-                Apn = user.ConfigLink,
+                Apn = apn,
                 Protocol = protocol,
                 AuthenticationType = ApnAuthenticationType.Pap,
                 ConfigureRoamingProtocol = true,
-                DisplayName = "APN Configuration"
+                DisplayName = "IPv4 + IPv6 APN Configuration"
             };
             var profileBytes = _generator.GenerateApnProfile(options);
             var fileName = AppleMobileConfigText.FileName(protocol);
@@ -198,11 +227,11 @@ public sealed class AppleMobileConfigTelegramFlow
                 InputFile.FromStream(stream, fileName),
                 cancellationToken: cancellationToken);
 
-            await _state.ClearUserStatus(new global::User { Id = callbackQuery.From.Id });
+            await _state.ClearUserStatus(new global::User { Id = userId });
             _logger.LogInformation(
                 "Apple APN profile generated. BotId={BotId} TelegramUserId={TelegramUserId} Protocol={Protocol} HasUsername={HasUsername} HasPassword={HasPassword}",
                 BotContextAccessor.CurrentBotId,
-                callbackQuery.From.Id,
+                userId,
                 protocol,
                 !string.IsNullOrEmpty(options.Username),
                 !string.IsNullOrEmpty(options.Password));
@@ -219,21 +248,18 @@ public sealed class AppleMobileConfigTelegramFlow
         }
         catch (Exception ex)
         {
-            // Never log generated XML, APN credentials, or exception data that could contain a password.
             _logger.LogWarning(
                 "Apple APN profile generation/delivery failed. BotId={BotId} TelegramUserId={TelegramUserId} Protocol={Protocol} ErrorType={ErrorType}",
                 BotContextAccessor.CurrentBotId,
-                callbackQuery.From.Id,
+                userId,
                 protocol,
                 ex.GetType().Name);
             await botClient.SendMessage(
                 chatId,
                 AppleMobileConfigText.GenericError,
-                replyMarkup: BuildProtocolKeyboard(),
+                replyMarkup: BuildMenuKeyboard(),
                 cancellationToken: cancellationToken);
         }
-
-        return true;
     }
 
     private async Task CancelAsync(
@@ -254,44 +280,43 @@ public sealed class AppleMobileConfigTelegramFlow
     private static bool IsActive(global::User user)
         => string.Equals(user?.Flow, FlowName, StringComparison.Ordinal);
 
-    private static bool TryParseProtocol(string data, out IpProtocolMode protocol)
+    private static bool TryResolveCarrierApn(string data, out string apn)
     {
-        protocol = data switch
+        apn = data switch
         {
-            CallbackIp4 => IpProtocolMode.IPv4,
-            CallbackIp6 => IpProtocolMode.IPv6,
-            CallbackIp46 => IpProtocolMode.IPv4AndIPv6,
-            _ => 0
+            CallbackMci => "mcinet",
+            CallbackIrancell => "mtnirancell",
+            CallbackRightel => "RighTel",
+            CallbackShatelMobile => "shatelmobile",
+            _ => null
         };
-        return protocol != 0;
+        return apn != null;
     }
 
     public static InlineKeyboardMarkup BuildMenuKeyboard()
         => new(new[]
         {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.MciButton, CallbackMci),
+                InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.IrancellButton, CallbackIrancell)
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.RightelButton, CallbackRightel),
+                InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.ShatelMobileButton, CallbackShatelMobile)
+            },
             new[] { InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.CustomApnButton, CallbackCustom) },
             new[] { InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.CancelButton, CallbackCancel) }
-        });
-
-    public static InlineKeyboardMarkup BuildProtocolKeyboard()
-        => new(new[]
-        {
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData("IPv4", CallbackIp4),
-                InlineKeyboardButton.WithCallbackData("IPv6", CallbackIp6)
-            },
-            new[] { InlineKeyboardButton.WithCallbackData("IPv4 + IPv6 ✅", CallbackIp46) },
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.BackButton, CallbackBack),
-                InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.CancelButton, CallbackCancel)
-            }
         });
 
     private static InlineKeyboardMarkup BuildApnInputKeyboard()
         => new(new[]
         {
-            new[] { InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.CancelButton, CallbackCancel) }
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.BackButton, CallbackBack),
+                InlineKeyboardButton.WithCallbackData(AppleMobileConfigText.CancelButton, CallbackCancel)
+            }
         });
 }

@@ -3,11 +3,15 @@ namespace Adminbot.Services.AppleMobileConfig;
 /// <summary>Persian Telegram copy for the iOS APN profile flow, kept separate from generation logic.</summary>
 public static class AppleMobileConfigText
 {
-    public const string MenuCommand = "📱 تنظیم APN آیفون";
+    public const string MenuCommand = "📱 تنظیم APN آیفون برای IPv6";
+    public const string LegacyMenuCommand = "📱 تنظیم APN آیفون";
     public const string CustomApnButton = "✏️ APN سفارشی";
+    public const string MciButton = "🔵 همراه اول";
+    public const string IrancellButton = "🟡 ایرانسل";
+    public const string RightelButton = "🟣 رایتل";
+    public const string ShatelMobileButton = "🟢 شاتل موبایل";
     public const string CancelButton = "لغو";
     public const string BackButton = "بازگشت";
-    public const string ProtocolTitle = "نوع IP را انتخاب کنید:";
     public const string GenericError =
         "❌ ساخت پروفایل انجام نشد. لطفاً دوباره تلاش کنید یا APN را مجدداً وارد کنید.";
     public const string ExpiredStep =
@@ -15,13 +19,13 @@ public static class AppleMobileConfigText
     public const string Cancelled = "ساخت پروفایل APN لغو شد.";
 
     public const string Intro =
-        "📱 ساخت پروفایل APN آیفون\n\n" +
+        "📱 ساخت پروفایل APN آیفون برای IPv4 + IPv6\n\n" +
         "پروفایل به‌صورت مستقیم داخل ربات ساخته می‌شود و اطلاعات شما به سرویس دیگری ارسال نمی‌شود.\n\n" +
-        "در نسخه فعلی برای جلوگیری از حدس‌زدن تنظیمات اپراتور، APN را خودتان وارد کنید.";
+        "اپراتور سیم‌کارت را انتخاب کنید. پروفایل همیشه به‌صورت IPv4 + IPv6 ساخته می‌شود و نیازی به انتخاب نوع IP یا نام پروفایل نیست.";
 
     public const string ApnPrompt =
-        "APN را وارد کنید:\n\n" +
-        "مثال: اگر اپراتور شما APN مشخصی اعلام کرده، همان مقدار را دقیقاً ارسال کنید.";
+        "APN سفارشی را وارد کنید:\n\n" +
+        "بعد از ارسال APN، فایل IPv4 + IPv6 مستقیم ساخته می‌شود و مرحله دیگری برای انتخاب نوع IP وجود ندارد.";
 
     public const string InvalidApn =
         "❌ مقدار APN معتبر نیست. یک مقدار غیرخالی و کوتاه‌تر ارسال کنید.";
@@ -35,7 +39,7 @@ public static class AppleMobileConfigText
     public static string BuildSuccess(string apn, IpProtocolMode protocol)
         => "✅ پروفایل APN آیفون ساخته شد.\n\n" +
            $"APN: {apn}\n" +
-           $"IP Mode: {ProtocolLabel(protocol)}\n\n" +
+           "IP Mode: IPv4 + IPv6\n\n" +
            "فایل بالا را روی آیفون/آیپد دانلود و نصب کنید.\n\n" +
            "پس از دانلود:\n" +
            "Settings → Profile Downloaded\n" +
