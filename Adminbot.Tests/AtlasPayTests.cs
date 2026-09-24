@@ -26,6 +26,7 @@ public sealed partial class ConcurrencyTests
         var handler = new AtlasHttpHandler((_, request, body, _) => Task.FromResult(JsonResponse(HttpStatusCode.OK,
             "{\"success\":true,\"orderId\":42,\"trackingCode\":\"TRK-42\",\"totalAmountToman\":250123," +
             "\"cardNumberMasked\":\"6037-****-1234\",\"cardNumber\":\"6037999999991234\"," +
+            "\"cardHolderName\":\"Ali Rezaei\",\"bankName\":\"Bank Melli\"," +
             "\"paymentDeadlineAt\":\"2026-09-10T12:00:00Z\",\"customerStartLink\":\"https://t.me/atlaspay_bot/start?start=x\"}")));
         var atlas = new AtlasPay(AtlasConfiguration(), new HttpClient(handler));
         var result = await atlas.CreateOrderAsync("AtlasPay-abc", 250000, 123456789);
@@ -40,7 +41,92 @@ public sealed partial class ConcurrencyTests
         Assert.Equal("AtlasPay-abc", json.Value<string>("merchantOrderRef"));
         Assert.Equal(42, result.OrderId); Assert.Equal("TRK-42", result.TrackingCode);
         Assert.Equal(250123, result.TotalAmountToman); Assert.Equal("6037-****-1234", result.CardNumberMasked);
+        Assert.Equal("6037999999991234", result.CardNumber);
+        Assert.Equal("Ali Rezaei", result.CardHolderName);
+        Assert.Equal("Bank Melli", result.BankName);
         Assert.Null(typeof(AtlasPayPaymentInfo).GetProperty("CardNumber"));
+    }
+
+    [Fact]
+    public void AtlasPay_direct_card_ui_shows_exact_amount_and_demotes_miniapp_to_receipt_fallback()
+    {
+        var created = new AtlasPayCreateOrderResponse
+        {
+            OrderId = 42,
+            TrackingCode = "TRK-42",
+            TotalAmountToman = 250123,
+            CardNumber = "6037999999991234",
+            CardHolderName = "Ali & Rezaei",
+            BankName = "Bank <Melli>",
+            PaymentDeadlineAt = new DateTimeOffset(2026, 9, 10, 12, 0, 0, TimeSpan.Zero),
+            CustomerStartLink = "https://t.me/atlaspay_bot/pay?startapp=order_42"
+        };
+
+        var direct = AtlasPayCustomerPaymentUi.TryCreateDirectPayment(created);
+        Assert.NotNull(direct);
+        var text = AtlasPayCustomerPaymentUi.BuildDirectPaymentText(direct!);
+        Assert.Contains("250123 تومان", text, StringComparison.Ordinal);
+        Assert.Contains("2501230 ریال", text, StringComparison.Ordinal);
+        Assert.Contains("6037999999991234", text, StringComparison.Ordinal);
+        Assert.Contains("Ali &amp; Rezaei", text, StringComparison.Ordinal);
+        Assert.Contains("Bank &lt;Melli&gt;", text, StringComparison.Ordinal);
+        Assert.Contains("۱ تومان", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Ali & Rezaei", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Bank <Melli>", text, StringComparison.Ordinal);
+
+        var keyboard = AtlasPayCustomerPaymentUi.BuildKeyboard(created.CustomerStartLink, "apchk_7", directCard: true);
+        var buttons = keyboard.InlineKeyboard.SelectMany(x => x).ToArray();
+        Assert.Equal("🧾 ارسال رسید / مشکل در تأیید", buttons[0].Text);
+        Assert.Equal(created.CustomerStartLink, buttons[0].Url);
+        Assert.Equal("🔄 بررسی وضعیت پرداخت", buttons[1].Text);
+        Assert.Equal("apchk_7", buttons[1].CallbackData);
+    }
+
+    [Fact]
+    public void AtlasPay_masked_or_incomplete_direct_card_never_enters_direct_mode()
+    {
+        var masked = new AtlasPayCreateOrderResponse
+        {
+            TotalAmountToman = 250123,
+            CardNumber = "6037****3165"
+        };
+        var shortValue = new AtlasPayCreateOrderResponse
+        {
+            TotalAmountToman = 250123,
+            CardNumber = "60379999"
+        };
+
+        Assert.Null(AtlasPayCustomerPaymentUi.TryCreateDirectPayment(masked));
+        Assert.Null(AtlasPayCustomerPaymentUi.TryCreateDirectPayment(shortValue));
+    }
+
+    [Fact]
+    public void AtlasPay_link_fallback_still_shows_exact_toman_and_rial_warning()
+    {
+        var text = AtlasPayCustomerPaymentUi.BuildExactAmountWarning(250123);
+        Assert.Contains("250123 تومان", text, StringComparison.Ordinal);
+        Assert.Contains("2501230 ریال", text, StringComparison.Ordinal);
+        Assert.Contains("ریال‌به‌ریال", text, StringComparison.Ordinal);
+        Assert.Contains("۱ تومان", AtlasPayCustomerPaymentUi.BuildDirectPaymentText(new(
+            "6037999999991234", null, null, 250123,
+            new DateTimeOffset(2026, 9, 10, 12, 0, 0, TimeSpan.Zero), "TRK")), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AtlasPay_without_direct_card_keeps_existing_link_payment_fallback()
+    {
+        var created = new AtlasPayCreateOrderResponse
+        {
+            TotalAmountToman = 250123,
+            CardNumberMasked = "6037****3165",
+            CustomerStartLink = "https://t.me/atlaspay_bot/pay?startapp=order_42"
+        };
+
+        Assert.Null(AtlasPayCustomerPaymentUi.TryCreateDirectPayment(created));
+        var keyboard = AtlasPayCustomerPaymentUi.BuildKeyboard(created.CustomerStartLink, "apchk_7", directCard: false);
+        var paymentButton = keyboard.InlineKeyboard.SelectMany(x => x).First();
+        Assert.Contains("پرداخت با اطلس‌پی", paymentButton.Text, StringComparison.Ordinal);
+        Assert.Equal(created.CustomerStartLink, paymentButton.Url);
     }
     [Theory]
     [InlineData(500, false)]
@@ -145,7 +231,8 @@ public sealed partial class ConcurrencyTests
         var payment = VerifiedAtlasPayment(); payment.ProviderOrderId = 987654321; payment.BaseAmountToman = 250000; payment.TotalAmountToman = 250123;
         payment.PaymentDeadlineAtUtc = new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc);
         var text = TenantBotService.BuildTenantAtlasPayPaymentText(order, payment);
-        Assert.Contains(250123L.FormatCurrency(), text);
+        Assert.Contains("250123 تومان", text, StringComparison.Ordinal);
+        Assert.Contains("2501230 ریال", text, StringComparison.Ordinal);
         Assert.Contains(payment.TrackingCode!, text);
         Assert.DoesNotContain(payment.ProviderOrderId!.Value.ToString(), text, StringComparison.Ordinal);
     }

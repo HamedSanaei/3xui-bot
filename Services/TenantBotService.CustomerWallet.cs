@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Newtonsoft.Json;
 using Telegram.Bot;
 using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using Adminbot.Utils;
 
@@ -84,10 +85,37 @@ public partial class TenantBotService
             try
             {
                 var invoice = await charges.CreateTenantAsync(store.Id, actor, chat, amount, (PaymentGateway)gateway, token);
-                await client.SendMessage(chat, invoice.Notice, replyMarkup: new InlineKeyboardMarkup(new[] {
-                    new[] { InlineKeyboardButton.WithUrl("پرداخت در درگاه مرکزی", invoice.Url) },
-                    new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت پرداخت", invoice.CheckCallback) }
-                }), cancellationToken: token);
+                if (invoice.DirectPayment != null)
+                {
+                    await client.SendMessage(
+                        chat,
+                        AtlasPayCustomerPaymentUi.BuildDirectPaymentText(invoice.DirectPayment),
+                        parseMode: ParseMode.Html,
+                        replyMarkup: AtlasPayCustomerPaymentUi.BuildKeyboard(
+                            invoice.Url,
+                            invoice.CheckCallback,
+                            directCard: true),
+                        cancellationToken: token);
+                }
+                else if ((PaymentGateway)gateway == PaymentGateway.AtlasPay)
+                {
+                    await client.SendMessage(
+                        chat,
+                        invoice.Notice,
+                        parseMode: ParseMode.Html,
+                        replyMarkup: AtlasPayCustomerPaymentUi.BuildKeyboard(
+                            invoice.Url,
+                            invoice.CheckCallback,
+                            directCard: false),
+                        cancellationToken: token);
+                }
+                else
+                {
+                    await client.SendMessage(chat, invoice.Notice, replyMarkup: new InlineKeyboardMarkup(new[] {
+                        new[] { InlineKeyboardButton.WithUrl("پرداخت در درگاه مرکزی", invoice.Url) },
+                        new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت پرداخت", invoice.CheckCallback) }
+                    }), cancellationToken: token);
+                }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {

@@ -9013,14 +9013,14 @@ public partial class TelegramBotService
         builder.AppendLine("📋 <b>تعرفه‌های داینامیک</b>");
         builder.AppendLine("تعرفه‌ها همیشه بر اساس نوع حساب شما، یعنی کاربر عادی یا همکار، نمایش داده می‌شود.");
         builder.AppendLine();
-        builder.AppendLine("👤 <b>مدیریت اکانت‌ها</b>");
-        builder.AppendLine("مشاهده همه اکانت‌ها، صفحه‌بندی، جستجو، دیدن جزئیات، تمدید، حذف تکی و تغییر لینک.");
+        builder.AppendLine("👤 <b>مدیریت اکانت‌ها و کانفیگ‌ها</b>");
+        builder.AppendLine("مشاهده کانفیگ‌های من، صفحه‌بندی همه اکانت‌ها، جستجو، جزئیات، تمدید، حذف تکی و تغییر لینک.");
         builder.AppendLine();
         builder.AppendLine("🔎 <b>جستجوی سریع</b>");
         builder.AppendLine("جستجو با نام اکانت، بخشی از کامنت یا UUID کامل کانفیگ.");
         builder.AppendLine();
-        builder.AppendLine("🔁 <b>تمدید و تغییر لینک</b>");
-        builder.AppendLine("تمدید با پلن‌های فعال ربات، تمدید مستقیم از پیام هشدار انقضا و ساخت لینک جدید در صورت لو رفتن اطلاعات اکانت.");
+        builder.AppendLine("🔄 <b>تمدید سریع و تغییر لینک</b>");
+        builder.AppendLine("دکمه تمدید مستقیماً در صفحه اصلی و مدیریت اکانت‌ها در دسترس است؛ می‌توانید نام/کانفیگ را بفرستید یا از دکمه «اکانت های من» اکانت را انتخاب کنید. تغییر لینک هم در صورت لو رفتن اطلاعات اکانت در دسترس است.");
         builder.AppendLine();
         builder.AppendLine("⏰ <b>هشدار انقضا</b>");
         builder.AppendLine("برای اکانت‌های قابل تمدید، ۷ روز، ۳ روز و ۱ روز قبل از انقضا پیام یادآوری همراه با دکمه تمدید ارسال می‌شود.");
@@ -9028,18 +9028,28 @@ public partial class TelegramBotService
         builder.AppendLine("🧹 <b>حذف اکانت‌های منقضی</b>");
         builder.AppendLine("نمایش و حذف یکجای اکانت‌هایی که حجم یا زمان آن‌ها تمام شده است.");
         builder.AppendLine();
-        builder.AppendLine("💰 <b>شارژ حساب</b>");
-        builder.AppendLine("شارژ کیف پول از درگاه ریالی HooshPay یا پرداخت ارز دیجیتال، با ثبت و بررسی وضعیت پرداخت.");
+        builder.AppendLine("💰 <b>کیف پول، شارژ و تراکنش‌ها</b>");
+        builder.AppendLine("مشاهده کیف پول و تاریخچه تراکنش‌ها و شارژ از درگاه‌های مرکزی فعال شامل HooshPay، Tetraminator، UniquePay، AtlasPay و NOWPayments. اگر نمایش مستقیم اطلاعات پرداخت از سمت AtlasPay برای فروشگاه فعال باشد، شماره‌کارت، صاحب کارت، بانک و مبلغ دقیق تومان/ریال داخل همین ربات نمایش داده می‌شود؛ لینک AtlasPay نیز برای ارسال رسید یا رفع مشکل تأیید باقی می‌ماند.");
         builder.AppendLine();
         builder.AppendLine("🌟 <b>اکانت تست</b>");
         builder.AppendLine("دریافت تست دوره‌ای برای بررسی کیفیت سرویس‌ها، در صورت داشتن شرایط.");
+        builder.AppendLine();
+        builder.AppendLine("📥 <b>دانلود نرم‌افزارهای پیشنهادی</b>");
+        builder.AppendLine("دریافت آخرین نسخه مناسب کلاینت‌های Windows و Android و لینک iOS، هر زمان این قابلیت توسط مدیر فعال باشد.");
+        builder.AppendLine();
+        builder.AppendLine("📱 <b>ساخت پروفایل APN آیفون</b>");
+        builder.AppendLine("ساخت مستقیم فایل mobileconfig برای APN سفارشی با حالت IPv4، IPv6 یا IPv4 + IPv6 بدون ارسال اطلاعات به سرویس ثالث.");
+        builder.AppendLine();
+        builder.AppendLine("🎁 <b>دعوت از دوستان</b>");
+        builder.AppendLine("دریافت لینک معرفی، مشاهده آمار دعوت و دریافت پاداش طبق قوانین فعال سیستم.");
 
         if (credUser?.IsColleague == true)
         {
             builder.AppendLine();
             builder.AppendLine("💎 <b>امکانات همکاران</b>");
             builder.AppendLine("قیمت همکار، ساخت چند اکانت در یک سفارش و دسترسی سریع به اکانت‌ها با شماره اکانت.");
-            builder.AppendLine("فعالسازی ربات فروشگاهی اختصاصی، خرید و تمدید مستقیم با HooshPay، ارز دیجیتال یا کارت‌به‌کارت همکار.");
+            builder.AppendLine("فعالسازی ربات فروشگاهی اختصاصی، خرید و تمدید با درگاه‌های مرکزی فعال، کیف پول یا کارت‌به‌کارت همکار.");
+            builder.AppendLine("کیف پول مشتری فروشگاه فقط پس از اعطای مجوز سوپرادمین و فعال‌سازی صریح مالک همان Tenant قابل استفاده است.");
             builder.AppendLine("مدیریت آموزش‌های فروشگاه، پیام عمومی فقط به مشتریان همان tenant، گزارش سفارش‌ها، آمار روزانه و ثبت سود یا کسر هزینه در ledger.");
         }
         else
@@ -9412,17 +9422,17 @@ public partial class TelegramBotService
             payment.ApplyCreate(created, DateTime.UtcNow,
                 AtlasPayPollingPolicy.GetInitialNextInquiryUtc(_appConfig, DateTime.UtcNow));
             await _workflow.SaveAsync(cancellationToken);
-            var deadline = payment.PaymentDeadlineAtUtc?.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture) ?? "نامشخص";
-            var text = "⚠️ <b>پیش از پرداخت لطفاً موارد زیر را بررسی کنید:</b>\n\n" +
-                       $"💰 مبلغ دقیق قابل پرداخت: <code>{Html(payment.TotalAmountToman!.Value.FormatCurrency())}</code>\n" +
-                       $"⏱ مهلت پرداخت: <code>{Html(deadline)}</code>\n" +
-                       $"🔖 شماره پیگیری: <code>{Html(payment.TrackingCode)}</code>\n\n" +
-                       "مبلغ را دقیقاً مطابق عدد بالا پرداخت کنید. شارژ کیف پول فقط پس از استعلام رسمی اطلس‌پی انجام می‌شود.";
-            var keyboard = new InlineKeyboardMarkup(new[]
-            {
-                new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | کارمزد ۱۲٪ | ریالی", payment.CustomerStartLink) },
-                new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", $"apchk_{payment.Id}") }
-            });
+            var directPayment = AtlasPayCustomerPaymentUi.TryCreateDirectPayment(created);
+            var text = directPayment != null
+                ? AtlasPayCustomerPaymentUi.BuildDirectPaymentText(directPayment)
+                : AtlasPayCustomerPaymentUi.BuildLinkFallbackText(
+                    payment.TotalAmountToman!.Value,
+                    payment.PaymentDeadlineAtUtc,
+                    payment.TrackingCode);
+            var keyboard = AtlasPayCustomerPaymentUi.BuildKeyboard(
+                payment.CustomerStartLink,
+                $"apchk_{payment.Id}",
+                directPayment != null);
             var sent = await ActiveBotClient.SendMessage(message.Chat.Id, text, parseMode: ParseMode.Html,
                 replyMarkup: keyboard, cancellationToken: cancellationToken);
             payment.TelMsgId = sent.MessageId;

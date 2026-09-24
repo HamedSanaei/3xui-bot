@@ -16,11 +16,13 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     IPaymentGatewayAvailability availability, TenantCustomerWalletPolicy policy, HooshPay hoosh,
     Tetraminator tetra, UniquePay unique, AtlasPay atlas, NowPayments now)
 {
-    /// <summary>Customer-safe invoice delivery data; no raw provider response or credential is returned.</summary>
+    /// <summary>Customer-safe invoice delivery data; raw provider responses and API credentials are never exposed.</summary>
     /// <param name="Url">Provider-issued payment link, intended only for its paying customer.</param>
     /// <param name="CheckCallback">Compact callback identifying the persisted payment; the handler must revalidate ownership.</param>
     /// <param name="Notice">Persian customer-facing payment guidance without secrets.</param>
-    public sealed record Invoice(string Url, string CheckCallback, string Notice);
+    /// <param name="DirectPayment">Optional AtlasPay card details kept only in this in-memory result for immediate customer display.</param>
+    public sealed record Invoice(string Url, string CheckCallback, string Notice,
+        AtlasPayCustomerPaymentUi.DirectPayment DirectPayment = null);
 
     /// <summary>Issues the shared owned/tenant HooshPay wallet invoice after its row has committed.</summary>
     /// <param name="payment">Persisted wallet-charge row, including immutable origin and amount.</param>
@@ -190,11 +192,14 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
                 p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId;
                 p.BeginCreationAttempt(DateTime.UtcNow);
                 workflow.Add(p); await workflow.SaveAsync(token);
+                AtlasPayCustomerPaymentUi.DirectPayment directPayment = null;
                 try
                 {
-                    p.ApplyCreate(await CreateAtlasPayAsync(p, token), DateTime.UtcNow,
+                    var created = await CreateAtlasPayAsync(p, token);
+                    p.ApplyCreate(created, DateTime.UtcNow,
                         AtlasPayPollingPolicy.GetInitialNextInquiryUtc(config, DateTime.UtcNow));
                     await workflow.SaveAsync(token);
+                    directPayment = AtlasPayCustomerPaymentUi.TryCreateDirectPayment(created);
                 }
                 catch (Exception ex)
                 {
@@ -202,7 +207,14 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
                     await workflow.SaveAsync(CancellationToken.None);
                     throw;
                 }
-                return new(p.CustomerStartLink, $"apchk_{p.Id}", notice + $"\nمبلغ دقیق پرداخت: {p.TotalAmountToman:N0} تومان\nمهلت: {p.PaymentDeadlineAtUtc:O}");
+                return new(
+                    p.CustomerStartLink,
+                    $"apchk_{p.Id}",
+                    AtlasPayCustomerPaymentUi.BuildLinkFallbackText(
+                        p.TotalAmountToman!.Value,
+                        p.PaymentDeadlineAtUtc,
+                        p.TrackingCode),
+                    directPayment);
             }
             case PaymentGateway.NowPayments:
             {

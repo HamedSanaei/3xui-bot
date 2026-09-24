@@ -312,6 +312,11 @@ public sealed class AtlasPayCreateOrderResponse
     [JsonProperty("trackingCode")] public string TrackingCode { get; set; }
     [JsonProperty("totalAmountToman")] public long TotalAmountToman { get; set; }
     [JsonProperty("cardNumberMasked")] public string CardNumberMasked { get; set; }
+    // Direct-card fields are optional and intentionally remain creation-response-only. They are never copied to
+    // AtlasPayPaymentInfo/users.db, so full merchant card data is not retained by the normal payment record.
+    [JsonProperty("cardNumber")] public string CardNumber { get; set; }
+    [JsonProperty("cardHolderName")] public string CardHolderName { get; set; }
+    [JsonProperty("bankName")] public string BankName { get; set; }
     [JsonProperty("paymentDeadlineAt")] public DateTimeOffset PaymentDeadlineAt { get; set; }
     [JsonProperty("customerStartLink")] public string CustomerStartLink { get; set; }
 }

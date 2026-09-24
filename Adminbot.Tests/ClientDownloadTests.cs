@@ -673,6 +673,24 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(TelegramBotService.OwnedRenewMyAccountsCallback, v3Button.CallbackData);
     }
 
+    /// <summary>The owned help text tracks the latest customer, payment and tenant-wallet UX.</summary>
+    [Fact]
+    public void Owned_bot_capabilities_describe_latest_features()
+    {
+        var builder = typeof(TelegramBotService).GetMethod(
+            "BuildBotCapabilitiesMessage", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var text = (string)builder.Invoke(null, new object[] { new CredUser { IsColleague = true } })!;
+
+        Assert.Contains("مشاهده کانفیگ‌های من", text, StringComparison.Ordinal);
+        Assert.Contains("اکانت های من", text, StringComparison.Ordinal);
+        Assert.Contains("AtlasPay", text, StringComparison.Ordinal);
+        Assert.Contains("شماره‌کارت، صاحب کارت، بانک و مبلغ دقیق تومان/ریال", text, StringComparison.Ordinal);
+        Assert.Contains("ارسال رسید یا رفع مشکل تأیید", text, StringComparison.Ordinal);
+        Assert.Contains("ساخت پروفایل APN آیفون", text, StringComparison.Ordinal);
+        Assert.Contains("مجوز سوپرادمین", text, StringComparison.Ordinal);
+        Assert.Contains("فعال‌سازی صریح مالک", text, StringComparison.Ordinal);
+    }
+
     /// <summary>The tenant storefront keyboard tracks the shared live client-download switch independently.</summary>
     [Fact]
     public void Tenant_customer_keyboard_tracks_the_live_switch()

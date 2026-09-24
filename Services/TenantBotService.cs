@@ -7691,8 +7691,9 @@ public partial class TenantBotService
             payment.ApplyCreate(created, DateTime.UtcNow, AtlasPayPollingPolicy.GetInitialNextInquiryUtc(_appConfig, DateTime.UtcNow));
             order.AtlasPayPaymentInfoId = payment.Id; order.PaymentUrl = payment.CustomerStartLink; order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
-            await botClient.SendMessage(chatId, BuildTenantAtlasPayPaymentText(order, payment), parseMode: ParseMode.Html,
-                replyMarkup: BuildTenantAtlasPayPaymentKeyboard(payment), cancellationToken: cancellationToken);
+            var directPayment = AtlasPayCustomerPaymentUi.TryCreateDirectPayment(created);
+            await botClient.SendMessage(chatId, BuildTenantAtlasPayPaymentText(order, payment, directPayment), parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantAtlasPayPaymentKeyboard(payment, directPayment != null), cancellationToken: cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور اطلس‌پی ساخته شد.", cancellationToken: cancellationToken);
         }
         catch (Exception ex)
@@ -7712,14 +7713,18 @@ public partial class TenantBotService
         }
     }
 
-    internal static string BuildTenantAtlasPayPaymentText(TenantBotOrder order, AtlasPayPaymentInfo payment)
+    internal static string BuildTenantAtlasPayPaymentText(
+        TenantBotOrder order,
+        AtlasPayPaymentInfo payment,
+        AtlasPayCustomerPaymentUi.DirectPayment directPayment = null)
     {
-        var deadline = payment.PaymentDeadlineAtUtc?.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture) ?? "نامشخص";
-        return "⚠️ <b>پیش از پرداخت لطفاً موارد زیر را بررسی کنید:</b>\n\n" +
-               $"💰 مبلغ دقیق قابل پرداخت: <code>{Html(payment.TotalAmountToman!.Value.FormatCurrency())}</code>\n" +
-               $"⏱ مهلت پرداخت: <code>{Html(deadline)}</code>\n" +
-               $"🔖 شماره پیگیری: <code>{Html(payment.TrackingCode)}</code>\n\n" +
-               "مبلغ را دقیقاً مطابق عدد بالا پرداخت کنید. پس از پرداخت، وضعیت فقط با استعلام رسمی اطلس‌پی تایید می‌شود.";
+        if (directPayment != null)
+            return AtlasPayCustomerPaymentUi.BuildDirectPaymentText(directPayment);
+
+        return AtlasPayCustomerPaymentUi.BuildLinkFallbackText(
+            payment.TotalAmountToman!.Value,
+            payment.PaymentDeadlineAtUtc,
+            payment.TrackingCode);
     }
 
     /// <summary>
@@ -12531,18 +12536,16 @@ public partial class TenantBotService
     /// <remarks>
     /// Display labels only. The callback payload stays <c>apchk_{payment.Id}</c>, and the tenant customer check still
     /// re-verifies the payment against the official AtlasPay API before any wallet credit, order fulfillment, or ledger
-    /// effect. The payment button carries the <c>ریالی</c> marker and the customer-visible ۱۲٪ fee disclosure because
-    /// AtlasPay settles in Iranian tomans. Signed provider webhook processing is independent of Telegram button captions.
+    /// effect. With direct card details the mini-app URL is demoted to a receipt/recovery fallback; otherwise the existing
+    /// rial payment button and ۱۲٪ fee disclosure remain. Signed provider webhook processing is independent of captions.
     /// </remarks>
-    internal static InlineKeyboardMarkup BuildTenantAtlasPayPaymentKeyboard(AtlasPayPaymentInfo payment)
-    {
-        var rows = new List<InlineKeyboardButton[]>();
-        if (!string.IsNullOrWhiteSpace(payment?.CustomerStartLink))
-            rows.Add(new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | کارمزد ۱۲٪ | ریالی", payment.CustomerStartLink) });
-        if (payment != null && payment.Id > 0)
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", $"apchk_{payment.Id}") });
-        return new InlineKeyboardMarkup(rows);
-    }
+    internal static InlineKeyboardMarkup BuildTenantAtlasPayPaymentKeyboard(
+        AtlasPayPaymentInfo payment,
+        bool directCard = false)
+        => AtlasPayCustomerPaymentUi.BuildKeyboard(
+            payment?.CustomerStartLink,
+            payment != null && payment.Id > 0 ? $"apchk_{payment.Id}" : null,
+            directCard);
 
     /// <summary>
     /// Builds the inline keyboard for GATEWAYS whose payment URL is stored directly on the tenant order.

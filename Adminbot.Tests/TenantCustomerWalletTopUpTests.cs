@@ -54,7 +54,9 @@ public sealed partial class ConcurrencyTests
                 ["pay_id"] = "fixture-id", ["payment_link"] = "https://pay.example/", ["paymentLink"] = "https://pay.example/",
                 ["id"] = 1, ["invoice_url"] = "https://pay.example/", ["price_amount"] = 1, ["price_currency"] = "usdtbsc",
                 ["orderId"] = 1, ["trackingCode"] = "fixture-track", ["totalAmountToman"] = 100000,
-                ["cardNumberMasked"] = "****", ["paymentDeadlineAt"] = "2027-01-01T00:00:00Z", ["customerStartLink"] = "https://t.me/fixture_bot?start=test"
+                ["cardNumberMasked"] = "****", ["cardNumber"] = "6037999999991234",
+                ["cardHolderName"] = "Fixture Holder", ["bankName"] = "Fixture Bank",
+                ["paymentDeadlineAt"] = "2027-01-01T00:00:00Z", ["customerStartLink"] = "https://t.me/fixture_bot?start=test"
             }.ToString());
         });
         HttpClient Client() => new(handler, disposeHandler: false);
@@ -68,6 +70,18 @@ public sealed partial class ConcurrencyTests
             new AtlasPay(config, Client()), new NowPayments(config, Client(), new TenantWalletQuote()));
         var invoice = await charges.CreateTenantAsync("tenant-a", 123, 123, 100000, gateway, default);
         Assert.NotEmpty(invoice.Url); Assert.Equal(1, posts);
+        if (gateway == PaymentGateway.AtlasPay)
+        {
+            Assert.NotNull(invoice.DirectPayment);
+            Assert.Equal("6037999999991234", invoice.DirectPayment!.CardNumber);
+            Assert.Equal("Fixture Holder", invoice.DirectPayment.CardHolderName);
+            Assert.Equal("Fixture Bank", invoice.DirectPayment.BankName);
+            Assert.Equal(100000, invoice.DirectPayment.TotalAmountToman);
+        }
+        else
+        {
+            Assert.Null(invoice.DirectPayment);
+        }
         await using (var db = databases.Users.CreateDbContext())
         { var store = await db.BotInstances.SingleAsync(); TenantCustomerWalletPolicy.Revoke(store); await db.SaveChangesAsync(); }
         await Assert.ThrowsAsync<InvalidOperationException>(() => charges.CreateTenantAsync("tenant-a", 123, 123, 100000, gateway, default));
