@@ -652,6 +652,25 @@ public sealed partial class ConcurrencyTests
         Assert.True((bool)myAccountsDetector.Invoke(null, new object[] { "وضعیت اکانت های من" })!);
     }
 
+    /// <summary>Both owned renewal entry paths expose the same inline account-list shortcut.</summary>
+    [Fact]
+    public void Owned_renewal_start_keyboards_offer_my_accounts_callback()
+    {
+        var legacyBuilder = typeof(TelegramBotService).GetMethod(
+            "BuildOwnedRenewStartKeyboard", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var legacy = (InlineKeyboardMarkup)legacyBuilder.Invoke(null, Array.Empty<object>())!;
+        var legacyButton = Assert.Single(legacy.InlineKeyboard.SelectMany(row => row));
+        Assert.Equal("اکانت های من", legacyButton.Text);
+        Assert.Equal(TelegramBotService.OwnedRenewMyAccountsCallback, legacyButton.CallbackData);
+
+        var v3Builder = typeof(XuiV3BotFlowService).GetMethod(
+            "BuildRenewStartKeyboard", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var v3 = (InlineKeyboardMarkup)v3Builder.Invoke(null, Array.Empty<object>())!;
+        var v3Button = Assert.Single(v3.InlineKeyboard.SelectMany(row => row),
+            button => button.Text == "اکانت های من");
+        Assert.Equal(TelegramBotService.OwnedRenewMyAccountsCallback, v3Button.CallbackData);
+    }
+
     /// <summary>The tenant storefront keyboard tracks the shared live client-download switch independently.</summary>
     [Fact]
     public void Tenant_customer_keyboard_tracks_the_live_switch()

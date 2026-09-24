@@ -811,18 +811,19 @@ public class XuiV3BotFlowService
 
             await botClient.SendMessage(
                 chatId: message.Chat.Id,
-                text: "یکی از شناسه‌های اکانت نسخه ۳ را برای تمدید ارسال کنید:\n" +
+                text: "برای ادامه تمدید، یکی از اطلاعات اکانت را برای ربات ارسال کنید:\n" +
                       "• نام اکانت (Email)\n" +
                       "• SubId یا لینک اشتراک\n" +
                       "• UUID\n" +
                       "• یکی از کانفیگ‌های VLESS، VMess، Trojan، Shadowsocks یا Hysteria\n\n" +
+                      "اگر این اطلاعات را نمی‌دانید، از دکمه «اکانت های من» در پیام بعد استفاده کنید و اکانت موردنظر را از لیست انتخاب کنید.\n\n" +
                       "تمدید اکانت شخص دیگر ممکن است، اما مالکیت یا دسترسی مدیریتی آن را تغییر نمی‌دهد.",
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
             await botClient.SendMessage(
                 chatId: message.Chat.Id,
-                text: "برای خروج از فرایند تمدید از دکمه زیر استفاده کنید.",
-                replyMarkup: BuildRenewHomeKeyboard(),
+                text: "می‌توانید اکانت را دستی بفرستید یا از لیست اکانت‌های خودتان انتخاب کنید:",
+                replyMarkup: BuildRenewStartKeyboard(),
                 cancellationToken: cancellationToken);
             return true;
         }
@@ -1236,6 +1237,17 @@ public class XuiV3BotFlowService
             text: text,
             replyMarkup: BuildRenewHomeKeyboard(),
             cancellationToken: cancellationToken);
+    }
+
+    /// <summary>Builds the inline choices shown immediately after an owned XUI v3 renewal starts.</summary>
+    /// <returns>An inline keyboard that can list the sender's accounts or abandon the current renewal flow.</returns>
+    private static InlineKeyboardMarkup BuildRenewStartKeyboard()
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData("اکانت های من", TelegramBotService.OwnedRenewMyAccountsCallback) },
+            new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) }
+        });
     }
 
     /// <summary>

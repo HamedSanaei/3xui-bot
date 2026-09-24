@@ -49,6 +49,9 @@ public partial class TelegramBotService
     /// <summary>Owned-customer shortcut that starts the same renewal flow exposed inside account management.</summary>
     internal const string OwnedRenewAction = "🔄 تمدید اکانت";
 
+    /// <summary>Owned-bot inline callback shown on the renewal-start prompt to list the current customer's accounts.</summary>
+    internal const string OwnedRenewMyAccountsCallback = "owned:renew:accounts";
+
     /// <summary>Owned-customer account-management action that shows the user's wallet/profile balance.</summary>
     internal const string OwnedWalletViewAction = "💰 مشاهده کیف پول";
 
@@ -898,6 +901,12 @@ public partial class TelegramBotService
             if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
             {
                 await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, callbackCredUser, callbackUserState, cancellationToken);
+                return;
+            }
+
+            if (string.Equals(callbackQuery.Data, OwnedRenewMyAccountsCallback, StringComparison.Ordinal))
+            {
+                await HandleOwnedRenewMyAccountsCallbackAsync(botClient, callbackQuery, callbackCredUser, cancellationToken);
                 return;
             }
 
@@ -2533,6 +2542,52 @@ public partial class TelegramBotService
 
         }
 
+    }
+
+    /// <summary>Lists the current owned customer's accounts from the renewal-start inline shortcut.</summary>
+    /// <param name="botClient">Telegram client of the active owned bot.</param>
+    /// <param name="callbackQuery">Authenticated callback sender; callback data contains no account identifier.</param>
+    /// <param name="credUser">Current global customer profile used only for ownership filtering and role display.</param>
+    /// <param name="cancellationToken">Cancellation token for panel reads and Telegram delivery.</param>
+    /// <returns>A task completing after the XUI v3 list or legacy fallback list is delivered.</returns>
+    /// <remarks>The active renewal conversation state is deliberately preserved so manual identifier entry still works after viewing the list.</remarks>
+    private async Task HandleOwnedRenewMyAccountsCallbackAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        CredUser credUser,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase) || credUser == null)
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id,
+                text: "این گزینه فقط در ربات اصلی در دسترس است.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "در حال دریافت اکانت‌های شما...", cancellationToken: cancellationToken);
+        var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var syntheticMessage = new Message
+        {
+            Chat = callbackQuery.Message?.Chat ?? new Chat { Id = chatId },
+            From = callbackQuery.From,
+            Text = OwnedMyConfigsAction
+        };
+
+        if (await _xuiV3BotFlowService.TryHandleMyAccountsAsync(
+                botClient, syntheticMessage, credUser, MainReplyMarkupKeyboardFa(), cancellationToken))
+            return;
+
+        await botClient.SendMessage(chatId, "در حال دریافت اکانت‌های شما...", cancellationToken: cancellationToken);
+        var accounts = await TryGetَAllClient(credUser.TelegramUserId);
+        if (accounts.Count == 0)
+        {
+            await botClient.SendMessage(chatId, "شما هنوز هیچ اکانتی از مجموعه ما ندارید.", cancellationToken: cancellationToken);
+            return;
+        }
+
+        await SendMessageWithClientInfo(chatId, credUser.IsColleague, accounts);
     }
 
     /// <summary>
@@ -7320,8 +7375,8 @@ public partial class TelegramBotService
             await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "لطفاً لینک Vmess یا نام اکانت خود را برای ربات ارسال کنید:",
-                replyMarkup: new ReplyKeyboardRemove(), parseMode: ParseMode.Markdown);
+                text: "برای ادامه تمدید، نام اکانت یا کانفیگ/لینک اکانت را برای ربات ارسال کنید.\n\nاگر نام یا کانفیگ را نمی‌دانید، از دکمه «اکانت های من» در پایین همین پیام استفاده کنید و اکانت موردنظر را از لیست پیدا کنید.",
+                replyMarkup: BuildOwnedRenewStartKeyboard(), parseMode: ParseMode.Markdown);
 
         }
         else if (user.Flow == "update" && user.LastStep == "get-traffic")
@@ -10136,6 +10191,11 @@ public partial class TelegramBotService
         }
         return value;
     }
+    /// <summary>Builds the inline shortcut shown immediately after a legacy owned renewal starts.</summary>
+    /// <returns>An inline keyboard that lists the sender's accounts without leaving the active renewal flow.</returns>
+    private static InlineKeyboardMarkup BuildOwnedRenewStartKeyboard()
+        => new(new[] { new[] { InlineKeyboardButton.WithCallbackData("اکانت های من", OwnedRenewMyAccountsCallback) } });
+
     /// <summary>Builds the owned-bot account-management submenu with stable two-column customer actions.</summary>
     /// <param name="credUser">Current owned-bot customer; colleague status controls the lower management rows.</param>
     /// <returns>The reply keyboard shown after the customer opens account management.</returns>
