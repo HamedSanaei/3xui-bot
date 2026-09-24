@@ -90,6 +90,10 @@ public sealed partial class ConcurrencyTests
         }
         using (context.Push(new BotRuntimeContext { Config = new BotInstanceConfig { Id = "main", Type = "owned" }, Client = client }))
         {
+            var menuUpdate = new Update { Message = new Message { Text = TenantBotService.TenantWalletAdminMenuAction,
+                From = new Telegram.Bot.Types.User { Id = 999 }, Chat = new Chat { Id = 999 } } };
+            Assert.True(await tenant.TryHandleWalletAdminAsync(client, menuUpdate, default));
+            Assert.Contains(client.Texts, x => x.Contains("مدیریت مجوز کیف پول مشتری", StringComparison.Ordinal));
             await tenant.TryHandleWalletAdminAsync(client, Callback(456, "TWA:o:456:1"), default);
             Assert.Equal("دسترسی مجاز نیست.", client.Texts.Last());
             await tenant.TryHandleWalletAdminAsync(client, Callback(999, "TWA:o:456:1"), default);

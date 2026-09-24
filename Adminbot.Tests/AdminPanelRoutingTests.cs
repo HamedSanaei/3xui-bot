@@ -271,6 +271,7 @@ public sealed class AdminPanelRoutingTests
         // Q and R: the audited wallet credit/debit actions stay reachable from the same panel.
         Assert.Contains("➕ Add credit", labels);
         Assert.Contains("➖ Reduce credit", labels);
+        Assert.Contains(TenantBotService.TenantWalletAdminMenuAction, labels);
         Assert.Contains("📑 Menu", labels);
     }
 

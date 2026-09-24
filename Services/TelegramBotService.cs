@@ -5774,6 +5774,7 @@ public partial class TelegramBotService
             AdminWeeklyUsageAction,
             AdminMonthlyUsageAction,
             AdminPaymentGatewayAction,
+            TenantBotService.TenantWalletAdminMenuAction,
             AdminClientDownloadAction,
             "🤖 وضعیت ربات‌ها",
             AdminManualReviewAction,

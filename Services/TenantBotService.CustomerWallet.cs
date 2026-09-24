@@ -9,6 +9,9 @@ using Adminbot.Utils;
 
 public partial class TenantBotService
 {
+    /// <summary>Owned-bot super-admin reply-keyboard action that opens tenant customer-wallet grant management.</summary>
+    /// <remarks>This is exactly equivalent to <c>/tenantwallet</c>; both routes converge on the same authorization and nonce flow.</remarks>
+    internal const string TenantWalletAdminMenuAction = "💰 مدیریت کیف پول فروشگاه‌ها";
     /// <summary>Routes approved customer wallet actions without entering the owned renewal engine.</summary>
     /// <param name="client">Current tenant Telegram client.</param>
     /// <param name="update">Customer update; its authenticated sender selects the global wallet.</param>
@@ -189,14 +192,18 @@ public partial class TenantBotService
     /// <param name="update">Telegram update whose authenticated sender supplies the administrator identity.</param>
     /// <param name="token">Cancellation of reads, permission persistence and Telegram delivery.</param>
     /// <returns>True when the wallet administration command or callback was consumed, including rejected attempts.</returns>
-    /// <remarks>Use /tenantwallet with an optional username, brand, internal id or owner id. Confirmation callbacks carry only a
-    /// nonce and expire after five minutes. Owners have no permission toggle. Every mutation rechecks configured super-admin authority.</remarks>
+    /// <remarks>Use the super-admin menu action or /tenantwallet with an optional username, brand, internal id or owner id.
+    /// Confirmation callbacks carry only a nonce and expire after five minutes. Tenant owners can only toggle their separate
+    /// opt-in after a grant; they cannot grant permission. Every grant mutation rechecks configured super-admin authority.</remarks>
     public async Task<bool> TryHandleWalletAdminAsync(ITelegramBotClient client, Update update, CancellationToken token)
     {
         var callback = update.CallbackQuery;
         var text = update.Message?.Text;
+        var isMenuAction = string.Equals(text, TenantWalletAdminMenuAction, StringComparison.Ordinal);
         if (callback?.Data?.StartsWith("TWA:", StringComparison.Ordinal) != true
-            && text != "/tenantwallet" && text?.StartsWith("/tenantwallet ", StringComparison.Ordinal) != true) return false;
+            && !isMenuAction
+            && text != "/tenantwallet"
+            && text?.StartsWith("/tenantwallet ", StringComparison.Ordinal) != true) return false;
         var actor = callback?.From.Id ?? update.Message?.From?.Id ?? 0;
         var chat = callback?.Message?.Chat.Id ?? update.Message?.Chat.Id ?? actor;
         if (BotContextAccessor.CurrentBotType != BotInstanceTypes.Owned || actor <= 0 || _appConfig.AdminsUserIds?.Contains(actor) != true)
@@ -206,7 +213,7 @@ public partial class TenantBotService
         }
         if (callback == null)
         {
-            var search = text.Length > 13 ? text[13..].Trim() : "";
+            var search = !isMenuAction && text.Length > 13 ? text[13..].Trim() : "";
             var rows = await _workflow.ReadAsync(db => db.BotInstances.AsNoTracking()
                 .Where(x => x.Type == BotInstanceTypes.Tenant && (search == "" || x.Id.Contains(search)
                     || (x.Username != null && x.Username.Contains(search)) || (x.BrandName != null && x.BrandName.Contains(search))
