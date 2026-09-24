@@ -137,30 +137,25 @@ public sealed partial class ConcurrencyTests
     }
 
     [Fact]
-    public async Task AtlasPay_webhook_primary_due_scan_never_polls_unrelated_invoices()
+    public async Task AtlasPay_webhook_primary_due_scan_recovers_missing_webhook_with_bounded_polling()
     {
         using var databases = new Databases();
         var config = AtlasWebhookConfiguration();
         var handler = new AtlasHttpHandler((_, _, _, _) =>
             Task.FromResult(JsonResponse(System.Net.HttpStatusCode.OK, StatusJson("awaiting_payment"))));
 
-        int unrelatedId;
-        int signaledId;
+        int paymentId;
         await using (var db = databases.Users.CreateDbContext())
         {
-            var unrelated = VerifiedAtlasPayment();
-            unrelated.MerchantOrderRef = "AtlasPay-unrelated";
-            unrelated.ProviderOrderId = 78;
-            unrelated.TrackingCode = "TRK-78";
-            unrelated.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(-1);
-            db.AtlasPayPaymentInfos.Add(unrelated);
-
-            var signaled = VerifiedAtlasPayment();
-            signaled.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(-1);
-            db.AtlasPayPaymentInfos.Add(signaled);
+            var payment = VerifiedAtlasPayment();
+            payment.NextInquiryAtUtc = null; // legacy webhook-only rows were stranded in exactly this state
+            payment.WebhookEvent = null;
+            payment.WebhookReceivedAtUtc = null;
+            payment.WebhookProcessedAtUtc = null;
+            payment.ReconciliationState = AtlasPayReconciliationStates.Active;
+            db.AtlasPayPaymentInfos.Add(payment);
             await db.SaveChangesAsync();
-            unrelatedId = unrelated.Id;
-            signaledId = signaled.Id;
+            paymentId = payment.Id;
         }
 
         var worker = new AtlasPayReconciliationHostedService(
@@ -171,26 +166,30 @@ public sealed partial class ConcurrencyTests
             NullLogger<AtlasPayReconciliationHostedService>.Instance);
 
         await worker.ReconcileDueAsync();
-        Assert.Empty(handler.Captures);
 
-        await using (var db = databases.Users.CreateDbContext())
-        {
-            var signaled = await db.AtlasPayPaymentInfos.SingleAsync(x => x.Id == signaledId);
-            signaled.WebhookEvent = "order.confirmed";
-            signaled.WebhookReceivedAtUtc = DateTime.UtcNow;
-            signaled.WebhookProviderTimestampUtc = DateTime.UtcNow;
-            await db.SaveChangesAsync();
-        }
-
-        await worker.ReconcileDueAsync();
-
-        Assert.Single(handler.Captures);
-        Assert.Contains("/orders/77", handler.Captures[0].Uri, StringComparison.Ordinal);
-        Assert.DoesNotContain(handler.Captures, capture =>
-            capture.Uri.Contains("/orders/78", StringComparison.Ordinal));
+        var capture = Assert.Single(handler.Captures);
+        Assert.Equal(HttpMethod.Get, capture.Method);
+        Assert.Contains("/orders/77", capture.Uri, StringComparison.Ordinal);
 
         await using var verify = databases.Users.CreateDbContext();
-        Assert.Null((await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == unrelatedId)).WebhookReceivedAtUtc);
+        var saved = await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId);
+        Assert.Equal(1, saved.InquiryAttemptCount);
+        Assert.NotNull(saved.LastInquiryAtUtc);
+        Assert.NotNull(saved.NextInquiryAtUtc);
+        Assert.Equal(AtlasPayReconciliationStates.Active, saved.ReconciliationState);
+        Assert.Null(saved.WebhookReceivedAtUtc);
+    }
+
+    [Fact]
+    public void AtlasPay_webhook_primary_still_schedules_polling_fallback()
+    {
+        var config = AtlasWebhookConfiguration().Get<AppConfig>()!;
+        var now = new DateTime(2026, 9, 24, 20, 0, 0, DateTimeKind.Utc);
+        var next = AtlasPayPollingPolicy.GetInitialNextInquiryUtc(config, now);
+
+        Assert.NotNull(next);
+        Assert.Equal(now.AddSeconds(30), next);
+        Assert.True(AtlasPayPollingPolicy.UsesWebhookPrimary(config));
     }
 
     [Fact]

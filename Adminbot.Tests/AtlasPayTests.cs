@@ -145,6 +145,46 @@ public sealed partial class ConcurrencyTests
     }
 
     [Fact]
+    public async Task AtlasPay_admin_lookup_accepts_incident_identifiers_without_bare_numeric_ambiguity()
+    {
+        using var databases = new Databases();
+        int paymentId;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var payment = VerifiedAtlasPayment();
+            payment.MerchantOrderRef = "AtlasPay-242f6ed128be4004a1bacafdbd047d12";
+            payment.TrackingCode = "ff0ef3ef194e85a8";
+            payment.ProviderOrderId = 10658;
+            db.AtlasPayPaymentInfos.Add(payment);
+            await db.SaveChangesAsync();
+            paymentId = payment.Id;
+        }
+
+        var inputs = new[]
+        {
+            $"AP:{paymentId}",
+            "AtlasPay-242f6ed128be4004a1bacafdbd047d12",
+            "242f6ed128be4004a1bacafdbd047d12",
+            "ff0ef3ef194e85a8",
+            "#ff0ef3ef194e85a8",
+            "APO:10658"
+        };
+
+        await using var verify = databases.Users.CreateDbContext();
+        foreach (var input in inputs)
+        {
+            var found = await XuiV3AdminFlowService
+                .BuildAtlasPayLookupQuery(verify.AtlasPayPaymentInfos.AsNoTracking(), input)
+                .SingleAsync();
+            Assert.Equal(paymentId, found.Id);
+        }
+
+        Assert.Empty(await XuiV3AdminFlowService
+            .BuildAtlasPayLookupQuery(verify.AtlasPayPaymentInfos.AsNoTracking(), paymentId.ToString())
+            .ToListAsync());
+    }
+
+    [Fact]
     public async Task AtlasPay_create_transport_failure_is_not_retried()
     {
         var handler = new AtlasHttpHandler((_, _, _, _) => throw new HttpRequestException("offline"));

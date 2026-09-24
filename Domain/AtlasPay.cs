@@ -1184,9 +1184,10 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
     /// <param name="cancellationToken">Cancellation token for users.db reads and provider reconciliation.</param>
     /// <returns>A task completing after the bounded due batch has been processed.</returns>
     /// <remarks>
-    /// With a webhook secret configured, only payments with a durably received but not conclusively processed webhook are
-    /// eligible. The periodic timer merely recovers that received event after queue loss/restart; it does not scan or
-    /// confirm unrelated invoices. Without a webhook secret, legacy bounded polling remains available for compatibility.
+    /// Signed webhook receipts are processed first when configured, but the same bounded read-only polling fallback is
+    /// always retained. This prevents a provider-confirmed payment from becoming permanently stranded when webhook
+    /// delivery is delayed or missing. Legacy rows created by the previous webhook-only policy are recovered when their
+    /// reconciliation state is still active even if <see cref="AtlasPayPaymentInfo.NextInquiryAtUtc"/> is null.
     /// </remarks>
     public async Task ReconcileDueAsync(CancellationToken cancellationToken = default)
     {
@@ -1196,45 +1197,54 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
         var webhookPrimary = AtlasPayPollingPolicy.UsesWebhookPrimary(_configuration);
         await using var db = _factory.CreateDbContext();
 
-        List<int> ids;
-        if (webhookPrimary)
-        {
-            ids = await db.AtlasPayPaymentInfos.AsNoTracking()
+        var webhookIds = webhookPrimary
+            ? await db.AtlasPayPaymentInfos.AsNoTracking()
                 .Where(x => x.ProviderOrderId != null &&
                             x.CreationState == AtlasPayCreationStates.Created &&
                             x.WebhookReceivedAtUtc != null &&
-                            (x.WebhookProcessedAtUtc == null || x.WebhookProcessedAtUtc < x.WebhookReceivedAtUtc) &&
-                            (x.NextInquiryAtUtc == null || x.NextInquiryAtUtc <= now))
+                            (x.WebhookProcessedAtUtc == null || x.WebhookProcessedAtUtc < x.WebhookReceivedAtUtc))
                 .OrderBy(x => x.WebhookReceivedAtUtc).ThenBy(x => x.Id)
-                .Select(x => x.Id).Take(batch).ToListAsync(cancellationToken);
-        }
-        else
-        {
-            ids = await db.AtlasPayPaymentInfos.AsNoTracking()
+                .Select(x => x.Id)
+                .Take(batch)
+                .ToListAsync(cancellationToken)
+            : new List<int>();
+
+        var remaining = Math.Max(0, batch - webhookIds.Count);
+        var fallbackIds = remaining == 0
+            ? new List<int>()
+            : await db.AtlasPayPaymentInfos.AsNoTracking()
                 .Where(x => x.ProviderOrderId != null &&
                             (!x.IsAddedToBalance ||
                              (x.IsProvisionallyApproved && x.ProviderConfirmedAfterProvisionalAtUtc == null)) &&
                             x.CreationState == AtlasPayCreationStates.Created &&
                             x.SettlementState != AtlasPaySettlementStates.ManualReview &&
-                            x.ProviderStatus != "rejected" && x.ProviderStatus != "expired" && x.ProviderStatus != "cancelled" &&
+                            x.ReconciliationState == AtlasPayReconciliationStates.Active &&
+                            x.ProviderStatus != "rejected" &&
+                            x.ProviderStatus != "expired" &&
+                            x.ProviderStatus != "cancelled" &&
                             x.InquiryAttemptCount < max &&
-                            x.NextInquiryAtUtc != null && x.NextInquiryAtUtc <= now)
-                .OrderBy(x => x.NextInquiryAtUtc).ThenBy(x => x.Id)
-                .Select(x => x.Id).Take(batch).ToListAsync(cancellationToken);
-        }
+                            (x.NextInquiryAtUtc == null || x.NextInquiryAtUtc <= now) &&
+                            !webhookIds.Contains(x.Id))
+                .OrderBy(x => x.NextInquiryAtUtc ?? x.CreatedAtUtc)
+                .ThenBy(x => x.Id)
+                .Select(x => x.Id)
+                .Take(remaining)
+                .ToListAsync(cancellationToken);
 
-        foreach (var id in ids)
+        var webhookSet = webhookIds.ToHashSet();
+        foreach (var id in webhookIds.Concat(fallbackIds))
         {
-            if (webhookPrimary && await MarkWebhookProcessedIfConclusiveAsync(id, cancellationToken))
+            var webhookTriggered = webhookSet.Contains(id);
+            if (webhookTriggered && await MarkWebhookProcessedIfConclusiveAsync(id, cancellationToken))
                 continue;
 
             await ReconcilePaymentAsync(
                 id,
-                webhookPrimary ? "atlaspay-webhook" : "reconciliation-worker",
+                webhookTriggered ? "atlaspay-webhook" : "reconciliation-worker",
                 false,
                 cancellationToken);
 
-            if (webhookPrimary)
+            if (webhookTriggered)
                 await MarkWebhookProcessedIfConclusiveAsync(id, cancellationToken);
         }
     }

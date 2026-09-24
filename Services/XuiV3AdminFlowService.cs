@@ -421,7 +421,7 @@ public partial class XuiV3AdminFlowService
 
             await botClient.SendMessage(
                 chatId: message.Chat.Id,
-                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای تترامیناتور می‌توانید `Order ID`، `Pay ID` یا شناسه داخلی رکورد را بفرستید.\nبرای UniquePay می‌توانید `UP:8`، `Hash ID` یا `Ref ID` بفرستید.\nبرای AtlasPay می‌توانید `AP:8` یا شناسه داخلی پرداخت AtlasPay را بفرستید تا با استعلام رسمی \"تایید پرداخت\" بررسی شود.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
+                text: "شناسه پرداخت را ارسال کنید.\nبرای NOWPayments می‌توانید `Order ID`، `Payment ID` یا `Invoice ID` بفرستید.\nبرای HooshPay می‌توانید `Order ID`، `Invoice UID` یا شناسه داخلی رکورد را بفرستید.\nبرای تترامیناتور می‌توانید `Order ID`، `Pay ID` یا شناسه داخلی رکورد را بفرستید.\nبرای UniquePay می‌توانید `UP:8`، `Hash ID` یا `Ref ID` بفرستید.\nبرای AtlasPay می‌توانید `AP:12`، `AtlasPay-...`، Tracking Code (با یا بدون #) یا `APO:10658` را بفرستید؛ نتیجه همیشه با استعلام رسمی AtlasPay بررسی می‌شود.\nبرای سفارش ناقص ربات فروشگاهی هم می‌توانید `OrderId` همان سفارش tenant را بفرستید تا تایید/تلاش مجدد انجام شود.\nاگر پرداخت در درگاه تایید شده باشد و قبلاً اعمال نشده باشد، تسویه یا تحویل انجام می‌شود:",
                 parseMode: ParseMode.Markdown,
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
@@ -2200,11 +2200,16 @@ public partial class XuiV3AdminFlowService
         string input,
         CancellationToken cancellationToken)
     {
-        if (!TryParseAtlasPayInternalId(input, out var paymentId)) return false;
         if (_atlasPayReconciliation == null) return false;
 
-        var payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos
-            .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken));
+        var payment = await _workflow.ReadAsync(async db =>
+        {
+            var matches = await BuildAtlasPayLookupQuery(db.AtlasPayPaymentInfos.AsNoTracking(), input)
+                .OrderByDescending(x => x.CreatedAtUtc)
+                .Take(2)
+                .ToListAsync(cancellationToken);
+            return matches.Count == 1 ? matches[0] : null;
+        });
         if (payment == null) return false;
 
         // Same authoritative boundary as polling and customer checks. The admin identity in the audit log is the only
@@ -2260,14 +2265,54 @@ public partial class XuiV3AdminFlowService
         return true;
     }
 
+    /// <summary>Builds the exact AtlasPay lookup used by the super-admin payment verification flow.</summary>
+    /// <param name="payments">AtlasPay payment query rooted in users.db.</param>
+    /// <param name="input">
+    /// One of: <c>AP:&lt;localId&gt;</c>, <c>APO:&lt;providerOrderId&gt;</c>, full merchant ref,
+    /// tracking code with or without <c>#</c>, or the bare 32-character merchant-ref suffix.
+    /// </param>
+    /// <returns>A query containing only exact identifier matches; the caller rejects ambiguous multi-row results.</returns>
+    /// <remarks>
+    /// Bare numeric values are never interpreted as AtlasPay local/provider ids, preventing cross-provider ambiguity in
+    /// the shared payment verification flow. The 32-character suffix is expanded only to the canonical
+    /// <c>AtlasPay-&lt;suffix&gt;</c> merchant reference form.
+    /// </remarks>
+    internal static IQueryable<AtlasPayPaymentInfo> BuildAtlasPayLookupQuery(
+        IQueryable<AtlasPayPaymentInfo> payments,
+        string input)
+    {
+        var value = input?.Trim() ?? string.Empty;
+        if (TryParseAtlasPayInternalId(value, out var localId))
+            return payments.Where(x => x.Id == localId);
+
+        if (value.StartsWith("APO:", StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(value[4..].Trim(), out var providerOrderId) &&
+            providerOrderId > 0)
+        {
+            return payments.Where(x => x.ProviderOrderId == providerOrderId);
+        }
+
+        if (value.StartsWith("#", StringComparison.Ordinal))
+            value = value[1..].Trim();
+
+        var merchantRef = value;
+        if (value.Length == 32 && value.All(Uri.IsHexDigit))
+            merchantRef = "AtlasPay-" + value;
+
+        if (string.IsNullOrWhiteSpace(value))
+            return payments.Where(_ => false);
+
+        return payments.Where(x =>
+            x.MerchantOrderRef == value ||
+            x.MerchantOrderRef == merchantRef ||
+            x.TrackingCode == value);
+    }
+
     /// <summary>Parses a provider-qualified AtlasPay internal payment id.</summary>
     /// <param name="input">Admin input in exact case-insensitive <c>AP:&lt;positive integer&gt;</c> form.</param>
     /// <param name="paymentId">Parsed positive users.db primary key, or zero when parsing fails.</param>
     /// <returns><c>true</c> when the provider prefix and a positive numeric id are both present.</returns>
-    /// <remarks>
-    /// A bare numeric id is deliberately rejected so an AtlasPay row can never be confused with another provider's
-    /// table, and so an operator cannot reach a payment by guessing an unrelated local key.
-    /// </remarks>
+    /// <remarks>A bare numeric id is deliberately rejected so another provider's local id cannot be misaddressed.</remarks>
     private static bool TryParseAtlasPayInternalId(string input, out int paymentId)
     {
         paymentId = 0;
