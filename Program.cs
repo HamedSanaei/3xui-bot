@@ -4,6 +4,7 @@ using Telegram.Bot;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Adminbot.Services;
+using Adminbot.Services.AppleMobileConfig;
 using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Builder;
@@ -155,6 +156,10 @@ public class Program
         // One shared release resolver for owned and tenant bots, so the asset-selection rules cannot diverge between them.
         services.AddSingleton<IClientReleaseService>(sp =>
             new ClientReleaseService(sp.GetRequiredService<ILogger<ClientReleaseService>>()));
+        // Apple APN profile generation is fully local and stateless. The scoped Telegram flow stores only transient
+        // bot/user conversation state through the existing UserStateStore and never persists generated profile bytes.
+        services.AddSingleton<IAppleMobileConfigGenerator, AppleMobileConfigGenerator>();
+        services.AddScoped<AppleMobileConfigTelegramFlow>();
         services.AddSingleton<NowPayments>();
         services.AddScoped<NowPaymentsSettlementService>();
         services.AddSingleton<HooshPay>();

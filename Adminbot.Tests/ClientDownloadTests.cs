@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Text;
 using Adminbot.Domain;
 using Adminbot.Services;
+using Adminbot.Services.AppleMobileConfig;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Telegram.Bot;
@@ -625,6 +626,7 @@ public sealed partial class ConcurrencyTests
         var rows = OwnedKeyboardRows(service);
         var accountRow = Assert.Single(rows, row => row.Contains("⚙️ مدیریت اکانت"));
         Assert.Equal(2, accountRow.Length);
+        Assert.Contains(AppleMobileConfigText.MenuCommand, rows.SelectMany(row => row));
         Assert.Contains(TelegramBotService.OwnedRenewAction, accountRow);
 
         var renewDetector = typeof(XuiV3BotFlowService).GetMethod(
@@ -680,9 +682,11 @@ public sealed partial class ConcurrencyTests
         var service = BuildClientDownloadTenantService(databases, flag, new CountingReleaseService());
 
         Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, TenantKeyboardLabels(service));
+        Assert.Contains(AppleMobileConfigText.MenuCommand, TenantKeyboardLabels(service));
 
         flag.SetEnabled(true);
         Assert.Contains(ClientDownloadCallbacks.OpenCommand, TenantKeyboardLabels(service));
+        Assert.Contains(AppleMobileConfigText.MenuCommand, TenantKeyboardLabels(service));
     }
 
     /// <summary>

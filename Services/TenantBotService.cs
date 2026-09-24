@@ -6,6 +6,7 @@ using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Adminbot.Domain.TelegramUi;
 using Adminbot.Services;
+using Adminbot.Services.AppleMobileConfig;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -857,6 +858,38 @@ public partial class TenantBotService
             var tenant = await GetCurrentTenantBotAsync(CancellationToken);
             if (tenant != null)
                 await TouchTenantCustomerStateAsync(tenant, CallbackQuery.From.Id, CancellationToken);
+
+            // Apple APN callbacks stay behind the same tenant Mandatory Join gate as normal customer actions.
+            // Profile generation is local/in-memory and cannot select another storefront or external service.
+            if (AppleMobileConfigTelegramFlow.IsCallback(CallbackQuery.Data))
+            {
+                // A callback ACK is non-authorizing UX only. Send it before the potentially slow membership probe;
+                // storefront access, mandatory join, and every business restriction still gate the actual APN action.
+                await SafeAnswerCallbackQueryAsync(
+                    botClient,
+                    CallbackQuery.Id,
+                    cancellationToken: CancellationToken);
+
+                if (!await EnsureTenantCustomerJoinAsync(
+                        botClient,
+                        CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                        CallbackQuery.From.Id,
+                        tenant,
+                        CancellationToken))
+                {
+                    return true;
+                }
+
+                await _serviceProvider.GetRequiredService<AppleMobileConfigTelegramFlow>()
+                    .TryHandleCallbackAsync(
+                        botClient,
+                        CallbackQuery,
+                        User,
+                        BuildTenantReplyKeyboardForStore(tenant),
+                        CancellationToken,
+                        callbackAlreadyAcknowledged: true);
+                return true;
+            }
 
             // Latest-client-software downloads share one callback namespace with the owned bot so both storefront
             // families behave identically. Only the three compile-time platforms can be selected, and the handler
@@ -3937,6 +3970,17 @@ public partial class TenantBotService
             return;
         }
 
+        if (await _serviceProvider.GetRequiredService<AppleMobileConfigTelegramFlow>()
+                .TryHandleMessageAsync(
+                    botClient,
+                    Message,
+                    User,
+                    tenantReplyKeyboard,
+                    CancellationToken))
+        {
+            return;
+        }
+
         // Reuse owned trial eligibility, per-type cooldown and durable creation under the current storefront context.
         if (await _xuiV3BotFlowService.TryHandleFreeTrialAsync(
                 botClient, Message, customer, User, tenantReplyKeyboard, CancellationToken))
@@ -6454,7 +6498,9 @@ public partial class TenantBotService
         if (TenantCustomerWalletPolicy.IsApproved(store))
             rows.Add(new KeyboardButton[] { "💰 کیف پول", "📒 تراکنش‌های من" });
         if (_clientDownloadAvailability.Snapshot.Enabled)
-            rows.Add(new KeyboardButton[] { ClientDownloadCallbacks.OpenCommand });
+            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand, ClientDownloadCallbacks.OpenCommand });
+        else
+            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand });
 
         return new ReplyKeyboardMarkup(rows)
         {

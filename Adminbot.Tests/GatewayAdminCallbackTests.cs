@@ -214,6 +214,7 @@ public sealed partial class ConcurrencyTests
         public List<EditMessageTextRequest> EditAttempts { get; } = new();
         public List<AnswerCallbackQueryRequest> Answers { get; } = new();
         public List<SendMessageRequest> Sends { get; } = new();
+        public List<SendDocumentRequest> Documents { get; } = new();
         public Exception? EditException { get; set; }
         public bool LocalBotServer => false;
         public long BotId => 12345;
@@ -244,6 +245,11 @@ public sealed partial class ConcurrencyTests
             if (request is SendMessageRequest send)
             {
                 Sends.Add(send);
+                return Task.FromResult((TResponse)(object)new Message { Id = 1, Chat = new Chat { Id = 1 } });
+            }
+            if (request is SendDocumentRequest document)
+            {
+                Documents.Add(document);
                 return Task.FromResult((TResponse)(object)new Message { Id = 1, Chat = new Chat { Id = 1 } });
             }
             throw new InvalidOperationException($"Unexpected Telegram request in gateway callback test: {request.GetType().Name}");

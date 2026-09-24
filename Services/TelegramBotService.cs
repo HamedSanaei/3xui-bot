@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using System.Diagnostics;
 using Adminbot.Domain;
 using Adminbot.Domain.TelegramUi;
+using Adminbot.Services.AppleMobileConfig;
 using Adminbot.Utils;
 
 using Newtonsoft.Json;
@@ -199,6 +200,7 @@ public partial class TelegramBotService
     private readonly IPaymentGatewayAvailability _gatewayAvailability;
     private readonly IClientDownloadAvailability _clientDownloadAvailability;
     private readonly IClientReleaseService _clientReleaseService;
+    private readonly AppleMobileConfigTelegramFlow _appleMobileConfigFlow;
     private readonly XuiV3PurchaseService _xuiV3PurchaseService;
     private readonly XuiV3BotFlowService _xuiV3BotFlowService;
     private readonly XuiV3PurchaseSessionStore _xuiV3PurchaseSessionStore;
@@ -389,7 +391,8 @@ public partial class TelegramBotService
         BotContextAccessor botContextAccessor,
         ReferralService referralService,
         TelegramInteractionTimeouts interactionTimeouts = null,
-        ITelegramMandatoryJoinMembershipCache mandatoryJoinMembershipCache = null)
+        ITelegramMandatoryJoinMembershipCache mandatoryJoinMembershipCache = null,
+        AppleMobileConfigTelegramFlow appleMobileConfigFlow = null)
     {
         _botClient = botClient;
         _workflow = dbContext;
@@ -414,6 +417,7 @@ public partial class TelegramBotService
         _gatewayAvailability = gatewayAvailability;
         _clientDownloadAvailability = clientDownloadAvailability;
         _clientReleaseService = clientReleaseService;
+        _appleMobileConfigFlow = appleMobileConfigFlow;
         _xuiV3PurchaseService = xuiV3PurchaseService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _xuiV3PurchaseSessionStore = xuiV3PurchaseSessionStore;
@@ -901,6 +905,53 @@ public partial class TelegramBotService
             if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
             {
                 await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, callbackCredUser, callbackUserState, cancellationToken);
+                return;
+            }
+
+            // Apple APN callback actions are admitted only after the same owned-bot mandatory-join gate as normal
+            // customer messages. A best-effort ACK may run first because it grants no access and performs no profile action.
+            if (_appleMobileConfigFlow != null && AppleMobileConfigTelegramFlow.IsCallback(callbackQuery.Data))
+            {
+                // ACK is UX-only and grants no access. Do it before the bounded Telegram membership probe so a slow
+                // mandatory-join check cannot leave the button spinner running. The profile flow still executes only
+                // after the same fail-closed access gate used by ordinary customer messages.
+                await SafeAnswerCallbackQueryAsync(
+                    botClient,
+                    callbackQuery.Id,
+                    cancellationToken: cancellationToken);
+
+                var channels = BuildMandatoryJoinChannels(CurrentChannelIds);
+                if (!await isJoinedToChannel(channels.Select(x => x.ChatId), callbackQuery.From.Id, cancellationToken))
+                {
+                    var joinRows = channels
+                        .Where(x => !string.IsNullOrWhiteSpace(x.Url))
+                        .Select(x => new[] { InlineKeyboardButton.WithUrl(x.Label, x.Url) })
+                        .ToArray();
+                    if (joinRows.Length > 0)
+                    {
+                        await botClient.SendMessage(
+                            callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                            "ابتدا در کانال‌های اجباری عضو شوید و سپس دوباره تلاش کنید.",
+                            replyMarkup: new InlineKeyboardMarkup(joinRows),
+                            cancellationToken: cancellationToken);
+                    }
+                    else
+                    {
+                        await botClient.SendMessage(
+                            callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                            "امکان تایید عضویت شما وجود ندارد. لطفاً از /start وارد شوید و راهنمای عضویت را دنبال کنید.",
+                            cancellationToken: cancellationToken);
+                    }
+                    return;
+                }
+
+                await _appleMobileConfigFlow.TryHandleCallbackAsync(
+                    botClient,
+                    callbackQuery,
+                    callbackUserState,
+                    callbackIsSuperAdmin ? GetMainMenuKeyboard() : MainReplyMarkupKeyboardFa(),
+                    cancellationToken,
+                    callbackAlreadyAcknowledged: true);
                 return;
             }
 
@@ -6141,6 +6192,17 @@ public partial class TelegramBotService
             return;
         }
 
+        if (_appleMobileConfigFlow != null &&
+            await _appleMobileConfigFlow.TryHandleMessageAsync(
+                botClient,
+                message,
+                user,
+                IsSuperAdminUser(message.From.Id) ? GetMainMenuKeyboard() : MainReplyMarkupKeyboardFa(),
+                cancellationToken))
+        {
+            return;
+        }
+
         if (hasNavigationCommand)
         {
             var registrationText = BuildReferralRegistrationMessage(referralRegistration);
@@ -10249,7 +10311,9 @@ public partial class TelegramBotService
         };
 
         if (_clientDownloadAvailability.Snapshot.Enabled)
-            rows.Add(new KeyboardButton[] { ClientDownloadCallbacks.OpenCommand });
+            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand, ClientDownloadCallbacks.OpenCommand });
+        else
+            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand });
 
         rows.Add(new KeyboardButton[] { "🏠منو" });
 
