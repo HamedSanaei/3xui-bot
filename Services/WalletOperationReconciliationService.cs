@@ -11,6 +11,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
     private readonly CredentialsDbContextFactory _credentials;
     private readonly UserDbContextFactory _users;
     private readonly WalletLedgerService _ledger;
+    private readonly TenantWalletOwnerTopUpMirrorService _ownerTopUpMirror;
     private readonly ILogger<WalletOperationReconciliationService> _logger;
     private readonly HashSet<string> _reportedPendingReceipts = new(StringComparer.Ordinal);
 
@@ -21,8 +22,14 @@ public sealed class WalletOperationReconciliationService : BackgroundService
     /// <param name="logger">Operational logger; logs coarse failures without private row contents.</param>
     /// <remarks>Recovery reads committed wallet receipts, writes users.db idempotently, then marks credentials.db reconciled. These are separate local commits with no network calls.</remarks>
     public WalletOperationReconciliationService(CredentialsDbContextFactory credentials, UserDbContextFactory users,
+        WalletLedgerService ledger, TenantWalletOwnerTopUpMirrorService ownerTopUpMirror,
+        ILogger<WalletOperationReconciliationService> logger)
+    { _credentials = credentials; _users = users; _ledger = ledger; _ownerTopUpMirror = ownerTopUpMirror; _logger = logger; }
+
+    /// <summary>Compatibility constructor for isolated recovery tests that do not exercise tenant owner mirroring.</summary>
+    public WalletOperationReconciliationService(CredentialsDbContextFactory credentials, UserDbContextFactory users,
         WalletLedgerService ledger, ILogger<WalletOperationReconciliationService> logger)
-    { _credentials = credentials; _users = users; _ledger = ledger; _logger = logger; }
+        : this(credentials, users, ledger, null, logger) { }
 
     /// <summary>Periodically reconciles committed receipts in bounded batches.</summary>
     /// <param name="stoppingToken">Host shutdown cancellation.</param>
@@ -81,8 +88,44 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                         throw new InvalidOperationException("Invalid tenant customer wallet receipt identity.");
                     await using var orders = _users.CreateDbContext();
                     var order = await orders.TenantBotOrders.AsNoTracking().SingleAsync(x => x.Id == orderId, token);
-                    await new TenantCustomerWalletFunding(_users, new CredentialsStore(_credentials), _ledger)
-                        .ReconcileReceiptAsync(order, receipt, token);
+                    if (parts[2] is "owner-base-cost" or "owner-base-cost-refund")
+                    {
+                        var refund = parts[2] == "owner-base-cost-refund";
+                        var expected = refund ? order.BaseCostToman : -order.BaseCostToman;
+                        if (receipt.TelegramUserId != order.OwnerTelegramUserId ||
+                            receipt.AmountToman != expected ||
+                            receipt.BotId != order.TenantBotId ||
+                            order.BaseCostToman <= 0)
+                            throw new InvalidOperationException("Tenant owner base-cost receipt conflicts with the order.");
+                        await _ledger.RecordAsync(
+                            order.OwnerTelegramUserId,
+                            refund ? WalletLedgerDirections.Credit : WalletLedgerDirections.Debit,
+                            order.BaseCostToman,
+                            receipt.BeforeBalance,
+                            receipt.AfterBalance,
+                            refund ? WalletLedgerReasons.TenantCustomerWalletBaseCostRefund : WalletLedgerReasons.TenantCustomerWalletBaseCost,
+                            provider: "wallet",
+                            referenceType: refund ? "tenant-customer-wallet-owner-refund" : "tenant-order",
+                            referenceId: order.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                            orderId: order.OrderId,
+                            description: refund ? "Recovered owner base-cost reservation refund" : "Recovered owner base-cost reservation",
+                            ownerTelegramUserId: order.OwnerTelegramUserId,
+                            counterpartyTelegramUserId: order.CustomerTelegramUserId,
+                            botId: order.TenantBotId,
+                            botUsername: order.TenantBotUsername,
+                            botType: BotInstanceTypes.Tenant,
+                            idempotencyKey: receipt.OperationKey,
+                            cancellationToken: token);
+                    }
+                    else
+                    {
+                        await new TenantCustomerWalletFunding(_users, new CredentialsStore(_credentials), _ledger)
+                            .ReconcileReceiptAsync(order, receipt, token);
+                    }
+                }
+                else if (receipt.OperationKey.StartsWith("tenant-card-wallet-charge:", StringComparison.Ordinal))
+                {
+                    await ReconcileTenantCardWalletChargeAsync(receipt, token);
                 }
                 else
                 {
@@ -94,6 +137,26 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                         referenceId: receipt.OperationKey, description: "Recovered committed wallet operation",
                         botId: receipt.BotId, botUsername: origin?.Username, botType: origin?.BotType, idempotencyKey: receipt.OperationKey, cancellationToken: token);
                     await RepairSettlementAsync(receipt, token);
+                    var paymentParts = receipt.OperationKey.Split(':');
+                    if (_ownerTopUpMirror != null &&
+                        credit &&
+                        origin != null &&
+                        string.Equals(origin.BotType, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) &&
+                        paymentParts.Length == 4 &&
+                        paymentParts[0] == "payment" &&
+                        int.TryParse(paymentParts[2], out var providerPaymentId))
+                    {
+                        await _ownerTopUpMirror.EnsureAsync(
+                            origin.Provider,
+                            providerPaymentId,
+                            receipt.BotId,
+                            origin.Username,
+                            origin.BotType,
+                            origin.OwnerTelegramUserId,
+                            receipt.TelegramUserId,
+                            receipt.AmountToman,
+                            token);
+                    }
                 }
                 await SqliteOperation.RunAsync(async ct =>
                 {
@@ -122,11 +185,75 @@ public sealed class WalletOperationReconciliationService : BackgroundService
         return repaired;
     }
 
+    /// <summary>Repairs a personal-card tenant wallet top-up after credentials.db committed before users.db.</summary>
+    private async Task ReconcileTenantCardWalletChargeAsync(WalletOperation receipt, CancellationToken token)
+    {
+        var parts = receipt.OperationKey.Split(':');
+        if (parts.Length != 3 || parts[0] != "tenant-card-wallet-charge" || parts[2] != "credit" ||
+            !int.TryParse(parts[1], out var orderId))
+            throw new InvalidOperationException("Invalid tenant personal-card wallet charge receipt identity.");
+
+        await using var db = _users.CreateDbContext();
+        var order = await db.TenantBotOrders.SingleOrDefaultAsync(x => x.Id == orderId, token)
+            ?? throw new InvalidOperationException("Tenant personal-card wallet charge order is missing.");
+        if (!string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase) ||
+            receipt.TelegramUserId != order.CustomerTelegramUserId ||
+            receipt.AmountToman != order.SalePriceToman ||
+            receipt.BotId != order.TenantBotId ||
+            receipt.AmountToman <= 0)
+            throw new InvalidOperationException("Tenant personal-card wallet charge receipt conflicts with the order.");
+
+        var manual = await db.TenantManualPaymentReceipts.AsNoTracking().FirstOrDefaultAsync(x =>
+            x.TenantBotOrderId == order.Id &&
+            x.Status == TenantManualPaymentReceiptStatuses.Approved &&
+            x.FinalConfirmedAtUtc != null, token);
+        if (manual == null || manual.AmountToman != order.SalePriceToman ||
+            manual.CustomerTelegramUserId != order.CustomerTelegramUserId ||
+            manual.OwnerTelegramUserId != order.OwnerTelegramUserId)
+            throw new InvalidOperationException("Approved manual receipt is missing for tenant wallet card recovery.");
+
+        await _ledger.RecordAsync(
+            order.CustomerTelegramUserId,
+            WalletLedgerDirections.Credit,
+            order.SalePriceToman,
+            receipt.BeforeBalance,
+            receipt.AfterBalance,
+            WalletLedgerReasons.WalletCharge,
+            provider: "tenant_card",
+            referenceType: "tenant-wallet-card-topup",
+            referenceId: order.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            orderId: order.OrderId,
+            description: "Recovered tenant customer wallet top-up through storefront personal card",
+            ownerTelegramUserId: order.OwnerTelegramUserId,
+            counterpartyTelegramUserId: order.OwnerTelegramUserId,
+            botId: order.TenantBotId,
+            botUsername: order.TenantBotUsername,
+            botType: BotInstanceTypes.Tenant,
+            idempotencyKey: receipt.OperationKey,
+            cancellationToken: token);
+
+        if (!order.IsFulfilled)
+        {
+            order.PaymentStatus = TenantBotOrderStatuses.Fulfilled;
+            order.PaidAtUtc ??= manual.FinalConfirmedAtUtc ?? receipt.CreatedAtUtc;
+            order.IsFulfilled = true;
+            order.IsOwnerCredited = false;
+            order.OwnerWalletDelta = 0;
+            order.FulfillmentSource ??= "wallet-reconciliation";
+            order.FulfilledAtUtc ??= receipt.CreatedAtUtc;
+            order.ErrorMessage = null;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await db.SaveChangesAsync(token);
+        }
+    }
+
     /// <summary>Maps the business event key to the existing ledger reason vocabulary.</summary>
     /// <param name="key">Stable non-secret wallet event identity.</param>
     /// <returns>The audit reason; unknown future events use an explicit recovery label.</returns>
     /// <remarks>Debt repayment is an owner wallet transfer, never purchase profit. Ledger recovery uses committed receipts only.</remarks>
     private static string ResolveReason(string key) => key.StartsWith("tenant-debt:", StringComparison.Ordinal) ? "owner_debt_settlement"
+        : key.StartsWith("tenant-wallet-topup:", StringComparison.Ordinal) ? WalletLedgerReasons.TenantWalletTopUpMirror
         : key.StartsWith("payment:", StringComparison.Ordinal) ? WalletLedgerReasons.WalletCharge
         : key.StartsWith("renew:", StringComparison.Ordinal) || key.StartsWith("legacy-renew:", StringComparison.Ordinal) ? WalletLedgerReasons.AccountRenew
         : key.StartsWith("purchase:", StringComparison.Ordinal) || key.StartsWith("legacy-purchase:", StringComparison.Ordinal) ? WalletLedgerReasons.AccountPurchase
@@ -136,7 +263,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
     /// <param name="Provider">Stable existing provider key from the wallet receipt.</param>
     /// <param name="Username">Nullable originating bot username saved at invoice creation.</param>
     /// <param name="BotType">Persisted owned/tenant origin; never inferred from a recovery worker's ambient context.</param>
-    private sealed record ChargeOrigin(string Provider, string Username, string BotType);
+    private sealed record ChargeOrigin(string Provider, string Username, string BotType, long? OwnerTelegramUserId);
 
     /// <summary>Reads saved payment origin instead of inferring it from the worker's ambient owned bot.</summary>
     /// <param name="key">Stable credentials receipt key.</param>
@@ -149,11 +276,11 @@ public sealed class WalletOperationReconciliationService : BackgroundService
         await using var db = _users.CreateDbContext();
         return parts[1] switch
         {
-            "hooshpay" => await db.HooshPayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("hooshpay", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
-            "tetraminator" => await db.TetraminatorPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("tetraminator", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
-            "uniquepay" => await db.UniquePayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("uniquepay", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
-            "atlaspay" => await db.AtlasPayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("atlaspay", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
-            "nowpayments" => await db.SwapinoPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("nowpayments", x.BotUsername, x.WalletOriginBotType)).SingleOrDefaultAsync(token),
+            "hooshpay" => await db.HooshPayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("hooshpay", x.BotUsername, x.WalletOriginBotType, x.TenantOwnerTelegramUserId)).SingleOrDefaultAsync(token),
+            "tetraminator" => await db.TetraminatorPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("tetraminator", x.BotUsername, x.WalletOriginBotType, x.TenantOwnerTelegramUserId)).SingleOrDefaultAsync(token),
+            "uniquepay" => await db.UniquePayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("uniquepay", x.BotUsername, x.WalletOriginBotType, x.TenantOwnerTelegramUserId)).SingleOrDefaultAsync(token),
+            "atlaspay" => await db.AtlasPayPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("atlaspay", x.BotUsername, x.WalletOriginBotType, x.TenantOwnerTelegramUserId)).SingleOrDefaultAsync(token),
+            "nowpayments" => await db.SwapinoPaymentInfos.Where(x => x.Id == id).Select(x => new ChargeOrigin("nowpayments", x.BotUsername, x.WalletOriginBotType, x.TenantOwnerTelegramUserId)).SingleOrDefaultAsync(token),
             _ => null
         };
     }

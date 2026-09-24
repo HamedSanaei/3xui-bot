@@ -21,21 +21,22 @@ public sealed partial class ConcurrencyTests
             }).Build();
         await using var provider = AtlasTenantProvider(databases, configuration, new AtlasPay(configuration), out var registry, out var clients);
         var (wallet, _, _) = await SeedCustomerWalletOrderAsync(databases);
+        await wallet.AddEmptyUser(456);
         await wallet.AddEmptyUser(999);
         var referrals = provider.GetRequiredService<ReferralService>();
         await referrals.RegisterRelationshipAsync(123, ReferralCodeCodec.Encode(999), "main", BotInstanceTypes.Owned);
         await using var scope = provider.CreateAsyncScope();
         var services = scope.ServiceProvider;
         var hp = HooshPayPaymentInfo.CreateWalletCharge(123, 100000, "https://merchant.example/hp", "https://merchant.example/return", 321);
-        hp.BotId = "tenant-a"; hp.WalletOriginBotType = BotInstanceTypes.Tenant; hp.WalletOriginTelegramBotId = 789; hp.PaymentStatus = "paid";
+        hp.BotId = "tenant-a"; hp.WalletOriginBotType = BotInstanceTypes.Tenant; hp.WalletOriginTelegramBotId = 789; hp.TenantOwnerTelegramUserId = 456; hp.PaymentStatus = "paid";
         var tm = TetraminatorPaymentInfo.CreateWalletCharge(123, 100000, "https://merchant.example/tm", 321);
-        tm.BotId = "tenant-a"; tm.WalletOriginBotType = BotInstanceTypes.Tenant; tm.WalletOriginTelegramBotId = 789; tm.PaymentStatus = "paid"; tm.PayId = "test-payment"; tm.PaidAtUtc = DateTime.UtcNow;
+        tm.BotId = "tenant-a"; tm.WalletOriginBotType = BotInstanceTypes.Tenant; tm.WalletOriginTelegramBotId = 789; tm.TenantOwnerTelegramUserId = 456; tm.PaymentStatus = "paid"; tm.PayId = "test-payment"; tm.PaidAtUtc = DateTime.UtcNow;
         var up = UniquePayPaymentInfo.CreateWalletCharge(123, 321, 100000, 0);
-        up.BotId = "tenant-a"; up.WalletOriginBotType = BotInstanceTypes.Tenant; up.WalletOriginTelegramBotId = 789; up.PaymentStatus = "paid"; up.PaidAtUtc = DateTime.UtcNow;
+        up.BotId = "tenant-a"; up.WalletOriginBotType = BotInstanceTypes.Tenant; up.WalletOriginTelegramBotId = 789; up.TenantOwnerTelegramUserId = 456; up.PaymentStatus = "paid"; up.PaidAtUtc = DateTime.UtcNow;
         var ap = AtlasPayPaymentInfo.CreateWalletCharge(123, 321, 100000);
-        ap.BotId = "tenant-a"; ap.WalletOriginBotType = BotInstanceTypes.Tenant; ap.WalletOriginTelegramBotId = 789; ap.ProviderStatus = "confirmed"; ap.PaidAtUtc = DateTime.UtcNow;
+        ap.BotId = "tenant-a"; ap.WalletOriginBotType = BotInstanceTypes.Tenant; ap.WalletOriginTelegramBotId = 789; ap.TenantOwnerTelegramUserId = 456; ap.ProviderStatus = "confirmed"; ap.PaidAtUtc = DateTime.UtcNow;
         var np = SwapinoPaymentInfo.CreateCryptoCharge(123, 100000, "https://merchant.example/np", chatId: 321);
-        np.BotId = "tenant-a"; np.WalletOriginBotType = BotInstanceTypes.Tenant; np.WalletOriginTelegramBotId = 789; np.PaymentStatus = "finished";
+        np.BotId = "tenant-a"; np.WalletOriginBotType = BotInstanceTypes.Tenant; np.WalletOriginTelegramBotId = 789; np.TenantOwnerTelegramUserId = 456; np.PaymentStatus = "finished";
         await using (var db = databases.Users.CreateDbContext())
         {
             var store = await db.BotInstances.SingleAsync();
@@ -52,12 +53,15 @@ public sealed partial class ConcurrencyTests
             await services.GetRequiredService<NowPaymentsSettlementService>().ApplyFinishedPaymentAsync(np, "fixture");
         }
         Assert.Equal(1000000, await wallet.GetAccountBalance(123));
+        Assert.Equal(500000, await wallet.GetAccountBalance(456));
         Assert.Equal(0, await wallet.GetAccountBalance(999));
         await using (var db = databases.Users.CreateDbContext())
         {
             Assert.Single(await db.ReferralRelationships.ToListAsync());
             Assert.Empty(await db.ReferralPaymentEvents.ToListAsync()); Assert.Empty(await db.ReferralRewards.ToListAsync());
-            Assert.Equal(5, await db.WalletLedgerEntries.CountAsync(x => x.BotType == "tenant" && x.BotId == "tenant-a"));
+            Assert.Equal(10, await db.WalletLedgerEntries.CountAsync(x => x.BotType == "tenant" && x.BotId == "tenant-a"));
+            Assert.Equal(5, await db.WalletLedgerEntries.CountAsync(x => x.Reason == WalletLedgerReasons.WalletCharge));
+            Assert.Equal(5, await db.WalletLedgerEntries.CountAsync(x => x.Reason == WalletLedgerReasons.TenantWalletTopUpMirror));
             var notifications = await db.PaymentSettlementNotifications.ToListAsync(); Assert.Equal(5, notifications.Count);
             Assert.All(notifications, n =>
             {

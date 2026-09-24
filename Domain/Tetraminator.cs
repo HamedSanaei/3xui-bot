@@ -410,6 +410,7 @@ public sealed class TetraminatorSettlementService
     private readonly CredentialsStore _credentialsDbContext;
     private readonly WalletLedgerService _walletLedgerService;
     private readonly ReferralService _referralService;
+    private readonly TenantWalletOwnerTopUpMirrorService _ownerTopUpMirror;
     private readonly BotClientProvider _botClientProvider;
     private readonly BotRegistry _botRegistry;
     private readonly BotContextAccessor _botContextAccessor;
@@ -435,12 +436,14 @@ public sealed class TetraminatorSettlementService
         BotClientProvider botClientProvider,
         BotRegistry botRegistry,
         BotContextAccessor botContextAccessor,
-        ILogger<TetraminatorSettlementService> logger)
+        ILogger<TetraminatorSettlementService> logger,
+        TenantWalletOwnerTopUpMirrorService ownerTopUpMirror = null)
     {
         _userDbContextFactory = userDbContext;
         _credentialsDbContext = credentialsDbContext;
         _walletLedgerService = walletLedgerService;
         _referralService = referralService;
+        _ownerTopUpMirror = ownerTopUpMirror;
         _botClientProvider = botClientProvider;
         _botRegistry = botRegistry;
         _botContextAccessor = botContextAccessor;
@@ -506,6 +509,10 @@ public sealed class TetraminatorSettlementService
                     await EnsureOfficialLedgerAsync(payment, payment.BalanceBefore ?? user.AccountBalance - payment.AmountToman, payment.BalanceAfter ?? user.AccountBalance, cancellationToken);
                     await ProcessReferralAsync(payment, cancellationToken);
                 }
+                if (_ownerTopUpMirror != null)
+                    await _ownerTopUpMirror.EnsureAsync("tetraminator", payment.Id, payment.BotId, payment.BotUsername,
+                        payment.WalletOriginBotType, payment.TenantOwnerTelegramUserId, payment.TelegramUserId,
+                        payment.AmountToman, cancellationToken);
                 return NowPaymentsSettlementResult.AlreadyAdded(user.AccountBalance);
             }
 
@@ -537,6 +544,10 @@ public sealed class TetraminatorSettlementService
             await _workflow.SaveAsync(cancellationToken);
             await EnsureOfficialLedgerAsync(payment, before, after, cancellationToken);
             await ProcessReferralAsync(payment, cancellationToken);
+            if (_ownerTopUpMirror != null)
+                await _ownerTopUpMirror.EnsureAsync("tetraminator", payment.Id, payment.BotId, payment.BotUsername,
+                    payment.WalletOriginBotType, payment.TenantOwnerTelegramUserId, payment.TelegramUserId,
+                    payment.AmountToman, cancellationToken);
 
             using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
             {

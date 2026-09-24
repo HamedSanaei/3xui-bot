@@ -110,16 +110,9 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="gateway">One of the supported central automatic payment gateways.</param>
     /// <param name="store">Fresh approved storefront snapshot.</param>
     /// <returns>True only when the central switch and this store's switch both permit invoice creation.</returns>
-    public bool IsAvailable(PaymentGateway gateway, BotInstance store) => TenantCustomerWalletPolicy.IsApproved(store)
-        && availability.Snapshot.IsEnabled(gateway) && gateway switch
-        {
-            PaymentGateway.HooshPay => store.TenantHooshPayEnabled,
-            PaymentGateway.Tetraminator => store.TenantTetraminatorEnabled,
-            PaymentGateway.UniquePay => store.TenantUniquePayEnabled,
-            PaymentGateway.AtlasPay => store.TenantAtlasPayEnabled,
-            PaymentGateway.NowPayments => store.TenantNowPaymentsEnabled,
-            _ => false
-        };
+    public bool IsAvailable(PaymentGateway gateway, BotInstance store)
+        => TenantCustomerWalletPolicy.IsApproved(store) &&
+           TenantPaymentGatewayPolicy.IsEnabled(store, gateway, availability.Snapshot);
 
     /// <summary>Validates the authoritative toman amount using the same provider policies as owned wallet charging.</summary>
     /// <param name="gateway">Supported central payment gateway.</param>
@@ -159,7 +152,7 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
             case PaymentGateway.HooshPay:
             {
                 var p = HooshPayPaymentInfo.CreateWalletCharge(customerId, amount, config.HooshPayIpnUrl, returnUrl, chatId);
-                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId;
+                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId; p.TenantOwnerTelegramUserId = store.OwnerTelegramUserId;
                 workflow.Add(p); await workflow.SaveAsync(token);
                 p.Apply((await CreateHooshPayAsync(p, token))?.data);
                 await workflow.SaveAsync(token);
@@ -168,7 +161,7 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
             case PaymentGateway.Tetraminator:
             {
                 var p = TetraminatorPaymentInfo.CreateWalletCharge(customerId, amount, config.TetraminatorCallbackUrl, chatId);
-                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId;
+                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId; p.TenantOwnerTelegramUserId = store.OwnerTelegramUserId;
                 p.CallbackUrl = AppendQuery(config.TetraminatorCallbackUrl, "orderId", p.OrderId);
                 workflow.Add(p); await workflow.SaveAsync(token);
                 p.Apply(await CreateTetraminatorAsync(p, token));
@@ -178,7 +171,7 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
             case PaymentGateway.UniquePay:
             {
                 var p = UniquePayPaymentInfo.CreateWalletCharge(customerId, chatId, amount, config.UniquePayFeePercent);
-                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId;
+                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId; p.TenantOwnerTelegramUserId = store.OwnerTelegramUserId;
                 workflow.Add(p); await workflow.SaveAsync(token);
                 p.Apply(await CreateUniquePayAsync(p, AppendQuery(config.UniquePayReturnUrl, "hashId", p.HashId),
                     AppendQuery(config.UniquePayCallbackUrl, "hashId", p.HashId), token));
@@ -189,7 +182,7 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
             case PaymentGateway.AtlasPay:
             {
                 var p = AtlasPayPaymentInfo.CreateWalletCharge(customerId, chatId, amount);
-                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId;
+                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId; p.TenantOwnerTelegramUserId = store.OwnerTelegramUserId;
                 p.BeginCreationAttempt(DateTime.UtcNow);
                 workflow.Add(p); await workflow.SaveAsync(token);
                 AtlasPayCustomerPaymentUi.DirectPayment directPayment = null;
@@ -220,7 +213,7 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
             {
                 var p = SwapinoPaymentInfo.CreateCryptoCharge(customerId, amount, config.NowpaymentIpnUrl,
                     chatId: chatId, baseCurrency: config.NowpaymentPriceCurrency);
-                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId;
+                p.BotId = botId; p.BotUsername = store.Username; p.WalletOriginBotType = BotInstanceTypes.Tenant; p.WalletOriginTelegramBotId = store.TelegramBotId; p.TenantOwnerTelegramUserId = store.OwnerTelegramUserId;
                 workflow.Add(p); await workflow.SaveAsync(token);
                 var invoice = await CreateNowPaymentsAsync(p,
                     string.IsNullOrWhiteSpace(config.NowpaymentPriceCurrency) ? "usdtbsc" : config.NowpaymentPriceCurrency, returnUrl, returnUrl, token);

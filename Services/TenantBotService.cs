@@ -7046,9 +7046,9 @@ public partial class TenantBotService
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + "PAYUP:" + BUILDPAYACTION(selection)) });
         if (IsTenantAtlasPayAvailable(tenant))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + "PAYAP:" + BUILDPAYACTION(selection)) });
-        if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
+        if (TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.NowPayments, _gatewayAvailability.Snapshot))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی | کارمزد ۰٪", CUSTOMERCALLBACKPREFIX + "PAYNP:" + BUILDPAYACTION(selection)) });
-        if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
+        if (TenantPaymentGatewayPolicy.IsPersonalCardEnabled(tenant))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("🧾 کارت‌به‌کارت به فروشگاه | ریالی", CUSTOMERCALLBACKPREFIX + "PAYCARD:" + BUILDPAYACTION(selection)) });
         PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") });
 
@@ -7220,8 +7220,7 @@ public partial class TenantBotService
         XuiV3PurchaseSelection selection,
         CancellationToken CancellationToken)
     {
-        if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ||
-            tenant?.TenantNowPaymentsEnabled != true)
+        if (!TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.NowPayments, _gatewayAvailability.Snapshot))
         {
             await SafeAnswerCallbackQueryAsync(
                 botClient,
@@ -7521,8 +7520,7 @@ public partial class TenantBotService
         int orderDbId,
         CancellationToken cancellationToken)
     {
-        if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ||
-            tenant?.TenantNowPaymentsEnabled != true)
+        if (!TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.NowPayments, _gatewayAvailability.Snapshot))
         {
             await SafeAnswerCallbackQueryAsync(
                 botClient,
@@ -9230,6 +9228,36 @@ public partial class TenantBotService
             return NowPaymentsSettlementResult.UserNotFound();
         }
 
+        if (string.Equals(order.PaymentProvider, "wallet", StringComparison.OrdinalIgnoreCase))
+        {
+            // Customer-wallet sales are backed only by the tenant owner's LOCAL bot wallet. Reserve the base cost
+            // atomically before any XUI mutation so concurrent customers cannot both spend the same owner balance.
+            WalletOperation ownerBaseCostReceipt;
+            using (var ownerAdmission = await OwnerSettlementGate.EnterAsync(
+                       order.OwnerTelegramUserId.ToString(CultureInfo.InvariantCulture),
+                       CancellationToken))
+            {
+                ownerBaseCostReceipt = await RESERVETENANTCUSTOMERWALLETOWNERBASECOSTASYNC(order, owner, CancellationToken);
+            }
+            if (ownerBaseCostReceipt == null)
+            {
+                order.PaymentStatus = TenantBotOrderStatuses.Failed;
+                order.ErrorMessage = "tenant_owner_wallet_insufficient";
+                order.UpdatedAtUtc = DateTime.UtcNow;
+                await _workflow.SaveAsync(CancellationToken);
+                await NOTIFYTENANTOWNERWALLETINSUFFICIENTASYNC(
+                    order, tenant, customer, owner.AccountBalance, CancellationToken);
+                await NOTIFYTENANTCUSTOMERFAILUREASYNC(
+                    order,
+                    "موجودی حساب فروشگاه برای انجام این سفارش کافی نیست؛ اکانتی ساخته یا تمدید نشد و مبلغ پرداخت‌شده از کیف پول شما به‌صورت امن بازگردانده می‌شود.",
+                    CancellationToken);
+                return NowPaymentsSettlementResult.InvalidAmount();
+            }
+            owner.AccountBalance = ownerBaseCostReceipt.AfterBalance;
+            // The strict base-cost debit was already reserved above. Settlement later only reconciles that receipt.
+            DEBITOWNERBASECOST = true;
+        }
+
         var selection = new XuiV3PurchaseSelection
         {
             ServiceKey = order.ServiceKey,
@@ -9452,8 +9480,22 @@ public partial class TenantBotService
         {
             if (order?.PaymentProvider == "wallet")
             {
-                try { await _serviceProvider.GetRequiredService<TenantCustomerWalletFunding>().RefundRejectedAsync(order.Id, CancellationToken); }
-                catch (Exception ex) { _logger.LogWarning("Customer wallet compensation remains pending. OrderId={OrderId} ErrorType={ErrorType}", order.Id, ex.GetType().Name); }
+                try
+                {
+                    var funding = _serviceProvider.GetRequiredService<TenantCustomerWalletFunding>();
+                    var refundedNow = await funding.RefundRejectedAsync(order.Id, CancellationToken);
+                    var customerRefunded = refundedNow || await _workflow.ReadAsync(async db => await db.TenantBotOrders
+                        .AsNoTracking()
+                        .Where(x => x.Id == order.Id)
+                        .Select(x => x.CustomerWalletState == "refunded")
+                        .SingleOrDefaultAsync(CancellationToken));
+                    if (customerRefunded)
+                        await REFUNDTENANTCUSTOMERWALLETOWNERBASECOSTASYNC(order, CancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Customer/owner wallet compensation remains pending. OrderId={OrderId} ErrorType={ErrorType}", order.Id, ex.GetType().Name);
+                }
             }
             tenantFulfillmentGateLease.Dispose();
         }
@@ -9620,7 +9662,8 @@ public partial class TenantBotService
             "✅ رسید ثبت شد و برای تایید مدیر ارسال شد.",
             cancellationToken: CancellationToken);
 
-        await PROVISIONTENANTCARDPROVISIONALASYNC(botClient, Message.Chat.Id, customer, order.Id, CancellationToken);
+        if (!string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase))
+            await PROVISIONTENANTCARDPROVISIONALASYNC(botClient, Message.Chat.Id, customer, order.Id, CancellationToken);
     }
 
     /// <summary>
@@ -10046,6 +10089,108 @@ public partial class TenantBotService
         }, cancellationToken);
     }
 
+    /// <summary>Applies an approved personal-card tenant wallet top-up exactly once.</summary>
+    /// <remarks>
+    /// The card transfer is already in the tenant owner's bank account, so this operation credits only the customer.
+    /// The immutable credentials receipt is the balance authority; users.db ledger/order repair is retry-safe after a crash.
+    /// No owner mirror, referral, XUI mutation, provisional account, or base-cost settlement is performed.
+    /// </remarks>
+    private async Task<WalletOperation> APPLYTENANTCARDWALLETCHARGEASYNC(
+        TenantBotOrder candidate,
+        string source,
+        CancellationToken cancellationToken)
+    {
+        if (candidate == null)
+            throw new ArgumentNullException(nameof(candidate));
+
+        using var gate = await TenantFulfillmentGate.EnterAsync(
+            $"wallet-charge:{candidate.Id.ToString(CultureInfo.InvariantCulture)}",
+            cancellationToken);
+        var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders
+            .FirstOrDefaultAsync(x => x.Id == candidate.Id, cancellationToken));
+        if (order == null ||
+            !string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase) ||
+            order.SalePriceToman <= 0 ||
+            order.CustomerTelegramUserId <= 0 ||
+            string.IsNullOrWhiteSpace(order.TenantBotId))
+            throw new InvalidOperationException("Tenant personal-card wallet charge identity is invalid.");
+
+        var manualReceipt = await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id &&
+                                      x.Status == TenantManualPaymentReceiptStatuses.Approved &&
+                                      x.FinalConfirmedAtUtc != null,
+                                 cancellationToken));
+        if (manualReceipt == null || manualReceipt.AmountToman != order.SalePriceToman ||
+            manualReceipt.CustomerTelegramUserId != order.CustomerTelegramUserId ||
+            manualReceipt.OwnerTelegramUserId != order.OwnerTelegramUserId)
+            throw new InvalidOperationException("Approved tenant wallet card receipt is missing or conflicts with the charge.");
+
+        var key = $"tenant-card-wallet-charge:{order.Id}:credit";
+        var walletReceipt = await _credentialsDbContext.MutateWalletAsync(
+            order.CustomerTelegramUserId,
+            order.SalePriceToman,
+            key,
+            cancellationToken,
+            order.TenantBotId);
+        if (walletReceipt == null ||
+            walletReceipt.TelegramUserId != order.CustomerTelegramUserId ||
+            walletReceipt.AmountToman != order.SalePriceToman ||
+            walletReceipt.BotId != order.TenantBotId)
+            throw new InvalidOperationException("Tenant personal-card wallet credit receipt conflicts with the charge.");
+
+        await _walletLedgerService.RecordAsync(
+            order.CustomerTelegramUserId,
+            WalletLedgerDirections.Credit,
+            order.SalePriceToman,
+            walletReceipt.BeforeBalance,
+            walletReceipt.AfterBalance,
+            WalletLedgerReasons.WalletCharge,
+            provider: "tenant_card",
+            referenceType: "tenant-wallet-card-topup",
+            referenceId: order.Id.ToString(CultureInfo.InvariantCulture),
+            orderId: order.OrderId,
+            description: "Tenant customer wallet top-up through storefront personal card",
+            ownerTelegramUserId: order.OwnerTelegramUserId,
+            counterpartyTelegramUserId: order.OwnerTelegramUserId,
+            botId: order.TenantBotId,
+            botUsername: order.TenantBotUsername,
+            botType: BotInstanceTypes.Tenant,
+            idempotencyKey: key,
+            cancellationToken: cancellationToken);
+
+        order.PaymentStatus = TenantBotOrderStatuses.Fulfilled;
+        order.PaidAtUtc ??= manualReceipt.FinalConfirmedAtUtc ?? DateTime.UtcNow;
+        order.IsFulfilled = true;
+        order.IsOwnerCredited = false;
+        order.OwnerWalletDelta = 0;
+        order.FulfillmentSource = source;
+        order.FulfilledAtUtc ??= DateTime.UtcNow;
+        order.ErrorMessage = null;
+        order.UpdatedAtUtc = DateTime.UtcNow;
+        await _workflow.SaveAsync(cancellationToken);
+
+        try
+        {
+            if (IsTenantTransportAvailable(order.TenantBotId))
+            {
+                await _botClientProvider.GetClient(order.TenantBotId).SendMessage(
+                    order.CustomerChatId,
+                    $"✅ واریز کارت‌به‌کارت تایید شد و کیف پول شما {order.SalePriceToman:N0} تومان شارژ شد.\nموجودی جدید: {walletReceipt.AfterBalance:N0} تومان",
+                    cancellationToken: cancellationToken);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex,
+                "Tenant personal-card wallet top-up notification failed after durable credit. orderId={OrderId}",
+                order.OrderId);
+        }
+
+        return walletReceipt;
+    }
+
     /// <summary>
     /// Final-confirms a tenant card-to-card receipt from the Sales Assistant and fulfills the linked order once.
     /// </summary>
@@ -10081,6 +10226,32 @@ public partial class TenantBotService
             CancellationToken));
         if (order == null)
             return "سفارش مرتبط با رسید پیدا نشد.";
+
+        if (string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase))
+        {
+            if (receipt.Status != TenantManualPaymentReceiptStatuses.Approved)
+            {
+                receipt.Status = TenantManualPaymentReceiptStatuses.Approved;
+                receipt.ReviewerTelegramUserId = ReviewerTelegramUserId;
+                receipt.ApprovedAtUtc ??= DateTime.UtcNow;
+                receipt.FinalConfirmedAtUtc ??= DateTime.UtcNow;
+                receipt.UpdatedAtUtc = DateTime.UtcNow;
+                order.PaymentStatus = TenantBotOrderStatuses.ReceiptApproved;
+                order.ManualReceiptId = receipt.Id;
+                order.UpdatedAtUtc = DateTime.UtcNow;
+                await _workflow.SaveAsync(CancellationToken);
+            }
+            try
+            {
+                var credit = await APPLYTENANTCARDWALLETCHARGEASYNC(order, "assistant-final-wallet-charge", CancellationToken);
+                return $"رسید تایید شد و کیف پول مشتری {credit.AmountToman:N0} تومان شارژ شد. موجودی جدید: {credit.AfterBalance:N0} تومان.";
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Approved tenant card wallet top-up remains unreconciled. receiptId={ReceiptId} orderId={OrderId}", RECEIPTID, order.OrderId);
+                return "رسید تایید شد اما ثبت موجودی کامل نشد؛ دوباره تایید را بزنید تا همان عملیات بدون شارژ تکراری بازیابی شود.";
+            }
+        }
 
         if (order.IsFulfilled)
         {
@@ -10320,6 +10491,26 @@ public partial class TenantBotService
         }
 
         var receipt = await ENSUREMANUALRECEIPTASYNC(order, owner.TelegramUserId, CancellationToken);
+        if (string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase))
+        {
+            receipt.Status = TenantManualPaymentReceiptStatuses.Approved;
+            receipt.ReviewerTelegramUserId = owner.TelegramUserId;
+            receipt.ApprovedAtUtc ??= DateTime.UtcNow;
+            receipt.FinalConfirmedAtUtc ??= DateTime.UtcNow;
+            receipt.UpdatedAtUtc = DateTime.UtcNow;
+            order.PaymentStatus = TenantBotOrderStatuses.ReceiptApproved;
+            order.ManualReceiptId = receipt.Id;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(CancellationToken);
+            var credit = await APPLYTENANTCARDWALLETCHARGEASYNC(order, "owner-orderid-wallet-charge", CancellationToken);
+            await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
+            await botClient.SendMessage(Message.Chat.Id,
+                $"پرداخت کارت‌به‌کارت تایید شد و کیف پول مشتری {credit.AmountToman:N0} تومان شارژ شد. موجودی جدید مشتری: {credit.AfterBalance:N0} تومان.",
+                cancellationToken: CancellationToken);
+            await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, owner, null, CancellationToken);
+            return;
+        }
+
         if (order.IsFulfilled)
         {
             await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
@@ -10392,6 +10583,22 @@ public partial class TenantBotService
         var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(x => x.OrderId == orderId, CancellationToken));
         if (order == null)
             return null;
+
+        if (string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase))
+        {
+            var receipt = await ENSUREMANUALRECEIPTASYNC(order, superAdminTelegramUserId, CancellationToken);
+            receipt.Status = TenantManualPaymentReceiptStatuses.Approved;
+            receipt.ReviewerTelegramUserId = superAdminTelegramUserId;
+            receipt.ApprovedAtUtc ??= DateTime.UtcNow;
+            receipt.FinalConfirmedAtUtc ??= DateTime.UtcNow;
+            receipt.UpdatedAtUtc = DateTime.UtcNow;
+            order.PaymentStatus = TenantBotOrderStatuses.ReceiptApproved;
+            order.ManualReceiptId = receipt.Id;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(CancellationToken);
+            var credit = await APPLYTENANTCARDWALLETCHARGEASYNC(order, "super-admin-wallet-charge", CancellationToken);
+            return $"✅ شارژ کیف پول کارت‌به‌کارت tenant ثبت شد. مبلغ: <code>{credit.AmountToman:N0}</code> تومان | موجودی جدید مشتری: <code>{credit.AfterBalance:N0}</code> تومان.";
+        }
 
         if (order.IsFulfilled)
         {
@@ -10651,6 +10858,35 @@ public partial class TenantBotService
         if (order == null)
         {
             await botClient.SendMessage(ChatId, "سفارش پیدا نشد.", cancellationToken: CancellationToken);
+            return;
+        }
+
+        if (string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase))
+        {
+            if (order.IsFulfilled)
+            {
+                var credit = await _credentialsDbContext.GetWalletOperationAsync(
+                    $"tenant-card-wallet-charge:{order.Id}:credit",
+                    CancellationToken);
+                await botClient.SendMessage(
+                    ChatId,
+                    credit == null
+                        ? "شارژ کیف پول ثبت شده است؛ برای مشاهده موجودی، کیف پول را دوباره باز کنید."
+                        : $"✅ شارژ کیف پول تایید شده است. مبلغ: {credit.AmountToman:N0} تومان\nموجودی پس از شارژ: {credit.AfterBalance:N0} تومان",
+                    cancellationToken: CancellationToken);
+                return;
+            }
+            if (IsPendingTenantCardOrder(order))
+            {
+                await botClient.SendMessage(ChatId,
+                    "در انتظار ارسال رسید یا تایید مالک فروشگاه برای شارژ کیف پول.",
+                    replyMarkup: BuildTenantCardPaymentKeyboard(order),
+                    cancellationToken: CancellationToken);
+                return;
+            }
+            await botClient.SendMessage(ChatId,
+                "رسید تایید شده و ثبت موجودی کیف پول در حال بازیابی است. کمی بعد دوباره وضعیت را بررسی کنید.",
+                cancellationToken: CancellationToken);
             return;
         }
 
@@ -11336,6 +11572,135 @@ public partial class TenantBotService
         }
     }
 
+    private static string TenantCustomerWalletOwnerBaseCostKey(int orderId)
+        => $"tenant-customer-wallet:{orderId}:owner-base-cost";
+
+    private static string TenantCustomerWalletOwnerBaseCostRefundKey(int orderId)
+        => $"tenant-customer-wallet:{orderId}:owner-base-cost-refund";
+
+    /// <summary>Reserves the tenant owner's base cost from the local bot wallet before customer-wallet XUI mutation.</summary>
+    /// <remarks>
+    /// This path is intentionally stricter than personal-card settlement: no website wallet and no overdraft are allowed.
+    /// The credentials receipt and balance commit atomically, so concurrent customer orders cannot overspend one owner balance.
+    /// </remarks>
+    private async Task<WalletOperation> RESERVETENANTCUSTOMERWALLETOWNERBASECOSTASYNC(
+        TenantBotOrder order,
+        CredUser owner,
+        CancellationToken cancellationToken)
+    {
+        if (order == null || owner?.TelegramUserId != order.OwnerTelegramUserId ||
+            !string.Equals(order.PaymentProvider, "wallet", StringComparison.OrdinalIgnoreCase) ||
+            order.Id <= 0 || order.BaseCostToman <= 0 || string.IsNullOrWhiteSpace(order.TenantBotId))
+            throw new InvalidOperationException("Tenant customer-wallet owner reservation identity is invalid.");
+
+        var key = TenantCustomerWalletOwnerBaseCostKey(order.Id);
+        var existing = await _credentialsDbContext.GetWalletOperationAsync(key, cancellationToken);
+        if (existing != null)
+        {
+            if (existing.TelegramUserId != order.OwnerTelegramUserId ||
+                existing.AmountToman != -order.BaseCostToman ||
+                existing.BotId != order.TenantBotId)
+                throw new InvalidOperationException("Tenant customer-wallet owner reservation conflicts with the order.");
+            owner.AccountBalance = existing.AfterBalance;
+            return existing;
+        }
+
+        var receipt = await _credentialsDbContext.TryDebitWalletIfSufficientAsync(
+            order.OwnerTelegramUserId,
+            order.BaseCostToman,
+            key,
+            order.TenantBotId,
+            cancellationToken);
+        if (receipt != null)
+            owner.AccountBalance = receipt.AfterBalance;
+        return receipt;
+    }
+
+    /// <summary>Returns a reserved owner base cost only after the customer-wallet order is durably refunded.</summary>
+    private async Task REFUNDTENANTCUSTOMERWALLETOWNERBASECOSTASYNC(
+        TenantBotOrder order,
+        CancellationToken cancellationToken)
+    {
+        if (order == null || order.Id <= 0 || order.BaseCostToman <= 0 ||
+            !string.Equals(order.PaymentProvider, "wallet", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var debitKey = TenantCustomerWalletOwnerBaseCostKey(order.Id);
+        var debit = await _credentialsDbContext.GetWalletOperationAsync(debitKey, cancellationToken);
+        if (debit == null)
+            return;
+        if (debit.TelegramUserId != order.OwnerTelegramUserId ||
+            debit.AmountToman != -order.BaseCostToman ||
+            debit.BotId != order.TenantBotId)
+            throw new InvalidOperationException("Tenant owner reservation refund conflicts with the original debit.");
+
+        var persisted = await _workflow.ReadAsync(async db => await db.TenantBotOrders.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == order.Id, cancellationToken));
+        if (persisted == null || persisted.IsFulfilled || persisted.CustomerWalletState != "refunded")
+            return;
+
+        var refundKey = TenantCustomerWalletOwnerBaseCostRefundKey(order.Id);
+        var refund = await _credentialsDbContext.MutateWalletAsync(
+            order.OwnerTelegramUserId,
+            order.BaseCostToman,
+            refundKey,
+            cancellationToken,
+            order.TenantBotId);
+        if (refund == null)
+            throw new InvalidOperationException("Tenant owner reservation refund receipt was not created.");
+
+        await _walletLedgerService.RecordAsync(
+            order.OwnerTelegramUserId,
+            WalletLedgerDirections.Credit,
+            order.BaseCostToman,
+            refund.BeforeBalance,
+            refund.AfterBalance,
+            WalletLedgerReasons.TenantCustomerWalletBaseCostRefund,
+            provider: "wallet",
+            referenceType: "tenant-customer-wallet-owner-refund",
+            referenceId: order.Id.ToString(CultureInfo.InvariantCulture),
+            orderId: order.OrderId,
+            description: "Refund of tenant owner base-cost reservation after safe customer-wallet compensation",
+            ownerTelegramUserId: order.OwnerTelegramUserId,
+            counterpartyTelegramUserId: order.CustomerTelegramUserId,
+            botId: order.TenantBotId,
+            botUsername: order.TenantBotUsername,
+            botType: BotInstanceTypes.Tenant,
+            idempotencyKey: refundKey,
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>Best-effort owner notice when a customer-wallet sale cannot reserve the tenant base cost.</summary>
+    private async Task NOTIFYTENANTOWNERWALLETINSUFFICIENTASYNC(
+        TenantBotOrder order,
+        BotInstance tenant,
+        CredUser customer,
+        long ownerBalanceToman,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var owner = await _credentialsDbContext.GetUserStatusWithId(order.OwnerTelegramUserId);
+            var chatId = owner?.ChatID > 0 ? owner.ChatID : order.OwnerTelegramUserId;
+            await _botClientProvider.GetClient(_botRegistry.DefaultBot.Id).SendMessage(
+                chatId,
+                "⚠️ سفارش پرداخت‌شده از کیف پول مشتری متوقف شد چون موجودی کیف پول ربات شما برای هزینه پایه کافی نیست.\n\n" +
+                $"فروشگاه: @{Html(tenant?.Username ?? order.TenantBotUsername)}\n" +
+                $"شماره سفارش: <code>{Html(order.OrderId)}</code>\n" +
+                $"هزینه پایه لازم: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
+                $"موجودی فعلی: <code>{Html(ownerBalanceToman.FormatCurrency())}</code>\n\n" +
+                "اکانت ساخته/تمدید نشد و بازپرداخت کیف پول مشتری از مسیر جبرانی امن انجام می‌شود.",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex,
+                "Tenant owner insufficient-wallet notification failed. orderId={OrderId}",
+                order?.OrderId);
+        }
+    }
+
     /// <summary>
     /// Applies the tenant owner's financial settlement for a fulfilled tenant purchase or renewal.
     /// </summary>
@@ -11378,6 +11743,49 @@ public partial class TenantBotService
     {
         if (owner?.TelegramUserId != order.OwnerTelegramUserId)
             throw new InvalidOperationException("Tenant settlement requires the order's shared wallet owner.");
+
+        if (string.Equals(order.PaymentProvider, "wallet", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!debitOwnerBaseCost)
+                throw new InvalidOperationException("Tenant customer-wallet settlement requires its reserved base cost.");
+            var key = TenantCustomerWalletOwnerBaseCostKey(order.Id);
+            var receipt = await _credentialsDbContext.GetWalletOperationAsync(key, cancellationToken)
+                ?? throw new InvalidOperationException("Tenant customer-wallet owner reservation is missing.");
+            if (receipt.TelegramUserId != order.OwnerTelegramUserId ||
+                receipt.AmountToman != -order.BaseCostToman ||
+                receipt.BotId != order.TenantBotId)
+                throw new InvalidOperationException("Tenant customer-wallet owner reservation conflicts with the order.");
+
+            owner.AccountBalance = receipt.AfterBalance;
+            await _walletLedgerService.RecordAsync(
+                order.OwnerTelegramUserId,
+                WalletLedgerDirections.Debit,
+                order.BaseCostToman,
+                receipt.BeforeBalance,
+                receipt.AfterBalance,
+                WalletLedgerReasons.TenantCustomerWalletBaseCost,
+                provider: "wallet",
+                referenceType: referenceType,
+                referenceId: order.Id.ToString(CultureInfo.InvariantCulture),
+                orderId: order.OrderId,
+                description: "Reserved tenant owner base cost for customer-wallet sale",
+                ownerTelegramUserId: order.OwnerTelegramUserId,
+                counterpartyTelegramUserId: order.CustomerTelegramUserId,
+                botId: order.TenantBotId,
+                botUsername: order.TenantBotUsername,
+                botType: BotInstanceTypes.Tenant,
+                idempotencyKey: key,
+                cancellationToken: cancellationToken);
+            var site = await GETTENANTOWNERSITEWALLETSNAPSHOTASYNC(order.OwnerTelegramUserId, cancellationToken);
+            return TenantOwnerWalletSettlementResult.Create(
+                TenantOwnerWalletSources.BotWallet,
+                -order.BaseCostToman,
+                receipt.BeforeBalance,
+                receipt.AfterBalance,
+                site,
+                site);
+        }
+
         using var ownerAdmission = await OwnerSettlementGate.EnterAsync(order.OwnerTelegramUserId.ToString(CultureInfo.InvariantCulture), cancellationToken);
         var botBefore = await _credentialsDbContext.GetAccountBalance(order.OwnerTelegramUserId);
         owner.AccountBalance = botBefore;
@@ -12358,8 +12766,7 @@ public partial class TenantBotService
     /// settlement so disabling the gateway cannot strand a customer who already paid.
     /// </remarks>
     private bool IsTenantHooshPayAvailable(BotInstance tenant, long amountToman)
-        => _gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) &&
-           tenant?.TenantHooshPayEnabled == true &&
+        => TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.HooshPay, _gatewayAvailability.Snapshot) &&
            HooshPayAmountPolicy.IsValid(amountToman);
 
     /// <summary>
@@ -12386,8 +12793,7 @@ public partial class TenantBotService
     /// global or tenant disablement so a customer payment cannot become stranded.
     /// </remarks>
     private bool IsTenantTetraminatorAvailable(BotInstance tenant, long amountToman)
-        => _gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) &&
-           tenant?.TenantTetraminatorEnabled == true &&
+        => TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.Tetraminator, _gatewayAvailability.Snapshot) &&
            amountToman >= _appConfig.TetraminatorMinimumAmountToman;
 
     /// <summary>
@@ -12403,12 +12809,11 @@ public partial class TenantBotService
     /// greater than 50,000 toman. Existing rows remain inquiry/settlement eligible after disablement.
     /// </returns>
     private bool IsTenantUniquePayAvailable(BotInstance tenant, long amountToman)
-        => _gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) &&
-           tenant?.TenantUniquePayEnabled == true &&
+        => TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.UniquePay, _gatewayAvailability.Snapshot) &&
            UniquePayAmountPolicy.IsValid(amountToman);
 
     private bool IsTenantAtlasPayAvailable(BotInstance tenant)
-        => _gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay) && tenant?.TenantAtlasPayEnabled == true;
+        => TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.AtlasPay, _gatewayAvailability.Snapshot);
 
     private string BuildTenantAtlasPayUnavailableMessage(BotInstance tenant)
         => !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay)
@@ -12481,9 +12886,9 @@ public partial class TenantBotService
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + $"RNUP:{order.Id}") });
         if (IsTenantAtlasPayAvailable(tenant))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + $"RNAP:{order.Id}") });
-        if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
+        if (TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.NowPayments, _gatewayAvailability.Snapshot))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی", CUSTOMERCALLBACKPREFIX + $"RNNP:{order.Id}") });
-        if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
+        if (TenantPaymentGatewayPolicy.IsPersonalCardEnabled(tenant))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🧾 کارت‌به‌کارت به فروشگاه | ریالی", CUSTOMERCALLBACKPREFIX + $"RNCARD:{order.Id}") });
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت سفارش", CUSTOMERCALLBACKPREFIX + $"chk:{order.Id}") });
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به فروشگاه", CUSTOMERCALLBACKPREFIX + "home") });

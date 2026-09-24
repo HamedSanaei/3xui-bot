@@ -4,6 +4,7 @@ using Adminbot.Domain;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json.Linq;
 using Xunit;
@@ -24,6 +25,7 @@ public sealed partial class ConcurrencyTests
     {
         using var databases = new Databases();
         var (wallet, _, _) = await SeedCustomerWalletOrderAsync(databases);
+        await wallet.AddEmptyUser(456);
         var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["hooshPayApiKey"] = "test-only", ["hooshPayBaseUrl"] = "https://hoosh.example/", ["hooshPayIpnUrl"] = "https://merchant.example/hp",
@@ -90,18 +92,203 @@ public sealed partial class ConcurrencyTests
         await wallet.MutateWalletAsync(123, 100000, key, botId: "tenant-a");
         await using (var db = databases.Credentials.CreateDbContext())
             await db.WalletOperations.ExecuteUpdateAsync(s => s.SetProperty(x => x.CreatedAtUtc, DateTime.UtcNow.AddMinutes(-2)));
-        var recovery = new WalletOperationReconciliationService(databases.Credentials, databases.Users,
-            new WalletLedgerService(databases.Users, wallet), NullLogger<WalletOperationReconciliationService>.Instance);
+        var ledger = new WalletLedgerService(databases.Users, wallet);
+        var mirror = new TenantWalletOwnerTopUpMirrorService(
+            wallet, ledger, databases.Users, NullLogger<TenantWalletOwnerTopUpMirrorService>.Instance);
+        var recovery = new WalletOperationReconciliationService(
+            databases.Credentials, databases.Users, ledger, mirror,
+            NullLogger<WalletOperationReconciliationService>.Instance);
         await recovery.ReconcileAsync(); await recovery.ReconcileAsync();
         Assert.Equal(600000, await wallet.GetAccountBalance(123));
+        Assert.Equal(100000, await wallet.GetAccountBalance(456));
         await using var verify = databases.Users.CreateDbContext();
         var entry = await verify.WalletLedgerEntries.SingleAsync(x => x.IdempotencyKey == key);
         Assert.Equal("tenant", entry.BotType); Assert.Equal("tenant-a", entry.BotId); Assert.Equal(providerKey, entry.Provider);
+        var mirrorKey = $"tenant-wallet-topup:{providerKey}:1:owner-credit";
+        var mirrorEntry = await verify.WalletLedgerEntries.SingleAsync(x => x.IdempotencyKey == mirrorKey);
+        Assert.Equal(WalletLedgerReasons.TenantWalletTopUpMirror, mirrorEntry.Reason);
+        Assert.Equal(456, mirrorEntry.TelegramUserId); Assert.Equal(123, mirrorEntry.CounterpartyTelegramUserId);
         var notification = await verify.PaymentSettlementNotifications.SingleAsync();
         Assert.Equal($"tenant-wallet:{providerKey}:1", notification.NotificationKey);
         Assert.Equal("tenant-a", notification.BotId); Assert.Equal(BotInstanceTypes.Tenant, notification.WalletOriginBotType);
         Assert.Equal(789, notification.WalletOriginTelegramBotId); Assert.Equal(123, notification.TelegramUserId);
         Assert.Equal(123, notification.ChatId); Assert.Equal(1, posts);
+    }
+
+    [Fact]
+    public async Task TenantCustomerWallet_HooshPay_provisional_credit_mirrors_owner_only_after_official_confirmation()
+    {
+        using var databases = new Databases();
+        var configuration = AtlasTenantConfiguration(databases, "http://127.0.0.1:1");
+        await using var provider = AtlasTenantProvider(
+            databases, configuration, new AtlasPay(configuration), out _, out _);
+        var wallet = provider.GetRequiredService<CredentialsStore>();
+        await SeedCustomerWalletOrderAsync(databases);
+        await wallet.AddEmptyUser(456);
+
+        var payment = HooshPayPaymentInfo.CreateWalletCharge(
+            123, 100_000, "https://merchant.example/hp", "https://merchant.example/return", 123);
+        payment.BotId = "tenant-a";
+        payment.BotUsername = "wallet_test";
+        payment.WalletOriginBotType = BotInstanceTypes.Tenant;
+        payment.WalletOriginTelegramBotId = 789;
+        payment.TenantOwnerTelegramUserId = 456;
+        payment.PaymentStatus = HooshPayStatuses.Pending;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.HooshPayPaymentInfos.Add(payment);
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var settlement = scope.ServiceProvider.GetRequiredService<HooshPaySettlementService>();
+            var provisional = await settlement.ApplyProvisionalWalletPaymentAsync(payment, 999, 123);
+            Assert.Equal(NowPaymentsSettlementStatus.Applied, provisional.Status);
+        }
+        Assert.Equal(600_000, await wallet.GetAccountBalance(123));
+        Assert.Equal(0, await wallet.GetAccountBalance(456));
+
+        HooshPayPaymentInfo official;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            official = await db.HooshPayPaymentInfos.SingleAsync(x => x.Id == payment.Id);
+            Assert.True(official.IsProvisionallyApproved);
+            official.PaymentStatus = HooshPayStatuses.Paid;
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var settlement = scope.ServiceProvider.GetRequiredService<HooshPaySettlementService>();
+            Assert.True(await settlement.RecordProviderConfirmationAfterProvisionalAsync(official, "fixture-official"));
+            Assert.Equal(NowPaymentsSettlementStatus.AlreadyAdded,
+                (await settlement.ApplyFinishedPaymentAsync(official, "fixture-official")).Status);
+            Assert.Equal(NowPaymentsSettlementStatus.AlreadyAdded,
+                (await settlement.ApplyFinishedPaymentAsync(official, "fixture-replay")).Status);
+        }
+
+        Assert.Equal(600_000, await wallet.GetAccountBalance(123));
+        Assert.Equal(100_000, await wallet.GetAccountBalance(456));
+        await using var credentials = databases.Credentials.CreateDbContext();
+        var mirrorKey = $"tenant-wallet-topup:hooshpay:{payment.Id}:owner-credit";
+        Assert.Equal(1, await credentials.WalletOperations.CountAsync(x => x.OperationKey == mirrorKey));
+        await using var users = databases.Users.CreateDbContext();
+        Assert.Equal(1, await users.WalletLedgerEntries.CountAsync(x =>
+            x.IdempotencyKey == mirrorKey && x.Reason == WalletLedgerReasons.TenantWalletTopUpMirror));
+    }
+
+    [Fact]
+    public async Task TenantCustomerWallet_Personal_card_approval_credits_only_customer_once()
+    {
+        using var databases = new Databases();
+        var configuration = AtlasTenantConfiguration(databases, "http://127.0.0.1:1");
+        await using var provider = AtlasTenantProvider(
+            databases, configuration, new AtlasPay(configuration), out var registry, out _);
+        var wallet = provider.GetRequiredService<CredentialsStore>();
+        await wallet.AddEmptyUser(123);
+        await wallet.MutateWalletAsync(123, 10_000, "fixture:card-customer");
+        await wallet.AddEmptyUser(456);
+        await wallet.MutateWalletAsync(456, 70_000, "fixture:card-owner");
+
+        var store = new BotInstance
+        {
+            Id = "tenant-card-wallet",
+            Username = "tenant_card_wallet",
+            Token = "789:" + new string('a', 35),
+            Type = BotInstanceTypes.Tenant,
+            Enabled = true,
+            OwnerTelegramUserId = 456,
+            TelegramBotId = 789,
+            TenantStoreNumber = 1,
+            TenantCardPaymentEnabled = true,
+            TenantCardNumber = "6037991234567890",
+            TenantCardHolderName = "Fixture Owner",
+            CreatedAtUtc = DateTime.UtcNow
+        };
+
+        int receiptId;
+        int orderId;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.BotInstances.Add(store);
+            var order = new TenantBotOrder
+            {
+                OrderId = "wallet-card-topup-1",
+                TenantBotId = store.Id,
+                TenantBotUsername = store.Username,
+                OwnerTelegramUserId = 456,
+                CustomerTelegramUserId = 123,
+                CustomerChatId = 123,
+                OrderKind = TenantBotOrderKinds.WalletCharge,
+                AccountCount = 0,
+                SalePriceToman = 100_000,
+                BaseCostToman = 0,
+                ProfitToman = 0,
+                PaymentProvider = "tenant_card",
+                PaymentStatus = TenantBotOrderStatuses.ReceiptSubmitted,
+                CreatedAtUtc = DateTime.UtcNow
+            };
+            db.TenantBotOrders.Add(order);
+            await db.SaveChangesAsync();
+            var receipt = new TenantManualPaymentReceipt
+            {
+                TenantBotOrderId = order.Id,
+                OrderId = order.OrderId,
+                TenantBotId = order.TenantBotId,
+                TenantBotUsername = order.TenantBotUsername,
+                OwnerTelegramUserId = 456,
+                CustomerTelegramUserId = 123,
+                CustomerChatId = 123,
+                PhotoFileId = "fixture-photo",
+                AmountToman = 100_000,
+                Status = TenantManualPaymentReceiptStatuses.Pending,
+                CreatedAtUtc = DateTime.UtcNow
+            };
+            db.TenantManualPaymentReceipts.Add(receipt);
+            await db.SaveChangesAsync();
+            order.ManualReceiptId = receipt.Id;
+            await db.SaveChangesAsync();
+            receiptId = receipt.Id;
+            orderId = order.Id;
+        }
+        registry.Upsert(store);
+
+        await using var scope = provider.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
+        var first = await service.APPROVEMANUALRECEIPTASYNC(receiptId, 456, default);
+        var second = await service.APPROVEMANUALRECEIPTASYNC(receiptId, 456, default);
+
+        Assert.Contains("100,000", first);
+        Assert.Contains("100,000", second);
+        Assert.Equal(110_000, await wallet.GetAccountBalance(123));
+        Assert.Equal(70_000, await wallet.GetAccountBalance(456));
+
+        await using (var credentials = databases.Credentials.CreateDbContext())
+        {
+            var key = $"tenant-card-wallet-charge:{orderId}:credit";
+            Assert.Equal(1, await credentials.WalletOperations.CountAsync(x => x.OperationKey == key));
+            var credit = await credentials.WalletOperations.SingleAsync(x => x.OperationKey == key);
+            Assert.Equal(100_000, credit.AmountToman);
+            Assert.Equal(123, credit.TelegramUserId);
+        }
+        await using (var verify = databases.Users.CreateDbContext())
+        {
+            var key = $"tenant-card-wallet-charge:{orderId}:credit";
+            Assert.Equal(1, await verify.WalletLedgerEntries.CountAsync(x => x.IdempotencyKey == key));
+            var entry = await verify.WalletLedgerEntries.SingleAsync(x => x.IdempotencyKey == key);
+            Assert.Equal(WalletLedgerReasons.WalletCharge, entry.Reason);
+            Assert.Equal("tenant_card", entry.Provider);
+            Assert.Equal(123, entry.TelegramUserId);
+            Assert.Equal(456, entry.OwnerTelegramUserId);
+            Assert.Empty(await verify.TenantBotLedgerEntries.Where(x => x.TenantBotOrderId == orderId).ToListAsync());
+            Assert.False(await verify.WalletLedgerEntries.AnyAsync(x =>
+                x.ReferenceId == orderId.ToString() && x.Reason == WalletLedgerReasons.TenantWalletTopUpMirror));
+            var order = await verify.TenantBotOrders.SingleAsync(x => x.Id == orderId);
+            Assert.True(order.IsFulfilled);
+            Assert.False(order.IsOwnerCredited);
+            Assert.Equal(0, order.OwnerWalletDelta);
+        }
     }
 
     /// <summary>Supplies a deterministic canonical IRT exchange rate without contacting a live pricing service.</summary>

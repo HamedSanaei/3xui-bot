@@ -238,6 +238,7 @@ public class Program
         // invalidate previous entries naturally.
         services.AddSingleton<ITelegramMandatoryJoinMembershipCache, TelegramMandatoryJoinMembershipCache>();
         services.AddSingleton<WalletLedgerService>();
+        services.AddSingleton<TenantWalletOwnerTopUpMirrorService>();
         services.AddHostedService<WalletOperationReconciliationService>();
         services.AddSingleton<IReferralNotificationSender, ReferralNotificationSender>();
         services.AddSingleton<ReferralService>();

@@ -631,6 +631,7 @@ public sealed partial class AtlasPaySettlementService
     private readonly CredentialsStore _credentials;
     private readonly WalletLedgerService _ledger;
     private readonly ReferralService _referrals;
+    private readonly TenantWalletOwnerTopUpMirrorService _ownerTopUpMirror;
     private readonly AppConfig _configuration;
     private readonly ILogger<AtlasPaySettlementService> _logger;
 
@@ -643,12 +644,14 @@ public sealed partial class AtlasPaySettlementService
     /// <param name="logger">Central financial audit logger.</param>
     public AtlasPaySettlementService(UserDbContextFactory factory, CredentialsStore credentials,
         WalletLedgerService ledger, ReferralService referrals, IConfiguration configuration,
-        ILogger<AtlasPaySettlementService> logger)
+        ILogger<AtlasPaySettlementService> logger,
+        TenantWalletOwnerTopUpMirrorService ownerTopUpMirror = null)
     {
         _factory = factory;
         _credentials = credentials;
         _ledger = ledger;
         _referrals = referrals;
+        _ownerTopUpMirror = ownerTopUpMirror;
         _configuration = configuration.Get<AppConfig>() ?? new AppConfig();
         _logger = logger;
     }
@@ -695,6 +698,10 @@ public sealed partial class AtlasPaySettlementService
                         cancellationToken);
                     await ProcessReferralAsync(tracked, cancellationToken);
                 }
+                if (_ownerTopUpMirror != null)
+                    await _ownerTopUpMirror.EnsureAsync("atlaspay", tracked.Id, tracked.BotId, tracked.BotUsername,
+                        tracked.WalletOriginBotType, tracked.TenantOwnerTelegramUserId, tracked.TelegramUserId,
+                        tracked.BaseAmountToman, cancellationToken);
                 return NowPaymentsSettlementResult.AlreadyAdded(tracked.BalanceAfter ?? user.AccountBalance);
             }
             if (string.Equals(tracked.SettlementState, AtlasPaySettlementStates.ManualReview, StringComparison.Ordinal))
@@ -732,6 +739,10 @@ public sealed partial class AtlasPaySettlementService
             await context.SaveAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, receipt.BeforeBalance, receipt.AfterBalance, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
+            if (_ownerTopUpMirror != null)
+                await _ownerTopUpMirror.EnsureAsync("atlaspay", tracked.Id, tracked.BotId, tracked.BotUsername,
+                    tracked.WalletOriginBotType, tracked.TenantOwnerTelegramUserId, tracked.TelegramUserId,
+                    tracked.BaseAmountToman, cancellationToken);
             if (!tracked.SuccessLoggedAtUtc.HasValue)
             {
                 tracked.SuccessLoggedAtUtc = DateTime.UtcNow; tracked.UpdatedAtUtc = DateTime.UtcNow; await context.SaveAsync(cancellationToken);

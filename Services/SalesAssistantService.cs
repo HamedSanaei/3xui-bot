@@ -656,6 +656,9 @@ public class SalesAssistantService
             return string.Empty;
 
         var provider = FormatPaymentProvider(order.PaymentProvider);
+        if (string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase))
+            return $"💳 درگاه: <code>{Html(provider)}</code>\n" +
+                   "💰 عملیات: <code>شارژ کیف پول مشتری</code>\n";
         var plan = ResolvePlanLabel(order);
         return $"💳 درگاه: <code>{Html(provider)}</code>\n" +
                $"📦 پلن: <code>{Html(plan)}</code>\n";

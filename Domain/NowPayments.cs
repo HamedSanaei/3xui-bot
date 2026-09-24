@@ -774,6 +774,7 @@ namespace Adminbot.Domain
         private readonly WalletLedgerService _walletLedgerService;
         /// <summary>Applies global owned-bot rewards only after a final original NOWPayments credit.</summary>
         private readonly ReferralService _referralService;
+        private readonly TenantWalletOwnerTopUpMirrorService _ownerTopUpMirror;
         private readonly NowPayments _nowPayments;
         private readonly ILogger<NowPaymentsSettlementService> _logger;
 
@@ -803,7 +804,8 @@ namespace Adminbot.Domain
             WalletLedgerService walletLedgerService,
             ReferralService referralService,
             NowPayments nowPayments,
-            ILogger<NowPaymentsSettlementService> logger)
+            ILogger<NowPaymentsSettlementService> logger,
+            TenantWalletOwnerTopUpMirrorService ownerTopUpMirror = null)
         {
             _userDbContextFactory = userDbContext;
             _credentialsDbContext = credentialsDbContext;
@@ -812,6 +814,7 @@ namespace Adminbot.Domain
             _botContextAccessor = botContextAccessor;
             _walletLedgerService = walletLedgerService;
             _referralService = referralService;
+            _ownerTopUpMirror = ownerTopUpMirror;
             _nowPayments = nowPayments;
             _logger = logger;
         }
@@ -870,6 +873,10 @@ namespace Adminbot.Domain
                         payment.BalanceAfter ?? credUser.AccountBalance,
                         cancellationToken);
                     await ProcessReferralAsync(payment, isProvisional: false, cancellationToken);
+                    if (_ownerTopUpMirror != null)
+                        await _ownerTopUpMirror.EnsureAsync("nowpayments", payment.Id, payment.BotId, payment.BotUsername,
+                            payment.WalletOriginBotType, payment.TenantOwnerTelegramUserId, payment.TelegramUserId,
+                            payment.AmountToman, cancellationToken);
                     return NowPaymentsSettlementResult.AlreadyAdded(credUser.AccountBalance);
                 }
 
@@ -911,6 +918,10 @@ namespace Adminbot.Domain
 
                 // Referral runs only after the original wallet credit and its audit ledger are available.
                 await ProcessReferralAsync(payment, isProvisional: false, cancellationToken);
+                if (_ownerTopUpMirror != null)
+                    await _ownerTopUpMirror.EnsureAsync("nowpayments", payment.Id, payment.BotId, payment.BotUsername,
+                        payment.WalletOriginBotType, payment.TenantOwnerTelegramUserId, payment.TelegramUserId,
+                        payment.AmountToman, cancellationToken);
                 using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
                 {
                     LogPayment(
@@ -1037,6 +1048,10 @@ namespace Adminbot.Domain
                 botType: payment.WalletOriginBotType,
                 idempotencyKey: $"payment:nowpayments:{payment.Id}:credit",
                 cancellationToken: cancellationToken);
+            if (_ownerTopUpMirror != null)
+                await _ownerTopUpMirror.EnsureAsync("nowpayments", payment.Id, payment.BotId, payment.BotUsername,
+                    payment.WalletOriginBotType, payment.TenantOwnerTelegramUserId, payment.TelegramUserId,
+                    creditedAmountToman, cancellationToken);
             using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
             {
                 LogPayment(payment, credUser, beforeBalance, afterBalance, source);

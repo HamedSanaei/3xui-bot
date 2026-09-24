@@ -77,7 +77,9 @@ public sealed partial class ConcurrencyTests
             var configuration = AtlasTenantConfiguration(databases, app.Urls.Single());
             await using var provider = AtlasTenantProvider(databases, configuration, new AtlasPay(configuration), out var registry, out var clients);
             var (wallet, funding, order) = await SeedCustomerWalletOrderAsync(databases);
-            await wallet.AddEmptyUser(456); await wallet.PromotOrDemote(456, true);
+            await wallet.AddEmptyUser(456);
+            await wallet.MutateWalletAsync(456, 200_000, "fixture:tenant-owner-fund");
+            await wallet.PromotOrDemote(456, true);
             await using (var db = databases.Users.CreateDbContext())
             {
                 var store = await db.BotInstances.SingleAsync(); store.Token = "789:" + new string('a', 35); store.Username = "wallet_test";
@@ -129,12 +131,14 @@ public sealed partial class ConcurrencyTests
             var success = outcome is "success" or "callbacks" or "applied-ambiguous";
             Assert.Equal(success, result.IsFulfilled);
             Assert.Equal(outcome == "rejected" ? 500000 : 440000, await wallet.GetAccountBalance(123));
-            Assert.Equal(success ? 10000 : 0, await wallet.GetAccountBalance(456));
+            Assert.Equal(outcome == "rejected" ? 200000 : 150000, await wallet.GetAccountBalance(456));
             await using var credentials = databases.Credentials.CreateDbContext();
             Assert.Equal(1, await credentials.WalletOperations.CountAsync(x => x.OperationKey == TenantCustomerWalletFunding.DebitKey(order.Id)));
-            Assert.Equal(success ? 1 : 0, await credentials.WalletOperations.CountAsync(x => x.OperationKey == $"tenant:{order.Id}:profit"));
+            Assert.Equal(0, await credentials.WalletOperations.CountAsync(x => x.OperationKey == $"tenant:{order.Id}:profit"));
             Assert.False(await credentials.WalletOperations.AnyAsync(x => x.OperationKey == $"tenant:{order.Id}:base-cost"));
-            Assert.Equal(outcome == "rejected" ? 1 : 0, await credentials.WalletOperations.CountAsync(x => x.OperationKey.EndsWith(":refund")));
+            Assert.Equal(1, await credentials.WalletOperations.CountAsync(x => x.OperationKey == $"tenant-customer-wallet:{order.Id}:owner-base-cost"));
+            Assert.Equal(outcome == "rejected" ? 1 : 0, await credentials.WalletOperations.CountAsync(x => x.OperationKey == $"tenant-customer-wallet:{order.Id}:owner-base-cost-refund"));
+            Assert.Equal(outcome == "rejected" ? 1 : 0, await credentials.WalletOperations.CountAsync(x => x.OperationKey == $"tenant-customer-wallet:{order.Id}:refund"));
             Assert.Equal(success ? 1 : 0, await users.TenantBotLedgerEntries.CountAsync());
             if (outcome == "callbacks")
             {

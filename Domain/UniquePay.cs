@@ -1109,6 +1109,7 @@ public sealed class UniquePaySettlementService
     private readonly CredentialsStore _credentialsDbContext;
     private readonly WalletLedgerService _walletLedgerService;
     private readonly ReferralService _referralService;
+    private readonly TenantWalletOwnerTopUpMirrorService _ownerTopUpMirror;
     private readonly ILogger<UniquePaySettlementService> _logger;
 
     /// <summary>
@@ -1135,13 +1136,15 @@ public sealed class UniquePaySettlementService
         CredentialsStore credentialsDbContext,
         WalletLedgerService walletLedgerService,
         ReferralService referralService,
-        ILogger<UniquePaySettlementService> logger)
+        ILogger<UniquePaySettlementService> logger,
+        TenantWalletOwnerTopUpMirrorService ownerTopUpMirror = null)
     {
         _configuration = configuration.Get<AppConfig>() ?? new AppConfig();
         _userDbContextFactory = userDbContextFactory ?? throw new ArgumentNullException(nameof(userDbContextFactory));
         _credentialsDbContext = credentialsDbContext;
         _walletLedgerService = walletLedgerService;
         _referralService = referralService;
+        _ownerTopUpMirror = ownerTopUpMirror;
         _logger = logger;
     }
 
@@ -1232,6 +1235,10 @@ public sealed class UniquePaySettlementService
                         cancellationToken);
                     await ProcessReferralAsync(tracked, cancellationToken);
                 }
+                if (_ownerTopUpMirror != null)
+                    await _ownerTopUpMirror.EnsureAsync("uniquepay", tracked.Id, tracked.BotId, tracked.BotUsername,
+                        tracked.WalletOriginBotType, tracked.TenantOwnerTelegramUserId, tracked.TelegramUserId,
+                        tracked.BaseAmountToman, cancellationToken);
                 return NowPaymentsSettlementResult.AlreadyAdded(user.AccountBalance);
             }
 
@@ -1300,6 +1307,10 @@ public sealed class UniquePaySettlementService
             await context.SaveAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, before, after, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
+            if (_ownerTopUpMirror != null)
+                await _ownerTopUpMirror.EnsureAsync("uniquepay", tracked.Id, tracked.BotId, tracked.BotUsername,
+                    tracked.WalletOriginBotType, tracked.TenantOwnerTelegramUserId, tracked.TelegramUserId,
+                    tracked.BaseAmountToman, cancellationToken);
             await LogSettlementOnceAsync(context, tracked, user, before, after, source, cancellationToken);
             return NowPaymentsSettlementResult.Applied(before, after);
         }

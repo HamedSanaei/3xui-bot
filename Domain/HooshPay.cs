@@ -395,6 +395,7 @@ namespace Adminbot.Domain
         private readonly WalletLedgerService _walletLedgerService;
         /// <summary>Applies global owned-bot rewards only for official, non-provisional HooshPay settlement.</summary>
         private readonly ReferralService _referralService;
+        private readonly TenantWalletOwnerTopUpMirrorService _ownerTopUpMirror;
         private readonly ILogger<HooshPaySettlementService> _logger;
 
         /// <summary>
@@ -417,7 +418,8 @@ namespace Adminbot.Domain
             BotContextAccessor botContextAccessor,
             WalletLedgerService walletLedgerService,
             ReferralService referralService,
-            ILogger<HooshPaySettlementService> logger)
+            ILogger<HooshPaySettlementService> logger,
+            TenantWalletOwnerTopUpMirrorService ownerTopUpMirror = null)
         {
             _userDbContextFactory = userDbContext;
             _credentialsDbContext = credentialsDbContext;
@@ -426,6 +428,7 @@ namespace Adminbot.Domain
             _botContextAccessor = botContextAccessor;
             _walletLedgerService = walletLedgerService;
             _referralService = referralService;
+            _ownerTopUpMirror = ownerTopUpMirror;
             _logger = logger;
         }
 
@@ -480,6 +483,12 @@ namespace Adminbot.Domain
                             cancellationToken);
                         await ProcessReferralAsync(payment, cancellationToken);
                     }
+                    // A provisional customer credit is never mirrored early. This method is reached only after
+                    // HooshPay is officially paid, so the owner mirror belongs outside the provisional branch.
+                    if (_ownerTopUpMirror != null)
+                        await _ownerTopUpMirror.EnsureAsync("hooshpay", payment.Id, payment.BotId, payment.BotUsername,
+                            payment.WalletOriginBotType, payment.TenantOwnerTelegramUserId, payment.TelegramUserId,
+                            payment.AmountToman, cancellationToken);
                     return NowPaymentsSettlementResult.AlreadyAdded(credUser.AccountBalance);
                 }
 
@@ -520,6 +529,10 @@ namespace Adminbot.Domain
                     cancellationToken);
                 // Referral settlement starts only after the official provider credit and matching ledger are durable.
                 await ProcessReferralAsync(payment, cancellationToken);
+                if (_ownerTopUpMirror != null)
+                    await _ownerTopUpMirror.EnsureAsync("hooshpay", payment.Id, payment.BotId, payment.BotUsername,
+                        payment.WalletOriginBotType, payment.TenantOwnerTelegramUserId, payment.TelegramUserId,
+                        payment.AmountToman, cancellationToken);
                 using (_botContextAccessor.Push(CreatePaymentBotContext(payment)))
                 {
                     LogPayment(

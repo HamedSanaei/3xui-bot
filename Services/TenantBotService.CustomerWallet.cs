@@ -55,7 +55,7 @@ public partial class TenantBotService
         if (action == "TCW:charge")
         {
             await _state.SaveUserStatus(new User { Id = actor, Flow = "tenant-wallet-charge", LastStep = "amount" });
-            await client.SendMessage(chat, "مبلغ افزایش موجودی کیف پول سراسری را به تومان وارد کنید.\nکارت‌به‌کارت شخصی فروشگاه برای شارژ کیف پول قابل استفاده نیست.", cancellationToken: token);
+            await client.SendMessage(chat, "مبلغ افزایش موجودی کیف پول سراسری را به تومان وارد کنید.\nروش‌های فعال همین فروشگاه، شامل کارت‌به‌کارت شخصی در صورت فعال بودن، در مرحله بعد نمایش داده می‌شوند.", cancellationToken: token);
             return true;
         }
         var charges = _serviceProvider.GetRequiredService<WalletChargeApplicationService>();
@@ -69,11 +69,26 @@ public partial class TenantBotService
             var gateways = new[] { PaymentGateway.HooshPay, PaymentGateway.Tetraminator, PaymentGateway.UniquePay, PaymentGateway.AtlasPay, PaymentGateway.NowPayments };
             var rows = gateways.Where(g => charges.IsAvailable(g, store) && WalletChargeApplicationService.IsValidAmount(g, amount, _appConfig))
                 .Select(g => new[] { InlineKeyboardButton.WithCallbackData(TenantPaymentProviderLabel(g.ToString()), $"TCW:g:{(int)g}:{nonce}") }).ToList();
+            if (TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store))
+                rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🧾 کارت‌به‌کارت به فروشگاه | ریالی", $"TCW:card:{nonce}") });
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به کیف پول", "TCW:home") });
-            await client.SendMessage(chat, $"مبلغ افزایش موجودی: {amount:N0} تومان\nدرگاه مرکزی را انتخاب کنید. کارمزد احتمالی در صفحه پرداخت نمایش داده می‌شود.",
+            await client.SendMessage(chat, $"مبلغ افزایش موجودی: {amount:N0} تومان\nیکی از روش‌های پرداخت فعال این فروشگاه را انتخاب کنید. درگاه‌های مرکزی پس از تایید، هم کیف پول شما و هم کیف پول مالک فروشگاه را شارژ می‌کنند؛ کارت‌به‌کارت شخصی فقط کیف پول شما را افزایش می‌دهد.",
                 replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: token);
             return true;
         }
+        if (action?.StartsWith("TCW:card:", StringComparison.Ordinal) == true)
+        {
+            var parts = action.Split(':');
+            if (parts.Length != 3 || state.Flow != "tenant-wallet-charge" || state.LastStep != "gateway" ||
+                state.SubLink != parts[2] || !long.TryParse(state.ConfigLink, out var amount))
+            { await client.SendMessage(chat, "این درخواست منقضی شده است. کیف پول را دوباره باز کنید.", cancellationToken: token); return true; }
+            if (!TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store))
+            { await client.SendMessage(chat, "کارت‌به‌کارت شخصی این فروشگاه در حال حاضر فعال نیست.", cancellationToken: token); return true; }
+            await _state.ClearUserStatus(state);
+            await CreateTenantWalletCardChargeAsync(client, store, customer, chat, amount, token);
+            return true;
+        }
+
         if (action?.StartsWith("TCW:g:", StringComparison.Ordinal) == true)
         {
             var parts = action.Split(':');
@@ -205,6 +220,60 @@ public partial class TenantBotService
         if (receipt == null) return;
         await funding.ReconcileReceiptAsync(order, receipt, token);
         await FULFILLPAIDTENANTORDERASYNC(order, "customer-wallet-recovery", null, null, false, token);
+    }
+
+    /// <summary>Creates a manual personal-card wallet top-up bound to the current tenant and customer.</summary>
+    /// <remarks>
+    /// The owner receives the card transfer outside the platform. Approval credits only the customer's shared wallet;
+    /// no owner mirror, XUI fulfillment, provisional account, base-cost debit, or referral side effect is allowed.
+    /// </remarks>
+    private async Task CreateTenantWalletCardChargeAsync(
+        ITelegramBotClient client,
+        BotInstance store,
+        CredUser customer,
+        long chatId,
+        long amountToman,
+        CancellationToken token)
+    {
+        if (amountToman <= 0 || !TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store))
+            throw new InvalidOperationException("Tenant personal card wallet charge is unavailable.");
+
+        var order = new TenantBotOrder
+        {
+            OrderId = CreateTenantOrderId(store, customer.TelegramUserId),
+            TenantBotId = store.Id,
+            TenantBotUsername = store.Username,
+            OwnerTelegramUserId = store.OwnerTelegramUserId ?? 0,
+            CustomerTelegramUserId = customer.TelegramUserId,
+            CustomerChatId = chatId,
+            CustomerUsername = customer.Username,
+            CustomerFirstName = customer.FirstName,
+            CustomerLastName = customer.LastName,
+            OrderKind = TenantBotOrderKinds.WalletCharge,
+            AccountCount = 0,
+            SalePriceToman = amountToman,
+            BaseCostToman = 0,
+            ProfitToman = 0,
+            PaymentProvider = "tenant_card",
+            PaymentStatus = TenantBotOrderStatuses.AwaitingReceipt,
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+        _workflow.Add(order);
+        await _workflow.SaveAsync(token);
+        await _state.SetPendingReceiptTargetAsync(customer.TelegramUserId, order.Id, token);
+
+        await client.SendMessage(
+            chatId,
+            "💳 <b>شارژ کیف پول با کارت‌به‌کارت فروشگاه</b>\n\n" +
+            $"مبلغ دقیق: <code>{Html(amountToman.FormatCurrency())}</code>\n" +
+            $"شماره کارت: <code>{Html(store.TenantCardNumber)}</code>\n" +
+            $"نام صاحب کارت: <b>{Html(store.TenantCardHolderName)}</b>\n" +
+            $"شماره پیگیری: <code>{Html(order.OrderId)}</code>\n\n" +
+            "مبلغ را دقیق واریز کنید و سپس عکس رسید را همینجا بفرستید. پس از تایید مالک فروشگاه، فقط موجودی کیف پول شما به همین مبلغ افزایش پیدا می‌کند.",
+            parseMode: ParseMode.Html,
+            replyMarkup: BuildTenantCardPaymentKeyboard(order),
+            cancellationToken: token);
     }
 
     /// <summary>Persists a short-lived confirmation in the owned bot/user conversation, binding approval to the displayed storefront.</summary>
