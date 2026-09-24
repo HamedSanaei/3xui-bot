@@ -80,6 +80,33 @@ grep -Fq "deployment SHA must be exactly 40 hexadecimal characters" <<< "$stream
 [[ "$streamed_output" != *"BASH_SOURCE"* ]]
 printf '  streamed bash -s entrypoint safely rejected invalid SHA\n'
 
+# Deployment-lock regression guard. A cancelled release previously left a reusable MSBuild node holding fd 9, which
+# kept /var/lock/vpnetiran-deploy.lock busy indefinitely and caused every later GitHub deploy to hang with no output.
+deploy_script="$script_dir/deploy-production.sh"
+workflow_file="$script_dir/../.github/workflows/deploy-production.yml"
+
+grep -Fq -- 'flock -w 60 -x 9' "$deploy_script" \
+  || { echo 'Production lock acquisition must have a bounded wait.' >&2; exit 1; }
+grep -Fq -- 'MSBUILDDISABLENODEREUSE=1' "$deploy_script" \
+  || { echo 'MSBuild node reuse must remain disabled during production deploys.' >&2; exit 1; }
+
+lock_fd_close_count="$(grep -Fc -- '9>&-' "$deploy_script")"
+if ((lock_fd_close_count < 4)); then
+  echo "Expected build, publish, and both migration checks to close the deployment lock fd; found $lock_fd_close_count closures." >&2
+  exit 1
+fi
+
+grep -Fq -- "-o ConnectTimeout=15 \\" "$workflow_file" \
+  || { echo 'Production SSH must have a bounded connection timeout and line continuation.' >&2; exit 1; }
+grep -Fq -- "-o ConnectionAttempts=2 \\" "$workflow_file" \
+  || { echo 'Production SSH must bound connection attempts and preserve the option chain.' >&2; exit 1; }
+
+printf 'Production deployment lock regression test: PASS\n'
+printf '  lock wait is bounded and emits diagnostics instead of hanging forever\n'
+printf '  reusable MSBuild nodes cannot retain the deployment lock\n'
+printf '  build, publish, and migration child processes do not inherit fd 9\n'
+printf '  SSH connection establishment is bounded and diagnosable\n'
+
 # Release-gate ordering assertions. The production synchronizer must not rely on `dotnet publish` alone: the pinned EF
 # tool, restore, build, the full test suite, and both EF pending-model checks have to run, and every one of them - plus
 # the published executable's migration preflight - has to run before any source or publish synchronization and before

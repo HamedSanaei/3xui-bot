@@ -77,12 +77,18 @@ main() {
   local live_root="${5:-$EXPECTED_LIVE_ROOT}"
   local service_name="${6:-$EXPECTED_SERVICE_NAME}"
 
+  printf 'Production deploy script started.\n'
+  printf 'Commit: %s\n' "$deploy_sha"
+  printf 'Run: %s attempt %s\n' "$run_id" "$run_attempt"
+
   [[ "$deploy_sha" =~ ^[0-9a-fA-F]{40}$ ]] || fail "deployment SHA must be exactly 40 hexadecimal characters."
   [[ "$run_id" =~ ^[0-9]+$ ]] || fail "GitHub run id must be numeric."
   [[ "$run_attempt" =~ ^[0-9]+$ ]] || fail "GitHub run attempt must be numeric."
   [[ "$repo_url" == "$CANONICAL_REPO_URL" ]] || fail "repository URL does not match the canonical origin."
   [[ "$live_root" == "$EXPECTED_LIVE_ROOT" ]] || fail "live root must remain $EXPECTED_LIVE_ROOT."
   [[ "$service_name" == "$EXPECTED_SERVICE_NAME" ]] || fail "service name must remain $EXPECTED_SERVICE_NAME."
+
+  printf 'Checking production prerequisites.\n'
   command -v git >/dev/null || fail "git is required on the production host."
   command -v dotnet >/dev/null || fail "dotnet is required on the production host."
   command -v rsync >/dev/null || fail "rsync is required on the production host."
@@ -91,9 +97,15 @@ main() {
   command -v stat >/dev/null || fail "stat is required on the production host."
   command -v systemctl >/dev/null || fail "systemctl is required on the production host."
   command -v journalctl >/dev/null || fail "journalctl is required on the production host."
+
+  # A cancelled deployment must not leave a reusable MSBuild node alive. Such a node can inherit the
+  # deployment lock descriptor and block every later deploy even after the GitHub Actions run has ended.
+  export MSBUILDDISABLENODEREUSE=1
+  printf 'Checking .NET 10 SDK.\n'
   dotnet --info >/dev/null || fail "dotnet --info failed on the production host."
   dotnet --list-sdks | awk '{print $1}' | grep -Eq '^10\.' || fail ".NET 10 SDK is required to publish net10.0."
 
+  printf 'Checking production paths and systemd service.\n'
   local live_publish="$live_root/bin/Release/net10.0/linux-x64/publish"
   local live_data="$live_publish/Data"
   [[ -d "$live_root" ]] || fail "live root does not exist."
@@ -117,10 +129,20 @@ main() {
   }
 
   mkdir -p "$STAGING_BASE"
+
   exec 9>"$LOCK_FILE"
-  if ! flock -x 9; then
-    fail "could not acquire the server-side deployment lock."
+  printf 'Waiting up to 60 seconds for production deployment lock.\n'
+  if ! flock -w 60 -x 9; then
+    printf 'Production deployment lock is still busy. Diagnostics follow.\n' >&2
+    if command -v lslocks >/dev/null 2>&1; then
+      lslocks | grep -F 'vpnetiran-deploy.lock' >&2 || true
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+      lsof "$LOCK_FILE" >&2 || true
+    fi
+    fail "production deployment lock remained busy for more than 60 seconds."
   fi
+  printf 'Production deployment lock acquired.\n'
 
   local stage_root="$STAGING_BASE/${deploy_sha}-${run_id}-${run_attempt}"
   local stage_source="$stage_root/source"
@@ -161,6 +183,9 @@ main() {
   # treated as a sufficient gate: it compiles the application but never runs the suite or the EF model checks.
   printf 'Running release gates for commit %s.\n' "$actual_sha"
   (
+    # Build/test tooling may spawn reusable or orphanable children. Never let those children inherit fd 9,
+    # otherwise an interrupted deploy can leave the production lock pinned indefinitely.
+    exec 9>&-
     cd "$stage_source"
     dotnet tool restore
     dotnet restore Adminbot.sln
@@ -174,6 +199,8 @@ main() {
   mkdir -p "$stage_publish"
   printf 'Publishing verified commit %s in staging.\n' "$actual_sha"
   (
+    # Keep the same lock-descriptor isolation for publish-time MSBuild processes.
+    exec 9>&-
     cd "$stage_source"
     dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false \
       "/p:SourceRevisionId=$actual_sha" -o "$stage_publish"
@@ -192,12 +219,13 @@ main() {
   # live production databases. This starts no web server, Telegram receiver, or worker, and it only reads the live
   # database files, so a schema change that cannot apply to real production data aborts the deployment here.
   printf 'Running migration preflight against fresh databases.\n'
-  "$stage_publish/Adminbot" --migration-check \
+  "$stage_publish/Adminbot" --migration-check 9>&- \
     || fail "migration preflight failed against fresh databases."
   printf 'Running migration preflight against production database copies.\n'
   "$stage_publish/Adminbot" --migration-check \
     --users-source "$live_data/users.db" \
     --credentials-source "$live_data/credentials.db" \
+    9>&- \
     || fail "migration preflight failed against production database copies."
   assert_data_unchanged
 

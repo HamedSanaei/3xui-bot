@@ -113,6 +113,9 @@ jobs:
             -o IdentitiesOnly=yes \
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=10 \
+            -v \
+            -o ConnectTimeout=15 \
+            -o ConnectionAttempts=2 \
             -o TCPKeepAlive=yes \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \

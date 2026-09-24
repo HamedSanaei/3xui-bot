@@ -32,12 +32,18 @@ using Newtonsoft.Json.Linq;
 /// </remarks>
 internal sealed class FakeUpstreamPanel : IAsyncDisposable
 {
+    // These tests spin up real in-process Kestrel listeners. xUnit runs test classes in parallel by default, so without
+    // a shared gate several fake panels can compete for loopback/socket/thread-pool resources on smaller CI runners.
+    // One active fake panel at a time keeps the integration fixture deterministic without serializing unrelated tests.
+    private static readonly SemaphoreSlim InstanceGate = new(1, 1);
+
     private readonly object _sync = new();
     private readonly Dictionary<string, JObject> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, List<JObject>> _globalTraffic = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Dictionary<int, List<JObject>>> _nodeTraffic = new(StringComparer.OrdinalIgnoreCase);
 
     private WebApplication? _app;
+    private bool _ownsInstanceGate;
 
     /// <summary>Gets the loopback base URL the fake panel listens on.</summary>
     public string Url { get; private set; } = string.Empty;
@@ -87,17 +93,26 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
     /// <returns>The started panel.</returns>
     public static async Task<FakeUpstreamPanel> StartAsync()
     {
-        var panel = new FakeUpstreamPanel();
-        var builder = WebApplication.CreateBuilder();
-        builder.Logging.ClearProviders();
-        builder.WebHost.UseUrls("http://127.0.0.1:0");
-        var app = builder.Build();
-        app.Run(async context => await panel.HandleAsync(context));
-        await app.StartAsync();
-        panel._app = app;
-        panel.Url = app.Urls.Single();
-        panel.ServerInfo = new ServerInfo { Url = panel.Url, ApiToken = "test-only" };
-        return panel;
+        await InstanceGate.WaitAsync();
+        var panel = new FakeUpstreamPanel { _ownsInstanceGate = true };
+        try
+        {
+            var builder = WebApplication.CreateBuilder();
+            builder.Logging.ClearProviders();
+            builder.WebHost.UseUrls("http://127.0.0.1:0");
+            var app = builder.Build();
+            app.Run(async context => await panel.HandleAsync(context));
+            await app.StartAsync();
+            panel._app = app;
+            panel.Url = app.Urls.Single();
+            panel.ServerInfo = new ServerInfo { Url = panel.Url, ApiToken = "test-only" };
+            return panel;
+        }
+        catch
+        {
+            panel.ReleaseInstanceGate();
+            throw;
+        }
     }
 
     /// <summary>Seeds a client's shared traffic row and client configuration.</summary>
@@ -456,7 +471,27 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        if (_app != null)
-            await _app.StopAsync();
+        try
+        {
+            if (_app != null)
+            {
+                await _app.StopAsync();
+                await _app.DisposeAsync();
+                _app = null;
+            }
+        }
+        finally
+        {
+            ReleaseInstanceGate();
+        }
+    }
+
+    private void ReleaseInstanceGate()
+    {
+        if (!_ownsInstanceGate)
+            return;
+
+        _ownsInstanceGate = false;
+        InstanceGate.Release();
     }
 }
