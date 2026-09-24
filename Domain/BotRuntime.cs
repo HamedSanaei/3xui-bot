@@ -80,9 +80,12 @@ namespace Adminbot.Domain
     /// </summary>
     public class BotInstance
     {
-        /// <summary>Super-admin admission permission to expose the global customer wallet through this storefront; defaults false.</summary>
-        /// <remarks>Revocation blocks new work, never settlement of paid invoices or recovery of committed debits.</remarks>
+        /// <summary>Super-admin grant allowing this storefront owner to opt in to the global customer wallet; defaults false.</summary>
+        /// <remarks>This is platform trust, not the owner's activation choice. Revocation blocks new work immediately.</remarks>
         public bool TenantCustomerWalletEnabled { get; set; }
+        /// <summary>Storefront owner's explicit opt-in after the super-admin grant; defaults false.</summary>
+        /// <remarks>Wallet admission requires this flag and a still-valid identity-bound super-admin grant.</remarks>
+        public bool TenantCustomerWalletOwnerEnabled { get; set; }
         /// <summary>UTC approval time, cleared when permission is revoked or storefront identity changes.</summary>
         public DateTime? TenantCustomerWalletApprovedAtUtc { get; set; }
         /// <summary>Configured super administrator's Telegram user id that granted this permission.</summary>

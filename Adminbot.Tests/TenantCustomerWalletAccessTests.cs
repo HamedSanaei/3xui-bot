@@ -25,6 +25,7 @@ public sealed partial class ConcurrencyTests
         }
         var policy = new TenantCustomerWalletPolicy(databases.Users, new AppConfig { AdminsUserIds = new() { 999 } }, NullLogger<TenantCustomerWalletPolicy>.Instance);
         await policy.SetAsync(999, "tenant-c", 791, 458, true);
+        await policy.SetOwnerEnabledAsync(458, "tenant-c", true);
         TenantBotOrder Candidate(string bot, long owner) => new() { TenantBotId = bot, OwnerTelegramUserId = owner,
             CustomerTelegramUserId = 123, CustomerChatId = 123, OrderId = Guid.NewGuid().ToString("N"),
             ServiceKey = "normal", SalePriceToman = 100000, BaseCostToman = 80000, ProfitToman = 20000 };
@@ -95,6 +96,14 @@ public sealed partial class ConcurrencyTests
             var confirm = client.Callbacks.Last(x => x.StartsWith("TWA:y:"));
             Assert.True(System.Text.Encoding.UTF8.GetByteCount(confirm) <= 64);
             await tenant.TryHandleWalletAdminAsync(client, Callback(999, confirm), default);
+            await using (var grantDb = databases.Users.CreateDbContext())
+            {
+                var granted = await grantDb.BotInstances.AsNoTracking().SingleAsync(x => x.Id == "tenant-a");
+                Assert.True(TenantCustomerWalletPolicy.HasValidGrant(granted));
+                Assert.False(granted.TenantCustomerWalletOwnerEnabled);
+                Assert.False(TenantCustomerWalletPolicy.IsApproved(granted));
+            }
+            await policy.SetOwnerEnabledAsync(456, "tenant-a", true);
             Assert.True(TenantCustomerWalletPolicy.IsApproved(await policy.RequireAsync("tenant-a")));
             await tenant.TryHandleWalletAdminAsync(client, Callback(999, "TWA:o:456:1"), default);
             var stale = client.Callbacks.Last(x => x.StartsWith("TWA:y:"));
@@ -103,5 +112,63 @@ public sealed partial class ConcurrencyTests
             await Assert.ThrowsAsync<InvalidOperationException>(() => policy.RequireAsync("tenant-a"));
         }
         Assert.Equal(500000, await wallet.GetAccountBalance(123));
+    }
+
+    /// <summary>The real tenant-owner callback cannot enable customer wallet before a super-admin grant.</summary>
+    /// <returns>A task completing after blocked, granted, active and revoked owner-panel transitions.</returns>
+    [Fact]
+    public async Task TenantCustomerWallet_Owner_panel_toggle_requires_live_super_admin_grant()
+    {
+        using var databases = new Databases();
+        await using var provider = StorefrontProvider(databases);
+        var stores = provider.GetRequiredService<TenantStoreStore>();
+        var store = await stores.CreateAsync(711, Guid.NewGuid().ToString("N"));
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var tracked = await db.BotInstances.SingleAsync(x => x.Id == store.Id);
+            tracked.TelegramBotId = 812345;
+            tracked.Enabled = true;
+            await db.SaveChangesAsync();
+            store = tracked;
+        }
+
+        var owner = new CredUser { TelegramUserId = 711, IsColleague = true };
+        await provider.GetRequiredService<CredentialsStore>().SaveUserStatus(owner);
+        var client = new StorefrontClient();
+        var policy = new TenantCustomerWalletPolicy(databases.Users,
+            new AppConfig { AdminsUserIds = new() { 999 } }, NullLogger<TenantCustomerWalletPolicy>.Instance);
+
+        using (new BotContextAccessor().Push(new BotRuntimeContext
+               { Config = new BotInstanceConfig { Id = "owned-wallet-panel", Type = BotInstanceTypes.Owned }, Client = client }))
+        {
+            await OwnerCallback(provider, client, owner, TenantOwnerCallback.Encode(store, "panel"));
+            await OwnerCallback(provider, client, owner, await FreshWalletToggleAsync(databases, store.Id, true));
+            Assert.Contains(client.Answers, x => x.Contains("سوپرادمین", StringComparison.Ordinal));
+            await using (var blockedDb = databases.Users.CreateDbContext())
+                Assert.False((await blockedDb.BotInstances.AsNoTracking().SingleAsync(x => x.Id == store.Id)).TenantCustomerWalletOwnerEnabled);
+
+            await policy.SetAsync(999, store.Id, 812345, 711, true);
+            await OwnerCallback(provider, client, owner, await FreshWalletToggleAsync(databases, store.Id, true));
+            await using (var activeDb = databases.Users.CreateDbContext())
+            {
+                var active = await activeDb.BotInstances.AsNoTracking().SingleAsync(x => x.Id == store.Id);
+                Assert.True(active.TenantCustomerWalletOwnerEnabled);
+                Assert.True(TenantCustomerWalletPolicy.IsApproved(active));
+            }
+
+            await policy.SetAsync(999, store.Id, 812345, 711, false);
+            await OwnerCallback(provider, client, owner, await FreshWalletToggleAsync(databases, store.Id, true));
+            await using var revokedDb = databases.Users.CreateDbContext();
+            var revoked = await revokedDb.BotInstances.AsNoTracking().SingleAsync(x => x.Id == store.Id);
+            Assert.False(revoked.TenantCustomerWalletOwnerEnabled);
+            Assert.False(TenantCustomerWalletPolicy.IsApproved(revoked));
+        }
+    }
+
+    private static async Task<string> FreshWalletToggleAsync(Databases databases, string storeId, bool enabled)
+    {
+        await using var db = databases.Users.CreateDbContext();
+        var store = await db.BotInstances.AsNoTracking().SingleAsync(x => x.Id == storeId);
+        return TenantOwnerCallback.Encode(store, "set-setting:wallet:" + (enabled ? 1 : 0));
     }
 }

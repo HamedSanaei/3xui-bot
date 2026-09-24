@@ -7,20 +7,26 @@ Storefront approval grants a route to that balance, not ownership of it. Approve
 customer balance; unapproved B cannot expose or spend it. The colleague owner's wallet remains separate.
 
 From an **owned bot**, a configured super administrator uses `/tenantwallet` or `/tenantwallet search` to list
-up to 30 matching stores (brand, username, internal store id or owner id). Select a store, inspect its owner,
-verified bot identity, runtime state and approval evidence, then explicitly confirm enablement or revoke it.
-Confirmation is bound to that owned-bot/admin conversation, a random nonce, the displayed store revision and
-a five-minute expiry. Possession of a callback is not authority. Store owners have no approval toggle.
+up to 30 matching stores (brand, username, internal store id or owner id). Selecting a store shows the current
+BotFather identity, owner identity, super-admin grant state, owner opt-in state and final wallet state. Grant and
+revocation confirmations are bound to that owned-bot/admin conversation, a random nonce, the displayed store
+revision and a five-minute expiry. Possession of a callback is not authority.
 
-Approval requires an enabled tenant and matching approved/current owner and BotFather ids. Reset, invalid-token
-cleanup and replacement with a different Telegram identity clear approval evidence. An identity mismatch also
-fails closed during concurrent changes. The same BotFather identity's routine token rotation preserves approval.
-New invoice/debit admission reads persisted approval; requests already admitted before concurrent revocation
-may finish. Revocation never cancels committed payment evidence or triggers a refund by itself.
+The super-admin action grants **eligibility only**. A fresh grant deliberately leaves
+`TenantCustomerWalletOwnerEnabled=false`. The exact persisted storefront owner must then use the separate
+`کیف پول مشتری` control in that storefront's owner panel. Attempting to enable it before a valid grant is rejected.
+The owner control changes only the owner opt-in bit and can never create or modify approval metadata.
 
-Approved home menus show `💰 کیف پول` and `📒 تراکنش‌های من`. History always queries the authenticated
-sender's global ledger, not an id supplied by a callback. Store owners receive order amount/profit/source only,
-never the customer's whole balance. Existing tenant owner suspension/debt checks still guard new interactions.
+Final customer-wallet admission requires all three conditions at the same time: the storefront is enabled, the
+identity-bound super-admin grant is still valid for the current BotFather id and owner id, and the current owner
+has explicitly opted in. Reset, invalid-token cleanup, owner reassignment, bot identity replacement, or explicit
+super-admin revocation clear the grant and owner opt-in. A routine token rotation that preserves the same numeric
+BotFather identity may preserve the grant. Revocation blocks new UI, top-up, purchase and renewal admission but
+never cancels committed payment evidence, paid invoice settlement, or durable debit recovery.
+
+Only the final active state shows `💰 کیف پول` and `📒 تراکنش‌های من` to customers. History always queries the
+authenticated sender's global ledger, not an id supplied by a callback. Store owners receive order amount/profit/source
+only, never the customer's whole balance. Existing tenant owner suspension/debt checks still guard new interactions.
 
 ## Top-up and settlement
 
@@ -97,11 +103,15 @@ procedures; do not delete markers, force a second create or refund based on time
 
 Migration `20260923083845_TenantCustomerWallet` changes **users.db only**:
 
-- BotInstances: approval flag (false default), UTC approval time, administrator id, approved bot id and owner id.
+- BotInstances: super-admin grant flag (false default), UTC approval time, administrator id, approved bot id and owner id.
 - TenantBotOrders: nullable admission key with a unique index; nullable funding state.
 - Five central payment tables: immutable WalletOriginBotType with historical `owned` default.
 - No historical credits, balances, ids or receipt keys change. No credentials snapshot/schema change.
 - Down refuses to discard tenant-origin payment history or any admitted wallet order. Use a compatible forward fix.
+- Migration `20260924023225_TenantCustomerWalletOwnerActivation` adds
+  `BotInstances.TenantCustomerWalletOwnerEnabled` with a constant false default. It changes no customer balance,
+  receipt, order, provider payment or approval identity. Existing approved storefronts therefore remain fail-closed
+  until their exact owner explicitly opts in after deployment.
 
 New application files: `TenantCustomerWalletPolicy`, `TenantCustomerWalletFunding`, `TenantCustomerWalletRecoveryWorker`,
 `WalletChargeApplicationService`, `TenantBotService.CustomerWallet` and `TelegramBotService.TenantWallet` in Services.

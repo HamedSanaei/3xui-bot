@@ -68,8 +68,18 @@ public sealed partial class ConcurrencyTests
         var policy = new TenantCustomerWalletPolicy(databases.Users, new AppConfig { AdminsUserIds = new() { 999 } },
             NullLogger<TenantCustomerWalletPolicy>.Instance);
         await Assert.ThrowsAsync<InvalidOperationException>(() => policy.RequireAsync("tenant-a"));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => policy.SetOwnerEnabledAsync(123, "tenant-a", true));
         await Assert.ThrowsAsync<UnauthorizedAccessException>(() => policy.SetAsync(123, "tenant-a", 456, 123, true));
         await policy.SetAsync(999, "tenant-a", 456, 123, true);
+        await using (var grantedDb = databases.Users.CreateDbContext())
+        {
+            var granted = await grantedDb.BotInstances.AsNoTracking().SingleAsync();
+            Assert.True(TenantCustomerWalletPolicy.HasValidGrant(granted));
+            Assert.False(granted.TenantCustomerWalletOwnerEnabled);
+            Assert.False(TenantCustomerWalletPolicy.IsApproved(granted));
+        }
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => policy.SetOwnerEnabledAsync(555, "tenant-a", true));
+        await policy.SetOwnerEnabledAsync(123, "tenant-a", true);
         Assert.True(TenantCustomerWalletPolicy.IsApproved(await policy.RequireAsync("tenant-a")));
         await using (var db = databases.Users.CreateDbContext())
             await db.BotInstances.Where(x => x.Id == "tenant-a").ExecuteUpdateAsync(s => s.SetProperty(x => x.TelegramBotId, (long?)457));
@@ -79,10 +89,63 @@ public sealed partial class ConcurrencyTests
         await using var verify = databases.Users.CreateDbContext();
         var row = await verify.BotInstances.SingleAsync();
         Assert.False(row.TenantCustomerWalletEnabled);
+        Assert.False(row.TenantCustomerWalletOwnerEnabled);
         Assert.Null(row.TenantCustomerWalletApprovedAtUtc);
         Assert.Null(row.TenantCustomerWalletApprovedByTelegramUserId);
         Assert.Null(row.TenantCustomerWalletApprovedBotId);
         Assert.Null(row.TenantCustomerWalletApprovedOwnerId);
+    }
+
+    /// <summary>Owner activation is impossible before a super-admin grant, while revocation clears both sides of consent.</summary>
+    /// <returns>A task completing after policy, persisted-state, and owner-panel button assertions.</returns>
+    [Fact]
+    public async Task TenantCustomerWallet_Owner_activation_requires_grant_and_revocation_clears_opt_in()
+    {
+        using var databases = new Databases();
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.BotInstances.Add(new BotInstance { Id = "tenant-owner-optin", Type = BotInstanceTypes.Tenant,
+                OwnerTelegramUserId = 456, TelegramBotId = 789, TenantStoreNumber = 1 });
+            await db.SaveChangesAsync();
+        }
+
+        var policy = new TenantCustomerWalletPolicy(databases.Users, new AppConfig { AdminsUserIds = new() { 999 } },
+            NullLogger<TenantCustomerWalletPolicy>.Instance);
+        var keyboardMethod = typeof(TenantBotService).GetMethod("BUILDOWNERPANELKEYBOARD",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var store = await db.BotInstances.AsNoTracking().SingleAsync();
+            var keyboard = (Telegram.Bot.Types.ReplyMarkups.InlineKeyboardMarkup)keyboardMethod.Invoke(null, new object[] { store })!;
+            var walletButton = Assert.Single(keyboard.InlineKeyboard.SelectMany(x => x),
+                x => x.CallbackData?.Contains("set-setting:wallet:", StringComparison.Ordinal) == true);
+            Assert.Contains("🔒", walletButton.Text);
+        }
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            policy.SetOwnerEnabledAsync(456, "tenant-owner-optin", true));
+        await policy.SetAsync(999, "tenant-owner-optin", 789, 456, true);
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var granted = await db.BotInstances.AsNoTracking().SingleAsync();
+            Assert.True(TenantCustomerWalletPolicy.HasValidGrant(granted));
+            Assert.False(granted.TenantCustomerWalletOwnerEnabled);
+            Assert.False(TenantCustomerWalletPolicy.IsApproved(granted));
+            var keyboard = (Telegram.Bot.Types.ReplyMarkups.InlineKeyboardMarkup)keyboardMethod.Invoke(null, new object[] { granted })!;
+            var walletButton = Assert.Single(keyboard.InlineKeyboard.SelectMany(x => x),
+                x => x.CallbackData?.Contains("set-setting:wallet:", StringComparison.Ordinal) == true);
+            Assert.Contains("فعال‌سازی", walletButton.Text);
+        }
+
+        await policy.SetOwnerEnabledAsync(456, "tenant-owner-optin", true);
+        Assert.True(TenantCustomerWalletPolicy.IsApproved(await policy.RequireAsync("tenant-owner-optin")));
+        await policy.SetAsync(999, "tenant-owner-optin", 789, 456, false);
+        await using var verify = databases.Users.CreateDbContext();
+        var revoked = await verify.BotInstances.AsNoTracking().SingleAsync();
+        Assert.False(TenantCustomerWalletPolicy.HasValidGrant(revoked));
+        Assert.False(revoked.TenantCustomerWalletOwnerEnabled);
+        Assert.False(TenantCustomerWalletPolicy.IsApproved(revoked));
     }
 
     /// <summary>A committed debit repairs users.db after restart and remains recoverable after approval is revoked.</summary>
@@ -210,11 +273,13 @@ public sealed partial class ConcurrencyTests
     [InlineData(false)]
     public void TenantCustomerWallet_Reset_erases_identity_bound_trust(bool fullReset)
     {
-        var store = new BotInstance { TenantCustomerWalletEnabled = true, TenantCustomerWalletApprovedAtUtc = DateTime.UtcNow,
-            TenantCustomerWalletApprovedByTelegramUserId = 999, TenantCustomerWalletApprovedBotId = 789, TenantCustomerWalletApprovedOwnerId = 456 };
+        var store = new BotInstance { TenantCustomerWalletEnabled = true, TenantCustomerWalletOwnerEnabled = true,
+            TenantCustomerWalletApprovedAtUtc = DateTime.UtcNow, TenantCustomerWalletApprovedByTelegramUserId = 999,
+            TenantCustomerWalletApprovedBotId = 789, TenantCustomerWalletApprovedOwnerId = 456 };
         typeof(TenantBotService).GetMethod("ResetTenantStorefrontSettings", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
             .Invoke(null, new object[] { store, fullReset });
-        Assert.False(store.TenantCustomerWalletEnabled); Assert.Null(store.TenantCustomerWalletApprovedAtUtc);
+        Assert.False(store.TenantCustomerWalletEnabled); Assert.False(store.TenantCustomerWalletOwnerEnabled);
+        Assert.Null(store.TenantCustomerWalletApprovedAtUtc);
         Assert.Null(store.TenantCustomerWalletApprovedByTelegramUserId); Assert.Null(store.TenantCustomerWalletApprovedBotId);
         Assert.Null(store.TenantCustomerWalletApprovedOwnerId);
     }
@@ -229,8 +294,9 @@ public sealed partial class ConcurrencyTests
         await using (var db = databases.Users.CreateDbContext())
         {
             db.BotInstances.Add(new BotInstance { Id = "tenant-a", Type = BotInstanceTypes.Tenant, OwnerTelegramUserId = 456,
-                TelegramBotId = 789, TenantStoreNumber = 1, TenantCustomerWalletEnabled = true, TenantCustomerWalletApprovedAtUtc = DateTime.UtcNow,
-                TenantCustomerWalletApprovedByTelegramUserId = 999, TenantCustomerWalletApprovedOwnerId = 456, TenantCustomerWalletApprovedBotId = 789 });
+                TelegramBotId = 789, TenantStoreNumber = 1, TenantCustomerWalletEnabled = true, TenantCustomerWalletOwnerEnabled = true,
+                TenantCustomerWalletApprovedAtUtc = DateTime.UtcNow, TenantCustomerWalletApprovedByTelegramUserId = 999,
+                TenantCustomerWalletApprovedOwnerId = 456, TenantCustomerWalletApprovedBotId = 789 });
             await db.SaveChangesAsync();
         }
         var funding = new TenantCustomerWalletFunding(databases.Users, wallet, new WalletLedgerService(databases.Users, wallet));

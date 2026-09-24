@@ -1,15 +1,18 @@
 # CODE_MAP.md
 
-- Tenant customer wallet: per-store super-admin approval via owned `/tenantwallet [search]`, bound to verified bot/owner,
-  revision and expiring confirmation. Reset/replacement revokes trust; new work checks persisted approval, while paid
-  recovery ignores revocation. This exposes the existing GLOBAL TelegramUserId wallet, never a tenant balance.
-  `WalletChargeApplicationService` shares central gateway creation with owned flow; personal tenant cards cannot top up.
-  Five providers persist immutable origin, exclude tenant referrals and enqueue delivery through the original tenant.
-  `TenantCustomerWalletFunding` uses atomic sufficient-balance debit `tenant-customer-wallet:{orderId}:debit`, existing
-  tenant creation/renewal sagas and owner profit only (no owner base debit). Proven rejection refunds once with `:refund`;
-  ambiguity never refunds. Recovery repairs independent database commits and never initiates an unpaid debit.
-  Migration `20260923083845_TenantCustomerWallet` defaults approval false; adds order admission uniqueness and payment origin,
-  with no credentials schema/balance changes. Down refuses to erase wallet history. See `docs/tenant-customer-wallet.md`.
+- Tenant customer wallet uses two independent, persisted gates per storefront. A configured super-admin grants
+  identity-bound eligibility through owned `/tenantwallet [search]`; that grant alone never exposes or spends the wallet.
+  The exact persisted tenant owner must then opt in from that storefront's owner panel. Final admission requires: store
+  enabled + current bot/owner identities still matching the grant + owner opt-in. Owner callbacks can never create grant
+  metadata; attempting to enable before a valid grant fails closed. Super-admin revocation clears both grant and owner
+  opt-in immediately for new work, while paid-invoice settlement and committed-debit recovery remain independent.
+  This exposes the existing GLOBAL TelegramUserId wallet, never a tenant balance. `WalletChargeApplicationService` shares
+  central gateway creation with owned flow; personal tenant cards cannot top up. Five providers persist immutable origin,
+  exclude tenant referrals and enqueue delivery through the original tenant. `TenantCustomerWalletFunding` uses atomic
+  sufficient-balance debit `tenant-customer-wallet:{orderId}:debit`, existing tenant creation/renewal sagas and owner
+  profit only (no owner base debit). Proven rejection refunds once with `:refund`; ambiguity never refunds. Migration
+  `20260924023225_TenantCustomerWalletOwnerActivation` adds the owner opt-in with default false, so existing and future
+  storefronts remain fail-closed until the owner explicitly enables after grant. See `docs/tenant-customer-wallet.md`.
 
 - Telegram.Bot is pinned to 22.10.3. API methods no longer use Async suffixes (`SendMessage`, `SendRequest`);
   markup uses `ReplyMarkup`, files use `TGFile`, and client BotId is non-nullable. Decorators retain delivery budgets.

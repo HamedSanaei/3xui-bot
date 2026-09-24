@@ -809,8 +809,8 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("20260625000000_AddMultiBotState", applied);
         Assert.Contains("20260910012628_AddAtlasPayGateway", applied);
         Assert.Contains("20260910184123_AddTenantOwnerNotificationRoute", applied);
-        // Latest applied migration must be the AtlasPay reconciliation lifecycle, which only adds nullable/defaulted
-        // columns plus an index and therefore cannot change existing balances.
+        // AtlasPay reconciliation remains present in the migration chain and only adds nullable/defaulted
+        // columns plus an index, so it cannot change existing balances.
         Assert.Contains("20260910233159_AddAtlasPayReconciliationLifecycle", applied);
         // The provisional finalize freeze only added nullable columns to the provisional saga-state table.
         Assert.Contains("20260911035150_AddProvisionalFinalizationFreeze", applied);
@@ -825,7 +825,7 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied);
         Assert.Contains("20260923083845_TenantCustomerWallet", applied);
         Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", applied);
-        Assert.Equal("20260924004926_AtlasPayWebhookPrimaryAndManualApproval", applied[^1]);
+        Assert.Equal("20260924023225_TenantCustomerWalletOwnerActivation", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1531,6 +1531,7 @@ public sealed partial class ConcurrencyTests
             var bot = await users.BotInstances.AsNoTracking().SingleAsync(x => x.Id == "tenant-legacy-atlas");
             Assert.True(bot.TenantAtlasPayEnabled, "Legacy tenants must inherit the Atlas default switch.");
             Assert.False(bot.TenantCustomerWalletEnabled);
+            Assert.False(bot.TenantCustomerWalletOwnerEnabled);
             Assert.Null(bot.TenantCustomerWalletApprovedAtUtc);
             Assert.Null(bot.TenantCustomerWalletApprovedByTelegramUserId);
             Assert.Equal(20, bot.TenantPriceMarkupPercent); Assert.Equal(711, bot.OwnerTelegramUserId);
@@ -1543,8 +1544,8 @@ public sealed partial class ConcurrencyTests
             var applied = (await users.Database.GetAppliedMigrationsAsync()).ToList();
             Assert.Contains(atlasMigration, applied);
             Assert.Contains("20260910184123_AddTenantOwnerNotificationRoute", applied);
-        // Latest applied migration must be the AtlasPay reconciliation lifecycle, which only adds nullable/defaulted
-        // columns plus an index and therefore cannot change existing balances.
+        // AtlasPay reconciliation remains present in the migration chain and only adds nullable/defaulted
+        // columns plus an index, so it cannot change existing balances.
         Assert.Contains("20260910233159_AddAtlasPayReconciliationLifecycle", applied);
         // The provisional finalize freeze only added nullable columns to the provisional saga-state table.
         Assert.Contains("20260911035150_AddProvisionalFinalizationFreeze", applied);
@@ -1559,7 +1560,7 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied);
         Assert.Contains("20260923083845_TenantCustomerWallet", applied);
         Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", applied);
-        Assert.Equal("20260924004926_AtlasPayWebhookPrimaryAndManualApproval", applied[^1]);
+        Assert.Equal("20260924023225_TenantCustomerWalletOwnerActivation", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1574,9 +1575,9 @@ public sealed partial class ConcurrencyTests
             Assert.Contains(atlasMigration, history);
             Assert.Contains("20260910184123_AddTenantOwnerNotificationRoute", history);
             Assert.Contains("20260910233159_AddAtlasPayReconciliationLifecycle", history);
-            // Latest applied migration freezes the final entitlement columns on the provisional saga-state table. It only
-            // adds nullable columns, so it cannot change existing balances, receipts, or fulfillment state, and the saga
-            // table must still be empty for a database that only just migrated.
+            // The provisional-operation migration adds only nullable final-entitlement columns, so it cannot change
+            // existing balances, receipts, or fulfillment state, and the saga table must still be empty for a database
+            // that only just migrated.
             Assert.Contains("20260911023015_AddTenantCardProvisionalOperation", history);
             Assert.Contains("20260911035150_AddProvisionalFinalizationFreeze", history);
             Assert.Contains("20260912005131_AddTenantReceiptUploadTarget", history);
@@ -1588,7 +1589,9 @@ public sealed partial class ConcurrencyTests
             Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", history);
             Assert.Contains("20260923083845_TenantCustomerWallet", history);
             Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", history);
-            Assert.Equal("20260924004926_AtlasPayWebhookPrimaryAndManualApproval", history[^1]);
+            Assert.Contains("20260924004926_AtlasPayWebhookPrimaryAndManualApproval", history);
+            // The latest migration adds only the owner-side wallet opt-in with false default, preserving fail-closed rollout.
+            Assert.Equal("20260924023225_TenantCustomerWalletOwnerActivation", history[^1]);
             command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='TenantCardProvisionalOperations';";
             Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
             command.CommandText = "SELECT COUNT(*) FROM TenantCardProvisionalOperations;";

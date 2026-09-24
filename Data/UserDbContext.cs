@@ -365,6 +365,7 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantPremiumUiEnabled).HasDefaultValue(false);
             // Independent super-admin trust: owner settings and runtime token changes cannot grant this capability.
             entity.Property(x => x.TenantCustomerWalletEnabled).HasDefaultValue(false);
+            entity.Property(x => x.TenantCustomerWalletOwnerEnabled).HasDefaultValue(false);
             entity.Property(x => x.TenantOwnerNotificationBotId).HasMaxLength(64);
             entity.HasIndex(x => x.Username);
             entity.HasIndex(x => x.OwnerTelegramUserId);

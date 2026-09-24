@@ -212,9 +212,9 @@ public partial class TenantBotService
                     || (x.Username != null && x.Username.Contains(search)) || (x.BrandName != null && x.BrandName.Contains(search))
                     || x.OwnerTelegramUserId.ToString() == search))
                 .OrderBy(x => x.OwnerTelegramUserId).ThenBy(x => x.TenantStoreNumber).Take(30).ToListAsync(token));
-            await client.SendMessage(chat, "مدیریت مجوز کیف پول مشتری\nبرای جستجو: /tenantwallet نام یا شناسه مالک\nحداکثر ۳۰ نتیجه:",
+            await client.SendMessage(chat, "مدیریت مجوز کیف پول مشتری\nبرای جستجو: /tenantwallet نام یا شناسه مالک\nحداکثر ۳۰ نتیجه:\n\nمجوز مدیر و فعال‌سازی مالک مستقل هستند؛ کیف پول فقط با هر دو فعال می‌شود.",
                 replyMarkup: new InlineKeyboardMarkup(rows.Select(x => new[] { InlineKeyboardButton.WithCallbackData(
-                    $"{x.BrandName ?? x.Username ?? x.Id} | {x.OwnerTelegramUserId} | {(x.Enabled ? "روشن" : "خاموش")} | {(x.TenantCustomerWalletEnabled ? "تأیید" : "غیرفعال")}",
+                    $"{x.BrandName ?? x.Username ?? x.Id} | {(TenantCustomerWalletPolicy.HasValidGrant(x) ? "مجوز✅" : "مجوز❌")} | {(x.TenantCustomerWalletOwnerEnabled ? "مالک✅" : "مالک❌")}",
                     $"TWA:o:{x.OwnerTelegramUserId}:{x.TenantStoreNumber}") })), cancellationToken: token);
             return true;
         }
@@ -229,9 +229,9 @@ public partial class TenantBotService
             await _state.SaveUserStatus(new User { Id = actor, Flow = "tenant-wallet-admin", LastStep = "confirm",
                 ConfigLink = nonce, SubLink = JsonConvert.SerializeObject(new WalletApprovalPanel(store.Id, store.TelegramBotId.Value, owner, DateTime.UtcNow.AddMinutes(5), (store.UpdatedAtUtc ?? store.CreatedAtUtc).Ticks)) });
             await client.SendMessage(chat,
-                $"فروشگاه: {store.BrandName} @{store.Username}\nشناسه: {store.Id}\nمالک: {owner}\nربات: {store.TelegramBotId}\nروشن: {store.Enabled}\nمجوز کیف پول: {store.TenantCustomerWalletEnabled}\nتأییدکننده: {store.TenantCustomerWalletApprovedByTelegramUserId}\nزمان تأیید: {store.TenantCustomerWalletApprovedAtUtc:O}\n\n⚠️ تأیید این قابلیت به مشتریان این فروشگاه اجازه افزایش موجودی و خرج‌کردن کیف پول سراسری پلتفرم را می‌دهد.",
+                $"فروشگاه: {store.BrandName} @{store.Username}\nشناسه: {store.Id}\nمالک: {owner}\nربات: {store.TelegramBotId}\nروشن بودن فروشگاه: {store.Enabled}\nمجوز سوپرادمین: {TenantCustomerWalletPolicy.HasValidGrant(store)}\nفعال‌سازی توسط مالک: {store.TenantCustomerWalletOwnerEnabled}\nوضعیت نهایی کیف پول: {TenantCustomerWalletPolicy.IsApproved(store)}\nتأییدکننده: {store.TenantCustomerWalletApprovedByTelegramUserId}\nزمان تأیید: {store.TenantCustomerWalletApprovedAtUtc:O}\n\n⚠️ اعطای مجوز به‌تنهایی کیف پول را فعال نمی‌کند. مالک همان فروشگاه باید بعداً از پنل مدیریتی خودش آن را فعال کند.",
                 replyMarkup: new InlineKeyboardMarkup(new[] {
-                    new[] { InlineKeyboardButton.WithCallbackData("تأیید صریح و فعال‌سازی", "TWA:y:" + nonce) },
+                    new[] { InlineKeyboardButton.WithCallbackData("اعطای مجوز کیف پول به مالک", "TWA:y:" + nonce) },
                     new[] { InlineKeyboardButton.WithCallbackData("لغو مجوز کیف پول مشتری", "TWA:n:" + nonce) }
                 }), cancellationToken: token);
             return true;
@@ -247,7 +247,11 @@ public partial class TenantBotService
             await _serviceProvider.GetRequiredService<TenantCustomerWalletPolicy>().SetAsync(actor, panel.BotId,
                 panel.TelegramBotId, panel.OwnerId, parts[1] == "y", token, panel.Revision);
             await _state.ResetUserStatus(new User { Id = actor });
-            await client.SendMessage(chat, "وضعیت مجوز کیف پول مشتری ثبت شد.", cancellationToken: token);
+            await client.SendMessage(chat,
+                parts[1] == "y"
+                    ? "✅ مجوز کیف پول برای این فروشگاه صادر شد. کیف پول هنوز خاموش است و مالک باید آن را از پنل مدیریتی فروشگاه فعال کند."
+                    : "⛔️ مجوز کیف پول لغو شد و فعال‌سازی مالک نیز خاموش شد. عملیات مالی قبلاً commit‌شده همچنان از مسیر recovery امن ادامه می‌یابد.",
+                cancellationToken: token);
         }
         catch (InvalidOperationException)
         { await client.SendMessage(chat, "هویت فروشگاه تغییر کرده است. /tenantwallet را دوباره باز کنید.", cancellationToken: token); }

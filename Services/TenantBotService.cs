@@ -1325,6 +1325,14 @@ public partial class TenantBotService
             ? $"روشن ({string.Join(", ", GETTENANTCHANNELIDS(tenant))})"
             : "خاموش";
         var WELCOME = string.IsNullOrWhiteSpace(tenant?.TenantWelcomeText) ? "ثبت نشده" : "ثبت شده";
+        var CUSTOMERWALLETGRANTED = TenantCustomerWalletPolicy.HasValidGrant(tenant);
+        var CUSTOMERWALLETOWNERENABLED = tenant?.TenantCustomerWalletOwnerEnabled == true;
+        var CUSTOMERWALLETACTIVE = TenantCustomerWalletPolicy.IsApproved(tenant);
+        var CUSTOMERWALLETSTATUS = !CUSTOMERWALLETGRANTED
+            ? "نیازمند تأیید سوپرادمین"
+            : !CUSTOMERWALLETOWNERENABLED
+                ? "مجوز مدیر صادر شده؛ توسط شما خاموش"
+                : tenant?.Enabled == true ? "فعال" : "فعال‌سازی مالک انجام شده؛ فروشگاه خاموش است";
 
         var text = "🛒 <b>ربات فروشگاهی همکار</b>\n\n" +
                    "کیف پول ربات و حساب گذرگاه شما بین تمام فروشگاه‌ها مشترک است. تنظیمات این پنل فقط برای همین فروشگاه است.\n\n" +
@@ -1344,6 +1352,7 @@ public partial class TenantBotService
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) && tenant?.TenantUniquePayEnabled == true)} درگاه یونیک‌پی (۱۲٪): <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) ? "سراسری خاموش" : tenant?.TenantUniquePayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay) && tenant?.TenantAtlasPayEnabled == true)} درگاه اطلس‌پی: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay) ? "سراسری خاموش" : tenant?.TenantAtlasPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ? "سراسری خاموش" : tenant?.TenantNowPaymentsEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(CUSTOMERWALLETACTIVE)} کیف پول مشتری: <b>{Html(CUSTOMERWALLETSTATUS)}</b>\n" +
                $"{STATUSICON(tenant?.TenantCardPaymentEnabled == true)} کارت به کارت همکار: <code>{Html(card)}</code>\n" +
                $"{STATUSICON(tenant?.TenantMandatoryJoinEnabled == true)} جوین اجباری فروشگاه: <code>{Html(TENANTJOIN)}</code>\n" +
                $"{STATUSICON(tenant?.TenantPremiumUiEnabled == true)} ظاهر پریمیوم فروشگاه: <b>{Html(tenant?.TenantPremiumUiEnabled == true ? "فعال" : "غیرفعال")}</b>\n" +
@@ -1367,6 +1376,8 @@ public partial class TenantBotService
         var CARDENABLED = tenant?.TenantCardPaymentEnabled == true;
         var JOINENABLED = tenant?.TenantMandatoryJoinEnabled == true;
         var PREMIUMUIENABLED = tenant?.TenantPremiumUiEnabled == true;
+        var CUSTOMERWALLETGRANTED = TenantCustomerWalletPolicy.HasValidGrant(tenant);
+        var CUSTOMERWALLETOWNERENABLED = tenant?.TenantCustomerWalletOwnerEnabled == true;
         var revision = BuildTenantPanelRevision(tenant);
         var currentUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var issuedAt = (currentUnixSeconds - currentUnixSeconds % 300).ToString("X", CultureInfo.InvariantCulture);
@@ -1402,6 +1413,14 @@ public partial class TenantBotService
             {
                 InlineKeyboardButton.WithCallbackData(UNIQUEPAYENABLED ? "✅ یونیک‌پی ۱۲٪" : "❌ یونیک‌پی ۱۲٪", BuildTenantSettingCallback("UniquePay", !UNIQUEPAYENABLED, revision, issuedAt)),
                 InlineKeyboardButton.WithCallbackData(ATLASPAYENABLED ? "✅ اطلس‌پی" : "❌ اطلس‌پی", BuildTenantSettingCallback("AtlasPay", !ATLASPAYENABLED, revision, issuedAt))
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    CUSTOMERWALLETGRANTED
+                        ? CUSTOMERWALLETOWNERENABLED ? "✅ کیف پول مشتری" : "💰 فعال‌سازی کیف پول مشتری"
+                        : "🔒 کیف پول مشتری | نیازمند تأیید مدیر",
+                    BuildTenantSettingCallback("wallet", !CUSTOMERWALLETOWNERENABLED, revision, issuedAt))
             },
             new[]
             {
@@ -1484,7 +1503,7 @@ public partial class TenantBotService
     /// <summary>
     /// Builds an idempotent target-state callback for one tenant storefront setting.
     /// </summary>
-    /// <param name="setting">Stable setting key: card, HooshPay, Tetraminator, NowPayments, or join.</param>
+    /// <param name="setting">Stable setting key: card, HooshPay, Tetraminator, UniquePay, AtlasPay, NowPayments, wallet, join, or premium.</param>
     /// <param name="enabled">Desired final state rather than an instruction to invert the current value.</param>
     /// <param name="revision">Panel revision returned by <see cref="BuildTenantPanelRevision" />.</param>
     /// <param name="issuedAt">Hexadecimal Unix timestamp rounded to the keyboard's five-minute render bucket.</param>
@@ -2576,7 +2595,7 @@ public partial class TenantBotService
     /// <param name="botClient">Main owned Bot client used to answer the owner callback.</param>
     /// <param name="CallbackQuery">Callback carrying the owner panel revision and Telegram callback id.</param>
     /// <param name="owner">colleague User who owns the tenant storefront.</param>
-    /// <param name="setting">Short setting key from callback data: card, HooshPay, Tetraminator, UniquePay, NowPayments, or join.</param>
+    /// <param name="setting">Short setting key from callback data: card, HooshPay, Tetraminator, UniquePay, AtlasPay, NowPayments, wallet, join, or premium.</param>
     /// <param name="desiredEnabled">Desired final value. Repeating the same callback does not invert the setting.</param>
     /// <param name="expectedRevision">Revision embedded in the panel keyboard that must match the current tenant row.</param>
     /// <param name="issuedAt">Hexadecimal Unix timestamp used to reject mutation buttons older than ten minutes.</param>
@@ -2585,7 +2604,8 @@ public partial class TenantBotService
     /// Forced join is validated immediately before it is enabled. The callback is acknowledged before any Telegram
     /// network probe, and validation failures are delivered as normal owner messages because callback answers can
     /// only be sent once. HooshPay, Tetraminator, UniquePay, and NOWPayments tenant preferences cannot be enabled
-    /// while their corresponding live global application switches are disabled.
+    /// while their corresponding live global application switches are disabled. Customer wallet owner opt-in is
+    /// separately persisted and can only be enabled while the exact storefront has a valid super-admin grant.
     /// </remarks>
     private async Task SETTENANTSETTINGASYNC(
         ITelegramBotClient botClient,
@@ -2705,6 +2725,19 @@ public partial class TenantBotService
                     return;
                 }
                 break;
+            case "wallet":
+                currentEnabled = tenant.TenantCustomerWalletOwnerEnabled;
+                if (desiredEnabled && !TenantCustomerWalletPolicy.HasValidGrant(tenant))
+                {
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient,
+                        CallbackQuery.Id,
+                        "فعالسازی کیف پول مشتری هنوز توسط سوپرادمین برای این فروشگاه مجاز نشده است.",
+                        showAlert: true,
+                        cancellationToken: CancellationToken);
+                    return;
+                }
+                break;
             case "join":
                 currentEnabled = tenant.TenantMandatoryJoinEnabled;
                 break;
@@ -2731,6 +2764,56 @@ public partial class TenantBotService
             CallbackQuery.Id,
             "در حال به‌روزرسانی تنظیمات...",
             cancellationToken: CancellationToken);
+
+        // Customer wallet is a privileged two-party feature. Owner preference is persisted through the dedicated policy
+        // so this callback can never manufacture or alter super-admin approval metadata.
+        if (string.Equals(setting, "wallet", StringComparison.Ordinal))
+        {
+            try
+            {
+                var updated = await _serviceProvider.GetRequiredService<TenantCustomerWalletPolicy>()
+                    .SetOwnerEnabledAsync(
+                        CallbackQuery.From.Id,
+                        tenant.Id,
+                        desiredEnabled,
+                        CancellationToken,
+                        (tenant.UpdatedAtUtc ?? tenant.CreatedAtUtc).Ticks);
+                _selectedOwnerStore = updated;
+                _botRegistry.Upsert(updated);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                await botClient.SendMessage(
+                    CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                    "⛔️ شما مالک فعلی این فروشگاه نیستید و اجازه تغییر کیف پول مشتری را ندارید.",
+                    cancellationToken: CancellationToken);
+                return;
+            }
+            catch (InvalidOperationException)
+            {
+                await botClient.SendMessage(
+                    CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                    desiredEnabled
+                        ? "🔒 فعال‌سازی انجام نشد. مجوز سوپرادمین معتبر نیست یا پنل قدیمی شده است؛ پنل جدید را بررسی کنید."
+                        : "⚠️ وضعیت کیف پول تغییر کرده است؛ پنل جدید را بررسی کنید.",
+                    cancellationToken: CancellationToken);
+                await using var refreshDb = _serviceProvider.GetRequiredService<UserDbContextFactory>().CreateDbContext();
+                _selectedOwnerStore = await refreshDb.BotInstances.AsNoTracking().SingleOrDefaultAsync(x =>
+                    x.Id == tenant.Id && x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId == owner.TelegramUserId,
+                    CancellationToken);
+                if (_selectedOwnerStore == null)
+                    return;
+            }
+
+            await SHOWOWNERPANELASYNC(
+                botClient,
+                CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                owner,
+                CallbackQuery.Message?.MessageId,
+                CancellationToken,
+                CallbackQuery.Message);
+            return;
+        }
 
         // Premium appearance is the only storefront setting that requires a Telegram round trip, so it is handled by a
         // dedicated method instead of the generic switch below. That method resolves authorization, runs the capability
