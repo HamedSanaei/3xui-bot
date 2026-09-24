@@ -123,6 +123,9 @@ namespace Adminbot.Domain.TelegramUi
         /// <summary>Wallet entry.</summary>
         public const string Wallet = "wallet";
 
+        /// <summary>Owned-bot wallet-view action.</summary>
+        public const string WalletView = "wallet_view";
+
         /// <summary>Storefront / shop entry.</summary>
         public const string Shop = "shop";
 
@@ -182,6 +185,7 @@ namespace Adminbot.Domain.TelegramUi
             Cancel,
             Settings,
             Wallet,
+            WalletView,
             Shop,
             Premium,
             Support,

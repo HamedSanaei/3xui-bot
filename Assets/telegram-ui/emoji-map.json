@@ -29,6 +29,10 @@
       "fallback": "💰",
       "customEmojiId": "5375296873982604963"
     },
+    "wallet_view": {
+      "fallback": "💰",
+      "customEmojiId": "5375296873982604963"
+    },
     "shop": {
       "fallback": "🛍️",
       "customEmojiId": "4970023558068568720"

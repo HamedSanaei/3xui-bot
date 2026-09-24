@@ -205,14 +205,15 @@ public class XuiV3BotFlowService
     /// <c>true</c> when the text is one of the owned-bot or tenant-bot labels for listing the sender's accounts.
     /// </returns>
     /// <remarks>
-    /// Tenant storefronts use the shorter "اکانت‌های من" label while the original owned bot uses
-    /// "وضعیت اکانت های من". Keeping both labels here lets tenant bots reuse this flow instead of duplicating
-    /// account-list code.
+    /// Tenant storefronts use the shorter "اکانت‌های من" label while owned bots expose
+    /// "مشاهده کانفیگ های من". The former owned label is retained as a stale-keyboard alias so deployments do not
+    /// strand users who still have an older reply keyboard.
     /// </remarks>
     private static bool IsMyAccountsCommand(string text)
     {
         var normalized = text?.Trim();
-        return string.Equals(normalized, "وضعیت اکانت های من", StringComparison.OrdinalIgnoreCase) ||
+        return string.Equals(normalized, TelegramBotService.OwnedMyConfigsAction, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, "وضعیت اکانت های من", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(normalized, "اکانت‌های من", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(normalized, "اکانت های من", StringComparison.OrdinalIgnoreCase);
     }

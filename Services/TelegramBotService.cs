@@ -49,6 +49,12 @@ public partial class TelegramBotService
     /// <summary>Owned-customer shortcut that starts the same renewal flow exposed inside account management.</summary>
     internal const string OwnedRenewAction = "🔄 تمدید اکانت";
 
+    /// <summary>Owned-customer account-management action that shows the user's wallet/profile balance.</summary>
+    internal const string OwnedWalletViewAction = "💰 مشاهده کیف پول";
+
+    /// <summary>Owned-customer account-management action that lists the sender's saved/provisioned configurations.</summary>
+    internal const string OwnedMyConfigsAction = "مشاهده کانفیگ های من";
+
     /// <summary>
     /// Super-admin reply-keyboard action that opens the XUI v3 renewal manual-review screen.
     /// </summary>
@@ -6553,40 +6559,11 @@ public partial class TelegramBotService
 
         else if (message.Text == "⚙️ مدیریت اکانت")
         {
-            var accountManagementRows = new List<KeyboardButton[]>
-            {
-                new KeyboardButton[] { "مشاهده وضعیت حساب", OwnedRenewAction },
-                new KeyboardButton[] { "وضعیت اکانت های من","🔎 جستجوی اکانت" },
-            };
-
-            if (credUser?.IsColleague != true)
-                accountManagementRows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "🤝 درخواست همکاری" });
-            else
-                accountManagementRows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "📌 قابلیت‌های ربات" });
-
-            if (credUser?.IsColleague != true)
-                accountManagementRows.Add(new KeyboardButton[] { "📌 قابلیت‌های ربات", "💳خرید اکانت جدید" });
-            else
-            {
-                accountManagementRows.Add(new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" });
-                accountManagementRows.Add(new KeyboardButton[] { TenantBotService.OwnerMenuButton });
-            }
-
-            accountManagementRows.Add(new KeyboardButton[] { "منوی اصلی" });
-
-            ReplyKeyboardMarkup replyKeyboardMarkup = new(accountManagementRows)
-            {
-                ResizeKeyboard = true, // This will make the keyboard buttons resize to fit their container
-                OneTimeKeyboard = true // This will hide the keyboard after a button is pressed (optional)
-            };
-
-
-            // var text = await GetUserProfileMessage(credUser);
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: "یک گزینه را انتخاب نمائید.",
-                replyMarkup: replyKeyboardMarkup, parseMode: ParseMode.Markdown);
-
+                replyMarkup: BuildOwnedAccountManagementKeyboard(credUser),
+                parseMode: ParseMode.Markdown);
         }
         else if (user.LastStep == "confirmation" && user.Flow == "charge")
         {
@@ -7288,7 +7265,8 @@ public partial class TelegramBotService
 
         }
 
-        else if (message.Text == "مشاهده وضعیت حساب")
+        else if (string.Equals(message.Text, OwnedWalletViewAction, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(message.Text, "مشاهده وضعیت حساب", StringComparison.OrdinalIgnoreCase))
         {
             var text = await GetUserProfileMessage(credUser);
             await botClient.CustomSendTextMessageAsync(
@@ -7296,7 +7274,8 @@ public partial class TelegramBotService
                 text: text,
                 replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
         }
-        else if (message.Text == "وضعیت اکانت های من")
+        else if (string.Equals(message.Text, OwnedMyConfigsAction, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(message.Text, "وضعیت اکانت های من", StringComparison.OrdinalIgnoreCase))
         {
             if (await _xuiV3BotFlowService.TryHandleMyAccountsAsync(
                 botClient,
@@ -10157,6 +10136,34 @@ public partial class TelegramBotService
         }
         return value;
     }
+    /// <summary>Builds the owned-bot account-management submenu with stable two-column customer actions.</summary>
+    /// <param name="credUser">Current owned-bot customer; colleague status controls the lower management rows.</param>
+    /// <returns>The reply keyboard shown after the customer opens account management.</returns>
+    private static ReplyKeyboardMarkup BuildOwnedAccountManagementKeyboard(CredUser credUser)
+    {
+        var rows = new List<KeyboardButton[]>
+        {
+            new KeyboardButton[] { OwnedWalletViewAction, OwnedRenewAction },
+            new KeyboardButton[] { OwnedMyConfigsAction, "🔎 جستجوی اکانت" },
+        };
+
+        if (credUser?.IsColleague != true)
+            rows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "🤝 درخواست همکاری" });
+        else
+            rows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "📌 قابلیت‌های ربات" });
+
+        if (credUser?.IsColleague != true)
+            rows.Add(new KeyboardButton[] { "📌 قابلیت‌های ربات", "💳خرید اکانت جدید" });
+        else
+        {
+            rows.Add(new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" });
+            rows.Add(new KeyboardButton[] { TenantBotService.OwnerMenuButton });
+        }
+
+        rows.Add(new KeyboardButton[] { "منوی اصلی" });
+        return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true, OneTimeKeyboard = true };
+    }
+
     /// <summary>
     /// Builds the Persian owned-bot main keyboard or a minimal tenant return action after shared payment inquiry.
     /// </summary>

@@ -112,6 +112,8 @@ public sealed class TelegramPremiumUiCatalogTests
         [TelegramUiEmojiKeys.Cancel] = "5273914604752216432",
         [TelegramUiEmojiKeys.Settings] = "5929229483436412274",
         [TelegramUiEmojiKeys.Wallet] = "5375296873982604963",
+        // Wallet-view intentionally aliases the already-reviewed wallet custom emoji.
+        [TelegramUiEmojiKeys.WalletView] = "5375296873982604963",
         [TelegramUiEmojiKeys.Shop] = "4970023558068568720",
         [TelegramUiEmojiKeys.Premium] = "5451636889717062286",
         [TelegramUiEmojiKeys.Support] = "5260535596941582167",

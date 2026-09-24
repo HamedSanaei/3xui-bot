@@ -633,6 +633,25 @@ public sealed partial class ConcurrencyTests
         Assert.True((bool)renewDetector.Invoke(null, new object[] { TelegramBotService.OwnedRenewAction })!);
     }
 
+    /// <summary>The owned account-management submenu exposes the renamed wallet and configuration actions.</summary>
+    [Fact]
+    public void Owned_account_management_uses_wallet_and_my_configs_labels()
+    {
+        var builder = typeof(TelegramBotService).GetMethod(
+            "BuildOwnedAccountManagementKeyboard", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var markup = (ReplyKeyboardMarkup)builder.Invoke(null, new object[] { new CredUser() })!;
+        var rows = markup.Keyboard.Select(row => row.Select(button => button.Text).ToArray()).ToList();
+
+        Assert.Equal(new[] { TelegramBotService.OwnedWalletViewAction, TelegramBotService.OwnedRenewAction }, rows[0]);
+        Assert.Equal(new[] { TelegramBotService.OwnedMyConfigsAction, "🔎 جستجوی اکانت" }, rows[1]);
+        Assert.DoesNotContain(rows.SelectMany(x => x), x => x == "مشاهده وضعیت حساب" || x == "وضعیت اکانت های من");
+
+        var myAccountsDetector = typeof(XuiV3BotFlowService).GetMethod(
+            "IsMyAccountsCommand", BindingFlags.Static | BindingFlags.NonPublic)!;
+        Assert.True((bool)myAccountsDetector.Invoke(null, new object[] { TelegramBotService.OwnedMyConfigsAction })!);
+        Assert.True((bool)myAccountsDetector.Invoke(null, new object[] { "وضعیت اکانت های من" })!);
+    }
+
     /// <summary>The tenant storefront keyboard tracks the shared live client-download switch independently.</summary>
     [Fact]
     public void Tenant_customer_keyboard_tracks_the_live_switch()
