@@ -124,6 +124,8 @@ public sealed class TelegramPremiumUiCatalogTests
         [TelegramUiEmojiKeys.Card] = "5472250091332993630",
         [TelegramUiEmojiKeys.Crypto] = "5456140674028019486",
         [TelegramUiEmojiKeys.Gift] = "5429263077927300012",
+        // Renewal intentionally aliases the already-reviewed circular-arrows custom emoji used by refresh.
+        [TelegramUiEmojiKeys.Renew] = "5258420634785947640",
         [TelegramUiEmojiKeys.Refresh] = "5258420634785947640"
     };
 

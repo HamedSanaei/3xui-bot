@@ -611,9 +611,29 @@ public sealed partial class ConcurrencyTests
         Assert.Contains(ClientDownloadCallbacks.OpenCommand, OwnedKeyboardLabels(service));
     }
 
-    /// <summary>
-    /// The tenant storefront keyboard must expose the same row, driven by the same global switch and no tenant flag.
-    /// </summary>
+    /// <summary>The owned home keyboard exposes renewal directly and keeps account management at normal half width.</summary>
+    [Fact]
+    public void Owned_customer_keyboard_pairs_account_management_with_direct_renewal()
+    {
+        using var databases = new Databases();
+        var service = BuildClientDownloadTelegramService(
+            databases,
+            new ClientDownloadAvailabilityProbe(enabled: false),
+            new CountingReleaseService(),
+            new GatewayTelegramClient());
+
+        var rows = OwnedKeyboardRows(service);
+        var accountRow = Assert.Single(rows, row => row.Contains("⚙️ مدیریت اکانت"));
+        Assert.Equal(2, accountRow.Length);
+        Assert.Contains(TelegramBotService.OwnedRenewAction, accountRow);
+
+        var renewDetector = typeof(XuiV3BotFlowService).GetMethod(
+            "IsRenewCommand", BindingFlags.Static | BindingFlags.NonPublic)!;
+        Assert.True((bool)renewDetector.Invoke(null, new object[] { "تمدید اکانت" })!);
+        Assert.True((bool)renewDetector.Invoke(null, new object[] { TelegramBotService.OwnedRenewAction })!);
+    }
+
+    /// <summary>The tenant storefront keyboard tracks the shared live client-download switch independently.</summary>
     [Fact]
     public void Tenant_customer_keyboard_tracks_the_live_switch()
     {
@@ -844,11 +864,15 @@ public sealed partial class ConcurrencyTests
     /// <param name="service">Owned service under test.</param>
     /// <returns>Every rendered button label in row order.</returns>
     private static List<string> OwnedKeyboardLabels(TelegramBotService service)
+        => OwnedKeyboardRows(service).SelectMany(row => row).ToList();
+
+    /// <summary>Reads the owned customer reply keyboard preserving its row/column layout.</summary>
+    private static List<string[]> OwnedKeyboardRows(TelegramBotService service)
     {
         var method = typeof(TelegramBotService).GetMethod(
             "MainReplyMarkupKeyboardFa", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var markup = (ReplyKeyboardMarkup)method.Invoke(service, Array.Empty<object>())!;
-        return markup.Keyboard.SelectMany(row => row).Select(button => button.Text).ToList();
+        return markup.Keyboard.Select(row => row.Select(button => button.Text).ToArray()).ToList();
     }
 
     /// <summary>Flattens the tenant storefront reply keyboard into its button labels.</summary>

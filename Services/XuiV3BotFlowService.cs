@@ -244,7 +244,9 @@ public class XuiV3BotFlowService
     /// </returns>
     private static bool IsRenewCommand(string text)
     {
-        return string.Equals(text?.Trim(), "تمدید اکانت", StringComparison.OrdinalIgnoreCase);
+        var normalized = text?.Trim();
+        return string.Equals(normalized, "تمدید اکانت", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, TelegramBotService.OwnedRenewAction, StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<bool> TryHandleMyAccountsAsync(

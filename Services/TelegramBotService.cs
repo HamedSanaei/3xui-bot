@@ -46,6 +46,9 @@ public partial class TelegramBotService
     /// </remarks>
     private const string AdminPanelEntryAction = "🗽 Admin";
 
+    /// <summary>Owned-customer shortcut that starts the same renewal flow exposed inside account management.</summary>
+    internal const string OwnedRenewAction = "🔄 تمدید اکانت";
+
     /// <summary>
     /// Super-admin reply-keyboard action that opens the XUI v3 renewal manual-review screen.
     /// </summary>
@@ -6552,7 +6555,7 @@ public partial class TelegramBotService
         {
             var accountManagementRows = new List<KeyboardButton[]>
             {
-                new KeyboardButton[] { "مشاهده وضعیت حساب","تمدید اکانت"},
+                new KeyboardButton[] { "مشاهده وضعیت حساب", OwnedRenewAction },
                 new KeyboardButton[] { "وضعیت اکانت های من","🔎 جستجوی اکانت" },
             };
 
@@ -7332,7 +7335,8 @@ public partial class TelegramBotService
             await _state.ClearUserStatus(new User { Id = message.From.Id });
             return;
         }
-        else if (message.Text == "تمدید اکانت")
+        else if (string.Equals(message.Text, "تمدید اکانت", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(message.Text, OwnedRenewAction, StringComparison.OrdinalIgnoreCase))
         {
             await _state.SaveUserStatus(new User { Id = message.From.Id, LastStep = "Renew Existing Account", Flow = "update" });
             await botClient.CustomSendTextMessageAsync(
@@ -10172,7 +10176,7 @@ public partial class TelegramBotService
         {
             new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
             new KeyboardButton[] { "📋 تعرفه‌ها", "📒 تراکنش‌های من" },
-            new KeyboardButton[] { "⚙️ مدیریت اکانت" },
+            new KeyboardButton[] { "⚙️ مدیریت اکانت", OwnedRenewAction },
             new KeyboardButton[] { "🌟اکانت تست", "💡راهنما نصب" },
             new KeyboardButton[] { "🎁 دعوت از دوستان", "💻 ارتباط با ادمین" }
         };

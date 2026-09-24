@@ -159,6 +159,9 @@ namespace Adminbot.Domain.TelegramUi
         /// <summary>Gift entry.</summary>
         public const string Gift = "gift";
 
+        /// <summary>Account-renewal entry.</summary>
+        public const string Renew = "renew";
+
         /// <summary>Refresh entry.</summary>
         public const string Refresh = "refresh";
 
@@ -191,6 +194,7 @@ namespace Adminbot.Domain.TelegramUi
             Card,
             Crypto,
             Gift,
+            Renew,
             Refresh
         };
     }

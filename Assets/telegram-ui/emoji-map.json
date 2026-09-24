@@ -77,6 +77,10 @@
       "fallback": "🎁",
       "customEmojiId": "5429263077927300012"
     },
+    "renew": {
+      "fallback": "🔄",
+      "customEmojiId": "5258420634785947640"
+    },
     "refresh": {
       "fallback": "🔄",
       "customEmojiId": "5258420634785947640"
