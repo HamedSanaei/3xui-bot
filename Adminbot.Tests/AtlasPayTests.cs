@@ -824,7 +824,8 @@ public sealed partial class ConcurrencyTests
         // every existing balance, receipt, fulfillment, wallet, and renewal row keeps its exact value.
         Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied);
         Assert.Contains("20260923083845_TenantCustomerWallet", applied);
-        Assert.Equal("20260923100853_TenantCustomerWalletBotIdentityBinding", applied[^1]);
+        Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", applied);
+        Assert.Equal("20260924004926_AtlasPayWebhookPrimaryAndManualApproval", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1557,7 +1558,8 @@ public sealed partial class ConcurrencyTests
         // every existing balance, receipt, fulfillment, wallet, and renewal row keeps its exact value.
         Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied);
         Assert.Contains("20260923083845_TenantCustomerWallet", applied);
-        Assert.Equal("20260923100853_TenantCustomerWalletBotIdentityBinding", applied[^1]);
+        Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", applied);
+        Assert.Equal("20260924004926_AtlasPayWebhookPrimaryAndManualApproval", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1585,7 +1587,8 @@ public sealed partial class ConcurrencyTests
             // balances, receipts, fulfillment state, or the still-empty provisional saga table either.
             Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", history);
             Assert.Contains("20260923083845_TenantCustomerWallet", history);
-            Assert.Equal("20260923100853_TenantCustomerWalletBotIdentityBinding", history[^1]);
+            Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", history);
+            Assert.Equal("20260924004926_AtlasPayWebhookPrimaryAndManualApproval", history[^1]);
             command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='TenantCardProvisionalOperations';";
             Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
             command.CommandText = "SELECT COUNT(*) FROM TenantCardProvisionalOperations;";

@@ -17,10 +17,10 @@ using Telegram.Bot.Exceptions;
 /// </summary>
 /// <remarks>
 /// Manual payment checks route verified tenant rows to <see cref="TenantBotService"/> and owned-wallet rows to their
-/// provider settlement service. Provisional HooshPay, Tetraminator, and UniquePay actions are restricted to configured
-/// super-admins and never bypass a provider mismatch or create a provisional tenant fulfillment.
+/// provider settlement service. Provisional HooshPay, Tetraminator, UniquePay, and AtlasPay actions are restricted to
+/// configured super-admins and never bypass a provider mismatch or create a provisional tenant fulfillment.
 /// </remarks>
-public class XuiV3AdminFlowService
+public partial class XuiV3AdminFlowService
 {
     private const string FlowName = "xui-v3-admin";
     private const string StepGetAccountInfo = "get-account-info";
@@ -56,6 +56,12 @@ public class XuiV3AdminFlowService
     private const string UniquePayProvisionalConfirmCallbackPrefix = "x3admin:up:provisional-confirm:";
     /// <summary>Cancellation callback prefix that removes UniquePay approval controls without financial effects.</summary>
     private const string UniquePayProvisionalCancelCallbackPrefix = "x3admin:up:provisional-cancel:";
+    /// <summary>First-stage super-admin callback prefix for an eligible pending AtlasPay wallet charge.</summary>
+    private const string AtlasPayProvisionalStartCallbackPrefix = "x3admin:ap:provisional:";
+    /// <summary>Final AtlasPay callback prefix; the provider is re-verified before any provisional wallet mutation.</summary>
+    private const string AtlasPayProvisionalConfirmCallbackPrefix = "x3admin:ap:provisional-confirm:";
+    /// <summary>Cancellation callback prefix for AtlasPay provisional approval.</summary>
+    private const string AtlasPayProvisionalCancelCallbackPrefix = "x3admin:ap:provisional-cancel:";
     private const int MaxDetailedAccountInfoMessages = 5;
     private const int MaxTelegramTextLength = 3900;
     private const string SkipCommentText = "ادامه بدون کامنت";
@@ -1396,7 +1402,7 @@ public class XuiV3AdminFlowService
     }
 
     /// <summary>
-    /// Routes two-stage super-admin provisional callbacks for HooshPay, Tetraminator, and UniquePay wallet charges.
+    /// Routes two-stage super-admin provisional callbacks for HooshPay, Tetraminator, UniquePay, and AtlasPay wallet charges.
     /// </summary>
     /// <param name="botClient">Telegram client for the owned bot through which the super-admin is working.</param>
     /// <param name="callbackQuery">Callback issued from an admin-only provider provisional approval message.</param>
@@ -1434,6 +1440,17 @@ public class XuiV3AdminFlowService
             data.StartsWith(UniquePayProvisionalCancelCallbackPrefix, StringComparison.Ordinal))
         {
             return await TryHandleUniquePayProvisionalCallbackAsync(
+                botClient,
+                callbackQuery,
+                mainMenu,
+                cancellationToken);
+        }
+
+        if (data.StartsWith(AtlasPayProvisionalStartCallbackPrefix, StringComparison.Ordinal) ||
+            data.StartsWith(AtlasPayProvisionalConfirmCallbackPrefix, StringComparison.Ordinal) ||
+            data.StartsWith(AtlasPayProvisionalCancelCallbackPrefix, StringComparison.Ordinal))
+        {
+            return await TryHandleAtlasPayProvisionalCallbackAsync(
                 botClient,
                 callbackQuery,
                 mainMenu,
@@ -2214,6 +2231,24 @@ public class XuiV3AdminFlowService
             },
             cancellationToken);
 
+        if (AtlasPaySettlementService.CanApplyProvisionalCredit(payment))
+        {
+            await _state.ClearUserStatus(currentUser);
+            await botClient.SendMessage(
+                message.Chat.Id,
+                BuildAtlasPayPaymentInfo(payment, settlement) +
+                "\n\nاین پرداخت در استعلام تازه هنوز توسط AtlasPay تایید نشده است. فقط در صورت اطمینان از دریافت وجه می‌توانید شارژ موقت کیف پول را آغاز کنید.",
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildProvisionalAtlasPayStartKeyboard(payment.Id),
+                cancellationToken: cancellationToken);
+            await botClient.SendMessage(
+                message.Chat.Id,
+                "منوی اصلی",
+                replyMarkup: mainMenu,
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
         await FinishWithMessageAsync(
             botClient,
             message.Chat.Id,
@@ -2267,11 +2302,21 @@ public class XuiV3AdminFlowService
            $"کاربر تلگرام: <code>{payment.TelegramUserId}</code>\n" +
            $"مبلغ پایه: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
            $"مبلغ کل پرداخت: <code>{Html(payment.TotalAmountToman?.FormatCurrency())}</code>\n" +
+           $"کارمزد نمایشی: <code>۱۲٪</code>\n" +
            $"مبلغ دریافتی واقعی: <code>{Html(payment.ActualReceivedAmountToman?.FormatCurrency())}</code>\n" +
            $"نیاز به تحویل دستی: <code>{(payment.RequiresManualDelivery ? "بله" : "خیر")}</code>\n" +
            $"وضعیت تسویه: <code>{Html(payment.SettlementState)}</code>\n" +
-           $"پایش خودکار: <code>{Html(payment.ReconciliationState)}</code>\n" +
+           $"پایش/ریکاوری: <code>{Html(payment.ReconciliationState)}</code>\n" +
            $"اعمال شده روی کیف پول: <code>{(payment.IsAddedToBalance ? "بله" : "خیر")}</code>\n" +
+           $"تایید موقت سوپرادمین: <code>{(payment.IsProvisionallyApproved ? "بله" : "خیر")}</code>\n" +
+           $"تاییدکننده موقت: <code>{payment.ProvisionalApprovedByTelegramUserId}</code>\n" +
+           $"زمان تایید موقت: <code>{Html(payment.ProvisionalApprovedAtUtc?.AddMinutes(210).ConvertToHijriShamsi())}</code>\n" +
+           $"تایید رسمی بعد از موقت: <code>{Html(payment.ProviderConfirmedAfterProvisionalAtUtc?.AddMinutes(210).ConvertToHijriShamsi())}</code>\n" +
+           $"Webhook event: <code>{Html(payment.WebhookEvent ?? "-")}</code>\n" +
+           $"Webhook received: <code>{Html(payment.WebhookReceivedAtUtc?.AddMinutes(210).ConvertToHijriShamsi())}</code>\n" +
+           $"Webhook processed: <code>{Html(payment.WebhookProcessedAtUtc?.AddMinutes(210).ConvertToHijriShamsi())}</code>\n" +
+           $"موجودی قبل: <code>{Html(payment.BalanceBefore?.FormatCurrency())}</code>\n" +
+           $"موجودی بعد: <code>{Html(payment.BalanceAfter?.FormatCurrency())}</code>\n" +
            $"کد خطا: <code>{Html(payment.ErrorCode ?? "-")}</code>\n" +
            "\n" + BuildAtlasPayOutcomeLine(payment, settlement);
 
@@ -2291,6 +2336,10 @@ public class XuiV3AdminFlowService
     /// </remarks>
     private static string BuildAtlasPayOutcomeLine(AtlasPayPaymentInfo payment, NowPaymentsSettlementResult settlement)
     {
+        if (payment.IsProvisionallyApproved && !payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue)
+            return "⚠️ کیف پول به‌صورت موقت توسط سوپرادمین شارژ شده است؛ تایید رسمی AtlasPay هنوز ثبت نشده و شارژ دوباره انجام نخواهد شد.";
+        if (payment.IsProvisionallyApproved && payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue)
+            return "✅ شارژ موقت قبلی بعداً توسط AtlasPay رسماً تایید شد؛ هیچ اعتبار اضافه‌ای دوباره اعمال نشد.";
         if (settlement?.Status == NowPaymentsSettlementStatus.Applied)
             return "✅ استعلام رسمی تایید شد و تسویه/تحویل انجام شد.";
         if (settlement?.Status == NowPaymentsSettlementStatus.AlreadyAdded)

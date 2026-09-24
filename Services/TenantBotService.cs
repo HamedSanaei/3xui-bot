@@ -6916,7 +6916,7 @@ public partial class TenantBotService
         if (IsTenantUniquePayAvailable(tenant, Price.SalePriceToman))
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + "PAYUP:" + BUILDPAYACTION(selection)) });
         if (IsTenantAtlasPayAvailable(tenant))
-            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | ریالی", CUSTOMERCALLBACKPREFIX + "PAYAP:" + BUILDPAYACTION(selection)) });
+            PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + "PAYAP:" + BUILDPAYACTION(selection)) });
         if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
             PAYMENTROWS.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی | کارمزد ۰٪", CUSTOMERCALLBACKPREFIX + "PAYNP:" + BUILDPAYACTION(selection)) });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
@@ -7559,7 +7559,7 @@ public partial class TenantBotService
         try
         {
             var created = await _atlasPay.CreateOrderAsync(payment.MerchantOrderRef, payment.BaseAmountToman, payment.TelegramUserId, cancellationToken);
-            payment.ApplyCreate(created, DateTime.UtcNow, DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600)));
+            payment.ApplyCreate(created, DateTime.UtcNow, AtlasPayPollingPolicy.GetInitialNextInquiryUtc(_appConfig, DateTime.UtcNow));
             order.AtlasPayPaymentInfoId = payment.Id; order.PaymentUrl = payment.CustomerStartLink; order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
             await botClient.SendMessage(chatId, BuildTenantAtlasPayPaymentText(order, payment), parseMode: ParseMode.Html,
@@ -12346,7 +12346,7 @@ public partial class TenantBotService
         if (IsTenantUniquePayAvailable(tenant, order.SalePriceToman))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + $"RNUP:{order.Id}") });
         if (IsTenantAtlasPayAvailable(tenant))
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | ریالی", CUSTOMERCALLBACKPREFIX + $"RNAP:{order.Id}") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + $"RNAP:{order.Id}") });
         if (_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant.TenantNowPaymentsEnabled)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی", CUSTOMERCALLBACKPREFIX + $"RNNP:{order.Id}") });
         if (tenant.TenantCardPaymentEnabled && !string.IsNullOrWhiteSpace(tenant.TenantCardNumber))
@@ -12402,14 +12402,14 @@ public partial class TenantBotService
     /// <remarks>
     /// Display labels only. The callback payload stays <c>apchk_{payment.Id}</c>, and the tenant customer check still
     /// re-verifies the payment against the official AtlasPay API before any wallet credit, order fulfillment, or ledger
-    /// effect. The payment button carries the <c>ریالی</c> marker because AtlasPay settles in Iranian tomans; AtlasPay
-    /// exposes no provider webhook in this integration, so no callback data depends on the button text.
+    /// effect. The payment button carries the <c>ریالی</c> marker and the customer-visible ۱۲٪ fee disclosure because
+    /// AtlasPay settles in Iranian tomans. Signed provider webhook processing is independent of Telegram button captions.
     /// </remarks>
     internal static InlineKeyboardMarkup BuildTenantAtlasPayPaymentKeyboard(AtlasPayPaymentInfo payment)
     {
         var rows = new List<InlineKeyboardButton[]>();
         if (!string.IsNullOrWhiteSpace(payment?.CustomerStartLink))
-            rows.Add(new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | ریالی", payment.CustomerStartLink) });
+            rows.Add(new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | کارمزد ۱۲٪ | ریالی", payment.CustomerStartLink) });
         if (payment != null && payment.Id > 0)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", $"apchk_{payment.Id}") });
         return new InlineKeyboardMarkup(rows);

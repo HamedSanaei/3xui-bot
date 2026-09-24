@@ -62,6 +62,10 @@ public sealed partial class ConcurrencyTests
         Assert.False(saved.IsAddedToBalance);
         Assert.Equal("awaiting_payment", saved.ProviderStatus);
         Assert.Equal(AtlasPaySettlementStates.Pending, saved.SettlementState);
+        Assert.Equal("order.confirmed", saved.WebhookEvent);
+        Assert.NotNull(saved.WebhookReceivedAtUtc);
+        Assert.Equal(new DateTime(2026, 9, 23, 12, 0, 0, DateTimeKind.Utc), saved.WebhookProviderTimestampUtc);
+        Assert.Null(saved.WebhookProcessedAtUtc);
     }
 
     [Fact]
@@ -107,6 +111,9 @@ public sealed partial class ConcurrencyTests
         {
             var payment = VerifiedAtlasPayment();
             payment.NextInquiryAtUtc = DateTime.UtcNow.AddHours(1);
+            payment.WebhookEvent = "order.confirmed";
+            payment.WebhookReceivedAtUtc = DateTime.UtcNow;
+            payment.WebhookProviderTimestampUtc = DateTime.UtcNow;
             db.AtlasPayPaymentInfos.Add(payment);
             await db.SaveChangesAsync();
             paymentId = payment.Id;
@@ -127,6 +134,94 @@ public sealed partial class ConcurrencyTests
         {
             await worker.StopAsync(default);
         }
+    }
+
+    [Fact]
+    public async Task AtlasPay_webhook_primary_due_scan_never_polls_unrelated_invoices()
+    {
+        using var databases = new Databases();
+        var config = AtlasWebhookConfiguration();
+        var handler = new AtlasHttpHandler((_, _, _, _) =>
+            Task.FromResult(JsonResponse(System.Net.HttpStatusCode.OK, StatusJson("awaiting_payment"))));
+
+        int unrelatedId;
+        int signaledId;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var unrelated = VerifiedAtlasPayment();
+            unrelated.MerchantOrderRef = "AtlasPay-unrelated";
+            unrelated.ProviderOrderId = 78;
+            unrelated.TrackingCode = "TRK-78";
+            unrelated.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(-1);
+            db.AtlasPayPaymentInfos.Add(unrelated);
+
+            var signaled = VerifiedAtlasPayment();
+            signaled.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(-1);
+            db.AtlasPayPaymentInfos.Add(signaled);
+            await db.SaveChangesAsync();
+            unrelatedId = unrelated.Id;
+            signaledId = signaled.Id;
+        }
+
+        var worker = new AtlasPayReconciliationHostedService(
+            config,
+            databases.Users,
+            new AtlasPay(config, new HttpClient(handler)),
+            null!,
+            NullLogger<AtlasPayReconciliationHostedService>.Instance);
+
+        await worker.ReconcileDueAsync();
+        Assert.Empty(handler.Captures);
+
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var signaled = await db.AtlasPayPaymentInfos.SingleAsync(x => x.Id == signaledId);
+            signaled.WebhookEvent = "order.confirmed";
+            signaled.WebhookReceivedAtUtc = DateTime.UtcNow;
+            signaled.WebhookProviderTimestampUtc = DateTime.UtcNow;
+            await db.SaveChangesAsync();
+        }
+
+        await worker.ReconcileDueAsync();
+
+        Assert.Single(handler.Captures);
+        Assert.Contains("/orders/77", handler.Captures[0].Uri, StringComparison.Ordinal);
+        Assert.DoesNotContain(handler.Captures, capture =>
+            capture.Uri.Contains("/orders/78", StringComparison.Ordinal));
+
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Null((await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == unrelatedId)).WebhookReceivedAtUtc);
+    }
+
+    [Fact]
+    public async Task AtlasPay_webhook_source_without_durable_receipt_cannot_call_provider()
+    {
+        using var databases = new Databases();
+        var config = AtlasWebhookConfiguration();
+        var handler = new AtlasHttpHandler((_, _, _, _) =>
+            throw new InvalidOperationException("provider must not be called without a durable signed webhook receipt"));
+
+        int paymentId;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var payment = VerifiedAtlasPayment();
+            payment.NextInquiryAtUtc = DateTime.UtcNow.AddMinutes(-1);
+            db.AtlasPayPaymentInfos.Add(payment);
+            await db.SaveChangesAsync();
+            paymentId = payment.Id;
+        }
+
+        var worker = new AtlasPayReconciliationHostedService(
+            config,
+            databases.Users,
+            new AtlasPay(config, new HttpClient(handler)),
+            null!,
+            NullLogger<AtlasPayReconciliationHostedService>.Instance);
+
+        var result = await worker.ReconcilePaymentAsync(paymentId, "atlaspay-webhook");
+
+        Assert.Equal(NowPaymentsSettlementStatus.ProviderNotPaid, result.Status);
+        Assert.Empty(handler.Captures);
     }
 
     private static IConfiguration AtlasWebhookConfiguration()

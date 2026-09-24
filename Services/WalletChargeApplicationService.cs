@@ -193,7 +193,7 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
                 try
                 {
                     p.ApplyCreate(await CreateAtlasPayAsync(p, token), DateTime.UtcNow,
-                        DateTime.UtcNow.AddSeconds(Math.Clamp(config.AtlasPayReconciliationIntervalSeconds, 10, 3600)));
+                        AtlasPayPollingPolicy.GetInitialNextInquiryUtc(config, DateTime.UtcNow));
                     await workflow.SaveAsync(token);
                 }
                 catch (Exception ex)

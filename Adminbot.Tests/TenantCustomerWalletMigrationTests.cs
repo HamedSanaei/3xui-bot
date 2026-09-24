@@ -18,9 +18,13 @@ public sealed partial class ConcurrencyTests
         Assert.True(await funding.DebitAsync(order));
         await using (var users = databases.Users.CreateDbContext())
         {
-            // Step back past the additive BotFather-delivery binding migration so the guarded wallet migration
-            // itself is asked to downgrade. Its financial-history guard must still refuse the destructive rollback.
-            var previous = users.Database.GetMigrations().SkipLast(2).Last();
+            // Target the migration immediately before TenantCustomerWallet itself instead of counting from
+            // the end. Later additive migrations (for example AtlasPay audit/webhook columns) must not weaken or
+            // accidentally bypass this destructive-downgrade guard.
+            var migrations = users.Database.GetMigrations().ToList();
+            var walletMigrationIndex = migrations.IndexOf("20260923083845_TenantCustomerWallet");
+            Assert.True(walletMigrationIndex > 0);
+            var previous = migrations[walletMigrationIndex - 1];
             await Assert.ThrowsAsync<SqliteException>(() => users.GetService<IMigrator>().MigrateAsync(previous));
         }
         await using var verify = databases.Users.CreateDbContext();

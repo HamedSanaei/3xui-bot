@@ -49,6 +49,7 @@ public sealed partial class ConcurrencyTests
 
         var atlas = Assert.Single(labels, label => label.Contains("اطلس‌پی", StringComparison.Ordinal));
         Assert.Contains("کارت‌به‌کارت آنی", atlas);
+        Assert.Contains("کارمزد ۱۲٪", atlas);
         Assert.Contains(RialMarker, atlas);
 
         var crypto = Assert.Single(labels, label => label.Contains("ارز دیجیتال", StringComparison.Ordinal));
@@ -73,7 +74,7 @@ public sealed partial class ConcurrencyTests
     [InlineData("⚡ هوش‌پی آنی | کارمزد ۱۵٪ | ریالی", "⚡ هوش‌پی آنی | کارمزد ۱۵٪", "درگاه ریالی هوش‌پی")]
     [InlineData("⚡ تترامیناتور آنی | کارمزد ۱۲٪ | ریالی", "⚡ تترامیناتور آنی | کارمزد ۱۲٪", "درگاه ریالی تترامیناتور")]
     [InlineData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی", "⚡ یونیک‌پی آنی | کارمزد ۱۲٪", "درگاه ریالی یونیک‌پی")]
-    [InlineData("💳 اطلس‌پی | کارت‌به‌کارت آنی | ریالی", "💳 اطلس‌پی | کارت‌به‌کارت آنی", "درگاه ریالی اطلس‌پی")]
+    [InlineData("💳 اطلس‌پی | کارت‌به‌کارت آنی | کارمزد ۱۲٪ | ریالی", "💳 اطلس‌پی | کارت‌به‌کارت آنی", "درگاه ریالی اطلس‌پی")]
     public void Owned_gateway_routing_accepts_current_and_previously_issued_captions(
         string currentLabel, string preMarkerLabel, string descriptiveAlias)
     {
@@ -104,6 +105,7 @@ public sealed partial class ConcurrencyTests
 
         Assert.Equal(2, labels.Count);
         var pay = Assert.Single(labels, label => label.Contains("اطلس‌پی", StringComparison.Ordinal));
+        Assert.Contains("کارمزد ۱۲٪", pay);
         Assert.Contains(RialMarker, pay);
         Assert.Equal(1, Occurrences(pay, RialMarker));
 
@@ -221,6 +223,7 @@ public sealed partial class ConcurrencyTests
 
         var atlas = Assert.Single(labels, label => label.Contains("اطلس‌پی", StringComparison.Ordinal));
         Assert.Contains("کارت‌به‌کارت آنی", atlas);
+        Assert.Contains("کارمزد ۱۲٪", atlas);
         Assert.Contains(RialMarker, atlas);
 
         var card = Assert.Single(labels, label => label.Contains("کارت‌به‌کارت به فروشگاه", StringComparison.Ordinal));

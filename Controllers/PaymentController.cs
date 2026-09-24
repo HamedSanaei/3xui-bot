@@ -320,7 +320,7 @@ public class PaymentController : ControllerBase
             return BadRequest(new { status = false, message = "invalid payload" });
 
         await using var db = _userDbContextFactory.CreateDbContext();
-        var payment = await db.AtlasPayPaymentInfos.AsNoTracking()
+        var payment = await db.AtlasPayPaymentInfos
             .FirstOrDefaultAsync(x => x.ProviderOrderId == payload.OrderId, cancellationToken);
         if (payment == null)
             return NotFound(new { status = false, message = "payment not found" });
@@ -334,18 +334,34 @@ public class PaymentController : ControllerBase
             return Conflict(new { status = false, message = "payment identity mismatch" });
         }
 
-        if (payment.IsAddedToBalance || string.Equals(payment.SettlementState, AtlasPaySettlementStates.Settled, StringComparison.Ordinal))
+        // Persist the authenticated event before acknowledging it. AtlasPay does not retry failed webhook delivery,
+        // so this durable marker is the recovery source if the in-memory wake-up queue is lost or the process restarts.
+        var receivedAtUtc = DateTime.UtcNow;
+        payment.WebhookEvent = payload.Event;
+        payment.WebhookReceivedAtUtc = receivedAtUtc;
+        payment.WebhookProviderTimestampUtc = payload.Timestamp.UtcDateTime;
+        payment.UpdatedAtUtc = receivedAtUtc;
+
+        if (payment.IsAddedToBalance &&
+            !payment.IsProvisionallyApproved &&
+            string.Equals(payment.SettlementState, AtlasPaySettlementStates.Settled, StringComparison.Ordinal))
+        {
+            payment.WebhookProcessedAtUtc = receivedAtUtc;
+            await db.SaveChangesAsync(cancellationToken);
             return Ok(new { status = true, accepted = true, queued = false, alreadySettled = true });
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
 
         var queued = _atlasPayReconciliation.TryQueueWebhookTrigger(payment.Id);
         if (!queued)
         {
             _logger.LogWarning(
-                "AtlasPay webhook hint queue is full; periodic polling remains responsible for paymentId={PaymentId}.",
+                "AtlasPay webhook wake-up queue is full; the durable webhook receipt will be recovered from users.db. paymentId={PaymentId}",
                 payment.Id);
         }
 
-        return Ok(new { status = true, accepted = true, queued, pollingFallback = true });
+        return Ok(new { status = true, accepted = true, queued, durableRecovery = true });
     }
 
     /// <summary>

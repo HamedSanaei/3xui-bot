@@ -254,6 +254,12 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                             atlas.SettledAtUtc ??= receipt.CreatedAtUtc; atlas.SettlementState = AtlasPaySettlementStates.Settled;
                             atlas.SettlementAttemptId = null; atlas.SettlementStartedAtUtc = null;
                             botId = atlas.BotId; chatId = atlas.ChatId; botType = atlas.WalletOriginBotType; walletOriginTelegramBotId = atlas.WalletOriginTelegramBotId;
+                            if (receipt.ApprovalKind == "provisional")
+                            {
+                                atlas.IsProvisionallyApproved = true;
+                                atlas.ProvisionalApprovedAtUtc = receipt.CreatedAtUtc;
+                                atlas.ProvisionalApprovedByTelegramUserId = receipt.ApprovedByTelegramUserId;
+                            }
                         }
                         break;
                 }

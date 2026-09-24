@@ -146,7 +146,7 @@ public partial class TelegramBotService
     /// <summary>
     /// Owned-wallet AtlasPay action label with its card-to-card wording and its rial-payment marker.
     /// </summary>
-    private const string AtlasPayGatewayAction = "💳 اطلس‌پی | کارت‌به‌کارت آنی | ریالی";
+    private const string AtlasPayGatewayAction = "💳 اطلس‌پی | کارت‌به‌کارت آنی | کارمزد ۱۲٪ | ریالی";
 
     /// <summary>
     /// Owned-wallet NOWPayments (cryptocurrency) action label with its displayed zero-fee policy.
@@ -7153,7 +7153,7 @@ public partial class TelegramBotService
 
                 user.PaymentMethod = "uniquepay";
             }
-            else if (IsGatewayAction(message.Text, AtlasPayGatewayAction, "💳 اطلس‌پی | کارت‌به‌کارت آنی", "درگاه ریالی اطلس‌پی"))
+            else if (IsGatewayAction(message.Text, AtlasPayGatewayAction, "💳 اطلس‌پی | کارت‌به‌کارت آنی | ریالی", "💳 اطلس‌پی | کارت‌به‌کارت آنی", "درگاه ریالی اطلس‌پی"))
             {
                 if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
                 {
@@ -9309,7 +9309,7 @@ public partial class TelegramBotService
         {
             var created = await _walletCharges.CreateAtlasPayAsync(payment, cancellationToken);
             payment.ApplyCreate(created, DateTime.UtcNow,
-                DateTime.UtcNow.AddSeconds(Math.Clamp(_appConfig.AtlasPayReconciliationIntervalSeconds, 10, 3600)));
+                AtlasPayPollingPolicy.GetInitialNextInquiryUtc(_appConfig, DateTime.UtcNow));
             await _workflow.SaveAsync(cancellationToken);
             var deadline = payment.PaymentDeadlineAtUtc?.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture) ?? "نامشخص";
             var text = "⚠️ <b>پیش از پرداخت لطفاً موارد زیر را بررسی کنید:</b>\n\n" +
@@ -9319,7 +9319,7 @@ public partial class TelegramBotService
                        "مبلغ را دقیقاً مطابق عدد بالا پرداخت کنید. شارژ کیف پول فقط پس از استعلام رسمی اطلس‌پی انجام می‌شود.";
             var keyboard = new InlineKeyboardMarkup(new[]
             {
-                new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | ریالی", payment.CustomerStartLink) },
+                new[] { InlineKeyboardButton.WithUrl("💳 پرداخت با اطلس‌پی | کارمزد ۱۲٪ | ریالی", payment.CustomerStartLink) },
                 new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", $"apchk_{payment.Id}") }
             });
             var sent = await ActiveBotClient.SendMessage(message.Chat.Id, text, parseMode: ParseMode.Html,
