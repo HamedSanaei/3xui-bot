@@ -53,6 +53,7 @@ public partial class TenantBotService
     /// </summary>
     private static readonly AsyncKeyedGate TenantUniquePayInvoiceCreationGate = new();
     private static readonly AsyncKeyedGate TenantAtlasPayInvoiceCreationGate = new();
+    private static readonly AsyncKeyedGate TenantAtlasPayPurchaseGate = new();
     public const string OwnerMenuButton = "🛒 فعالسازی ربات فروشگاهی";
 
     private const string OWNERCALLBACKPREFIX = "TBM:";
@@ -7619,10 +7620,96 @@ public partial class TenantBotService
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, BuildTenantAtlasPayUnavailableMessage(tenant),
                 showAlert: true, cancellationToken: cancellationToken); return;
         }
+
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        var purchaseGateKey = $"{tenant.Id}:{customer.TelegramUserId}:{BUILDPAYACTION(selection)}";
+        using var purchaseGate = await TenantAtlasPayPurchaseGate.EnterAsync(purchaseGateKey, cancellationToken);
+
+        var reusable = await FindReusableTenantAtlasPayPurchaseAsync(
+            tenant.Id, customer.TelegramUserId, selection, price.SalePriceToman, cancellationToken);
+        if (reusable != null)
+        {
+            await botClient.SendMessage(
+                chatId,
+                "♻️ <b>فاکتور فعال قبلی اطلس‌پی</b>\n\n" + BuildTenantAtlasPayPaymentText(reusable.Order, reusable.Payment),
+                parseMode: ParseMode.Html,
+                replyMarkup: BuildTenantAtlasPayPaymentKeyboard(reusable.Payment),
+                cancellationToken: cancellationToken);
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                "یک فاکتور فعال برای همین خرید دارید؛ همان فاکتور نمایش داده شد.",
+                cancellationToken: cancellationToken);
+            _logger.LogInformation(
+                "AtlasPay tenant purchase reused active invoice. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, customerTelegramUserId={CustomerTelegramUserId}, deadlineUtc={DeadlineUtc}",
+                tenant.Id,
+                reusable.Order.OrderId,
+                reusable.Payment.Id,
+                customer.TelegramUserId,
+                reusable.Payment.PaymentDeadlineAtUtc);
+            return;
+        }
+
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "atlaspay");
         _workflow.Add(order); await _workflow.SaveAsync(cancellationToken);
         await CreateTenantAtlasPayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
+    }
+
+    private sealed record ReusableTenantAtlasPayPurchase(TenantBotOrder Order, AtlasPayPaymentInfo Payment);
+
+    private async Task<ReusableTenantAtlasPayPurchase> FindReusableTenantAtlasPayPurchaseAsync(
+        string tenantBotId,
+        long customerTelegramUserId,
+        XuiV3PurchaseSelection selection,
+        long salePriceToman,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = DateTime.UtcNow;
+        return await _workflow.ReadAsync(async db =>
+        {
+            var payments = await db.AtlasPayPaymentInfos.AsNoTracking()
+                .Where(x =>
+                    x.BotId == tenantBotId &&
+                    x.TelegramUserId == customerTelegramUserId &&
+                    x.PaymentPurpose == TenantBotPaymentPurposes.TenantOrder &&
+                    x.CreationState == AtlasPayCreationStates.Created &&
+                    x.ProviderStatus == "awaiting_payment" &&
+                    x.SettlementState == AtlasPaySettlementStates.Pending &&
+                    !x.IsAddedToBalance &&
+                    x.PaymentDeadlineAtUtc.HasValue &&
+                    x.PaymentDeadlineAtUtc.Value > nowUtc &&
+                    x.CustomerStartLink != null &&
+                    x.CustomerStartLink != "" &&
+                    x.TenantBotOrderId.HasValue)
+                .OrderByDescending(x => x.CreatedAtUtc)
+                .Take(10)
+                .ToListAsync(cancellationToken);
+
+            foreach (var payment in payments)
+            {
+                var order = await db.TenantBotOrders.AsNoTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.Id == payment.TenantBotOrderId.Value &&
+                        !x.IsFulfilled &&
+                        x.PaymentProvider == "atlaspay" &&
+                        x.PaymentStatus == TenantBotOrderStatuses.Pending &&
+                        x.OrderKind == TenantBotOrderKinds.Purchase &&
+                        x.SalePriceToman == salePriceToman &&
+                        x.ServiceKey == selection.ServiceKey,
+                        cancellationToken);
+                if (order == null) continue;
+
+                var sameSelection = !string.IsNullOrWhiteSpace(selection.UnlimitedPlanKey)
+                    ? string.Equals(order.UnlimitedPlanKey, selection.UnlimitedPlanKey, StringComparison.Ordinal)
+                    : string.IsNullOrWhiteSpace(order.UnlimitedPlanKey) &&
+                      order.TrafficGb == selection.TrafficGb &&
+                      string.Equals(order.DurationKey, selection.DurationKey, StringComparison.Ordinal);
+                if (sameSelection)
+                    return new ReusableTenantAtlasPayPurchase(order, payment);
+            }
+
+            return null;
+        });
     }
 
     private async Task CreateTenantAtlasPayInvoiceForExistingOrderAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery,
@@ -7697,14 +7784,35 @@ public partial class TenantBotService
         catch (Exception ex)
         {
             var definitive = AtlasPay.IsDefinitiveCreateFailure(ex);
-            var code = ex is AtlasPayApiException api && api.StatusCode > 0 ? api.StatusCode.ToString(CultureInfo.InvariantCulture) : "ambiguous";
-            payment.RecordCreationFailure(definitive, code, DateTime.UtcNow); payment.ErrorCode = code;
-            payment.ErrorMessage = definitive ? "AtlasPay rejected order creation." : "AtlasPay create outcome is ambiguous; no automatic retry.";
+            var apiError = ex as AtlasPayApiException;
+            var code = apiError is { StatusCode: > 0 }
+                ? apiError.StatusCode.ToString(CultureInfo.InvariantCulture)
+                : "ambiguous";
+            var providerMessage = AtlasPay.SafeProviderErrorMessage(apiError);
+            payment.RecordCreationFailure(definitive, code, DateTime.UtcNow);
+            payment.ErrorCode = code;
+            payment.ErrorMessage = definitive
+                ? string.IsNullOrWhiteSpace(providerMessage)
+                    ? "AtlasPay rejected order creation."
+                    : $"AtlasPay rejected order creation: {providerMessage}"
+                : "AtlasPay create outcome is ambiguous; no automatic retry.";
             order.PaymentStatus = definitive ? TenantBotOrderStatuses.Failed : TenantBotOrderStatuses.Pending;
-            order.ErrorMessage = definitive ? "AtlasPay invoice creation failed." : "AtlasPay invoice creation outcome is ambiguous.";
-            order.UpdatedAtUtc = DateTime.UtcNow; await _workflow.SaveAsync(cancellationToken);
-            _logger.LogWarning("AtlasPay tenant create ended without usable invoice. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, definitive={Definitive}, errorType={ErrorType}",
-                tenant.Id, order.OrderId, payment.Id, definitive, ex.GetType().Name);
+            order.ErrorMessage = definitive
+                ? string.IsNullOrWhiteSpace(providerMessage)
+                    ? "AtlasPay invoice creation failed."
+                    : $"AtlasPay invoice creation failed: {providerMessage}"
+                : "AtlasPay invoice creation outcome is ambiguous.";
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await _workflow.SaveAsync(cancellationToken);
+            _logger.LogWarning(
+                "AtlasPay tenant create ended without usable invoice. tenantBotId={TenantBotId}, orderId={OrderId}, paymentId={PaymentId}, definitive={Definitive}, errorType={ErrorType}, statusCode={StatusCode}, providerMessage={ProviderMessage}",
+                tenant.Id,
+                order.OrderId,
+                payment.Id,
+                definitive,
+                ex.GetType().Name,
+                apiError?.StatusCode ?? 0,
+                providerMessage ?? "-");
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id,
                 definitive ? "ساخت فاکتور اطلس‌پی ناموفق بود." : "نتیجه ساخت فاکتور اطلس‌پی نامشخص است؛ برای جلوگیری از فاکتور تکراری درخواست دوباره ارسال نمی‌شود.",
                 showAlert: true, cancellationToken: cancellationToken);

@@ -134,7 +134,14 @@ public partial class TenantBotService
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogWarning("Tenant wallet invoice unavailable. BotId={BotId} ErrorType={ErrorType}", store.Id, ex.GetType().Name);
+                var apiError = ex as AtlasPayApiException;
+                var providerMessage = AtlasPay.SafeProviderErrorMessage(apiError);
+                _logger.LogWarning(
+                    "Tenant wallet invoice unavailable. BotId={BotId} ErrorType={ErrorType} StatusCode={StatusCode} ProviderMessage={ProviderMessage}",
+                    store.Id,
+                    ex.GetType().Name,
+                    apiError?.StatusCode ?? 0,
+                    providerMessage ?? "-");
                 await client.SendMessage(chat, "فاکتور قابل نمایش نیست. نتیجه درخواست برای بررسی محفوظ است؛ پرداخت یا برداشت خودکار تکرار نمی‌شود.", cancellationToken: token);
             }
             return true;

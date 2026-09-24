@@ -116,6 +116,53 @@ public sealed partial class ConcurrencyTests
     }
 
     [Fact]
+    public async Task TenantCustomerWallet_AtlasPay_400_persists_provider_reason_without_retry()
+    {
+        using var databases = new Databases();
+        await SeedCustomerWalletOrderAsync(databases);
+        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["atlasPayApiKey"] = "test-only",
+            ["atlasPayBaseUrl"] = "https://atlas.example/api/v1"
+        }).Build();
+        var posts = 0;
+        var handler = new AtlasHttpHandler((_, _, _, _) =>
+        {
+            Interlocked.Increment(ref posts);
+            return Task.FromResult(JsonResponse(HttpStatusCode.BadRequest, "{\"error\":\"fixture invalid amount\"}"));
+        });
+        HttpClient Client() => new(handler, disposeHandler: false);
+        var availability = new GatewayAvailabilityProbe();
+        var policy = new TenantCustomerWalletPolicy(
+            databases.Users,
+            config.Get<AppConfig>()!,
+            NullLogger<TenantCustomerWalletPolicy>.Instance);
+        var charges = new WalletChargeApplicationService(
+            new UserWorkflowStore(databases.Users),
+            config.Get<AppConfig>()!,
+            availability,
+            policy,
+            new HooshPay(config, Client()),
+            new Tetraminator(config, Client()),
+            new UniquePay(config, Client()),
+            new AtlasPay(config, Client()),
+            new NowPayments(config, Client(), new TenantWalletQuote()));
+
+        var ex = await Assert.ThrowsAsync<AtlasPayApiException>(() =>
+            charges.CreateTenantAsync("tenant-a", 123, 123, 20_000, PaymentGateway.AtlasPay, default));
+
+        Assert.Equal(1, posts);
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal("fixture invalid amount", AtlasPay.SafeProviderErrorMessage(ex));
+        await using var db = databases.Users.CreateDbContext();
+        var payment = await db.AtlasPayPaymentInfos.SingleAsync();
+        Assert.Equal(AtlasPayCreationStates.Failed, payment.CreationState);
+        Assert.Equal("400", payment.CreationErrorCode);
+        Assert.Equal("400", payment.ErrorCode);
+        Assert.Contains("fixture invalid amount", payment.ErrorMessage);
+    }
+
+    [Fact]
     public async Task TenantCustomerWallet_HooshPay_provisional_credit_mirrors_owner_only_after_official_confirmation()
     {
         using var databases = new Databases();

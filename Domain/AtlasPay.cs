@@ -396,8 +396,15 @@ public sealed class AtlasPayApiException : Exception
 {
     public int StatusCode { get; }
     public bool IsTransient { get; }
-    public AtlasPayApiException(int statusCode, string message, bool isTransient = false, Exception inner = null)
-        : base(message, inner) { StatusCode = statusCode; IsTransient = isTransient; }
+    public string ResponseBody { get; }
+
+    public AtlasPayApiException(int statusCode, string message, bool isTransient = false, Exception inner = null, string responseBody = null)
+        : base(message, inner)
+    {
+        StatusCode = statusCode;
+        IsTransient = isTransient;
+        ResponseBody = responseBody;
+    }
 }
 
 public sealed class AtlasPay
@@ -425,6 +432,44 @@ public sealed class AtlasPay
 
     public static bool IsDefinitiveCreateFailure(Exception exception)
         => exception is AtlasPayApiException { StatusCode: 400 or 401 };
+
+    public static string SafeProviderErrorMessage(AtlasPayApiException exception)
+    {
+        var body = exception?.ResponseBody;
+        if (string.IsNullOrWhiteSpace(body)) return null;
+
+        string value = null;
+        try
+        {
+            var token = Newtonsoft.Json.Linq.JToken.Parse(body);
+            var message = token["message"];
+            value = message?.Type == Newtonsoft.Json.Linq.JTokenType.String ? message.ToString() : null;
+            var error = token["error"];
+            if (string.IsNullOrWhiteSpace(value) && error != null)
+            {
+                if (error.Type == Newtonsoft.Json.Linq.JTokenType.String)
+                    value = error.ToString();
+                else
+                {
+                    var nestedMessage = error["message"];
+                    var nestedError = error["error"];
+                    value = nestedMessage?.Type == Newtonsoft.Json.Linq.JTokenType.String
+                        ? nestedMessage.ToString()
+                        : nestedError?.Type == Newtonsoft.Json.Linq.JTokenType.String
+                            ? nestedError.ToString()
+                            : null;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        value = string.Join(" ", value.Split((char[])null, StringSplitOptions.RemoveEmptyEntries));
+        return value.Length <= 500 ? value : value[..500];
+    }
 
     public async Task<AtlasPayCreateOrderResponse> CreateOrderAsync(string merchantOrderRef, long baseAmountToman,
         long customerTelegramId, CancellationToken cancellationToken = default)
@@ -481,7 +526,7 @@ public sealed class AtlasPay
                 var transient = code is 408 or 429 || code >= 500;
                 if (retryReadOnly && transient && attempt < retryCount)
                 { await Task.Delay(TimeSpan.FromMilliseconds(100 * (attempt + 1)), cancellationToken); continue; }
-                throw new AtlasPayApiException(code, $"AtlasPay request failed with HTTP {code}.", transient);
+                throw new AtlasPayApiException(code, $"AtlasPay request failed with HTTP {code}.", transient, responseBody: text);
             }
             catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
             {

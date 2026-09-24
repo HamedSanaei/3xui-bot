@@ -139,6 +139,8 @@ public sealed partial class ConcurrencyTests
         var ex = await Assert.ThrowsAsync<AtlasPayApiException>(() => atlas.CreateOrderAsync("AtlasPay-one", 250000, 123));
         Assert.Single(handler.Captures);
         Assert.Equal(definitive, AtlasPay.IsDefinitiveCreateFailure(ex));
+        Assert.Equal("{\"error\":\"x\"}", ex.ResponseBody);
+        Assert.Equal("x", AtlasPay.SafeProviderErrorMessage(ex));
         Assert.DoesNotContain("test-atlas-key", ex.ToString(), StringComparison.Ordinal);
     }
 
@@ -772,7 +774,7 @@ public sealed partial class ConcurrencyTests
                 return JsonResponse(HttpStatusCode.OK, Newtonsoft.Json.JsonConvert.SerializeObject(new
                 {
                     success=true, orderId=providerOrderId, trackingCode="TRK-9001", totalAmountToman=totalAmount,
-                    cardNumberMasked="6037-****-9001", paymentDeadlineAt="2026-09-10T12:00:00Z",
+                    cardNumberMasked="6037-****-9001", paymentDeadlineAt=DateTimeOffset.UtcNow.AddMinutes(20).ToString("O"),
                     customerStartLink="https://t.me/atlaspay_bot/start?start=tenant"
                 }));
             }
@@ -805,6 +807,8 @@ public sealed partial class ConcurrencyTests
         var callback = new CallbackQuery { Id="atlas-create", From=new Telegram.Bot.Types.User { Id=722 }, Message=new Message { Id =1, Chat=new Chat { Id=722 } } };
         var selection = new XuiV3PurchaseSelection { ServiceKey="normal", TrafficGb=10, DurationKey="m1", AccountCount=1 };
         await (Task)method.Invoke(service, new object[] { client, callback, tenant, customer!, selection, CancellationToken.None })!;
+        var repeatCallback = new CallbackQuery { Id="atlas-create-repeat", From=new Telegram.Bot.Types.User { Id=722 }, Message=new Message { Id=1, Chat=new Chat { Id=722 } } };
+        await (Task)method.Invoke(service, new object[] { client, repeatCallback, tenant, customer!, selection, CancellationToken.None })!;
 
         Assert.True(prePersisted); Assert.Equal(1, createPosts);
         int paymentId; int orderId;

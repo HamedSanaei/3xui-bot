@@ -196,7 +196,19 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
                 }
                 catch (Exception ex)
                 {
-                    p.RecordCreationFailure(AtlasPay.IsDefinitiveCreateFailure(ex), "create_unconfirmed", DateTime.UtcNow);
+                    var apiError = ex as AtlasPayApiException;
+                    var definitive = AtlasPay.IsDefinitiveCreateFailure(ex);
+                    var code = apiError is { StatusCode: > 0 }
+                        ? apiError.StatusCode.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                        : "create_unconfirmed";
+                    var providerMessage = AtlasPay.SafeProviderErrorMessage(apiError);
+                    p.RecordCreationFailure(definitive, code, DateTime.UtcNow);
+                    p.ErrorCode = code;
+                    p.ErrorMessage = definitive
+                        ? string.IsNullOrWhiteSpace(providerMessage)
+                            ? "AtlasPay rejected wallet charge creation."
+                            : $"AtlasPay rejected wallet charge creation: {providerMessage}"
+                        : "AtlasPay wallet charge creation outcome is ambiguous; no automatic retry.";
                     await workflow.SaveAsync(CancellationToken.None);
                     throw;
                 }
