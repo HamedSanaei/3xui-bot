@@ -6,6 +6,8 @@ using Telegram.Bot.Types.ReplyMarkups;
 /// <summary>Builds customer-facing AtlasPay payment instructions without persisting full merchant card details.</summary>
 public static class AtlasPayCustomerPaymentUi
 {
+    private static readonly TimeZoneInfo TehranTimeZone = ResolveTehranTimeZone();
+
     /// <summary>Ephemeral direct-payment values returned only by AtlasPay order creation.</summary>
     public sealed record DirectPayment(
         string CardNumber,
@@ -40,7 +42,7 @@ public static class AtlasPayCustomerPaymentUi
         ArgumentNullException.ThrowIfNull(payment);
         var toman = payment.TotalAmountToman.ToString("0", CultureInfo.InvariantCulture);
         var rial = (payment.TotalAmountToman * 10m).ToString("0", CultureInfo.InvariantCulture);
-        var deadline = payment.PaymentDeadlineAt.UtcDateTime.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture);
+        var deadline = FormatTehranShamsiDeadline(payment.PaymentDeadlineAt);
         var lines = new List<string>
         {
             "💳 <b>اطلاعات پرداخت مستقیم اطلس‌پی</b>",
@@ -74,7 +76,10 @@ public static class AtlasPayCustomerPaymentUi
     /// <summary>Builds the complete link-only fallback message when direct card display is not enabled for the merchant.</summary>
     public static string BuildLinkFallbackText(long totalAmountToman, DateTime? paymentDeadlineAtUtc, string trackingCode)
     {
-        var deadline = paymentDeadlineAtUtc?.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture) ?? "نامشخص";
+        var deadline = paymentDeadlineAtUtc.HasValue
+            ? FormatTehranShamsiDeadline(new DateTimeOffset(
+                DateTime.SpecifyKind(paymentDeadlineAtUtc.Value, DateTimeKind.Utc)))
+            : "نامشخص";
         var lines = new List<string>
         {
             "⚠️ <b>پیش از پرداخت لطفاً موارد زیر را با دقت بررسی کنید:</b>",
@@ -119,6 +124,34 @@ public static class AtlasPayCustomerPaymentUi
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔄 بررسی وضعیت پرداخت", checkCallback) });
 
         return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>Formats an AtlasPay UTC deadline as a Solar Hijri date in Tehran local time.</summary>
+    public static string FormatTehranShamsiDeadline(DateTimeOffset deadline)
+    {
+        var tehran = TimeZoneInfo.ConvertTime(deadline, TehranTimeZone);
+        var local = tehran.DateTime;
+        var calendar = new PersianCalendar();
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"{calendar.GetYear(local):0000}/{calendar.GetMonth(local):00}/{calendar.GetDayOfMonth(local):00} - {tehran:HH:mm} (ساعت تهران)");
+    }
+
+    private static TimeZoneInfo ResolveTehranTimeZone()
+    {
+        foreach (var id in new[] { "Asia/Tehran", "Iran Standard Time" })
+        {
+            try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
+            catch (TimeZoneNotFoundException) { }
+            catch (InvalidTimeZoneException) { }
+        }
+
+        // Iran has used a fixed UTC+03:30 offset since abolishing DST in 2022.
+        return TimeZoneInfo.CreateCustomTimeZone(
+            "TehranFallback",
+            TimeSpan.FromMinutes(210),
+            "Tehran",
+            "Tehran");
     }
 
     private static string Html(string value)

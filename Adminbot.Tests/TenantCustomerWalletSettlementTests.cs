@@ -62,8 +62,15 @@ public sealed partial class ConcurrencyTests
             Assert.Equal(10, await db.WalletLedgerEntries.CountAsync(x => x.BotType == "tenant" && x.BotId == "tenant-a"));
             Assert.Equal(5, await db.WalletLedgerEntries.CountAsync(x => x.Reason == WalletLedgerReasons.WalletCharge));
             Assert.Equal(5, await db.WalletLedgerEntries.CountAsync(x => x.Reason == WalletLedgerReasons.TenantWalletTopUpMirror));
-            var notifications = await db.PaymentSettlementNotifications.ToListAsync(); Assert.Equal(5, notifications.Count);
-            Assert.All(notifications, n =>
+            var notifications = await db.PaymentSettlementNotifications.ToListAsync();
+            Assert.Equal(10, notifications.Count);
+            var customerNotifications = notifications.Where(x => !x.IsTenantOwnerReport).ToList();
+            var ownerReports = notifications.Where(x => x.IsTenantOwnerReport).ToList();
+            Assert.Equal(5, customerNotifications.Count);
+            Assert.Equal(5, ownerReports.Count);
+            Assert.Equal(5, customerNotifications.Select(x => x.NotificationKey).Distinct(StringComparer.Ordinal).Count());
+            Assert.Equal(5, ownerReports.Select(x => x.NotificationKey).Distinct(StringComparer.Ordinal).Count());
+            Assert.All(customerNotifications, n =>
             {
                 Assert.Equal(321, n.ChatId);
                 Assert.Equal(BotInstanceTypes.Tenant, n.WalletOriginBotType);

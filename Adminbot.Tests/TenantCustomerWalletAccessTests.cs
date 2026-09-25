@@ -74,7 +74,9 @@ public sealed partial class ConcurrencyTests
             Assert.Contains(menu.Keyboard.SelectMany(x => x), x => x.Text == "💰 کیف پول");
             var customer = await wallet.GetUserStatusWithId(123);
             async Task Route(Update update) => await (Task<bool>)handler.Invoke(tenant, new object[] { client, update, customer, await state.GetUserStatus(123), CancellationToken.None })!;
-            await Route(Callback(123, "TCW:home")); Assert.Contains(client.Texts, x => x.Contains("500,000"));
+            await Route(Callback(123, "TCW:home"));
+            Assert.Contains(client.Texts, x =>
+                new string(x.Where(char.IsDigit).ToArray()).Contains("500000", StringComparison.Ordinal));
             Assert.Contains("TCW:h:0", client.Callbacks); Assert.Contains("TCW:charge", client.Callbacks);
             await Route(Callback(123, "TCW:h:0")); Assert.Contains(client.Texts, x => x.Contains("تراکنش‌های کیف پول"));
             await Route(Callback(123, "TCW:charge"));

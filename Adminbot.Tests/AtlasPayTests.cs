@@ -71,6 +71,8 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("Ali &amp; Rezaei", text, StringComparison.Ordinal);
         Assert.Contains("Bank &lt;Melli&gt;", text, StringComparison.Ordinal);
         Assert.Contains("۱ تومان", text, StringComparison.Ordinal);
+        Assert.Contains("1405/06/19 - 15:30 (ساعت تهران)", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("UTC", text, StringComparison.Ordinal);
         Assert.DoesNotContain("Ali & Rezaei", text, StringComparison.Ordinal);
         Assert.DoesNotContain("Bank <Melli>", text, StringComparison.Ordinal);
 
@@ -80,6 +82,23 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(created.CustomerStartLink, buttons[0].Url);
         Assert.Equal("🔄 بررسی وضعیت پرداخت", buttons[1].Text);
         Assert.Equal("apchk_7", buttons[1].CallbackData);
+    }
+
+    [Fact]
+    public void AtlasPay_deadline_is_shamsi_and_tehran_local_in_direct_and_fallback_ui()
+    {
+        var utc = new DateTimeOffset(2026, 9, 25, 10, 22, 0, TimeSpan.Zero);
+        Assert.Equal(
+            "1405/07/03 - 13:52 (ساعت تهران)",
+            AtlasPayCustomerPaymentUi.FormatTehranShamsiDeadline(utc));
+
+        var fallback = AtlasPayCustomerPaymentUi.BuildLinkFallbackText(
+            90_176,
+            utc.UtcDateTime,
+            "41e5cc19b932b087");
+        Assert.Contains("1405/07/03 - 13:52 (ساعت تهران)", fallback, StringComparison.Ordinal);
+        Assert.DoesNotContain("2026-09-25", fallback, StringComparison.Ordinal);
+        Assert.DoesNotContain("UTC", fallback, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -128,6 +147,46 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("پرداخت با اطلس‌پی", paymentButton.Text, StringComparison.Ordinal);
         Assert.Equal(created.CustomerStartLink, paymentButton.Url);
     }
+    [Theory]
+    [InlineData(49_999)]
+    [InlineData(2_000_001)]
+    public async Task AtlasPay_create_rejects_out_of_range_amount_before_http(long amount)
+    {
+        var handler = new AtlasHttpHandler((_, _, _, _) =>
+            throw new InvalidOperationException("provider must not be called"));
+        var atlas = new AtlasPay(AtlasConfiguration(), new HttpClient(handler));
+
+        var ex = await Assert.ThrowsAsync<AtlasPayCreateValidationException>(() =>
+            atlas.CreateOrderAsync("AtlasPay-range", amount, 123));
+
+        Assert.True(AtlasPay.IsDefinitiveCreateFailure(ex));
+        Assert.NotNull(AtlasPay.SafeCreateErrorMessage(ex));
+        Assert.Empty(handler.Captures);
+    }
+
+    [Theory]
+    [InlineData(50_000)]
+    [InlineData(2_000_000)]
+    public void AtlasPay_amount_range_accepts_provider_boundaries(long amount)
+    {
+        Assert.True(AtlasPay.IsSupportedBaseAmount(amount));
+        Assert.True(WalletChargeApplicationService.IsValidAmount(
+            PaymentGateway.AtlasPay,
+            amount,
+            new AppConfig()));
+    }
+
+    [Theory]
+    [InlineData(49_999)]
+    [InlineData(2_000_001)]
+    public void AtlasPay_wallet_amount_policy_rejects_out_of_range_values(long amount)
+    {
+        Assert.False(WalletChargeApplicationService.IsValidAmount(
+            PaymentGateway.AtlasPay,
+            amount,
+            new AppConfig()));
+    }
+
     [Theory]
     [InlineData(500, false)]
     [InlineData(400, true)]

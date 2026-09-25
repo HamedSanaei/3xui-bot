@@ -104,7 +104,8 @@ public sealed partial class ConcurrencyTests
                { Config = new BotInstanceConfig { Id = "tenant-a", Type = BotInstanceTypes.Tenant }, Client = joined }))
         {
             await Route(joined, Callback("TCW:home"));
-            Assert.Contains(joined.Texts, text => text.Contains("500,000"));
+            Assert.Contains(joined.Texts, text =>
+                text.Replace('٬', ',').Contains("500,000", StringComparison.Ordinal));
 
             await Route(joined, Callback("TCW:charge"));
             await Route(joined, Text("100000"));
@@ -254,7 +255,8 @@ public sealed partial class ConcurrencyTests
             "DeliverClaimAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var batch = await (Task<IReadOnlyList<PaymentSettlementNotification>>)claim.Invoke(
             worker, new object[] { CancellationToken.None })!;
-        var notification = Assert.Single(batch);
+        var notification = Assert.Single(batch, x => !x.IsTenantOwnerReport);
+        Assert.Single(batch, x => x.IsTenantOwnerReport);
         Assert.Equal(789, notification.WalletOriginTelegramBotId);
         await (Task)deliver.Invoke(worker, new object[] { notification, CancellationToken.None })!;
 
@@ -271,7 +273,8 @@ public sealed partial class ConcurrencyTests
                 x.Provider == "atlaspay" && x.TelegramUserId == 123).ToListAsync());
             Assert.Empty(await db.ReferralPaymentEvents.ToListAsync());
             Assert.Empty(await db.ReferralRewards.ToListAsync());
-            var savedNotification = await db.PaymentSettlementNotifications.SingleAsync();
+            var savedNotification = await db.PaymentSettlementNotifications
+                .SingleAsync(x => !x.NotificationKey.StartsWith(PaymentSettlementNotification.TenantOwnerReportPrefix));
             Assert.Equal(PaymentSettlementNotificationStatuses.ManualReview, savedNotification.Status);
             Assert.Equal("bot_identity_changed", savedNotification.LastError);
             Assert.Equal(789, savedNotification.WalletOriginTelegramBotId);

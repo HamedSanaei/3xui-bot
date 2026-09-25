@@ -407,8 +407,17 @@ public sealed class AtlasPayApiException : Exception
     }
 }
 
+/// <summary>Represents a locally rejected AtlasPay create request that must never be retried unchanged.</summary>
+public sealed class AtlasPayCreateValidationException : Exception
+{
+    public AtlasPayCreateValidationException(string message) : base(message) { }
+}
+
 public sealed class AtlasPay
 {
+    public const long MinimumBaseAmountToman = 50_000;
+    public const long MaximumBaseAmountToman = 2_000_000;
+
     private readonly AppConfig _configuration;
     private readonly HttpClient _httpClient;
     private readonly Uri _baseUri;
@@ -431,7 +440,18 @@ public sealed class AtlasPay
     }
 
     public static bool IsDefinitiveCreateFailure(Exception exception)
-        => exception is AtlasPayApiException { StatusCode: 400 or 401 };
+        => exception is AtlasPayApiException { StatusCode: 400 or 401 } or AtlasPayCreateValidationException;
+
+    public static bool IsSupportedBaseAmount(long amountToman)
+        => amountToman is >= MinimumBaseAmountToman and <= MaximumBaseAmountToman;
+
+    public static string SafeCreateErrorMessage(Exception exception)
+        => exception switch
+        {
+            AtlasPayApiException api => SafeProviderErrorMessage(api),
+            AtlasPayCreateValidationException validation => validation.Message,
+            _ => null
+        };
 
     public static string SafeProviderErrorMessage(AtlasPayApiException exception)
     {
@@ -475,8 +495,14 @@ public sealed class AtlasPay
         long customerTelegramId, CancellationToken cancellationToken = default)
     {
         EnsureConfigured();
-        if (string.IsNullOrWhiteSpace(merchantOrderRef) || baseAmountToman <= 0 || customerTelegramId <= 0)
-            throw new ArgumentException("Invalid AtlasPay order parameters.");
+        if (string.IsNullOrWhiteSpace(merchantOrderRef))
+            throw new AtlasPayCreateValidationException("AtlasPay merchant order reference is required.");
+        if (customerTelegramId <= 0)
+            throw new AtlasPayCreateValidationException("AtlasPay customer Telegram id must be a positive integer.");
+        if (!IsSupportedBaseAmount(baseAmountToman))
+            throw new AtlasPayCreateValidationException(
+                $"مبلغ سفارش اطلس‌پی باید بین {MinimumBaseAmountToman:N0} تا {MaximumBaseAmountToman:N0} تومان باشد.");
+
         var request = new AtlasPayCreateOrderRequest
         { MerchantOrderRef = merchantOrderRef, BaseAmountToman = baseAmountToman, CustomerTelegramId = customerTelegramId };
         var response = await SendAsync(HttpMethod.Post, "orders", request, retryReadOnly: false, cancellationToken);

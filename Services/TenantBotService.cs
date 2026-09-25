@@ -7744,6 +7744,16 @@ public partial class TenantBotService
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
         if (!IsTenantAtlasPayAvailable(tenant))
         { await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, BuildTenantAtlasPayUnavailableMessage(tenant), showAlert: true, cancellationToken: cancellationToken); return; }
+        if (!AtlasPay.IsSupportedBaseAmount(order.SalePriceToman))
+        {
+            await SafeAnswerCallbackQueryAsync(
+                botClient,
+                callbackQuery.Id,
+                $"مبلغ اطلس‌پی باید بین {AtlasPay.MinimumBaseAmountToman:N0} تا {AtlasPay.MaximumBaseAmountToman:N0} تومان باشد.",
+                showAlert: true,
+                cancellationToken: cancellationToken);
+            return;
+        }
         AtlasPayPaymentInfo payment; string existingLink = null; bool mutationBlocked = false;
         using var gate = await TenantAtlasPayInvoiceCreationGate.EnterAsync(order.Id.ToString(CultureInfo.InvariantCulture), cancellationToken);
         try
@@ -7801,8 +7811,10 @@ public partial class TenantBotService
             var apiError = ex as AtlasPayApiException;
             var code = apiError is { StatusCode: > 0 }
                 ? apiError.StatusCode.ToString(CultureInfo.InvariantCulture)
-                : "ambiguous";
-            var providerMessage = AtlasPay.SafeProviderErrorMessage(apiError);
+                : ex is AtlasPayCreateValidationException
+                    ? "validation"
+                    : "ambiguous";
+            var providerMessage = AtlasPay.SafeCreateErrorMessage(ex);
             payment.RecordCreationFailure(definitive, code, DateTime.UtcNow);
             payment.ErrorCode = code;
             payment.ErrorMessage = definitive

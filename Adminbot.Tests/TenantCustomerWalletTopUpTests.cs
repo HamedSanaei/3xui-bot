@@ -108,8 +108,10 @@ public sealed partial class ConcurrencyTests
         var mirrorEntry = await verify.WalletLedgerEntries.SingleAsync(x => x.IdempotencyKey == mirrorKey);
         Assert.Equal(WalletLedgerReasons.TenantWalletTopUpMirror, mirrorEntry.Reason);
         Assert.Equal(456, mirrorEntry.TelegramUserId); Assert.Equal(123, mirrorEntry.CounterpartyTelegramUserId);
-        var notification = await verify.PaymentSettlementNotifications.SingleAsync();
-        Assert.Equal($"tenant-wallet:{providerKey}:1", notification.NotificationKey);
+        var notificationKey = $"tenant-wallet:{providerKey}:1";
+        var notification = await verify.PaymentSettlementNotifications
+            .SingleAsync(x => x.NotificationKey == notificationKey);
+        Assert.Equal(notificationKey, notification.NotificationKey);
         Assert.Equal("tenant-a", notification.BotId); Assert.Equal(BotInstanceTypes.Tenant, notification.WalletOriginBotType);
         Assert.Equal(789, notification.WalletOriginTelegramBotId); Assert.Equal(123, notification.TelegramUserId);
         Assert.Equal(123, notification.ChatId); Assert.Equal(1, posts);
@@ -149,7 +151,7 @@ public sealed partial class ConcurrencyTests
             new NowPayments(config, Client(), new TenantWalletQuote()));
 
         var ex = await Assert.ThrowsAsync<AtlasPayApiException>(() =>
-            charges.CreateTenantAsync("tenant-a", 123, 123, 20_000, PaymentGateway.AtlasPay, default));
+            charges.CreateTenantAsync("tenant-a", 123, 123, 50_000, PaymentGateway.AtlasPay, default));
 
         Assert.Equal(1, posts);
         Assert.Equal(400, ex.StatusCode);

@@ -124,7 +124,8 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
         PaymentGateway.HooshPay => HooshPayAmountPolicy.IsValid(amount),
         PaymentGateway.UniquePay => UniquePayAmountPolicy.IsValid(amount),
         PaymentGateway.Tetraminator => amount >= config.TetraminatorMinimumAmountToman,
-        PaymentGateway.AtlasPay or PaymentGateway.NowPayments => true,
+        PaymentGateway.AtlasPay => AtlasPay.IsSupportedBaseAmount(amount),
+        PaymentGateway.NowPayments => true,
         _ => false
     };
 
@@ -200,8 +201,10 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
                     var definitive = AtlasPay.IsDefinitiveCreateFailure(ex);
                     var code = apiError is { StatusCode: > 0 }
                         ? apiError.StatusCode.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                        : "create_unconfirmed";
-                    var providerMessage = AtlasPay.SafeProviderErrorMessage(apiError);
+                        : ex is AtlasPayCreateValidationException
+                            ? "validation"
+                            : "create_unconfirmed";
+                    var providerMessage = AtlasPay.SafeCreateErrorMessage(ex);
                     p.RecordCreationFailure(definitive, code, DateTime.UtcNow);
                     p.ErrorCode = code;
                     p.ErrorMessage = definitive

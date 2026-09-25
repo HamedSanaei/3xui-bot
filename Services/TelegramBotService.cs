@@ -9409,6 +9409,15 @@ public partial class TelegramBotService
                 replyMarkup: BuildChargePaymentMethodKeyboard(), cancellationToken: cancellationToken);
             return;
         }
+        if (!AtlasPay.IsSupportedBaseAmount(amount))
+        {
+            await ActiveBotClient.SendMessage(
+                message.Chat.Id,
+                $"مبلغ اطلس‌پی باید بین {AtlasPay.MinimumBaseAmountToman:N0} تا {AtlasPay.MaximumBaseAmountToman:N0} تومان باشد.",
+                replyMarkup: BuildChargePaymentMethodKeyboard(),
+                cancellationToken: cancellationToken);
+            return;
+        }
         await _state.ClearUserStatus(user);
         var payment = AtlasPayPaymentInfo.CreateWalletCharge(credUser.TelegramUserId, message.Chat.Id, amount);
         payment.BotId = BotContextAccessor.CurrentBotId;
@@ -9443,15 +9452,35 @@ public partial class TelegramBotService
         catch (Exception ex)
         {
             var definitive = AtlasPay.IsDefinitiveCreateFailure(ex);
-            var code = ex is AtlasPayApiException api ? (api.StatusCode > 0 ? api.StatusCode.ToString(CultureInfo.InvariantCulture) : "ambiguous") : "ambiguous";
+            var apiError = ex as AtlasPayApiException;
+            var code = apiError is { StatusCode: > 0 }
+                ? apiError.StatusCode.ToString(CultureInfo.InvariantCulture)
+                : ex is AtlasPayCreateValidationException
+                    ? "validation"
+                    : "ambiguous";
+            var createErrorMessage = AtlasPay.SafeCreateErrorMessage(ex);
             payment.RecordCreationFailure(definitive, code, DateTime.UtcNow);
             payment.ErrorCode = code;
-            payment.ErrorMessage = definitive ? "AtlasPay rejected order creation." : "AtlasPay create outcome is ambiguous; automatic retry is disabled.";
+            payment.ErrorMessage = definitive
+                ? string.IsNullOrWhiteSpace(createErrorMessage)
+                    ? "AtlasPay rejected order creation."
+                    : $"AtlasPay rejected order creation: {createErrorMessage}"
+                : "AtlasPay create outcome is ambiguous; automatic retry is disabled.";
             await _workflow.SaveAsync(cancellationToken);
-            _logger.LogWarning("AtlasPay create attempt ended without a usable invoice. paymentId={PaymentId}, botId={BotId}, definitive={Definitive}, errorType={ErrorType}",
-                payment.Id, payment.BotId, definitive, ex.GetType().Name);
+            _logger.LogWarning(
+                "AtlasPay create attempt ended without a usable invoice. paymentId={PaymentId}, botId={BotId}, definitive={Definitive}, errorType={ErrorType}, statusCode={StatusCode}, providerMessage={ProviderMessage}",
+                payment.Id,
+                payment.BotId,
+                definitive,
+                ex.GetType().Name,
+                apiError?.StatusCode ?? 0,
+                createErrorMessage ?? "-");
+            var definitiveCustomerMessage = string.IsNullOrWhiteSpace(createErrorMessage)
+                ? "ساخت فاکتور اطلس‌پی ناموفق بود. لطفاً از درگاه دیگری استفاده کنید."
+                : $"ساخت فاکتور اطلس‌پی ناموفق بود.\n\nعلت: {createErrorMessage}";
             await ActiveBotClient.SendMessage(message.Chat.Id,
-                definitive ? "ساخت فاکتور اطلس‌پی ناموفق بود. لطفاً از درگاه دیگری استفاده کنید."
+                definitive
+                    ? definitiveCustomerMessage
                     : "نتیجه ساخت فاکتور اطلس‌پی نامشخص است. برای جلوگیری از صدور فاکتور تکراری، درخواست ساخت دوباره ارسال نخواهد شد و موضوع نیازمند بررسی است.",
                 replyMarkup: MainReplyMarkupKeyboardFa(), cancellationToken: cancellationToken);
         }
