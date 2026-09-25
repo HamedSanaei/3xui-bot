@@ -744,8 +744,12 @@ public sealed class TetraminatorSettlementService
     /// <param name="after">Wallet balance in toman after settlement.</param>
     /// <param name="source">Non-secret settlement source label.</param>
     /// <param name="provisional">Whether the audit represents a provisional financial exception.</param>
+    /// <remarks>Tenant central top-ups are reported by TenantWalletOwnerTopUpMirrorService using both immutable receipts;
+    /// this legacy formatter remains for owned payments and existing provisional exceptions.</remarks>
     private void LogSettlement(TetraminatorPaymentInfo payment, CredUser user, long before, long after, string source, bool provisional)
     {
+        // Tenant central top-ups emit one receipt-backed report through the shared mirror service.
+        if (payment.WalletOriginBotType == BotInstanceTypes.Tenant && _ownerTopUpMirror != null && !provisional) return;
         var userSummary = TelegramUserLinkFormatter.HtmlSummary(user);
         var message = (provisional ? "⚠️ شارژ موقت تترامیناتور" : "✅ پرداخت ریالی تترامیناتور تایید شد") + "\n\n" +
                       userSummary + "\n\n" +

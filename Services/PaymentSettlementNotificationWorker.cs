@@ -38,6 +38,8 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     private readonly BotClientProvider _botClientProvider;
     /// <summary>Structured delivery diagnostics; notification bodies and secrets are never logged.</summary>
     private readonly ILogger<PaymentSettlementNotificationWorker> _logger;
+    /// <summary>Resolves only the configured Sales Assistant for explicitly typed owner reports.</summary>
+    private readonly BotRegistry _registry;
 
     /// <summary>
     /// Creates the delivery-only settlement notification worker.
@@ -49,14 +51,17 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     /// Runtime provider that resolves the originating owned or tenant bot client from the persisted internal bot id.
     /// </param>
     /// <param name="logger">Structured logger that never receives bot tokens or notification message bodies.</param>
+    /// <param name="registry">Runtime registry for Sales Assistant delivery; absent configuration parks owner reports.</param>
     public PaymentSettlementNotificationWorker(
         UserDbContextFactory contextFactory,
         BotClientProvider botClientProvider,
-        ILogger<PaymentSettlementNotificationWorker> logger)
+        ILogger<PaymentSettlementNotificationWorker> logger,
+        BotRegistry registry = null)
     {
         _contextFactory = contextFactory ?? throw new ArgumentNullException(nameof(contextFactory));
         _botClientProvider = botClientProvider ?? throw new ArgumentNullException(nameof(botClientProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _registry = registry;
     }
 
     /// <summary>
@@ -202,6 +207,8 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     /// <remarks>
     /// A Telegram message id is the success acknowledgement. If saving that acknowledgement fails, the worker makes
     /// one fresh-context attempt to mark delivery-uncertain and never deliberately resends the same message.
+    /// Explicit owner-report keys route to Sales Assistant and the captured owner chat; customer keys retain exact
+    /// originating tenant identity checks. Neither route re-enters settlement or resolves a replacement owner.
     /// </remarks>
     private async Task DeliverClaimAsync(
         PaymentSettlementNotification notification,
@@ -217,7 +224,7 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
             return;
         }
 
-        if (string.Equals(notification.WalletOriginBotType, BotInstanceTypes.Tenant, StringComparison.Ordinal))
+        if (!notification.IsTenantOwnerReport && string.Equals(notification.WalletOriginBotType, BotInstanceTypes.Tenant, StringComparison.Ordinal))
         {
             if (notification.WalletOriginTelegramBotId is not > 0)
             {
@@ -248,12 +255,25 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
 
         try
         {
-            var client = string.Equals(notification.WalletOriginBotType, BotInstanceTypes.Tenant, StringComparison.Ordinal)
+            // Owner reports have an explicit persisted discriminator. Customer delivery still enforces the
+            // original tenant identity; an owner report never falls back to an owned or tenant transport.
+            var assistant = notification.IsTenantOwnerReport
+                ? _registry?.Bots.FirstOrDefault(bot => bot.Type == BotInstanceTypes.SalesAssistant && bot.Enabled)
+                : null;
+            if (notification.IsTenantOwnerReport && assistant == null)
+            {
+                await RetryOrExhaustAsync(notification, ScanInterval, "sales_assistant_unavailable", cancellationToken);
+                return;
+            }
+            var client = notification.IsTenantOwnerReport
+                ? _botClientProvider.GetClient(assistant.Id)
+                : string.Equals(notification.WalletOriginBotType, BotInstanceTypes.Tenant, StringComparison.Ordinal)
                 ? _botClientProvider.GetClient(notification.BotId, notification.WalletOriginTelegramBotId!.Value)
                 : _botClientProvider.GetClient(notification.BotId);
             var sent = await client.SendMessage(
                 chatId: notification.ChatId,
                 text: notification.MessageText,
+                parseMode: notification.IsTenantOwnerReport ? Telegram.Bot.Types.Enums.ParseMode.Html : default,
                 cancellationToken: cancellationToken);
 
             try

@@ -1328,6 +1328,13 @@ namespace Adminbot.Domain
                    "Confirm or force the payment inside NOWPayments first, then run the bot check again.";
         }
 
+        /// <summary>Logs owned wallet settlements; tenant settlements use the shared dual-receipt report.</summary>
+        /// <param name="payment">Persisted provider invoice with immutable bot origin.</param>
+        /// <param name="credUser">Customer profile for display only.</param>
+        /// <param name="beforeBalance">Committed customer receipt balance before credit, in toman.</param>
+        /// <param name="afterBalance">Committed customer receipt balance after credit, in toman.</param>
+        /// <param name="source">Non-secret settlement source label.</param>
+        /// <remarks>Tenant reports and owner notifications are emitted after mirror credit; no financial mutation occurs here.</remarks>
         private void LogPayment(
             SwapinoPaymentInfo payment,
             CredUser credUser,
@@ -1335,6 +1342,8 @@ namespace Adminbot.Domain
             long afterBalance,
             string source)
         {
+            // Tenant central top-ups emit one receipt-backed report through the shared mirror service.
+            if (payment.WalletOriginBotType == BotInstanceTypes.Tenant && _ownerTopUpMirror != null) return;
             var data = payment.GetNowPaymentsData();
             var baseCurrency = payment.BaseCurrency ?? data.PriceCurrency;
             var baseAmount = payment.BaseAmount == 0 ? data.PriceAmount : payment.BaseAmount;

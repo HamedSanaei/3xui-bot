@@ -1,5 +1,15 @@
 # CODE_MAP.md
 
+- Central tenant top-up reporting: `TenantWalletOwnerTopUpMirrorService` reads immutable customer and owner wallet
+  receipts after the existing credits, then persists one `tenant-owner-topup-report:{provider}:{paymentId}:{owner}`
+  notification and emits the same HTML report centrally. Equal customer/owner ids reuse one receipt; personal cards
+  are excluded. Replay/reconciliation repairs missing reports. `PaymentSettlementNotification.IsTenantOwnerReport`
+  is a nonmapped discriminator using existing unique keys (no migration); historical keys remain customer notices.
+  The notification worker routes only this kind through Sales Assistant, preserving customer origin identity checks
+  and existing ambiguous-delivery review. No bulk historical report backfill. Owner panel `set:customer-balance`
+  checks fresh selected-store ownership plus BotUserStates membership before showing a read-only global balance.
+  Customer wallet home shows numeric id/balance only. See `docs/tenant-wallet-reporting.md`.
+
 - Tenant customer wallet uses two independent, persisted gates per storefront. A configured super-admin grants
   identity-bound eligibility through owned `/tenantwallet [search]`; that grant alone never exposes or spends the wallet.
   The exact persisted tenant owner must then opt in from that storefront's owner panel. Final admission requires: store

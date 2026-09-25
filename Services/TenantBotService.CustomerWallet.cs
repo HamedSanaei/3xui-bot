@@ -20,7 +20,8 @@ public partial class TenantBotService
     /// <param name="state">Existing conversation state scoped to this bot and sender.</param>
     /// <param name="token">Cancellation of admission and the existing fulfillment saga.</param>
     /// <returns>True for wallet actions, including rejected stale actions.</returns>
-    /// <remarks>Fresh persisted approval is mandatory. Callback data never supplies a trusted price or wallet owner.</remarks>
+    /// <remarks>Fresh persisted approval is mandatory. Callback data never supplies a trusted price or wallet owner.
+    /// The wallet home displays only the customer's numeric Telegram id and current balance, retaining charge/history/back actions.</remarks>
     private async Task<bool> TryHandleCustomerWalletAsync(ITelegramBotClient client, Update update, CredUser customer, User state, CancellationToken token)
     {
         var callback = update.CallbackQuery;
@@ -202,7 +203,7 @@ public partial class TenantBotService
             await FULFILLPAIDTENANTORDERASYNC(order, "customer-wallet", null, null, false, token);
             return true;
         }
-        await client.SendMessage(chat, $"💰 کیف پول سراسری پلتفرم\nاین موجودی متعلق به شماست و در اختیار مالک فروشگاه نیست.\nموجودی: {await _credentialsDbContext.GetAccountBalance(actor):N0} تومان",
+        await client.SendMessage(chat, $"💰 کیف پول\n🆔 آیدی عددی: {actor}\n💳 موجودی: {(await _credentialsDbContext.GetAccountBalance(actor)).FormatCurrency()}",
             replyMarkup: new InlineKeyboardMarkup(new[] {
                 new[] { InlineKeyboardButton.WithCallbackData("افزایش موجودی", "TCW:charge") },
                 new[] { InlineKeyboardButton.WithCallbackData("📒 تراکنش‌های من", "TCW:h:0") },

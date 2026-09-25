@@ -1652,6 +1652,8 @@ public sealed class UniquePaySettlementService
     /// Wallet credit, settlement state, ledger, referral processing, and customer notification are already durable
     /// before this helper runs. A Telegram logging failure must not cause the financial mutation to be replayed.
     /// </remarks>
+    /// <remarks>Tenant central top-ups are reported by TenantWalletOwnerTopUpMirrorService using both immutable receipts;
+    /// this legacy formatter remains for owned payments and existing provisional exceptions.</remarks>
     private async Task LogSettlementOnceAsync(
         UserWorkflowStore context,
         UniquePayPaymentInfo payment,
@@ -1661,6 +1663,8 @@ public sealed class UniquePaySettlementService
         string source,
         CancellationToken cancellationToken)
     {
+        // Tenant top-ups are logged with both committed receipts by the mirror service.
+        if (payment.WalletOriginBotType == BotInstanceTypes.Tenant && _ownerTopUpMirror != null) return;
         if (payment.SuccessLoggedAtUtc.HasValue)
             return;
         payment.SuccessLoggedAtUtc = DateTime.UtcNow;

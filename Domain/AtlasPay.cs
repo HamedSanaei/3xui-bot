@@ -709,6 +709,8 @@ public sealed partial class AtlasPaySettlementService
     /// <remarks>Only a verified paid wallet_charge can settle. Receipt and balance commit atomically in credentials.db;
     /// marker and notification commit separately in users.db. Repeated calls repair the ledger without another credit.
     /// Approval revocation does not block a previously created invoice's legitimate settlement.</remarks>
+    /// <remarks>Tenant wallet top-ups use the shared receipt-backed customer/owner report and durable Sales Assistant
+    /// notification after mirror credit; owned audit formatting and all financial operation keys remain unchanged.</remarks>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(AtlasPayPaymentInfo payment, string source,
         CancellationToken cancellationToken = default)
     {
@@ -788,7 +790,7 @@ public sealed partial class AtlasPaySettlementService
                 await _ownerTopUpMirror.EnsureAsync("atlaspay", tracked.Id, tracked.BotId, tracked.BotUsername,
                     tracked.WalletOriginBotType, tracked.TenantOwnerTelegramUserId, tracked.TelegramUserId,
                     tracked.BaseAmountToman, cancellationToken);
-            if (!tracked.SuccessLoggedAtUtc.HasValue)
+            if (!tracked.SuccessLoggedAtUtc.HasValue && (tracked.WalletOriginBotType != BotInstanceTypes.Tenant || _ownerTopUpMirror == null))
             {
                 tracked.SuccessLoggedAtUtc = DateTime.UtcNow; tracked.UpdatedAtUtc = DateTime.UtcNow; await context.SaveAsync(cancellationToken);
                 var userSummary = TelegramUserLinkFormatter.HtmlSummary(user);

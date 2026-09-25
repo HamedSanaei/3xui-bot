@@ -63,6 +63,8 @@ public partial class TenantBotService
     private const string TENANTPURCHASESTEPTRAFFIC = "purchase-traffic";
     private const string TENANTPURCHASESTEPDURATION = "purchase-duration";
     private const string STEPTOKEN = "Token";
+    /// <summary>Read-only lookup scoped to the selected storefront and authenticated owner conversation.</summary>
+    private const string STEPCUSTOMERBALANCE = "customer-balance";
     private const string STEPMARKUP = "markup";
     private const string STEPSUPPORT = "support";
     private const string STEPWELCOME = "WELCOME";
@@ -376,6 +378,7 @@ public partial class TenantBotService
     /// <param name="CancellationToken">Cancellation Token for async Telegram/database calls.</param>
     /// <returns>true when this Message was handled by tenant setup; false when caller should continue normal routing.</returns>
     /// <remarks>
+    /// Customer balance lookup revalidates selected-store membership without modifying the global wallet.
     /// Owner setup state is scoped to the current owned bot and user. OwnerStoreId persists the exact target across restart;
     /// ownership is rechecked before input is consumed. Opening the store list or selecting another store cancels pending input.
     /// The text button <c>بازگشت به پنل</c> is treated as a cancellation for any pending owner setting input,
@@ -445,6 +448,12 @@ public partial class TenantBotService
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: CancellationToken);
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, CredUser, null, CancellationToken);
+            return true;
+        }
+
+        if (step == STEPCUSTOMERBALANCE)
+        {
+            await ShowStoreCustomerBalanceAsync(botClient, Message, CredUser.TelegramUserId, CancellationToken);
             return true;
         }
 
@@ -1483,6 +1492,7 @@ public partial class TenantBotService
             },
             new[]
             {
+                InlineKeyboardButton.WithCallbackData("💰 موجودی مشتری", OWNERCALLBACKPREFIX + "set:customer-balance"),
                 InlineKeyboardButton.WithCallbackData("📊 آمار روزانه", OWNERCALLBACKPREFIX + "stats"),
                 InlineKeyboardButton.WithCallbackData("📒 تراکنش‌ها", OWNERCALLBACKPREFIX + "ledger"),
             },
@@ -1980,6 +1990,8 @@ public partial class TenantBotService
     /// need to inspect the current support id before deciding whether to change it.
     /// </remarks>
     /// <returns>A task completing after the owner input step is saved and its prompt is sent.</returns>
+    /// <remarks>The customer-balance step is read-only and uses the same persisted owned-bot/user/OwnerStoreId target
+    /// as settings input. Its reply keyboard allows cancellation back to the selected panel.</remarks>
     private async Task STARTOWNERINPUTASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -1988,6 +2000,7 @@ public partial class TenantBotService
     {
         var step = field switch
         {
+            STEPCUSTOMERBALANCE => STEPCUSTOMERBALANCE,
             STEPTOKEN => STEPTOKEN,
             STEPMARKUP => STEPMARKUP,
             STEPSUPPORT => STEPSUPPORT,
@@ -2018,6 +2031,7 @@ public partial class TenantBotService
 
         var PROMPT = step switch
         {
+            STEPCUSTOMERBALANCE => "آیدی عددی مشتری این فروشگاه را ارسال کنید.",
             STEPTOKEN => "توکن رباتی که از <a href=\"https://t.me/BotFather\">@BotFather</a> گرفته‌اید را ارسال کنید.",
             STEPMARKUP => "درصد سود روی قیمت همکار را فقط به عدد ارسال کنید. مثال: 20",
             STEPSUPPORT => $"آیدی پشتیبان فعلی: <code>{Html(currentSupport)}</code>\n\nیوزرنیم پشتیبانی فروشگاه را ارسال کنید. مثال: <code>@SUPPORT_USERNAME</code>",
@@ -2032,7 +2046,7 @@ public partial class TenantBotService
             chatId: CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
             text: PROMPT,
             parseMode: ParseMode.Html,
-            replyMarkup: step == STEPSUPPORT
+            replyMarkup: step == STEPSUPPORT || step == STEPCUSTOMERBALANCE
                 ? new ReplyKeyboardMarkup(new[]
                 {
                     new[] { new KeyboardButton("بازگشت به پنل") }

@@ -819,6 +819,8 @@ namespace Adminbot.Domain
         /// <param name="beforeBalance">Wallet balance before settlement.</param>
         /// <param name="afterBalance">Wallet balance after settlement.</param>
         /// <param name="source">Settlement source shown in the log.</param>
+        /// <remarks>Tenant central top-ups are reported by TenantWalletOwnerTopUpMirrorService using both immutable receipts;
+        /// this legacy formatter remains for owned payments and existing provisional exceptions.</remarks>
         private void LogPayment(
             HooshPayPaymentInfo payment,
             CredUser credUser,
@@ -826,6 +828,8 @@ namespace Adminbot.Domain
             long afterBalance,
             string source)
         {
+            // Tenant central top-ups emit one receipt-backed report through the shared mirror service.
+            if (payment.WalletOriginBotType == BotInstanceTypes.Tenant && _ownerTopUpMirror != null && source != "admin-provisional") return;
             var userSummary = TelegramUserLinkFormatter.HtmlSummary(credUser);
             if (string.IsNullOrWhiteSpace(userSummary))
                 userSummary = $"👤 کاربر: <code>{Html(payment.TelegramUserId.ToString())}</code>";

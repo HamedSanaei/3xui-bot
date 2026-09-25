@@ -31,10 +31,12 @@ public static class PaymentSettlementNotificationStatuses
 }
 
 /// <summary>
-/// Persists one customer-facing Telegram notification created by a successful platform-wallet settlement or proven refund.
+/// Persists a customer settlement/refund notification or a separate receipt-backed tenant owner report.
 /// </summary>
 /// <remarks>
-/// The row is inserted into <c>users.db</c> in the same save that records the provider payment's first-credit marker.
+/// Customer rows are inserted into <c>users.db</c> with the provider payment's first-credit marker.
+/// Owner reports are inserted after both wallet receipts exist and use a distinct key prefix; legacy rows remain
+/// customer notifications without a schema change. Owner reports are sent only by the configured Sales Assistant.
 /// A unique notification key prevents duplicate enqueue on callback replay. The background worker knows only this
 /// table and Telegram, so retrying delivery can never re-enter financial settlement or credit a wallet twice.
 ///
@@ -45,6 +47,13 @@ public static class PaymentSettlementNotificationStatuses
 /// </remarks>
 public sealed class PaymentSettlementNotification
 {
+    /// <summary>Durable discriminator for owner reports; all historical keys remain customer notifications.</summary>
+    public const string TenantOwnerReportPrefix = "tenant-owner-topup-report:";
+
+    /// <summary>Whether delivery must use the receipt-confirmation Sales Assistant, never the originating tenant.</summary>
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public bool IsTenantOwnerReport => NotificationKey?.StartsWith(TenantOwnerReportPrefix, StringComparison.Ordinal) == true;
+
     /// <summary>Creates an origin-aware wallet-credit delivery intent while retaining historical owned keys.</summary>
     /// <param name="provider">Stable central provider label without secrets.</param>
     /// <param name="providerPaymentId">Local provider payment row id.</param>
@@ -94,7 +103,7 @@ public sealed class PaymentSettlementNotification
 
     /// <summary>
     /// Internal runtime bot id whose Telegram token must deliver the notification. Empty values resolve to the
-    /// default owned bot for legacy payment rows.
+    /// default owned bot for legacy payment rows. Owner reports retain the tenant origin here but deliver via Sales Assistant.
     /// </summary>
     public string BotId { get; set; }
 
@@ -113,7 +122,7 @@ public sealed class PaymentSettlementNotification
     /// <summary>Credited wallet amount in Iranian toman, stored as a major currency unit.</summary>
     public long AmountToman { get; set; }
 
-    /// <summary>Final plain-text Persian notification body, safe to send without a Telegram parse mode.</summary>
+    /// <summary>Final Persian body: plain text for customer notifications, encoded Telegram HTML for owner reports.</summary>
     public string MessageText { get; set; }
 
     /// <summary>Current value from <see cref="PaymentSettlementNotificationStatuses"/>.</summary>
