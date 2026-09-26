@@ -228,6 +228,10 @@ public class XuiV3PurchaseService
     /// Whether colleague base pricing should be used. Tenant storefronts pass <c>false</c> for public sale
     /// pricing and call the same method again with <c>true</c> when calculating owner base cost.
     /// </param>
+    /// <param name="adminActorTelegramUserId">
+    /// Optional authenticated Telegram sender id for admin issuance, never the recipient id or callback data.
+    /// Must be a positive global configured super-admin id. Null retains customer minimums, including for colleagues.
+    /// </param>
     /// <returns>
     /// A normalized purchase result containing the enabled service and plan, traffic bytes, duration days, limit IP,
     /// and whole-toman unit price. Metered results also contain the authoritative component breakdown used to explain
@@ -240,11 +244,14 @@ public class XuiV3PurchaseService
     /// revalidated against the current normal-service policy. Unlimited storefront audience is deliberately not
     /// inferred from <paramref name="isColleague" />: owned callers use <see cref="ResolveOwnedPurchase" /> and tenant
     /// callers use <see cref="ResolveTenantPurchase" /> before wallet, order, ledger, or XUI side effects.
+    /// Admin issuance bypasses only the metered service minimum; positive traffic, duration, service and pricing
+    /// validation remain mandatory. Authorization is checked against all configured super-admin ids.
     /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="selection"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
     /// Thrown when the service, unlimited plan, duration, traffic, configured minimum, or financial setting is invalid.
     /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The supplied admin actor is not a configured super-admin.</exception>
     /// <exception cref="OverflowException">
     /// Thrown when a valid metered formula produces an amount outside the supported signed 64-bit toman range.
     /// </exception>
@@ -260,10 +267,16 @@ public class XuiV3PurchaseService
     ///     isColleague: false);
     /// </code>
     /// </example>
-    public XuiV3ResolvedPurchase ResolvePurchase(XuiV3PurchaseSelection selection, bool isColleague)
+    public XuiV3ResolvedPurchase ResolvePurchase(XuiV3PurchaseSelection selection, bool isColleague, long? adminActorTelegramUserId = null)
     {
         if (selection == null)
             throw new ArgumentNullException(nameof(selection));
+
+        // Only an explicitly authenticated admin-issuance actor can bypass customer traffic policy.
+        // Recipient ownership, colleague pricing and audit metadata never confer this privilege.
+        if (adminActorTelegramUserId.HasValue &&
+            (adminActorTelegramUserId.Value <= 0 || _appConfig.AdminsUserIds?.Contains(adminActorTelegramUserId.Value) != true))
+            throw new UnauthorizedAccessException("Admin issuance requires a configured super-admin.");
 
         // One authoritative enabled-service lookup for the whole class, so the commercial path and the placement-only
         // path can never disagree about which catalog entries exist or are switched on.
@@ -295,7 +308,7 @@ public class XuiV3PurchaseService
             throw new InvalidOperationException("TrafficGb is required for metered plans.");
 
         var minimumTrafficGb = GetMinimumTrafficGb(service);
-        if (selection.TrafficGb.Value < minimumTrafficGb)
+        if (!adminActorTelegramUserId.HasValue && selection.TrafficGb.Value < minimumTrafficGb)
             throw new InvalidOperationException($"Minimum traffic for service '{service.Key}' is {minimumTrafficGb} GB.");
 
         if (!TryResolveDurationKey(service, selection.DurationKey, out var duration))
@@ -1194,9 +1207,13 @@ public class XuiV3PurchaseService
     /// <param name="selectedCountry">Panel tag used in legacy bot/user state and account metadata.</param>
     /// <param name="cancellationToken">Cancellation of local reservation and external panel operations.</param>
     /// <param name="metadataOptions">Optional audit/state options; supplies the stable order/account operation key for recovery.</param>
+    /// <param name="adminActorTelegramUserId">Optional authenticated Telegram sender id for admin issuance, not the owner id.
+    /// A positive configured super-admin id bypasses only the customer traffic minimum; null preserves customer policy.</param>
     /// <returns>Creation proof or a safe failed result. A failed or ambiguous reservation never authorizes another addClient.</returns>
     /// <remarks>This method creates no wallet transaction. Callers settle proven creation separately before Telegram delivery.
     /// Client identity is persisted before HTTP when the operation key is supplied; repeated calls use read-back only.</remarks>
+    /// <exception cref="UnauthorizedAccessException">The supplied admin actor is not a configured super-admin.</exception>
+    /// <exception cref="InvalidOperationException">The selected service, traffic, duration or pricing is invalid.</exception>
     /// <example><code>var result = await service.CreateAccountAsync(user, panel, selection, "primary", token, metadataOptions);</code></example>
     public async Task<XuiV3AccountCreationResult> CreateAccountAsync(
         CredUser user,
@@ -1204,11 +1221,12 @@ public class XuiV3PurchaseService
         XuiV3PurchaseSelection selection,
         string selectedCountry,
         CancellationToken cancellationToken = default,
-        XuiV3AccountMetadataOptions metadataOptions = null)
+        XuiV3AccountMetadataOptions metadataOptions = null,
+        long? adminActorTelegramUserId = null)
     {
         metadataOptions ??= new XuiV3AccountMetadataOptions();
+        var resolved = ResolvePurchase(selection, user.IsColleague, adminActorTelegramUserId);
         metadataOptions.AccountCounter = await ResolveAccountCounterAsync(user, metadataOptions);
-        var resolved = ResolvePurchase(selection, user.IsColleague);
         var inboundIds = ResolveServiceInboundIds(resolved.Service);
         var trafficBytes = metadataOptions.TrafficBytes > 0 ? metadataOptions.TrafficBytes : resolved.TrafficBytes;
         var priceToman = metadataOptions.PriceTomanOverride ?? resolved.PriceToman;
@@ -1424,6 +1442,8 @@ public class XuiV3PurchaseService
     /// <param name="selectedCountry">Panel tag or URL stored in the legacy user state for display and audit.</param>
     /// <param name="options">Optional bulk metadata, account count, override price, and audit settings.</param>
     /// <param name="cancellationToken">Cancellation token for panel calls, users.db writes, and inter-account delay.</param>
+    /// <param name="adminActorTelegramUserId">Optional authenticated Telegram sender id for admin issuance, not the recipient.
+    /// Must be a positive configured super-admin id; null retains customer minimums. Revalidated for each account.</param>
     /// <returns>
     /// A bulk creation result containing every successfully created account and the first failure that stopped the
     /// loop. Panel HTTP timeouts and API exceptions are converted to <see cref="XuiV3BulkCreationFailure"/> so owned,
@@ -1435,7 +1455,11 @@ public class XuiV3PurchaseService
     /// swallowed and still propagates through <see cref="OperationCanceledException"/>. Full panel exceptions are
     /// retained only in the private daily diagnostic log; every failure returned to callers contains fixed,
     /// Telegram-safe text and must not be replaced with <see cref="Exception.Message"/>.
+    /// Admin issuance bypasses only the customer traffic minimum for the batch and each child account; no wallet debit
+    /// is performed here and durable operation keys and recipient ownership remain unchanged.
     /// </remarks>
+    /// <exception cref="UnauthorizedAccessException">The supplied admin actor is not a configured super-admin.</exception>
+    /// <exception cref="InvalidOperationException">The selected service, traffic, duration or pricing is invalid.</exception>
     /// <example>
     /// <code>
     /// var result = await purchaseService.CreateBulkAccountsAsync(
@@ -1455,10 +1479,11 @@ public class XuiV3PurchaseService
         XuiV3PurchaseSelection selection,
         string selectedCountry,
         XuiV3BulkCreateOptions options = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        long? adminActorTelegramUserId = null)
     {
         options ??= new XuiV3BulkCreateOptions();
-        var resolved = ResolvePurchase(selection, user.IsColleague);
+        var resolved = ResolvePurchase(selection, user.IsColleague, adminActorTelegramUserId);
         var accountCount = NormalizeAccountCount(options.AccountCount > 0 ? options.AccountCount : selection.AccountCount);
         var bulkOrderId = string.IsNullOrWhiteSpace(options.BulkOrderId)
             ? $"x3-{user.TelegramUserId}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
@@ -1508,7 +1533,8 @@ public class XuiV3PurchaseService
                     selection,
                     selectedCountry,
                     cancellationToken,
-                    createOptions);
+                    createOptions,
+                    adminActorTelegramUserId);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {

@@ -792,7 +792,7 @@ public partial class XuiV3AdminFlowService
         var refreshedUser = await _state.GetUserStatus(message.From.Id);
         await botClient.SendMessage(
             chatId: message.Chat.Id,
-            text: BuildCreateSummary(refreshedUser),
+            text: BuildCreateSummary(refreshedUser, message.From.Id),
             parseMode: ParseMode.Html,
             replyMarkup: BuildYesNoKeyboard("Yes Create!", "No Don't Create!"),
             cancellationToken: cancellationToken);
@@ -4373,10 +4373,17 @@ public partial class XuiV3AdminFlowService
         return TryGetIntFromText(text, out days) ? days : null;
     }
 
-    private string BuildCreateSummary(User user)
+    /// <summary>Builds the admin issuance confirmation without applying the customer traffic minimum.</summary>
+    /// <param name="user">Required bot-scoped administrator state containing the recipient and selected limits.</param>
+    /// <param name="actorTelegramUserId">Authenticated Telegram sender id, checked against the global super-admin list.</param>
+    /// <returns>HTML confirmation text; no account, wallet or state mutation is performed.</returns>
+    /// <remarks>Recipient and colleague roles do not grant the exemption. Other catalog validation remains active.</remarks>
+    /// <exception cref="UnauthorizedAccessException">The sender is not a configured super-admin.</exception>
+    /// <exception cref="InvalidOperationException">The selected service or plan limits are invalid.</exception>
+    private string BuildCreateSummary(User user, long actorTelegramUserId)
     {
         var selection = BuildCreateSelection(user);
-        var resolved = _purchaseService.ResolvePurchase(selection, false);
+        var resolved = _purchaseService.ResolvePurchase(selection, false, actorTelegramUserId);
         var accountCount = XuiV3PurchaseService.NormalizeAccountCount(user.PendingAccountCount);
         var totalPrice = resolved.PriceToman * accountCount;
         var durationText = resolved.DurationDays <= 0 ? "نامحدود / لایف‌تایم" : $"{resolved.DurationDays} روز";
@@ -4429,7 +4436,10 @@ public partial class XuiV3AdminFlowService
     /// <param name="actorTelegramUserId">Authenticated super-admin Telegram id recorded in creation metadata.</param>
     /// <param name="cancellationToken">Cancellation of intent persistence, panel work and metadata updates.</param>
     /// <returns>The verified account or safe failed result; no wallet debit is performed.</returns>
-    /// <remarks>The session is saved before HTTP and its creation key is reused across duplicate confirmations.</remarks>
+    /// <remarks>The session is saved before HTTP and its creation key is reused across duplicate confirmations.
+    /// The configured super-admin actor, not the recipient, exempts issuance from the customer traffic minimum.</remarks>
+    /// <exception cref="UnauthorizedAccessException">The actor is not a configured super-admin.</exception>
+    /// <exception cref="InvalidOperationException">The recipient id or selected catalog limits are invalid.</exception>
     private async Task<XuiV3AccountCreationResult> CreateAdminAccountAsync(
         User currentUser,
         long actorTelegramUserId,
@@ -4471,7 +4481,8 @@ public partial class XuiV3AdminFlowService
                 LastUpdatedByTelegramUserId = actorTelegramUserId,
                 LastAction = "admin-create",
                 SaveUserStatus = false
-            });
+            },
+            adminActorTelegramUserId: actorTelegramUserId);
 
         if (!creation.Success)
             return creation;
@@ -4508,7 +4519,10 @@ public partial class XuiV3AdminFlowService
     /// <param name="actorTelegramUserId">Authenticated super-admin Telegram id; admin issuance does not debit a wallet.</param>
     /// <param name="cancellationToken">Cancellation of local reservation and external provisioning.</param>
     /// <returns>The verified subset of the batch and any safe failure; uncertain creation remains reserved for review.</returns>
-    /// <remarks>Each account receives its own stable index under the persisted batch session key.</remarks>
+    /// <remarks>Each account receives its own stable index under the persisted batch session key.
+    /// The configured super-admin actor exempts every account from the customer traffic minimum, not other validation.</remarks>
+    /// <exception cref="UnauthorizedAccessException">The actor is not a configured super-admin.</exception>
+    /// <exception cref="InvalidOperationException">The recipient id or selected catalog limits are invalid.</exception>
     private async Task<XuiV3BulkCreationResult> CreateAdminAccountsAsync(
         User currentUser,
         long actorTelegramUserId,
@@ -4547,7 +4561,8 @@ public partial class XuiV3AdminFlowService
                 NextAccountCounter = 0,
                 SaveUserStatus = false
             },
-            cancellationToken);
+            cancellationToken,
+            adminActorTelegramUserId: actorTelegramUserId);
     }
 
     /// <summary>Persists an admin creation intent before the first panel mutation.</summary>

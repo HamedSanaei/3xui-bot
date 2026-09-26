@@ -1,5 +1,11 @@
 # CODE_MAP.md
 
+- Super-admin issuance passes the authenticated sender id from `XuiV3AdminFlowService` through confirmation,
+  single creation and bulk creation to `XuiV3PurchaseService`. The global `AdminsUserIds` allow-list is rechecked;
+  only this explicit issuance context bypasses metered `minimumTrafficGb`. Recipient/audit ids and colleague pricing
+  never grant an exemption. Positive traffic and all other catalog validation remain required. Customer/tenant
+  purchases retain the normal-service 10 GB minimum. Regression: `AdminIssuanceMinimumTrafficTests.cs`.
+
 - Central tenant top-up reporting: `TenantWalletOwnerTopUpMirrorService` reads immutable customer and owner wallet
   receipts after the existing credits, then persists one `tenant-owner-topup-report:{provider}:{paymentId}:{owner}`
   notification and emits the same HTML report centrally. Equal customer/owner ids reuse one receipt; personal cards
