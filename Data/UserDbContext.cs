@@ -362,6 +362,13 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantCardNumber).HasMaxLength(64);
             entity.Property(x => x.TenantCardHolderName).HasMaxLength(128);
             entity.Property(x => x.TenantTutorialsJson);
+            // Required percent default keeps historical raw-SQL tenant rows and existing orders on the legacy price path.
+            // Nullable tenant-owned sale rates are independent of configured bots and other storefronts.
+            entity.Property(x => x.TenantPricingMode).IsRequired().HasMaxLength(16).HasDefaultValue(TenantPricingModes.Percent);
+            entity.Property(x => x.TenantNormalPricePerGbToman).HasColumnType("INTEGER");
+            entity.Property(x => x.TenantNormalPricePerDayToman).HasColumnType("INTEGER");
+            entity.Property(x => x.TenantNationalPricePerGbToman).HasColumnType("INTEGER");
+            entity.Property(x => x.TenantUnlimitedPlanPricesJson).HasMaxLength(8192).HasColumnType("TEXT");
             entity.Property(x => x.TenantTetraminatorEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantUniquePayEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantAtlasPayEnabled).HasDefaultValue(true);
@@ -787,6 +794,8 @@ public class UserDbContext : DbContext
             entity.HasKey(x => new { x.BotId, x.TelegramUserId });
             entity.Property(x => x.BotId).HasMaxLength(64);
             entity.Property(x => x.OwnerDiscountDraftJson).HasMaxLength(4096);
+            // Store-bound pricing drafts share this bot/user composite key; no draft crosses into another bot.
+            entity.Property(x => x.OwnerPricingDraftJson).HasMaxLength(16384).HasColumnType("TEXT");
             entity.Property(x => x.RenewalDiscountSelectionJson).HasMaxLength(1024);
             entity.Property(x => x.PaymentMethod).HasMaxLength(64);
             entity.Property(x => x.RenewTargetUuid).HasMaxLength(64);

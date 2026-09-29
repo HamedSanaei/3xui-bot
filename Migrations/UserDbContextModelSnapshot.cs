@@ -333,6 +333,15 @@ namespace Adminbot.Migrations
                     b.Property<bool>("TenantMandatoryJoinEnabled")
                         .HasColumnType("INTEGER");
 
+                    b.Property<long?>("TenantNationalPricePerGbToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("TenantNormalPricePerDayToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("TenantNormalPricePerGbToman")
+                        .HasColumnType("INTEGER");
+
                     b.Property<bool>("TenantNowPaymentsEnabled")
                         .HasColumnType("INTEGER");
 
@@ -347,6 +356,13 @@ namespace Adminbot.Migrations
 
                     b.Property<int>("TenantPriceMarkupPercent")
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("TenantPricingMode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("percent");
 
                     b.Property<int?>("TenantStoreNumber")
                         .HasColumnType("INTEGER");
@@ -363,6 +379,10 @@ namespace Adminbot.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER")
                         .HasDefaultValue(true);
+
+                    b.Property<string>("TenantUnlimitedPlanPricesJson")
+                        .HasMaxLength(8192)
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("TenantWelcomeText")
                         .HasColumnType("TEXT");
@@ -438,6 +458,10 @@ namespace Adminbot.Migrations
 
                     b.Property<string>("OwnerDiscountDraftJson")
                         .HasMaxLength(4096)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OwnerPricingDraftJson")
+                        .HasMaxLength(16384)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("OwnerStoreId")

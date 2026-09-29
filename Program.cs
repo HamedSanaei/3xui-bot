@@ -402,9 +402,10 @@ public class Program
     /// Copies configured owned bots from the runtime registry into <c>users.db</c>.
     /// </summary>
     /// <remarks>
-    /// This keeps the database representation of first-party bots aligned with <c>configuration.json</c>.
-    /// Numeric bot identity is reserved by a unique index so a configured bot cannot reuse a storefront identity before receivers start.
-    /// Runtime-created tenant bots are loaded separately by <see cref="BotRegistry.LoadTenantBotsFromDatabaseAsync"/>.
+    /// This keeps configured bots aligned with configuration.json but does not replace tenant-owned pricing when
+    /// a configured bot id collides with a pre-existing tenant row. The percent schema default preserves raw-SQL rows.
+    /// Numeric bot identity remains protected by its unique index. Runtime-created tenant bots are loaded separately
+    /// by <see cref="BotRegistry.LoadTenantBotsFromDatabaseAsync"/>.
     /// </remarks>
     /// <param name="userDb">Runtime database context that owns the <c>BotInstances</c> table.</param>
     /// <param name="botRegistry">Registry already populated from application configuration.</param>
@@ -414,6 +415,10 @@ public class Program
         foreach (var bot in botRegistry.Bots)
         {
             var existing = await userDb.BotInstances.FirstOrDefaultAsync(x => x.Id == bot.Id);
+            // A database-owned storefront cannot become configuration-owned through an id collision: otherwise
+            // the next sync would overwrite its prices (including historical markup) and even its bot identity.
+            if (string.Equals(existing?.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase))
+                continue;
             if (existing == null)
             {
                 existing = new BotInstance { Id = bot.Id, CreatedAtUtc = DateTime.UtcNow };
@@ -436,6 +441,11 @@ public class Program
             existing.AndroidTutorialJson = BotInstanceConfigExtensions.SerializeStringArray(bot.AndroidTutorial);
             existing.WindowsTutorialJson = BotInstanceConfigExtensions.SerializeStringArray(bot.WindowsTutorial);
             existing.TenantPriceMarkupPercent = bot.TenantPriceMarkupPercent;
+            existing.TenantPricingMode = bot.TenantPricingMode;
+            existing.TenantNormalPricePerGbToman = bot.TenantNormalPricePerGbToman;
+            existing.TenantNormalPricePerDayToman = bot.TenantNormalPricePerDayToman;
+            existing.TenantNationalPricePerGbToman = bot.TenantNationalPricePerGbToman;
+            existing.TenantUnlimitedPlanPricesJson = bot.TenantUnlimitedPlanPricesJson;
             existing.TenantWelcomeText = bot.TenantWelcomeText;
             existing.TenantMandatoryJoinEnabled = bot.TenantMandatoryJoinEnabled;
             existing.TenantChannelIdsJson = BotInstanceConfigExtensions.SerializeStringArray(bot.TenantChannelIds);

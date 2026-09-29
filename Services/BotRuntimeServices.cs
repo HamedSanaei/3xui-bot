@@ -102,10 +102,11 @@ public class BotRegistry
     }
 
     /// <summary>
-    /// Converts the persisted BotInstance row to the runtime BotInstanceConfig shape.
+    /// Converts a persisted bot row into the runtime configuration, retaining storefront-specific pricing.
     /// </summary>
-    /// <param name="bot">Persisted bot row from users.db.</param>
-    /// <returns>Runtime configuration used by bot client and dispatch code.</returns>
+    /// <param name="bot">Persisted users.db bot row; tenant-owned prices are scoped to this bot's database id.</param>
+    /// <returns>Runtime configuration with the stored pricing mode and nullable manual rates unchanged; no database write occurs.</returns>
+    /// <remarks>An invalid stored mode stays invalid. Consumers must not silently use percent/public pricing for unknown modes.</remarks>
     private static BotInstanceConfig ToConfig(BotInstance bot)
     {
         return new BotInstanceConfig
@@ -130,6 +131,11 @@ public class BotRegistry
             Enabled = bot.Enabled,
             OwnerTelegramUserId = bot.OwnerTelegramUserId,
             TenantPriceMarkupPercent = bot.TenantPriceMarkupPercent,
+            TenantPricingMode = bot.TenantPricingMode,
+            TenantNormalPricePerGbToman = bot.TenantNormalPricePerGbToman,
+            TenantNormalPricePerDayToman = bot.TenantNormalPricePerDayToman,
+            TenantNationalPricePerGbToman = bot.TenantNationalPricePerGbToman,
+            TenantUnlimitedPlanPricesJson = bot.TenantUnlimitedPlanPricesJson,
             TenantWelcomeText = bot.TenantWelcomeText,
             TenantMandatoryJoinEnabled = bot.TenantMandatoryJoinEnabled,
             TenantChannelIds = DeserializeStringList(bot.TenantChannelIdsJson),
@@ -213,18 +219,16 @@ public class BotRegistry
     }
 
     /// <summary>
-    /// Applies fallback values and normalizes BotId, username, and Telegram channel destinations for one bot.
+    /// Applies fallback identity and destination values and normalizes configured bot settings.
     /// </summary>
-    /// <param name="bot">Raw bot config item from configuration.json.</param>
-    /// <param name="fallback">App-level fallback config.</param>
-    /// <returns>A complete runtime bot configuration.</returns>
+    /// <param name="bot">Configured bot from configuration.json, including any explicitly configured storefront rates.</param>
+    /// <param name="fallback">Application-level fallback for bot identity, token, and global destinations, never tenant pricing.</param>
+    /// <returns>Runtime configured bot preserving its pricing mode, markup and nullable manual rates without tenant price fallback.</returns>
     /// <remarks>
-    /// Channel normalization follows the shared <see cref="TelegramDestination"/> contract: a blank value and the
-    /// numeric zero sentinel both become an empty string meaning "not configured". A value of 0 in
-    /// <see cref="AppConfig.BackupChannel"/> must never become the string "0", because downstream Telegram code
-    /// cannot distinguish a non-blank string from a configured destination. Malformed non-empty values are preserved
-    /// verbatim and rejected later by destination validation, so a sync can never silently discard an operator
-    /// setting. This method performs no validation and no network call.
+    /// Channel normalization follows the shared <see cref="TelegramDestination"/> contract: blank or numeric zero
+    /// becomes empty. Malformed non-empty destinations are retained for downstream validation. Pricing fields are
+    /// copied only from this configured bot; they are not inferred from another tenant or the application fallback.
+    /// An unknown pricing mode remains invalid instead of silently becoming percentage pricing. No network call occurs.
     /// </remarks>
     private static BotInstanceConfig NormalizeBot(BotInstanceConfig bot, AppConfig fallback)
     {
@@ -267,6 +271,11 @@ public class BotRegistry
             IsDefault = bot.IsDefault,
             OwnerTelegramUserId = bot.OwnerTelegramUserId,
             TenantPriceMarkupPercent = bot.TenantPriceMarkupPercent,
+            TenantPricingMode = bot.TenantPricingMode,
+            TenantNormalPricePerGbToman = bot.TenantNormalPricePerGbToman,
+            TenantNormalPricePerDayToman = bot.TenantNormalPricePerDayToman,
+            TenantNationalPricePerGbToman = bot.TenantNationalPricePerGbToman,
+            TenantUnlimitedPlanPricesJson = bot.TenantUnlimitedPlanPricesJson,
             TenantWelcomeText = bot.TenantWelcomeText,
             TenantMandatoryJoinEnabled = bot.TenantMandatoryJoinEnabled,
             TenantChannelIds = bot.TenantChannelIds?.Where(c => !string.IsNullOrWhiteSpace(c)).ToList() ?? new List<string>(),

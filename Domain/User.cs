@@ -18,6 +18,10 @@ public class User
     /// <remarks>Null preserves partial updates; clearing or switching stores cancels the draft.</remarks>
     [NotMapped]
     public string OwnerDiscountDraftJson { get; set; }
+    /// <summary>Detached pricing editor draft scoped to the selected storefront in this owned-bot/user conversation.</summary>
+    /// <remarks>Not an authorization grant. Null preserves partial updates; clearing this conversation or switching owner stores cancels it.</remarks>
+    [NotMapped]
+    public string OwnerPricingDraftJson { get; set; }
     /// <summary>Detached renewal discount selection; the order admission revalidates live pricing and code revision.</summary>
     [NotMapped]
     public string RenewalDiscountSelectionJson { get; set; }

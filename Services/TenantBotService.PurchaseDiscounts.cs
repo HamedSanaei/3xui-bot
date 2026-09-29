@@ -246,7 +246,9 @@ public partial class TenantBotService
     /// <param name="token">Cancellation of Telegram and users.db operations.</param>
     /// <param name="displayCode">Optional normalized entered code to HTML-escape in this render only.</param>
     /// <returns>True only when the successfully displayed Telegram message is bound to the open quote.</returns>
-    /// <remarks>If editing fails, a successful send rebinds and tombstones the old message; if both fail, the quote expires without admission.</remarks>
+    /// <remarks>Manual pricing also uses an undiscounted quote to bind the displayed rate to this exact message;
+    /// discount controls appear only when a code is active or already selected. An edit failure triggers a new
+    /// bound message; if both sends fail, the quote expires without admission.</remarks>
     private async Task<bool> RenderPurchaseDiscountQuoteAsync(ITelegramBotClient botClient, ChatId chatId, int? messageId,
         BotInstance tenant, XuiV3PurchaseSelection selection, TenantDiscountQuote quote, CancellationToken token, string displayCode = null)
     {
@@ -265,10 +267,12 @@ public partial class TenantBotService
             $"مبلغ قابل پرداخت: <b>{Html(quote.NetToman.FormatCurrency())}</b>\n\n" +
             BuildTenantPaymentTimingNotice(isRenewal: false);
         var id36 = DiscountId(quote.Id);
-        var rows = new List<InlineKeyboardButton[]> {
-            new[] { InlineKeyboardButton.WithCallbackData("🎟 ثبت کد تخفیف", CUSTOMERCALLBACKPREFIX + "DC:" + id36) }
-        };
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("حذف کد تخفیف", CUSTOMERCALLBACKPREFIX + "DR:" + id36) });
+        var rows = new List<InlineKeyboardButton[]>();
+        if (quote.CodeId.HasValue ||
+            await discounts.HasActiveScopeAsync(tenant.Id, TenantDiscountScopes.Purchase, token))
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🎟 ثبت کد تخفیف", CUSTOMERCALLBACKPREFIX + "DC:" + id36) });
+        if (quote.CodeId.HasValue)
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("حذف کد تخفیف", CUSTOMERCALLBACKPREFIX + "DR:" + id36) });
         foreach (var (provider, caption) in PurchaseDiscountPaymentMethods(tenant, quote.NetToman))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData(caption, CUSTOMERCALLBACKPREFIX + "DQ:" + id36 + ":" + provider) });
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") });

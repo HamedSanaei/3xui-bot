@@ -36,7 +36,9 @@ public partial class TenantBotService
     /// <param name="action">Compact server-issued DQ quote id and first payment method.</param>
     /// <param name="token">Cancellation of users.db admission, provider and Telegram operations.</param>
     /// <returns>A task after the original order's frozen payment path or actionable error.</returns>
-    /// <remarks>The transaction reserves one code use before gateway I/O. Admitted replay never reprices or changes its provider.</remarks>
+    /// <remarks>The transaction reserves one code use before gateway I/O. An open quote with changed gross/base
+    /// is expired before replying so restoring an old rate cannot revive a stale preview. Admitted replay
+    /// retains its original stored order and payment method without repricing.</remarks>
     private async Task HandleQuotedPurchasePaymentAsync(ITelegramBotClient botClient, CallbackQuery callback,
         BotInstance tenant, CredUser customer, string action, CancellationToken token)
     {
@@ -72,6 +74,8 @@ public partial class TenantBotService
             if (!TryCurrentPurchaseQuotePrice(tenant, selection, quote, out var price)
                 || quote.ExpiresAtUtc <= DateTime.UtcNow)
             {
+                await _serviceProvider.GetRequiredService<TenantDiscountService>()
+                    .ExpireQuoteAsync(quoteId, tenant.Id, customer.TelegramUserId, chatId, token);
                 await SafeAnswerCallbackQueryAsync(botClient, callback.Id,
                     "تعرفه یا مهلت پیش‌فاکتور تغییر کرده است؛ دوباره خرید کنید.",
                     showAlert: true, cancellationToken: token);

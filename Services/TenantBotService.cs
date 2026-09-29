@@ -450,6 +450,12 @@ public partial class TenantBotService
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, CredUser, null, CancellationToken);
             return true;
         }
+        if (step == "pricing-rate")
+        {
+            await HandleOwnerPricingTextAsync(botClient, Message, CredUser, User, CancellationToken);
+            return true;
+        }
+
         if (step.StartsWith("discount-", StringComparison.Ordinal))
         {
             await HandleOwnerDiscountTextAsync(botClient, Message, CredUser, User, CancellationToken);
@@ -793,6 +799,12 @@ public partial class TenantBotService
             await HandleOwnerDiscountCallbackAsync(botClient, CallbackQuery, CredUser, User, action, CancellationToken);
             return true;
         }
+        if (action.StartsWith("p:", StringComparison.Ordinal))
+        {
+            await HandleOwnerPricingCallbackAsync(botClient, CallbackQuery, CredUser, User, action, CancellationToken);
+            return true;
+        }
+
         if (action.StartsWith("set:", StringComparison.Ordinal))
         {
             var field = action.Replace("set:", "", StringComparison.Ordinal);
@@ -1204,12 +1216,12 @@ public partial class TenantBotService
 
         await botClient.SendMessage(
             chatId,
-            service.IsUnlimited
+            TenantRenewPricingPrompt(tenant, service, service.IsUnlimited
                 ? "یکی از پلن‌های زیر را انتخاب کنید:"
-                : $"یکی از حجم‌های زیر را انتخاب کنید یا عدد دلخواه بفرستید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
+                : $"یکی از حجم‌های زیر را انتخاب کنید یا عدد دلخواه بفرستید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است."),
             replyMarkup: service.IsUnlimited
                 ? BuildTenantRenewUnlimitedKeyboard(service, tenant)
-                : BuildTenantRenewTrafficKeyboard(service),
+                : BuildTenantRenewTrafficKeyboard(service, tenant),
             cancellationToken: cancellationToken);
     }
 
@@ -1397,7 +1409,8 @@ public partial class TenantBotService
         return text +
                $"{STATUSICON(hasToken)} توکن ربات: <code>{Html(hasToken ? "ثبت شده" : "ثبت نشده")}</code>\n" +
                $"{STATUSICON(hasToken)} یوزرنیم ربات: <code>{Html(Username)}</code>\n" +
-               $"{STATUSICON(true)} درصد سود روی قیمت همکار: <code>{markup}%</code>\n" +
+               $"{STATUSICON(true)} حالت قیمت‌گذاری: <b>{Html(tenant?.TenantPricingMode == TenantPricingModes.Manual ? "قیمت دستی" : tenant?.TenantPricingMode == TenantPricingModes.Percent ? "درصدی" : "نامعتبر")}</b>\n" +
+               $"{STATUSICON(true)} درصد سود (فقط در حالت درصدی): <code>{markup}%</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.SupportAccount))} پشتیبانی فروشگاه: <code>{Html(support)}</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.TenantWelcomeText))} متن خوشامد: <code>{Html(WELCOME)}</code>\n" +
                $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) && tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) ? "سراسری خاموش" : tenant?.TenantHooshPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
@@ -1410,7 +1423,7 @@ public partial class TenantBotService
                $"{STATUSICON(tenant?.TenantMandatoryJoinEnabled == true)} جوین اجباری فروشگاه: <code>{Html(TENANTJOIN)}</code>\n" +
                $"{STATUSICON(tenant?.TenantPremiumUiEnabled == true)} ظاهر پریمیوم فروشگاه: <b>{Html(tenant?.TenantPremiumUiEnabled == true ? "فعال" : "غیرفعال")}</b>\n" +
                $"{STATUSICON(IsEnabled)} وضعیت: <b>{Html(IsEnabled ? "روشن" : "خاموش")}</b>\n\n" +
-               "اگر درصد سود را صفر بگذارید، قیمت فروش با تعرفه کاربر عادی محاسبه می‌شود و سود شما اختلاف قیمت کاربر عادی و قیمت همکار خواهد بود.";
+               "در حالت درصدی، سود صفر قیمت تعرفه کاربر عادی را به‌کار می‌برد و سود مثبت روی قیمت همکار محاسبه می‌شود. در حالت دستی درصد سود اثری ندارد.";
     }
 
     /// <summary>
@@ -1441,6 +1454,10 @@ public partial class TenantBotService
             {
                 InlineKeyboardButton.WithCallbackData("🤖 ثبت/تغییر توکن", OWNERCALLBACKPREFIX + "set:Token"),
                 InlineKeyboardButton.WithCallbackData("📈 درصد سود", OWNERCALLBACKPREFIX + "set:markup")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("💰 قیمت‌گذاری", OWNERCALLBACKPREFIX + "p:open")
             },
             new[]
             {
@@ -1902,8 +1919,8 @@ public partial class TenantBotService
     /// method returns.
     /// </param>
     /// <param name="clearAllStorefrontSettings">
-    /// When true, all owner-configured storefront settings are cleared. When false, only token identity and
-    /// enabled state are cleared so unrelated settings like card payment and support remain intact.
+    /// When true, all owner-configured settings including both pricing modes/rates are cleared. When false,
+    /// token identity and enabled state alone are cleared; every price and the owner's markup remain intact.
     /// </param>
     /// <remarks>
     /// This method deliberately does not delete tenant orders, receipts, ledger entries, customer states, or payment
@@ -1926,6 +1943,11 @@ public partial class TenantBotService
         tenant.SupportAccount = null;
         tenant.TenantWelcomeText = null;
         tenant.TenantPriceMarkupPercent = 0;
+        tenant.TenantPricingMode = TenantPricingModes.Percent;
+        tenant.TenantNormalPricePerGbToman = null;
+        tenant.TenantNormalPricePerDayToman = null;
+        tenant.TenantNationalPricePerGbToman = null;
+        tenant.TenantUnlimitedPlanPricesJson = null;
         tenant.TenantMandatoryJoinEnabled = false;
         tenant.TenantChannelIdsJson = null;
         tenant.TenantCardPaymentEnabled = false;
@@ -2066,7 +2088,7 @@ public partial class TenantBotService
         {
             STEPCUSTOMERBALANCE => "آیدی عددی مشتری این فروشگاه را ارسال کنید.",
             STEPTOKEN => "توکن رباتی که از <a href=\"https://t.me/BotFather\">@BotFather</a> گرفته‌اید را ارسال کنید.",
-            STEPMARKUP => "درصد سود روی قیمت همکار را فقط به عدد ارسال کنید. مثال: 20",
+            STEPMARKUP => "درصد سود 0 تا 500 را وارد کنید؛ ذخیره، حالت درصدی را فعال می‌کند. صفر یعنی قیمت کاربر عادی؛ مقدار مثبت یعنی قیمت همکار به‌علاوه درصد سود.",
             STEPSUPPORT => $"آیدی پشتیبان فعلی: <code>{Html(currentSupport)}</code>\n\nیوزرنیم پشتیبانی فروشگاه را ارسال کنید. مثال: <code>@SUPPORT_USERNAME</code>",
             STEPWELCOME => "متن خوشامد فروشگاه را ارسال کنید.",
             STEPCARDNUMBER => "شماره کارت درگاه کارت‌به‌کارت فروشگاه را بدون فاصله یا با فاصله خوانا ارسال کنید.",
@@ -2282,14 +2304,15 @@ public partial class TenantBotService
     }
 
     /// <summary>
-    /// Stores the markup percent for the explicitly selected storefront's prices.
+    /// Saves a 0–500 percent markup for the selected store and switches its active price mode to percent.
     /// </summary>
-    /// <param name="botClient">Main brand Bot client.</param>
-    /// <param name="Message">owner Message containing A numeric percent.</param>
-    /// <param name="owner">colleague owner profile.</param>
-    /// <param name="CancellationToken">Cancellation Token.</param>
-    /// <returns>A task completing after the validated 0 through 500 percent markup is saved and confirmed.</returns>
-    /// <remarks>The caller must establish the active bot context and authorize the actor before entry. Conversation writes use BotId plus TelegramUserId, preserving independent state for the same person in other bots. Network work is outside state-store transactions.</remarks>
+    /// <param name="botClient">Owned-bot client that acknowledges the authenticated owner's input.</param>
+    /// <param name="Message">Owner's required whole-number percentage, received in the owned-bot chat.</param>
+    /// <param name="owner">Authenticated colleague whose selected store is independently checked.</param>
+    /// <param name="CancellationToken">Cancellation of users.db persistence and Telegram delivery.</param>
+    /// <returns>A task after this store's mode and markup are saved and the owner panel is redrawn.</returns>
+    /// <remarks>Manual prices remain stored but inactive. A successful save cancels the bot-scoped draft;
+    /// orders admitted before this switch retain their own persisted amounts.</remarks>
     private async Task SAVETENANTMARKUPASYNC(ITelegramBotClient botClient, Message Message, CredUser owner, CancellationToken CancellationToken)
     {
         if (!int.TryParse(Message.Text?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var markup) || markup < 0 || markup > 500)
@@ -2300,6 +2323,7 @@ public partial class TenantBotService
 
         var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         tenant.TenantPriceMarkupPercent = markup;
+        tenant.TenantPricingMode = TenantPricingModes.Percent;
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
@@ -4275,6 +4299,12 @@ public partial class TenantBotService
                 TrafficGb = trafficGb,
                 DurationKey = duration.Key
             };
+            if (!TryGetTenantSalePrice(tenant, selection, null, out _))
+            {
+                await SHOWDURATIONOPTIONSASYNC(botClient, message.Chat.Id, null, tenant, service.Key,
+                    trafficGb, cancellationToken, "قیمت این گزینه در حال تنظیم است.");
+                return true;
+            }
             await _state.ClearUserStatus(user);
             await SHOWCUSTOMERCONFIRMASYNC(
                 botClient,
@@ -4514,12 +4544,12 @@ public partial class TenantBotService
                 await _state.SaveUserStatus(user);
                 await botClient.SendMessage(
                     message.Chat.Id,
-                    selectedService.IsUnlimited
+                    TenantRenewPricingPrompt(tenant, selectedService, selectedService.IsUnlimited
                         ? "پلن تمدید نامحدود را انتخاب کنید:"
-                        : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(selectedService)} GB است.",
+                        : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(selectedService)} GB است."),
                     replyMarkup: selectedService.IsUnlimited
                         ? BuildTenantRenewUnlimitedKeyboard(selectedService, tenant)
-                        : BuildTenantRenewTrafficKeyboard(selectedService),
+                        : BuildTenantRenewTrafficKeyboard(selectedService, tenant),
                     cancellationToken: cancellationToken);
                 return;
             }
@@ -4590,7 +4620,13 @@ public partial class TenantBotService
         {
             if (!TryParseTenantTrafficSelection(text, service, out var trafficGb))
             {
-                await botClient.SendMessage(message.Chat.Id, BuildTenantMinimumTrafficMessage(service), replyMarkup: BuildTenantRenewTrafficKeyboard(service), cancellationToken: cancellationToken);
+                await botClient.SendMessage(message.Chat.Id, BuildTenantMinimumTrafficMessage(service), replyMarkup: BuildTenantRenewTrafficKeyboard(service, tenant), cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (!IsTenantMeteredServicePriced(tenant, service))
+            {
+                await RecoverUnavailableTenantRenewPriceAsync(botClient, message.Chat.Id, tenant, service, user, cancellationToken);
                 return;
             }
 
@@ -4601,7 +4637,7 @@ public partial class TenantBotService
             await botClient.SendMessage(
                 message.Chat.Id,
                 XuiV3PurchaseService.BuildDurationSelectionText(service, "مدت تمدید را انتخاب کنید:"),
-                replyMarkup: BuildTenantRenewDurationKeyboard(service),
+                replyMarkup: BuildTenantRenewDurationKeyboard(service, tenant, trafficGb),
                 cancellationToken: cancellationToken);
             return;
         }
@@ -4616,8 +4652,16 @@ public partial class TenantBotService
                     XuiV3PurchaseService.BuildDurationSelectionText(
                         service,
                         "مدت تمدید معتبر نیست. یکی از گزینه‌های زیر را انتخاب کنید."),
-                    replyMarkup: BuildTenantRenewDurationKeyboard(service),
+                    replyMarkup: BuildTenantRenewDurationKeyboard(service, tenant, int.TryParse(user.TotoalGB, out var selectedTraffic) ? selectedTraffic : 0),
                     cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (!int.TryParse(user.TotoalGB, NumberStyles.Integer, CultureInfo.InvariantCulture, out var renewalGb) ||
+                !TryGetTenantSalePrice(tenant, new XuiV3PurchaseSelection
+                { ServiceKey = service.Key, TrafficGb = renewalGb, DurationKey = duration.Key }, null, out _))
+            {
+                await RecoverUnavailableTenantRenewPriceAsync(botClient, message.Chat.Id, tenant, service, user, cancellationToken);
                 return;
             }
 
@@ -4635,6 +4679,13 @@ public partial class TenantBotService
             if (plan == null)
             {
                 await botClient.SendMessage(message.Chat.Id, "پلن تمدید معتبر نیست. یکی از گزینه‌های زیر را انتخاب کنید.", replyMarkup: BuildTenantRenewUnlimitedKeyboard(service, tenant), cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (!TryGetTenantSalePrice(tenant, new XuiV3PurchaseSelection
+                { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key }, null, out _))
+            {
+                await RecoverUnavailableTenantRenewPriceAsync(botClient, message.Chat.Id, tenant, service, user, cancellationToken);
                 return;
             }
 
@@ -4681,7 +4732,7 @@ public partial class TenantBotService
                     XuiV3PurchaseService.BuildDurationSelectionText(
                         service,
                         "مدت انتخاب‌شده دیگر معتبر نیست. مدت جدید را انتخاب کنید."),
-                    replyMarkup: BuildTenantRenewDurationKeyboard(service),
+                    replyMarkup: BuildTenantRenewDurationKeyboard(service, tenant, int.TryParse(user.TotoalGB, out var renewTraffic) ? renewTraffic : 0),
                     cancellationToken: cancellationToken);
                 return;
             }
@@ -5111,12 +5162,12 @@ public partial class TenantBotService
 
         await botClient.SendMessage(
             chatId,
-            service.IsUnlimited
+            TenantRenewPricingPrompt(tenant, service, service.IsUnlimited
                 ? "پلن تمدید نامحدود را انتخاب کنید:"
-                : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
+                : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است."),
             replyMarkup: service.IsUnlimited
                 ? BuildTenantRenewUnlimitedKeyboard(service, tenant)
-                : BuildTenantRenewTrafficKeyboard(service),
+                : BuildTenantRenewTrafficKeyboard(service, tenant),
             cancellationToken: cancellationToken);
     }
 
@@ -5175,11 +5226,11 @@ public partial class TenantBotService
         await botClient.SendMessage(
             chatId,
             $"نوع سرویس اکانت از اطلاعات فعلی پنل دوباره تشخیص داده شد: <b>{Html(service.DisplayName)}</b>\n" +
-            "انتخاب قبلی کنار گذاشته شد. لطفاً گزینه تمدید مناسب این سرویس را انتخاب کنید.",
+            TenantRenewPricingPrompt(tenant, service, "انتخاب قبلی کنار گذاشته شد. لطفاً گزینه تمدید مناسب این سرویس را انتخاب کنید."),
             parseMode: ParseMode.Html,
             replyMarkup: service.IsUnlimited
                 ? BuildTenantRenewUnlimitedKeyboard(service, tenant)
-                : BuildTenantRenewTrafficKeyboard(service),
+                : BuildTenantRenewTrafficKeyboard(service, tenant),
             cancellationToken: cancellationToken);
     }
 
@@ -5434,7 +5485,13 @@ public partial class TenantBotService
 
         var selection = BuildTenantRenewSelectionFromState(user);
         var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
-        var price = CalculateTenantPrice(tenant, selection);
+        TenantPriceResult price;
+        try { price = CalculateTenantPrice(tenant, selection); }
+        catch (TenantPriceUnavailableException)
+        {
+            await RecoverUnavailableTenantRenewPriceAsync(botClient, chatId, tenant, service, user, cancellationToken);
+            return;
+        }
         var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
         var discount = ReadTenantRenewDiscountSelection(user, tenant, selection, price.SalePriceToman, price.BaseCostToman);
         if (!discount.Success)
@@ -5498,6 +5555,11 @@ public partial class TenantBotService
                 : BuildTenantRenewDiscountPriceText(discount.Value) + "\n") +
             "بعد از تایید، روش پرداخت را انتخاب می‌کنید و پس از پرداخت موفق اکانت تمدید می‌شود.";
 
+        // Bind this specific displayed gross/base pair to the confirmation step. A later owner edit must re-prompt,
+        // not turn an old confirmation into a new amount before the customer has seen it.
+        user._ConfigPrice = $"{price.SalePriceToman}:{price.BaseCostToman}";
+        await _state.SaveUserStatus(user);
+
         await botClient.SendMessage(
             chatId,
             text,
@@ -5521,11 +5583,9 @@ public partial class TenantBotService
     /// routine, which applies the renewal exactly once. Every safely lockable renewal stores the normalized target UUID
     /// on the order; old state or an owned legacy client without UUID leaves it null and remains owner-checked. A live
     /// unresolved-operation lookup runs before insertion so no new payable order is offered for a locked account.
-    /// Authoritative tenant pricing rejects a hidden unlimited plan before the order row is created. The target's live
-    /// detail metadata is also compared with the saved service category; a mismatch resets the state selector and creates
-    /// no order, payment row, provider request, wallet entry, or XUI mutation. The service-resolution evidence mode is
-    /// copied to the order so payment activation and paid fulfillment can distinguish a verified customer choice from a
-    /// historical null value without storing account metadata or exposing identity in callback data.
+    /// The displayed gross/base snapshot is compared against fresh tenant pricing before an order is inserted;
+    /// stale or unavailable rates return the customer to selection without any wallet or gateway effects.
+    /// The target's live service metadata is also rechecked and its evidence mode is copied to the order.
     /// </remarks>
     private async Task CreateTenantRenewOrderFromStateAsync(
         ITelegramBotClient botClient,
@@ -5625,7 +5685,21 @@ public partial class TenantBotService
         }
 
         var selection = BuildTenantRenewSelectionFromState(user);
-        var price = CalculateTenantPrice(tenant, selection);
+        TenantPriceResult price;
+        try { price = CalculateTenantPrice(tenant, selection); }
+        catch (TenantPriceUnavailableException)
+        {
+            await RecoverUnavailableTenantRenewPriceAsync(botClient, chatId, tenant, service, user, cancellationToken);
+            return;
+        }
+        if (!string.Equals(user._ConfigPrice,
+                $"{price.SalePriceToman}:{price.BaseCostToman}", StringComparison.Ordinal))
+        {
+            await botClient.SendMessage(chatId, "قیمت تمدید تغییر کرده است. خلاصه جدید را بررسی و دوباره تأیید کنید.",
+                cancellationToken: cancellationToken);
+            await SendTenantRenewSummaryAsync(botClient, chatId, tenant, customer, user, cancellationToken);
+            return;
+        }
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "pending");
         order.OrderKind = TenantBotOrderKinds.Renew;
         order.TargetAccountEmail = client.Email;
@@ -5765,34 +5839,40 @@ public partial class TenantBotService
     /// <summary>
     /// Builds the reply keyboard used to choose metered renewal traffic.
     /// </summary>
-    /// <param name="service">Metered XUI service definition.</param>
-    /// <returns>Reply keyboard containing traffic options and cancel.</returns>
-    private static ReplyKeyboardMarkup BuildTenantRenewTrafficKeyboard(XuiV3ServiceDefinition service)
+    /// <param name="service">Enabled metered XUI service definition.</param>
+    /// <param name="tenant">Storefront whose unit rates determine whether traffic choices are available.</param>
+    /// <returns>Reply keyboard containing traffic options when priced, plus cancel in all cases.</returns>
+    /// <remarks>Unpriced metered services cannot start a renewal checkout; typed input is independently checked.</remarks>
+    private static ReplyKeyboardMarkup BuildTenantRenewTrafficKeyboard(XuiV3ServiceDefinition service, BotInstance tenant)
     {
-        var rows = XuiV3PurchaseService.GetVisibleTrafficOptions(service)
-            .Chunk(3)
-            .Select(chunk => chunk.Select(x => new KeyboardButton($"{x} GB")).ToArray())
-            .Append(new[] { new KeyboardButton("❌ انصراف") })
-            .ToArray();
+        var rows = IsTenantMeteredServicePriced(tenant, service)
+            ? XuiV3PurchaseService.GetVisibleTrafficOptions(service)
+                .Chunk(3)
+                .Select(chunk => chunk.Select(x => new KeyboardButton($"{x} GB")).ToArray())
+                .Append(new[] { new KeyboardButton("❌ انصراف") }).ToArray()
+            : new[] { new[] { new KeyboardButton("❌ انصراف") } };
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
     }
 
     /// <summary>
     /// Builds the reply keyboard used to choose metered renewal duration.
     /// </summary>
-    /// <param name="service">Metered XUI service definition.</param>
-    /// <returns>Reply keyboard containing enabled duration options and cancel.</returns>
-    /// <remarks>
-    /// The global catalog controls duration availability for every tenant. Text parsing and final order pricing repeat
-    /// this check because an old Telegram reply keyboard can outlive a configuration change.
-    /// </remarks>
-    private static ReplyKeyboardMarkup BuildTenantRenewDurationKeyboard(XuiV3ServiceDefinition service)
+    /// <param name="service">Enabled metered XUI service from the current global catalog.</param>
+    /// <param name="tenant">Storefront whose manual rates may make individual durations unavailable.</param>
+    /// <param name="trafficGb">Selected renewal traffic in whole GB, from bot-scoped state.</param>
+    /// <returns>Currently priced durations and a cancel button, including when no duration is available.</returns>
+    /// <remarks>Typed duration input and order admission repeat live pricing; no order or debit occurs here.</remarks>
+    private ReplyKeyboardMarkup BuildTenantRenewDurationKeyboard(XuiV3ServiceDefinition service, BotInstance tenant, int trafficGb)
     {
-        var rows = XuiV3PurchaseService.GetEnabledDurationOptions(service)
-            .OrderBy(x => x.Days)
-            .Select(x => new[] { new KeyboardButton($"{x.DisplayName} [{x.Key}]") })
-            .Append(new[] { new KeyboardButton("❌ انصراف") })
-            .ToArray();
+        var rows = new List<KeyboardButton[]>();
+        foreach (var duration in XuiV3PurchaseService.GetEnabledDurationOptions(service).OrderBy(x => x.Days))
+        {
+            if (trafficGb <= 0 || !TryGetTenantSalePrice(tenant,
+                    new XuiV3PurchaseSelection { ServiceKey = service.Key, TrafficGb = trafficGb, DurationKey = duration.Key },
+                    null, out _)) continue;
+            rows.Add(new[] { new KeyboardButton($"{duration.DisplayName} [{duration.Key}]") });
+        }
+        rows.Add(new[] { new KeyboardButton("❌ انصراف") });
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
     }
 
@@ -5803,11 +5883,8 @@ public partial class TenantBotService
     /// <param name="tenant">
     /// Tenant bot whose authoritative pricing policy controls the displayed customer price.
     /// </param>
-    /// <returns>Reply keyboard containing only tenant-visible unlimited plans and an explicit cancel row.</returns>
-    /// <remarks>
-    /// Each label uses <see cref="CalculateTenantPrice" /> so fixed-public-price plans and ordinary markup plans cannot
-    /// drift from order pricing. Typed selections and final state are revalidated separately before any side effect.
-    /// </remarks>
+    /// <returns>Currently priced tenant-visible unlimited plans and an explicit cancel row.</returns>
+    /// <remarks>Only a manual price failure hides a plan. Typed selections and final state are revalidated before payment.</remarks>
     /// <example>
     /// <code>
     /// var keyboard = BuildTenantRenewUnlimitedKeyboard(service, tenant);
@@ -5815,16 +5892,15 @@ public partial class TenantBotService
     /// </example>
     private ReplyKeyboardMarkup BuildTenantRenewUnlimitedKeyboard(XuiV3ServiceDefinition service, BotInstance tenant)
     {
-        var rows = XuiV3PurchaseService.GetUnlimitedPlansForTenant(service)
-            .OrderBy(x => x.Days)
-            .Select(plan =>
-            {
-                var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
-                var price = CalculateTenantPrice(tenant, selection).SalePriceToman;
-                return new[] { new KeyboardButton($"{plan.DisplayName} [{plan.Key}] - {price.FormatCurrency()}") };
-            })
-            .Append(new[] { new KeyboardButton("❌ انصراف") })
-            .ToArray();
+        var prices = TenantUnlimitedPricesForList(tenant);
+        var rows = new List<KeyboardButton[]>();
+        foreach (var plan in XuiV3PurchaseService.GetUnlimitedPlansForTenant(service).OrderBy(x => x.Days))
+        {
+            var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
+            if (!TryGetTenantSalePrice(tenant, selection, prices, out var price)) continue;
+            rows.Add(new[] { new KeyboardButton($"{plan.DisplayName} [{plan.Key}] - {price.FormatCurrency()}") });
+        }
+        rows.Add(new[] { new KeyboardButton("❌ انصراف") });
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
     }
 
@@ -6353,6 +6429,14 @@ public partial class TenantBotService
                 }
 
                 var selection = new XuiV3PurchaseSelection { ServiceKey = parts[1], TrafficGb = GB, DurationKey = parts[3] };
+                if (!TryGetTenantSalePrice(tenant, selection, null, out _))
+                {
+                    await SHOWDURATIONOPTIONSASYNC(botClient, ChatId, MessageId, tenant, service.Key, GB,
+                        CancellationToken, "قیمت این گزینه در حال تنظیم است.");
+                    await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id,
+                        "قیمت این گزینه در حال تنظیم است.", showAlert: true, cancellationToken: CancellationToken);
+                    return;
+                }
                 await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                 await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, CallbackQuery.From.Id, MessageId, tenant, selection, CancellationToken);
             }
@@ -6398,6 +6482,14 @@ public partial class TenantBotService
                 else
                 {
                     var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
+                    if (!TryGetTenantSalePrice(tenant, selection, null, out _))
+                    {
+                        await SHOWSERVICEOPTIONSASYNC(botClient, ChatId, MessageId, tenant,
+                            service.Key, CallbackQuery.From.Id, CancellationToken);
+                        await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id,
+                            "قیمت این گزینه در حال تنظیم است.", showAlert: true, cancellationToken: CancellationToken);
+                        return;
+                    }
                     await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
                     await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, CallbackQuery.From.Id, MessageId, tenant, selection, CancellationToken);
                 }
@@ -6422,6 +6514,12 @@ public partial class TenantBotService
         {
             if (await RejectLegacyQuotedPurchaseAsync(botClient, CallbackQuery, tenant, CancellationToken))
                 return;
+            if (tenant.TenantPricingMode == TenantPricingModes.Manual)
+            {
+                await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id,
+                    "این پیش‌فاکتور قدیمی است؛ خرید را دوباره آغاز کنید.", showAlert: true, cancellationToken: CancellationToken);
+                return;
+            }
             var selection = PARSESELECTIONFROMPAYACTION(action);
             if (selection == null)
             {
@@ -6453,6 +6551,12 @@ public partial class TenantBotService
         {
             if (await RejectLegacyQuotedPurchaseAsync(botClient, CallbackQuery, tenant, CancellationToken))
                 return;
+            if (tenant.TenantPricingMode == TenantPricingModes.Manual)
+            {
+                await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id,
+                    "این پیش‌فاکتور قدیمی است؛ خرید را دوباره آغاز کنید.", showAlert: true, cancellationToken: CancellationToken);
+                return;
+            }
             var Provider = action.Split(':', 2)[0];
             var PAYACTION = action[(Provider.Length + 1)..];
             var selection = PARSESELECTIONFROMPAYACTION(PAYACTION);
@@ -6713,14 +6817,15 @@ public partial class TenantBotService
                username.All(ch => char.IsAsciiLetterOrDigit(ch) || ch == '_');
     }
 
-    /// <summary>
-    /// sends or edits the first storefront purchase step where the customer CHOOSES A service.
-    /// </summary>
-    /// <param name="botClient">tenant Bot client.</param>
-    /// <param name="ChatId">customer chat Id.</param>
-    /// <param name="tenant">current tenant Bot row.</param>
-    /// <param name="CancellationToken">Cancellation Token.</param>
-    /// <param name="MessageId">optional Message Id to edit.</param>
+    /// <summary>Sends the live tenant service selector, omitting choices without a valid manual sale price.</summary>
+    /// <param name="botClient">Telegram client for the tenant storefront in the active bot context.</param>
+    /// <param name="ChatId">Telegram chat id of the customer choosing an enabled tenant service.</param>
+    /// <param name="tenant">Persisted tenant bot row whose pricing mode and rates control this menu; never use another owner's store.</param>
+    /// <param name="CancellationToken">Token for Telegram delivery; no payment or database write occurs.</param>
+    /// <param name="MessageId">Existing customer message id to edit, or null to send a new selection.</param>
+    /// <returns>A task after delivering available service buttons and a back action.</returns>
+    /// <remarks>When no choice remains priced, the customer sees a configuration notice instead of a public-price fallback.
+    /// Pricing is rechecked at selection and checkout; the menu itself never reserves an order.</remarks>
     private async Task SendServiceSelectionAsync(
         ITelegramBotClient botClient,
         ChatId ChatId,
@@ -6728,8 +6833,10 @@ public partial class TenantBotService
         CancellationToken CancellationToken,
         int? MessageId = null)
     {
-        var keyboard = BUILDTENANTSERVICEKEYBOARD();
-        var Text = "نوع سرویس مورد نظر را انتخاب کنید:";
+        var keyboard = BUILDTENANTSERVICEKEYBOARD(tenant);
+        var Text = keyboard.InlineKeyboard.Count() == 1
+            ? "قیمت گزینه‌های این فروشگاه در حال تنظیم است. بعداً دوباره تلاش کنید."
+            : "نوع سرویس مورد نظر را انتخاب کنید:";
         if (MessageId.HasValue)
         {
             await SafeEditMessageTextAsync(botClient, ChatId, MessageId.Value, Text, replyMarkup: keyboard, cancellationToken: CancellationToken);
@@ -6739,20 +6846,21 @@ public partial class TenantBotService
         await botClient.SendMessage(ChatId, Text, replyMarkup: keyboard, cancellationToken: CancellationToken);
     }
 
-    /// <summary>
-    /// Builds inline buttons for all enabled xui v3 service definitions.
-    /// </summary>
-    /// <returns>inline keyboard where each button POINTS to A tenant service callback.</returns>
-    private InlineKeyboardMarkup BUILDTENANTSERVICEKEYBOARD()
+    /// <summary>Builds the currently priced service selector for one tenant storefront.</summary>
+    /// <param name="tenant">Storefront owning the active pricing mode and nullable manual prices.</param>
+    /// <returns>Available service buttons and a back action even when nothing is priced.</returns>
+    /// <remarks>Unknown manual service keys and stale prices are hidden without changing other stores.</remarks>
+    private InlineKeyboardMarkup BUILDTENANTSERVICEKEYBOARD(BotInstance tenant)
     {
+        var prices = TenantUnlimitedPricesForList(tenant);
         var rows = _purchaseService.GetEnabledServices()
+            .Where(service => IsTenantServicePriced(tenant, service, prices))
             .Select(service => new[]
             {
                 InlineKeyboardButton.WithCallbackData(service.DisplayName, CUSTOMERCALLBACKPREFIX + "svc:" + service.Key)
             })
             .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "home") })
             .ToArray();
-
         return new InlineKeyboardMarkup(rows);
     }
 
@@ -6762,9 +6870,7 @@ public partial class TenantBotService
     /// <param name="botClient">Telegram client for the tenant storefront handling the customer callback.</param>
     /// <param name="ChatId">Telegram chat id of the tenant customer receiving the live service choices.</param>
     /// <param name="MessageId">Optional Telegram message id to edit; null sends a new selection message.</param>
-    /// <param name="tenant">
-    /// Tenant bot row whose markup or fixed-public-price policy determines each displayed sale amount.
-    /// </param>
+    /// <param name="tenant">Storefront whose active mode determines the available customer prices.</param>
     /// <param name="ServiceKey">Global enabled XUI service key selected by the tenant customer callback.</param>
     /// <param name="CustomerTelegramUserId">
     /// Numeric Telegram user id of the tenant customer. This is stored in users.db state so a typed traffic
@@ -6773,10 +6879,9 @@ public partial class TenantBotService
     /// <param name="CancellationToken">Token that cancels users.db state changes and Telegram delivery.</param>
     /// <returns>A task that completes after tenant-scoped state and the current selection message are synchronized.</returns>
     /// <remarks>
-    /// Selecting a metered service atomically clears duration, plan, traffic, count, and comment values from any older
-    /// purchase before installing the traffic step. A removed or disabled service clears this tenant conversation and
-    /// returns to the live service menu. Unlimited selection clears prior state before showing only tenant-visible
-    /// plans priced by <see cref="CalculateTenantPrice" />. No order, wallet, payment, or XUI operation is performed.
+    /// Selecting a metered service clears previous temporary choices before installing the traffic step. Removed,
+    /// hidden, or unpriced manual choices return to the live menu. Unlimited plans decode one saved price map for
+    /// the list and omit only unavailable plans. No order, wallet, payment, or XUI operation is performed.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="CancellationToken"/> is cancelled during users.db or Telegram work.
@@ -6803,26 +6908,38 @@ public partial class TenantBotService
             await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             return;
         }
+        var unlimitedPrices = service.IsUnlimited ? TenantUnlimitedPricesForList(tenant) : null;
+        if (!IsTenantServicePriced(tenant, service, unlimitedPrices))
+        {
+            await _state.ClearUserStatus(new User { Id = CustomerTelegramUserId });
+            await EDITORSENDASYNC(botClient, ChatId, MessageId,
+                "قیمت این گزینه در حال تنظیم است. سرویس دیگری را انتخاب کنید.",
+                BUILDTENANTSERVICEKEYBOARD(tenant), CancellationToken);
+            return;
+        }
+
 
         if (service.IsUnlimited)
         {
             await _state.ClearUserStatus(new User { Id = CustomerTelegramUserId });
-            var rows = XuiV3PurchaseService.GetUnlimitedPlansForTenant(service)
-                .Select(plan =>
+            var rows = new List<InlineKeyboardButton[]>();
+            foreach (var plan in XuiV3PurchaseService.GetUnlimitedPlansForTenant(service))
+            {
+                var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
+                if (!TryGetTenantSalePrice(tenant, selection, unlimitedPrices, out var price)) continue;
+                rows.Add(new[]
                 {
-                    var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
-                    var Price = CalculateTenantPrice(tenant, selection).SalePriceToman;
-                    return new[]
-                    {
-                        InlineKeyboardButton.WithCallbackData(
-                            $"{plan.DisplayName} - {Price.FormatCurrency()}",
-                            CUSTOMERCALLBACKPREFIX + $"upl:{service.Key}:{plan.Key}")
-                    };
-                })
-                .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") })
-                .ToArray();
+                    InlineKeyboardButton.WithCallbackData(
+                        $"{plan.DisplayName} - {price.FormatCurrency()}",
+                        CUSTOMERCALLBACKPREFIX + $"upl:{service.Key}:{plan.Key}")
+                });
+            }
+            var hasChoices = rows.Count > 0;
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") });
 
-            await EDITORSENDASYNC(botClient, ChatId, MessageId, "پلن مورد نظر را انتخاب کنید:", new InlineKeyboardMarkup(rows), CancellationToken);
+            await EDITORSENDASYNC(botClient, ChatId, MessageId, hasChoices
+                ? "پلن مورد نظر را انتخاب کنید:" : "قیمت این گزینه در حال تنظیم است.",
+                new InlineKeyboardMarkup(rows), CancellationToken);
             return;
         }
 
@@ -6859,9 +6976,7 @@ public partial class TenantBotService
     /// <param name="MessageId">
     /// Optional Telegram message id to edit. When <c>null</c>, a new message is sent instead.
     /// </param>
-    /// <param name="tenant">
-    /// Tenant bot instance that owns the storefront, pricing markup, and payment settings for this purchase.
-    /// </param>
+    /// <param name="tenant">Exact storefront whose selected price mode and payment settings apply to this purchase.</param>
     /// <param name="ServiceKey">
     /// Service key from <c>xui-v3-service-plans.json</c>, such as <c>normal</c> or <c>national</c>.
     /// </param>
@@ -6879,9 +6994,9 @@ public partial class TenantBotService
     /// <remarks>
     /// This method is shared by callback traffic buttons and manually typed traffic in tenant bots. It rechecks the
     /// minimum traffic and includes only currently enabled preset durations. When the normal service enables typed
-    /// custom durations, the prompt also publishes its inclusive day range and explicit numeric example. Every button
-    /// price comes from the shared resolver plus current tenant markup, so stale data cannot bypass global pricing or
-    /// availability. The method sends or edits Telegram text but does not create an order or mutate a wallet.
+    /// custom durations, the prompt also publishes its inclusive day range. Each currently priced button uses
+    /// <see cref="CalculateTenantPrice" />; missing or below-cost manual choices are unavailable rather than
+    /// falling back to public. It sends Telegram text but creates no order or wallet mutation.
     /// </remarks>
     private async Task SHOWDURATIONOPTIONSASYNC(
         ITelegramBotClient botClient,
@@ -6899,6 +7014,13 @@ public partial class TenantBotService
             await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             return;
         }
+        if (!IsTenantMeteredServicePriced(tenant, service))
+        {
+            await EDITORSENDASYNC(botClient, ChatId, MessageId, "قیمت این گزینه در حال تنظیم است.",
+                BUILDTENANTSERVICEKEYBOARD(tenant), CancellationToken);
+            return;
+        }
+
 
         if (!XuiV3PurchaseService.MeetsMinimumTraffic(service, TrafficGb))
         {
@@ -6912,28 +7034,27 @@ public partial class TenantBotService
             return;
         }
 
-        var rows = XuiV3PurchaseService.GetEnabledDurationOptions(service)
-            .Select(Duration =>
+        var rows = new List<InlineKeyboardButton[]>();
+        foreach (var duration in XuiV3PurchaseService.GetEnabledDurationOptions(service))
+        {
+            var selection = new XuiV3PurchaseSelection { ServiceKey = ServiceKey, TrafficGb = TrafficGb, DurationKey = duration.Key };
+            if (!TryGetTenantSalePrice(tenant, selection, null, out var price)) continue;
+            rows.Add(new[]
             {
-                var selection = new XuiV3PurchaseSelection { ServiceKey = ServiceKey, TrafficGb = TrafficGb, DurationKey = Duration.Key };
-                var Price = CalculateTenantPrice(tenant, selection).SalePriceToman;
-                return new[]
-                {
-                    InlineKeyboardButton.WithCallbackData(
-                        $"{Duration.DisplayName} - {Price.FormatCurrency()}",
-                        CUSTOMERCALLBACKPREFIX + $"dur:{ServiceKey}:{TrafficGb}:{Duration.Key}")
-                };
-            })
-            .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + $"svc:{ServiceKey}") })
-            .ToArray();
+                InlineKeyboardButton.WithCallbackData(
+                    $"{duration.DisplayName} - {price.FormatCurrency()}",
+                    CUSTOMERCALLBACKPREFIX + $"dur:{ServiceKey}:{TrafficGb}:{duration.Key}")
+            });
+        }
+        var hasChoices = rows.Count > 0;
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + $"svc:{ServiceKey}") });
 
         await EDITORSENDASYNC(
             botClient,
             ChatId,
             MessageId,
-            XuiV3PurchaseService.BuildDurationSelectionText(
-                service,
-                Heading ?? "مدت سرویس را انتخاب کنید:"),
+            XuiV3PurchaseService.BuildDurationSelectionText(service,
+                hasChoices ? Heading ?? "مدت سرویس را انتخاب کنید:" : "قیمت این گزینه در حال تنظیم است."),
             new InlineKeyboardMarkup(rows),
             CancellationToken);
     }
@@ -7084,7 +7205,7 @@ public partial class TenantBotService
             _ = CalculateTenantPrice(tenant, selection);
             return true;
         }
-        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+        catch (TenantPriceUnavailableException ex)
         {
             _logger.LogWarning(
                 ex,
@@ -7095,7 +7216,7 @@ public partial class TenantBotService
             await SafeAnswerCallbackQueryAsync(
                 botClient,
                 callbackQuery.Id,
-                "تعرفه این سفارش تغییر کرده است. خرید را دوباره آغاز کنید.",
+                "قیمت این گزینه در حال تنظیم است. گزینه دیگری انتخاب کنید.",
                 showAlert: true,
                 cancellationToken: cancellationToken);
             return false;
@@ -7109,19 +7230,17 @@ public partial class TenantBotService
     /// <param name="ChatId">Telegram chat id of the tenant customer receiving or updating the pre-invoice.</param>
     /// <param name="customerTelegramUserId">Numeric Telegram sender of this storefront preview, distinct from the chat id and never inferred from a callback payload.</param>
     /// <param name="MessageId">Optional Telegram message id to edit; <c>null</c> sends a new message.</param>
-    /// <param name="tenant">Tenant bot whose markup and enabled payment methods control the sale.</param>
+    /// <param name="tenant">Tenant bot whose active pricing mode and payment methods control the sale.</param>
     /// <param name="selection">
     /// Current global plan selection. A metered duration may be an enabled preset or canonical <c>days-N</c> custom key.
     /// </param>
     /// <param name="CancellationToken">Cancellation token for Telegram delivery.</param>
     /// <returns>A task that completes after the tenant-visible pre-invoice and payment choices are delivered.</returns>
     /// <remarks>
-    /// The shared resolver revalidates service, traffic, and duration before the summary is built. Metered summaries
-    /// show traffic and daily components using customer-visible effective tenant rates; markup pricing never exposes
-    /// the owner's raw colleague cost. Unlimited selections are tenant-authorized again, and fixed-public-price policy
-    /// changes only the displayed sale amount. With an eligible tenant code the bound quote renderer saves the actual
-    /// Telegram message id before offering payable buttons; without a code, legacy buttons and exact text are preserved.
-    /// This method does not create a payable order, invoice, wallet mutation, ledger entry, or XUI account.
+    /// The shared resolver revalidates service, traffic, and duration before the summary is built. Customer-visible
+    /// effective rates never expose colleague costs. Manual-mode previews always use an exact-message-bound
+    /// persisted quote so an old callback cannot silently admit a changed rate; percentage mode keeps its legacy
+    /// preview unless discount codes are enabled. No order, invoice, debit, ledger, or XUI mutation occurs here.
     ///
     /// Every enabled online gateway is displayed as instant and includes its customer-facing fee percentage:
     /// HooshPay 15%, Tetraminator 12%, UniquePay 12%, AtlasPay card-to-card, and NOWPayments 0%. Rial methods - the four
@@ -7134,7 +7253,8 @@ public partial class TenantBotService
     /// </remarks>
     private async Task SHOWCUSTOMERCONFIRMASYNC(ITelegramBotClient botClient, ChatId ChatId, long customerTelegramUserId, int? MessageId, BotInstance tenant, XuiV3PurchaseSelection selection, CancellationToken CancellationToken)
     {
-        if (await _serviceProvider.GetRequiredService<TenantDiscountService>()
+        if (tenant.TenantPricingMode == TenantPricingModes.Manual ||
+            await _serviceProvider.GetRequiredService<TenantDiscountService>()
                 .HasActiveScopeAsync(tenant.Id, TenantDiscountScopes.Purchase, CancellationToken))
         {
             await ShowCustomerDiscountConfirmAsync(botClient, ChatId, MessageId, tenant, selection, customerTelegramUserId, CancellationToken);
@@ -13069,22 +13189,16 @@ public partial class TenantBotService
     /// <summary>
     /// Builds the tenant storefront tariff message from global service rules and tenant-specific sale pricing.
     /// </summary>
-    /// <param name="tenant">
-    /// Tenant bot row that owns the storefront. Its non-negative markup percent can replace the public tariff with a
-    /// marked-up colleague base cost; null uses the public normal-customer tariff.
-    /// </param>
+    /// <param name="tenant">Exact storefront whose selected manual or percentage rates are displayed.</param>
     /// <returns>
-    /// HTML-formatted Persian tariff text safe for the tenant bot to send to its customers. Disabled durations and
-    /// unlimited plans are omitted. Every metered service exposes its effective per-GB/per-day storefront rates and
-    /// exactly one formula example whose final total is the authoritative whole-toman tenant sale price.
+    /// HTML-formatted customer tariff text with only currently priced enabled offerings. Metered services display
+    /// their active-mode GB/day rates and an authoritative whole-order example when that sample is available.
+    /// A no-prices notice replaces the list when all manual offerings are unavailable.
     /// </returns>
     /// <remarks>
-    /// Per-unit display never reveals the owner's colleague base cost. With no markup it shows public rates; with
-    /// markup it shows effective colleague rates after the tenant percentage. Final example/order prices are always
-    /// obtained from <see cref="CalculateTenantPrice" />, not reconstructed from formatted presentation strings.
-    /// Unlimited lists contain only tenant-visible plans; fixed-public-price plans show the configured public amount
-    /// without exposing colleague base cost or profit. This method performs no database writes, wallet changes,
-    /// gateway calls, or Telegram sends.
+    /// The selected mode controls every displayed sale unit and whole-order example. Unpriced manual offerings
+    /// are omitted individually; no colleague cost or owner profit is exposed on this customer surface.
+    /// Disabled/hidden catalog choices are also omitted. No wallet, gateway, database, or XUI side effects occur.
     /// </remarks>
     /// <example>
     /// <code>
@@ -13099,9 +13213,13 @@ public partial class TenantBotService
         Builder.AppendLine("✨ برای استفاده روزمره، پلن‌های نامحدود با حد مصرف منصفانه پیشنهاد می‌شوند.");
         Builder.AppendLine("🌍 لوکیشن‌های فعال فعلی: آلمان، آمریکا و فنلاند. لوکیشن‌های بیشتری هم به‌زودی اضافه می‌شود.");
         Builder.AppendLine();
+        var unlimitedPrices = TenantUnlimitedPricesForList(tenant);
+        var visibleServices = 0;
 
         foreach (var service in _purchaseService.GetEnabledServices())
         {
+            if (!IsTenantServicePriced(tenant, service, unlimitedPrices)) continue;
+            visibleServices++;
             var serviceIcon = service.IsUnlimited
                 ? "🚀"
                 : string.Equals(service.Key, "national", StringComparison.OrdinalIgnoreCase) ? "🌐" : "🌍";
@@ -13111,7 +13229,7 @@ public partial class TenantBotService
                 foreach (var plan in XuiV3PurchaseService.GetUnlimitedPlansForTenant(service).OrderBy(x => x.Days))
                 {
                     var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
-                    var Price = CalculateTenantPrice(tenant, selection).SalePriceToman;
+                    if (!TryGetTenantSalePrice(tenant, selection, unlimitedPrices, out var Price)) continue;
                     Builder.AppendLine($"• {Html(plan.DisplayName)} | حد مصرف منصفانه <code>{plan.FairUsageGb} GB</code> | کاربر مجاز <code>{plan.MaxUsers}</code> | <b>{Html(Price.FormatCurrency())}</b>");
                 }
             }
@@ -13156,21 +13274,25 @@ public partial class TenantBotService
                 if (sampleTraffic > 0 && sampleDuration != null)
                 {
                     var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, TrafficGb = sampleTraffic, DurationKey = sampleDuration.Key };
-                    var samplePrice = CalculateTenantPrice(tenant, selection).SalePriceToman;
-                    var formula = $"{sampleTraffic}GB × {FormatTenantPriceAmount(effectivePricePerGb)}";
-                    if (hasDailyPrice && sampleDuration.Days > 0)
+                    if (TryGetTenantSalePrice(tenant, selection, null, out var samplePrice))
                     {
-                        var effectiveDailyPrice = CalculateTenantEffectiveMeteredRateToman(tenant, service, isDailyRate: true);
-                        formula += $" + {sampleDuration.Days} روز × {FormatTenantPriceAmount(effectiveDailyPrice)}";
-                    }
+                        var formula = $"{sampleTraffic}GB × {FormatTenantPriceAmount(effectivePricePerGb)}";
+                        if (hasDailyPrice && sampleDuration.Days > 0)
+                        {
+                            var effectiveDailyPrice = CalculateTenantEffectiveMeteredRateToman(tenant, service, isDailyRate: true);
+                            formula += $" + {sampleDuration.Days} روز × {FormatTenantPriceAmount(effectiveDailyPrice)}";
+                        }
 
-                    Builder.AppendLine("🧮 <b>یک نمونه محاسبه:</b>");
-                    Builder.AppendLine($"<code>{Html(formula)} = {Html(samplePrice.FormatCurrency())}</code>");
+                        Builder.AppendLine("🧮 <b>یک نمونه محاسبه:</b>");
+                        Builder.AppendLine($"<code>{Html(formula)} = {Html(samplePrice.FormatCurrency())}</code>");
+                    }
                 }
             }
 
             Builder.AppendLine();
         }
+        if (visibleServices == 0)
+            Builder.AppendLine("قیمت گزینه‌های این فروشگاه در حال تنظیم است.");
 
         Builder.AppendLine("💡 برای شرایط قطعی یا اختلال شدید اینترنت، داشتن یک کانفیگ نت ملی با زمان انقضای نامحدود هم توصیه می‌شود.");
         return Builder.ToString();
@@ -13515,23 +13637,22 @@ public partial class TenantBotService
     /// <summary>
     /// Calculates customer sale price, owner base cost, and owner profit for a tenant-storefront selection.
     /// </summary>
-    /// <param name="tenant">
-    /// Tenant bot row that owns the storefront. Its markup is a non-negative percentage; null means no custom markup.
-    /// </param>
+    /// <param name="tenant">Exact tenant storefront row; manual prices are scoped to this bot, never its owner's other stores.</param>
     /// <param name="selection">
     /// Global service selection made by the tenant customer, including metered traffic and duration or a fixed
     /// unlimited-plan key. The selection must remain enabled in the current catalog.
     /// </param>
+    /// <param name="unlimitedPrices">Optional already-decoded fixed-price map for a list render; null decodes only for a manual unlimited selection.</param>
     /// <returns>
     /// A whole-toman breakdown containing the customer sale amount, colleague owner base cost, and non-negative owner
     /// profit. The result is detached and callers persist it on the tenant order before settlement.
     /// </returns>
     /// <remarks>
-    /// The shared resolver first applies per-GB, per-day, or lifetime-multiplier pricing for both public and colleague
-    /// roles. For ordinary plans, a positive tenant markup replaces the public sale with the colleague total multiplied
-    /// by that markup and the sale is never below owner base cost. A plan with <c>TenantUsesUserPrice</c> instead fixes
-    /// sale to its public/user total, keeps colleague total as base cost, and ignores tenant markup. This method does
-    /// not debit or credit a wallet and does not create an order, ledger entry, gateway invoice, or XUI account.
+    /// Both roles resolve against the current catalog. Percent mode retains the historical public-at-zero,
+    /// colleague-plus-markup-at-positive and TenantUsesUserPrice behavior. Manual mode requires current per-unit
+    /// or plan colleague floors and a final whole-order floor; no missing price falls back to public pricing.
+    /// Admitted orders retain this result even when the storefront changes later. This method has no wallet,
+    /// gateway, ledger, Telegram, or XUI side effects.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// Thrown when the selected global plan is invalid, disabled, hidden from tenants, or has invalid financial data.
@@ -13545,30 +13666,44 @@ public partial class TenantBotService
     ///     new XuiV3PurchaseSelection { ServiceKey = "unlimited", UnlimitedPlanKey = "configured-plan-key" });
     /// </code>
     /// </example>
-    private TenantPriceResult CalculateTenantPrice(BotInstance tenant, XuiV3PurchaseSelection selection)
+    private TenantPriceResult CalculateTenantPrice(BotInstance tenant, XuiV3PurchaseSelection selection,
+        IReadOnlyDictionary<string, Dictionary<string, long>> unlimitedPrices = null)
     {
         var PUBLICRESOLVED = _purchaseService.ResolveTenantPurchase(selection, false);
         var COLLEAGUERESOLVED = _purchaseService.ResolveTenantPurchase(selection, true);
         var BASECOST = COLLEAGUERESOLVED.PriceToman;
         var sale = PUBLICRESOLVED.PriceToman;
 
-        if (PUBLICRESOLVED.UnlimitedPlan?.TenantUsesUserPrice == true)
+        if (tenant?.TenantPricingMode == TenantPricingModes.Manual)
         {
-            return new TenantPriceResult
-            {
-                SalePriceToman = sale,
-                BaseCostToman = BASECOST,
-                ProfitToman = Math.Max(0, sale - BASECOST)
-            };
+            // Metered checkout uses saved unit rates directly; only an unlimited lookup needs the JSON map.
+            if (COLLEAGUERESOLVED.IsUnlimited)
+                unlimitedPrices ??= TenantStorefrontPricing.ParseUnlimitedPlanPrices(tenant.TenantUnlimitedPlanPricesJson);
+            try { sale = TenantStorefrontPricing.CalculateManualSale(tenant, COLLEAGUERESOLVED, unlimitedPrices); }
+            catch (OverflowException) { throw new TenantPriceUnavailableException("مبلغ قیمت دستی از محدوده قابل پشتیبانی بیشتر است."); }
         }
+        else if (tenant?.TenantPricingMode == TenantPricingModes.Percent)
+        {
+            if (PUBLICRESOLVED.UnlimitedPlan?.TenantUsesUserPrice == true)
+            {
+                return new TenantPriceResult
+                {
+                    SalePriceToman = sale,
+                    BaseCostToman = BASECOST,
+                    ProfitToman = Math.Max(0, sale - BASECOST)
+                };
+            }
 
-        var markup = Math.Max(0, tenant?.TenantPriceMarkupPercent ?? 0);
-        // default sale Price is public TARIFF; A custom markup overrides it from colleague base cost.
-        if (markup > 0)
-            sale = (long)Math.Ceiling(BASECOST * (1M + markup / 100M));
+            var markup = Math.Max(0, tenant?.TenantPriceMarkupPercent ?? 0);
+            // Default sale price is public tariff; a positive markup overrides it from the colleague base cost.
+            if (markup > 0)
+                sale = (long)Math.Ceiling(BASECOST * (1M + markup / 100M));
 
-        if (sale < BASECOST)
-            sale = BASECOST;
+            if (sale < BASECOST)
+                sale = BASECOST;
+        }
+        else
+            throw new TenantPriceUnavailableException("حالت قیمت‌گذاری این فروشگاه معتبر نیست.");
 
         return new TenantPriceResult
         {
@@ -13581,9 +13716,7 @@ public partial class TenantBotService
     /// <summary>
     /// Builds a customer-visible traffic and duration calculation for one tenant metered sale.
     /// </summary>
-    /// <param name="tenant">
-    /// Tenant storefront whose non-negative markup percentage determines the customer-visible effective rates.
-    /// </param>
+    /// <param name="tenant">Tenant storefront with active percent or manual customer rates.</param>
     /// <param name="resolved">
     /// Public-role selection resolved by the central purchase service. Unlimited selections and null values produce
     /// an empty result.
@@ -13597,10 +13730,9 @@ public partial class TenantBotService
     /// unlimited selections. The text exposes only public or effective sale rates, never the owner's colleague cost.
     /// </returns>
     /// <remarks>
-    /// Without markup, the shared public-price breakdown is reused verbatim. With markup, each visible rate is derived
-    /// from the colleague rate multiplied by <c>1 + markup / 100</c>, while the final line uses the authoritative tenant
-    /// sale total so component formatting cannot change an order amount. This method has no persistence, wallet,
-    /// gateway, ledger, Telegram-send, or XUI side effects.
+    /// Percent mode retains the original public or colleague-derived wording. Manual mode displays the actual
+    /// configured unit prices and authoritative final sale without revealing colleague rates. This method has
+    /// no persistence, wallet, gateway, ledger, Telegram-send, or XUI side effects.
     /// </remarks>
     /// <example>
     /// <code>
@@ -13616,12 +13748,15 @@ public partial class TenantBotService
         if (breakdown == null)
             return string.Empty;
 
+        var manual = tenant?.TenantPricingMode == TenantPricingModes.Manual;
         var markup = Math.Max(0, tenant?.TenantPriceMarkupPercent ?? 0);
-        if (markup <= 0)
+        if (!manual && markup <= 0)
             return XuiV3PurchaseService.BuildMeteredPriceBreakdownText(resolved);
 
         var saleFactor = 1M + markup / 100M;
-        var effectivePricePerGb = resolved.Service.GetPricePerGb(isColleague: true) * saleFactor;
+        var effectivePricePerGb = manual
+            ? CalculateTenantEffectiveMeteredRateToman(tenant, resolved.Service, isDailyRate: false)
+            : resolved.Service.GetPricePerGb(isColleague: true) * saleFactor;
         var trafficSubtotal = breakdown.TrafficGb * effectivePricePerGb;
         var builder = new StringBuilder();
         builder.AppendLine("جزئیات محاسبه قیمت:");
@@ -13639,7 +13774,9 @@ public partial class TenantBotService
         }
         else
         {
-            var effectivePricePerDay = resolved.Service.GetPricePerDay(isColleague: true) * saleFactor;
+            var effectivePricePerDay = manual
+                ? CalculateTenantEffectiveMeteredRateToman(tenant, resolved.Service, isDailyRate: true)
+                : resolved.Service.GetPricePerDay(isColleague: true) * saleFactor;
             var durationSubtotal = breakdown.DurationDays * effectivePricePerDay;
             rawTotal = trafficSubtotal + durationSubtotal;
             builder.AppendLine(
@@ -13677,9 +13814,7 @@ public partial class TenantBotService
     /// <summary>
     /// Calculates one customer-visible effective per-GB or per-day rate for a tenant metered tariff.
     /// </summary>
-    /// <param name="tenant">
-    /// Tenant bot whose non-negative markup percentage controls storefront sale pricing. Null uses the public tariff.
-    /// </param>
+    /// <param name="tenant">Tenant bot whose active pricing mode controls this customer-visible rate.</param>
     /// <param name="service">
     /// Global metered service containing role-specific per-GB and per-day rates in Iranian toman. It must come from the validated
     /// current catalog and must not be an unlimited fixed-price service.
@@ -13693,10 +13828,9 @@ public partial class TenantBotService
     /// total is rounded only by <see cref="CalculateTenantPrice" />. The result does not expose the raw colleague rate.
     /// </returns>
     /// <remarks>
-    /// With no positive markup, the selected public per-GB or per-day tariff is returned. With markup, the corresponding
-    /// colleague rate is multiplied by <c>1 + markup / 100</c>. Final order totals continue to use
-    /// <see cref="CalculateTenantPrice" /> so combined rounding and traffic pricing remain authoritative.
-    /// This method has no persistence, wallet, Telegram, gateway, ledger, or XUI side effects.
+    /// Manual mode uses the validated configured GB/day rate; national daily pricing remains the current colleague
+    /// daily rate. Percent mode retains public rates at zero and colleague times markup otherwise. Final totals use
+    /// <see cref="CalculateTenantPrice" /> and are rounded only once. No financial or Telegram side effects occur.
     /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="service" /> is null.</exception>
     /// <exception cref="InvalidOperationException">Thrown when the selected configured rate is negative.</exception>
@@ -13713,7 +13847,22 @@ public partial class TenantBotService
         if (service == null)
             throw new ArgumentNullException(nameof(service));
 
-        var markup = Math.Max(0, tenant?.TenantPriceMarkupPercent ?? 0);
+        if (tenant?.TenantPricingMode == TenantPricingModes.Manual)
+        {
+            var normal = string.Equals(service.Key, "normal", StringComparison.OrdinalIgnoreCase);
+            var national = string.Equals(service.Key, "national", StringComparison.OrdinalIgnoreCase);
+            if (!normal && !national) throw new TenantPriceUnavailableException("قیمت این سرویس در حال تنظیم است.");
+            var configured = isDailyRate
+                ? normal ? tenant.TenantNormalPricePerDayToman : service.GetPricePerDay(true)
+                : normal ? tenant.TenantNormalPricePerGbToman : tenant.TenantNationalPricePerGbToman;
+            var floor = isDailyRate ? service.GetPricePerDay(true) : service.GetPricePerGb(true);
+            if (!configured.HasValue || configured.Value < floor || (!isDailyRate && configured.Value <= 0))
+                throw new TenantPriceUnavailableException("قیمت این گزینه در حال تنظیم است.");
+            return configured.Value;
+        }
+        if (tenant?.TenantPricingMode != TenantPricingModes.Percent)
+            throw new TenantPriceUnavailableException("حالت قیمت‌گذاری فروشگاه معتبر نیست.");
+        var markup = Math.Max(0, tenant.TenantPriceMarkupPercent);
         var effectiveRate = markup > 0
             ? (isDailyRate ? service.GetPricePerDay(isColleague: true) : service.GetPricePerGb(isColleague: true)) *
               (1M + markup / 100M)

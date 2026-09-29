@@ -1,5 +1,19 @@
 # CODE_MAP.md
 
+- Tenant storefront pricing: `BotInstance.TenantPricingMode` defaults to `percent` (zero markup
+  charges the public catalog, positive markup charges colleague cost plus percentage; unlimited
+  `TenantUsesUserPrice` retains public priority). `manual` instead prices normal GB/day, national
+  GB and each tenant-visible unlimited plan from tenant-scoped fields/nested service+plan JSON.
+  `TenantStorefrontPricing` validates case-insensitive keys, whole-toman rates, completeness and
+  current colleague floors; invalid/missing selections are hidden or explicitly rejected, never
+  charged at public prices. `TenantBotService.Pricing.cs` owns the revision/nonce-bound owner
+  draft editor and authenticated mode changes. Manual purchase quotes bind message and gross/base;
+  a changed rate expires an unpaid quote. Renewal previews bind gross/base in bot-scoped state
+  and re-prompt on change before order creation; admitted orders retain frozen sale/base/profit.
+  Migration `20260929160000_AddTenantStorefrontPricingModes` changes only users.db and preserves
+  legacy percent settings. Full storefront reset clears the manual fields; invalid-token cleanup
+  preserves them. See `Adminbot.Tests/TenantPricingModesTests.cs` for real owner/customer callbacks.
+
 - Tenant storefront discount codes: `Domain/TenantDiscount.cs`, `TenantDiscountService`, and
   `20260929150000_AddTenantDiscountCodes` add per-bot owner definitions, message-bound two-hour
   purchase quotes, immutable net order snapshots, and one unique redemption per order in `users.db`.

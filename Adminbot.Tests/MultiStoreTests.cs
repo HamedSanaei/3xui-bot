@@ -326,8 +326,8 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(230, (await wallet.GetWalletOperationAsync("tenant:802:profit")).AmountToman);
     }
 
-    /// <summary>Reset preserves store identity and history, while repeated numeric Telegram identity is rejected even for the same owner.</summary>
-    /// <returns>A task completing after the real token guard and unique-index checks.</returns>
+    /// <summary>Full reset clears the selected store's prices alongside its settings; invalid-token cleanup retains prices.</summary>
+    /// <returns>A task completing after reset, token and independent store-price checks.</returns>
     [Fact]
     public async Task Store_reset_and_token_identity_are_isolated_within_one_owner()
     {
@@ -335,7 +335,11 @@ public sealed partial class ConcurrencyTests
         var stores = provider.GetRequiredService<TenantStoreStore>();
         var a = await stores.CreateAsync(711, Guid.NewGuid().ToString("N")); var b = await stores.CreateAsync(711, Guid.NewGuid().ToString("N"));
         a.Token = "60001:" + new string('a', 35); a.TelegramBotId = 60001; a.Enabled = true; a.TenantWelcomeText = "فروشگاه اول";
+        a.TenantPricingMode = TenantPricingModes.Manual; a.TenantNormalPricePerGbToman = 4200;
+        a.TenantNormalPricePerDayToman = 600; a.TenantNationalPricePerGbToman = 110000;
+        a.TenantUnlimitedPlanPricesJson = "{\"unlimited\":{\"u2-m1\":256000}}";
         b.Token = "60002:" + new string('b', 35); b.TelegramBotId = 60002; b.Enabled = true; b.TenantWelcomeText = "فروشگاه دوم";
+        b.TenantPricingMode = TenantPricingModes.Manual; b.TenantNormalPricePerGbToman = 4800;
         await using (var db = databases.Users.CreateDbContext()) { db.Update(a); db.Update(b); await db.SaveChangesAsync(); }
         await using var scope = provider.CreateAsyncScope(); var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
         typeof(TenantBotService).GetField("_selectedOwnerStore", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(service, a);
@@ -351,11 +355,26 @@ public sealed partial class ConcurrencyTests
             var row = await db.BotInstances.SingleAsync(x => x.Id == a.Id); row.TelegramBotId = b.TelegramBotId;
             await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
         }
-        // Use the exact runtime reset transformation, retaining the allocation identity and slot.
+        // Invalid-token cleanup cannot silently replace tenant-owned prices with percentage/public prices.
+        typeof(TenantBotService).GetMethod("ResetTenantStorefrontSettings", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, new object[] { a, false });
+        Assert.Equal(TenantPricingModes.Manual, a.TenantPricingMode);
+        Assert.Equal(4200, a.TenantNormalPricePerGbToman);
+        Assert.Equal(600, a.TenantNormalPricePerDayToman);
+        Assert.Equal(110000, a.TenantNationalPricePerGbToman);
+        Assert.Contains("u2-m1", a.TenantUnlimitedPlanPricesJson);
+        // A full reset must not erase B's independent rates.
         typeof(TenantBotService).GetMethod("ResetTenantStorefrontSettings", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, new object[] { a, true });
         await using (var db = databases.Users.CreateDbContext()) { db.Update(a); await db.SaveChangesAsync(); }
         var rows = await stores.ListAsync(711);
         Assert.False(rows[0].Enabled); Assert.Null(rows[0].Token); Assert.Equal(a.TenantCreationKey, rows[0].TenantCreationKey);
+        Assert.Equal(TenantPricingModes.Percent, rows[0].TenantPricingMode);
+        Assert.Equal(0, rows[0].TenantPriceMarkupPercent);
+        Assert.Null(rows[0].TenantNormalPricePerGbToman);
+        Assert.Null(rows[0].TenantNormalPricePerDayToman);
+        Assert.Null(rows[0].TenantNationalPricePerGbToman);
+        Assert.Null(rows[0].TenantUnlimitedPlanPricesJson);
+        Assert.Equal(TenantPricingModes.Manual, rows[1].TenantPricingMode);
+        Assert.Equal(4800, rows[1].TenantNormalPricePerGbToman);
         Assert.True(rows[1].Enabled); Assert.Equal("فروشگاه دوم", rows[1].TenantWelcomeText); Assert.Equal(2, rows.Count);
     }
 
@@ -392,15 +411,19 @@ public sealed partial class ConcurrencyTests
     /// <summary>Builds the real dependency graph against isolated databases without starting hosted services.</summary>
     /// <param name="databases">Fixture that owns all database paths and cleanup.</param>
     /// <param name="websiteUrl">Optional loopback fake website endpoint; remote site sync is otherwise disabled.</param>
+    /// <param name="catalogPath">Optional isolated XUI plan catalog used to exercise changed wholesale prices.</param>
+    /// <param name="panelUrl">Optional isolated XUI panel URL for renewal handler scenarios.</param>
     /// <returns>A provider that the test must asynchronously dispose.</returns>
-    private static ServiceProvider StorefrontProvider(Databases databases, string? websiteUrl = null)
+    private static ServiceProvider StorefrontProvider(Databases databases, string? websiteUrl = null, string? catalogPath = null, string? panelUrl = null)
     {
         var configuration = new ConfigurationBuilder().AddJsonFile(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../Data/configuration.example.json")))
             .AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["bots:0:enabled"] = "false", ["bots:0:token"] = "12345:" + new string('a', 35),
                 ["GozargahSiteSyncEnabled"] = (websiteUrl != null).ToString(), ["GozargahSiteWalletPaymentsEnabled"] = (websiteUrl != null).ToString(),
-                ["GozargahSiteApiBaseUrl"] = websiteUrl, ["GozargahSiteApiKey"] = "test-only"
+                ["GozargahSiteApiBaseUrl"] = websiteUrl, ["GozargahSiteApiKey"] = "test-only",
+                ["XuiV3ApiBaseUrl"] = panelUrl, ["XuiV3ApiToken"] = panelUrl == null ? null : "test-only",
+                ["XuiV3ServicePlansPath"] = catalogPath ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../Data/xui-v3-service-plans.json"))
             }).Build();
         var config = configuration.Get<AppConfig>()!; config.UserDatabasePath = Path.Combine(databases.DirectoryPath, "users.db"); config.CredentialsDatabasePath = Path.Combine(databases.DirectoryPath, "credentials.db");
         var services = new ServiceCollection(); Program.RegisterApplicationServices(services, configuration, config, databases.DirectoryPath);

@@ -26,6 +26,21 @@ namespace Adminbot.Domain
         public bool Enabled { get; set; } = true;
         public long? OwnerTelegramUserId { get; set; }
         public int TenantPriceMarkupPercent { get; set; }
+        /// <summary>Pricing scheme for this bot's tenant storefront; percent is the legacy default.</summary>
+        /// <remarks>Manual rates apply only in manual mode; an unknown stored mode is invalid, not a request for public prices.</remarks>
+        public string TenantPricingMode { get; set; } = TenantPricingModes.Percent;
+        /// <summary>Optional normal-service sale price per GB in whole toman, scoped to this storefront.</summary>
+        /// <remarks>Null means unconfigured; manual mode takes precedence over the percentage markup.</remarks>
+        public long? TenantNormalPricePerGbToman { get; set; }
+        /// <summary>Optional normal-service sale price per day in whole toman, scoped to this storefront.</summary>
+        /// <remarks>Null means unconfigured; it is not a zero-priced day in manual mode.</remarks>
+        public long? TenantNormalPricePerDayToman { get; set; }
+        /// <summary>Optional national-service sale price per GB in whole toman, scoped to this storefront.</summary>
+        /// <remarks>Null means unconfigured; it is not a zero-priced GB in manual mode.</remarks>
+        public long? TenantNationalPricePerGbToman { get; set; }
+        /// <summary>Optional storefront-specific fixed unlimited plan prices in whole toman as service-key/plan-key JSON.</summary>
+        /// <remarks>Null means unconfigured. Nested exact catalog keys, not Telegram display names, identify plans; lookup is ordinal case-insensitive.</remarks>
+        public string TenantUnlimitedPlanPricesJson { get; set; }
         public string TenantWelcomeText { get; set; }
         public bool TenantMandatoryJoinEnabled { get; set; }
         public List<string> TenantChannelIds { get; set; } = new();
@@ -74,6 +89,15 @@ namespace Adminbot.Domain
         public const string SalesAssistant = "sales_assistant";
     }
 
+    /// <summary>Persisted pricing mode identifiers for one tenant storefront.</summary>
+    public static class TenantPricingModes
+    {
+        /// <summary>Legacy sale calculation: public price at zero markup, otherwise colleague cost plus percentage.</summary>
+        public const string Percent = "percent";
+        /// <summary>Use configured per-unit or per-plan storefront sale prices instead of percentage markup.</summary>
+        public const string Manual = "manual";
+    }
+
     /// <summary>
     /// Persisted representation of a bot instance in users.db.
     /// This lets runtime-created tenant bots survive application restarts without changing credentials.db.
@@ -118,6 +142,21 @@ namespace Adminbot.Domain
         public string AndroidTutorialJson { get; set; }
         public string WindowsTutorialJson { get; set; }
         public int TenantPriceMarkupPercent { get; set; }
+        /// <summary>Selected tenant pricing mode; existing and new rows default to percent.</summary>
+        /// <remarks>Only <see cref="TenantPricingModes.Percent"/> and <see cref="TenantPricingModes.Manual"/> are valid. An unknown persisted value must not be treated as public or percentage pricing.</remarks>
+        public string TenantPricingMode { get; set; } = TenantPricingModes.Percent;
+        /// <summary>Optional normal-service sale rate per GB in whole toman for this storefront.</summary>
+        /// <remarks>Null is not configured; this rate supersedes markup only in manual mode. Other storefronts have independent rates.</remarks>
+        public long? TenantNormalPricePerGbToman { get; set; }
+        /// <summary>Optional normal-service sale rate per day in whole toman for this storefront.</summary>
+        /// <remarks>Null is not configured; this rate supersedes markup only in manual mode.</remarks>
+        public long? TenantNormalPricePerDayToman { get; set; }
+        /// <summary>Optional national-service sale rate per GB in whole toman for this storefront.</summary>
+        /// <remarks>Null is not configured; this rate supersedes markup only in manual mode.</remarks>
+        public long? TenantNationalPricePerGbToman { get; set; }
+        /// <summary>Optional nested JSON map of fixed sale prices per unlimited service and plan in whole toman.</summary>
+        /// <remarks>Keys are exact catalog service and plan keys, never display names. Null means unconfigured; lookups are case-insensitive and these prices take priority only in manual mode.</remarks>
+        public string TenantUnlimitedPlanPricesJson { get; set; }
         public string TenantWelcomeText { get; set; }
         public bool TenantMandatoryJoinEnabled { get; set; }
         public string TenantChannelIdsJson { get; set; }
@@ -573,6 +612,9 @@ namespace Adminbot.Domain
         public string OwnerStoreId { get; set; }
         /// <summary>Store-bound owner edit draft JSON, canceled when the bot-scoped conversation is cleared.</summary>
         public string OwnerDiscountDraftJson { get; set; }
+        /// <summary>Pricing editor draft JSON for the selected storefront in this owned-bot/user conversation.</summary>
+        /// <remarks>Never grants owner access; selection changes or clearing this bot's conversation cancels the draft without touching another bot's state.</remarks>
+        public string OwnerPricingDraftJson { get; set; }
         /// <summary>Tenant renewal discount selection JSON, revalidated against live price before admission.</summary>
         public string RenewalDiscountSelectionJson { get; set; }
         /// <summary>Purchase quote awaiting customer code input in this bot-scoped conversation.</summary>
@@ -657,9 +699,9 @@ namespace Adminbot.Domain
         /// <param name="user">Legacy User state object collected by existing call sites.</param>
         /// <returns>A new BotUserState that can be inserted into users.db.</returns>
         /// <remarks>
-        /// The conversion carries owner-store selection and discount drafts/selections into the specified bot scope
-        /// alongside renewal account locks. It performs no account, wallet, order, or panel operation; callers persist
-        /// the returned row and independently authorize every checkout or owner edit.
+        /// The conversion carries owner-store selection and both owner drafts into this one bot/user scope
+        /// alongside discount selections and renewal account locks. It performs no account, wallet, order, or
+        /// panel operation; callers persist the returned row and authorize every owner edit separately.
         /// </remarks>
         public static BotUserState FromUser(string botId, User user)
         {
@@ -669,6 +711,7 @@ namespace Adminbot.Domain
                 TelegramUserId = user.Id,
                 OwnerStoreId = user.OwnerStoreId,
                 OwnerDiscountDraftJson = user.OwnerDiscountDraftJson,
+                OwnerPricingDraftJson = user.OwnerPricingDraftJson,
                 RenewalDiscountSelectionJson = user.RenewalDiscountSelectionJson,
                 PurchaseDiscountQuoteId = user.PurchaseDiscountQuoteId,
                 SelectedCountry = user.SelectedCountry,
@@ -701,8 +744,8 @@ namespace Adminbot.Domain
         /// </summary>
         /// <returns>A User object with the same conversation fields and Telegram user id.</returns>
         /// <remarks>
-        /// Renewal account locks and the owner store/draft and customer discount selections are restored after restart.
-        /// The returned compatibility DTO is detached and authorizes no action by itself.
+        /// The owner store, both owner drafts, customer discount selections and renewal account locks survive restart
+        /// in this bot/user scope. The returned compatibility DTO is detached and authorizes no action by itself.
         /// </remarks>
         public User ToUser()
         {
@@ -711,6 +754,7 @@ namespace Adminbot.Domain
                 Id = TelegramUserId,
                 OwnerStoreId = OwnerStoreId,
                 OwnerDiscountDraftJson = OwnerDiscountDraftJson,
+                OwnerPricingDraftJson = OwnerPricingDraftJson,
                 RenewalDiscountSelectionJson = RenewalDiscountSelectionJson,
                 PurchaseDiscountQuoteId = PurchaseDiscountQuoteId,
                 SelectedCountry = SelectedCountry,
@@ -743,17 +787,22 @@ namespace Adminbot.Domain
         /// <param name="user">Partial legacy state update.</param>
         /// <remarks>
         /// Null preserves stored nullable legacy fields; an explicit empty string clears string fields. Store switching
-        /// cancels the owner discount draft even if the partial input also supplies a draft. A nullable quote id cannot
-        /// be cleared by a partial update; use <see cref="Clear"/> or an explicit tracked state update. Callers persist
-        /// this merge and independently revalidate renewal locks, discount selections and owner authorization.
+        /// cancels both owner drafts even if the partial input also supplies a draft. A nullable quote id cannot
+        /// be cleared by a partial update; use <see cref="Clear"/> or an explicit tracked state update. Callers
+        /// persist this merge and independently revalidate renewal locks, discount selections and owner authorization.
         /// </remarks>
         public void ApplyPartial(User user)
         {
             bool switchingStore = user.OwnerStoreId != null &&
                 !string.Equals(OwnerStoreId, user.OwnerStoreId, StringComparison.Ordinal);
-            if (switchingStore) OwnerDiscountDraftJson = null;
+            if (switchingStore)
+            {
+                OwnerDiscountDraftJson = null;
+                OwnerPricingDraftJson = null;
+            }
             if (user.OwnerStoreId != null) OwnerStoreId = user.OwnerStoreId;
             if (!switchingStore && user.OwnerDiscountDraftJson != null) OwnerDiscountDraftJson = user.OwnerDiscountDraftJson;
+            if (!switchingStore && user.OwnerPricingDraftJson != null) OwnerPricingDraftJson = user.OwnerPricingDraftJson;
             if (user.RenewalDiscountSelectionJson != null) RenewalDiscountSelectionJson = user.RenewalDiscountSelectionJson;
             if (user.PurchaseDiscountQuoteId.HasValue) PurchaseDiscountQuoteId = user.PurchaseDiscountQuoteId;
             if (user.SelectedCountry != null) SelectedCountry = user.SelectedCountry;
@@ -784,14 +833,15 @@ namespace Adminbot.Domain
         /// Clears transient flow fields while keeping the bot/user row and long-lived counters.
         /// </summary>
         /// <remarks>
-        /// Renewal account locks, discount selections, owner drafts and payment choice are cleared with the conversation.
-        /// Wallets, tenant orders, account metadata and state rows belonging to other bots are untouched; the selected
-        /// owner store is also cleared, canceling pending settings input.
+        /// Renewal account locks, discount selections, both owner drafts and payment choice are cleared with the
+        /// conversation. Wallets, tenant orders, account metadata and state rows belonging to other bots are untouched;
+        /// the selected owner store is also cleared, canceling pending settings input.
         /// </remarks>
         public void Clear()
         {
             OwnerStoreId = "";
             OwnerDiscountDraftJson = null;
+            OwnerPricingDraftJson = null;
             RenewalDiscountSelectionJson = null;
             PurchaseDiscountQuoteId = null;
             SelectedCountry = "";
