@@ -1,5 +1,6 @@
 ﻿using Adminbot.Domain;
 using Adminbot.Domain.Logging;
+using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -53,6 +54,59 @@ public sealed partial class ConcurrencyTests
             await using var credentials = databases.Credentials.CreateDbContext();
             Assert.Empty(await credentials.WalletOperations.ToListAsync());
         }
+    }
+
+    [Theory]
+    [InlineData("atlaspay", "اطلس‌پی", "هوش‌پی")]
+    [InlineData("hooshpay", "هوش‌پی", "اطلس‌پی")]
+    public void Assistant_sale_reports_customer_gateway_independently_of_owner_settlement(
+        string provider, string expectedGateway, string otherGateway)
+    {
+        var order = new TenantBotOrder
+        {
+            TenantBotId = "tenant-<711>",
+            TenantBotUsername = "shop&bot",
+            OrderId = "sale-<123>",
+            OwnerTelegramUserId = 711,
+            CustomerTelegramUserId = 812,
+            CustomerFirstName = "Buyer",
+            PaymentProvider = provider,
+            OrderKind = TenantBotOrderKinds.Purchase,
+            PaymentStatus = TenantBotOrderStatuses.Fulfilled,
+            IsFulfilled = true,
+            ServiceKey = "normal&fast",
+            DurationKey = "one-month",
+            TrafficGb = 30,
+            AccountCount = 1,
+            SalePriceToman = 120_000,
+            BaseCostToman = 90_000,
+            ProfitToman = 30_000,
+            OwnerWalletDelta = -90_000,
+            CreatedAccountEmail = "buyer<&>@example.com",
+            PaymentUrl = "https://private.example/invoice-secret",
+            CreatedSubLink = "https://private.example/subscription-secret",
+            CreatedAccountJson = "{\"token\":\"private-secret\"}"
+        };
+
+        var html = SalesAssistantService.BuildTenantSaleNotificationHtml(order, 300_000, 210_000);
+
+        Assert.Contains($"روش پرداخت مشتری: <code>{expectedGateway}</code>", html);
+        Assert.DoesNotContain(otherGateway, html);
+        Assert.Contains("سفارش: <code>sale-&lt;123&gt;</code>", html);
+        Assert.Contains("ربات فروشگاهی: <code>tenant-&lt;711&gt;</code> @shop&amp;bot", html);
+        Assert.Contains("مالک فروشگاه: <code>711</code>", html);
+        Assert.Contains("مشتری: <code>812</code>", html);
+        Assert.Contains("عملیات: <code>خرید اکانت</code>", html);
+        Assert.Contains("تایید سفارش: <code>تحویل انجام شد</code>", html);
+        Assert.Contains("سرویس: <code>normal&amp;fast</code>", html);
+        Assert.Contains($"مبلغ فروش: <code>{120_000L.FormatCurrency()}</code>", html);
+        Assert.Contains($"هزینه پایه همکار: <code>{90_000L.FormatCurrency()}</code>", html);
+        Assert.Contains($"سود همکار: <code>{30_000L.FormatCurrency()}</code>", html);
+        Assert.Contains($"تغییر موجودی مالک: <code>{(-90_000L).FormatCurrency()}</code>", html);
+        Assert.Contains("اکانت: <code>buyer&lt;&amp;&gt;@example.com</code>", html);
+        Assert.DoesNotContain("invoice-secret", html);
+        Assert.DoesNotContain("subscription-secret", html);
+        Assert.DoesNotContain("private-secret", html);
     }
 
     [Theory]

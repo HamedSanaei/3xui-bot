@@ -336,6 +336,19 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   Periodic polling remains the recovery/source-of-truth fallback because AtlasPay webhook delivery has no retry. Customer
   `apchk_<id>`/tenant checks and super-admin verification still converge on `ReconcilePaymentAsync`, so there is no second
   financial path and duplicate webhook deliveries remain idempotent.
+- AtlasPay tenant purchase reporting: `TenantBotService.ApplyPaidTenantOrderAsync` settles through the existing
+  one-time storefront fulfillment path, then `EnsureAtlasPayTenantPaymentAuditAsync` emits a separate protected
+  `LogPayment` receipt with local `AP:` id, provider order id, buyer/owner, tenant/order, service/plan/account,
+  customer base and charged total, invoice fee, owner base cost/profit, and provider status. It verifies reciprocal
+  payment/order links and settled fulfillment, and uses the
+  `SuccessLoggedAtUtc` marker to avoid repeat audits. The users.db marker and Telegram logger outbox are separate
+  databases: delivery/admission failure is not crash-atomic with the marker; check the logger destination/outbox
+  when a report is missing. Data-only migration `20260929120000_RequeueAtlasPayTenantPaymentAudits` clears historical
+  false markers for linked, already-fulfilled AtlasPay orders; `AtlasPayReconciliationHostedService` scans bounded
+  missing audits without re-inquiring the provider or re-running XUI/wallet/ledger/customer delivery. The original
+  purchase log is separate from this payment receipt. The Sales Assistant's existing durable one-send
+  `sales_assistant_sale_notification` includes the customer gateway from `TenantBotOrder.PaymentProvider` and
+  distinct sale/base/profit/owner-wallet amounts; customer payment source is not owner funding source.
 - AtlasPay super-admin verification: type `AP:<localId>` in the admin payment-status screen
   (`XuiV3AdminFlowService.TryHandleAtlasPayStatusAsync`). `AP:` is mandatory and bare ids are rejected, the row must
   exist locally (a raw provider order id can never be settled), and the action only calls the shared verification

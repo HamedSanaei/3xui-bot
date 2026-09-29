@@ -1208,14 +1208,18 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
         }
     }
 
-    /// <summary>Processes due AtlasPay automatic work without allowing broad polling to race the signed webhook path.</summary>
-    /// <param name="cancellationToken">Cancellation token for users.db reads and provider reconciliation.</param>
-    /// <returns>A task completing after the bounded due batch has been processed.</returns>
+    /// <summary>
+    /// Processes due AtlasPay automatic work and emits missing audits for already settled tenant purchases.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token for users.db reads, authenticated provider inquiries, and audit admission.</param>
+    /// <returns>A task completing after the bounded due payment and tenant-audit batches have been processed.</returns>
     /// <remarks>
-    /// Signed webhook receipts are processed first when configured, but the same bounded read-only polling fallback is
-    /// always retained. This prevents a provider-confirmed payment from becoming permanently stranded when webhook
-    /// delivery is delayed or missing. Legacy rows created by the previous webhook-only policy are recovered when their
-    /// reconciliation state is still active even if <see cref="AtlasPayPaymentInfo.NextInquiryAtUtc"/> is null.
+    /// Signed webhook receipts are processed first when configured, but the bounded read-only polling fallback is
+    /// always retained. This prevents a provider-confirmed payment from being stranded when webhook delivery is
+    /// delayed or missing. Legacy rows from the previous webhook-only policy are recovered while reconciliation
+    /// remains active even if <see cref="AtlasPayPaymentInfo.NextInquiryAtUtc"/> is null.
+    /// Tenant audits are a separate, bounded read of already settled and fulfilled orders: recovering a missing
+    /// central payment report must not issue another provider request, credit a wallet, or re-provision an account.
     /// </remarks>
     public async Task ReconcileDueAsync(CancellationToken cancellationToken = default)
     {
@@ -1274,6 +1278,50 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
 
             if (webhookTriggered)
                 await MarkWebhookProcessedIfConclusiveAsync(id, cancellationToken);
+        }
+        await EmitMissingTenantPaymentAuditsAsync(batch, cancellationToken);
+    }
+
+    /// <summary>
+    /// Replays only missing customer-payment audit admission for verified, fulfilled tenant AtlasPay sales.
+    /// </summary>
+    /// <param name="batchSize">Maximum settled users.db payments to examine in this scan; caller clamps it to 1–500.</param>
+    /// <param name="cancellationToken">Cancellation token for users.db and audit-outbox operations.</param>
+    /// <returns>A task completing after each selected receipt has been considered for central logging.</returns>
+    /// <remarks>
+    /// The migration clears legacy false <c>SuccessLoggedAtUtc</c> markers only for paid, linked tenant orders.
+    /// This scan also recovers a post-settlement crash before the payment report was admitted. The tenant service
+    /// rechecks the full payment/order link and marks only the audit, never financial or delivery state. An already
+    /// delivered Sales Assistant sale notification is not replayed.
+    /// </remarks>
+    private async Task EmitMissingTenantPaymentAuditsAsync(int batchSize, CancellationToken cancellationToken)
+    {
+        await using var db = _factory.CreateDbContext();
+        var ids = await db.AtlasPayPaymentInfos.AsNoTracking()
+            .Where(payment =>
+                payment.PaymentPurpose == TenantBotPaymentPurposes.TenantOrder &&
+                payment.SettlementState == AtlasPaySettlementStates.Settled &&
+                payment.IsAddedToBalance && payment.PaidAtUtc != null &&
+                (payment.ProviderStatus == "confirmed" || payment.ProviderStatus == "settled") &&
+                payment.SuccessLoggedAtUtc == null &&
+                db.TenantBotOrders.Any(order =>
+                    order.Id == payment.TenantBotOrderId &&
+                    order.AtlasPayPaymentInfoId == payment.Id &&
+                    order.TenantBotId == payment.BotId &&
+                    order.CustomerTelegramUserId == payment.TelegramUserId &&
+                    order.OwnerTelegramUserId == payment.TenantOwnerTelegramUserId &&
+                    order.SalePriceToman == payment.BaseAmountToman &&
+                    order.PaymentProvider == "atlaspay" && order.IsFulfilled))
+            .OrderBy(payment => payment.Id)
+            .Select(payment => payment.Id)
+            .Take(batchSize)
+            .ToListAsync(cancellationToken);
+
+        foreach (var id in ids)
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            await scope.ServiceProvider.GetRequiredService<TenantBotService>()
+                .EnsureAtlasPayTenantPaymentAuditAsync(id, cancellationToken);
         }
     }
 

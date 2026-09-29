@@ -337,6 +337,114 @@ public sealed partial class ConcurrencyTests
         Assert.Contains(payment.TrackingCode!, text);
         Assert.DoesNotContain(payment.ProviderOrderId!.Value.ToString(), text, StringComparison.Ordinal);
     }
+    /// <summary>Recovers one settled storefront payment audit without redoing fulfillment, balance, or customer delivery.</summary>
+    /// <returns>A task completing after protected Telegram delivery and replay guards are checked.</returns>
+    /// <remarks>
+    /// Regression: tenant AtlasPay settlement previously set the success marker without logging customer payment.
+    /// The reconciliation scan must queue one HTML-safe receipt for a linked fulfilled order, excluding a mismatched
+    /// owner without provider inquiry, another account, ledger entry, owner credit, or customer notification.
+    /// </remarks>
+    [Fact]
+    public async Task AtlasPay_fulfilled_tenant_payment_audit_is_queued_once_and_rejects_mismatched_owner()
+    {
+        using var databases = new Databases();
+        var (provider, _, clients) = IncidentProvider(databases, extraConfiguration: new Dictionary<string, string?>
+        {
+            ["loggerChannel"] = "-1001234567890",
+            ["bots:0:loggerChannel"] = "-1001234567890"
+        });
+        await using (provider)
+        {
+            int paymentId;
+            int rejectedId;
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                var order = new TenantBotOrder
+                {
+                    OrderId = "sale-<test>", TenantBotId = "tenant-audit", TenantBotUsername = "shop&bot",
+                    OwnerTelegramUserId = 711, CustomerTelegramUserId = 812, CustomerChatId = 812,
+                    SalePriceToman = 191_400, BaseCostToman = 127_600, ProfitToman = 63_800,
+                    OwnerWalletDelta = 63_800, PaymentProvider = "atlaspay",
+                    ServiceKey = "normal&fast", DurationKey = "monthly",
+                    CreatedAccountEmail = "buyer<&>@example.test",
+                    IsFulfilled = true, PaymentStatus = TenantBotOrderStatuses.Fulfilled,
+                    PaidAtUtc = DateTime.UtcNow, FulfilledAtUtc = DateTime.UtcNow,
+                    FulfillmentSource = "atlaspay-official"
+                };
+                db.TenantBotOrders.Add(order);
+                await db.SaveChangesAsync();
+                var payment = VerifiedAtlasPayment();
+                payment.PaymentPurpose = TenantBotPaymentPurposes.TenantOrder;
+                payment.BotId = order.TenantBotId; payment.TelegramUserId = order.CustomerTelegramUserId;
+                payment.TenantOwnerTelegramUserId = order.OwnerTelegramUserId;
+                payment.TenantBotOrderId = order.Id;
+                payment.BaseAmountToman = order.SalePriceToman; payment.TotalAmountToman = 214_618;
+                payment.ProviderOrderId = 11_634; payment.ProviderStatus = "settled";
+                payment.PaidAtUtc = DateTime.UtcNow; payment.SettledAtUtc = DateTime.UtcNow;
+                payment.SettlementState = AtlasPaySettlementStates.Settled; payment.IsAddedToBalance = true;
+                db.AtlasPayPaymentInfos.Add(payment);
+                await db.SaveChangesAsync();
+                order.AtlasPayPaymentInfoId = payment.Id;
+                paymentId = payment.Id;
+
+                var wrongOrder = new TenantBotOrder
+                {
+                    OrderId = "mismatch", TenantBotId = order.TenantBotId, TenantBotUsername = order.TenantBotUsername,
+                    OwnerTelegramUserId = 999, CustomerTelegramUserId = order.CustomerTelegramUserId,
+                    SalePriceToman = order.SalePriceToman, PaymentProvider = "atlaspay",
+                    IsFulfilled = true, PaymentStatus = TenantBotOrderStatuses.Fulfilled,
+                    PaidAtUtc = DateTime.UtcNow, FulfilledAtUtc = DateTime.UtcNow
+                };
+                db.TenantBotOrders.Add(wrongOrder);
+                await db.SaveChangesAsync();
+                var rejected = VerifiedAtlasPayment();
+                rejected.MerchantOrderRef = "AtlasPay-owner-mismatch";
+                rejected.PaymentPurpose = TenantBotPaymentPurposes.TenantOrder;
+                rejected.BotId = wrongOrder.TenantBotId; rejected.TelegramUserId = wrongOrder.CustomerTelegramUserId;
+                rejected.TenantOwnerTelegramUserId = 711; rejected.TenantBotOrderId = wrongOrder.Id;
+                rejected.BaseAmountToman = wrongOrder.SalePriceToman; rejected.TotalAmountToman = 214_618;
+                rejected.ProviderOrderId = 11_635; rejected.ProviderStatus = "settled";
+                rejected.PaidAtUtc = DateTime.UtcNow; rejected.SettledAtUtc = DateTime.UtcNow;
+                rejected.SettlementState = AtlasPaySettlementStates.Settled; rejected.IsAddedToBalance = true;
+                db.AtlasPayPaymentInfos.Add(rejected);
+                await db.SaveChangesAsync();
+                wrongOrder.AtlasPayPaymentInfoId = rejected.Id;
+                rejectedId = rejected.Id;
+                await db.SaveChangesAsync();
+            }
+
+            await using var scope = provider.CreateAsyncScope();
+            var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
+            await provider.GetRequiredService<AtlasPayReconciliationHostedService>().ReconcileDueAsync(default);
+            Assert.False(await service.EnsureAtlasPayTenantPaymentAuditAsync(paymentId, default));
+            Assert.False(await service.EnsureAtlasPayTenantPaymentAuditAsync(rejectedId, default));
+
+            await using var verify = databases.Users.CreateDbContext();
+            Assert.NotNull((await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId)).SuccessLoggedAtUtc);
+            Assert.Null((await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == rejectedId)).SuccessLoggedAtUtc);
+            Assert.Empty(await verify.TenantBotLedgerEntries.ToListAsync());
+            Assert.Empty(await verify.TenantOrderNotifications.ToListAsync());
+            await using var credentials = databases.Credentials.CreateDbContext();
+            Assert.Empty(await credentials.WalletOperations.ToListAsync());
+
+            // The production dispatcher can drain its durable row immediately. Observe the
+            // Telegram transport rather than racing the pending-outbox table.
+            await UntilAsync(() => Task.FromResult(
+                clients.TryGetValue("main", out var client) &&
+                client.Texts.Any(message => message.Contains($"AP:{paymentId}", StringComparison.Ordinal))));
+            var text = Assert.Single(clients["main"].Texts,
+                message => message.Contains($"AP:{paymentId}", StringComparison.Ordinal));
+            Assert.Contains("sale-&lt;test&gt;", text);
+            Assert.Contains("shop&amp;bot", text);
+            Assert.Contains(214_618L.FormatCurrency(), text);
+            Assert.Contains("normal&amp;fast", text);
+            Assert.Contains("monthly", text);
+            Assert.Contains("buyer&lt;&amp;&gt;@example.test", text);
+            Assert.Contains(127_600L.FormatCurrency(), text);
+            Assert.Contains(63_800L.FormatCurrency(), text);
+        }
+    }
+
     [Fact]
     public async Task AtlasPay_owned_settlement_credits_base_amount_exactly_once_with_ledger_and_notification()
     {
@@ -1015,7 +1123,6 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied);
         Assert.Contains("20260923083845_TenantCustomerWallet", applied);
         Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", applied);
-        Assert.Equal("20260924023225_TenantCustomerWalletOwnerActivation", applied[^1]);
         var connection = fixtureUsers.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open) await connection.OpenAsync();
         await using var tableCommand = connection.CreateCommand();
@@ -1750,7 +1857,6 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("20260919210134_AddXuiV3RenewalManualReviewLifecycle", applied);
         Assert.Contains("20260923083845_TenantCustomerWallet", applied);
         Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", applied);
-        Assert.Equal("20260924023225_TenantCustomerWalletOwnerActivation", applied[^1]);
             var multiBotIndex = applied.FindIndex(x => x == "20260625000000_AddMultiBotState");
             Assert.True(multiBotIndex >= 0 && multiBotIndex < applied.Count - 1);
             var connection = users.Database.GetDbConnection();
@@ -1780,8 +1886,6 @@ public sealed partial class ConcurrencyTests
             Assert.Contains("20260923083845_TenantCustomerWallet", history);
             Assert.Contains("20260923100853_TenantCustomerWalletBotIdentityBinding", history);
             Assert.Contains("20260924004926_AtlasPayWebhookPrimaryAndManualApproval", history);
-            // The latest migration adds only the owner-side wallet opt-in with false default, preserving fail-closed rollout.
-            Assert.Equal("20260924023225_TenantCustomerWalletOwnerActivation", history[^1]);
             command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='TenantCardProvisionalOperations';";
             Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
             command.CommandText = "SELECT COUNT(*) FROM TenantCardProvisionalOperations;";

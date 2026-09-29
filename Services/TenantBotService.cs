@@ -8648,6 +8648,20 @@ public partial class TenantBotService
         return await FULFILLPAIDTENANTORDERASYNC(order, Source, payment, null, false, CancellationToken, retryAuthorization);
     }
 
+    /// <summary>
+    /// Settles a provider-confirmed AtlasPay tenant order through the one-time storefront fulfillment path.
+    /// </summary>
+    /// <param name="payment">Users.db tenant-order AtlasPay row already verified against the provider; never a wallet top-up.</param>
+    /// <param name="Source">Non-secret callback, inquiry, or operator confirmation source.</param>
+    /// <param name="CancellationToken">Cancels database, fulfillment, and audit operations.</param>
+    /// <param name="retryAuthorization">Optional explicit super-admin authorization for a rejected provisioning attempt.</param>
+    /// <returns>The fulfillment result, or already added for a settled payment; no financial work is repeated on that path.</returns>
+    /// <remarks>
+    /// A successful settlement first persists the payment state, then emits the separately guarded AtlasPay customer
+    /// payment audit. An already settled payment can repair a missing audit without reentering XUI, balance, ledger,
+    /// or customer delivery. The fulfillment path still owns all financial and provisioning effects.
+    /// </remarks>
+    /// <example><code>await tenantBotService.ApplyPaidTenantOrderAsync(verifiedPayment, "inquiry", cancellationToken);</code></example>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         AtlasPayPaymentInfo payment, string Source, CancellationToken CancellationToken = default,
         TenantProvisioningRetryAuthorization retryAuthorization = null)
@@ -8657,8 +8671,14 @@ public partial class TenantBotService
             return NowPaymentsSettlementResult.ProviderNotPaid();
         payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.FirstOrDefaultAsync(x => x.Id == payment.Id, CancellationToken));
         if (payment == null) return NowPaymentsSettlementResult.NotFound();
+        if (!string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) ||
+            !AtlasPayStatuses.IsSuccess(payment.ProviderStatus) || payment.RequiresManualDelivery || !payment.PaidAtUtc.HasValue)
+            return NowPaymentsSettlementResult.ProviderNotPaid();
         if (payment.IsAddedToBalance || payment.SettlementState == AtlasPaySettlementStates.Settled)
+        {
+            await EnsureAtlasPayTenantPaymentAuditAsync(payment.Id, CancellationToken);
             return NowPaymentsSettlementResult.AlreadyAdded(payment.BalanceAfter ?? 0);
+        }
         if (payment.SettlementState == AtlasPaySettlementStates.ManualReview) return NowPaymentsSettlementResult.ProviderNotPaid();
         if (payment.SettlementState == AtlasPaySettlementStates.Processing)
         {
@@ -8706,7 +8726,7 @@ public partial class TenantBotService
             payment.IsAddedToBalance = true; payment.SettlementState = AtlasPaySettlementStates.Settled;
             payment.SettlementAttemptId = null; payment.SettlementStartedAtUtc = null; payment.SettledAtUtc ??= order.FulfilledAtUtc ?? DateTime.UtcNow;
             payment.BalanceBefore = settlement.BeforeBalance; payment.BalanceAfter = settlement.AfterBalance; payment.NextInquiryAtUtc = null;
-            payment.ErrorCode = null; payment.ErrorMessage = null; payment.SuccessLoggedAtUtc ??= DateTime.UtcNow; payment.UpdatedAtUtc = DateTime.UtcNow;
+            payment.ErrorCode = null; payment.ErrorMessage = null; payment.UpdatedAtUtc = DateTime.UtcNow;
         }
         else if (settlement.Status is NowPaymentsSettlementStatus.UserNotFound or NowPaymentsSettlementStatus.PaymentNotFound)
         {
@@ -8719,7 +8739,103 @@ public partial class TenantBotService
             payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.ErrorCode = "tenant_fulfillment_ambiguous";
             payment.NextInquiryAtUtc = null; payment.UpdatedAtUtc = DateTime.UtcNow;
         }
-        await _workflow.SaveAsync(CancellationToken); return settlement;
+        await _workflow.SaveAsync(CancellationToken);
+        if (settlement.Status is NowPaymentsSettlementStatus.Applied or NowPaymentsSettlementStatus.AlreadyAdded)
+            await EnsureAtlasPayTenantPaymentAuditAsync(payment.Id, CancellationToken);
+        return settlement;
+    }
+
+    /// <summary>
+    /// Emits the missing AtlasPay customer-payment receipt for an already settled, fulfilled tenant order.
+    /// </summary>
+    /// <param name="paymentId">Positive users.db AtlasPay payment primary key, not a provider order id.</param>
+    /// <param name="cancellationToken">Cancellation of the short users.db audit transaction.</param>
+    /// <returns>
+    /// <c>true</c> when the payment log was submitted to the central logger and the UTC marker committed;
+    /// <c>false</c> when already marked or not eligible. The logger controls whether it can durably accept delivery.
+    /// </returns>
+    /// <remarks>
+    /// Called after first settlement and by audit recovery after false historical markers have been cleared.
+    /// A conditional write takes the users.db SQLite write lock before reading and checking the payment/order,
+    /// preventing parallel callers from enqueueing the same unmarked row under deferred transactions.
+    /// After verifying official success, reciprocal identities/amounts, and fulfilled state, this method submits
+    /// the payment log with stored plan, account, customer charge, provider fee, owner cost and profit, then commits
+    /// the marker. The logger outbox and users.db are separate databases: a crash or
+    /// ambiguous commit between these operations cannot provide cross-database exactly-once delivery.
+    /// Logger failures may also be contained internally and are not an acknowledgement of outbox acceptance.
+    /// It never invokes XUI, credits a wallet, appends a ledger entry, changes an order, or resends a notification.
+    /// </remarks>
+    /// <example><code>var logged = await tenantBotService.EnsureAtlasPayTenantPaymentAuditAsync(paymentId, cancellationToken);</code></example>
+    public Task<bool> EnsureAtlasPayTenantPaymentAuditAsync(int paymentId, CancellationToken cancellationToken)
+    {
+        if (paymentId <= 0)
+            return Task.FromResult(false);
+
+        return _workflow.WriteAsync(async db =>
+        {
+            await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+            // Claim the SQLite writer slot before any read: a deferred read transaction alone allows two log enqueues.
+            // The self-assignment changes no stored values; only the later audit marker commit records the event.
+            var claimed = await db.AtlasPayPaymentInfos
+                .Where(x => x.Id == paymentId && x.SuccessLoggedAtUtc == null)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.UpdatedAtUtc, x => x.UpdatedAtUtc),
+                    cancellationToken);
+            if (claimed != 1)
+                return false;
+            var payment = await db.AtlasPayPaymentInfos.FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
+            if (payment == null || payment.SuccessLoggedAtUtc.HasValue ||
+                !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) ||
+                !AtlasPayStatuses.IsSuccess(payment.ProviderStatus) || payment.RequiresManualDelivery ||
+                !payment.PaidAtUtc.HasValue || !payment.SettledAtUtc.HasValue ||
+                !payment.IsAddedToBalance || payment.SettlementState != AtlasPaySettlementStates.Settled ||
+                !payment.ProviderOrderId.HasValue || payment.ProviderOrderId <= 0 ||
+                payment.BaseAmountToman <= 0 || !payment.TotalAmountToman.HasValue ||
+                payment.TotalAmountToman < payment.BaseAmountToman ||
+                !payment.TenantBotOrderId.HasValue)
+                return false;
+
+            var order = await db.TenantBotOrders.FirstOrDefaultAsync(
+                x => x.Id == payment.TenantBotOrderId.Value, cancellationToken);
+            if (order == null || order.AtlasPayPaymentInfoId != payment.Id ||
+                !string.Equals(order.PaymentProvider, "atlaspay", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(order.TenantBotId) || string.IsNullOrWhiteSpace(order.OrderId) ||
+                !string.Equals(order.TenantBotId, payment.BotId, StringComparison.Ordinal) ||
+                order.OwnerTelegramUserId <= 0 || order.CustomerTelegramUserId <= 0 ||
+                order.OwnerTelegramUserId != payment.TenantOwnerTelegramUserId ||
+                order.CustomerTelegramUserId != payment.TelegramUserId ||
+                order.SalePriceToman != payment.BaseAmountToman ||
+                !order.IsFulfilled || order.PaymentStatus != TenantBotOrderStatuses.Fulfilled ||
+                !order.PaidAtUtc.HasValue || !order.FulfilledAtUtc.HasValue)
+                return false;
+
+            var fee = payment.TotalAmountToman.Value - payment.BaseAmountToman;
+            _logger.LogPayment(
+                "✅ پرداخت رسمی AtlasPay مشتری فروشگاه تایید شد\n\n" +
+                $"ربات tenant: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
+                $"Order ID: <code>{Html(order.OrderId)}</code>\n" +
+                $"نوع سفارش: <code>{Html(order.OrderKind)}</code>\n" +
+                $"سرویس: <code>{Html(order.ServiceKey)}</code>\n" +
+                $"پلن: <code>{Html(order.UnlimitedPlanKey ?? order.DurationKey)}</code>\n" +
+                $"تعداد اکانت: <code>{order.AccountCount}</code>\n" +
+                $"مشتری: <code>{order.CustomerTelegramUserId}</code>\n" +
+                $"مالک فروشگاه: <code>{order.OwnerTelegramUserId}</code>\n" +
+                $"Payment ID: <code>AP:{payment.Id}</code>\n" +
+                $"Provider Order ID: <code>{payment.ProviderOrderId}</code>\n" +
+                $"مبلغ پایه (تومان): <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+                $"مبلغ پرداخت‌شده فاکتور (تومان): <code>{Html(payment.TotalAmountToman.Value.FormatCurrency())}</code>\n" +
+                $"هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
+                $"سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
+                $"کارمزد/اختلاف فاکتور (تومان): <code>{Html(fee.FormatCurrency())}</code>\n" +
+                $"وضعیت provider: <code>{Html(payment.ProviderStatus)}</code>\n" +
+                $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>\n" +
+                $"منبع تایید: <code>{Html(order.FulfillmentSource ?? "-")}</code>");
+
+            payment.SuccessLoggedAtUtc = DateTime.UtcNow;
+            payment.UpdatedAtUtc = DateTime.UtcNow;
+            await db.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return true;
+        }, cancellationToken);
     }
 
     /// <summary>
@@ -12367,16 +12483,17 @@ public partial class TenantBotService
             callbackTotal.TotalMilliseconds);
     }
 
-    /// <summary>Maps the persisted order gateway to a safe customer-payment label for purchase and renewal logs.</summary>
-    /// <param name="provider">Nullable provider key from the tenant order, never a credential.</param>
-    /// <returns>A fixed display label; unknown values are not echoed into logs.</returns>
+    /// <summary>Maps the persisted tenant order gateway to a fixed customer-payment label shared by purchase and assistant audits.</summary>
+    /// <param name="provider">Nullable, untrusted provider key from a tenant order; never a credential.</param>
+    /// <returns>A fixed Persian display label, or <c>نامشخص</c> for unknown/null providers; never echoes external text.</returns>
     /// <remarks>This is presentation only and does not identify or change the owner's funding source.</remarks>
-    /// <example><code>var label = TenantPaymentProviderLabel(order.PaymentProvider);</code></example>
-    private static string TenantPaymentProviderLabel(string provider) => provider?.Trim().ToLowerInvariant() switch
+    /// <example><code>var label = TenantBotService.TenantPaymentProviderLabel(order.PaymentProvider);</code></example>
+    internal static string TenantPaymentProviderLabel(string provider) => provider?.Trim().ToLowerInvariant() switch
     {
         "wallet" => "کیف پول مشتری",
         "tenant_card" => "کارت‌به‌کارت شخصی فروشگاه",
         "hooshpay" => "هوش‌پی",
+        "atlaspay" => "اطلس‌پی",
         "tetraminator" => "تترامیناتور",
         "nowpayments" or "swapino" => "NOWPayments",
         "uniquepay" => "یونیک‌پی",

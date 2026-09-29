@@ -105,15 +105,13 @@ public class SalesAssistantService
     }
 
     /// <summary>
-    /// NOTIFIES A tenant owner in the assistant Bot after A tenant sale has been fulfilled.
+    /// Attempts the owner-facing sale report after fulfillment using the persisted customer payment method.
     /// </summary>
-    /// <param name="order">fulfilled tenant order containing customer, account, sale, cost, and owner-balance Data.</param>
-    /// <param name="beforeBalance">tenant owner wallet balance in toman before the sale ledger EFFECT.</param>
-    /// <param name="afterBalance">tenant owner wallet balance in toman after the sale ledger EFFECT.</param>
-    /// <param name="CancellationToken">Cancellation Token for Telegram delivery.</param>
-    /// <remarks>
-    /// delivery is best-effort. A failed assistant notification must not ROLL back account fulfillment or wallet ledger Writes.
-    /// </remarks>
+    /// <param name="order">Fulfilled tenant order whose buyer, owner, storefront, and financial facts appear in the report.</param>
+    /// <param name="beforeBalance">Owner's bot-wallet balance in toman before settlement.</param>
+    /// <param name="afterBalance">Owner's bot-wallet balance in toman after settlement.</param>
+    /// <param name="CancellationToken">Cancellation token for the Sales Assistant Telegram send.</param>
+    /// <remarks>Best effort: a failed send is logged and cannot roll back fulfillment or wallet changes. Durable outbox callers use <see cref="SENDTENANTSALEASYNC"/> directly to acknowledge one Telegram message.</remarks>
     public async Task NOTIFYTENANTSALEASYNC(TenantBotOrder order, long beforeBalance, long afterBalance, CancellationToken CancellationToken)
     {
         try { await SENDTENANTSALEASYNC(order, beforeBalance, afterBalance, CancellationToken); }
@@ -123,25 +121,67 @@ public class SalesAssistantService
         }
     }
 
-    /// <summary>Sends one tenant-sale notification and returns a concrete Telegram message id for durable outbox acknowledgement.</summary>
+    /// <summary>
+    /// Sends the fulfilled tenant order's customer-payment and sale report through the existing Sales Assistant outbox.
+    /// </summary>
+    /// <param name="order">Persisted tenant-scoped fulfilled order containing the buyer, owner, purchase and settlement amounts.</param>
+    /// <param name="beforeBalance">Owner's bot-wallet balance in toman before settlement, or zero when no snapshot was persisted.</param>
+    /// <param name="afterBalance">Owner's bot-wallet balance in toman after settlement, or zero when no snapshot was persisted.</param>
+    /// <param name="cancellationToken">Cancellation token for the single Telegram delivery attempt.</param>
+    /// <returns>The Telegram message id to acknowledge in the durable outbox, or null when the assistant bot is unavailable.</returns>
+    /// <remarks>
+    /// The persisted customer provider is independent of the owner's funding source and wallet delta. The caller
+    /// owns outbox acknowledgement and ambiguous-delivery handling; this method never creates or replays intents.
+    /// </remarks>
+    /// <example><code>var messageId = await assistant.SENDTENANTSALEASYNC(order, order.OwnerBalanceBefore ?? 0, order.OwnerBalanceAfter ?? 0, cancellationToken);</code></example>
     public async Task<int?> SENDTENANTSALEASYNC(TenantBotOrder order, long beforeBalance, long afterBalance, CancellationToken cancellationToken)
     {
         var assistant = GetAssistantBot();
         if (assistant == null || !assistant.Enabled || string.IsNullOrWhiteSpace(assistant.Token)) return null;
-        var text =
-            "✅ <b>فروش ربات همکار انجام شد</b>\n\n" +
-            $"🤖 ربات: <code>{Html(order.TenantBotUsername)}</code>\n" +
-            $"🧾 سفارش: <code>{Html(order.OrderId)}</code>\n" +
-            $"👤 مشتری: <code>{order.CustomerTelegramUserId}</code>\n" +
-            $"💰 مبلغ فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
-            $"📌 هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
-            $"📈 تغییر موجودی: <code>{Html(order.OwnerWalletDelta.FormatCurrency())}</code>\n" +
-            $"💳 موجودی قبل: <code>{Html(beforeBalance.FormatCurrency())}</code>\n" +
-            $"💳 موجودی بعد: <code>{Html(afterBalance.FormatCurrency())}</code>\n" +
-            $"📦 اکانت: <code>{Html(order.CreatedAccountEmail)}</code>";
+        var text = BuildTenantSaleNotificationHtml(order, beforeBalance, afterBalance);
         var sent = await _botClientProvider.GetClient(assistant.Id).SendMessage(
             order.OwnerTelegramUserId, text, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
         return sent.MessageId;
+    }
+
+    /// <summary>
+    /// Formats the persisted tenant purchase and settlement facts for one owner-facing sale notification.
+    /// </summary>
+    /// <param name="order">Fulfilled tenant order; its provider identifies the customer's payment, not the owner's gateway.</param>
+    /// <param name="beforeBalance">Owner's bot-wallet balance before settlement in toman, or zero for historical missing snapshots.</param>
+    /// <param name="afterBalance">Owner's bot-wallet balance after settlement in toman, or zero for historical missing snapshots.</param>
+    /// <returns>HTML-escaped sale report safe for the Sales Assistant Telegram message body.</returns>
+    /// <remarks>Only order identity, plan keys, account email and financial totals are exposed. Payment URLs, subscription links, account JSON and gateway credentials are never rendered. No financial or delivery state is changed.</remarks>
+    /// <example><code>var text = BuildTenantSaleNotificationHtml(order, order.OwnerBalanceBefore ?? 0, order.OwnerBalanceAfter ?? 0);</code></example>
+    internal static string BuildTenantSaleNotificationHtml(TenantBotOrder order, long beforeBalance, long afterBalance)
+    {
+        var operation = order.OrderKind switch
+        {
+            TenantBotOrderKinds.Renew => "تمدید اکانت",
+            TenantBotOrderKinds.WalletCharge => "شارژ کیف پول مشتری",
+            _ => "خرید اکانت"
+        };
+        var plan = order.UnlimitedPlanKey ?? order.DurationKey;
+        var traffic = order.TrafficGb is > 0 ? $"💾 حجم: <code>{order.TrafficGb} GB</code>\n" : string.Empty;
+        return "✅ <b>فروش ربات همکار انجام شد</b>\n\n" +
+               $"🤖 ربات فروشگاهی: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
+               $"🧾 سفارش: <code>{Html(order.OrderId)}</code>\n" +
+               $"📌 عملیات: <code>{operation}</code>\n" +
+               $"✅ تایید سفارش: <code>{(order.IsFulfilled ? "تحویل انجام شد" : "در انتظار تحویل")}</code>\n" +
+               $"💳 روش پرداخت مشتری: <code>{Html(TenantBotService.TenantPaymentProviderLabel(order.PaymentProvider))}</code>\n" +
+               $"👤 مالک فروشگاه: <code>{order.OwnerTelegramUserId}</code>\n" +
+               $"👤 مشتری: <code>{order.CustomerTelegramUserId}</code>\n" +
+               $"📦 سرویس: <code>{Html(order.ServiceKey)}</code>\n" +
+               $"📦 پلن: <code>{Html(string.IsNullOrWhiteSpace(plan) ? "ثبت نشده" : plan)}</code>\n" +
+               traffic +
+               $"🔢 تعداد اکانت: <code>{order.AccountCount}</code>\n" +
+               $"💰 مبلغ فروش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
+               $"📌 هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
+               $"📈 سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
+               $"📊 تغییر موجودی مالک: <code>{Html(order.OwnerWalletDelta.FormatCurrency())}</code>\n" +
+               $"💳 موجودی مالک قبل: <code>{Html(beforeBalance.FormatCurrency())}</code>\n" +
+               $"💳 موجودی مالک بعد: <code>{Html(afterBalance.FormatCurrency())}</code>\n" +
+               $"📦 اکانت: <code>{Html(order.CreatedAccountEmail)}</code>";
     }
 
     /// <summary>
