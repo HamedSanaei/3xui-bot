@@ -94,6 +94,7 @@
   "atlasPayEnabled": false,
   "atlasPayApiKey": "",
   "atlasPayWebhookSecret": "",
+  "atlasPayWebhookUrl": "",
   "atlasPayBaseUrl": "https://api.atlaspay.space/api/v1",
   "atlasPayRequestTimeoutSeconds": 15,
   "atlasPayInquiryRetryCount": 3,

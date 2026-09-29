@@ -299,11 +299,16 @@ public sealed class AtlasPayPaymentInfo
     }
 }
 
+/// <summary>Creation payload for a wallet or tenant AtlasPay order, including its optional callback override.</summary>
+/// <remarks>The callback URL routes signed events to this application; the signing secret is never sent in this payload.</remarks>
 public sealed class AtlasPayCreateOrderRequest
 {
     [JsonProperty("merchantOrderRef")] public string MerchantOrderRef { get; set; }
     [JsonProperty("baseAmountToman")] public long BaseAmountToman { get; set; }
     [JsonProperty("customerTelegramId")] public long CustomerTelegramId { get; set; }
+    /// <summary>Optional HTTPS callback endpoint for this order, overriding the merchant account's webhook URL.</summary>
+    /// <remarks>Null is omitted so AtlasPay can use the account-wide setting or the normal polling fallback.</remarks>
+    [JsonProperty("webhookUrl", NullValueHandling = NullValueHandling.Ignore)] public string WebhookUrl { get; set; }
 }
 
 public sealed class AtlasPayCreateOrderResponse
@@ -430,6 +435,10 @@ public sealed class AtlasPay
         _baseUri = ValidateBaseUrl(_configuration.AtlasPayBaseUrl);
     }
 
+    /// <summary>Validates the configured AtlasPay API root before sending requests.</summary>
+    /// <param name="value">Required absolute HTTPS provider API root from application configuration.</param>
+    /// <returns>The normalized provider URI, ready to resolve relative order endpoints.</returns>
+    /// <exception cref="InvalidOperationException">The configured URL is not absolute HTTPS with a host.</exception>
     public static Uri ValidateBaseUrl(string value)
     {
         if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
@@ -437,6 +446,24 @@ public sealed class AtlasPay
             string.IsNullOrWhiteSpace(uri.Host))
             throw new InvalidOperationException("AtlasPay base URL must be an absolute HTTPS URL.");
         return new Uri(uri.AbsoluteUri.TrimEnd('/') + "/", UriKind.Absolute);
+    }
+
+    /// <summary>Validates the public endpoint used as AtlasPay's per-order callback override.</summary>
+    /// <param name="value">Required, externally reachable HTTPS callback URL from application configuration; no credentials, query, or fragment.</param>
+    /// <returns>The validated URI pointing exactly to this application's <c>/atlaspay-webhook</c> route.</returns>
+    /// <remarks>Use the merchant's existing webhook secret for signature verification; this method never registers or rotates it.</remarks>
+    /// <exception cref="InvalidOperationException">The callback URL is unsafe or cannot reach the declared receiver route.</exception>
+    public static Uri ValidateWebhookUrl(string value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+            !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(uri.Host) ||
+            !string.IsNullOrEmpty(uri.UserInfo) ||
+            !string.IsNullOrEmpty(uri.Query) ||
+            !string.IsNullOrEmpty(uri.Fragment) ||
+            !string.Equals(uri.AbsolutePath, "/atlaspay-webhook", StringComparison.Ordinal))
+            throw new InvalidOperationException("AtlasPay webhook URL must be an absolute HTTPS URL ending in /atlaspay-webhook without credentials, query, or fragment.");
+        return uri;
     }
 
     public static bool IsDefinitiveCreateFailure(Exception exception)
@@ -491,6 +518,22 @@ public sealed class AtlasPay
         return value.Length <= 500 ? value : value[..500];
     }
 
+    /// <summary>Creates one AtlasPay order with the configured per-order signed webhook destination when available.</summary>
+    /// <param name="merchantOrderRef">Required unique merchant reference persisted with the owned or tenant payment before this non-retried POST.</param>
+    /// <param name="baseAmountToman">Customer base amount in Iranian toman; must be within AtlasPay's supported 50,000–2,000,000 range.</param>
+    /// <param name="customerTelegramId">Positive Telegram user id of the purchasing customer, from the persisted payment row.</param>
+    /// <param name="cancellationToken">Cancellation of the outbound provider request; a timeout can leave creation ambiguous.</param>
+    /// <returns>Provider order metadata to persist before showing the payment link; not proof of payment or fulfillment.</returns>
+    /// <remarks>
+    /// Both wallet and tenant callers share this request. The webhook override is sent only with a valid HTTPS endpoint
+    /// and the account's already registered signing secret. No webhook receipt directly settles a payment: the existing
+    /// controller verifies the signature and the worker fetches the authoritative order; polling still recovers missed events.
+    /// Never retry an ambiguous creation because AtlasPay creation has no idempotency guarantee.
+    /// </remarks>
+    /// <exception cref="AtlasPayCreateValidationException">A required order identity or supported amount is invalid.</exception>
+    /// <exception cref="InvalidOperationException">The API key or configured webhook destination/secret is unusable.</exception>
+    /// <exception cref="AtlasPayApiException">The provider rejects, times out, or returns an invalid creation response.</exception>
+    /// <example><code>var invoice = await atlasPay.CreateOrderAsync(payment.MerchantOrderRef, payment.BaseAmountToman, payment.TelegramUserId, cancellationToken);</code></example>
     public async Task<AtlasPayCreateOrderResponse> CreateOrderAsync(string merchantOrderRef, long baseAmountToman,
         long customerTelegramId, CancellationToken cancellationToken = default)
     {
@@ -503,8 +546,19 @@ public sealed class AtlasPay
             throw new AtlasPayCreateValidationException(
                 $"مبلغ سفارش اطلس‌پی باید بین {MinimumBaseAmountToman:N0} تا {MaximumBaseAmountToman:N0} تومان باشد.");
 
+        string webhookUrl = null;
+        if (!string.IsNullOrWhiteSpace(_configuration.AtlasPayWebhookUrl))
+        {
+            if (string.IsNullOrWhiteSpace(_configuration.AtlasPayWebhookSecret))
+                throw new InvalidOperationException("AtlasPay per-order webhook requires a configured signing secret.");
+            webhookUrl = ValidateWebhookUrl(_configuration.AtlasPayWebhookUrl).AbsoluteUri;
+        }
+
         var request = new AtlasPayCreateOrderRequest
-        { MerchantOrderRef = merchantOrderRef, BaseAmountToman = baseAmountToman, CustomerTelegramId = customerTelegramId };
+        {
+            MerchantOrderRef = merchantOrderRef, BaseAmountToman = baseAmountToman,
+            CustomerTelegramId = customerTelegramId, WebhookUrl = webhookUrl
+        };
         var response = await SendAsync(HttpMethod.Post, "orders", request, retryReadOnly: false, cancellationToken);
         AtlasPayCreateOrderResponse result;
         try { result = JsonConvert.DeserializeObject<AtlasPayCreateOrderResponse>(response); }

@@ -126,6 +126,28 @@ know: unknown keys are ignored by the configuration binder, so a newer configura
 an older configuration stays usable by a newer build. Every message it produces names a configuration key and never
 echoes a configured value, a chat id, a bot token, or a panel secret.
 
+## AtlasPay callback activation
+
+`POST /atlaspay-webhook` is the public HTTPS receiver. AtlasPay section 3.8 requires a merchant
+webhook signing secret: register the receiver once with `POST /webhook` (or use the mini-app settings),
+store the one-time `webhookSecret` as `atlasPayWebhookSecret` in the **existing** persistent
+`Data/configuration.json` or a protected secret source, and keep it out of logs/source control.
+Registration rotates/returns the secret; do not repeat it on each startup or order. `GET /webhook`
+can confirm the registered account URL without exposing the secret.
+
+Set `atlasPayWebhookUrl` to the externally reachable `https://<payment-host>/atlaspay-webhook` to
+send that URL as the per-order `webhookUrl` in section 3.1 for **new** AtlasPay wallet and tenant
+orders. This override uses the same registered merchant secret. If the account-wide URL already
+points here, the override is optional; leave it empty to use the account URL. Add only the intended
+keys to the persistent configuration—do not rebuild it from the example—and deploy the same values
+on each payment-server instance. Invalid HTTPS routes or a missing secret reject startup when
+AtlasPay is enabled. Allow inbound HTTPS POST through the reverse proxy to this route.
+
+The receiver checks HMAC against the raw body, stores the hint, and returns quickly; the worker
+fetches `GET /orders/{id}` before applying any payment/fulfillment change. AtlasPay sends no retry
+after a failed callback; bounded polling and customer/super-admin checks still recover missed
+notifications. Existing invoices keep their original account-wide destination.
+
 ## Test schema policy
 
 The general concurrency fixture in `Adminbot.Tests/ConcurrencyTests.cs` uses `EnsureCreated` only for short-lived unit

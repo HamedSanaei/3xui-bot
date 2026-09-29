@@ -332,12 +332,22 @@ namespace Adminbot.Domain
         /// Secret returned once by AtlasPay when the optional merchant webhook is registered.
         /// </summary>
         /// <remarks>
-        /// The value authenticates <c>POST /atlaspay-webhook</c> with HMAC-SHA256. When configured, signed webhook
-        /// receipt becomes the only automatic provider-inquiry admission; broad periodic invoice polling is disabled.
-        /// Customer/super-admin checks remain explicit recovery actions. The secret must never be logged, sent to Telegram,
-        /// or committed to source control.
+        /// The value authenticates <c>POST /atlaspay-webhook</c> with HMAC-SHA256. Configure it from the one-time
+        /// <c>POST /webhook</c> response before setting <see cref="AtlasPayWebhookUrl"/> for per-order delivery.
+        /// Signed receipts wake the authoritative inquiry; bounded periodic polling remains the fallback because
+        /// AtlasPay does not retry callbacks. Never log, send to Telegram, or commit the secret to source control.
         /// </remarks>
         public string AtlasPayWebhookSecret { get; set; }
+        /// <summary>
+        /// Public HTTPS URL of this application's <c>POST /atlaspay-webhook</c> endpoint, sent as the optional
+        /// per-order <c>webhookUrl</c> on every new AtlasPay wallet-charge or tenant invoice.
+        /// </summary>
+        /// <remarks>
+        /// Leave empty to use the account-wide URL registered directly with AtlasPay (or polling if none exists).
+        /// When set, <see cref="AtlasPayWebhookSecret"/> must hold the merchant's previously registered signing
+        /// secret; the order override does not generate a new secret. Use the externally reachable HTTPS host.
+        /// </remarks>
+        public string AtlasPayWebhookUrl { get; set; }
         public string AtlasPayBaseUrl { get; set; } = "https://api.atlaspay.space/api/v1";
         public int AtlasPayRequestTimeoutSeconds { get; set; } = 15;
         public int AtlasPayInquiryRetryCount { get; set; } = 3;
@@ -350,11 +360,11 @@ namespace Adminbot.Domain
         /// the customer presses the check button.
         /// </summary>
         /// <remarks>
-        /// Customer checks always perform a real provider request when admitted by this cooldown. When the signed webhook is
-        /// configured, broad automatic invoice polling is disabled; only a durable received webhook event may trigger automatic
-        /// inquiry. This cooldown is measured from the last inquiry, so repeated button presses cannot bypass the provider rate limit. Values are
-        /// clamped to 0..3600 seconds; 0 disables the cooldown. While the cooldown is active the user is answered from
-        /// local state and no financial state changes.
+        /// Admitted customer checks inquire the provider even when a signed webhook is configured. Callback receipts
+        /// also trigger immediate inquiries, while bounded automatic polling recovers notifications that AtlasPay never
+        /// retries. The cooldown is measured from the last inquiry so repeated button presses cannot bypass the
+        /// provider rate limit. Values are clamped to 0..3600 seconds; 0 disables the cooldown. While active, the
+        /// customer sees local state and no financial state changes.
         /// </remarks>
         public int AtlasPayManualCheckMinIntervalSeconds { get; set; } = 10;
 

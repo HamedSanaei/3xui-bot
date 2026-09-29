@@ -28,7 +28,13 @@ public sealed partial class ConcurrencyTests
             "\"cardNumberMasked\":\"6037-****-1234\",\"cardNumber\":\"6037999999991234\"," +
             "\"cardHolderName\":\"Ali Rezaei\",\"bankName\":\"Bank Melli\"," +
             "\"paymentDeadlineAt\":\"2026-09-10T12:00:00Z\",\"customerStartLink\":\"https://t.me/atlaspay_bot/start?start=x\"}")));
-        var atlas = new AtlasPay(AtlasConfiguration(), new HttpClient(handler));
+        var config = new ConfigurationBuilder().AddConfiguration(AtlasConfiguration())
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["atlasPayWebhookUrl"] = "https://pay.example/atlaspay-webhook",
+                ["atlasPayWebhookSecret"] = "test-webhook-secret"
+            }).Build();
+        var atlas = new AtlasPay(config, new HttpClient(handler));
         var result = await atlas.CreateOrderAsync("AtlasPay-abc", 250000, 123456789);
         var request = Assert.Single(handler.Captures);
         Assert.Equal(HttpMethod.Post, request.Method);
@@ -39,12 +45,17 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(250000, json.Value<long>("baseAmountToman"));
         Assert.Equal(123456789, json.Value<long>("customerTelegramId"));
         Assert.Equal("AtlasPay-abc", json.Value<string>("merchantOrderRef"));
+        Assert.Equal("https://pay.example/atlaspay-webhook", json.Value<string>("webhookUrl"));
+        Assert.DoesNotContain("test-webhook-secret", request.Body, StringComparison.Ordinal);
         Assert.Equal(42, result.OrderId); Assert.Equal("TRK-42", result.TrackingCode);
         Assert.Equal(250123, result.TotalAmountToman); Assert.Equal("6037-****-1234", result.CardNumberMasked);
         Assert.Equal("6037999999991234", result.CardNumber);
         Assert.Equal("Ali Rezaei", result.CardHolderName);
         Assert.Equal("Bank Melli", result.BankName);
         Assert.Null(typeof(AtlasPayPaymentInfo).GetProperty("CardNumber"));
+        var withoutOverride = new AtlasPay(AtlasConfiguration(), new HttpClient(handler));
+        await withoutOverride.CreateOrderAsync("AtlasPay-default", 250000, 123456789);
+        Assert.Null(JObject.Parse(handler.Captures[1].Body!).Property("webhookUrl"));
     }
 
     [Fact]
@@ -967,6 +978,26 @@ public sealed partial class ConcurrencyTests
         Assert.False(AtlasPayManualCheckPolicy.IsWithinCooldown(payment, 10, now.AddSeconds(11), out _));
         // Zero disables the cooldown for operators who explicitly want no throttle.
         Assert.False(AtlasPayManualCheckPolicy.IsWithinCooldown(payment, 0, now, out _));
+    }
+
+    /// <summary>Rejects unsafe or unverifiable per-order webhook configuration before provider orders can be issued.</summary>
+    /// <remarks>An account-wide webhook can still work with only a secret; a per-order override requires both settings.</remarks>
+    [Fact]
+    public void AtlasPay_webhook_override_requires_https_endpoint_and_signing_secret()
+    {
+        var method = typeof(Program).GetMethod("ValidateAtlasPayConfiguration", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        foreach (var url in new[] { "http://pay.example/atlaspay-webhook", "https://pay.example/other", "https://u:p@pay.example/atlaspay-webhook", "https://pay.example/atlaspay-webhook?token=secret" })
+        {
+            var error = Assert.Throws<System.Reflection.TargetInvocationException>(() => method.Invoke(null, new object[] {
+                new AppConfig { AtlasPayEnabled = true, AtlasPayApiKey = "x", AtlasPayWebhookUrl = url, AtlasPayWebhookSecret = "test-secret" }
+            }));
+            Assert.IsType<InvalidOperationException>(error.InnerException);
+        }
+
+        var missingSecret = Assert.Throws<System.Reflection.TargetInvocationException>(() => method.Invoke(null, new object[] {
+            new AppConfig { AtlasPayEnabled = true, AtlasPayApiKey = "x", AtlasPayWebhookUrl = "https://pay.example/atlaspay-webhook" }
+        }));
+        Assert.IsType<InvalidOperationException>(missingSecret.InnerException);
     }
 
     [Fact]

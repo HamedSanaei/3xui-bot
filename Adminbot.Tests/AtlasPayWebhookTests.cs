@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -66,6 +67,69 @@ public sealed partial class ConcurrencyTests
         Assert.NotNull(saved.WebhookReceivedAtUtc);
         Assert.Equal(new DateTime(2026, 9, 23, 12, 0, 0, DateTimeKind.Utc), saved.WebhookProviderTimestampUtc);
         Assert.Null(saved.WebhookProcessedAtUtc);
+    }
+
+    /// <summary>Exercises signed callback admission through the real wallet settlement path, including duplicate delivery.</summary>
+    /// <returns>A task verifying that only the official provider inquiry credits the wallet once.</returns>
+    /// <remarks>The callback arrives before the scheduled fallback inquiry; the signed payload is a hint, not financial evidence.</remarks>
+    [Fact]
+    public async Task AtlasPay_signed_callback_confirms_owned_wallet_via_provider_inquiry_once()
+    {
+        using var databases = new Databases();
+        var (provider, _, _) = IncidentProvider(databases);
+        await using (provider)
+        {
+            await using var scope = provider.CreateAsyncScope();
+            var credentials = scope.ServiceProvider.GetRequiredService<CredentialsStore>();
+            await credentials.AddEmptyUser(99002);
+            int paymentId;
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                var payment = VerifiedAtlasPayment();
+                payment.TelegramUserId = 99002;
+                payment.ChatId = 99002;
+                payment.BotId = "main";
+                payment.PaymentPurpose = TenantBotPaymentPurposes.WalletCharge;
+                payment.NextInquiryAtUtc = DateTime.UtcNow.AddHours(1);
+                db.AtlasPayPaymentInfos.Add(payment);
+                await db.SaveChangesAsync();
+                paymentId = payment.Id;
+            }
+
+            var config = AtlasWebhookConfiguration();
+            var handler = new AtlasHttpHandler((_, _, _, _) =>
+                Task.FromResult(JsonResponse(System.Net.HttpStatusCode.OK, StatusJson("confirmed", paid: true, actual: 250000))));
+            var reconciler = new AtlasPayReconciliationHostedService(
+                config, databases.Users, new AtlasPay(config, new HttpClient(handler)),
+                provider.GetRequiredService<IServiceScopeFactory>(),
+                NullLogger<AtlasPayReconciliationHostedService>.Instance);
+            var controller = new PaymentController(
+                databases.Users, config, null!, null!, null!, null!, null!, reconciler, null!,
+                NullLogger<PaymentController>.Instance);
+            const string body = "{\"event\":\"order.confirmed\",\"orderId\":77,\"merchantOrderRef\":\"AtlasPay-test\",\"totalAmountToman\":250123,\"status\":\"confirmed\",\"timestamp\":\"2026-09-23T12:00:00Z\"}";
+            AttachAtlasWebhook(controller, body, SignAtlasWebhook(body));
+            Assert.IsType<OkObjectResult>(await controller.ReceiveAtlasPayWebhook(default));
+            Assert.Equal(0, await credentials.GetAccountBalance(99002));
+
+            await reconciler.ReconcileDueAsync();
+            Assert.Equal(250000, await credentials.GetAccountBalance(99002));
+            Assert.Single(handler.Captures);
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                var saved = await db.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId);
+                Assert.True(saved.IsAddedToBalance);
+                Assert.Equal(AtlasPaySettlementStates.Settled, saved.SettlementState);
+                Assert.NotNull(saved.WebhookProcessedAtUtc);
+                Assert.True(saved.WebhookProcessedAtUtc >= saved.WebhookReceivedAtUtc);
+                Assert.Equal(1, await db.WalletLedgerEntries.CountAsync(x => x.Provider == "atlaspay" && x.ReferenceId == paymentId.ToString()));
+            }
+
+            AttachAtlasWebhook(controller, body, SignAtlasWebhook(body));
+            Assert.IsType<OkObjectResult>(await controller.ReceiveAtlasPayWebhook(default));
+            await reconciler.ReconcileDueAsync();
+            Assert.Equal(250000, await credentials.GetAccountBalance(99002));
+            Assert.Single(handler.Captures);
+        }
     }
 
     [Fact]

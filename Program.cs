@@ -562,6 +562,11 @@ public class Program
             throw new InvalidOperationException("Tetraminator is enabled but 'tetraminatorCallbackUrl' is not an absolute HTTP/HTTPS URL.");
     }
 
+    /// <summary>Validates AtlasPay credentials and the optional signed per-order callback before accepting invoices.</summary>
+    /// <param name="appConfig">Startup configuration for the global gateway, including its HTTPS callback and merchant signing secret.</param>
+    /// <remarks>Disabled gateways may retain incomplete settings; enabled gateways with a callback URL must have the matching registered secret. No registration call is made because the provider returns that secret only once.</remarks>
+    /// <exception cref="ArgumentNullException">Configuration is missing.</exception>
+    /// <exception cref="InvalidOperationException">Enabled provider settings are missing, unsafe, or cannot authenticate callbacks.</exception>
     private static void ValidateAtlasPayConfiguration(AppConfig appConfig)
     {
         ArgumentNullException.ThrowIfNull(appConfig);
@@ -576,6 +581,12 @@ public class Program
         if (string.IsNullOrWhiteSpace(appConfig.AtlasPayApiKey))
             throw new InvalidOperationException("AtlasPay is enabled but 'atlasPayApiKey' is missing.");
         AtlasPay.ValidateBaseUrl(appConfig.AtlasPayBaseUrl);
+        if (!string.IsNullOrWhiteSpace(appConfig.AtlasPayWebhookUrl))
+        {
+            AtlasPay.ValidateWebhookUrl(appConfig.AtlasPayWebhookUrl);
+            if (string.IsNullOrWhiteSpace(appConfig.AtlasPayWebhookSecret))
+                throw new InvalidOperationException("AtlasPay webhook URL is configured but 'atlasPayWebhookSecret' is missing.");
+        }
     }
 
     /// <summary>
