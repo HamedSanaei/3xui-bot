@@ -29,7 +29,10 @@ public sealed partial class ConcurrencyTests
         }
         await using var verify = databases.Users.CreateDbContext();
         Assert.Contains("20260923083845_TenantCustomerWallet", await verify.Database.GetAppliedMigrationsAsync());
-        Assert.Equal("paid", (await verify.TenantBotOrders.SingleAsync()).CustomerWalletState);
+        // The attempted downgrade can remove later audit-only columns before the older financial guard rejects it.
+        // Read the protected historical value without materializing today's full TenantBotOrder model.
+        Assert.Equal("paid", await verify.Database.SqlQueryRaw<string>(
+            "SELECT \"CustomerWalletState\" AS \"Value\" FROM \"TenantBotOrders\"").SingleAsync());
         Assert.NotNull(await wallet.GetWalletOperationAsync(TenantCustomerWalletFunding.DebitKey(order.Id)));
         Assert.Equal(400000, await wallet.GetAccountBalance(123));
     }

@@ -267,7 +267,8 @@ namespace Adminbot.Domain
 
     /// <summary>
     /// Represents one direct-sale order made inside a colleague tenant bot.
-    /// The order links customer, owner, selected XUI plan, HooshPay invoice, fulfillment result, and owner profit.
+    /// The order links customer, owner, selected XUI plan, payment provider, fulfillment result, and owner profit.
+    /// Owner bot-wallet balances and optional Gozargah website-wallet observations are retained for settlement audits.
     /// </summary>
     public class TenantBotOrder
     {
@@ -347,6 +348,22 @@ namespace Adminbot.Domain
         public long OwnerWalletDelta { get; set; }
         public long? OwnerBalanceBefore { get; set; }
         public long? OwnerBalanceAfter { get; set; }
+        /// <summary>
+        /// Whether website-wallet observations were captured during this order's owner settlement.
+        /// </summary>
+        /// <remarks>
+        /// False on historical orders, so a later payment-audit replay never presents today's website balance as
+        /// the balance at fulfillment. The website wallet is not changed by a platform-gateway profit credit.
+        /// </remarks>
+        public bool OwnerSiteWalletSnapshotRecorded { get; set; }
+
+        /// <summary>Observed Gozargah website-wallet balance in toman before owner settlement, if available.</summary>
+        /// <remarks>Null with a recorded snapshot means the read was unavailable; null on historical orders is unknown.</remarks>
+        public long? OwnerSiteBalanceBefore { get; set; }
+
+        /// <summary>Observed Gozargah website-wallet balance in toman after owner settlement, if available.</summary>
+        /// <remarks>These values are audit observations, not proof of a website-wallet debit for gateway sales.</remarks>
+        public long? OwnerSiteBalanceAfter { get; set; }
         public string CreatedAccountEmail { get; set; }
         public string CreatedSubLink { get; set; }
         public string CreatedAccountJson { get; set; }

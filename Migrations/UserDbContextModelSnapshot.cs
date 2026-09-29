@@ -1517,6 +1517,15 @@ namespace Adminbot.Migrations
                     b.Property<long>("OwnerWalletDelta")
                         .HasColumnType("INTEGER");
 
+                    b.Property<long?>("OwnerSiteBalanceAfter")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("OwnerSiteBalanceBefore")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("OwnerSiteWalletSnapshotRecorded")
+                        .HasColumnType("INTEGER");
+
                     b.Property<DateTime?>("PaidAtUtc")
                         .HasColumnType("TEXT");
 

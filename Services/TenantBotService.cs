@@ -8657,9 +8657,10 @@ public partial class TenantBotService
     /// <param name="retryAuthorization">Optional explicit super-admin authorization for a rejected provisioning attempt.</param>
     /// <returns>The fulfillment result, or already added for a settled payment; no financial work is repeated on that path.</returns>
     /// <remarks>
-    /// A successful settlement first persists the payment state, then emits the separately guarded AtlasPay customer
-    /// payment audit. An already settled payment can repair a missing audit without reentering XUI, balance, ledger,
-    /// or customer delivery. The fulfillment path still owns all financial and provisioning effects.
+    /// A successful settlement first persists the payment state and owner-wallet snapshots, then emits the separately
+    /// guarded AtlasPay customer payment audit. An already settled payment can repair a missing audit from those saved
+    /// balances without reentering XUI, balance, ledger, or customer delivery. The fulfillment path still owns all
+    /// financial and provisioning effects.
     /// </remarks>
     /// <example><code>await tenantBotService.ApplyPaidTenantOrderAsync(verifiedPayment, "inquiry", cancellationToken);</code></example>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
@@ -8759,8 +8760,10 @@ public partial class TenantBotService
     /// A conditional write takes the users.db SQLite write lock before reading and checking the payment/order,
     /// preventing parallel callers from enqueueing the same unmarked row under deferred transactions.
     /// After verifying official success, reciprocal identities/amounts, and fulfilled state, this method submits
-    /// the payment log with stored plan, account, customer charge, provider fee, owner cost and profit, then commits
-    /// the marker. The logger outbox and users.db are separate databases: a crash or
+    /// the payment log with stored plan, account, customer charge, provider fee, owner cost, profit, and the owner
+    /// wallet balances captured at fulfillment, then commits the marker. Historical orders without a website-wallet
+    /// observation explicitly show that it was not recorded; the current website balance is never substituted.
+    /// The logger outbox and users.db are separate databases: a crash or
     /// ambiguous commit between these operations cannot provide cross-database exactly-once delivery.
     /// Logger failures may also be contained internally and are not an acknowledgement of outbox acceptance.
     /// It never invokes XUI, credits a wallet, appends a ledger entry, changes an order, or resends a notification.
@@ -8810,25 +8813,25 @@ public partial class TenantBotService
 
             var fee = payment.TotalAmountToman.Value - payment.BaseAmountToman;
             _logger.LogPayment(
-                "✅ پرداخت رسمی AtlasPay مشتری فروشگاه تایید شد\n\n" +
-                $"ربات tenant: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
-                $"Order ID: <code>{Html(order.OrderId)}</code>\n" +
-                $"نوع سفارش: <code>{Html(order.OrderKind)}</code>\n" +
-                $"سرویس: <code>{Html(order.ServiceKey)}</code>\n" +
-                $"پلن: <code>{Html(order.UnlimitedPlanKey ?? order.DurationKey)}</code>\n" +
-                $"تعداد اکانت: <code>{order.AccountCount}</code>\n" +
-                $"مشتری: <code>{order.CustomerTelegramUserId}</code>\n" +
-                $"مالک فروشگاه: <code>{order.OwnerTelegramUserId}</code>\n" +
-                $"Payment ID: <code>AP:{payment.Id}</code>\n" +
-                $"Provider Order ID: <code>{payment.ProviderOrderId}</code>\n" +
-                $"مبلغ پایه (تومان): <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
-                $"مبلغ پرداخت‌شده فاکتور (تومان): <code>{Html(payment.TotalAmountToman.Value.FormatCurrency())}</code>\n" +
-                $"هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
-                $"سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
-                $"کارمزد/اختلاف فاکتور (تومان): <code>{Html(fee.FormatCurrency())}</code>\n" +
-                $"وضعیت provider: <code>{Html(payment.ProviderStatus)}</code>\n" +
-                $"اکانت: <code>{Html(order.CreatedAccountEmail)}</code>\n" +
-                $"منبع تایید: <code>{Html(order.FulfillmentSource ?? "-")}</code>");
+                "✅ <b>پرداخت رسمی AtlasPay مشتری فروشگاه تأیید شد</b>\n\n" +
+                "🏪 <b>فروشگاه و سفارش</b>\n" +
+                $"🤖 ربات: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
+                $"🧾 سفارش: <code>{Html(order.OrderId)}</code>\n" +
+                $"📦 نوع: <code>{Html(order.OrderKind)}</code> | سرویس: <code>{Html(order.ServiceKey)}</code>\n" +
+                $"📋 پلن: <code>{Html(order.UnlimitedPlanKey ?? order.DurationKey)}</code> | تعداد: <code>{order.AccountCount}</code>\n" +
+                $"👤 مشتری: <code>{order.CustomerTelegramUserId}</code> | مالک: <code>{order.OwnerTelegramUserId}</code>\n\n" +
+                "💳 <b>پرداخت و سهم فروشگاه</b>\n" +
+                $"🔖 Payment ID: <code>AP:{payment.Id}</code> | Provider Order ID: <code>{payment.ProviderOrderId}</code>\n" +
+                $"💰 مبلغ فروش: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+                $"💵 مبلغ فاکتور: <code>{Html(payment.TotalAmountToman.Value.FormatCurrency())}</code>\n" +
+                $"📉 هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
+                $"📈 سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
+                $"🧮 کارمزد/اختلاف فاکتور: <code>{Html(fee.FormatCurrency())}</code>\n" +
+                BuildTenantOwnerWalletAuditSection(order) +
+                "\n📌 <b>نتیجه</b>\n" +
+                $"🔎 وضعیت درگاه: <code>{Html(payment.ProviderStatus)}</code>\n" +
+                $"🌐 اکانت: <code>{Html(order.CreatedAccountEmail)}</code>\n" +
+                $"📡 منبع تأیید: <code>{Html(order.FulfillmentSource ?? "-")}</code>");
 
             payment.SuccessLoggedAtUtc = DateTime.UtcNow;
             payment.UpdatedAtUtc = DateTime.UtcNow;
@@ -8855,8 +8858,9 @@ public partial class TenantBotService
     /// This method never accepts provisional approval. It only consumes an already provider-verified payment row;
     /// callers handling return, customer-check, or worker triggers must perform
     /// <see cref="UniquePayPaymentVerifier.IsVerifiedPaid" /> immediately before invoking it.
-    /// Successful fulfillment records the effective currency, fee payer, stored base amount, and provider-reported
-    /// fee once in the protected payment channel; repeated fulfillment checks do not emit another provider-success log.
+    /// Successful fulfillment records the effective currency, fee payer, stored base amount, provider-reported fee,
+    /// and persisted owner-wallet before/after observations once in the protected payment channel; repeated
+    /// fulfillment checks do not emit another provider-success log.
     /// </remarks>
     /// <param name="retryAuthorization">
     /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
@@ -8971,17 +8975,19 @@ public partial class TenantBotService
             if (shouldLogProviderSuccess)
             {
                 _logger.LogPayment(
-                    "✅ پرداخت رسمی UniquePay فروشگاه تایید شد\n\n" +
-                    $"ربات tenant: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
-                    $"Order ID: <code>{Html(order.OrderId)}</code>\n" +
-                    $"Payment ID: <code>UP:{payment.Id}</code>\n" +
-                    $"Hash ID: <code>{Html(payment.HashId)}</code>\n" +
-                    $"Ref ID: <code>{Html(payment.RefId)}</code>\n" +
-                    $"مبلغ پایه: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
-                    $"کارمزد واقعی درگاه: <code>{Html((payment.ProviderFeeToman ?? 0).FormatCurrency())}</code>\n" +
-                    $"پرداخت‌کننده کارمزد: <code>{Html(payment.FeePayer)}</code>\n" +
-                    $"واحد: <code>{Html(payment.Currency)}</code>\n" +
-                    $"منبع: <code>{Html(Source)}</code>");
+                    "✅ <b>پرداخت رسمی UniquePay فروشگاه تأیید شد</b>\n\n" +
+                    "🏪 <b>فروشگاه و سفارش</b>\n" +
+                    $"🤖 ربات: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
+                    $"🧾 سفارش: <code>{Html(order.OrderId)}</code>\n" +
+                    $"👤 مشتری: <code>{order.CustomerTelegramUserId}</code> | مالک: <code>{order.OwnerTelegramUserId}</code>\n\n" +
+                    "💳 <b>پرداخت</b>\n" +
+                    $"🔖 Payment ID: <code>UP:{payment.Id}</code>\n" +
+                    $"🔎 Hash ID: <code>{Html(payment.HashId)}</code> | Ref ID: <code>{Html(payment.RefId)}</code>\n" +
+                    $"💰 مبلغ فروش: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+                    $"🧮 کارمزد واقعی درگاه: <code>{Html((payment.ProviderFeeToman ?? 0).FormatCurrency())}</code>\n" +
+                    $"📌 پرداخت‌کننده کارمزد: <code>{Html(payment.FeePayer)}</code> | واحد: <code>{Html(payment.Currency)}</code>\n" +
+                    $"📡 منبع تأیید: <code>{Html(Source)}</code>" +
+                    BuildTenantOwnerWalletAuditSection(order));
             }
         }
         else if (settlement.Status is NowPaymentsSettlementStatus.UserNotFound or NowPaymentsSettlementStatus.PaymentNotFound)
@@ -9420,6 +9426,8 @@ public partial class TenantBotService
     /// order gate also protects definitive-rejection compensation; ambiguous/applied XUI operations prohibit refunds.
     /// Timing begins only after the paid order, tenant, owner, customer, and plan are ready for execution. The central
     /// audit reports accumulated panel API time and total fulfillment time and never includes gateway waiting time.
+    /// On success, bot-wallet receipt balances and read-only website-wallet observations are persisted with the
+    /// fulfilled order so provider-specific payment audits remain accurate when delivered after a restart.
     /// </remarks>
     private async Task<NowPaymentsSettlementResult> FULFILLPAIDTENANTORDERASYNC(
         TenantBotOrder order,
@@ -9658,6 +9666,7 @@ public partial class TenantBotService
                 order.OwnerWalletDelta = settlement.OwnerDelta;
                 order.OwnerBalanceBefore = settlement.BotWalletBefore;
                 order.OwnerBalanceAfter = settlement.BotWalletAfter;
+                RecordTenantOwnerSiteWalletSnapshots(order, settlement);
                 order.PaymentStatus = TenantBotOrderStatuses.Fulfilled;
                 order.FulfillmentSource = Source;
                 order.CreatedAccountEmail = created.Email;
@@ -12520,6 +12529,55 @@ public partial class TenantBotService
     }
 
     /// <summary>
+    /// Saves both website-wallet observations alongside the bot-wallet receipt on the fulfilled tenant order.
+    /// </summary>
+    /// <param name="order">Tracked users.db order for the current tenant and owner; saved by the caller with fulfillment.</param>
+    /// <param name="settlement">The completed owner settlement, including read-only Gozargah balances in toman.</param>
+    /// <remarks>
+    /// Platform gateways credit profit only to the owner's bot wallet. These website balances are observations,
+    /// not website-wallet movements. The recorded flag distinguishes an unavailable new read from a historical
+    /// order whose website balances were never captured; neither case is reconstructed from a later live balance.
+    /// </remarks>
+    /// <example><code>RecordTenantOwnerSiteWalletSnapshots(order, settlement);</code></example>
+    private static void RecordTenantOwnerSiteWalletSnapshots(
+        TenantBotOrder order, TenantOwnerWalletSettlementResult settlement)
+    {
+        order.OwnerSiteWalletSnapshotRecorded = true;
+        order.OwnerSiteBalanceBefore = settlement.SiteWalletBefore?.IsConnected == true
+            ? settlement.SiteWalletBefore.WalletToman : null;
+        order.OwnerSiteBalanceAfter = settlement.SiteWalletAfter?.IsConnected == true
+            ? settlement.SiteWalletAfter.WalletToman : null;
+    }
+
+    /// <summary>
+    /// Formats the persisted before/after balances of both owner wallets for a protected tenant payment audit.
+    /// </summary>
+    /// <param name="order">Fulfilled tenant order containing the owner's settlement-time balances in toman.</param>
+    /// <returns>HTML-safe wallet section; unavailable or historical values are labeled rather than inferred.</returns>
+    /// <remarks>
+    /// AtlasPay audit recovery can run long after fulfillment, so this method never queries current balances.
+    /// A positive owner delta is a credit to the owner's bot wallet, not to the Gozargah website wallet.
+    /// </remarks>
+    /// <example><code>var walletSection = BuildTenantOwnerWalletAuditSection(fulfilledOrder);</code></example>
+    private static string BuildTenantOwnerWalletAuditSection(TenantBotOrder order)
+    {
+        var botBefore = order.OwnerBalanceBefore.HasValue
+            ? order.OwnerBalanceBefore.Value.FormatCurrency() : "ثبت نشده";
+        var botAfter = order.OwnerBalanceAfter.HasValue
+            ? order.OwnerBalanceAfter.Value.FormatCurrency() : "ثبت نشده";
+        var siteBefore = !order.OwnerSiteWalletSnapshotRecorded ? "برای این سفارش ثبت نشده"
+            : order.OwnerSiteBalanceBefore.HasValue ? order.OwnerSiteBalanceBefore.Value.FormatCurrency() : "در دسترس نبود";
+        var siteAfter = !order.OwnerSiteWalletSnapshotRecorded ? "برای این سفارش ثبت نشده"
+            : order.OwnerSiteBalanceAfter.HasValue ? order.OwnerSiteBalanceAfter.Value.FormatCurrency() : "در دسترس نبود";
+
+        return "\n\n👛 <b>موجودی کیف پول مالک هنگام تسویه</b>\n" +
+               $"🤖 ربات | قبل: <code>{Html(botBefore)}</code> | بعد: <code>{Html(botAfter)}</code>\n" +
+               $"🌐 گذرگاه | قبل: <code>{Html(siteBefore)}</code> | بعد: <code>{Html(siteAfter)}</code>\n" +
+               $"➕ تغییر کیف پول ربات: <code>{Html(order.OwnerWalletDelta.FormatCurrency())}</code>\n" +
+               "ℹ️ فروش درگاهی، کیف پول گذرگاه را بابت این سفارش تغییر نمی‌دهد.\n";
+    }
+
+    /// <summary>
     /// Clears stale tenant-order fulfillment errors after an order is successfully delivered.
     /// </summary>
     /// <param name="order">
@@ -14889,6 +14947,11 @@ public partial class TenantBotService
     /// <param name="operationTiming">Active operation timer used for audits.</param>
     /// <param name="cancellationToken">Token that cancels panel, users.db, ledger, and Telegram operations.</param>
     /// <returns>The settlement result; the order-level ledger uniqueness prevents any duplicate settlement.</returns>
+    /// <remarks>
+    /// The fulfilled order durably records bot-wallet before/after and read-only Gozargah website-wallet observations
+    /// before the renewal operation lock is released. A later gateway audit reads those saved values, never today's
+    /// balances; website-wallet reads do not debit the owner for platform-gateway payments.
+    /// </remarks>
     private async Task<NowPaymentsSettlementResult> CompleteTenantRenewalFulfillmentAsync(
         TenantBotOrder order,
         CredUser owner,
@@ -14934,6 +14997,7 @@ public partial class TenantBotService
         order.OwnerWalletDelta = settlement.OwnerDelta;
         order.OwnerBalanceBefore = settlement.BotWalletBefore;
         order.OwnerBalanceAfter = settlement.BotWalletAfter;
+        RecordTenantOwnerSiteWalletSnapshots(order, settlement);
         order.PaymentStatus = TenantBotOrderStatuses.Fulfilled;
         order.FulfillmentSource = source;
         order.CreatedAccountEmail = client.Email;

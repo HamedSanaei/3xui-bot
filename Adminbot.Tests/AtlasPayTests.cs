@@ -341,8 +341,9 @@ public sealed partial class ConcurrencyTests
     /// <returns>A task completing after protected Telegram delivery and replay guards are checked.</returns>
     /// <remarks>
     /// Regression: tenant AtlasPay settlement previously set the success marker without logging customer payment.
-    /// The reconciliation scan must queue one HTML-safe receipt for a linked fulfilled order, excluding a mismatched
-    /// owner without provider inquiry, another account, ledger entry, owner credit, or customer notification.
+    /// The reconciliation scan must queue one HTML-safe receipt containing the stored owner-wallet observations for a
+    /// linked fulfilled order, excluding a mismatched owner without provider inquiry, another account, ledger entry,
+    /// owner credit, or customer notification. A replay must never use current balances for the historical receipt.
     /// </remarks>
     [Fact]
     public async Task AtlasPay_fulfilled_tenant_payment_audit_is_queued_once_and_rejects_mismatched_owner()
@@ -357,6 +358,7 @@ public sealed partial class ConcurrencyTests
         {
             int paymentId;
             int rejectedId;
+            int historicalPaymentId;
             await using (var db = databases.Users.CreateDbContext())
             {
                 var order = new TenantBotOrder
@@ -364,7 +366,10 @@ public sealed partial class ConcurrencyTests
                     OrderId = "sale-<test>", TenantBotId = "tenant-audit", TenantBotUsername = "shop&bot",
                     OwnerTelegramUserId = 711, CustomerTelegramUserId = 812, CustomerChatId = 812,
                     SalePriceToman = 191_400, BaseCostToman = 127_600, ProfitToman = 63_800,
-                    OwnerWalletDelta = 63_800, PaymentProvider = "atlaspay",
+                    OwnerWalletDelta = 63_800, OwnerBalanceBefore = 10_000, OwnerBalanceAfter = 73_800,
+                    OwnerSiteWalletSnapshotRecorded = true,
+                    OwnerSiteBalanceBefore = 500_000, OwnerSiteBalanceAfter = 500_000,
+                    PaymentProvider = "atlaspay",
                     ServiceKey = "normal&fast", DurationKey = "monthly",
                     CreatedAccountEmail = "buyer<&>@example.test",
                     IsFulfilled = true, PaymentStatus = TenantBotOrderStatuses.Fulfilled,
@@ -386,6 +391,40 @@ public sealed partial class ConcurrencyTests
                 await db.SaveChangesAsync();
                 order.AtlasPayPaymentInfoId = payment.Id;
                 paymentId = payment.Id;
+
+                // A pre-migration order has persisted bot-wallet balances but no website-wallet observation.
+                // Audit recovery must not invent a historical website balance by reading the owner's current wallet.
+                var historicalOrder = new TenantBotOrder
+                {
+                    OrderId = "historical-sale", TenantBotId = "tenant-audit", TenantBotUsername = "shopbot",
+                    OwnerTelegramUserId = 711, CustomerTelegramUserId = 813, CustomerChatId = 813,
+                    SalePriceToman = 100_000, BaseCostToman = 60_000, ProfitToman = 40_000,
+                    OwnerWalletDelta = 40_000, OwnerBalanceBefore = 73_800, OwnerBalanceAfter = 113_800,
+                    PaymentProvider = "atlaspay", ServiceKey = "normal", DurationKey = "m1",
+                    IsFulfilled = true, PaymentStatus = TenantBotOrderStatuses.Fulfilled,
+                    PaidAtUtc = DateTime.UtcNow, FulfilledAtUtc = DateTime.UtcNow
+                };
+                db.TenantBotOrders.Add(historicalOrder);
+                await db.SaveChangesAsync();
+                var historicalPayment = VerifiedAtlasPayment();
+                historicalPayment.MerchantOrderRef = "AtlasPay-historical";
+                historicalPayment.PaymentPurpose = TenantBotPaymentPurposes.TenantOrder;
+                historicalPayment.BotId = historicalOrder.TenantBotId;
+                historicalPayment.TelegramUserId = historicalOrder.CustomerTelegramUserId;
+                historicalPayment.TenantOwnerTelegramUserId = historicalOrder.OwnerTelegramUserId;
+                historicalPayment.TenantBotOrderId = historicalOrder.Id;
+                historicalPayment.BaseAmountToman = historicalOrder.SalePriceToman;
+                historicalPayment.TotalAmountToman = 112_000;
+                historicalPayment.ProviderOrderId = 11_636;
+                historicalPayment.ProviderStatus = "settled";
+                historicalPayment.PaidAtUtc = DateTime.UtcNow;
+                historicalPayment.SettledAtUtc = DateTime.UtcNow;
+                historicalPayment.SettlementState = AtlasPaySettlementStates.Settled;
+                historicalPayment.IsAddedToBalance = true;
+                db.AtlasPayPaymentInfos.Add(historicalPayment);
+                await db.SaveChangesAsync();
+                historicalOrder.AtlasPayPaymentInfoId = historicalPayment.Id;
+                historicalPaymentId = historicalPayment.Id;
 
                 var wrongOrder = new TenantBotOrder
                 {
@@ -418,9 +457,11 @@ public sealed partial class ConcurrencyTests
             await provider.GetRequiredService<AtlasPayReconciliationHostedService>().ReconcileDueAsync(default);
             Assert.False(await service.EnsureAtlasPayTenantPaymentAuditAsync(paymentId, default));
             Assert.False(await service.EnsureAtlasPayTenantPaymentAuditAsync(rejectedId, default));
+            Assert.False(await service.EnsureAtlasPayTenantPaymentAuditAsync(historicalPaymentId, default));
 
             await using var verify = databases.Users.CreateDbContext();
             Assert.NotNull((await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId)).SuccessLoggedAtUtc);
+            Assert.NotNull((await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == historicalPaymentId)).SuccessLoggedAtUtc);
             Assert.Null((await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == rejectedId)).SuccessLoggedAtUtc);
             Assert.Empty(await verify.TenantBotLedgerEntries.ToListAsync());
             Assert.Empty(await verify.TenantOrderNotifications.ToListAsync());
@@ -442,6 +483,17 @@ public sealed partial class ConcurrencyTests
             Assert.Contains("buyer&lt;&amp;&gt;@example.test", text);
             Assert.Contains(127_600L.FormatCurrency(), text);
             Assert.Contains(63_800L.FormatCurrency(), text);
+            Assert.Contains("🤖 ربات | قبل: <code>" + 10_000L.FormatCurrency(), text);
+            Assert.Contains("بعد: <code>" + 73_800L.FormatCurrency(), text);
+            Assert.Contains("🌐 گذرگاه | قبل: <code>" + 500_000L.FormatCurrency(), text);
+            Assert.Contains("فروش درگاهی، کیف پول گذرگاه را بابت این سفارش تغییر نمی‌دهد", text);
+            await UntilAsync(() => Task.FromResult(clients["main"].Texts.Any(
+                message => message.Contains($"AP:{historicalPaymentId}", StringComparison.Ordinal))));
+            var historicalText = Assert.Single(clients["main"].Texts,
+                message => message.Contains($"AP:{historicalPaymentId}", StringComparison.Ordinal));
+            Assert.Contains("🤖 ربات | قبل: <code>" + 73_800L.FormatCurrency(), historicalText);
+            Assert.Contains("🌐 گذرگاه | قبل: <code>برای این سفارش ثبت نشده</code>", historicalText);
+            Assert.Contains("بعد: <code>برای این سفارش ثبت نشده</code>", historicalText);
         }
     }
 
@@ -1837,9 +1889,14 @@ public sealed partial class ConcurrencyTests
             Assert.Equal("hooshpay", order.PaymentProvider); Assert.Equal("pending", order.PaymentStatus);
             Assert.Equal(80000, order.BaseCostToman); Assert.Equal(20000, order.ProfitToman);
             Assert.False(order.IsFulfilled);
+            // The later audit-only migration does not fabricate website-wallet balances for existing orders.
+            Assert.False(order.OwnerSiteWalletSnapshotRecorded);
+            Assert.Null(order.OwnerSiteBalanceBefore);
+            Assert.Null(order.OwnerSiteBalanceAfter);
             Assert.Empty(await users.AtlasPayPaymentInfos.ToListAsync());
             var applied = (await users.Database.GetAppliedMigrationsAsync()).ToList();
             Assert.Contains(atlasMigration, applied);
+            Assert.Contains("20260929140000_RecordTenantOwnerSiteWalletSnapshots", applied);
             Assert.Contains("20260910184123_AddTenantOwnerNotificationRoute", applied);
         // AtlasPay reconciliation remains present in the migration chain and only adds nullable/defaulted
         // columns plus an index, so it cannot change existing balances.
