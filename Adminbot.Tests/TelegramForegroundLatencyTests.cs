@@ -140,11 +140,12 @@ public sealed partial class ConcurrencyTests
     /// <returns>Server information accepted by <see cref="ApiServicev3"/>.</returns>
     private static ServerInfo LatencyPanelServer(string url) => new() { ApiVersion = "v3", Url = url, RootPath = "", ApiToken = "test-only" };
 
-    /// <summary>The shared production interactive delivery budget and the untouched UX interaction budgets.</summary>
+    /// <summary>Ordinary sends retain eight seconds while media groups have a bounded multipart upload allowance.</summary>
     [Fact]
-    public void Foreground_budgets_are_eight_seconds_and_existing_interaction_timeouts_are_unchanged()
+    public void Foreground_budgets_separate_media_uploads_from_ordinary_interactions()
     {
         Assert.Equal(TimeSpan.FromSeconds(8), TelegramForegroundDeliveryPolicy.Production.OverallBudget);
+        Assert.Equal(TimeSpan.FromSeconds(24), TelegramForegroundDeliveryPolicy.Production.MediaGroupBudget);
         Assert.Equal(TimeSpan.FromSeconds(2), TelegramInteractionTimeouts.Production.CallbackAnswer);
         Assert.Equal(TimeSpan.FromSeconds(5), TelegramInteractionTimeouts.Production.MandatoryJoin);
         Assert.Equal(TimeSpan.FromSeconds(12), ApiServicev3.DefaultForegroundReadOverallBudget);

@@ -76,6 +76,19 @@ service; a failing gate exits before the protected `Data` directory or systemd i
 preflight all precede synchronization, and synchronization precedes the restart) so the gate cannot be dropped or moved
 by a later edit on a machine without rsync or systemd.
 
+## Tenant installation tutorial assets
+
+`Assets/tutorials/{android_v2rayng,windows_v2rayn,ios_android_v2box}/` is application content, not persistent
+`Data` state. Publish and synchronize all three directories with the release. The original numbered PNG slides
+are retained without lossy recompression. Use a clean publish directory: old JPEG substitutes left beside the
+original PNGs would make the image resolver send duplicate steps, because it accepts both formats.
+
+An album upload has a bounded 24-second foreground deadline; ordinary Telegram interaction still has eight seconds.
+If `Tenant tutorial album delivery failed` reports `send_media_group` timing out, check Telegram connectivity and the
+number/size of shipped slides before changing any bot configuration. A timeout is ambiguous (Telegram may already
+have received the group), so the application never re-sends it automatically. No database row stores tutorial progress
+or proves recipient delivery.
+
 ## Configuration change safety
 
 `Data/configuration.json` is persistent runtime state, not a build artifact. It is excluded from publish and from

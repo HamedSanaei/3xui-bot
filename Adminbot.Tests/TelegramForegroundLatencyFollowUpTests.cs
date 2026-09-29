@@ -440,13 +440,12 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>
-    /// Message edits and photo albums are bounded as interactive delivery and attempted exactly once.
+    /// Message edits and photo albums have separate bounded deadlines and neither is automatically retried.
     /// </summary>
-    /// <returns>A task completing after both request shapes are proven bounded.</returns>
+    /// <returns>A task completing after both timeout paths have attempted exactly one request.</returns>
     /// <remarks>
-    /// The production storefront service-selection step edits the previous message, and tutorial delivery sends a media
-    /// group. Both are interactive UX calls, so both must respect the same overall budget and must never be re-sent
-    /// automatically after the budget expires.
+    /// An album has more time for its multipart upload than a menu edit, but a hung upload must still release the
+    /// customer's update lane. The fake uses short budgets to exercise both deadlines without contacting Telegram.
     /// </remarks>
     [Fact]
     public async Task Foreground_delivery_bounds_edit_and_album_requests()
@@ -455,7 +454,11 @@ public sealed partial class ConcurrencyTests
         probe.HangOn.Add("EditMessageTextRequest");
         probe.HangOn.Add("SendMediaGroupRequest");
         var bounded = new ForegroundBoundedTelegramBotClient(
-            probe, new TelegramForegroundDeliveryPolicy { OverallBudget = TimeSpan.FromMilliseconds(60) });
+            probe, new TelegramForegroundDeliveryPolicy
+            {
+                OverallBudget = TimeSpan.FromMilliseconds(60),
+                MediaGroupBudget = TimeSpan.FromMilliseconds(120)
+            });
 
         var editSw = Stopwatch.StartNew();
         var editTimeout = await Assert.ThrowsAsync<TelegramForegroundDeliveryTimeoutException>(
@@ -475,6 +478,7 @@ public sealed partial class ConcurrencyTests
         albumSw.Stop();
 
         Assert.Equal("send_media_group", albumTimeout.RequestKind);
+        Assert.Equal(TimeSpan.FromMilliseconds(120), albumTimeout.Budget);
         Assert.Equal(1, probe.Attempts("SendMediaGroupRequest"));
         Assert.True(albumSw.Elapsed < TimeSpan.FromSeconds(3), $"elapsed={albumSw.Elapsed}");
     }

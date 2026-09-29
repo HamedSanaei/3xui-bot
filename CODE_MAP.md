@@ -543,15 +543,14 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   still win, `NoAutomaticRetry` still performs exactly one POST, and a timeout never makes an ambiguous mutation
   replayable (a regression test asserts one POST against a transient status).
 - **Foreground Telegram delivery budget** (`Services/TelegramForegroundDeliveryPolicy.cs`,
-  `Services/ForegroundBoundedTelegramBotClient.cs`): one immutable 8 s overall budget per non-durable interactive
-  delivery (message/photo/album/document send, edits, deletes, callback acknowledgement, chat/membership lookups).
-  `TelegramUpdateExecutor` wraps the resolved client in this decorator **per update execution only**; receivers, long
-  polling, background workers, and `DownloadFileAsync` keep the raw unbounded client, so the shared transport timeout
-  is never changed globally. On expiry the send is abandoned with `TelegramForegroundDeliveryTimeoutException` and is
-  **never automatically re-sent** (an ambiguous send may already have been accepted); `TelegramBotService`
-  (`HandleUpdateAsync`) records one `handle_update_foreground_delivery_timeout` activity entry, logs one warning, and
-  releases the lane as a stable non-error outcome. Existing 2 s callback-ack and 5 s mandatory-join budgets are
-  untouched, and durable outbox delivery keeps its own `delivery_uncertain` semantics.
+  `Services/ForegroundBoundedTelegramBotClient.cs`): ordinary non-durable interactive calls have an 8 s overall
+  budget; `sendMediaGroup` has a separate 24 s bounded multipart-upload budget. The six-slide iOS tutorial is about
+  8.19 MiB in its original PNG format; the former 8 s limit expired while uploading it. Images are not recompressed.
+  `TelegramUpdateExecutor` wraps the resolved client **per update execution only**; receivers, long polling,
+  background workers and file downloads keep the raw transport. A timed-out send is ambiguous,
+  **never automatically re-sent**, and the handler releases the lane as a stable non-error outcome.
+  Existing 2 s callback-ack and 5 s mandatory-join budgets are unchanged;
+  durable delivery retains its own `delivery_uncertain` semantics.
 - **Stage attribution** (`Services/TelegramUpdateLatencyScope.cs`): closed vocabulary `XuiRead`, `TelegramSend`,
   `TelegramEdit`, `TelegramMembership`, `SiteLookup`, `ProviderRead`, `DatabaseWait`, `BusinessRecovery`, carried by
   `AsyncLocal` for one update execution only. The scheduler pushes one scope per execution; the bounded client wrapper,
@@ -1060,15 +1059,17 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   for production options, the read-only backup snapshot, and the shared-cache outbox, and the fixture directory delete
   then failed with `IOException: The process cannot access the file ... because it is being used by another process`.
   Fixture connections declare `Pooling=false`, and the helper refuses any directory outside the OS temp root.
-- **Tenant storefront installation tutorials are built in, not owner-configured.** Customer tutorials are three fixed
-  image albums shipped as publish assets under `Assets/tutorials/` (`android_v2rayng`, `windows_v2rayn`,
-  `ios_android_v2box`). `Services/TenantTutorialAssetService.cs` owns the closed kind set
-  (`TenantTutorialKinds.android|ios|windows`), the kind-to-directory mapping, the supported-format whitelist
-  (`.jpg/.jpeg/.png`, case-insensitive; `.webp` deliberately excluded as unshipped/unverified), natural step ordering
-  (`1,2,…,10`, not `1,10,2`), and batching. `Services/TenantTutorialAlbumSender.cs` uploads each batch as a real
-  Telegram **media group** (max 10 items per album, caption on the first slide of the first album only, a single image
-  sent via `SendPhotoAsync` because a one-item media group is invalid). Streams are opened per batch and disposed
-  immediately after that batch's request. The customer menu is reached by the existing `راهنما نصب` / `💡راهنما نصب`
+- **Tenant storefront installation tutorials are built in, not owner-configured.** Three fixed photo albums ship
+  under `Assets/tutorials/` (`android_v2rayng`, `windows_v2rayn`, `ios_android_v2box`). The original numbered
+  instructional slides remain PNG without lossy recompression; the six-slide iOS album is about 8.19 MiB. A clean
+  publish directory must contain exactly one version of each slide: leftover JPEG copies would be uploaded as
+  duplicate steps because the resolver also accepts JPEG.
+  `Services/TenantTutorialAssetService.cs` owns the closed kind set (`TenantTutorialKinds.android|ios|windows`),
+  directory mapping, supported formats (`.jpg/.jpeg/.png`, case-insensitive; `.webp` excluded), natural step ordering,
+  and batching. `Services/TenantTutorialAlbumSender.cs` uploads each batch as a real Telegram media group (at most
+  10 items; caption on the first slide of the first group only); a single image uses `SendPhoto`. Streams open per
+  batch and are disposed when its request finishes.
+  The customer menu is reached by the existing `راهنما نصب` / `💡راهنما نصب`
   aliases and by the callbacks `TN:tutorial:android`, `TN:tutorial:ios`, `TN:tutorial:windows`; the callback payload
   can only select one of the three compile-time kinds, never a path or another bot. Requesting a tutorial writes nothing
   to users.db (the callback branch deliberately does not clear conversation state, so an in-progress purchase survives),

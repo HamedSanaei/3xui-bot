@@ -28,36 +28,46 @@ using System;
 /// customer retries by pressing the button again, which produces a new update and a new decision.
 /// </para>
 /// <para>
-/// Production value:
-/// <see cref="Production"/> uses a single overall eight-second budget. The value is intentionally not bound to
-/// <c>configuration.json</c>: it is a UX guarantee, not an operator-tunable provider setting, and the hosting
-/// environment must not be able to raise interactive replies back to pathological values. Tests construct their own
-/// instance with millisecond budgets so timeout behaviour is deterministic.
+/// Production values:
+/// Ordinary foreground calls keep the eight-second UX budget. Media-group uploads have a separate 24-second
+/// ceiling: several shipped tutorial images must be transferred in one multipart request, and the ordinary budget
+/// was expiring before Telegram could acknowledge that upload. Neither deadline triggers an automatic resend.
+/// Tests can set both budgets independently to exercise slow uploads without waiting for production deadlines.
 /// </para>
 /// </remarks>
 public sealed class TelegramForegroundDeliveryPolicy
 {
     /// <summary>
-    /// Gets the shared production instance. One overall eight-second budget covers a single interactive Telegram
-    /// delivery, including connection setup, upload, and response reading.
+    /// Gets the shared production instance. Ordinary interactive calls have eight seconds; media-group uploads
+    /// have 24 seconds to transfer several images and receive Telegram's response.
     /// </summary>
     public static TelegramForegroundDeliveryPolicy Production { get; } = new();
 
     /// <summary>
-    /// Gets the overall wall-clock budget for one interactive foreground Telegram delivery. Production value: eight
-    /// seconds.
+    /// Gets the overall wall-clock budget for one ordinary interactive foreground Telegram delivery. Production
+    /// value: eight seconds; media groups use <see cref="MediaGroupBudget"/> instead.
     /// </summary>
     /// <remarks>
     /// This is one budget per delivery, not per retry, and no retry is performed when it expires. Only
-    /// <see cref="TelegramForegroundDeliveryPolicy"/>-aware interactive calls are affected; durable outbox delivery
-    /// and receiver polling keep their own configured behavior.
+    /// foreground-decorated calls are affected; durable outbox delivery and receiver polling are unchanged.
     /// </remarks>
     public TimeSpan OverallBudget { get; init; } = TimeSpan.FromSeconds(8);
+
+    /// <summary>
+    /// Gets the bounded wall-clock budget for a foreground media-group upload, including transfer and response.
+    /// Production value: 24 seconds.
+    /// </summary>
+    /// <remarks>
+    /// Large multipart albums need longer than a text message, but still have a finite deadline so the customer's
+    /// FIFO update lane cannot wait on the transport indefinitely. A timed-out upload may have been accepted by
+    /// Telegram and must not be resent automatically.
+    /// </remarks>
+    public TimeSpan MediaGroupBudget { get; init; } = TimeSpan.FromSeconds(24);
 }
 
 /// <summary>
-/// Raised when one non-durable interactive Telegram delivery exceeded
-/// <see cref="TelegramForegroundDeliveryPolicy.OverallBudget"/> before Telegram answered.
+/// Raised when one non-durable interactive Telegram delivery exceeded its selected
+/// <see cref="TelegramForegroundDeliveryPolicy"/> budget before Telegram answered.
 /// </summary>
 /// <remarks>
 /// The send is abandoned and never re-sent automatically because Telegram may already have accepted the request.

@@ -45,7 +45,7 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// <summary>Inner client that performs the real Telegram call; never disposed by this decorator.</summary>
     private readonly ITelegramBotClient _inner;
 
-    /// <summary>Immutable overall budget applied to each bounded interactive delivery.</summary>
+    /// <summary>Immutable budgets for ordinary sends and multipart media-group uploads.</summary>
     private readonly TelegramForegroundDeliveryPolicy _policy;
 
     /// <summary>
@@ -135,11 +135,12 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// <param name="cancellationToken">The caller's own lane cancellation token.</param>
     /// <returns>The inner client's response for the request.</returns>
     /// <remarks>
-    /// Non-interactive requests pass through unchanged. For interactive requests one linked token adds the overall
-    /// budget, and a stage measurement reports elapsed time to the ambient
-    /// <see cref="TelegramUpdateLatencyScope"/>. When only the budget expired — the caller's own token is still live —
-    /// the typed <see cref="TelegramForegroundDeliveryTimeoutException"/> is raised and no retry is attempted. Caller
-    /// cancellation and Telegram errors keep their original exception identity.
+    /// Non-interactive requests pass through unchanged. Interactive requests use one linked token with the selected
+    /// deadline: media groups get the bounded upload budget, all other interactive calls keep the ordinary deadline.
+    /// The ambient <see cref="TelegramUpdateLatencyScope"/> measures the same request. When only that deadline
+    /// expires — the caller's own token is still live — the typed
+    /// <see cref="TelegramForegroundDeliveryTimeoutException"/> is raised without retrying. Caller cancellation
+    /// and Telegram errors keep their original exception identity.
     /// </remarks>
     /// <exception cref="TelegramForegroundDeliveryTimeoutException">
     /// The overall interactive delivery budget expired before Telegram answered.
@@ -149,8 +150,9 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
         if (!TryClassifyForegroundRequest(request, out var stage))
             return await _inner.SendRequest(request, cancellationToken);
 
+        var overallBudget = request is SendMediaGroupRequest ? _policy.MediaGroupBudget : _policy.OverallBudget;
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        budget.CancelAfter(_policy.OverallBudget);
+        budget.CancelAfter(overallBudget);
         using var measurement = TelegramUpdateLatencyScope.Current?.Measure(stage) ?? default;
 
         try
@@ -159,9 +161,8 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && budget.IsCancellationRequested)
         {
-            // Only our own budget expired: the customer's lane is still live, so report a typed interactive-delivery
-            // timeout instead of a shutdown cancellation. The send is abandoned and never replayed automatically.
-            throw new TelegramForegroundDeliveryTimeoutException(DescribeRequestKind(request), _policy.OverallBudget);
+            // An upload may have reached Telegram before its response was lost; never retry an ambiguous send.
+            throw new TelegramForegroundDeliveryTimeoutException(DescribeRequestKind(request), overallBudget);
         }
     }
 

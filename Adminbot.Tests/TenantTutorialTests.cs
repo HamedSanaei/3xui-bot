@@ -5,6 +5,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.ReplyMarkups;
+using Telegram.Bot.Requests;
+using Telegram.Bot.Requests.Abstractions;
 using Xunit;
 
 /// <summary>
@@ -77,6 +79,31 @@ public sealed partial class ConcurrencyTests
         }
 
         return root;
+    }
+
+    /// <summary>Models a slow but successful Telegram multipart upload without making a network request.</summary>
+    private sealed class DelayedTutorialAlbumClient : StorefrontClient
+    {
+        /// <summary>Counts album attempts even when the caller's budget cancels the upload.</summary>
+        public int AlbumAttempts { get; private set; }
+
+        /// <summary>Waits for the simulated upload before recording Telegram's acknowledgement.</summary>
+        /// <typeparam name="TResponse">The Telegram request's response type.</typeparam>
+        /// <param name="request">The request whose media upload may be delayed.</param>
+        /// <param name="cancellationToken">Caller cancellation, including the foreground delivery deadline.</param>
+        /// <returns>The normal fake response after the simulated upload finishes.</returns>
+        /// <remarks>A cancelled multipart upload never claims success; the caller must not retry it automatically.</remarks>
+        public override async Task<TResponse> SendRequest<TResponse>(
+            IRequest<TResponse> request, CancellationToken cancellationToken = default)
+        {
+            if (request is SendMediaGroupRequest)
+            {
+                AlbumAttempts++;
+                await Task.Delay(TimeSpan.FromMilliseconds(160), cancellationToken);
+            }
+
+            return await base.SendRequest(request, cancellationToken);
+        }
     }
 
     /// <summary>
@@ -248,6 +275,47 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(new[] { 10, 1 }, TenantTutorialAssetService.BatchForMediaGroups(Enumerable.Range(1, 11).Select(i => $"s{i}.png").ToArray()).Select(b => b.Count));
         Assert.Empty(TenantTutorialAssetService.BatchForMediaGroups(Array.Empty<string>()));
         Assert.Equal(new[] { 1 }, TenantTutorialAssetService.BatchForMediaGroups(new[] { "only.png" }).Select(b => b.Count));
+    }
+
+    /// <summary>
+    /// The original six-slide PNG V2Box guide finishes when uploading outlasts a text reply.
+    /// </summary>
+    /// <returns>A task completing after the original shipped images pass through the foreground album sender.</returns>
+    /// <remarks>
+    /// Regression for the six-image iOS album that exceeded the former eight-second text-message budget. The simulated
+    /// Telegram upload is slower than the ordinary foreground deadline but faster than the bounded album deadline;
+    /// the shipped images retain their PNG format rather than trading image fidelity for upload speed.
+    /// </remarks>
+    [Fact]
+    public async Task Shipped_ios_album_upload_completes_past_the_ordinary_send_budget()
+    {
+        var root = CopyRepositoryTutorialAssets();
+        try
+        {
+            var assets = TenantTutorialAssetService.Resolve(TenantTutorialKinds.Ios, root);
+            Assert.Equal(6, assets.ImagePaths.Count);
+            Assert.All(assets.ImagePaths, path => Assert.Equal(".png", Path.GetExtension(path)));
+
+            var inner = new DelayedTutorialAlbumClient();
+            var bounded = new ForegroundBoundedTelegramBotClient(inner,
+                new TelegramForegroundDeliveryPolicy
+                {
+                    OverallBudget = TimeSpan.FromMilliseconds(50),
+                    MediaGroupBudget = TimeSpan.FromMilliseconds(800)
+                });
+
+            var delivered = await TenantTutorialAlbumSender.SendAsync(
+                bounded, new ChatId(722), assets, null, CancellationToken.None);
+
+            Assert.True(delivered);
+            Assert.Equal(1, inner.AlbumAttempts);
+            Assert.Equal(new[] { 6 }, inner.MediaGroupSizes);
+            Assert.Single(inner.MediaGroupCaptions);
+        }
+        finally
+        {
+            DeleteTutorialAssetRoot(root);
+        }
     }
 
     /// <summary>
