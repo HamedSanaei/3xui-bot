@@ -5,13 +5,15 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
-/// <summary>
-/// AtlasPay-specific two-stage provisional approval controls for the super-admin payment-status flow.
-/// </summary>
+/// <summary>AtlasPay two-stage provisional approval controls for the super-admin payment-status flow.</summary>
+/// <remarks>
+/// Only an owned-wallet charge with a freshly verified pending or expired status may be offered. An expired response
+/// does not establish receipt; the configured admin must check the full transfer independently before confirming.
+/// </remarks>
 public partial class XuiV3AdminFlowService
 {
-    /// <summary>Builds the first-stage control for a freshly verified pending AtlasPay wallet charge.</summary>
-    /// <param name="paymentId">Positive internal users.db AtlasPay payment id.</param>
+    /// <summary>Builds the first-stage control for a freshly checked pending or expired AtlasPay wallet charge.</summary>
+    /// <param name="paymentId">Positive internal users.db AtlasPay payment id; never a provider order id.</param>
     /// <returns>An inline keyboard containing only the provisional-review action.</returns>
     /// <remarks>The callback carries only the local id; amount, customer and provider state are always reloaded.</remarks>
     private static InlineKeyboardMarkup BuildProvisionalAtlasPayStartKeyboard(int paymentId)
@@ -32,9 +34,10 @@ public partial class XuiV3AdminFlowService
     /// <param name="cancellationToken">Cancellation token for provider, wallet, ledger, users.db, and Telegram work.</param>
     /// <returns><c>true</c> because the router calls this method only for AtlasPay provisional prefixes.</returns>
     /// <remarks>
-    /// Every stage rechecks configured-super-admin authorization. The final stage performs a fresh official AtlasPay
-    /// verification while holding the payment reconciliation gate. Direct tenant orders, terminal/mismatched responses,
-    /// accepted underpayments and financial ambiguity can never be provisionally overridden.
+    /// Every stage rechecks configured-super-admin authorization. Final confirmation performs a new official provider
+    /// verification while holding the payment reconciliation gate. An expired response is not proof of receipt: the
+    /// super-admin must independently confirm the full transfer with the provider/bank before accepting that exception.
+    /// Direct tenant orders, cancelled/rejected orders, known underpayments and financial ambiguity remain blocked.
     /// </remarks>
     private async Task<bool> TryHandleAtlasPayProvisionalCallbackAsync(
         ITelegramBotClient botClient,
@@ -111,14 +114,21 @@ public partial class XuiV3AdminFlowService
                         AtlasPayProvisionalCancelCallbackPrefix + payment.Id)
                 }
             });
+            var expired = string.Equals(payment.ProviderStatus, "expired", StringComparison.OrdinalIgnoreCase);
             await EditProvisionalMessageAsync(
                 botClient,
                 callbackQuery,
-                "⚠️ <b>تایید موقت شارژ AtlasPay</b>\n\n" +
+                (expired ? "⚠️ <b>بررسی دستی شارژ منقضی‌شده AtlasPay</b>\n\n"
+                    : "⚠️ <b>تایید موقت شارژ AtlasPay</b>\n\n") +
                 BuildAtlasPayPaymentInfo(payment, null) +
-                "\n\nدر مرحله نهایی AtlasPay دوباره به‌صورت رسمی استعلام می‌شود. " +
-                "اگر همچنان پرداخت تایید نشده باشد، فقط مبلغ پایه ذخیره‌شده یک‌بار به کیف پول اضافه می‌شود. " +
-                "تایید رسمی بعدی کیف پول، ledger یا referral را دوباره افزایش نمی‌دهد.\n\nآیا ادامه می‌دهید؟",
+                (expired
+                    ? "\n\nدر مرحله نهایی استعلام رسمی دوباره انجام می‌شود. اگر همچنان expired باشد، " +
+                      "این وضعیت و Webhook به‌تنهایی پرداخت را ثابت نمی‌کنند. فقط پس از بررسی مستقل دریافت کامل مبلغ کل " +
+                      "و شماره پیگیری در تسویه‌حساب درگاه و حساب بانکی تایید کنید. مبلغ پایه ذخیره‌شده یک‌بار به " +
+                      "کیف پول افزوده می‌شود؛ مسئولیت این استثنای دستی با تاییدکننده است.\n\nآیا ادامه می‌دهید؟"
+                    : "\n\nدر مرحله نهایی AtlasPay دوباره به‌صورت رسمی استعلام می‌شود. " +
+                      "اگر همچنان پرداخت تایید نشده باشد، فقط مبلغ پایه ذخیره‌شده یک‌بار به کیف پول اضافه می‌شود. " +
+                      "تایید رسمی بعدی کیف پول، ledger یا referral را دوباره افزایش نمی‌دهد.\n\nآیا ادامه می‌دهید؟"),
                 keyboard,
                 cancellationToken);
             await AnswerCallbackSafelyAsync(

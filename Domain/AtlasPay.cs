@@ -746,9 +746,13 @@ public static class AtlasPayManualCheckPolicy
     }
 }
 
-/// <summary>Settles verified central AtlasPay charges into the global customer wallet with immutable owned/tenant origin.</summary>
-/// <remarks>Uses existing receipt keys and independent database commits. Customer delivery is an outbox intent;
-/// tenant-origin payments never qualify for owned referral rewards or direct tenant-order fulfillment.</remarks>
+/// <summary>Credits official AtlasPay wallet charges or explicitly approved provisional owned-wallet exceptions.</summary>
+/// <remarks>
+/// The immutable base amount in toman uses the same receipt key for official and super-admin provisional approval;
+/// credentials.db receipts and users.db markers commit independently and a duplicate never adds another wallet credit.
+/// Customer delivery is an outbox intent. Expired responses alone never authorize funds, tenant-origin wallet charges
+/// cannot use the expired exception, and provisional credits never earn owned referral rewards.
+/// </remarks>
 public sealed partial class AtlasPaySettlementService
 {
     private static readonly AsyncKeyedGate SettlementGate = new();
@@ -907,16 +911,18 @@ public sealed partial class AtlasPaySettlementService
         finally { lease.Dispose(); }
     }
 
-    /// <summary>Provisionally credits one AtlasPay wallet charge after an explicit two-stage super-admin decision.</summary>
-    /// <param name="payment">Freshly verified pending wallet-charge row; direct tenant orders are rejected.</param>
-    /// <param name="approvedByTelegramUserId">Configured super-admin Telegram id persisted with the financial exception.</param>
-    /// <param name="notifyChatId">Optional customer chat override for the durable settlement notification.</param>
+    /// <summary>Provisionally credits one owned AtlasPay wallet charge after an explicit two-stage super-admin decision.</summary>
+    /// <param name="payment">Local payment freshly verified by the reconciliation gate; tenant orders are rejected.</param>
+    /// <param name="approvedByTelegramUserId">Configured global super-admin Telegram user id persisted in the credit receipt.</param>
+    /// <param name="notifyChatId">Optional customer Telegram chat id for the one durable settlement notification.</param>
     /// <param name="cancellationToken">Cancellation token for wallet, users.db, ledger, and outbox work.</param>
     /// <returns>Applied for the first provisional credit, AlreadyAdded for a duplicate, or a non-mutating rejection.</returns>
     /// <remarks>
-    /// The immutable base amount is credited exactly once through the same credentials.db operation key as official
-    /// settlement. Provider status remains pending. A later official webhook confirmation records audit only and never
-    /// creates another wallet credit, ledger row, referral reward, or customer notification.
+    /// The immutable base amount in toman is credited exactly once through the official credentials.db operation key.
+    /// A fresh expired response remains unpaid evidence: only the super-admin's separate bank/provider receipt review
+    /// permits that explicit exception. Pending and expired credits retain their provider status and audited admin id.
+    /// A later official confirmation records audit only, without another wallet credit, ledger row, referral or notice.
+    /// The wallet receipt commits independently of the users.db marker; ambiguous claims require manual recovery.
     /// </remarks>
     public async Task<NowPaymentsSettlementResult> ApplyProvisionalPaymentAsync(
         AtlasPayPaymentInfo payment,
@@ -961,10 +967,15 @@ public sealed partial class AtlasPaySettlementService
 
             var attemptId = Guid.NewGuid().ToString("N");
             var claimedAtUtc = DateTime.UtcNow;
+            // Compare the freshly verified provider state while claiming: another process must not change identity or
+            // terminal evidence between the admin decision and the single credentials.db wallet operation.
             var claimed = await context.WriteAsync(async db => await db.AtlasPayPaymentInfos
                 .Where(x => x.Id == tracked.Id &&
                             !x.IsAddedToBalance &&
-                            x.SettlementState == AtlasPaySettlementStates.Pending)
+                            x.SettlementState == AtlasPaySettlementStates.Pending &&
+                            x.ProviderStatus == tracked.ProviderStatus &&
+                            x.ErrorCode == tracked.ErrorCode &&
+                            x.LastInquiryAtUtc == tracked.LastInquiryAtUtc)
                 .ExecuteUpdateAsync(
                     setters => setters
                         .SetProperty(x => x.SettlementState, AtlasPaySettlementStates.Processing)
@@ -1007,7 +1018,8 @@ public sealed partial class AtlasPaySettlementService
             tracked.BalanceBefore = receipt.BeforeBalance;
             tracked.BalanceAfter = receipt.AfterBalance;
             tracked.SettledAtUtc ??= DateTime.UtcNow;
-            tracked.NextInquiryAtUtc = AtlasPayPollingPolicy.GetInitialNextInquiryUtc(_configuration, DateTime.UtcNow);
+            tracked.NextInquiryAtUtc = AtlasPayStatuses.IsTerminal(tracked.ProviderStatus)
+                ? null : AtlasPayPollingPolicy.GetInitialNextInquiryUtc(_configuration, DateTime.UtcNow);
             tracked.UpdatedAtUtc = DateTime.UtcNow;
 
             context.Add(PaymentSettlementNotification.CreateWalletCredit(
@@ -1165,19 +1177,20 @@ public sealed partial class AtlasPaySettlementService
             _ => string.IsNullOrWhiteSpace(source) ? "-" : source
         };
 
-    /// <summary>Determines whether a freshly verified AtlasPay wallet charge may receive a super-admin provisional credit.</summary>
-    /// <param name="payment">Payment row after the immediately preceding authoritative provider verification.</param>
-    /// <returns><c>true</c> only for an unresolved wallet charge with stable provider identity and no terminal/manual-review state.</returns>
+    /// <summary>Determines whether a freshly verified owned-wallet charge can receive a provisional admin credit.</summary>
+    /// <param name="payment">Local charge refreshed by the official verification endpoint before final admin confirmation.</param>
+    /// <returns><c>true</c> only for a still-pending valid charge or the restricted, freshly expired manual-review exception.</returns>
     /// <remarks>
-    /// Direct tenant orders, tenant-origin wallet charges, paid/terminal rows, provider-review/underpayment states,
-    /// ambiguous settlement claims, and provider errors are excluded. The final confirmation path performs another
-    /// official verification while holding the payment gate.
+    /// An expired status is never payment proof: only the configured super-admin's deliberate two-stage bank-verified
+    /// decision can authorize the existing idempotent provisional receipt. Tenant funds, cancelled/rejected orders,
+    /// known underpayments, identity mismatches, provider failures and ambiguous settlement claims fail closed.
     /// </remarks>
     public static bool CanApplyProvisionalCredit(AtlasPayPaymentInfo payment)
-        => CanOfferAdminReview(payment) &&
-           string.Equals(payment.ProviderStatus, "awaiting_payment", StringComparison.OrdinalIgnoreCase) &&
-           string.IsNullOrWhiteSpace(payment.ErrorCode) &&
-           string.Equals(payment.SettlementState, AtlasPaySettlementStates.Pending, StringComparison.Ordinal);
+        => string.Equals(payment?.SettlementState, AtlasPaySettlementStates.Pending, StringComparison.Ordinal) &&
+           (CanOfferExpiredAdminReview(payment) ||
+            (CanOfferAdminReview(payment) &&
+             string.Equals(payment.ProviderStatus, "awaiting_payment", StringComparison.OrdinalIgnoreCase) &&
+             string.IsNullOrWhiteSpace(payment.ErrorCode)));
 
     /// <summary>Appends the receipt-backed wallet-charge audit using the persisted payment origin.</summary>
     /// <param name="payment">Settled local payment with immutable customer, amount and originating bot.</param>
@@ -1204,6 +1217,12 @@ public sealed partial class AtlasPaySettlementService
             AtlasPayStatuses.IsSuccess(payment.ProviderStatus), IsProvisional: payment.IsProvisionallyApproved), token);
 }
 
+/// <summary>Reconciles AtlasPay hints and operator checks against official provider order/verify responses.</summary>
+/// <remarks>
+/// Worker and customer checks skip cached terminal orders. A configured super-admin may force a fresh verification
+/// of an expired local order; payment identity and total still gate automatic settlement. An unchanged expired result
+/// can only enter the separate two-stage owned-wallet exception after an independent human bank receipt review.
+/// </remarks>
 public sealed partial class AtlasPayReconciliationHostedService : BackgroundService
 {
     private static readonly AsyncKeyedGate Gate = new();
@@ -1379,9 +1398,30 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
         }
     }
 
+    /// <summary>Reconciles a local AtlasPay order from an official provider response and applies only verified financial effects.</summary>
+    /// <param name="paymentId">Positive internal users.db AtlasPay payment id; never a provider order id.</param>
+    /// <param name="source">Internal non-secret reconciliation trigger for auditing; it cannot authorize payment.</param>
+    /// <param name="useVerify">Whether to POST the provider's official verify endpoint instead of reading order status.</param>
+    /// <param name="cancellationToken">Cancellation token for provider calls and durable payment/ledger work.</param>
+    /// <param name="terminalReviewAdminId">
+    /// Optional configured global super-admin Telegram user id. Only a valid admin plus <paramref name="useVerify"/>
+    /// may recheck a cached terminal state; this does not itself authorize provisional wallet credit.
+    /// </param>
+    /// <returns>Applied/AlreadyAdded only after provider proof or existing receipt; otherwise a non-credit result.</returns>
+    /// <remarks>
+    /// Workers and customer checks never requery terminal invoices. A super-admin recheck may discover a delayed
+    /// official confirmation; if the provider still reports expired, any wallet credit requires a separate two-stage
+    /// bank-verified decision. Provider identity and total are checked before terminal status is persisted.
+    /// </remarks>
+    /// <example><code>await reconciler.ReconcilePaymentAsync(localId, "superadmin-verify", true, token, adminTelegramUserId);</code></example>
+    /// <exception cref="OperationCanceledException">The caller cancels provider or persistence work.</exception>
     public async Task<NowPaymentsSettlementResult> ReconcilePaymentAsync(int paymentId, string source,
-        bool useVerify = false, CancellationToken cancellationToken = default)
+        bool useVerify = false, CancellationToken cancellationToken = default, long? terminalReviewAdminId = null)
     {
+        if (terminalReviewAdminId.HasValue &&
+            (!useVerify || _configuration.AdminsUserIds?.Contains(terminalReviewAdminId.Value) != true))
+            return NowPaymentsSettlementResult.InvalidAmount();
+
         if (string.Equals(source, "atlaspay-webhook", StringComparison.Ordinal) &&
             AtlasPayPollingPolicy.UsesWebhookPrimary(_configuration) &&
             !await HasPendingWebhookReceiptAsync(paymentId, cancellationToken))
@@ -1391,7 +1431,7 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
 
         using var lease = Gate.TryEnter(paymentId.ToString(CultureInfo.InvariantCulture));
         if (lease == null) return NowPaymentsSettlementResult.ProviderNotPaid();
-        try { return await ReconcileCoreAsync(paymentId, source, useVerify, cancellationToken); }
+        try { return await ReconcileCoreAsync(paymentId, source, useVerify, cancellationToken, terminalReviewAdminId.HasValue); }
         finally { lease.Dispose(); }
     }
 
@@ -1412,19 +1452,20 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
             cancellationToken);
     }
 
-    /// <summary>Performs a fresh AtlasPay verification and, only if it remains safely pending, applies provisional admin credit.</summary>
-    /// <param name="paymentId">Positive internal AtlasPay payment id selected by the super-admin flow.</param>
-    /// <param name="approvedByTelegramUserId">Configured super-admin Telegram id persisted with the financial exception.</param>
-    /// <param name="notifyChatId">Optional customer chat id for the provisional-credit notification.</param>
-    /// <param name="source">Non-secret audit source for the final admin confirmation.</param>
-    /// <param name="cancellationToken">Cancellation token for provider, users.db, wallet, ledger, and notification work.</param>
+    /// <summary>Rechecks AtlasPay and applies a provisional credit only after a configured super-admin's final decision.</summary>
+    /// <param name="paymentId">Positive internal AtlasPay payment id selected in the owned super-admin flow.</param>
+    /// <param name="approvedByTelegramUserId">Configured super-admin Telegram user id persisted in the financial receipt.</param>
+    /// <param name="notifyChatId">Optional customer Telegram chat id for the one durable credit notice.</param>
+    /// <param name="source">Internal non-secret audit source for the final admin confirmation.</param>
+    /// <param name="cancellationToken">Cancellation token for provider, users.db, wallet, ledger and notification work.</param>
     /// <returns>
-    /// Official settlement when AtlasPay now reports paid; otherwise provisional settlement only when the freshly
-    /// verified row remains eligible. Tenant orders, terminal responses, manual-review rows, and provider failures fail closed.
+    /// Official settlement when AtlasPay now reports paid; otherwise provisional settlement only after an eligible
+    /// pending or newly reverified expired owned-wallet charge. All other states fail closed without a credit.
     /// </returns>
     /// <remarks>
-    /// The same payment-keyed reconciliation gate is held from provider verification through provisional admission, so a
-    /// concurrent webhook cannot slip between the final provider check and the durable wallet claim.
+    /// The payment-keyed reconciliation gate stays held from the official verify call through provisional admission.
+    /// An expired response is NOT payment proof; only an independently bank-verified human admin decision justifies the
+    /// separate provisional path. Repeated callbacks reuse the credentials.db operation key and cannot double-credit.
     /// </remarks>
     public async Task<NowPaymentsSettlementResult> ReconcileAndApplyProvisionalAsync(
         int paymentId,
@@ -1443,7 +1484,8 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
         using var lease = await Gate.EnterAsync(paymentId.ToString(CultureInfo.InvariantCulture), cancellationToken);
         try
         {
-            var official = await ReconcileCoreAsync(paymentId, source, useVerify: true, cancellationToken);
+            var official = await ReconcileCoreAsync(paymentId, source, useVerify: true, cancellationToken,
+                allowTerminalRecheck: true);
             await using var db = _factory.CreateDbContext();
             var payment = await db.AtlasPayPaymentInfos.AsNoTracking()
                 .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
@@ -1504,7 +1546,19 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
         return true;
     }
 
-    private async Task<NowPaymentsSettlementResult> ReconcileCoreAsync(int paymentId, string source, bool useVerify, CancellationToken token)
+    /// <summary>Verifies a local AtlasPay row and runs its official wallet or tenant settlement path.</summary>
+    /// <param name="paymentId">Internal users.db AtlasPay id whose provider order identity is persisted locally.</param>
+    /// <param name="source">Internal reconciliation trigger used only in safe financial audit labels.</param>
+    /// <param name="useVerify">Whether to call the provider verify endpoint instead of GET order status.</param>
+    /// <param name="token">Cancellation token for the provider call and durable settlement work.</param>
+    /// <param name="allowTerminalRecheck">Allows a previously expired order to be queried only after admin authorization.</param>
+    /// <returns>Official settlement result or a non-credit result when the provider does not prove full payment.</returns>
+    /// <remarks>
+    /// A terminal cache is skipped for workers and customers. A permitted manual refresh never credits on an expired
+    /// response; identity and total must match the local order before either terminal evidence or eligibility is saved.
+    /// </remarks>
+    private async Task<NowPaymentsSettlementResult> ReconcileCoreAsync(int paymentId, string source,
+        bool useVerify, CancellationToken token, bool allowTerminalRecheck = false)
     {
         var context = new UserWorkflowStore(_factory);
         var payment = await context.ReadAsync(async db => await db.AtlasPayPaymentInfos.FirstOrDefaultAsync(x => x.Id == paymentId, token));
@@ -1552,7 +1606,9 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
                 .ApplyOfficialPaymentAsync(payment, source, token);
         }
 
-        if (AtlasPayStatuses.IsTerminal(payment.ProviderStatus))
+        if (AtlasPayStatuses.IsTerminal(payment.ProviderStatus) &&
+            (!allowTerminalRecheck ||
+             !string.Equals(payment.ProviderStatus, "expired", StringComparison.OrdinalIgnoreCase)))
             return NowPaymentsSettlementResult.ProviderNotPaid();
         try
         {
@@ -1577,10 +1633,26 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
             }
             if (!verified)
             {
-                if (AtlasPayStatuses.IsTerminal(response.Status)) { payment.NextInquiryAtUtc = null; payment.ErrorCode = $"provider_{response.Status}"; }
-                else if (error != "provider_not_paid") { payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.NextInquiryAtUtc = null; payment.ErrorCode = error; }
-                else { payment.ErrorCode = null; NextInquiry(payment); }
-                payment.UpdatedAtUtc = DateTime.UtcNow; await context.SaveAsync(token);
+                // Identity/amount failures always take precedence over a terminal status: an unrelated expired order
+                // cannot create an admin override for a different local payment.
+                if (error != "provider_not_paid")
+                {
+                    payment.SettlementState = AtlasPaySettlementStates.ManualReview;
+                    payment.NextInquiryAtUtc = null;
+                    payment.ErrorCode = error;
+                }
+                else if (AtlasPayStatuses.IsTerminal(response.Status))
+                {
+                    payment.NextInquiryAtUtc = null;
+                    payment.ErrorCode = $"provider_{response.Status}";
+                }
+                else
+                {
+                    payment.ErrorCode = null;
+                    NextInquiry(payment);
+                }
+                payment.UpdatedAtUtc = DateTime.UtcNow;
+                await context.SaveAsync(token);
                 return NowPaymentsSettlementResult.ProviderNotPaid();
             }
             payment.PaidAtUtc ??= DateTime.UtcNow;

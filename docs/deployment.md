@@ -181,6 +181,32 @@ registration per order or on startup. Confirm a **new** signed provider callback
 separate authoritative `GET /orders/{id}` inquiry. Keep HTTP 401 for unverifiable callbacks;
 polling and explicit customer/admin checks cover callbacks AtlasPay does not retry.
 
+### Delayed payment after an AtlasPay order expires
+
+From the **owned bot's configured global super-admin** payment-status screen, enter the exact local
+`AP:<id>` or the full `AtlasPay-...` merchant reference. A cached `expired` status no longer prevents
+a new authenticated `/orders/{id}/verify` call. If AtlasPay now reports full payment with the
+original order id, merchant reference and total, the normal idempotent settlement runs: **do not**
+use manual approval. A signed `order.confirmed` webhook is only a hint; it cannot replace verification.
+
+If a fresh response still says `expired`, the bot may offer **two-stage provisional wallet credit**
+only for an uncredited owned-bot `wallet_charge`. Before pressing either approval button, the
+super-admin must independently confirm receipt of the **entire customer-facing total in toman**,
+the matching provider order/reference/tracking code, and the actual bank/provider settlement.
+Neither the expired API response nor the button supplies that proof. The status screen shows the
+immutable base amount that will be credited; the service stores the approving admin/time and a
+receipt-backed wallet/ledger audit. An unknown provider-received amount requires manual bank
+evidence; a known short payment is ineligible. Do not approve a disputed or refunded transfer.
+
+The final button repeats the official verification under the payment gate. A new paid result uses
+official settlement instead; if still expired, only that explicit decision may add the saved
+base amount once. A repeated callback or later official confirmation cannot add another credit,
+ledger entry, referral or notification. Rejected/cancelled orders, tenant orders or tenant-origin
+wallet charges, identity/amount mismatches, provider errors, and ambiguous claims stay blocked.
+For a previously expired provisional charge, a later **manual super-admin status check** can
+record official confirmation without a second credit; automatic polling of terminal rows remains
+disabled. Never hand-edit `users.db`, `credentials.db`, or a customer's balance to emulate approval.
+
 ## Test schema policy
 
 The general concurrency fixture in `Adminbot.Tests/ConcurrencyTests.cs` uses `EnsureCreated` only for short-lived unit

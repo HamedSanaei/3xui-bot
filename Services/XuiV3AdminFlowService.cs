@@ -18,7 +18,8 @@ using Telegram.Bot.Exceptions;
 /// <remarks>
 /// Manual payment checks route verified tenant rows to <see cref="TenantBotService"/> and owned-wallet rows to their
 /// provider settlement service. Provisional HooshPay, Tetraminator, UniquePay, and AtlasPay actions are restricted to
-/// configured super-admins and never bypass a provider mismatch or create a provisional tenant fulfillment.
+/// configured super-admins and never bypass a provider mismatch or create a provisional tenant fulfillment. AtlasPay
+/// expired wallet charges require a new provider check and explicit two-stage independent bank receipt review.
 /// </remarks>
 public partial class XuiV3AdminFlowService
 {
@@ -56,7 +57,7 @@ public partial class XuiV3AdminFlowService
     private const string UniquePayProvisionalConfirmCallbackPrefix = "x3admin:up:provisional-confirm:";
     /// <summary>Cancellation callback prefix that removes UniquePay approval controls without financial effects.</summary>
     private const string UniquePayProvisionalCancelCallbackPrefix = "x3admin:up:provisional-cancel:";
-    /// <summary>First-stage super-admin callback prefix for an eligible pending AtlasPay wallet charge.</summary>
+    /// <summary>First-stage super-admin callback prefix for an eligible pending or freshly expired OWNED AtlasPay wallet charge.</summary>
     private const string AtlasPayProvisionalStartCallbackPrefix = "x3admin:ap:provisional:";
     /// <summary>Final AtlasPay callback prefix; the provider is re-verified before any provisional wallet mutation.</summary>
     private const string AtlasPayProvisionalConfirmCallbackPrefix = "x3admin:ap:provisional-confirm:";
@@ -2167,10 +2168,10 @@ public partial class XuiV3AdminFlowService
     /// authoritative AtlasPay verification, and reporting the shared settlement outcome.
     /// </summary>
     /// <param name="botClient">Owned-bot Telegram client serving the configured global super-admin.</param>
-    /// <param name="message">Admin message containing a provider-qualified <c>AP:&lt;localId&gt;</c> identifier.</param>
+    /// <param name="message">Telegram message from the configured super-admin; its sender id authorizes terminal recheck.</param>
     /// <param name="currentUser">Bot-scoped admin flow state cleared before the verification report is sent.</param>
     /// <param name="mainMenu">Super-admin reply keyboard restored after the report.</param>
-    /// <param name="input">Provider-qualified local AtlasPay payment id. The value is an address, never payment proof.</param>
+    /// <param name="input">Qualified local <c>AP:</c> id, provider <c>APO:</c> order id, full merchant reference or tracking code; a lookup key, never payment proof.</param>
     /// <param name="cancellationToken">
     /// Cancellation token covering the provider request, settlement/fulfilment, activity logging, and Telegram delivery.
     /// </param>
@@ -2180,17 +2181,13 @@ public partial class XuiV3AdminFlowService
     /// provider lookup.
     /// </returns>
     /// <remarks>
-    /// This is verification, not a force-settle button. The handler cannot credit a wallet or fulfil a tenant order from
-    /// local data, does not trust any amount or status supplied by the operator, and delegates every financial effect to
-    /// the same <see cref="AtlasPayReconciliationHostedService.ReconcilePaymentAsync"/> boundary used by the background
-    /// poller and the customer check. Repeating the command is therefore idempotent: an already-settled payment reports
-    /// <c>AlreadyAdded</c> instead of crediting again.
-    ///
-    /// Only global super-admins reach this handler, because the admin flow performs the super-admin authorization before
-    /// dispatching admin messages.
-    ///
-    /// Security: the report never contains the AtlasPay API key, signing material, or full card numbers, and raw provider
-    /// response text is never echoed.
+    /// This action first checks the official provider response; it never credits a wallet from a local status or a
+    /// signed webhook alone. A configured super-admin may explicitly recheck a cached expired order. If AtlasPay now
+    /// confirms full payment the ordinary idempotent settlement runs; if it still says expired, an eligible owned-wallet
+    /// charge may offer a separate two-stage provisional decision, requiring independent bank/provider receipt proof.
+    /// Tenant orders, known underpayments and ambiguous settlement claims are never offered that manual exception.
+    /// Only configured global super-admins reach this handler. The report contains no API key, signing material, raw
+    /// provider response or full card number.
     /// </remarks>
     private async Task<bool> TryHandleAtlasPayStatusAsync(
         ITelegramBotClient botClient,
@@ -2212,10 +2209,11 @@ public partial class XuiV3AdminFlowService
         });
         if (payment == null) return false;
 
-        // Same authoritative boundary as polling and customer checks. The admin identity in the audit log is the only
-        // thing that differs; settlement, idempotency keys, and tenant fulfilment semantics stay identical.
+        // An admin may recheck a cached expired order, but only AtlasPay's own paid response authorizes official
+        // settlement. A continued expired response can only be handled by a separate human-reviewed callback.
         var settlement = await _atlasPayReconciliation.ReconcilePaymentAsync(
-            payment.Id, "superadmin-verify", useVerify: true, cancellationToken);
+            payment.Id, "superadmin-verify", useVerify: true, cancellationToken,
+            terminalReviewAdminId: message.From.Id);
         await _workflow.ReloadAsync(payment, cancellationToken);
 
         var actor = await GetActivityActorAsync(message.From.Id);
@@ -2239,10 +2237,14 @@ public partial class XuiV3AdminFlowService
         if (AtlasPaySettlementService.CanApplyProvisionalCredit(payment))
         {
             await _state.ClearUserStatus(currentUser);
+            var guidance = string.Equals(payment.ProviderStatus, "expired", StringComparison.OrdinalIgnoreCase)
+                ? "\n\n⚠️ استعلام تازه AtlasPay هنوز وضعیت expired را نشان می‌دهد؛ این وضعیت اثبات دریافت وجه نیست. " +
+                  "فقط اگر واریز کامل مبلغ کل سفارش و شماره پیگیری را در تسویه‌حساب درگاه و حساب بانکی بررسی کرده‌اید، " +
+                  "می‌توانید تصمیم دستی دومرحله‌ای برای شارژ موقت کیف پول را آغاز کنید."
+                : "\n\nاین پرداخت در استعلام تازه هنوز توسط AtlasPay تایید نشده است. فقط در صورت اطمینان از دریافت وجه می‌توانید شارژ موقت کیف پول را آغاز کنید.";
             await botClient.SendMessage(
                 message.Chat.Id,
-                BuildAtlasPayPaymentInfo(payment, settlement) +
-                "\n\nاین پرداخت در استعلام تازه هنوز توسط AtlasPay تایید نشده است. فقط در صورت اطمینان از دریافت وجه می‌توانید شارژ موقت کیف پول را آغاز کنید.",
+                BuildAtlasPayPaymentInfo(payment, settlement) + guidance,
                 parseMode: ParseMode.Html,
                 replyMarkup: BuildProvisionalAtlasPayStartKeyboard(payment.Id),
                 cancellationToken: cancellationToken);

@@ -399,12 +399,21 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   purchase log is separate from this payment receipt. The Sales Assistant's existing durable one-send
   `sales_assistant_sale_notification` includes the customer gateway from `TenantBotOrder.PaymentProvider` and
   distinct sale/base/profit/owner-wallet amounts; customer payment source is not owner funding source.
-- AtlasPay super-admin verification: type `AP:<localId>` in the admin payment-status screen
-  (`XuiV3AdminFlowService.TryHandleAtlasPayStatusAsync`). `AP:` is mandatory and bare ids are rejected, the row must
-  exist locally (a raw provider order id can never be settled), and the action only calls the shared verification
-  boundary — it is verification, not a force-credit button. The report shows local id, provider order id, tracking code,
-  provider status, purpose, bot/tenant linkage, `BaseAmountToman` vs `TotalAmountToman` vs actual received, manual-delivery
-  flag, settlement state, and reconciliation state, and never exposes the API key or card data.
+- AtlasPay super-admin verification (`XuiV3AdminFlowService.TryHandleAtlasPayStatusAsync`) accepts `AP:<localId>`,
+  `APO:<providerOrderId>`, the full merchant reference, or tracking code; bare numeric ids remain ambiguous and are
+  rejected. Every lookup resolves exactly one local users.db row. Worker/customer checks skip cached terminal states,
+  but a configured super-admin forces one fresh official `/verify` on an expired row. A newly confirmed payment uses
+  ordinary provider-verified settlement. If it remains `expired`, only a freshly checked (within two minutes) owned-bot
+  `wallet_charge` with a stable provider identity, `provider_expired` reason, no known short payment, and no competing
+  financial claim can offer the existing two-stage provisional admin callback. **Expired status and webhook hints are
+  not payment proof**: the admin must confirm the full transfer independently against the provider/bank first. Final
+  callback re-verifies; cancelled/rejected, tenant-origin/order, identity-mismatched, known underpaid, and provider-error
+  rows never qualify. The one base-toman credit shares the official credentials.db receipt key, writes one admin-tagged
+  users.db ledger and notice, and never awards a referral or double-credits on replay/later official confirmation.
+  Expired provisional rows do not poll forever; later official confirmation can be recorded on a fresh admin recheck.
+  See `docs/deployment.md` for the operator procedure; never edit the payment row or wallet directly.
+  The status report lists local/provider ids, tracking, purpose/origin, base/total/received amounts and settlement
+  state; API keys, signing material, raw provider responses and full card numbers must never be displayed.
 - AtlasPay reconciliation policy: `AtlasPayFailurePolicy` is the single classifier. Only provider-marked temporary
   failures (HTTP 408/429/5xx including the documented 503, plus timeout/transport) keep the bounded automatic retry
   budget. Documented permanent errors (400 invalid input, 401 invalid key, 404 order-not-found-or-not-yours) stop
