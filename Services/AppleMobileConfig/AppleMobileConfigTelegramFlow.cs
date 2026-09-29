@@ -199,6 +199,21 @@ public sealed class AppleMobileConfigTelegramFlow
         return true;
     }
 
+    /// <summary>Creates an APN profile and delivers it once without mistaking an unacknowledged upload for failed generation.</summary>
+    /// <param name="botClient">The current owned or tenant bot's Telegram client, used for the document and status messages.</param>
+    /// <param name="chatId">The Telegram chat receiving the profile; it must belong to the current conversation.</param>
+    /// <param name="userId">The current bot's Telegram user id whose APN input state is cleared after acknowledged delivery.</param>
+    /// <param name="apn">The validated APN from the selected carrier or the user's custom input.</param>
+    /// <param name="homeKeyboard">The current bot's home keyboard, shown only after acknowledged document delivery.</param>
+    /// <param name="cancellationToken">The current update's cancellation token; caller cancellation is never hidden.</param>
+    /// <returns>A task completing after the profile and its status message, or after reporting an uncertain upload.</returns>
+    /// <remarks>
+    /// The generated profile stays in memory. A document timeout does not prove failure and must never resend the
+    /// document automatically; the user's bot-scoped APN state stays available for a deliberate retry. After Telegram
+    /// acknowledges the document, the state is cleared before sending optional installation instructions. A timeout
+    /// on those instructions must not claim that profile generation failed or deliver a second profile.
+    /// </remarks>
+    /// <example><code>await GenerateAndSendAsync(botClient, chatId, userId, "mcinet", homeKeyboard, cancellationToken);</code></example>
     private async Task GenerateAndSendAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -208,6 +223,7 @@ public sealed class AppleMobileConfigTelegramFlow
         CancellationToken cancellationToken)
     {
         const IpProtocolMode protocol = IpProtocolMode.IPv4AndIPv6;
+        var documentAcknowledged = false;
         try
         {
             var options = new ApnProfileOptions
@@ -226,6 +242,7 @@ public sealed class AppleMobileConfigTelegramFlow
                 chatId,
                 InputFile.FromStream(stream, fileName),
                 cancellationToken: cancellationToken);
+            documentAcknowledged = true;
 
             await _state.ClearUserStatus(new global::User { Id = userId });
             _logger.LogInformation(
@@ -242,6 +259,22 @@ public sealed class AppleMobileConfigTelegramFlow
                 replyMarkup: homeKeyboard,
                 cancellationToken: cancellationToken);
         }
+        catch (TelegramForegroundDeliveryTimeoutException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The upload response may be lost even when Telegram accepted the document; never retry it automatically.
+            _logger.LogWarning(
+                "Apple APN Telegram delivery uncertain. BotId={BotId} TelegramUserId={TelegramUserId} Stage={Stage} RequestKind={RequestKind}",
+                BotContextAccessor.CurrentBotId,
+                userId,
+                documentAcknowledged ? "instructions" : "document",
+                ex.RequestKind);
+            if (!documentAcknowledged)
+                await botClient.SendMessage(
+                    chatId,
+                    AppleMobileConfigText.DeliveryUncertain,
+                    replyMarkup: BuildMenuKeyboard(),
+                    cancellationToken: cancellationToken);
+        }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
@@ -249,11 +282,14 @@ public sealed class AppleMobileConfigTelegramFlow
         catch (Exception ex)
         {
             _logger.LogWarning(
-                "Apple APN profile generation/delivery failed. BotId={BotId} TelegramUserId={TelegramUserId} Protocol={Protocol} ErrorType={ErrorType}",
+                "Apple APN profile generation/delivery failed. BotId={BotId} TelegramUserId={TelegramUserId} Protocol={Protocol} DocumentAcknowledged={DocumentAcknowledged} ErrorType={ErrorType}",
                 BotContextAccessor.CurrentBotId,
                 userId,
                 protocol,
+                documentAcknowledged,
                 ex.GetType().Name);
+            if (documentAcknowledged)
+                throw;
             await botClient.SendMessage(
                 chatId,
                 AppleMobileConfigText.GenericError,

@@ -132,6 +132,47 @@ public sealed partial class ConcurrencyTests
         }
     }
 
+    /// <summary>Accepts an authentic documented rejection as a durable hint without treating it as financial proof.</summary>
+    /// <returns>A task checking exact-body HMAC admission and unchanged wallet/settlement state.</returns>
+    /// <remarks>The optional rejection reason is untrusted payment data; only a later provider inquiry can settle an order.</remarks>
+    [Fact]
+    public async Task AtlasPay_signed_rejected_event_persists_hint_without_financial_effect()
+    {
+        using var databases = new Databases();
+        var config = AtlasWebhookConfiguration();
+        int paymentId;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var payment = VerifiedAtlasPayment();
+            payment.ProviderStatus = "awaiting_payment";
+            db.AtlasPayPaymentInfos.Add(payment);
+            await db.SaveChangesAsync();
+            paymentId = payment.Id;
+        }
+
+        var reconciler = new AtlasPayReconciliationHostedService(
+            config, databases.Users, new AtlasPay(config, new HttpClient(new AtlasHttpHandler(
+                (_, _, _, _) => throw new InvalidOperationException("webhook must not inquire inline")))),
+            null!, NullLogger<AtlasPayReconciliationHostedService>.Instance);
+        var controller = new PaymentController(
+            databases.Users, config, null!, null!, null!, null!, null!, reconciler, null!,
+            NullLogger<PaymentController>.Instance);
+        const string body = "{ \"timestamp\":\"2026-09-29T12:11:15.000Z\", \"reason\":\"invalid receipt\", \"status\":\"rejected\", \"totalAmountToman\":250123, \"merchantOrderRef\":\"AtlasPay-test\", \"orderId\":77, \"event\":\"order.rejected\" }";
+        AttachAtlasWebhook(controller, body, SignAtlasWebhook(body));
+
+        Assert.IsType<OkObjectResult>(await controller.ReceiveAtlasPayWebhook(default));
+
+        await using var verify = databases.Users.CreateDbContext();
+        var saved = await verify.AtlasPayPaymentInfos.SingleAsync(x => x.Id == paymentId);
+        Assert.Equal("order.rejected", saved.WebhookEvent);
+        Assert.NotNull(saved.WebhookReceivedAtUtc);
+        Assert.Equal(new DateTime(2026, 9, 29, 12, 11, 15, DateTimeKind.Utc), saved.WebhookProviderTimestampUtc);
+        Assert.Equal("awaiting_payment", saved.ProviderStatus);
+        Assert.False(saved.IsAddedToBalance);
+        Assert.Equal(AtlasPaySettlementStates.Pending, saved.SettlementState);
+        Assert.Null(saved.WebhookProcessedAtUtc);
+    }
+
     [Fact]
     public async Task AtlasPay_webhook_rejects_invalid_signature_and_identity_mismatch()
     {
@@ -146,17 +187,33 @@ public sealed partial class ConcurrencyTests
             config, databases.Users, new AtlasPay(config, new HttpClient(new AtlasHttpHandler(
                 (_, _, _, _) => throw new InvalidOperationException()))), null!,
             NullLogger<AtlasPayReconciliationHostedService>.Instance);
+        var diagnostics = new DiagnosticLogger<PaymentController>();
         var controller = new PaymentController(
             databases.Users, config, null!, null!, null!, null!, null!, reconciler, null!,
-            NullLogger<PaymentController>.Instance);
+            diagnostics);
 
         const string validBody = "{\"event\":\"order.confirmed\",\"orderId\":77,\"merchantOrderRef\":\"AtlasPay-test\",\"totalAmountToman\":250123,\"status\":\"confirmed\",\"timestamp\":\"2026-09-23T12:00:00Z\"}";
+        AttachAtlasWebhook(controller, validBody, "");
+        Assert.IsType<UnauthorizedObjectResult>(await controller.ReceiveAtlasPayWebhook(default));
         AttachAtlasWebhook(controller, validBody, "00");
         Assert.IsType<UnauthorizedObjectResult>(await controller.ReceiveAtlasPayWebhook(default));
+        Assert.Contains(diagnostics.Messages(Microsoft.Extensions.Logging.LogLevel.Warning),
+            warning => warning.Contains("SignatureHeaderPresent=False", StringComparison.Ordinal));
+        Assert.Contains(diagnostics.Messages(Microsoft.Extensions.Logging.LogLevel.Warning),
+            warning => warning.Contains("SignatureHeaderPresent=True", StringComparison.Ordinal));
+        Assert.DoesNotContain(diagnostics.Messages(Microsoft.Extensions.Logging.LogLevel.Warning),
+            warning => warning.Contains("test-atlas-webhook-secret", StringComparison.Ordinal));
 
         const string mismatchedBody = "{\"event\":\"order.confirmed\",\"orderId\":77,\"merchantOrderRef\":\"wrong-ref\",\"totalAmountToman\":250123,\"status\":\"confirmed\",\"timestamp\":\"2026-09-23T12:00:00Z\"}";
         AttachAtlasWebhook(controller, mismatchedBody, SignAtlasWebhook(mismatchedBody));
         Assert.IsType<ConflictObjectResult>(await controller.ReceiveAtlasPayWebhook(default));
+
+        await using var verify = databases.Users.CreateDbContext();
+        var saved = await verify.AtlasPayPaymentInfos.SingleAsync();
+        Assert.Null(saved.WebhookReceivedAtUtc);
+        Assert.Null(saved.WebhookEvent);
+        Assert.False(saved.IsAddedToBalance);
+        Assert.Equal(AtlasPaySettlementStates.Pending, saved.SettlementState);
     }
 
     [Fact]

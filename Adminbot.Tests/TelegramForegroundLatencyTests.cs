@@ -37,11 +37,26 @@ public sealed partial class ConcurrencyTests
         /// <summary>Number of interactive message sends that entered the client.</summary>
         public int InteractiveSendAttempts;
 
+        /// <summary>Number of document sends that entered the client.</summary>
+        public int DocumentSendAttempts;
+
         /// <summary>Number of non-interactive requests that entered the client.</summary>
         public int OtherRequests;
 
-        /// <summary>True blocks a send until cancellation; false replies immediately.</summary>
+        /// <summary>Messages attempted, including those Telegram did not acknowledge.</summary>
+        public List<SendMessageRequest> SentMessages { get; } = new();
+
+        /// <summary>True blocks a message until cancellation; false replies immediately.</summary>
         public bool HangOnSend { get; set; } = true;
+
+        /// <summary>True blocks a document until cancellation; the operation can still have reached Telegram.</summary>
+        public bool HangOnDocument { get; set; }
+
+        /// <summary>True blocks the status message sent after an acknowledged document.</summary>
+        public bool HangOnSendAfterDocument { get; set; }
+
+        /// <summary>Artificial Telegram response delay for a document upload.</summary>
+        public TimeSpan DocumentDelay { get; set; }
 
         /// <inheritdoc />
         public bool LocalBotServer => false;
@@ -65,21 +80,34 @@ public sealed partial class ConcurrencyTests
         public Task DownloadFile(string filePath, Stream destination, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
-        /// <summary>Records the request kind and either hangs or answers immediately.</summary>
-        /// <typeparam name="TResponse">Requested response type.</typeparam>
-        /// <param name="request">Request built by the caller.</param>
-        /// <param name="cancellationToken">Token that also carries the foreground budget.</param>
-        /// <returns>A synthetic Telegram response.</returns>
+        /// <summary>Records interactive requests and simulates delayed or unacknowledged Telegram responses.</summary>
+        /// <typeparam name="TResponse">Response type requested by the Telegram client.</typeparam>
+        /// <param name="request">The real Telegram request emitted by the flow or decorator.</param>
+        /// <param name="cancellationToken">The caller's linked foreground deadline, when one is configured.</param>
+        /// <returns>A synthetic Telegram response for acknowledged requests.</returns>
+        /// <remarks>Blocked sends honor cancellation without reporting whether Telegram accepted the request.</remarks>
         public async Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
         {
-            if (request is SendMessageRequest)
+            if (request is SendMessageRequest send)
             {
                 Interlocked.Increment(ref InteractiveSendAttempts);
-                if (HangOnSend)
+                SentMessages.Add(send);
+                if (HangOnSend || (HangOnSendAfterDocument && Volatile.Read(ref DocumentSendAttempts) > 0))
                 {
                     await Task.Delay(System.Threading.Timeout.InfiniteTimeSpan, cancellationToken);
                     throw new InvalidOperationException("unreachable");
                 }
+            }
+            else if (request is SendDocumentRequest)
+            {
+                Interlocked.Increment(ref DocumentSendAttempts);
+                if (HangOnDocument)
+                {
+                    await Task.Delay(System.Threading.Timeout.InfiniteTimeSpan, cancellationToken);
+                    throw new InvalidOperationException("unreachable");
+                }
+                if (DocumentDelay > TimeSpan.Zero)
+                    await Task.Delay(DocumentDelay, cancellationToken);
             }
             else
             {
@@ -140,7 +168,7 @@ public sealed partial class ConcurrencyTests
     /// <returns>Server information accepted by <see cref="ApiServicev3"/>.</returns>
     private static ServerInfo LatencyPanelServer(string url) => new() { ApiVersion = "v3", Url = url, RootPath = "", ApiToken = "test-only" };
 
-    /// <summary>Ordinary sends retain eight seconds while media groups have a bounded multipart upload allowance.</summary>
+    /// <summary>Ordinary sends retain eight seconds while multipart uploads have a bounded 24-second allowance.</summary>
     [Fact]
     public void Foreground_budgets_separate_media_uploads_from_ordinary_interactions()
     {
@@ -150,6 +178,47 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(TimeSpan.FromSeconds(5), TelegramInteractionTimeouts.Production.MandatoryJoin);
         Assert.Equal(TimeSpan.FromSeconds(12), ApiServicev3.DefaultForegroundReadOverallBudget);
         Assert.Equal(TimeSpan.FromSeconds(15), ApiServicev3.ForegroundReadOverallHardCap);
+    }
+
+    /// <summary>A document that outlasts the text deadline still succeeds within its multipart budget.</summary>
+    /// <returns>A task verifying the response and the single document attempt.</returns>
+    [Fact]
+    public async Task Foreground_document_upload_uses_multipart_budget_without_retry()
+    {
+        var inner = new DeliveryProbeClient { HangOnSend = false, DocumentDelay = TimeSpan.FromMilliseconds(70) };
+        var bounded = new ForegroundBoundedTelegramBotClient(inner, new TelegramForegroundDeliveryPolicy
+        {
+            OverallBudget = TimeSpan.FromMilliseconds(25),
+            MediaGroupBudget = TimeSpan.FromMilliseconds(500)
+        });
+        using var profile = new MemoryStream(new byte[] { 1, 2, 3 });
+
+        var response = await bounded.SendDocument(7, InputFile.FromStream(profile, "test.mobileconfig"));
+
+        Assert.Equal(1, response.Id);
+        Assert.Equal(1, Volatile.Read(ref inner.DocumentSendAttempts));
+        Assert.Equal(0, Volatile.Read(ref inner.InteractiveSendAttempts));
+    }
+
+    /// <summary>An unacknowledged document upload expires at its own deadline without an automatic second attempt.</summary>
+    /// <returns>A task verifying the typed request kind, selected budget and single attempt.</returns>
+    [Fact]
+    public async Task Foreground_document_timeout_is_ambiguous_and_never_retries()
+    {
+        var inner = new DeliveryProbeClient { HangOnDocument = true };
+        var bounded = new ForegroundBoundedTelegramBotClient(inner, new TelegramForegroundDeliveryPolicy
+        {
+            OverallBudget = TimeSpan.FromMilliseconds(20),
+            MediaGroupBudget = TimeSpan.FromMilliseconds(45)
+        });
+        using var profile = new MemoryStream(new byte[] { 1 });
+
+        var exception = await Assert.ThrowsAsync<TelegramForegroundDeliveryTimeoutException>(
+            () => bounded.SendDocument(7, InputFile.FromStream(profile, "test.mobileconfig")));
+
+        Assert.Equal("send_document", exception.RequestKind);
+        Assert.Equal(TimeSpan.FromMilliseconds(45), exception.Budget);
+        Assert.Equal(1, Volatile.Read(ref inner.DocumentSendAttempts));
     }
 
     /// <summary>A hanging interactive send is abandoned at the budget and never re-sent automatically.</summary>

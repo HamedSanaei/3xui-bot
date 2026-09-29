@@ -137,6 +137,70 @@ public sealed partial class ConcurrencyTests
         }
     }
 
+    /// <summary>An unacknowledged APN upload reports uncertainty rather than claiming generation failed or resending it.</summary>
+    /// <returns>A task verifying the retryable state and exactly one document attempt.</returns>
+    [Fact]
+    public async Task Apple_apn_unacknowledged_upload_keeps_menu_and_reports_uncertain_delivery()
+    {
+        using var databases = new Databases();
+        var state = new global::UserStateStore(databases.Users);
+        var inner = new DeliveryProbeClient { HangOnSend = false, HangOnDocument = true };
+        var client = new ForegroundBoundedTelegramBotClient(inner, new TelegramForegroundDeliveryPolicy
+        {
+            OverallBudget = TimeSpan.FromMilliseconds(100),
+            MediaGroupBudget = TimeSpan.FromMilliseconds(45)
+        });
+        var accessor = new BotContextAccessor();
+
+        using (accessor.Push(OwnedContext(client)))
+        {
+            await state.ResetUserStatus(new global::User
+            {
+                Id = 4242, Flow = AppleMobileConfigTelegramFlow.FlowName, LastStep = "menu"
+            });
+            Assert.True(await BuildFlow(state).TryHandleCallbackAsync(
+                client, Callback(4242, "IOSAPN:CARRIER:MCI"),
+                await state.GetUserStatus(4242), HomeKeyboard(), CancellationToken.None));
+
+            Assert.Equal(1, inner.DocumentSendAttempts);
+            Assert.Equal("menu", (await state.GetUserStatus(4242)).LastStep);
+            Assert.Contains(inner.SentMessages, send => send.Text == AppleMobileConfigText.DeliveryUncertain);
+            Assert.DoesNotContain(inner.SentMessages, send => send.Text == AppleMobileConfigText.GenericError);
+        }
+    }
+
+    /// <summary>A lost instruction response must not turn an already acknowledged APN profile into a failure.</summary>
+    /// <returns>A task verifying the cleared state, single document and absence of a misleading error message.</returns>
+    [Fact]
+    public async Task Apple_apn_instruction_timeout_does_not_retry_document_or_claim_failure()
+    {
+        using var databases = new Databases();
+        var state = new global::UserStateStore(databases.Users);
+        var inner = new DeliveryProbeClient { HangOnSend = false, HangOnSendAfterDocument = true };
+        var client = new ForegroundBoundedTelegramBotClient(inner, new TelegramForegroundDeliveryPolicy
+        {
+            OverallBudget = TimeSpan.FromMilliseconds(45),
+            MediaGroupBudget = TimeSpan.FromMilliseconds(100)
+        });
+        var accessor = new BotContextAccessor();
+
+        using (accessor.Push(OwnedContext(client)))
+        {
+            await state.ResetUserStatus(new global::User
+            {
+                Id = 4242, Flow = AppleMobileConfigTelegramFlow.FlowName, LastStep = "menu"
+            });
+            Assert.True(await BuildFlow(state).TryHandleCallbackAsync(
+                client, Callback(4242, "IOSAPN:CARRIER:MCI"),
+                await state.GetUserStatus(4242), HomeKeyboard(), CancellationToken.None));
+
+            Assert.Equal(1, inner.DocumentSendAttempts);
+            Assert.True(string.IsNullOrEmpty((await state.GetUserStatus(4242)).Flow));
+            Assert.Single(inner.SentMessages);
+            Assert.DoesNotContain(inner.SentMessages, send => send.Text == AppleMobileConfigText.GenericError);
+        }
+    }
+
     private static AppleMobileConfigTelegramFlow BuildFlow(global::UserStateStore state)
         => new(
             new AppleMobileConfigGenerator(),
@@ -147,7 +211,10 @@ public sealed partial class ConcurrencyTests
     private static ReplyKeyboardMarkup HomeKeyboard()
         => new(new[] { new[] { new KeyboardButton("خانه") } });
 
-    private static BotRuntimeContext OwnedContext(GatewayTelegramClient client)
+    /// <summary>Creates the owned-bot context used by APN flow tests with either a raw or bounded Telegram client.</summary>
+    /// <param name="client">Fake Telegram client or its foreground delivery decorator; no network calls are made.</param>
+    /// <returns>The test-only owned-bot context used to scope user state and diagnostic bot id.</returns>
+    private static BotRuntimeContext OwnedContext(Telegram.Bot.ITelegramBotClient client)
         => new()
         {
             Config = new BotInstanceConfig { Id = "owned-apn-test", Type = BotInstanceTypes.Owned },

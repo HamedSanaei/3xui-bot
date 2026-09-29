@@ -284,11 +284,13 @@ public class PaymentController : ControllerBase
     /// has been configured.
     /// </returns>
     /// <remarks>
-    /// The HMAC-SHA256 signature is verified over the exact request bytes before JSON is parsed. Even a valid signed body
-    /// is only a low-latency hint: amount/status fields never directly credit a wallet or fulfill a tenant order. The
-    /// existing reconciliation worker performs <c>GET /orders/{id}</c> and all established amount, manual-delivery,
-    /// idempotency, tenant, wallet, and XUI guards. The action returns quickly so it stays within AtlasPay's five-second
-    /// webhook timeout; periodic polling remains the fallback if the bounded hint queue is temporarily full.
+    /// The HMAC-SHA256 signature is verified over the exact request bytes before JSON is parsed. A rejected callback
+    /// logs only whether the signature header was present, never its value or the payload, so an absent header can be
+    /// distinguished from a mismatched secret/body without weakening verification. Even a valid signed body is only a
+    /// low-latency hint: amount/status fields never directly credit a wallet or fulfill a tenant order. The existing
+    /// reconciliation worker performs <c>GET /orders/{id}</c> and all established amount, manual-delivery, idempotency,
+    /// tenant, wallet, and XUI guards. The action returns quickly within AtlasPay's five-second webhook timeout;
+    /// periodic polling remains the fallback if the bounded hint queue is temporarily full.
     /// </remarks>
     [HttpPost("/atlaspay-webhook")]
     [RequestSizeLimit(16 * 1024)]
@@ -306,7 +308,10 @@ public class PaymentController : ControllerBase
         var signature = Request.Headers["X-Webhook-Signature"].FirstOrDefault();
         if (!AtlasPayWebhookSignature.Verify(rawBody, signature, _appConfig.AtlasPayWebhookSecret))
         {
-            _logger.LogWarning("Rejected AtlasPay webhook with an invalid signature.");
+            // Do not record the header, body, secret or untrusted order id; header presence narrows proxy versus HMAC investigations.
+            _logger.LogWarning(
+                "Rejected AtlasPay webhook with an invalid signature. SignatureHeaderPresent={SignatureHeaderPresent}",
+                !string.IsNullOrWhiteSpace(signature));
             return Unauthorized(new { status = false, message = "invalid signature" });
         }
 

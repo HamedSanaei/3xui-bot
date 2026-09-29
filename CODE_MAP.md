@@ -277,6 +277,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - `Domain/PaymentGatewayAvailability.cs`: process-wide live snapshot for HooshPay, Tetraminator, UniquePay, AtlasPay, and NOWPayments. Super-admin target-state callbacks use this service; only root `enabled` booleans are persisted through the byte-preserving atomic JSON editor. API credentials remain restart-loaded and are never displayed or logged.
 - `Domain/ClientDownloadAvailability.cs` + `Services/ClientReleaseService.cs` + `Services/ClientDownloadFlow.cs`: global latest-client-software download menu for owned and tenant bots. One root boolean `latestClientDownloadEnabled` (optional; missing means disabled) is the only switch — not per tenant, not per bot, not in users.db — and a super-admin `📥 دانلود نرم‌افزار` panel toggles it live via the same byte-preserving revisioned editor, so newly rendered keyboards pick it up without a restart. Both bot families share one resolver: Windows uses GitHub `/releases/latest` for `2dust/v2rayN` and only the exact `v2rayN-windows-64.zip` asset; Android uses `/releases/latest` for `2dust/v2rayNG` and only `v2rayNG_{tag}_arm64-v8a.apk` (fallback requires exactly one safe `_arm64-v8a.apk` candidate and never the F-Droid build or another ABI); iOS is the fixed V2Box App Store URL with no provider call. Results are cached 30 minutes per repository with single-flight refresh, fall back to a stale last-known-good link for at most 24 hours (labelled as previously fetched), and otherwise answer as temporarily unavailable. Callbacks are the closed set `APPDL:android|ios|windows`; stale reply keyboards and stale inline buttons re-check the live switch and perform no provider lookup when disabled. Only the vendor's absolute HTTPS URL is sent — archives are never uploaded through Telegram.
 - `Services/AppleMobileConfig/*`: shared owned/tenant iOS APN profile generator and Telegram flow. `AppleMobileConfigGenerator` emits a valid unsigned Apple plist entirely in memory using the modern `com.apple.cellular` payload (never deprecated `com.apple.apn.managed`), distinct root/payload UUIDs, `APNs` plus `AttachAPN`, PAP/CHAP, optional credentials, and protocol masks 1/2/3 for IPv4/IPv6/dual stack. Apple's documented roaming masks and optional `EnableXLAT464` are emitted only on the APNs item. The Telegram UX is intentionally narrower: it always generates dual-stack mask 3 (IPv4 + IPv6), asks no protocol or profile-name question, and offers verified presets for همراه اول=`mcinet`, ایرانسل=`mtnirancell`, رایتل=`RighTel`, شاتل موبایل=`shatelmobile`, plus custom APN. In owned bots, both this APN action and latest-client download live under `⚙️ مدیریت اکانت` instead of the home keyboard; tenant routing remains behind `EnsureTenantCustomerJoinAsync`. Generation and delivery stay in-memory and logs contain only sanitized metadata.
+- APN document sends use the 24 s multipart foreground budget; ordinary prompts remain at 8 s. If Telegram does not
+  acknowledge an APN upload, the bot does not resend it automatically, leaves bot-scoped input state intact, and
+  reports uncertain delivery if a text reply is possible. After an acknowledged document, the state is cleared and a
+  subsequent installation-text timeout cannot be reported as a failed profile. APN callback/timeout coverage lives in
+  `Adminbot.Tests/AppleMobileConfigTelegramFlowTests.cs`.
 - `Domain/UniquePay.cs`: UniquePay Bearer/form-urlencoded bot-gateway client, owned-wallet settlement, fail-closed authoritative verification for both official toman fee-payer contracts, durable settlement claims, restricted provisional OWNED credits, callback coordination, and bounded recovery polling. New invoice creation is single-attempt; inquiry is read-only. `CreationState` independently records `attempting`, `created`, `ambiguous`, `failed`, or `manual_review`: the one POST reservation is saved before network I/O, while HTTP 5xx/timeouts/disconnects/malformed success remain GET-only recoverable and can never authorize another create call.
 - `Services/UsageAnalyticsService.cs`: completed Tehran-day aggregation of JSONL messages/callbacks, successful owned sales, and fulfilled tenant sales; excludes global super-admin ids and supports tenant bot filtering.
 - `Services/UsageReportChartRenderer.cs`: cross-platform SkiaSharp high-resolution line-chart PNG renderer with
@@ -376,6 +381,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   An empty override keeps account-wide webhook delivery (if registered), or polling. Startup rejects
   a configured override without a secret or with an unsafe/wrong callback route when enabled.
   See `docs/deployment.md` for activation; `Data/configuration.example.json` is not runtime config.
+  Webhook 401 diagnostics include only `SignatureHeaderPresent` (never the header/body/secret). A present header alone
+  does not prove provider origin or secret validity; raw signed provider requests and the registered one-time merchant
+  secret are required to diagnose mismatches. `GET /webhook` reveals only the registered URL, not the signing secret.
+  Follow `docs/deployment.md` for coordinated registration/rotation and proxy checks; do not bypass HMAC or infer
+  signature validity from payment inquiry timing. Rejected events have no durable webhook receipt/payment effect.
 - AtlasPay tenant purchase reporting: `TenantBotService.ApplyPaidTenantOrderAsync` settles through the existing
   one-time storefront fulfillment path, then `EnsureAtlasPayTenantPaymentAuditAsync` emits a separate protected
   `LogPayment` receipt with local `AP:` id, provider order id, buyer/owner, tenant/order, service/plan/account,
@@ -597,8 +607,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   replayable (a regression test asserts one POST against a transient status).
 - **Foreground Telegram delivery budget** (`Services/TelegramForegroundDeliveryPolicy.cs`,
   `Services/ForegroundBoundedTelegramBotClient.cs`): ordinary non-durable interactive calls have an 8 s overall
-  budget; `sendMediaGroup` has a separate 24 s bounded multipart-upload budget. The six-slide iOS tutorial is about
-  8.19 MiB in its original PNG format; the former 8 s limit expired while uploading it. Images are not recompressed.
+  budget; `sendMediaGroup` and `sendDocument` share a separate 24 s bounded multipart-upload budget. The six-slide iOS
+  tutorial is about 8.19 MiB in its original PNG format; the former 8 s limit expired while uploading it. Images are not recompressed.
   `TelegramUpdateExecutor` wraps the resolved client **per update execution only**; receivers, long polling,
   background workers and file downloads keep the raw transport. A timed-out send is ambiguous,
   **never automatically re-sent**, and the handler releases the lane as a stable non-error outcome.

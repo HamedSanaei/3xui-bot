@@ -136,9 +136,9 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// <returns>The inner client's response for the request.</returns>
     /// <remarks>
     /// Non-interactive requests pass through unchanged. Interactive requests use one linked token with the selected
-    /// deadline: media groups get the bounded upload budget, all other interactive calls keep the ordinary deadline.
-    /// The ambient <see cref="TelegramUpdateLatencyScope"/> measures the same request. When only that deadline
-    /// expires — the caller's own token is still live — the typed
+    /// deadline: media groups and documents get the bounded multipart upload budget, while other interactive calls
+    /// keep the ordinary deadline. The ambient <see cref="TelegramUpdateLatencyScope"/> measures the same request.
+    /// When only that deadline expires — the caller's own token is still live — the typed
     /// <see cref="TelegramForegroundDeliveryTimeoutException"/> is raised without retrying. Caller cancellation
     /// and Telegram errors keep their original exception identity.
     /// </remarks>
@@ -150,7 +150,8 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
         if (!TryClassifyForegroundRequest(request, out var stage))
             return await _inner.SendRequest(request, cancellationToken);
 
-        var overallBudget = request is SendMediaGroupRequest ? _policy.MediaGroupBudget : _policy.OverallBudget;
+        var overallBudget = request is SendMediaGroupRequest or SendDocumentRequest
+            ? _policy.MediaGroupBudget : _policy.OverallBudget;
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(overallBudget);
         using var measurement = TelegramUpdateLatencyScope.Current?.Measure(stage) ?? default;

@@ -148,6 +148,39 @@ fetches `GET /orders/{id}` before applying any payment/fulfillment change. Atlas
 after a failed callback; bounded polling and customer/super-admin checks still recover missed
 notifications. Existing invoices keep their original account-wide destination.
 
+### Callback signature rejection (HTTP 401)
+
+An `invalid signature` warning means the receiver could **not authenticate the request**. It
+does not establish whether the sender was an attacker or AtlasPay using a different signing
+secret, and the receiver must not accept it based on its source address, order id, or apparent
+timing. The rejection leaves no durable webhook receipt and has no payment effect. Compare
+the warning times with provider inquiry outcomes and local payment timestamps using the
+correct server/UTC time-zone offset; correlation is a diagnostic clue, not signature proof.
+Do not copy callback bodies, signature headers, customer identifiers, or secret values into
+logs, tickets, or chat.
+
+New receiver warnings include `SignatureHeaderPresent=false` when the header was absent or
+blank; `true` means only that a nonblank value was supplied, **not** that AtlasPay sent it or
+that its bytes were well-formed. Both cases still return HTTP 401 without storing a receipt
+or settling an order.
+
+Check the current registered account URL through AtlasPay's authenticated `GET /webhook`
+(section 3.8; it does not disclose the signing secret), and compare its destination with the
+public receiver URL and any per-order `webhookUrl` override. Verify that the reverse proxy
+forwards the `X-Webhook-Signature` header and the original request body bytes unchanged;
+AtlasPay signs the body with the merchant's one-time **webhook** secret, not the API key.
+The configured `atlasPayWebhookSecret` must be the secret from the same merchant account
+currently signing these orders, on **every** receiver instance. The registration-status GET
+cannot validate that secret. If its provenance cannot be established, deliberately
+re-register the intended HTTPS callback using authenticated `POST /webhook`, securely
+capture the newly returned secret once, update the existing protected configuration/secret
+source on every instance, and restart/reload the receivers together. This rotates the
+signing secret: coordinate the change to avoid a split deployment, and never repeat
+registration per order or on startup. Confirm a **new** signed provider callback writes
+`WebhookReceivedAtUtc` for a matching local order and that settlement still requires a
+separate authoritative `GET /orders/{id}` inquiry. Keep HTTP 401 for unverifiable callbacks;
+polling and explicit customer/admin checks cover callbacks AtlasPay does not retry.
+
 ## Test schema policy
 
 The general concurrency fixture in `Adminbot.Tests/ConcurrencyTests.cs` uses `EnsureCreated` only for short-lived unit

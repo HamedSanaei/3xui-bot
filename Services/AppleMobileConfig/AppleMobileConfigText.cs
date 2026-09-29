@@ -14,6 +14,9 @@ public static class AppleMobileConfigText
     public const string BackButton = "بازگشت";
     public const string GenericError =
         "❌ ساخت پروفایل انجام نشد. لطفاً دوباره تلاش کنید یا APN را مجدداً وارد کنید.";
+    /// <summary>Shown when Telegram did not acknowledge a profile upload, which may still have arrived.</summary>
+    public const string DeliveryUncertain =
+        "⚠️ نتیجهٔ ارسال فایل مشخص نیست. اگر فایل را دریافت کرده‌اید دوباره آن را نسازید؛ در غیر این صورت از منو دوباره تلاش کنید.";
     public const string ExpiredStep =
         "این مرحله منقضی شده است. از منوی اصلی دوباره ساخت پروفایل APN را شروع کنید.";
     public const string Cancelled = "ساخت پروفایل APN لغو شد.";

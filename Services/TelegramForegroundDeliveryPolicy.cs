@@ -29,23 +29,22 @@ using System;
 /// </para>
 /// <para>
 /// Production values:
-/// Ordinary foreground calls keep the eight-second UX budget. Media-group uploads have a separate 24-second
-/// ceiling: several shipped tutorial images must be transferred in one multipart request, and the ordinary budget
-/// was expiring before Telegram could acknowledge that upload. Neither deadline triggers an automatic resend.
-/// Tests can set both budgets independently to exercise slow uploads without waiting for production deadlines.
+/// Ordinary foreground calls keep the eight-second UX budget. Media-group and document uploads have a separate
+/// 24-second ceiling: multipart files need time to transfer before Telegram can acknowledge them. Neither deadline
+/// triggers an automatic resend. Tests can set both budgets independently without waiting for production deadlines.
 /// </para>
 /// </remarks>
 public sealed class TelegramForegroundDeliveryPolicy
 {
     /// <summary>
-    /// Gets the shared production instance. Ordinary interactive calls have eight seconds; media-group uploads
-    /// have 24 seconds to transfer several images and receive Telegram's response.
+    /// Gets the shared production instance. Ordinary interactive calls have eight seconds; multipart uploads
+    /// have 24 seconds to transfer the files and receive Telegram's response.
     /// </summary>
     public static TelegramForegroundDeliveryPolicy Production { get; } = new();
 
     /// <summary>
     /// Gets the overall wall-clock budget for one ordinary interactive foreground Telegram delivery. Production
-    /// value: eight seconds; media groups use <see cref="MediaGroupBudget"/> instead.
+    /// value: eight seconds; media groups and documents use <see cref="MediaGroupBudget"/> instead.
     /// </summary>
     /// <remarks>
     /// This is one budget per delivery, not per retry, and no retry is performed when it expires. Only
@@ -54,13 +53,13 @@ public sealed class TelegramForegroundDeliveryPolicy
     public TimeSpan OverallBudget { get; init; } = TimeSpan.FromSeconds(8);
 
     /// <summary>
-    /// Gets the bounded wall-clock budget for a foreground media-group upload, including transfer and response.
-    /// Production value: 24 seconds.
+    /// Gets the bounded wall-clock budget for a foreground media-group or document upload, including transfer
+    /// and response. Production value: 24 seconds.
     /// </summary>
     /// <remarks>
-    /// Large multipart albums need longer than a text message, but still have a finite deadline so the customer's
-    /// FIFO update lane cannot wait on the transport indefinitely. A timed-out upload may have been accepted by
-    /// Telegram and must not be resent automatically.
+    /// Multipart uploads need longer than a text message, but still have a finite deadline so the customer's FIFO
+    /// update lane cannot wait on the transport indefinitely. A timed-out upload may have been accepted by Telegram
+    /// and must not be resent automatically.
     /// </remarks>
     public TimeSpan MediaGroupBudget { get; init; } = TimeSpan.FromSeconds(24);
 }
