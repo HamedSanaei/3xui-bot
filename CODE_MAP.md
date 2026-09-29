@@ -1,5 +1,23 @@
 # CODE_MAP.md
 
+- Tenant storefront discount codes: `Domain/TenantDiscount.cs`, `TenantDiscountService`, and
+  `20260929150000_AddTenantDiscountCodes` add per-bot owner definitions, message-bound two-hour
+  purchase quotes, immutable net order snapshots, and one unique redemption per order in `users.db`.
+  Codes are ASCII 3–32, uppercase, unique only among live definitions in the same store; owner
+  edit/disable/delete/reset is exact-store authorized and preserves historical claims. Fixed or
+  percent discounts use a gross minimum, optional maximum, and a colleague-cost profit floor.
+  Purchase preview binds bot/sender/chat/message/selection; `TN:DQ` admits one frozen method and
+  refuses old full-price buttons on quoted messages. Renewal preview snapshots the selected code
+  and tariff in bot-scoped state, then reserves the pending net order at confirmation; changed
+  codes/tariffs fail closed with explicit gross retry, never silent fallback. Gateway/card/wallet
+  use the stored net. Wallet quote admission shares the users.db reservation transaction and
+  charges once through an immutable credentials.db debit key; insufficient funds release only
+  after a definitive no-debit decision, ambiguity retains capacity. `TenantDiscountReservationWorker`
+  consumes verified paid claims even if delivery fails, frees expired unselected renewals/cards
+  after two hours without receipt, terminal unpaid invoices and verified wallet refunds, but
+  never frees uncertain gateway attempts or submitted card receipts. See
+  `Adminbot.Tests/TenantDiscountTests.cs` for cross-store, net-price, replay and expiry scenarios.
+
 - Super-admin issuance passes the authenticated sender id from `XuiV3AdminFlowService` through confirmation,
   single creation and bulk creation to `XuiV3PurchaseService`. The global `AdminsUserIds` allow-list is rechecked;
   only this explicit issuance context bypasses metered `minimumTrafficGb`. Recipient/audit ids and colleague pricing

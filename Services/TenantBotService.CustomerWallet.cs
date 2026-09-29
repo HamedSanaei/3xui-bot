@@ -29,10 +29,13 @@ public partial class TenantBotService
         var amountInput = callback == null && state?.Flow == "tenant-wallet-charge" && state.LastStep == "amount";
         if (amountInput && action is "/start" or "بازگشت")
         { await _state.ClearUserStatus(state); return false; }
+        var quotedWallet = action?.StartsWith("TN:DQ:", StringComparison.Ordinal) == true
+            && action.EndsWith(":W", StringComparison.Ordinal);
         var purchase = action?.StartsWith("TN:PAYWALLET:", StringComparison.Ordinal) == true;
         var renewal = action?.StartsWith("TN:RNWALLET:", StringComparison.Ordinal) == true;
         var history = action == "📒 تراکنش‌های من" || action?.StartsWith("TCW:h:", StringComparison.Ordinal) == true;
-        if (!amountInput && !purchase && !renewal && !history && action != "💰 کیف پول" && action?.StartsWith("TCW:", StringComparison.Ordinal) != true) return false;
+        if (!amountInput && !purchase && !renewal && !quotedWallet && !history && action != "💰 کیف پول"
+            && action?.StartsWith("TCW:", StringComparison.Ordinal) != true) return false;
         var actor = callback?.From.Id ?? update.Message?.From?.Id ?? 0;
         var chat = callback?.Message?.Chat.Id ?? update.Message?.Chat.Id ?? actor;
         if (actor <= 0 || customer?.TelegramUserId != actor) return true;
@@ -159,13 +162,81 @@ public partial class TenantBotService
                 }), cancellationToken: token);
             return true;
         }
-        if (purchase || renewal)
+        if (purchase || renewal || quotedWallet)
         {
             var funding = _serviceProvider.GetRequiredService<TenantCustomerWalletFunding>();
             TenantBotOrder order;
-            if (purchase)
+            if (quotedWallet)
+            {
+                var parts = action.Split(':');
+                if (parts.Length != 4 || !ParseDiscountId(parts[2], out var quoteId) || quoteId <= 0
+                    || callback?.Message == null)
+                {
+                    await client.SendMessage(chat, "پیش‌فاکتور نامعتبر است؛ خرید را دوباره آغاز کنید.", cancellationToken: token);
+                    return true;
+                }
+                var quote = await LoadPurchaseDiscountQuoteAsync(quoteId, store.Id, actor, chat,
+                    callback.Message.MessageId, token);
+                if (quote == null || (quote.State != TenantDiscountQuoteStates.Open
+                    && (quote.State != TenantDiscountQuoteStates.Admitted || quote.SelectedProvider != "W"))
+                    || (quote.State == TenantDiscountQuoteStates.Open && quote.ExpiresAtUtc <= DateTime.UtcNow))
+                {
+                    await client.SendMessage(chat, "این پیش‌فاکتور منقضی یا با روش دیگری ثبت شده است؛ خرید را دوباره آغاز کنید.", cancellationToken: token);
+                    return true;
+                }
+                var selection = PARSESELECTIONFROMPAYACTION(quote.SelectionKey);
+                if (quote.State == TenantDiscountQuoteStates.Admitted && quote.OrderId.HasValue)
+                {
+                    var admittedOrder = await _workflow.ReadAsync(db => db.TenantBotOrders.AsNoTracking()
+                        .SingleOrDefaultAsync(x => x.Id == quote.OrderId && x.TenantBotId == store.Id
+                            && x.CustomerTelegramUserId == actor && x.CustomerChatId == chat
+                            && x.PaymentProvider == "wallet", token));
+                    if (admittedOrder != null)
+                    {
+                        var receipt = await funding.ReadPaidEvidenceAsync(admittedOrder, token);
+                        if (receipt != null)
+                        {
+                            await funding.ReconcileReceiptAsync(admittedOrder, receipt, token);
+                            await FULFILLPAIDTENANTORDERASYNC(admittedOrder, "customer-wallet", null, null, false, token);
+                            return true;
+                        }
+                    }
+                }
+                if (!TryCurrentPurchaseQuotePrice(store, selection, quote, out var price))
+                {
+                    await client.SendMessage(chat, "تعرفه تغییر کرده است؛ خرید را دوباره آغاز کنید.", cancellationToken: token);
+                    return true;
+                }
+                if (!PurchaseDiscountPaymentMethods(store, quote.NetToman).Any(x => x.Provider == "W"))
+                {
+                    await client.SendMessage(chat, "پرداخت با کیف پول برای مبلغ این پیش‌فاکتور فعال نیست؛ پیش‌فاکتور تازه بگیرید.", cancellationToken: token);
+                    return true;
+                }
+                if (!await EnsureTenantPurchaseSelectionIsCurrentAsync(client, callback, store, selection, token)) return true;
+                order = CreateTenantOrder(store, customer, chat, selection, price, "wallet");
+                order.SalePriceToman = quote.NetToman;
+                order.ProfitToman = quote.NetToman - price.BaseCostToman;
+                var admissionKey = $"tcw-quote:{store.Id}:{actor}:{chat}:{callback.Message.MessageId}";
+                try
+                {
+                    order = await funding.AdmitQuotedAsync(order, admissionKey, quote.Id, callback.Message.MessageId,
+                        quote.SelectionKey, price.SalePriceToman, price.BaseCostToman, token);
+                }
+                catch (InvalidOperationException)
+                {
+                    await client.SendMessage(chat, "کد، ظرفیت یا پیش‌فاکتور تغییر کرده است؛ خرید را دوباره آغاز کنید.", cancellationToken: token);
+                    return true;
+                }
+            }
+            else if (purchase)
             {
                 var selection = PARSESELECTIONFROMPAYACTION(action["TN:PAYWALLET:".Length..]);
+                if (callback?.Message != null && await _serviceProvider.GetRequiredService<TenantDiscountService>()
+                    .HasQuoteForMessageAsync(store.Id, actor, chat, callback.Message.MessageId, token))
+                {
+                    await client.SendMessage(chat, "این پیش‌فاکتور به کد تخفیف متصل است؛ از دکمه‌های همان پیش‌فاکتور استفاده کنید.", cancellationToken: token);
+                    return true;
+                }
                 if (selection == null || callback.Message == null || !await EnsureTenantPurchaseSelectionIsCurrentAsync(client, callback, store, selection, token)) return true;
                 var price = CalculateTenantPrice(store, selection);
                 order = CreateTenantOrder(store, customer, chat, selection, price, "wallet");
@@ -182,7 +253,12 @@ public partial class TenantBotService
                 {
                     order = await GetPendingTenantRenewOrderAsync(id, store, customer, token);
                     if (order == null) return true;
-                    order = await funding.AdmitAsync(order, $"tcw-renew:{id}", token);
+                    try { order = await funding.AdmitAsync(order, $"tcw-renew:{id}", token); }
+                    catch (InvalidOperationException)
+                    {
+                        await client.SendMessage(chat, "سهمیه یا روش پرداخت این تمدید تغییر کرده است؛ تایید تازه ثبت کنید.", cancellationToken: token);
+                        return true;
+                    }
                 }
                 else if (await funding.ReadPaidEvidenceAsync(order, token) == null)
                 {
@@ -191,10 +267,39 @@ public partial class TenantBotService
                     if (order == null) return true;
                 }
             }
-            if (!await funding.DebitAsync(order, token))
+            long? freshGross = null, freshBase = null;
+            if (order.TenantDiscountCodeId.HasValue && await funding.ReadPaidEvidenceAsync(order, token) == null)
+            {
+                try
+                {
+                    var selected = new XuiV3PurchaseSelection
+                    {
+                        ServiceKey = order.ServiceKey, TrafficGb = order.TrafficGb,
+                        DurationKey = order.DurationKey, UnlimitedPlanKey = order.UnlimitedPlanKey
+                    };
+                    var fresh = CalculateTenantPrice(store, selected);
+                    freshGross = fresh.SalePriceToman;
+                    freshBase = fresh.BaseCostToman;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+                {
+                    await client.SendMessage(chat, "تعرفه یا سرویس تغییر کرده است؛ خرید را دوباره آغاز کنید.", cancellationToken: token);
+                    return true;
+                }
+            }
+            bool paid;
+            try { paid = await funding.DebitAsync(order, token, freshGross, freshBase); }
+            catch (InvalidOperationException)
+            {
+                await client.SendMessage(chat, "نتیجه برداشت این سفارش برای بررسی محفوظ است؛ برداشت خودکار تکرار نمی‌شود. برای خرید جدید پیش‌فاکتور تازه بگیرید.", cancellationToken: token);
+                return true;
+            }
+            if (!paid)
             {
                 var currentStore = await _workflow.ReadAsync(db => db.BotInstances.AsNoTracking().SingleOrDefaultAsync(x => x.Id == store.Id, token));
-                await client.SendMessage(chat, $"موجودی کیف پول کافی نیست.\nموجودی: {await _credentialsDbContext.GetAccountBalance(actor):N0} تومان\nمبلغ لازم: {order.SalePriceToman:N0} تومان",
+                var freshQuoteNotice = order.DiscountInvoiceAttemptState != null
+                    ? "\nاین سفارش بسته شد؛ پس از افزایش موجودی، خرید یا تایید تمدید تازه ثبت کنید." : string.Empty;
+                await client.SendMessage(chat, $"موجودی کیف پول کافی نیست.\nموجودی: {await _credentialsDbContext.GetAccountBalance(actor):N0} تومان\nمبلغ لازم: {order.SalePriceToman:N0} تومان{freshQuoteNotice}",
                     replyMarkup: TenantCustomerWalletPolicy.IsApproved(currentStore)
                         ? new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("افزایش موجودی", "TCW:charge")) : null,
                     cancellationToken: token);
@@ -221,6 +326,7 @@ public partial class TenantBotService
     {
         var order = await _workflow.ReadAsync(db => db.TenantBotOrders.AsNoTracking().SingleOrDefaultAsync(x => x.Id == orderId, token));
         if (order?.PaymentProvider != "wallet" || order.IsFulfilled) return;
+        if (order.CustomerWalletState == "definitive_failed" || order.PaymentStatus == TenantBotOrderStatuses.DiscountExpired) return;
         var funding = _serviceProvider.GetRequiredService<TenantCustomerWalletFunding>();
         if (order.CustomerWalletState is "refund_pending" or "refunded")
         { await funding.RefundRejectedAsync(order.Id, token); return; }

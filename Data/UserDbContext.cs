@@ -53,6 +53,12 @@ public class UserDbContext : DbContext
     public DbSet<BotUserState> BotUserStates { get; set; }
     // Tenant storefront state stays in users.db; credentials.db owns global profiles, balances, and wallet receipts.
     public DbSet<TenantBotOrder> TenantBotOrders { get; set; }
+    /// <summary>Owner definitions scoped to users.db tenant storefronts.</summary>
+    public DbSet<TenantDiscountCode> TenantDiscountCodes { get; set; }
+    /// <summary>Message-bound checkout quotes and their admitted order identities.</summary>
+    public DbSet<TenantDiscountQuote> TenantDiscountQuotes { get; set; }
+    /// <summary>Exactly-once tenant discount capacity claims.</summary>
+    public DbSet<TenantDiscountRedemption> TenantDiscountRedemptions { get; set; }
     public DbSet<TenantBotLedgerEntry> TenantBotLedgerEntries { get; set; }
     public DbSet<WalletLedgerEntry> WalletLedgerEntries { get; set; }
     /// <summary>Global immutable referral relationships shared by all owned bots.</summary>
@@ -382,6 +388,43 @@ public class UserDbContext : DbContext
         modelBuilder.Entity<TenantWalletRoute>().HasKey(x => x.Id);
         modelBuilder.Entity<TenantWalletRoute>().Property(x => x.Id).ValueGeneratedNever();
 
+        modelBuilder.Entity<TenantDiscountCode>(entity =>
+        {
+            entity.ToTable("TenantDiscountCodes");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.TenantBotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.Code).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.Kind).IsRequired().HasMaxLength(16);
+            entity.Property(x => x.Scope).IsRequired().HasMaxLength(16);
+            entity.HasIndex(x => new { x.TenantBotId, x.Code }).IsUnique().HasFilter("\"IsDeleted\" = 0");
+        });
+
+        modelBuilder.Entity<TenantDiscountQuote>(entity =>
+        {
+            entity.ToTable("TenantDiscountQuotes");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.TenantBotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.SelectionKey).IsRequired().HasMaxLength(240);
+            entity.Property(x => x.State).IsRequired().HasMaxLength(16);
+            entity.Property(x => x.SelectedProvider).HasMaxLength(32);
+            entity.HasIndex(x => new { x.TenantBotId, x.CustomerTelegramUserId, x.ChatId, x.MessageId })
+                .IsUnique().HasFilter("\"MessageId\" IS NOT NULL");
+            entity.HasIndex(x => x.OrderId).IsUnique().HasFilter("\"OrderId\" IS NOT NULL");
+            entity.HasIndex(x => new { x.State, x.ExpiresAtUtc });
+        });
+
+        modelBuilder.Entity<TenantDiscountRedemption>(entity =>
+        {
+            entity.ToTable("TenantDiscountRedemptions");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedOnAdd();
+            entity.Property(x => x.State).IsRequired().HasMaxLength(16);
+            entity.HasIndex(x => x.TenantBotOrderId).IsUnique();
+            entity.HasIndex(x => new { x.CodeId, x.State });
+        });
+
         modelBuilder.Entity<TenantBotOrder>(entity =>
         {
             // One persisted order per customer confirmation, before the independent credentials.db debit commit.
@@ -405,6 +448,8 @@ public class UserDbContext : DbContext
             entity.Property(x => x.UnlimitedPlanKey).HasMaxLength(64);
             entity.Property(x => x.PaymentProvider).HasMaxLength(64);
             entity.Property(x => x.PaymentStatus).HasMaxLength(64);
+            entity.Property(x => x.AppliedDiscountCode).HasMaxLength(32);
+            entity.Property(x => x.DiscountInvoiceAttemptState).HasMaxLength(32);
             entity.Property(x => x.FulfillmentSource).HasMaxLength(64);
             entity.Property(x => x.HooshPayInvoiceUid).HasMaxLength(120);
             // Provisional tenant card-to-card delivery. Defaults to "none" so every historical order stays unchanged and
@@ -741,6 +786,8 @@ public class UserDbContext : DbContext
             // Conversation state is isolated per bot so the same user can use several brands safely.
             entity.HasKey(x => new { x.BotId, x.TelegramUserId });
             entity.Property(x => x.BotId).HasMaxLength(64);
+            entity.Property(x => x.OwnerDiscountDraftJson).HasMaxLength(4096);
+            entity.Property(x => x.RenewalDiscountSelectionJson).HasMaxLength(1024);
             entity.Property(x => x.PaymentMethod).HasMaxLength(64);
             entity.Property(x => x.RenewTargetUuid).HasMaxLength(64);
             entity.Property(x => x.RenewalSessionId).HasMaxLength(64);

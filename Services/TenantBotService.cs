@@ -450,6 +450,11 @@ public partial class TenantBotService
             await SHOWOWNERPANELASYNC(botClient, Message.Chat.Id, CredUser, null, CancellationToken);
             return true;
         }
+        if (step.StartsWith("discount-", StringComparison.Ordinal))
+        {
+            await HandleOwnerDiscountTextAsync(botClient, Message, CredUser, User, CancellationToken);
+            return true;
+        }
 
         if (step == STEPCUSTOMERBALANCE)
         {
@@ -783,6 +788,11 @@ public partial class TenantBotService
             return true;
         }
 
+        if (action.StartsWith("d:", StringComparison.Ordinal))
+        {
+            await HandleOwnerDiscountCallbackAsync(botClient, CallbackQuery, CredUser, User, action, CancellationToken);
+            return true;
+        }
         if (action.StartsWith("set:", StringComparison.Ordinal))
         {
             var field = action.Replace("set:", "", StringComparison.Ordinal);
@@ -1498,6 +1508,10 @@ public partial class TenantBotService
             },
             new[]
             {
+                InlineKeyboardButton.WithCallbackData("🎟 کدهای تخفیف", OWNERCALLBACKPREFIX + "d:l")
+            },
+            new[]
+            {
                 InlineKeyboardButton.WithCallbackData("💸 تسویه حساب", OWNERCALLBACKPREFIX + "settlement"),
                 InlineKeyboardButton.WithCallbackData("📘 راهنمای پنل همکاری", OWNERCALLBACKPREFIX + "guide")
             },
@@ -1703,9 +1717,8 @@ public partial class TenantBotService
     /// Token used to cancel users.db writes, runtime stop, cache invalidation, and Telegram replies.
     /// </param>
     /// <remarks>
-    /// This method intentionally resets only the mutable storefront configuration stored on <see cref="BotInstance" />.
-    /// It preserves the tenant internal id, owner Telegram id, orders, receipts, ledger entries, payments, and
-    /// customer state so financial and delivery history remains auditable after the owner starts over.
+    /// Resets mutable storefront settings and soft-deletes its discount definitions in one users.db commit.
+    /// Existing reserved and paid claims, orders, receipts, and financial history remain unchanged.
     /// </remarks>
     private async Task RESETTENANTSETTINGSASYNC(
         ITelegramBotClient botClient,
@@ -1716,8 +1729,28 @@ public partial class TenantBotService
         var tenant = await RequireSelectedOwnerStoreAsync(owner, CancellationToken);
         await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
 
-        ResetTenantStorefrontSettings(tenant, clearAllStorefrontSettings: true);
-        await _workflow.SaveAsync(CancellationToken);
+        var revision = (tenant.UpdatedAtUtc ?? tenant.CreatedAtUtc).Ticks;
+        await _workflow.WriteAsync(async db =>
+        {
+            await using var transaction = await db.Database.BeginTransactionAsync(CancellationToken);
+            var current = await db.BotInstances.SingleOrDefaultAsync(x => x.Id == tenant.Id
+                && x.Type == BotInstanceTypes.Tenant && x.OwnerTelegramUserId == owner.TelegramUserId, CancellationToken);
+            if (current == null || (current.UpdatedAtUtc ?? current.CreatedAtUtc).Ticks != revision)
+                throw new DbUpdateConcurrencyException("Storefront changed before reset.");
+            ResetTenantStorefrontSettings(current, clearAllStorefrontSettings: true);
+            var codes = await db.TenantDiscountCodes.Where(x => x.TenantBotId == current.Id && !x.IsDeleted)
+                .ToListAsync(CancellationToken);
+            foreach (var code in codes)
+            {
+                code.IsActive = false;
+                code.IsDeleted = true;
+                code.UpdatedAtUtc = DateTime.UtcNow;
+            }
+            await db.SaveChangesAsync(CancellationToken);
+            await transaction.CommitAsync(CancellationToken);
+            return true;
+        }, CancellationToken);
+        await _workflow.ReloadAsync(tenant, CancellationToken);
         _botRegistry.Upsert(tenant);
         _botClientProvider.Invalidate(tenant.Id);
 
@@ -4040,6 +4073,11 @@ public partial class TenantBotService
             return;
         }
 
+        if (User?.LastStep == "purchase-discount-entry")
+        {
+            await HandlePurchaseDiscountTextAsync(botClient, Message, tenant, customer, User, CancellationToken);
+            return;
+        }
         if (await TRYHANDLETENANTPURCHASETEXTASYNC(
                 botClient,
                 Message,
@@ -4241,6 +4279,7 @@ public partial class TenantBotService
             await SHOWCUSTOMERCONFIRMASYNC(
                 botClient,
                 message.Chat.Id,
+                message.From.Id,
                 null,
                 tenant,
                 selection,
@@ -4401,6 +4440,14 @@ public partial class TenantBotService
         {
             await _state.ClearUserStatus(user);
             await botClient.SendMessage(message.Chat.Id, "فرایند تمدید لغو شد.", replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
+            return;
+        }
+        if (user.LastStep == "renew-discount-entry")
+        {
+            if (await TryResumeTenantRenewalWithoutDiscountAsync(botClient, message.Chat.Id, tenant, customer,
+                    user, text, cancellationToken))
+                return;
+            await HandleTenantRenewDiscountTextAsync(botClient, message, tenant, customer, user, cancellationToken);
             return;
         }
 
@@ -4601,6 +4648,22 @@ public partial class TenantBotService
 
         if (user.LastStep == TENANTRENEWSTEPCONFIRM)
         {
+            if (text == "🎟 ثبت کد تخفیف")
+            {
+                if (!await _serviceProvider.GetRequiredService<TenantDiscountService>()
+                        .HasActiveScopeAsync(tenant.Id, TenantDiscountScopes.Renew, cancellationToken))
+                {
+                    await botClient.SendMessage(message.Chat.Id, "کد تخفیف فعالی برای تمدید وجود ندارد.",
+                        replyMarkup: BuildTenantRenewConfirmKeyboard(), cancellationToken: cancellationToken);
+                    return;
+                }
+                user.LastStep = "renew-discount-entry";
+                user.RenewalDiscountSelectionJson = "";
+                await _state.SaveUserStatus(user);
+                await botClient.SendMessage(message.Chat.Id, "کد تخفیف تمدید را وارد کنید؛ «❌ انصراف» این فرایند را لغو می‌کند.",
+                    cancellationToken: cancellationToken);
+                return;
+            }
             if (!IsConfirmText(text))
             {
                 await botClient.SendMessage(message.Chat.Id, "برای ساخت فاکتور تمدید، گزینه تایید را بزنید یا انصراف دهید.", replyMarkup: BuildTenantRenewConfirmKeyboard(), cancellationToken: cancellationToken);
@@ -5373,6 +5436,19 @@ public partial class TenantBotService
         var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
         var price = CalculateTenantPrice(tenant, selection);
         var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, price.SalePriceToman);
+        var discount = ReadTenantRenewDiscountSelection(user, tenant, selection, price.SalePriceToman, price.BaseCostToman);
+        if (!discount.Success)
+        {
+            user.RenewalDiscountSelectionJson = "";
+            user.LastStep = "renew-discount-entry";
+            await _state.SaveUserStatus(user);
+            await botClient.SendMessage(chatId,
+                "قیمت یا انتخاب تخفیف تغییر کرده است. کد را دوباره وارد کنید یا «❌ انصراف» را بزنید.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+        var allowDiscount = await _serviceProvider.GetRequiredService<TenantDiscountService>()
+            .HasActiveScopeAsync(tenant.Id, TenantDiscountScopes.Renew, cancellationToken);
 
         var blockingPreviewRenewal = await _renewalOperationStore.FindBlockingOperationAsync(
             client.Uuid,
@@ -5417,14 +5493,16 @@ public partial class TenantBotService
             $"مدت افزوده: <code>{Html(resolved.DurationDays <= 0 ? "نامحدود" : resolved.DurationDays + " روز")}</code>\n" +
             (renewal == null ? string.Empty : $"مدت نهایی بعد از تمدید: <code>{Html(renewal.FinalDurationDays <= 0 ? "نامحدود" : renewal.FinalDurationDays + " روز")}</code>\n") +
             (string.IsNullOrWhiteSpace(priceBreakdownText) ? string.Empty : $"\n{priceBreakdownText}\n") +
-            $"مبلغ قابل پرداخت: <b>{Html(price.SalePriceToman.FormatCurrency())}</b>\n\n" +
+            (discount.Value == null
+                ? $"مبلغ قابل پرداخت: <b>{Html(price.SalePriceToman.FormatCurrency())}</b>\n\n"
+                : BuildTenantRenewDiscountPriceText(discount.Value) + "\n") +
             "بعد از تایید، روش پرداخت را انتخاب می‌کنید و پس از پرداخت موفق اکانت تمدید می‌شود.";
 
         await botClient.SendMessage(
             chatId,
             text,
             parseMode: ParseMode.Html,
-            replyMarkup: BuildTenantRenewConfirmKeyboard(),
+            replyMarkup: BuildTenantRenewConfirmKeyboard(allowDiscount),
             cancellationToken: cancellationToken);
     }
 
@@ -5557,6 +5635,9 @@ public partial class TenantBotService
         order.RenewalServiceResolutionMode = resolutionMode;
         order.PaymentStatus = TenantBotOrderStatuses.Pending;
         order.UpdatedAtUtc = DateTime.UtcNow;
+        if (await AdmitDiscountedRenewalFromStateAsync(botClient, chatId, tenant, customer, user, order,
+                price.SalePriceToman, price.BaseCostToman, cancellationToken))
+            return;
 
         _workflow.Add(order);
         await _workflow.SaveAsync(cancellationToken);
@@ -5750,16 +5831,16 @@ public partial class TenantBotService
     /// <summary>
     /// Builds the final confirmation keyboard for tenant renewal order creation.
     /// </summary>
+    /// <param name="allowDiscount">True only while this storefront has at least one enabled renewal-eligible code.</param>
     /// <returns>Reply keyboard with confirm and cancel labels.</returns>
-    private static ReplyKeyboardMarkup BuildTenantRenewConfirmKeyboard()
+    private static ReplyKeyboardMarkup BuildTenantRenewConfirmKeyboard(bool allowDiscount = false)
     {
-        return new ReplyKeyboardMarkup(new[]
+        var rows = new List<KeyboardButton[]>
         {
             new[] { new KeyboardButton("✅ تایید"), new KeyboardButton("❌ انصراف") }
-        })
-        {
-            ResizeKeyboard = true
         };
+        if (allowDiscount) rows.Add(new[] { new KeyboardButton("🎟 ثبت کد تخفیف") });
+        return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
     }
 
     /// <summary>
@@ -6273,7 +6354,7 @@ public partial class TenantBotService
 
                 var selection = new XuiV3PurchaseSelection { ServiceKey = parts[1], TrafficGb = GB, DurationKey = parts[3] };
                 await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
-                await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, MessageId, tenant, selection, CancellationToken);
+                await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, CallbackQuery.From.Id, MessageId, tenant, selection, CancellationToken);
             }
 
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
@@ -6318,7 +6399,7 @@ public partial class TenantBotService
                 {
                     var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
                     await _state.ClearUserStatus(new User { Id = CallbackQuery.From.Id });
-                    await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, MessageId, tenant, selection, CancellationToken);
+                    await SHOWCUSTOMERCONFIRMASYNC(botClient, ChatId, CallbackQuery.From.Id, MessageId, tenant, selection, CancellationToken);
                 }
             }
 
@@ -6326,8 +6407,21 @@ public partial class TenantBotService
             return;
         }
 
+        if (action.StartsWith("DC:", StringComparison.Ordinal) || action.StartsWith("DR:", StringComparison.Ordinal))
+        {
+            await HandlePurchaseDiscountCallbackAsync(botClient, CallbackQuery, tenant, customer, action, CancellationToken);
+            return;
+        }
+
+        if (action.StartsWith("DQ:", StringComparison.Ordinal))
+        {
+            await HandleQuotedPurchasePaymentAsync(botClient, CallbackQuery, tenant, customer, action, CancellationToken);
+            return;
+        }
         if (action.StartsWith("Pay:", StringComparison.Ordinal))
         {
+            if (await RejectLegacyQuotedPurchaseAsync(botClient, CallbackQuery, tenant, CancellationToken))
+                return;
             var selection = PARSESELECTIONFROMPAYACTION(action);
             if (selection == null)
             {
@@ -6357,6 +6451,8 @@ public partial class TenantBotService
             action.StartsWith("PAYNP:", StringComparison.Ordinal) ||
             action.StartsWith("PAYCARD:", StringComparison.Ordinal))
         {
+            if (await RejectLegacyQuotedPurchaseAsync(botClient, CallbackQuery, tenant, CancellationToken))
+                return;
             var Provider = action.Split(':', 2)[0];
             var PAYACTION = action[(Provider.Length + 1)..];
             var selection = PARSESELECTIONFROMPAYACTION(PAYACTION);
@@ -7011,6 +7107,7 @@ public partial class TenantBotService
     /// </summary>
     /// <param name="botClient">Telegram client for the tenant storefront that owns this customer conversation.</param>
     /// <param name="ChatId">Telegram chat id of the tenant customer receiving or updating the pre-invoice.</param>
+    /// <param name="customerTelegramUserId">Numeric Telegram sender of this storefront preview, distinct from the chat id and never inferred from a callback payload.</param>
     /// <param name="MessageId">Optional Telegram message id to edit; <c>null</c> sends a new message.</param>
     /// <param name="tenant">Tenant bot whose markup and enabled payment methods control the sale.</param>
     /// <param name="selection">
@@ -7022,9 +7119,9 @@ public partial class TenantBotService
     /// The shared resolver revalidates service, traffic, and duration before the summary is built. Metered summaries
     /// show traffic and daily components using customer-visible effective tenant rates; markup pricing never exposes
     /// the owner's raw colleague cost. Unlimited selections are tenant-authorized again, and fixed-public-price policy
-    /// changes only the displayed sale amount. This method sends UI only and does not create an order, invoice, wallet
-    /// movement, ledger entry, or XUI account. Customer-wallet payment is displayed only for current persisted approval;
-    /// the callback rechecks permission and authoritative prices before order admission or a sufficient-balance debit.
+    /// changes only the displayed sale amount. With an eligible tenant code the bound quote renderer saves the actual
+    /// Telegram message id before offering payable buttons; without a code, legacy buttons and exact text are preserved.
+    /// This method does not create a payable order, invoice, wallet mutation, ledger entry, or XUI account.
     ///
     /// Every enabled online gateway is displayed as instant and includes its customer-facing fee percentage:
     /// HooshPay 15%, Tetraminator 12%, UniquePay 12%, AtlasPay card-to-card, and NOWPayments 0%. Rial methods - the four
@@ -7035,8 +7132,14 @@ public partial class TenantBotService
     /// verified online fulfillment from card-to-card fulfillment that waits for the tenant owner's receipt approval and
     /// may take longer.
     /// </remarks>
-    private async Task SHOWCUSTOMERCONFIRMASYNC(ITelegramBotClient botClient, ChatId ChatId, int? MessageId, BotInstance tenant, XuiV3PurchaseSelection selection, CancellationToken CancellationToken)
+    private async Task SHOWCUSTOMERCONFIRMASYNC(ITelegramBotClient botClient, ChatId ChatId, long customerTelegramUserId, int? MessageId, BotInstance tenant, XuiV3PurchaseSelection selection, CancellationToken CancellationToken)
     {
+        if (await _serviceProvider.GetRequiredService<TenantDiscountService>()
+                .HasActiveScopeAsync(tenant.Id, TenantDiscountScopes.Purchase, CancellationToken))
+        {
+            await ShowCustomerDiscountConfirmAsync(botClient, ChatId, MessageId, tenant, selection, customerTelegramUserId, CancellationToken);
+            return;
+        }
         var Price = CalculateTenantPrice(tenant, selection);
         var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
         var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, Price.SalePriceToman);
@@ -7113,32 +7216,8 @@ public partial class TenantBotService
             return;
         }
 
-        var OrderId = CreateTenantOrderId(tenant, customer.TelegramUserId);
-
-        // the local order is created before the invoice so ipn can be matched EVEN if the User leaves Telegram.
-        var order = new TenantBotOrder
-        {
-            OrderId = OrderId,
-            TenantBotId = tenant.Id,
-            TenantBotUsername = tenant.Username,
-            OwnerTelegramUserId = tenant.OwnerTelegramUserId ?? 0,
-            CustomerTelegramUserId = customer.TelegramUserId,
-            CustomerChatId = ChatId,
-            CustomerUsername = customer.Username,
-            CustomerFirstName = customer.FirstName,
-            CustomerLastName = customer.LastName,
-            OrderKind = TenantBotOrderKinds.Purchase,
-            ServiceKey = selection.ServiceKey,
-            TrafficGb = selection.TrafficGb,
-            DurationKey = selection.DurationKey,
-            UnlimitedPlanKey = selection.UnlimitedPlanKey,
-            AccountCount = 1,
-            SalePriceToman = Price.SalePriceToman,
-            BaseCostToman = Price.BaseCostToman,
-            ProfitToman = Price.ProfitToman,
-            PaymentStatus = TenantBotOrderStatuses.Pending,
-            CreatedAtUtc = DateTime.UtcNow
-        };
+        // The factory owns the common purchase snapshot for both quoted and legacy HooshPay orders.
+        var order = CreateTenantOrder(tenant, customer, ChatId, selection, Price, "HooshPay");
 
         _workflow.Add(order);
         await _workflow.SaveAsync(CancellationToken);
@@ -7445,6 +7524,12 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
             return;
         }
+        if (order.TenantDiscountCodeId.HasValue)
+        {
+            if (!await ClaimDiscountRenewalMethodAsync(botClient, callbackQuery, order, "HooshPay", cancellationToken)) return;
+            await CreateTenantHooshPayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
+            return;
+        }
 
         order.PaymentProvider = "HooshPay";
         order.UpdatedAtUtc = DateTime.UtcNow;
@@ -7550,6 +7635,12 @@ public partial class TenantBotService
         if (order == null)
         {
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد، قبلاً پردازش شده یا نوع سرویس اکانت با سفارش سازگار نیست. دوباره از منوی تمدید اقدام کنید.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+        if (order.TenantDiscountCodeId.HasValue)
+        {
+            if (!await ClaimDiscountRenewalMethodAsync(botClient, callbackQuery, order, "NowPayments", cancellationToken)) return;
+            await CreateTenantNowPaymentsInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
             return;
         }
 
@@ -7708,6 +7799,8 @@ public partial class TenantBotService
                         x.PaymentProvider == "atlaspay" &&
                         x.PaymentStatus == TenantBotOrderStatuses.Pending &&
                         x.OrderKind == TenantBotOrderKinds.Purchase &&
+                        x.OriginalSalePriceToman == null &&
+                        !db.TenantDiscountQuotes.Any(quote => quote.OrderId == x.Id) &&
                         x.SalePriceToman == salePriceToman &&
                         x.ServiceKey == selection.ServiceKey,
                         cancellationToken);
@@ -7734,6 +7827,14 @@ public partial class TenantBotService
         { await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد یا قبلاً پردازش شده است.", showAlert: true, cancellationToken: cancellationToken); return; }
         if (!IsTenantAtlasPayAvailable(tenant))
         { await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, BuildTenantAtlasPayUnavailableMessage(tenant), showAlert: true, cancellationToken: cancellationToken); return; }
+        if (!AtlasPay.IsSupportedBaseAmount(order.SalePriceToman))
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id,
+                "مبلغ این سفارش برای اطلس‌پی قابل پرداخت نیست.", showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+        if (order.TenantDiscountCodeId.HasValue &&
+            !await ClaimDiscountRenewalMethodAsync(botClient, callbackQuery, order, "atlaspay", cancellationToken)) return;
         order.PaymentProvider = "atlaspay"; order.UpdatedAtUtc = DateTime.UtcNow; await _workflow.SaveAsync(cancellationToken);
         await CreateTenantAtlasPayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
     }
@@ -7742,7 +7843,7 @@ public partial class TenantBotService
         BotInstance tenant, CredUser customer, TenantBotOrder order, CancellationToken cancellationToken)
     {
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
-        if (!IsTenantAtlasPayAvailable(tenant))
+        if (!IsTenantAtlasPayAvailable(tenant) && order.DiscountInvoiceAttemptState is (null or "none"))
         { await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, BuildTenantAtlasPayUnavailableMessage(tenant), showAlert: true, cancellationToken: cancellationToken); return; }
         if (!AtlasPay.IsSupportedBaseAmount(order.SalePriceToman))
         {
@@ -7759,6 +7860,12 @@ public partial class TenantBotService
         try
         {
             payment = await _workflow.ReadAsync(async db => await db.AtlasPayPaymentInfos.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, cancellationToken));
+            if (payment == null && order.DiscountInvoiceAttemptState is not (null or "none"))
+            {
+                await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id,
+                    "نتیجه تلاش قبلی نامشخص است؛ فاکتور دیگری ساخته نمی‌شود.", showAlert: true, cancellationToken: cancellationToken);
+                return;
+            }
             if (payment != null)
             {
                 order.AtlasPayPaymentInfoId = payment.Id; order.UpdatedAtUtc = DateTime.UtcNow;
@@ -7776,6 +7883,11 @@ public partial class TenantBotService
                     TenantOwnerTelegramUserId = tenant.OwnerTelegramUserId, CreationState = AtlasPayCreationStates.Attempting,
                     SettlementState = AtlasPaySettlementStates.Pending, CreatedAtUtc = DateTime.UtcNow, UpdatedAtUtc = DateTime.UtcNow
                 };
+                if (order.TenantDiscountCodeId.HasValue || order.DiscountInvoiceAttemptState != null)
+                {
+                    order.DiscountInvoiceAttemptState = "started";
+                    order.DiscountInvoiceAttemptedAtUtc = DateTime.UtcNow;
+                }
                 payment.BeginCreationAttempt(payment.CreatedAtUtc); _workflow.Add(payment); await _workflow.SaveAsync(cancellationToken);
                 order.AtlasPayPaymentInfoId = payment.Id; order.PaymentProvider = "atlaspay"; order.UpdatedAtUtc = DateTime.UtcNow;
                 await _workflow.SaveAsync(cancellationToken);
@@ -7799,6 +7911,7 @@ public partial class TenantBotService
             var created = await _atlasPay.CreateOrderAsync(payment.MerchantOrderRef, payment.BaseAmountToman, payment.TelegramUserId, cancellationToken);
             payment.ApplyCreate(created, DateTime.UtcNow, AtlasPayPollingPolicy.GetInitialNextInquiryUtc(_appConfig, DateTime.UtcNow));
             order.AtlasPayPaymentInfoId = payment.Id; order.PaymentUrl = payment.CustomerStartLink; order.UpdatedAtUtc = DateTime.UtcNow;
+            if (order.DiscountInvoiceAttemptState == "started") order.DiscountInvoiceAttemptState = "created";
             await _workflow.SaveAsync(cancellationToken);
             var directPayment = AtlasPayCustomerPaymentUi.TryCreateDirectPayment(created);
             await botClient.SendMessage(chatId, BuildTenantAtlasPayPaymentText(order, payment, directPayment), parseMode: ParseMode.Html,
@@ -7823,6 +7936,8 @@ public partial class TenantBotService
                     : $"AtlasPay rejected order creation: {providerMessage}"
                 : "AtlasPay create outcome is ambiguous; no automatic retry.";
             order.PaymentStatus = definitive ? TenantBotOrderStatuses.Failed : TenantBotOrderStatuses.Pending;
+            if (order.DiscountInvoiceAttemptState == "started")
+                order.DiscountInvoiceAttemptState = definitive ? "definitive_failed" : "ambiguous";
             order.ErrorMessage = definitive
                 ? string.IsNullOrWhiteSpace(providerMessage)
                     ? "AtlasPay invoice creation failed."
@@ -7850,13 +7965,11 @@ public partial class TenantBotService
         AtlasPayPaymentInfo payment,
         AtlasPayCustomerPaymentUi.DirectPayment directPayment = null)
     {
-        if (directPayment != null)
-            return AtlasPayCustomerPaymentUi.BuildDirectPaymentText(directPayment);
-
-        return AtlasPayCustomerPaymentUi.BuildLinkFallbackText(
-            payment.TotalAmountToman!.Value,
-            payment.PaymentDeadlineAtUtc,
-            payment.TrackingCode);
+        var text = directPayment != null
+            ? AtlasPayCustomerPaymentUi.BuildDirectPaymentText(directPayment)
+            : AtlasPayCustomerPaymentUi.BuildLinkFallbackText(
+                payment.TotalAmountToman!.Value, payment.PaymentDeadlineAtUtc, payment.TrackingCode);
+        return text + (order.TenantDiscountCodeId.HasValue ? "\n\n" + BuildTenantDiscountOrderPriceText(order) : "");
     }
 
     /// <summary>
@@ -7943,6 +8056,8 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
             return;
         }
+        if (order.TenantDiscountCodeId.HasValue &&
+            !await ClaimDiscountRenewalMethodAsync(botClient, callbackQuery, order, "UniquePay", cancellationToken)) return;
 
         order.PaymentProvider = "UniquePay";
         order.UpdatedAtUtc = DateTime.UtcNow;
@@ -7977,7 +8092,8 @@ public partial class TenantBotService
         CancellationToken cancellationToken)
     {
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
-        if (!IsTenantUniquePayAvailable(tenant, order.SalePriceToman))
+        if (!IsTenantUniquePayAvailable(tenant, order.SalePriceToman) &&
+            order.DiscountInvoiceAttemptState is (null or "none"))
         {
             await SafeAnswerCallbackQueryAsync(
                 botClient,
@@ -7999,6 +8115,12 @@ public partial class TenantBotService
             payment = await _workflow.ReadAsync(async db => await db.UniquePayPaymentInfos.FirstOrDefaultAsync(
                 x => x.TenantBotOrderId == order.Id || x.HashId == order.OrderId,
                 cancellationToken));
+            if (payment == null && order.DiscountInvoiceAttemptState is not (null or "none"))
+            {
+                await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id,
+                    "نتیجه تلاش قبلی نامشخص است؛ فاکتور دیگری ساخته نمی‌شود.", showAlert: true, cancellationToken: cancellationToken);
+                return;
+            }
             if (payment != null)
             {
                 order.UniquePayPaymentInfoId = payment.Id;
@@ -8045,6 +8167,11 @@ public partial class TenantBotService
                     callbackUrl = BuildUniquePayCallbackUrl(payment.HashId)
                 });
                 _workflow.Add(payment);
+                if (order.TenantDiscountCodeId.HasValue || order.DiscountInvoiceAttemptState != null)
+                {
+                    order.DiscountInvoiceAttemptState = "started";
+                    order.DiscountInvoiceAttemptedAtUtc = DateTime.UtcNow;
+                }
                 await _workflow.SaveAsync(cancellationToken);
 
                 // The tenant-order relationship must survive even when the one create POST times out or returns 5xx.
@@ -8103,6 +8230,7 @@ public partial class TenantBotService
                 3600));
             order.UniquePayPaymentInfoId = payment.Id;
             order.PaymentUrl = payment.PaymentLink;
+            if (order.DiscountInvoiceAttemptState == "started") order.DiscountInvoiceAttemptState = "created";
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
 
@@ -8128,6 +8256,8 @@ public partial class TenantBotService
                 ? TenantBotOrderStatuses.Failed
                 : TenantBotOrderStatuses.Pending;
             order.ErrorMessage = ex.Message;
+            if (order.DiscountInvoiceAttemptState == "started")
+                order.DiscountInvoiceAttemptState = definitiveFailure ? "definitive_failed" : "ambiguous";
             payment.ErrorCode = creationErrorCode;
             payment.ErrorMessage = ex.Message;
             payment.RawResponseJson = ex is UniquePayApiException providerError
@@ -8240,6 +8370,8 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
             return;
         }
+        if (order.TenantDiscountCodeId.HasValue &&
+            !await ClaimDiscountRenewalMethodAsync(botClient, callbackQuery, order, "Tetraminator", cancellationToken)) return;
 
         order.PaymentProvider = "Tetraminator";
         order.UpdatedAtUtc = DateTime.UtcNow;
@@ -8282,6 +8414,12 @@ public partial class TenantBotService
             payment = await _workflow.ReadAsync(async db => await db.TetraminatorPaymentInfos.FirstOrDefaultAsync(
                 x => x.OrderId == order.OrderId || x.TenantBotOrderId == order.Id,
                 cancellationToken));
+            if (payment == null && order.DiscountInvoiceAttemptState is not (null or "none"))
+            {
+                await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id,
+                    "نتیجه تلاش قبلی نامشخص است؛ فاکتور دیگری ساخته نمی‌شود.", showAlert: true, cancellationToken: cancellationToken);
+                return;
+            }
             if (payment != null)
             {
                 if (!string.IsNullOrWhiteSpace(payment.PayId) && !string.IsNullOrWhiteSpace(payment.PaymentLink))
@@ -8323,6 +8461,11 @@ public partial class TenantBotService
                     order_id = payment.OrderId
                 });
                 _workflow.Add(payment);
+                if (order.TenantDiscountCodeId.HasValue || order.DiscountInvoiceAttemptState != null)
+                {
+                    order.DiscountInvoiceAttemptState = "started";
+                    order.DiscountInvoiceAttemptedAtUtc = DateTime.UtcNow;
+                }
                 await _workflow.SaveAsync(cancellationToken);
             }
         }
@@ -8366,6 +8509,7 @@ public partial class TenantBotService
             order.PaymentUrl = payment.PaymentLink;
             order.PaymentStatus = TenantBotOrderStatuses.Pending;
             order.ErrorMessage = null;
+            if (order.DiscountInvoiceAttemptState == "started") order.DiscountInvoiceAttemptState = "created";
             order.UpdatedAtUtc = DateTime.UtcNow;
             await _workflow.SaveAsync(cancellationToken);
 
@@ -8379,8 +8523,10 @@ public partial class TenantBotService
         }
         catch (Exception ex)
         {
-            order.PaymentStatus = TenantBotOrderStatuses.Failed;
+            order.PaymentStatus = order.TenantDiscountCodeId.HasValue || order.DiscountInvoiceAttemptState != null
+                ? TenantBotOrderStatuses.Pending : TenantBotOrderStatuses.Failed;
             order.ErrorMessage = "Tetraminator invoice creation failed.";
+            if (order.DiscountInvoiceAttemptState == "started") order.DiscountInvoiceAttemptState = "ambiguous";
             order.UpdatedAtUtc = DateTime.UtcNow;
             payment.ErrorCode = ex is TetraminatorApiException apiException
                 ? apiException.StatusCode.ToString(CultureInfo.InvariantCulture)
@@ -8423,6 +8569,8 @@ public partial class TenantBotService
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "سفارش تمدید پیدا نشد، قبلاً پردازش شده یا نوع سرویس اکانت با سفارش سازگار نیست. دوباره از منوی تمدید اقدام کنید.", showAlert: true, cancellationToken: cancellationToken);
             return;
         }
+        if (order.TenantDiscountCodeId.HasValue &&
+            !await ClaimDiscountRenewalMethodAsync(botClient, callbackQuery, order, "tenant_card", cancellationToken)) return;
 
         order.PaymentProvider = "tenant_card";
         order.PaymentStatus = TenantBotOrderStatuses.AwaitingReceipt;
@@ -8434,6 +8582,7 @@ public partial class TenantBotService
             chatId,
             "💳 <b>پرداخت کارت‌به‌کارت تمدید</b>\n\n" +
             $"مبلغ دقیق: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
+            BuildTenantDiscountOrderPriceText(order) +
             $"شماره کارت: <code>{Html(tenant.TenantCardNumber)}</code>\n" +
             $"نام صاحب کارت: <b>{Html(tenant.TenantCardHolderName)}</b>\n" +
             $"شماره سفارش: <code>{Html(order.OrderId)}</code>\n\n" +
@@ -8569,7 +8718,7 @@ public partial class TenantBotService
                 AccountCount = order.AccountCount
             };
             var currentPrice = CalculateTenantPrice(tenant, selection);
-            if (currentPrice.SalePriceToman != order.SalePriceToman ||
+            if (currentPrice.SalePriceToman != (order.OriginalSalePriceToman ?? order.SalePriceToman) ||
                 currentPrice.BaseCostToman != order.BaseCostToman)
             {
                 _logger.LogWarning(
@@ -9913,7 +10062,15 @@ public partial class TenantBotService
         }
 
         // Receipt row + owner-notification outbox row commit together, and only then is any panel work attempted.
-        await PERSISTTENANTMANUALRECEIPTASYNC(order.Id, receiptMedia.FileId, CancellationToken);
+        var receiptId = await PERSISTTENANTMANUALRECEIPTASYNC(order.Id, receiptMedia.FileId, CancellationToken);
+        if (receiptId <= 0)
+        {
+            await _state.ClearPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id,
+                "مهلت این سفارش کارت‌به‌کارت یا ظرفیت تخفیف آن پایان یافته است؛ خرید تازه‌ای شروع کنید.",
+                cancellationToken: CancellationToken);
+            return;
+        }
         await _state.ClearPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken);
 
         await botClient.SendMessage(
@@ -10297,6 +10454,20 @@ public partial class TenantBotService
                 ? await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, cancellationToken)
                 : await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, cancellationToken);
 
+            // Recheck inside the receipt writer transaction: a concurrent two-hour sweep may have
+            // released the claim after the earlier target lookup but before this photo arrived.
+            if (order.TenantDiscountCodeId.HasValue)
+            {
+                if (order.PaymentStatus is not (TenantBotOrderStatuses.AwaitingReceipt or TenantBotOrderStatuses.ReceiptSubmitted)
+                    || !await db.TenantDiscountRedemptions.AnyAsync(x => x.TenantBotOrderId == order.Id
+                        && x.CodeId == order.TenantDiscountCodeId && x.State == TenantDiscountRedemptionStates.Reserved,
+                        cancellationToken)
+                    || receipt?.Status == TenantManualPaymentReceiptStatuses.Rejected
+                    || (order.CreatedAtUtc.AddHours(2) <= DateTime.UtcNow &&
+                        string.IsNullOrWhiteSpace(receipt?.PhotoFileId)))
+                    return 0;
+            }
+
             // A rejected receipt is an immutable review attempt. A legitimate customer resubmission gets a new
             // receipt id/outbox key so the old assistant buttons remain historical while the new photo can be reviewed once.
             if (receipt?.Status == TenantManualPaymentReceiptStatuses.Rejected)
@@ -10518,6 +10689,8 @@ public partial class TenantBotService
             return "این سفارش قبلاً تایید و ساخته شده است؛ ارسال مشخصات ذخیره‌شده برای شما در صف پایدار دستیار فروش قرار گرفت.";
         }
 
+        if (await IsDiscountCardApprovalBlockedAsync(order, receipt, CancellationToken))
+            return "این سفارش تخفیف منقضی یا رسید آن رد شده است؛ تایید دوباره آن مجاز نیست.";
         if (!IsTenantTransportAvailable(order.TenantBotId))
         {
             return "فروشگاه این سفارش غیرفعال است یا توکن همان ربات در دسترس نیست. هیچ تغییر مالی یا ساخت اکانتی انجام نشد؛ ابتدا همان فروشگاه را دوباره فعال کنید و سپس تایید نهایی را تکرار کنید.";
@@ -10749,6 +10922,12 @@ public partial class TenantBotService
             return;
         }
 
+        if (!order.IsFulfilled && await IsDiscountCardApprovalBlockedAsync(order, null, CancellationToken))
+        {
+            await botClient.SendMessage(Message.Chat.Id, "این سفارش تخفیف منقضی یا رد شده است؛ تایید آن مجاز نیست.",
+                cancellationToken: CancellationToken);
+            return;
+        }
         var receipt = await ENSUREMANUALRECEIPTASYNC(order, owner.TelegramUserId, CancellationToken);
         if (string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase))
         {
@@ -10872,6 +11051,8 @@ public partial class TenantBotService
             TenantProvisioningRetryAuthorizationKind.SuperAdminExplicit,
             superAdminTelegramUserId,
             order.Id);
+        if (await IsDiscountCardApprovalBlockedAsync(order, null, CancellationToken))
+            return "سفارش تخفیف منقضی یا رد شده است؛ تایید آن مجاز نیست.";
         if (string.Equals(order.PaymentProvider, "tenant_card", StringComparison.OrdinalIgnoreCase))
         {
             var receipt = await ENSUREMANUALRECEIPTASYNC(order, superAdminTelegramUserId, CancellationToken);
@@ -11007,6 +11188,8 @@ public partial class TenantBotService
         long reviewerTelegramUserId,
         CancellationToken CancellationToken)
     {
+        if (!order.IsFulfilled && await IsDiscountCardApprovalBlockedAsync(order, null, CancellationToken))
+            throw new InvalidOperationException("The discounted card order cannot accept an approval receipt.");
         var receipt = order.ManualReceiptId.HasValue
             ? await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, CancellationToken))
             : await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, CancellationToken));
@@ -11482,7 +11665,8 @@ public partial class TenantBotService
         return string.Equals(order.PaymentStatus, TenantBotOrderStatuses.Pending, StringComparison.OrdinalIgnoreCase) ||
                string.Equals(order.PaymentStatus, TenantBotOrderStatuses.AwaitingReceipt, StringComparison.OrdinalIgnoreCase) ||
                string.Equals(order.PaymentStatus, TenantBotOrderStatuses.ReceiptSubmitted, StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(order.PaymentStatus, TenantBotOrderStatuses.ReceiptRejected, StringComparison.OrdinalIgnoreCase);
+               (!order.TenantDiscountCodeId.HasValue &&
+                string.Equals(order.PaymentStatus, TenantBotOrderStatuses.ReceiptRejected, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>
@@ -13003,6 +13187,7 @@ public partial class TenantBotService
         var Payable = payment.PayableAmountToman > 0 ? payment.PayableAmountToman : payment.AmountToman + payment.FeeAmountToman;
         return "✅ فاکتور پرداخت ساخته شد.\n\n" +
                $"مبلغ سفارش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
+               BuildTenantDiscountOrderPriceText(order) +
                $"مبلغ قابل پرداخت با کارمزد درگاه: <code>{Html(Payable.FormatCurrency())}</code>\n" +
                $"شماره سفارش: <code>{Html(order.OrderId)}</code>\n\n" +
                "پس از پرداخت موفق، اکانت شما به صورت خودکار ساخته و ارسال می‌شود. اگر پرداخت انجام شد و پیام ساخت اکانت را نگرفتید، دکمه بررسی وضعیت را بزنید.";
@@ -13023,6 +13208,7 @@ public partial class TenantBotService
                $"اکانت: <code>{Html(order.TargetAccountEmail)}</code>\n" +
                $"شماره سفارش: <code>{Html(order.OrderId)}</code>\n" +
                $"مبلغ تمدید: <b>{Html(order.SalePriceToman.FormatCurrency())}</b>\n\n" +
+               BuildTenantDiscountOrderPriceText(order) +
                "قیمت تمدید دقیقاً مثل قیمت خرید همین پلن در فروشگاه محاسبه شده است.\n\n" +
                BuildTenantPaymentTimingNotice(isRenewal: true);
     }
@@ -13193,7 +13379,7 @@ public partial class TenantBotService
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ تترامیناتور آنی | ریالی", CUSTOMERCALLBACKPREFIX + $"RNTM:{order.Id}") });
         if (IsTenantUniquePayAvailable(tenant, order.SalePriceToman))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + $"RNUP:{order.Id}") });
-        if (IsTenantAtlasPayAvailable(tenant))
+        if (IsTenantAtlasPayAvailable(tenant) && AtlasPay.IsSupportedBaseAmount(order.SalePriceToman))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 اطلس‌پی | کارت‌به‌کارت آنی | کارمزد ۱۲٪ | ریالی", CUSTOMERCALLBACKPREFIX + $"RNAP:{order.Id}") });
         if (TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.NowPayments, _gatewayAvailability.Snapshot))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⚡ ارز دیجیتال آنی", CUSTOMERCALLBACKPREFIX + $"RNNP:{order.Id}") });
@@ -13215,6 +13401,7 @@ public partial class TenantBotService
         return "✅ فاکتور پرداخت ساخته شد.\n\n" +
                $"درگاه: <b>{Html(PROVIDERDISPLAYNAME)}</b>\n" +
                $"مبلغ سفارش: <code>{Html(order.SalePriceToman.FormatCurrency())}</code>\n" +
+               BuildTenantDiscountOrderPriceText(order) +
                $"شماره سفارش: <code>{Html(order.OrderId)}</code>\n\n" +
                "پس از پرداخت موفق، اکانت شما به صورت خودکار ساخته و ارسال می‌شود. اگر پرداخت انجام شد و پیام ساخت اکانت را نگرفتید، دکمه بررسی وضعیت را بزنید.";
     }

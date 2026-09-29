@@ -14,6 +14,16 @@ public class User
     /// <remarks>Null preserves a partial update; empty clears the selection. Handlers must recheck owner access.</remarks>
     [NotMapped]
     public string OwnerStoreId { get; set; }
+    /// <summary>Detached owner discount draft, persisted only in the selected bot's conversation state.</summary>
+    /// <remarks>Null preserves partial updates; clearing or switching stores cancels the draft.</remarks>
+    [NotMapped]
+    public string OwnerDiscountDraftJson { get; set; }
+    /// <summary>Detached renewal discount selection; the order admission revalidates live pricing and code revision.</summary>
+    [NotMapped]
+    public string RenewalDiscountSelectionJson { get; set; }
+    /// <summary>Detached purchase quote awaiting code entry; quote ownership is verified independently.</summary>
+    [NotMapped]
+    public int? PurchaseDiscountQuoteId { get; set; }
     public long Id { get; set; }
     public string SelectedCountry { get; set; }
     public string SelectedPeriod { get; set; }

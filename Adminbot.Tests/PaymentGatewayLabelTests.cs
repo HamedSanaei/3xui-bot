@@ -170,7 +170,7 @@ public sealed partial class ConcurrencyTests
         // 50 GB of the metered 'normal' service keeps the sale price inside HooshPay's accepted range and above the
         // Tetraminator minimum, so every rial gateway row renders regardless of colleague vs user rate resolution.
         var selection = new XuiV3PurchaseSelection { ServiceKey = "normal", TrafficGb = 50, DurationKey = "m1", AccountCount = 1 };
-        await (Task)purchase.Invoke(service, new object?[] { client, new ChatId(911), null, tenant, selection, CancellationToken.None })!;
+        await (Task)purchase.Invoke(service, new object?[] { client, new ChatId(911), 911L, null, tenant, selection, CancellationToken.None })!;
 
         AssertRialSelectionKeyboard(client.Labels, client.Callbacks, "PAY", "کارمزد ۱۵٪", "کارمزد ۱۲٪", "کارمزد ۱۲٪");
 

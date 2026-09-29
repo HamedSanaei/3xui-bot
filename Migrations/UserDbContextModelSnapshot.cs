@@ -436,6 +436,10 @@ namespace Adminbot.Migrations
                     b.Property<string>("LastStep")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("OwnerDiscountDraftJson")
+                        .HasMaxLength(4096)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("OwnerStoreId")
                         .HasColumnType("TEXT");
 
@@ -452,6 +456,9 @@ namespace Adminbot.Migrations
                     b.Property<string>("PendingUserComment")
                         .HasColumnType("TEXT");
 
+                    b.Property<int?>("PurchaseDiscountQuoteId")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("PurchaseSessionId")
                         .HasColumnType("TEXT");
 
@@ -461,6 +468,10 @@ namespace Adminbot.Migrations
 
                     b.Property<string>("RenewalServiceResolutionMode")
                         .HasMaxLength(48)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RenewalDiscountSelectionJson")
+                        .HasMaxLength(1024)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("RenewalSessionId")
@@ -1422,6 +1433,10 @@ namespace Adminbot.Migrations
                     b.Property<int>("AccountCount")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("AppliedDiscountCode")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
                     b.Property<int?>("AtlasPayPaymentInfoId")
                         .HasColumnType("INTEGER");
 
@@ -1463,6 +1478,16 @@ namespace Adminbot.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("TEXT");
 
+                    b.Property<long?>("DiscountAmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("DiscountInvoiceAttemptedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DiscountInvoiceAttemptState")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("DurationKey")
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
@@ -1494,6 +1519,9 @@ namespace Adminbot.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<int?>("NowPaymentsPaymentInfoId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("OriginalSalePriceToman")
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("OrderId")
@@ -1582,6 +1610,9 @@ namespace Adminbot.Migrations
                         .HasMaxLength(48)
                         .HasColumnType("TEXT");
 
+                    b.Property<int?>("TenantDiscountCodeId")
+                        .HasColumnType("INTEGER");
+
                     b.Property<long>("SalePriceToman")
                         .HasColumnType("INTEGER");
 
@@ -1655,6 +1686,186 @@ namespace Adminbot.Migrations
                     b.HasIndex("ProvisionalDeliveryState", "TenantBotId");
 
                     b.ToTable("TenantBotOrders", (string)null);
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.TenantDiscountCode", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Code")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("FixedAmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsActive")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("MaxDiscountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("MaxUses")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("MinimumOrderToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("Percent")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Scope")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("TenantBotId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantBotId", "Code")
+                        .IsUnique()
+                        .HasFilter("\"IsDeleted\" = 0");
+
+                    b.ToTable("TenantDiscountCodes");
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.TenantDiscountQuote", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("AdmittedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("BaseCostToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("ChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("CodeId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("CodeUpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("CustomerTelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("DiscountAmountToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("ExpiresAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("GrossToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("MessageId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("NetToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("OrderId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("SelectedProvider")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SelectionKey")
+                        .IsRequired()
+                        .HasMaxLength(240)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("TenantBotId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("OrderId")
+                        .IsUnique()
+                        .HasFilter("\"OrderId\" IS NOT NULL");
+
+                    b.HasIndex("State", "ExpiresAtUtc");
+
+                    b.HasIndex("TenantBotId", "CustomerTelegramUserId", "ChatId", "MessageId")
+                        .IsUnique()
+                        .HasFilter("\"MessageId\" IS NOT NULL");
+
+                    b.ToTable("TenantDiscountQuotes");
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.TenantDiscountRedemption", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("CodeId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("ConsumedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("ReleasedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("ReservedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("TenantBotOrderId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantBotOrderId")
+                        .IsUnique();
+
+                    b.HasIndex("CodeId", "State");
+
+                    b.ToTable("TenantDiscountRedemptions");
                 });
 
             modelBuilder.Entity("Adminbot.Domain.TenantCardProvisionalOperation", b =>

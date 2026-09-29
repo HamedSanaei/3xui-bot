@@ -178,6 +178,8 @@ namespace Adminbot.Domain
         public const string Paid = "paid";
         public const string Fulfilled = "fulfilled";
         public const string Failed = "failed";
+        /// <summary>Discounted unpaid card order without a timely receipt, or renewal without a selected payment method, expired.</summary>
+        public const string DiscountExpired = "discount_expired";
     }
 
     /// <summary>
@@ -324,6 +326,18 @@ namespace Adminbot.Domain
         public int AccountCount { get; set; } = 1;
         public string UserComment { get; set; }
         public long SalePriceToman { get; set; }
+        /// <summary>Undiscounted storefront price, null for historical orders without a discount snapshot.</summary>
+        public long? OriginalSalePriceToman { get; set; }
+        /// <summary>Actual profit-floored whole-toman reduction; null on historical orders.</summary>
+        public long? DiscountAmountToman { get; set; }
+        /// <summary>Original selected code identity, retained even after owner deletion.</summary>
+        public int? TenantDiscountCodeId { get; set; }
+        /// <summary>Canonical code snapshot shown on receipts; null for historical or undiscounted orders.</summary>
+        public string AppliedDiscountCode { get; set; }
+        /// <summary>First-method invoice attempt state for quoted purchase and discounted renewal; null on historical orders.</summary>
+        public string DiscountInvoiceAttemptState { get; set; }
+        /// <summary>UTC start of the frozen provider creation attempt, if one has been claimed.</summary>
+        public DateTime? DiscountInvoiceAttemptedAtUtc { get; set; }
         public long BaseCostToman { get; set; }
         public long ProfitToman { get; set; }
         public string PaymentProvider { get; set; } = "hooshpay";
@@ -557,6 +571,12 @@ namespace Adminbot.Domain
         /// <summary>Selected storefront database id for owner input in this owned-bot/user conversation.</summary>
         /// <remarks>Not an authorization grant: every handler rechecks the owner. Switching stores clears pending input.</remarks>
         public string OwnerStoreId { get; set; }
+        /// <summary>Store-bound owner edit draft JSON, canceled when the bot-scoped conversation is cleared.</summary>
+        public string OwnerDiscountDraftJson { get; set; }
+        /// <summary>Tenant renewal discount selection JSON, revalidated against live price before admission.</summary>
+        public string RenewalDiscountSelectionJson { get; set; }
+        /// <summary>Purchase quote awaiting customer code input in this bot-scoped conversation.</summary>
+        public int? PurchaseDiscountQuoteId { get; set; }
         public string BotId { get; set; }
         public long TelegramUserId { get; set; }
         public string SelectedCountry { get; set; }
@@ -637,9 +657,9 @@ namespace Adminbot.Domain
         /// <param name="user">Legacy User state object collected by existing call sites.</param>
         /// <returns>A new BotUserState that can be inserted into users.db.</returns>
         /// <remarks>
-        /// The conversion copies an optional renewal UUID target lock and tenant service-resolution evidence into the
-        /// specified bot scope, along with the owner-selected store id. It performs no account, wallet, order, or panel operation and callers remain responsible
-        /// for persisting the returned row.
+        /// The conversion carries owner-store selection and discount drafts/selections into the specified bot scope
+        /// alongside renewal account locks. It performs no account, wallet, order, or panel operation; callers persist
+        /// the returned row and independently authorize every checkout or owner edit.
         /// </remarks>
         public static BotUserState FromUser(string botId, User user)
         {
@@ -648,6 +668,9 @@ namespace Adminbot.Domain
                 BotId = string.IsNullOrWhiteSpace(botId) ? BotContextAccessor.DefaultBotId : botId,
                 TelegramUserId = user.Id,
                 OwnerStoreId = user.OwnerStoreId,
+                OwnerDiscountDraftJson = user.OwnerDiscountDraftJson,
+                RenewalDiscountSelectionJson = user.RenewalDiscountSelectionJson,
+                PurchaseDiscountQuoteId = user.PurchaseDiscountQuoteId,
                 SelectedCountry = user.SelectedCountry,
                 SelectedPeriod = user.SelectedPeriod,
                 Type = user.Type,
@@ -678,8 +701,7 @@ namespace Adminbot.Domain
         /// </summary>
         /// <returns>A User object with the same conversation fields and Telegram user id.</returns>
         /// <remarks>
-        /// The sensitive renewal UUID target lock and tenant service-resolution evidence are copied so later preview/payment
-        /// handlers can revalidate them; the owner-selected store id is also restored for input after restart.
+        /// Renewal account locks and the owner store/draft and customer discount selections are restored after restart.
         /// The returned compatibility DTO is detached and authorizes no action by itself.
         /// </remarks>
         public User ToUser()
@@ -688,6 +710,9 @@ namespace Adminbot.Domain
             {
                 Id = TelegramUserId,
                 OwnerStoreId = OwnerStoreId,
+                OwnerDiscountDraftJson = OwnerDiscountDraftJson,
+                RenewalDiscountSelectionJson = RenewalDiscountSelectionJson,
+                PurchaseDiscountQuoteId = PurchaseDiscountQuoteId,
                 SelectedCountry = SelectedCountry,
                 SelectedPeriod = SelectedPeriod,
                 Type = Type,
@@ -717,14 +742,20 @@ namespace Adminbot.Domain
         /// </summary>
         /// <param name="user">Partial legacy state update.</param>
         /// <remarks>
-        /// Null means "preserve the stored value" for all nullable legacy fields; an explicit empty string clears a
-        /// string field. This distinction preserves the renewal UUID target lock and service-resolution evidence across
-        /// payment-method and plan updates but means callers that must clear either value must pass an empty string or use
-        /// a full reset. OwnerStoreId follows the same null-preserves/empty-clears rule. Callers must save the tracked state after this in-memory merge.
+        /// Null preserves stored nullable legacy fields; an explicit empty string clears string fields. Store switching
+        /// cancels the owner discount draft even if the partial input also supplies a draft. A nullable quote id cannot
+        /// be cleared by a partial update; use <see cref="Clear"/> or an explicit tracked state update. Callers persist
+        /// this merge and independently revalidate renewal locks, discount selections and owner authorization.
         /// </remarks>
         public void ApplyPartial(User user)
         {
+            bool switchingStore = user.OwnerStoreId != null &&
+                !string.Equals(OwnerStoreId, user.OwnerStoreId, StringComparison.Ordinal);
+            if (switchingStore) OwnerDiscountDraftJson = null;
             if (user.OwnerStoreId != null) OwnerStoreId = user.OwnerStoreId;
+            if (!switchingStore && user.OwnerDiscountDraftJson != null) OwnerDiscountDraftJson = user.OwnerDiscountDraftJson;
+            if (user.RenewalDiscountSelectionJson != null) RenewalDiscountSelectionJson = user.RenewalDiscountSelectionJson;
+            if (user.PurchaseDiscountQuoteId.HasValue) PurchaseDiscountQuoteId = user.PurchaseDiscountQuoteId;
             if (user.SelectedCountry != null) SelectedCountry = user.SelectedCountry;
             if (user.SelectedPeriod != null) SelectedPeriod = user.SelectedPeriod;
             if (user.Type != null) Type = user.Type;
@@ -753,13 +784,16 @@ namespace Adminbot.Domain
         /// Clears transient flow fields while keeping the bot/user row and long-lived counters.
         /// </summary>
         /// <remarks>
-        /// Renewal UUID target lock, tenant category evidence, and payment choice are cleared with the conversation so a
-        /// later flow cannot inherit authorization. Wallets, tenant orders, account metadata, and state rows belonging to
-        /// other bots are untouched. The owner-selected store is cleared too, cancelling pending settings input.
+        /// Renewal account locks, discount selections, owner drafts and payment choice are cleared with the conversation.
+        /// Wallets, tenant orders, account metadata and state rows belonging to other bots are untouched; the selected
+        /// owner store is also cleared, canceling pending settings input.
         /// </remarks>
         public void Clear()
         {
             OwnerStoreId = "";
+            OwnerDiscountDraftJson = null;
+            RenewalDiscountSelectionJson = null;
+            PurchaseDiscountQuoteId = null;
             SelectedCountry = "";
             SelectedPeriod = "";
             Type = "";

@@ -249,10 +249,12 @@ public class Program
         services.AddScoped<TenantOwnerNotificationTransportResolver>();
         services.AddScoped<TenantOrderNotificationDeliveryService>();
         services.AddScoped<TenantBotService>();
+        services.AddSingleton<TenantDiscountService>();
         services.AddSingleton<TenantCustomerWalletPolicy>();
         services.AddScoped<TenantCustomerWalletFunding>();
         services.AddScoped<WalletChargeApplicationService>();
         services.AddHostedService<TenantCustomerWalletRecoveryWorker>();
+        services.AddHostedService<TenantDiscountReservationWorker>();
         services.AddSingleton<TenantStoreStore>();
         services.AddScoped<TenantAccessService>();
         services.AddScoped<TenantStorefrontFundingAlertService>();
