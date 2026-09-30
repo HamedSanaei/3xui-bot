@@ -1219,9 +1219,9 @@ public sealed partial class AtlasPaySettlementService
 
 /// <summary>Reconciles AtlasPay hints and operator checks against official provider order/verify responses.</summary>
 /// <remarks>
-/// Worker and customer checks skip cached terminal orders. A configured super-admin may force a fresh verification
-/// of an expired local order; payment identity and total still gate automatic settlement. An unchanged expired result
-/// can only enter the separate two-stage owned-wallet exception after an independent human bank receipt review.
+/// Workers and customer checks skip cached terminal orders unless an authenticated, durable late confirmation requires
+/// a fresh inquiry of an expired order. A configured super-admin can also force an expired-order verification. Provider
+/// identity, total and full-payment proof still gate settlement; an unchanged expired response never authorizes credit.
 /// </remarks>
 public sealed partial class AtlasPayReconciliationHostedService : BackgroundService
 {
@@ -1409,9 +1409,9 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
     /// </param>
     /// <returns>Applied/AlreadyAdded only after provider proof or existing receipt; otherwise a non-credit result.</returns>
     /// <remarks>
-    /// Workers and customer checks never requery terminal invoices. A super-admin recheck may discover a delayed
-    /// official confirmation; if the provider still reports expired, any wallet credit requires a separate two-stage
-    /// bank-verified decision. Provider identity and total are checked before terminal status is persisted.
+    /// Ordinary workers and customer checks never requery terminal invoices. A durable signed confirmation can trigger
+    /// a fresh GET for an expired invoice; a configured super-admin can independently force verification. Both paths
+    /// require official full-payment proof. An unchanged expired result requires a separate bank-verified admin decision.
     /// </remarks>
     /// <example><code>await reconciler.ReconcilePaymentAsync(localId, "superadmin-verify", true, token, adminTelegramUserId);</code></example>
     /// <exception cref="OperationCanceledException">The caller cancels provider or persistence work.</exception>
@@ -1451,6 +1451,23 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
                  (x.WebhookProcessedAtUtc == null || x.WebhookProcessedAtUtc < x.WebhookReceivedAtUtc),
             cancellationToken);
     }
+
+    /// <summary>Detects a durable late confirmation that has not yet received a conclusive expired-order inquiry.</summary>
+    /// <param name="payment">The local users.db payment bound to the authenticated webhook's provider id, merchant reference and total.</param>
+    /// <returns><c>true</c> only for a pending signed confirmation on an expired payment without a successful terminal inquiry since receipt.</returns>
+    /// <remarks>
+    /// A cached expiration and a failed inquiry are not responses to the new confirmation. Temporary provider errors
+    /// retain the existing bounded retry policy; exhausted, escalated and manual-review states still stop automatic work.
+    /// The helper authorizes an inquiry only, never a wallet credit or tenant fulfillment.
+    /// </remarks>
+    /// <example><code>bool requiresFreshProviderInquiry = NeedsExpiredConfirmationInquiry(payment);</code></example>
+    private static bool NeedsExpiredConfirmationInquiry(AtlasPayPaymentInfo payment)
+        => string.Equals(payment.ProviderStatus, "expired", StringComparison.OrdinalIgnoreCase) &&
+           string.Equals(payment.WebhookEvent, "order.confirmed", StringComparison.Ordinal) &&
+           payment.WebhookReceivedAtUtc.HasValue &&
+           (!payment.WebhookProcessedAtUtc.HasValue || payment.WebhookProcessedAtUtc < payment.WebhookReceivedAtUtc) &&
+           (!payment.LastInquiryAtUtc.HasValue || payment.LastInquiryAtUtc < payment.WebhookReceivedAtUtc ||
+            !string.Equals(payment.ErrorCode, "provider_expired", StringComparison.Ordinal));
 
     /// <summary>Rechecks AtlasPay and applies a provisional credit only after a configured super-admin's final decision.</summary>
     /// <param name="paymentId">Positive internal AtlasPay payment id selected in the owned super-admin flow.</param>
@@ -1514,6 +1531,11 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
     /// <c>true</c> when there is no pending webhook work or the latest webhook was conclusively handled; <c>false</c>
     /// when the same durable event still requires a later authoritative retry.
     /// </returns>
+    /// <remarks>
+    /// Persists the processed timestamp only for a conclusive outcome. A cached expiration cannot complete a newly
+    /// received confirmation before a successful fresh official inquiry; temporary errors retain the pending receipt.
+    /// </remarks>
+    /// <example><code>await MarkWebhookProcessedIfConclusiveAsync(paymentId, cancellationToken);</code></example>
     private async Task<bool> MarkWebhookProcessedIfConclusiveAsync(
         int paymentId,
         CancellationToken cancellationToken)
@@ -1532,7 +1554,7 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
         var conclusive =
             payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue ||
             (payment.IsAddedToBalance && !payment.IsProvisionallyApproved) ||
-            AtlasPayStatuses.IsTerminal(payment.ProviderStatus) ||
+            (AtlasPayStatuses.IsTerminal(payment.ProviderStatus) && !NeedsExpiredConfirmationInquiry(payment)) ||
             string.Equals(payment.SettlementState, AtlasPaySettlementStates.ManualReview, StringComparison.Ordinal) ||
             string.Equals(payment.ReconciliationState, AtlasPayReconciliationStates.Escalated, StringComparison.Ordinal) ||
             string.Equals(payment.ReconciliationState, AtlasPayReconciliationStates.Exhausted, StringComparison.Ordinal);
@@ -1551,12 +1573,15 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
     /// <param name="source">Internal reconciliation trigger used only in safe financial audit labels.</param>
     /// <param name="useVerify">Whether to call the provider verify endpoint instead of GET order status.</param>
     /// <param name="token">Cancellation token for the provider call and durable settlement work.</param>
-    /// <param name="allowTerminalRecheck">Allows a previously expired order to be queried only after admin authorization.</param>
+    /// <param name="allowTerminalRecheck">Whether a configured super-admin independently authorized a fresh expired-order verification.</param>
     /// <returns>Official settlement result or a non-credit result when the provider does not prove full payment.</returns>
     /// <remarks>
-    /// A terminal cache is skipped for workers and customers. A permitted manual refresh never credits on an expired
-    /// response; identity and total must match the local order before either terminal evidence or eligibility is saved.
+    /// Ordinary terminal caches are skipped. A durable authenticated late confirmation may also recheck expiration,
+    /// but neither that hint nor an expired response authorizes credit. Official identity, total and full-payment
+    /// validation remain mandatory for owned wallets and tenant orders, including provisional-credit reconciliation.
     /// </remarks>
+    /// <example><code>await ReconcileCoreAsync(paymentId, "atlaspay-webhook", false, cancellationToken);</code></example>
+    /// <exception cref="OperationCanceledException">Provider or database work is cancelled by the caller.</exception>
     private async Task<NowPaymentsSettlementResult> ReconcileCoreAsync(int paymentId, string source,
         bool useVerify, CancellationToken token, bool allowTerminalRecheck = false)
     {
@@ -1606,8 +1631,14 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
                 .ApplyOfficialPaymentAsync(payment, source, token);
         }
 
+        // A late provider-admin approval can arrive after polling has recorded expiration. Only the authenticated,
+        // still-pending confirmation may reopen that cache; customer buttons and unsigned source labels cannot.
+        var lateConfirmationRecheck =
+            string.Equals(source, "atlaspay-webhook", StringComparison.Ordinal) &&
+            AtlasPayPollingPolicy.UsesWebhookPrimary(_configuration) &&
+            NeedsExpiredConfirmationInquiry(payment);
         if (AtlasPayStatuses.IsTerminal(payment.ProviderStatus) &&
-            (!allowTerminalRecheck ||
+            (!(allowTerminalRecheck || lateConfirmationRecheck) ||
              !string.Equals(payment.ProviderStatus, "expired", StringComparison.OrdinalIgnoreCase)))
             return NowPaymentsSettlementResult.ProviderNotPaid();
         try

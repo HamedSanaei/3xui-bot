@@ -360,8 +360,16 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Data-only migration `20260802000000_RequeueUniquePayUserFeePayerFailures` requeues uncredited rows rejected before the live `feePayer=user` buyer alias/payable contract was supported; the worker still requires a fresh fully matching paid response before settlement.
 - Data-only migration `20260803180000_RequeueUniquePayVerifiedUnsettled` schedules provider-paid but uncredited rows for a fresh authenticated inquiry after the stale-context settlement fix. `UniquePaySettlementService` owns a factory-created users.db context per attempt so reconciliation's newly persisted `paid` state cannot be hidden by the legacy singleton change tracker; no migration directly credits a wallet.
 - UniquePay `feePayer` is controlled by the business-level `gatewayFee`/`feePayer` settings in the provider panel; the documented create-invoice form has no fee-payer field. Keep verification support for `user`/`buyer` and `owner` so existing invoices remain settleable; the provider currently reports `user` when the customer bears the configured 12% fee.
-- Tenant UniquePay availability is `global UniquePay enabled && TenantUniquePayEnabled`; the tenant owner panel shows `سراسری خاموش` when the global switch is off and refuses local enabling until global configuration is ready.
-- AtlasPay is a toman card-to-card provider (`Domain/AtlasPay.cs`) using `X-API-Key` over HTTPS with `POST /orders`, `GET /orders/{id}`, `POST /orders/{id}/verify`; the customer-visible reference is `trackingCode` and the charged amount is `totalAmountToman`, while settlement always credits/stores the immutable `BaseAmountToman`. Migration `20260910012628_AddAtlasPayGateway` adds `AtlasPayPaymentInfos`, `TenantBotOrders.AtlasPayPaymentInfoId`, and `BotInstances.TenantAtlasPayEnabled` (default true); no other table changes. The API key is restart-loaded only (never persisted or logged). When AtlasPay's optional direct-payment-details capability is enabled for the merchant, `POST /orders` may additionally return `cardNumber`, `cardHolderName`, and `bankName`; these are used only from the in-memory create response to render the customer's payment message and are never copied into `AtlasPayPaymentInfo`/users.db/logs. Persisted payment rows still store only `CardNumberMasked`. Invoice creation is single-attempt: the local payment row and order FK are persisted before `POST /orders`, and HTTP 400/401 are definitive while 5xx/timeout/transport/malformed-success are ambiguous and never auto-retried. Reconciliation/verify only inquire (`GET`/`verify`) and never re-create. Settlement is `IsVerifiedForAutomaticSettlement` fail-closed on identity (provider order id, merchant ref, tracking code, total amount), known status (`confirmed`/`settled` eligible), and `requiresManualDelivery` (never auto-settles; moves to `manual_review`). Owned wallet credits use operation key `payment:atlaspay:{id}:credit`; tenant fulfillment reuses the common purchase/renewal pipeline with an atomic `pending -> processing -> settled` claim and tenant/order linkage checks. Tenant AtlasPay availability is `global AtlasPay enabled && TenantAtlasPayEnabled`; the owner panel refuses local enabling while the global switch is off, and both switches govern creation only (existing payments keep settling). Referral eligibility includes `atlaspay`.
+- All five tenant platform gateways use `live global enabled && saved tenant preference` for new customer invoices.
+  `TenantBotService.SETTENANTSETTINGASYNC` saves an authenticated owner preference even while globally disabled,
+  then warns that management disabled customer visibility until management enables it. Owner panel text separates
+  saved preference from effective availability; keyboard checkmarks show preference only. Purchase, renewal and
+  customer-wallet top-up menus/stale callbacks retain the shared live gate; existing invoice settlement is unchanged.
+  `MultiStoreTests.Store_gateway_preference_saves_while_global_off_and_customer_admission_tracks_live_permission`
+  covers all five providers, exact-store authorization, replay/expiry and live off/on admission.
+  Tetraminator's invoice core also rechecks permission before allocating a new payment for an already-admitted quote;
+  existing linked invoices are reused independently of later disablement.
+- AtlasPay is a toman card-to-card provider (`Domain/AtlasPay.cs`) using `X-API-Key` over HTTPS with `POST /orders`, `GET /orders/{id}`, `POST /orders/{id}/verify`; the customer-visible reference is `trackingCode` and the charged amount is `totalAmountToman`, while settlement always credits/stores the immutable `BaseAmountToman`. Migration `20260910012628_AddAtlasPayGateway` adds `AtlasPayPaymentInfos`, `TenantBotOrders.AtlasPayPaymentInfoId`, and `BotInstances.TenantAtlasPayEnabled` (default true); no other table changes. The API key is restart-loaded only (never persisted or logged). When AtlasPay's optional direct-payment-details capability is enabled for the merchant, `POST /orders` may additionally return `cardNumber`, `cardHolderName`, and `bankName`; these are used only from the in-memory create response to render the customer's payment message and are never copied into `AtlasPayPaymentInfo`/users.db/logs. Persisted payment rows still store only `CardNumberMasked`. Invoice creation is single-attempt: the local payment row and order FK are persisted before `POST /orders`, and HTTP 400/401 are definitive while 5xx/timeout/transport/malformed-success are ambiguous and never auto-retried. Reconciliation/verify only inquire (`GET`/`verify`) and never re-create. Settlement is `IsVerifiedForAutomaticSettlement` fail-closed on identity (provider order id, merchant ref, tracking code, total amount), known status (`confirmed`/`settled` eligible), and `requiresManualDelivery` (never auto-settles; moves to `manual_review`). Owned wallet credits use operation key `payment:atlaspay:{id}:credit`; tenant fulfillment reuses the common purchase/renewal pipeline with an atomic `pending -> processing -> settled` claim and tenant/order linkage checks. Tenant AtlasPay availability is `global AtlasPay enabled && TenantAtlasPayEnabled`; owner preference is saved independently of global disablement, and both switches govern creation only (existing payments keep settling). Referral eligibility includes `atlaspay`.
 - AtlasPay supports the optional signed webhook documented in section 3.8 of `api_docs/atlaspay-sdk مستندات.md`. The public
   endpoint is `POST /atlaspay-webhook`; `atlasPayWebhookSecret` is the one-time secret returned when the merchant webhook
   is registered and must stay outside source control/logs/Telegram. `PaymentController.ReceiveAtlasPayWebhook` verifies
@@ -373,6 +381,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   Periodic polling remains the recovery/source-of-truth fallback because AtlasPay webhook delivery has no retry. Customer
   `apchk_<id>`/tenant checks and super-admin verification still converge on `ReconcilePaymentAsync`, so there is no second
   financial path and duplicate webhook deliveries remain idempotent.
+  A durable signed `order.confirmed` received after local expiration now authorizes a fresh GET, never direct credit.
+  `NeedsExpiredConfirmationInquiry` prevents either scan or queue handling from discarding that hint based only on
+  cached `expired`; temporary inquiry errors retain the receipt within the existing bounded budget. A successful
+  fresh expired response completes it without credit. Rejected/cancelled/manual-review states are not reopened.
+  `AtlasPayWebhookTests` covers delayed confirmation, duplicate one-credit settlement and temporary-error recovery.
   To actually route **new** wallet and tenant order callbacks here, configure the public HTTPS
   `atlasPayWebhookUrl` ending in `/atlaspay-webhook`; `AtlasPay.CreateOrderAsync` includes it as the
   documented per-order `webhookUrl` override. A merchant webhook must first be registered once
@@ -401,8 +414,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   distinct sale/base/profit/owner-wallet amounts; customer payment source is not owner funding source.
 - AtlasPay super-admin verification (`XuiV3AdminFlowService.TryHandleAtlasPayStatusAsync`) accepts `AP:<localId>`,
   `APO:<providerOrderId>`, the full merchant reference, or tracking code; bare numeric ids remain ambiguous and are
-  rejected. Every lookup resolves exactly one local users.db row. Worker/customer checks skip cached terminal states,
-  but a configured super-admin forces one fresh official `/verify` on an expired row. A newly confirmed payment uses
+  rejected. Every lookup resolves exactly one local users.db row. Ordinary worker/customer checks skip cached terminal
+  states; a pending signed late confirmation can recheck expiration with GET, and a configured super-admin can force
+  one fresh official `/verify` on an expired row. A newly confirmed payment uses
   ordinary provider-verified settlement. If it remains `expired`, only a freshly checked (within two minutes) owned-bot
   `wallet_charge` with a stable provider identity, `provider_expired` reason, no known short payment, and no competing
   financial claim can offer the existing two-stage provisional admin callback. **Expired status and webhook hints are
@@ -410,7 +424,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   callback re-verifies; cancelled/rejected, tenant-origin/order, identity-mismatched, known underpaid, and provider-error
   rows never qualify. The one base-toman credit shares the official credentials.db receipt key, writes one admin-tagged
   users.db ledger and notice, and never awards a referral or double-credits on replay/later official confirmation.
-  Expired provisional rows do not poll forever; later official confirmation can be recorded on a fresh admin recheck.
+  Expired provisional rows do not poll forever; later official confirmation can be recorded by a signed late event
+  or a fresh admin recheck, without a second credit.
   See `docs/deployment.md` for the operator procedure; never edit the payment row or wallet directly.
   The status report lists local/provider ids, tracking, purpose/origin, base/total/received amounts and settlement
   state; API keys, signing material, raw provider responses and full card numbers must never be displayed.

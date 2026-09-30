@@ -1373,8 +1373,8 @@ public partial class TenantBotService
     /// <param name="tokenNotice">Optional HTML-safe status line produced by token validation before panel rendering.</param>
     /// <returns>Html-formatted panel Text.</returns>
     /// <remarks>
-    /// Gateway status combines tenant preferences with live global switches. When a gateway is disabled globally, the
-    /// panel reports <c>سراسری خاموش</c> without changing the tenant's persisted preference.
+    /// Each gateway line distinguishes the saved owner preference from its effective customer availability. Global
+    /// disablement hides the gateway without erasing the preference, which takes effect again when management enables it.
     /// </remarks>
     private string BUILDOWNERPANELTEXT(BotInstance tenant, CredUser owner, string tokenNotice = null)
     {
@@ -1398,6 +1398,7 @@ public partial class TenantBotService
             : !CUSTOMERWALLETOWNERENABLED
                 ? "مجوز مدیر صادر شده؛ توسط شما خاموش"
                 : tenant?.Enabled == true ? "فعال" : "فعال‌سازی مالک انجام شده؛ فروشگاه خاموش است";
+        var gateways = _gatewayAvailability.Snapshot;
 
         var text = "🛒 <b>ربات فروشگاهی همکار</b>\n\n" +
                    "کیف پول ربات و حساب گذرگاه شما بین تمام فروشگاه‌ها مشترک است. تنظیمات این پنل فقط برای همین فروشگاه است.\n\n" +
@@ -1413,11 +1414,11 @@ public partial class TenantBotService
                $"{STATUSICON(true)} درصد سود (فقط در حالت درصدی): <code>{markup}%</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.SupportAccount))} پشتیبانی فروشگاه: <code>{Html(support)}</code>\n" +
                $"{STATUSICON(!string.IsNullOrWhiteSpace(tenant?.TenantWelcomeText))} متن خوشامد: <code>{Html(WELCOME)}</code>\n" +
-               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) && tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay) ? "سراسری خاموش" : tenant?.TenantHooshPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
-               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) && tenant?.TenantTetraminatorEnabled == true)} درگاه تترامیناتور: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator) ? "سراسری خاموش" : tenant?.TenantTetraminatorEnabled == true ? "روشن" : "خاموش")}</b>\n" +
-               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) && tenant?.TenantUniquePayEnabled == true)} درگاه یونیک‌پی (۱۲٪): <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay) ? "سراسری خاموش" : tenant?.TenantUniquePayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
-               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay) && tenant?.TenantAtlasPayEnabled == true)} درگاه اطلس‌پی: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay) ? "سراسری خاموش" : tenant?.TenantAtlasPayEnabled == true ? "روشن" : "خاموش")}</b>\n" +
-               $"{STATUSICON(_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) && tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments) ? "سراسری خاموش" : tenant?.TenantNowPaymentsEnabled == true ? "روشن" : "خاموش")}</b>\n" +
+               $"{STATUSICON(gateways.IsEnabled(PaymentGateway.HooshPay) && tenant?.TenantHooshPayEnabled == true)} درگاه هوش‌پی: <b>{Html(BuildTenantGatewayPanelStatus(tenant?.TenantHooshPayEnabled == true, gateways.IsEnabled(PaymentGateway.HooshPay)))}</b>\n" +
+               $"{STATUSICON(gateways.IsEnabled(PaymentGateway.Tetraminator) && tenant?.TenantTetraminatorEnabled == true)} درگاه تترامیناتور: <b>{Html(BuildTenantGatewayPanelStatus(tenant?.TenantTetraminatorEnabled == true, gateways.IsEnabled(PaymentGateway.Tetraminator)))}</b>\n" +
+               $"{STATUSICON(gateways.IsEnabled(PaymentGateway.UniquePay) && tenant?.TenantUniquePayEnabled == true)} درگاه یونیک‌پی (۱۲٪): <b>{Html(BuildTenantGatewayPanelStatus(tenant?.TenantUniquePayEnabled == true, gateways.IsEnabled(PaymentGateway.UniquePay)))}</b>\n" +
+               $"{STATUSICON(gateways.IsEnabled(PaymentGateway.AtlasPay) && tenant?.TenantAtlasPayEnabled == true)} درگاه اطلس‌پی: <b>{Html(BuildTenantGatewayPanelStatus(tenant?.TenantAtlasPayEnabled == true, gateways.IsEnabled(PaymentGateway.AtlasPay)))}</b>\n" +
+               $"{STATUSICON(gateways.IsEnabled(PaymentGateway.NowPayments) && tenant?.TenantNowPaymentsEnabled == true)} درگاه ارز دیجیتال: <b>{Html(BuildTenantGatewayPanelStatus(tenant?.TenantNowPaymentsEnabled == true, gateways.IsEnabled(PaymentGateway.NowPayments)))}</b>\n" +
                $"{STATUSICON(CUSTOMERWALLETACTIVE)} کیف پول مشتری: <b>{Html(CUSTOMERWALLETSTATUS)}</b>\n" +
                $"{STATUSICON(tenant?.TenantCardPaymentEnabled == true)} کارت به کارت همکار: <code>{Html(card)}</code>\n" +
                $"{STATUSICON(tenant?.TenantMandatoryJoinEnabled == true)} جوین اجباری فروشگاه: <code>{Html(TENANTJOIN)}</code>\n" +
@@ -1426,11 +1427,22 @@ public partial class TenantBotService
                "در حالت درصدی، سود صفر قیمت تعرفه کاربر عادی را به‌کار می‌برد و سود مثبت روی قیمت همکار محاسبه می‌شود. در حالت دستی درصد سود اثری ندارد.";
     }
 
+    /// <summary>Distinguishes a storefront's saved gateway preference from its effective customer visibility.</summary>
+    /// <param name="ownerEnabled">Persisted gateway opt-in of the selected storefront, not a global switch.</param>
+    /// <param name="globallyEnabled">Live platform permission for new invoices from the shared gateway snapshot.</param>
+    /// <returns>Plain Persian owner-panel text; callers HTML-escape it before rendering.</returns>
+    /// <remarks>Rendering never changes either switch or blocks settlement of an existing invoice.</remarks>
+    /// <example><code>BuildTenantGatewayPanelStatus(ownerEnabled: true, globallyEnabled: false);</code></example>
+    private static string BuildTenantGatewayPanelStatus(bool ownerEnabled, bool globallyEnabled)
+        => $"تنظیم ذخیره‌شده شما: {(ownerEnabled ? "روشن" : "خاموش")} | مشتریان: " +
+           (!globallyEnabled ? "توسط مدیریت غیرفعال" : ownerEnabled ? "فعال" : "توسط شما غیرفعال");
+
     /// <summary>
     /// Builds inline buttons for EDITING tenant settings and TOGGLING storefront status.
     /// </summary>
     /// <param name="tenant">current tenant Bot row.</param>
     /// <returns>inline keyboard for the owner panel.</returns>
+    /// <remarks>Gateway button checkmarks reflect saved owner preferences, not platform permission or customer visibility.</remarks>
     private static InlineKeyboardMarkup BUILDOWNERPANELKEYBOARD(BotInstance tenant)
     {
         var IsEnabled = tenant?.Enabled == true;
@@ -2705,12 +2717,14 @@ public partial class TenantBotService
     /// <param name="expectedRevision">Revision embedded in the panel keyboard that must match the current tenant row.</param>
     /// <param name="issuedAt">Hexadecimal Unix timestamp used to reject mutation buttons older than ten minutes.</param>
     /// <param name="CancellationToken">Cancellation Token for users.db Writes, Telegram calls, and optional join validation.</param>
+    /// <returns>A task completing after the selected-store mutation and owner response, or a stale/invalid action rejection.</returns>
     /// <remarks>
     /// Forced join is validated immediately before it is enabled. The callback is acknowledged before any Telegram
     /// network probe, and validation failures are delivered as normal owner messages because callback answers can
-    /// only be sent once. HooshPay, Tetraminator, UniquePay, and NOWPayments tenant preferences cannot be enabled
-    /// while their corresponding live global application switches are disabled. Customer wallet owner opt-in is
-    /// separately persisted and can only be enabled while the exact storefront has a valid super-admin grant.
+    /// only be sent once. All five platform gateway preferences are saved even while globally disabled; the owner
+    /// receives a post-save warning and customer invoice admission remains gated by the independent global switch.
+    /// The authenticated selected store, panel revision, and timestamp still protect each write; replay never inverts
+    /// its target state. Customer wallet opt-in can only be enabled while that store has a valid super-admin grant.
     /// </remarks>
     private async Task SETTENANTSETTINGASYNC(
         ITelegramBotClient botClient,
@@ -2757,6 +2771,8 @@ public partial class TenantBotService
             return;
         }
 
+        PaymentGateway? selectedGateway = null;
+        const string gatewayDisabledWarning = "⚠️ این درگاه توسط مدیریت غیرفعال شده است. تنظیم شما ذخیره شد، اما درگاه تا زمانی که مدیریت آن را فعال کند به مشتریان نمایش داده نمی‌شود.";
         bool currentEnabled;
         switch (setting)
         {
@@ -2771,64 +2787,23 @@ public partial class TenantBotService
                 break;
             case "HooshPay":
                 currentEnabled = tenant.TenantHooshPayEnabled;
-                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.HooshPay))
-                {
-                    await SafeAnswerCallbackQueryAsync(
-                        botClient,
-                        CallbackQuery.Id,
-                        "درگاه هوش‌پی در تنظیمات سراسری غیرفعال است.",
-                        showAlert: true,
-                        cancellationToken: CancellationToken);
-                    return;
-                }
+                selectedGateway = PaymentGateway.HooshPay;
                 break;
             case "Tetraminator":
                 currentEnabled = tenant.TenantTetraminatorEnabled;
-                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.Tetraminator))
-                {
-                    await SafeAnswerCallbackQueryAsync(
-                        botClient,
-                        CallbackQuery.Id,
-                        "درگاه تترامیناتور در تنظیمات سراسری غیرفعال است.",
-                        showAlert: true,
-                        cancellationToken: CancellationToken);
-                    return;
-                }
+                selectedGateway = PaymentGateway.Tetraminator;
                 break;
             case "UniquePay":
                 currentEnabled = tenant.TenantUniquePayEnabled;
-                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.UniquePay))
-                {
-                    await SafeAnswerCallbackQueryAsync(
-                        botClient,
-                        CallbackQuery.Id,
-                        "درگاه یونیک‌پی در تنظیمات سراسری خاموش است.",
-                        showAlert: true,
-                        cancellationToken: CancellationToken);
-                    return;
-                }
+                selectedGateway = PaymentGateway.UniquePay;
                 break;
             case "AtlasPay":
                 currentEnabled = tenant.TenantAtlasPayEnabled;
-                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
-                {
-                    await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id,
-                        "درگاه اطلس‌پی در تنظیمات سراسری خاموش یا ناقص است.", showAlert: true, cancellationToken: CancellationToken);
-                    return;
-                }
+                selectedGateway = PaymentGateway.AtlasPay;
                 break;
             case "NowPayments":
                 currentEnabled = tenant.TenantNowPaymentsEnabled;
-                if (desiredEnabled && !_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.NowPayments))
-                {
-                    await SafeAnswerCallbackQueryAsync(
-                        botClient,
-                        CallbackQuery.Id,
-                        "درگاه ارز دیجیتال در تنظیمات سراسری خاموش است.",
-                        showAlert: true,
-                        cancellationToken: CancellationToken);
-                    return;
-                }
+                selectedGateway = PaymentGateway.NowPayments;
                 break;
             case "wallet":
                 currentEnabled = tenant.TenantCustomerWalletOwnerEnabled;
@@ -2859,7 +2834,10 @@ public partial class TenantBotService
             await SafeAnswerCallbackQueryAsync(
                 botClient,
                 CallbackQuery.Id,
-                "این تنظیم از قبل در همین وضعیت است.",
+                selectedGateway.HasValue && !_gatewayAvailability.Snapshot.IsEnabled(selectedGateway.Value)
+                    ? gatewayDisabledWarning
+                    : "این تنظیم از قبل در همین وضعیت است.",
+                showAlert: selectedGateway.HasValue && !_gatewayAvailability.Snapshot.IsEnabled(selectedGateway.Value),
                 cancellationToken: CancellationToken);
             return;
         }
@@ -2972,6 +2950,14 @@ public partial class TenantBotService
         tenant.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);
         _botRegistry.Upsert(tenant);
+
+        // Global permission controls new customer invoices, not this owner's persisted preference. Warn only after
+        // the exact-store optimistic write succeeds; a later global enablement reuses this preference unchanged.
+        if (selectedGateway.HasValue && !_gatewayAvailability.Snapshot.IsEnabled(selectedGateway.Value))
+            await botClient.SendMessage(
+                CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                gatewayDisabledWarning,
+                cancellationToken: CancellationToken);
 
         await SHOWOWNERPANELASYNC(
             botClient,
@@ -8513,6 +8499,8 @@ public partial class TenantBotService
     /// <c>PayId</c>. A provider-create timeout is deliberately not retried to avoid duplicate invoices. Repeated
     /// callbacks reuse the persisted invoice when its link is known; an ambiguous prior create remains blocked for
     /// manual review instead of sending another provider mutation.
+    /// A new local invoice requires current global permission and this storefront's preference, including an admitted
+    /// quote replay that has not started provider creation. Existing linked invoices bypass this admission-only guard.
     /// </remarks>
     /// <returns>A task completing after the order's invoice attempt and customer response; uncertain attempts stay reserved.</returns>
     private async Task CreateTenantTetraminatorInvoiceCoreAsync(
@@ -8559,6 +8547,15 @@ public partial class TenantBotService
             }
             else
             {
+                // A quote can already be admitted while invoice creation has not started. Recheck at this last local
+                // creation boundary; reuse of a previously linked invoice must remain independent of later disablement.
+                if (!IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))
+                {
+                    await SafeAnswerCallbackQueryAsync(
+                        botClient, callbackQuery.Id, "درگاه تترامیناتور برای این فروشگاه در حال حاضر غیرفعال است.",
+                        showAlert: true, cancellationToken: cancellationToken);
+                    return;
+                }
                 payment = new TetraminatorPaymentInfo
                 {
                     OrderId = order.OrderId,

@@ -183,6 +183,19 @@ polling and explicit customer/admin checks cover callbacks AtlasPay does not ret
 
 ### Delayed payment after an AtlasPay order expires
 
+A valid signed `order.confirmed` arriving after the local invoice became `expired` now triggers a fresh official
+`GET /orders/{id}` automatically. The expired cache cannot discard or complete that new hint. Full-payment,
+provider identity, total, manual-delivery and one-credit checks still apply to both wallets and tenant orders.
+Temporary inquiry failures leave the receipt pending within the existing retry budget; an official response that
+still says `expired` completes the hint without credit. Rejected/cancelled and manual-review orders are not reopened.
+This does not restart periodic polling of every expired invoice or restore an absent/rejected historical callback.
+
+For diagnosis, inspect the matching row's `WebhookReceivedAtUtc`, `WebhookEvent`, `WebhookProcessedAtUtc`,
+`LastInquiryAtUtc`, `ProviderStatus`, `SettlementState`, and `IsAddedToBalance`, together with the payment host's
+POST access/error logs at the provider approval time. An empty receipt proves no callback was durably accepted in
+that database snapshot, not whether AtlasPay sent one. A `settled` provider inquiry proves provider payment, not
+local wallet credit; an `atlaspay_status_verified` activity event alone is not settlement evidence.
+
 From the **owned bot's configured global super-admin** payment-status screen, enter the exact local
 `AP:<id>` or the full `AtlasPay-...` merchant reference. A cached `expired` status no longer prevents
 a new authenticated `/orders/{id}/verify` call. If AtlasPay now reports full payment with the
@@ -203,8 +216,8 @@ official settlement instead; if still expired, only that explicit decision may a
 base amount once. A repeated callback or later official confirmation cannot add another credit,
 ledger entry, referral or notification. Rejected/cancelled orders, tenant orders or tenant-origin
 wallet charges, identity/amount mismatches, provider errors, and ambiguous claims stay blocked.
-For a previously expired provisional charge, a later **manual super-admin status check** can
-record official confirmation without a second credit; automatic polling of terminal rows remains
+For a previously expired provisional charge, a later signed confirmation or **manual super-admin status check**
+can record official confirmation without a second credit; ordinary periodic polling of terminal rows remains
 disabled. Never hand-edit `users.db`, `credentials.db`, or a customer's balance to emulate approval.
 
 ## Test schema policy

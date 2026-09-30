@@ -69,11 +69,14 @@ public sealed partial class ConcurrencyTests
         Assert.Null(saved.WebhookProcessedAtUtc);
     }
 
-    /// <summary>Exercises signed callback admission through the real wallet settlement path, including duplicate delivery.</summary>
+    /// <summary>Exercises signed callback admission through the real wallet settlement path, including delayed approval and duplicate delivery.</summary>
+    /// <param name="cachedStatus">The locally persisted provider status before the signed confirmation, including an expiration from ten hours earlier.</param>
     /// <returns>A task verifying that only the official provider inquiry credits the wallet once.</returns>
-    /// <remarks>The callback arrives before the scheduled fallback inquiry; the signed payload is a hint, not financial evidence.</remarks>
-    [Fact]
-    public async Task AtlasPay_signed_callback_confirms_owned_wallet_via_provider_inquiry_once()
+    /// <remarks>A late signed confirmation must recheck an expired cache; the signed payload itself never authorizes a financial effect.</remarks>
+    [Theory]
+    [InlineData("awaiting_payment")]
+    [InlineData("expired")]
+    public async Task AtlasPay_signed_callback_confirms_owned_wallet_via_provider_inquiry_once(string cachedStatus)
     {
         using var databases = new Databases();
         var (provider, _, _) = IncidentProvider(databases);
@@ -91,6 +94,9 @@ public sealed partial class ConcurrencyTests
                 payment.BotId = "main";
                 payment.PaymentPurpose = TenantBotPaymentPurposes.WalletCharge;
                 payment.NextInquiryAtUtc = DateTime.UtcNow.AddHours(1);
+                payment.ProviderStatus = cachedStatus;
+                payment.LastInquiryAtUtc = DateTime.UtcNow.AddHours(-10);
+                payment.ErrorCode = cachedStatus == "expired" ? "provider_expired" : null;
                 db.AtlasPayPaymentInfos.Add(payment);
                 await db.SaveChangesAsync();
                 paymentId = payment.Id;
@@ -342,6 +348,100 @@ public sealed partial class ConcurrencyTests
 
         Assert.Equal(NowPaymentsSettlementStatus.ProviderNotPaid, result.Status);
         Assert.Empty(handler.Captures);
+    }
+
+    /// <summary>Preserves a late signed confirmation after temporary inquiry failure, but never credits an officially expired payment.</summary>
+    /// <returns>A task proving the receipt remains pending after HTTP 503 and is completed only after a successful official inquiry.</returns>
+    /// <remarks>The cached expiration predates the webhook. A transport failure is not fresh evidence that the late confirmation is false.</remarks>
+    [Fact]
+    public async Task AtlasPay_late_confirmation_retries_temporary_inquiry_failure_without_trusting_expired_cache()
+    {
+        using var databases = new Databases();
+        var config = new ConfigurationBuilder().AddConfiguration(AtlasWebhookConfiguration())
+            .AddInMemoryCollection(new Dictionary<string, string?> { ["atlasPayInquiryRetryCount"] = "0" }).Build();
+        var handler = new AtlasHttpHandler((attempt, _, _, _) => Task.FromResult(
+            attempt == 1
+                ? JsonResponse(System.Net.HttpStatusCode.ServiceUnavailable, "{}")
+                : JsonResponse(System.Net.HttpStatusCode.OK, StatusJson("expired"))));
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var payment = VerifiedAtlasPayment();
+            payment.ProviderStatus = "expired";
+            payment.ErrorCode = "provider_expired";
+            payment.LastInquiryAtUtc = DateTime.UtcNow.AddHours(-10);
+            payment.NextInquiryAtUtc = null;
+            db.AtlasPayPaymentInfos.Add(payment);
+            await db.SaveChangesAsync();
+        }
+        var worker = new AtlasPayReconciliationHostedService(
+            config, databases.Users, new AtlasPay(config, new HttpClient(handler)), null!,
+            NullLogger<AtlasPayReconciliationHostedService>.Instance);
+        var controller = new PaymentController(
+            databases.Users, config, null!, null!, null!, null!, null!, worker, null!,
+            NullLogger<PaymentController>.Instance);
+        const string body = "{\"event\":\"order.confirmed\",\"orderId\":77,\"merchantOrderRef\":\"AtlasPay-test\",\"totalAmountToman\":250123,\"status\":\"confirmed\",\"timestamp\":\"2026-09-30T12:00:00Z\"}";
+        AttachAtlasWebhook(controller, body, SignAtlasWebhook(body));
+        Assert.IsType<OkObjectResult>(await controller.ReceiveAtlasPayWebhook(default));
+
+        await worker.ReconcileDueAsync();
+        Assert.Single(handler.Captures);
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var saved = await db.AtlasPayPaymentInfos.SingleAsync();
+            Assert.Null(saved.WebhookProcessedAtUtc);
+            Assert.NotNull(saved.NextInquiryAtUtc);
+            Assert.False(saved.IsAddedToBalance);
+        }
+
+        await worker.ReconcileDueAsync();
+        Assert.Equal(2, handler.Captures.Count);
+        await using var verify = databases.Users.CreateDbContext();
+        var final = await verify.AtlasPayPaymentInfos.SingleAsync();
+        Assert.NotNull(final.WebhookProcessedAtUtc);
+        Assert.Equal("expired", final.ProviderStatus);
+        Assert.False(final.IsAddedToBalance);
+        Assert.Empty(await verify.WalletLedgerEntries.ToListAsync());
+        await worker.ReconcileDueAsync();
+        Assert.Equal(2, handler.Captures.Count);
+    }
+
+    /// <summary>Prevents a signed confirmation from reopening provider-rejected or cancelled invoices.</summary>
+    /// <param name="terminalStatus">The authoritative terminal status that must retain its existing fail-closed behavior.</param>
+    /// <returns>A task proving no provider request or financial mutation occurs for a rejected or cancelled invoice.</returns>
+    /// <remarks>Only expiration can be revisited after a delayed signed confirmation; rejected and cancelled orders still need operator investigation.</remarks>
+    [Theory]
+    [InlineData("rejected")]
+    [InlineData("cancelled")]
+    public async Task AtlasPay_late_confirmation_does_not_reopen_rejected_or_cancelled_orders(string terminalStatus)
+    {
+        using var databases = new Databases();
+        var config = AtlasWebhookConfiguration();
+        var handler = new AtlasHttpHandler((_, _, _, _) =>
+            throw new InvalidOperationException("rejected or cancelled orders must not be rechecked automatically"));
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var payment = VerifiedAtlasPayment();
+            payment.ProviderStatus = terminalStatus;
+            payment.LastInquiryAtUtc = DateTime.UtcNow.AddHours(-10);
+            db.AtlasPayPaymentInfos.Add(payment);
+            await db.SaveChangesAsync();
+        }
+        var worker = new AtlasPayReconciliationHostedService(
+            config, databases.Users, new AtlasPay(config, new HttpClient(handler)), null!,
+            NullLogger<AtlasPayReconciliationHostedService>.Instance);
+        var controller = new PaymentController(
+            databases.Users, config, null!, null!, null!, null!, null!, worker, null!,
+            NullLogger<PaymentController>.Instance);
+        const string body = "{\"event\":\"order.confirmed\",\"orderId\":77,\"merchantOrderRef\":\"AtlasPay-test\",\"totalAmountToman\":250123,\"status\":\"confirmed\",\"timestamp\":\"2026-09-30T12:00:00Z\"}";
+        AttachAtlasWebhook(controller, body, SignAtlasWebhook(body));
+        Assert.IsType<OkObjectResult>(await controller.ReceiveAtlasPayWebhook(default));
+        await worker.ReconcileDueAsync();
+        Assert.Empty(handler.Captures);
+        await using var verify = databases.Users.CreateDbContext();
+        var saved = await verify.AtlasPayPaymentInfos.SingleAsync();
+        Assert.Equal(terminalStatus, saved.ProviderStatus);
+        Assert.False(saved.IsAddedToBalance);
+        Assert.Empty(await verify.WalletLedgerEntries.ToListAsync());
     }
 
     private static IConfiguration AtlasWebhookConfiguration()

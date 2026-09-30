@@ -130,6 +130,184 @@ public sealed partial class ConcurrencyTests
         Assert.All(client.Callbacks, x => Assert.InRange(Encoding.UTF8.GetByteCount(x), 1, 64));
     }
 
+    /// <summary>Globally disabled gateways retain exact-store owner opt-in but cannot admit new customer payments.</summary>
+    /// <param name="gateway">Each platform provider, exercising the same persisted preference and live permission contract.</param>
+    /// <param name="method">Stable customer callback suffix for purchase and renewal.</param>
+    /// <returns>A task after real owner/customer handlers and isolated persisted financial state are checked.</returns>
+    /// <remarks>
+    /// Regression: management disablement must not reject owner saves or be bypassed by a saved preference or old button.
+    /// Re-enabling management restores customer visibility without another owner edit; sibling stores remain unchanged.
+    /// </remarks>
+    [Theory]
+    [InlineData(PaymentGateway.HooshPay, "HP")]
+    [InlineData(PaymentGateway.Tetraminator, "TM")]
+    [InlineData(PaymentGateway.UniquePay, "UP")]
+    [InlineData(PaymentGateway.AtlasPay, "AP")]
+    [InlineData(PaymentGateway.NowPayments, "NP")]
+    public async Task Store_gateway_preference_saves_while_global_off_and_customer_admission_tracks_live_permission(
+        PaymentGateway gateway, string method)
+    {
+        using var databases = new Databases();
+        var availability = new GatewayAvailabilityProbe();
+        await availability.SetEnabledAsync(gateway, false, availability.Snapshot.Revision);
+        await using var provider = StorefrontProvider(databases, gatewayAvailability: availability);
+        var stores = provider.GetRequiredService<TenantStoreStore>();
+        var a = await stores.CreateAsync(711, Guid.NewGuid().ToString("N"));
+        var b = await stores.CreateAsync(711, Guid.NewGuid().ToString("N"));
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            foreach (var row in await db.BotInstances.ToListAsync())
+            {
+                row.TenantHooshPayEnabled = row.TenantTetraminatorEnabled = row.TenantUniquePayEnabled =
+                    row.TenantAtlasPayEnabled = row.TenantNowPaymentsEnabled = false;
+                row.Enabled = true;
+            }
+            var selected = await db.BotInstances.SingleAsync(x => x.Id == a.Id);
+            selected.TelegramBotId = 60001;
+            selected.TenantCustomerWalletEnabled = true;
+            selected.TenantCustomerWalletOwnerEnabled = true;
+            selected.TenantCustomerWalletApprovedAtUtc = DateTime.UtcNow;
+            selected.TenantCustomerWalletApprovedByTelegramUserId = 85758085;
+            selected.TenantCustomerWalletApprovedBotId = selected.TelegramBotId;
+            selected.TenantCustomerWalletApprovedOwnerId = 711;
+            await db.SaveChangesAsync();
+        }
+        a = (await stores.ListAsync(711))[0];
+        var owner = new CredUser { TelegramUserId = 711, IsColleague = true };
+        var wallet = provider.GetRequiredService<CredentialsStore>();
+        await wallet.SaveUserStatus(owner);
+        await wallet.MutateWalletAsync(711, 500000, "gateway-preference-owner-access");
+        var state = provider.GetRequiredService<UserStateStore>();
+        var ownerClient = new StorefrontClient();
+        var context = provider.GetRequiredService<BotContextAccessor>();
+        using (context.Push(new BotRuntimeContext { Config = new BotInstanceConfig { Id = "owned-a" }, Client = ownerClient }))
+        {
+            await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(a, "panel"));
+            var enable = TenantOwnerCallback.Encode(a, $"set-setting:{gateway}:1");
+            await OwnerCallback(provider, ownerClient, owner, enable);
+            a = (await stores.ListAsync(711))[0];
+            // A fully enabled platform snapshot isolates which persisted storefront switch was changed.
+            var globallyEnabled = new PaymentGatewayAvailabilitySnapshot(true, true, true, true, true, 1);
+            Assert.True(TenantPaymentGatewayPolicy.IsEnabled(a, gateway, globallyEnabled));
+            Assert.False(TenantPaymentGatewayPolicy.IsEnabled(a, gateway, availability.Snapshot));
+            var savedRevision = a.UpdatedAtUtc;
+            await OwnerCallback(provider, ownerClient, owner, enable);
+            await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(a, "panel"));
+            await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(a, $"set-setting:{gateway}:1"));
+            Assert.Equal(savedRevision, (await stores.ListAsync(711))[0].UpdatedAtUtc);
+
+            // Expiry and exact selected-store ownership still protect mutations while the global switch is off.
+            var expired = TenantOwnerCallback.Encode(a, $"set-setting:{gateway}:0").Split(':');
+            expired[3] = (DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 1200).ToString("X");
+            await OwnerCallback(provider, ownerClient, owner, string.Join(":", expired));
+            await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(b, "panel"));
+            await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(a, $"set-setting:{gateway}:0"));
+            await OwnerCallback(provider, ownerClient, new CredUser { TelegramUserId = 999, IsColleague = true },
+                TenantOwnerCallback.Encode(a, $"set-setting:{gateway}:0"));
+            var persisted = await stores.ListAsync(711);
+            Assert.Equal(savedRevision, persisted[0].UpdatedAtUtc);
+            Assert.True(TenantPaymentGatewayPolicy.IsEnabled(persisted[0], gateway, globallyEnabled));
+            Assert.All(Enum.GetValues<PaymentGateway>(), g =>
+                Assert.False(TenantPaymentGatewayPolicy.IsEnabled(persisted[1], g, globallyEnabled)));
+        }
+
+        var customerClient = new StorefrontClient();
+        using (context.Push(new BotRuntimeContext
+        { Config = new BotInstanceConfig { Id = a.Id, Type = BotInstanceTypes.Tenant }, Client = customerClient }))
+        {
+            async Task Press(Update update)
+            {
+                await using var scope = provider.CreateAsyncScope();
+                Assert.True(await scope.ServiceProvider.GetRequiredService<TenantBotService>().TryHandleTenantUpdateAsync(
+                    customerClient, update, new CredUser { TelegramUserId = 912 }, await state.GetUserStatus(912), default));
+            }
+            Update Callback(string data) => new() { CallbackQuery = new CallbackQuery
+            {
+                Id = Guid.NewGuid().ToString("N"), Data = data,
+                From = new Telegram.Bot.Types.User { Id = 912 }, Message = new Message { Id = 1, Chat = new Chat { Id = 912 } }
+            } };
+            async Task RenderPaymentChoices()
+            {
+                customerClient.Callbacks.Clear();
+                await Press(Callback("TN:dur:normal:10:m1"));
+                await state.SaveUserStatus(new User { Id = 912, Flow = "tenant-wallet-charge", LastStep = "amount" });
+                await Press(new Update { Message = new Message
+                {
+                    From = new Telegram.Bot.Types.User { Id = 912 }, Chat = new Chat { Id = 912 }, Text = "100000"
+                } });
+            }
+            async Task AssertRenewalVisibility(bool visible)
+            {
+                await using var scope = provider.CreateAsyncScope();
+                var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
+                var keyboard = (InlineKeyboardMarkup)typeof(TenantBotService).GetMethod(
+                    "BuildTenantRenewPaymentProviderKeyboard", BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .Invoke(service, new object[] { new TenantBotOrder { Id = 42, SalePriceToman = 100000 }, a })!;
+                Assert.Equal(visible, keyboard.InlineKeyboard.SelectMany(x => x).Any(x => x.CallbackData == $"TN:RN{method}:42"));
+            }
+            await RenderPaymentChoices();
+            Assert.DoesNotContain(customerClient.Callbacks, x => x.StartsWith($"TN:PAY{method}:", StringComparison.Ordinal));
+            Assert.DoesNotContain(customerClient.Callbacks, x => x.StartsWith($"TCW:g:{(int)gateway}:", StringComparison.Ordinal));
+            await AssertRenewalVisibility(false);
+
+            await availability.SetEnabledAsync(gateway, true, availability.Snapshot.Revision);
+            await RenderPaymentChoices();
+            var purchase = Assert.Single(customerClient.Callbacks, x => x.StartsWith($"TN:PAY{method}:", StringComparison.Ordinal));
+            var topUp = Assert.Single(customerClient.Callbacks, x => x.StartsWith($"TCW:g:{(int)gateway}:", StringComparison.Ordinal));
+            await AssertRenewalVisibility(true);
+
+            // Disable after the keyboard was emitted: neither stale customer action may create a local invoice or order.
+            await availability.SetEnabledAsync(gateway, false, availability.Snapshot.Revision);
+            await Press(Callback(topUp));
+            await Press(Callback(purchase));
+            await using var verify = databases.Users.CreateDbContext();
+            Assert.Empty(await verify.TenantBotOrders.ToListAsync());
+            Assert.Empty(await verify.HooshPayPaymentInfos.ToListAsync());
+            Assert.Empty(await verify.TetraminatorPaymentInfos.ToListAsync());
+            Assert.Empty(await verify.UniquePayPaymentInfos.ToListAsync());
+            Assert.Empty(await verify.AtlasPayPaymentInfos.ToListAsync());
+            Assert.Empty(await verify.SwapinoPaymentInfos.ToListAsync());
+            Assert.Equal(500000, await wallet.GetAccountBalance(711));
+        }
+    }
+
+    /// <summary>An admitted Tetraminator order without a started invoice must recheck live permission before creating a payment.</summary>
+    /// <returns>A task after the last creation boundary rejects the globally disabled provider without consuming the attempt.</returns>
+    /// <remarks>Regression: admitted quote replay bypasses the open-quote method list, so the invoice core is the final gate.</remarks>
+    [Fact]
+    public async Task Store_admitted_Tetraminator_order_without_invoice_cannot_bypass_global_disablement()
+    {
+        using var databases = new Databases();
+        var availability = new GatewayAvailabilityProbe();
+        await availability.SetEnabledAsync(PaymentGateway.Tetraminator, false, availability.Snapshot.Revision);
+        await using var provider = StorefrontProvider(databases, gatewayAvailability: availability);
+        var tenant = await provider.GetRequiredService<TenantStoreStore>().CreateAsync(711, Guid.NewGuid().ToString("N"));
+        tenant.TenantTetraminatorEnabled = true;
+        var order = new TenantBotOrder
+        {
+            OrderId = "admitted-before-global-disable", TenantBotId = tenant.Id, OwnerTelegramUserId = 711,
+            CustomerTelegramUserId = 912, SalePriceToman = 100000, PaymentProvider = "Tetraminator",
+            PaymentStatus = TenantBotOrderStatuses.Pending, DiscountInvoiceAttemptState = "none"
+        };
+        await using (var db = databases.Users.CreateDbContext()) { db.Add(order); await db.SaveChangesAsync(); }
+        await using var scope = provider.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
+        var callback = new CallbackQuery
+        {
+            Id = "disabled-admitted-invoice", From = new Telegram.Bot.Types.User { Id = 912 },
+            Message = new Message { Id = 1, Chat = new Chat { Id = 912 } }
+        };
+        await (Task)typeof(TenantBotService).GetMethod("CreateTenantTetraminatorInvoiceCoreAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(service, new object[]
+            { new StorefrontClient(), callback, tenant, new CredUser { TelegramUserId = 912 }, order, CancellationToken.None })!;
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Empty(await verify.TetraminatorPaymentInfos.ToListAsync());
+        var saved = await verify.TenantBotOrders.SingleAsync();
+        Assert.Null(saved.TetraminatorPaymentInfoId);
+        Assert.Equal("none", saved.DiscountInvoiceAttemptState);
+        Assert.Equal(TenantBotOrderStatuses.Pending, saved.PaymentStatus);
+    }
+
     /// <summary>Customer state and broadcast recipients remain partitioned by store even for the same owner and customer.</summary>
     /// <returns>A task completing after state and actual broadcast-audience queries.</returns>
     [Fact]
@@ -413,8 +591,10 @@ public sealed partial class ConcurrencyTests
     /// <param name="websiteUrl">Optional loopback fake website endpoint; remote site sync is otherwise disabled.</param>
     /// <param name="catalogPath">Optional isolated XUI plan catalog used to exercise changed wholesale prices.</param>
     /// <param name="panelUrl">Optional isolated XUI panel URL for renewal handler scenarios.</param>
+    /// <param name="gatewayAvailability">Optional live in-memory global switch store for invoice-admission transitions.</param>
     /// <returns>A provider that the test must asynchronously dispose.</returns>
-    private static ServiceProvider StorefrontProvider(Databases databases, string? websiteUrl = null, string? catalogPath = null, string? panelUrl = null)
+    private static ServiceProvider StorefrontProvider(Databases databases, string? websiteUrl = null, string? catalogPath = null,
+        string? panelUrl = null, IPaymentGatewayAvailability? gatewayAvailability = null)
     {
         var configuration = new ConfigurationBuilder().AddJsonFile(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../Data/configuration.example.json")))
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -427,6 +607,7 @@ public sealed partial class ConcurrencyTests
             }).Build();
         var config = configuration.Get<AppConfig>()!; config.UserDatabasePath = Path.Combine(databases.DirectoryPath, "users.db"); config.CredentialsDatabasePath = Path.Combine(databases.DirectoryPath, "credentials.db");
         var services = new ServiceCollection(); Program.RegisterApplicationServices(services, configuration, config, databases.DirectoryPath);
+        if (gatewayAvailability != null) services.AddSingleton<IPaymentGatewayAvailability>(gatewayAvailability);
         return services.BuildServiceProvider();
     }
 
