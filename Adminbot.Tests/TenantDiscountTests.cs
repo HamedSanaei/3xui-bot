@@ -8,6 +8,10 @@ using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.ReplyMarkups;
+using Telegram.Bot;
+using Telegram.Bot.Exceptions;
+using Telegram.Bot.Requests;
+using Telegram.Bot.Requests.Abstractions;
 
 public sealed partial class ConcurrencyTests
 {
@@ -164,6 +168,200 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(TenantDiscountFailure.NotFound,
             (await codes.GetCodeAsync(store.Id, 711, beforeReset.Value.Id)).Failure);
         Assert.All(client.Callbacks, data => Assert.InRange(Encoding.UTF8.GetByteCount(data), 1, 64));
+    }
+
+    /// <summary>Repeated owner edits complete the durable inbox and cannot mutate the live definition before save.</summary>
+    /// <param name="action">A repeatable discount choice from the confirmed incident; the same rendered menu is delivered twice.</param>
+    /// <returns>A task after real owner callbacks, persisted inbox outcomes, and unchanged live discount state are checked.</returns>
+    /// <remarks>Two distinct updates replay the same choice; redelivery of the identical update id is also deduplicated by the inbox.</remarks>
+    [Theory]
+    [InlineData("d:a:p")]
+    [InlineData("d:t:p")]
+    [InlineData("d:t:f")]
+    [InlineData("d:cap:none")]
+    public async Task TenantDiscount_Repeated_owner_edit_is_successful_and_preserves_draft_and_business_state(string action)
+    {
+        using var databases = new Databases();
+        await using var provider = StorefrontProvider(databases);
+        var stores = provider.GetRequiredService<TenantStoreStore>();
+        var store = await stores.CreateAsync(711, Guid.NewGuid().ToString("N"));
+        var discounts = provider.GetRequiredService<TenantDiscountService>();
+        var saved = await discounts.SaveCodeAsync(store.Id, 711,
+            new TenantDiscountCodeInput("UNCHANGED", TenantDiscountKinds.Fixed, TenantDiscountScopes.Both,
+                1000, null, 3000, 0, 4, true));
+        Assert.True(saved.Success);
+        store = (await stores.ListAsync(711)).Single();
+        var owner = new CredUser { TelegramUserId = 711, IsColleague = true };
+        var client = new DiscountEditClient();
+        var accessor = provider.GetRequiredService<BotContextAccessor>();
+        using var context = accessor.Push(new BotRuntimeContext
+        {
+            Config = new BotInstanceConfig { Id = "owned-discount-replay" }, Client = client
+        });
+        await OwnerCallback(provider, client, owner, TenantOwnerCallback.Encode(store, "panel"));
+        await OwnerCallback(provider, client, owner, TenantOwnerCallback.Encode(store, $"d:e:{saved.Value.Id}:menu"));
+        var callbackData = TenantOwnerCallback.Encode(store, action);
+        await OwnerCallback(provider, client, owner, callbackData);
+        var state = provider.GetRequiredService<UserStateStore>();
+        var expectedDraft = (await state.GetUserStatus(711)).OwnerDiscountDraftJson;
+        var expectedRevision = saved.Value.UpdatedAtUtc;
+        var executed = new List<int>();
+        using var scheduler = Create(databases, new Executor(async (item, token) =>
+        {
+            using var executionContext = accessor.Push(new BotRuntimeContext
+            {
+                Config = new BotInstanceConfig { Id = item.Key.BotId }, Client = client
+            });
+            await using var scope = provider.CreateAsyncScope();
+            Assert.True(await scope.ServiceProvider.GetRequiredService<TenantBotService>().TryHandleOwnerCallbackAsync(
+                client, item.Update.CallbackQuery!, owner, await state.GetUserStatus(711), token));
+            executed.Add(item.Update.Id);
+        }));
+        var first = DiscountCallbackUpdate(2101, owner, callbackData);
+        await scheduler.EnqueueAsync("owned-discount-replay", first, default);
+        await scheduler.EnqueueAsync("owned-discount-replay", first, default);
+        await scheduler.EnqueueAsync("owned-discount-replay", DiscountCallbackUpdate(2102, owner, callbackData), default);
+        await scheduler.StartAsync(default);
+        await scheduler.StopAsync(default);
+
+        Assert.Equal(new[] { 2101, 2102 }, executed);
+        Assert.Equal(expectedDraft, (await state.GetUserStatus(711)).OwnerDiscountDraftJson);
+        Assert.Equal(store.Id, (await state.GetUserStatus(711)).OwnerStoreId);
+        Assert.True(client.NoOpEdits >= 2);
+        var live = (await discounts.GetCodeAsync(store.Id, 711, saved.Value.Id)).Value;
+        Assert.Equal((TenantDiscountKinds.Fixed, TenantDiscountScopes.Both, 1000L, 3000L, 4, expectedRevision),
+            (live.Kind, live.Scope, live.FixedAmountToman!.Value, live.MaxDiscountToman!.Value, live.MaxUses, live.UpdatedAtUtc));
+        await using var db = databases.Users.CreateDbContext();
+        Assert.Equal(new[] { 2101, 2102 }, await db.TelegramUpdateInbox.OrderBy(x => x.Sequence).Select(x => x.UpdateId).ToArrayAsync());
+        Assert.All(await db.TelegramUpdateInbox.ToListAsync(), row =>
+        {
+            Assert.Equal("completed", row.Status);
+            Assert.Null(row.FailureCode);
+            Assert.Null(row.Payload);
+        });
+        Assert.Single(await db.TenantDiscountCodes.ToListAsync());
+        Assert.Empty(await db.TenantDiscountRedemptions.ToListAsync());
+        Assert.Empty(await db.TenantBotOrders.ToListAsync());
+        Assert.Empty(await db.WalletLedgerEntries.ToListAsync());
+    }
+
+    /// <summary>A genuine edit rejection propagates and remains an execution_failed outcome, not a semantic no-op.</summary>
+    /// <param name="code">Telegram numeric status; non-400 statuses must not match even when the description mentions a no-op.</param>
+    /// <param name="description">Controlled Telegram error text unrelated to valid identical-edit confirmation.</param>
+    /// <returns>A task after direct exception identity and durable failure classification are verified.</returns>
+    /// <remarks>Includes missing edit targets, which the legacy best-effort helper swallows but strict discount rendering must expose.</remarks>
+    [Theory]
+    [InlineData(400, "Bad Request: message to edit not found")]
+    [InlineData(400, "Bad Request: can't parse entities")]
+    [InlineData(403, "Forbidden: message is not modified")]
+    public async Task TenantDiscount_Other_edit_failures_propagate_and_remain_execution_failed(int code, string description)
+    {
+        using var databases = new Databases();
+        await using var provider = StorefrontProvider(databases);
+        var store = await provider.GetRequiredService<TenantStoreStore>().CreateAsync(711, Guid.NewGuid().ToString("N"));
+        var owner = new CredUser { TelegramUserId = 711, IsColleague = true };
+        var client = new DiscountEditClient();
+        using var context = provider.GetRequiredService<BotContextAccessor>().Push(new BotRuntimeContext
+        {
+            Config = new BotInstanceConfig { Id = "owned-discount-rejection" }, Client = client
+        });
+        await OwnerCallback(provider, client, owner, TenantOwnerCallback.Encode(store, "panel"));
+        await OwnerCallback(provider, client, owner, TenantOwnerCallback.Encode(store, "d:c"));
+        var data = TenantOwnerCallback.Encode(store, "d:a:p");
+        var failure = new ApiRequestException(description, code);
+        client.EditFailure = failure;
+        Assert.Same(failure, await Assert.ThrowsAsync<ApiRequestException>(() => OwnerCallback(provider, client, owner, data)));
+        var expectedDraft = (await provider.GetRequiredService<UserStateStore>().GetUserStatus(711)).OwnerDiscountDraftJson;
+        using var scheduler = Create(databases, new Executor((item, _) => OwnerCallback(provider, client, owner, item.Update.CallbackQuery!.Data!)));
+        await scheduler.EnqueueAsync("owned-discount-rejection", DiscountCallbackUpdate(2201, owner, data), default);
+        await scheduler.StartAsync(default);
+        await scheduler.StopAsync(default);
+        await using var db = databases.Users.CreateDbContext();
+        var row = await db.TelegramUpdateInbox.SingleAsync();
+        Assert.Equal("completed_with_error", row.Status);
+        Assert.Equal("execution_failed", row.FailureCode);
+        Assert.Equal(expectedDraft, (await provider.GetRequiredService<UserStateStore>().GetUserStatus(711)).OwnerDiscountDraftJson);
+    }
+
+    /// <summary>Outer cancellation wins even if Telegram simultaneously confirms that the requested discount menu is unchanged.</summary>
+    /// <returns>A task after cancellation escapes the actual owner callback without committing a live discount.</returns>
+    /// <remarks>The fake cancels only at the edit boundary, after state reads and the idempotent draft choice have completed.</remarks>
+    [Fact]
+    public async Task TenantDiscount_Outer_cancellation_is_not_swallowed_by_no_op_edit()
+    {
+        using var databases = new Databases();
+        await using var provider = StorefrontProvider(databases);
+        var store = await provider.GetRequiredService<TenantStoreStore>().CreateAsync(711, Guid.NewGuid().ToString("N"));
+        var owner = new CredUser { TelegramUserId = 711, IsColleague = true };
+        var client = new DiscountEditClient();
+        using var context = provider.GetRequiredService<BotContextAccessor>().Push(new BotRuntimeContext
+        {
+            Config = new BotInstanceConfig { Id = "owned-discount-cancel" }, Client = client
+        });
+        await OwnerCallback(provider, client, owner, TenantOwnerCallback.Encode(store, "panel"));
+        await OwnerCallback(provider, client, owner, TenantOwnerCallback.Encode(store, "d:c"));
+        var data = TenantOwnerCallback.Encode(store, "d:a:p");
+        await OwnerCallback(provider, client, owner, data);
+        using var cancellation = new CancellationTokenSource();
+        client.BeforeEdit = cancellation.Cancel;
+        await using var scope = provider.CreateAsyncScope();
+        var callback = DiscountCallbackUpdate(2301, owner, data).CallbackQuery!;
+        var state = await provider.GetRequiredService<UserStateStore>().GetUserStatus(711);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            scope.ServiceProvider.GetRequiredService<TenantBotService>().TryHandleOwnerCallbackAsync(
+                client, callback, owner, state, cancellation.Token));
+        await using var db = databases.Users.CreateDbContext();
+        Assert.Empty(await db.TenantDiscountCodes.ToListAsync());
+    }
+
+    /// <summary>Creates a synthetic addressed owner update without sending data to Telegram.</summary>
+    /// <param name="id">Distinct numeric Telegram update id for inbox deduplication.</param>
+    /// <param name="owner">Authenticated colleague profile whose Telegram sender and private chat ids must match.</param>
+    /// <param name="data">Addressed test callback envelope, not a credential or authorization grant.</param>
+    /// <returns>A callback update accepted by the real inbox and owner handler.</returns>
+    /// <remarks>The existing menu id is fixed so replay targets the same text and keyboard.</remarks>
+    /// <example><code>var update = DiscountCallbackUpdate(2101, owner, TenantOwnerCallback.Encode(store, "d:a:p"));</code></example>
+    private static Update DiscountCallbackUpdate(int id, CredUser owner, string data) => new()
+    {
+        Id = id,
+        CallbackQuery = new CallbackQuery
+        {
+            Id = $"discount-{id}", Data = data,
+            From = new Telegram.Bot.Types.User { Id = owner.TelegramUserId },
+            Message = new Message { Id = 1, Chat = new Chat { Id = owner.TelegramUserId, Type = Telegram.Bot.Types.Enums.ChatType.Private } }
+        }
+    };
+
+    /// <summary>Emulates Telegram's identical-content edit rejection using the complete rendered text and inline markup.</summary>
+    /// <remarks>Only one owner/menu is used per fixture. Transport failures can be injected without changing draft behavior.</remarks>
+    private sealed class DiscountEditClient : StorefrontClient
+    {
+        /// <summary>Last acknowledged complete edit payload, including the owner-addressed keyboard.</summary>
+        private string? _lastEdit;
+        /// <summary>Count of rejected identical edits, proving the regression really exercised Telegram's no-op response.</summary>
+        public int NoOpEdits { get; private set; }
+        /// <summary>Optional controlled rejection returned for every edit.</summary>
+        public Exception? EditFailure { get; set; }
+        /// <summary>Optional action at the edit boundary used to race outer cancellation with no-op acknowledgement.</summary>
+        public Action? BeforeEdit { get; set; }
+        /// <inheritdoc />
+        public override Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+        {
+            if (request is EditMessageTextRequest edit)
+            {
+                BeforeEdit?.Invoke();
+                if (EditFailure != null) return Task.FromException<TResponse>(EditFailure);
+                var render = JsonConvert.SerializeObject(new { edit.ChatId, edit.MessageId, edit.Text, edit.ParseMode, edit.ReplyMarkup });
+                if (render == _lastEdit)
+                {
+                    NoOpEdits++;
+                    return Task.FromException<TResponse>(new ApiRequestException(
+                        "Bad Request: message is not modified: specified new message content and reply markup are exactly the same", 400));
+                }
+                _lastEdit = render;
+            }
+            return base.SendRequest(request, cancellationToken);
+        }
     }
     /// <summary>Real purchase preview binds its delivered message and applies the displayed capped net without reserving until payment choice.</summary>
     [Fact]

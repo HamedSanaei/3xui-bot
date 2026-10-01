@@ -592,9 +592,14 @@ public sealed partial class ConcurrencyTests
     /// <param name="catalogPath">Optional isolated XUI plan catalog used to exercise changed wholesale prices.</param>
     /// <param name="panelUrl">Optional isolated XUI panel URL for renewal handler scenarios.</param>
     /// <param name="gatewayAvailability">Optional live in-memory global switch store for invoice-admission transitions.</param>
+    /// <param name="tokenProbe">Optional controlled getMe transport; owner-panel tests never contact Telegram.</param>
+    /// <param name="ownerTokenProbeCache">Optional short-budget cache shared by the test's actual scoped handlers.</param>
     /// <returns>A provider that the test must asynchronously dispose.</returns>
+    /// <remarks>Each fixture supplies its own database paths. Inject a probe before using saved tokens so owner regressions remain network-free.</remarks>
+    /// <example><code>await using var provider = StorefrontProvider(databases, tokenProbe: probe);</code></example>
     private static ServiceProvider StorefrontProvider(Databases databases, string? websiteUrl = null, string? catalogPath = null,
-        string? panelUrl = null, IPaymentGatewayAvailability? gatewayAvailability = null)
+        string? panelUrl = null, IPaymentGatewayAvailability? gatewayAvailability = null,
+        ITelegramTokenProbe? tokenProbe = null, TenantOwnerTokenProbeCache? ownerTokenProbeCache = null)
     {
         var configuration = new ConfigurationBuilder().AddJsonFile(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../Data/configuration.example.json")))
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -608,6 +613,8 @@ public sealed partial class ConcurrencyTests
         var config = configuration.Get<AppConfig>()!; config.UserDatabasePath = Path.Combine(databases.DirectoryPath, "users.db"); config.CredentialsDatabasePath = Path.Combine(databases.DirectoryPath, "credentials.db");
         var services = new ServiceCollection(); Program.RegisterApplicationServices(services, configuration, config, databases.DirectoryPath);
         if (gatewayAvailability != null) services.AddSingleton<IPaymentGatewayAvailability>(gatewayAvailability);
+        if (tokenProbe != null) services.AddSingleton<ITelegramTokenProbe>(tokenProbe);
+        if (ownerTokenProbeCache != null) services.AddSingleton(ownerTokenProbeCache);
         return services.BuildServiceProvider();
     }
 
@@ -616,13 +623,18 @@ public sealed partial class ConcurrencyTests
     /// <param name="client">Recording Telegram transport.</param>
     /// <param name="owner">Authenticated colleague profile.</param>
     /// <param name="data">Untrusted management callback under test.</param>
+    /// <param name="cancellationToken">Optional handler cancellation, including foreground probe waits and cache hits.</param>
     /// <returns>A task completing after the handler and state writes.</returns>
-    private static async Task OwnerCallback(ServiceProvider provider, StorefrontClient client, CredUser owner, string data)
+    /// <remarks>The real handler still validates callback addressing, revision, owner identity and persisted store selection.</remarks>
+    /// <exception cref="OperationCanceledException">The handler cancellation token is canceled during the callback.</exception>
+    /// <example><code>await OwnerCallback(provider, client, owner, TenantOwnerCallback.Encode(store, "panel"), token);</code></example>
+    private static async Task OwnerCallback(ServiceProvider provider, StorefrontClient client, CredUser owner, string data,
+        CancellationToken cancellationToken = default)
     {
         await using var scope = provider.CreateAsyncScope();
         await scope.ServiceProvider.GetRequiredService<TenantBotService>().TryHandleOwnerCallbackAsync(client,
             new CallbackQuery { Id = Guid.NewGuid().ToString("N"), Data = data, From = new Telegram.Bot.Types.User { Id = owner.TelegramUserId }, Message = new Message { Id = 1, Chat = new Chat { Id = owner.TelegramUserId } } },
-            owner, await provider.GetRequiredService<UserStateStore>().GetUserStatus(owner.TelegramUserId), default);
+            owner, await provider.GetRequiredService<UserStateStore>().GetUserStatus(owner.TelegramUserId), cancellationToken);
     }
 
     /// <summary>Records owner responses without creating any network connection or changing client lifetimes.</summary>

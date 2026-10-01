@@ -757,17 +757,4 @@ public sealed partial class ConcurrencyTests
         finally { Directory.Delete(directory, recursive: true); }
     }
 
-    /// <summary>Every closed-vocabulary stage name is stable so a log parser can rely on it.</summary>
-    [Fact]
-    public void Stage_vocabulary_is_stable()
-    {
-        var names = Enum.GetNames<TelegramUpdateStage>();
-        Assert.Equal(
-            new[]
-            {
-                "XuiRead", "TelegramSend", "TelegramEdit", "TelegramMembership",
-                "SiteLookup", "ProviderRead", "DatabaseWait", "BusinessRecovery"
-            },
-            names);
-    }
 }

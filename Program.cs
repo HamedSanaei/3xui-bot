@@ -134,8 +134,10 @@ public class Program
     /// <param name="configuration">Runtime configuration; private values must never be written to logs or test output.</param>
     /// <param name="appConfig">Validated application options with resolved absolute database paths.</param>
     /// <param name="contentRootPath">Application content root for local configuration and logging outbox paths.</param>
-    /// <remarks>Singletons retain factories only. Legacy coordinated handler graphs are scoped to one execution; state and wallet stores own shorter contexts.
+    /// <remarks>Singletons never capture scoped database contexts. Legacy coordinated handler graphs are scoped to one execution; state and wallet stores own shorter contexts.
+    /// Owner handlers share the bounded token-probe cache but retain isolated tenant selections.
     /// Backup channels resolve nonblank global configuration before the default-owned channel; the dispatcher supplies durable fallback.</remarks>
+    /// <example><code>RegisterApplicationServices(services, configuration, validatedOptions, contentRootPath);</code></example>
     public static void RegisterApplicationServices(IServiceCollection services, IConfiguration configuration, AppConfig appConfig, string contentRootPath)
     {
         var telegramOutboxDatabasePath = Path.Combine(contentRootPath, "Data", "telegram-log-outbox.db");
@@ -173,6 +175,10 @@ public class Program
         services.AddSingleton<BotContextAccessor>();
         services.AddSingleton<BotRegistry>();
         services.AddSingleton<BotClientProvider>();
+        // Owner-panel getMe uses its own short budget and bounded singleton cache across sequential handler scopes.
+        // Token registration reuses only the injectable transport, retaining the existing startup-sized budget.
+        services.AddSingleton<ITelegramTokenProbe, TelegramTokenProbe>();
+        services.AddSingleton<TenantOwnerTokenProbeCache>();
         // Telegram premium-UI infrastructure. The emoji catalog is loaded and validated ONCE here, during service
         // registration, so a missing or malformed release asset fails application startup instead of rendering a
         // half-configured UI later. The remaining registrations are immutable or thread-safe stateless services; none of

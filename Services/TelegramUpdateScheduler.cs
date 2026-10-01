@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Exceptions;
 
 /// <summary>Accepts durable bounded updates independently of handler execution.</summary>
 public interface ITelegramUpdateScheduler
@@ -284,7 +285,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <param name="sequence">Internal inbox sequence; no secret data.</param>
     /// <param name="token">Cancellation propagated to the handler after drain expiry.</param>
     /// <returns>A tracked task that observes handler failures and attempts independent final persistence.</returns>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
+    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure. Telegram API failures retain numeric status and closed reason metadata, never exception messages or payloads; all failures retain their durable terminal outcome.</remarks>
     private async Task ProcessAsync(long sequence, CancellationToken token)
     {
         _store.Executing.TryAdd(sequence, 0);
@@ -366,6 +367,13 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                 "Telegram update ended with unavailable bot transport. Sequence={Sequence} FailureCode={FailureCode} ReasonCode={ReasonCode}",
                 sequence, failure, ex.ReasonCode);
         }
+        catch (ApiRequestException ex)
+        {
+            failure = "execution_failed";
+            _logger.LogError(
+                "Telegram update failed and was released. Sequence={Sequence} FailureCode={FailureCode} ErrorType={ErrorType} ErrorCode={ErrorCode} ReasonCode={ReasonCode}",
+                sequence, failure, ex.GetType().Name, ex.ErrorCode, GetTelegramFailureReason(ex));
+        }
         catch (Exception ex)
         {
             failure = "execution_failed";
@@ -396,6 +404,18 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             Wake(); // Completion also releases an active-task slot even when final persistence failed.
             _logger.LogDebug("Telegram update finished. Sequence={Sequence} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome}", sequence, duration, failure ?? "completed");
         }
+    }
+
+    /// <summary>Classifies a Telegram API failure into safe, closed operator metadata.</summary>
+    /// <param name="exception">Required Telegram exception; existing safe classifiers inspect its description locally, never returning or logging arbitrary text.</param>
+    /// <returns>A shared Telegram failure reason safe for local and operator logs, with server failures grouped and numeric fallback bounded.</returns>
+    /// <remarks>Classification is diagnostic only: even an uncaught no-op remains execution_failed here. Semantic no-op handling belongs to the edit caller.</remarks>
+    /// <example><code>var reason = GetTelegramFailureReason(new ApiRequestException("Forbidden", 403)); // telegram_forbidden</code></example>
+    private static string GetTelegramFailureReason(ApiRequestException exception)
+    {
+        if (TenantBotService.ISTELEGRAMMESSAGENOTMODIFIED(exception.ErrorCode, exception.Message))
+            return "telegram_message_not_modified";
+        return TelegramDeliveryFailureClassifier.Classify(exception);
     }
 
     /// <summary>

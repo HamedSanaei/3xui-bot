@@ -157,6 +157,10 @@ public partial class TenantBotService
     private readonly GozargahSiteSyncService _gozargahSiteSyncService;
     private readonly BroadcastManager _broadcastManager;
     private readonly UsageAnalyticsService _usageAnalyticsService;
+    /// <summary>Non-retrying injectable Telegram identity transport; token registration keeps its existing startup-sized budget.</summary>
+    private readonly ITelegramTokenProbe _tokenProbe;
+    /// <summary>Singleton bounded foreground identity cache shared across scoped owner handlers, isolated by storefront and token fingerprint.</summary>
+    private readonly TenantOwnerTokenProbeCache _ownerTokenProbeCache;
     /// <summary>
     /// Proves that the exact storefront bot may use Telegram custom emoji before the owner's opt-in is persisted.
     /// </summary>
@@ -226,9 +230,13 @@ public partial class TenantBotService
     /// <param name="UniquePay">
     /// UniquePay API client used to create tenant purchase and renewal invoices with the saved merchant hash.
     /// </param>
+    /// <param name="AtlasPay">Global AtlasPay client used for tenant invoices without logging its provider secrets.</param>
+    /// <param name="AtlasPayReconciliation">Provider reconciliation coordinator for persisted tenant AtlasPay payment state.</param>
     /// <param name="GatewayAvailability">
     /// Live global gateway switches combined with each tenant's local preference.
     /// </param>
+    /// <param name="ClientDownloadAvailability">Global live switch controlling exposure of approved client download links.</param>
+    /// <param name="ClientReleaseService">Shared approved release resolver for tenant client-download menus.</param>
     /// <param name="BotRegistry">runtime Bot registry.</param>
     /// <param name="BotClientProvider">Telegram client Provider for owned and tenant bots.</param>
     /// <param name="BotContextAccessor">current Bot context accessor.</param>
@@ -268,12 +276,21 @@ public partial class TenantBotService
     /// <c>tenant-create:</c> operation, allocating a new <c>:retry:N</c> generation only under a new explicit durable
     /// retry authorization after a definitive rejection.
     /// </param>
+    /// <param name="TenantCardProvisionalProvisioning">Required service granting the existing courtesy entitlement for tenant card receipts.</param>
+    /// <param name="TenantCardProvisionalFinalization">Required service upgrading the same courtesy client after owner approval without duplicate issuance.</param>
+    /// <param name="TenantCardProvisionalRevocation">Required service disabling that courtesy client after owner rejection, without financial settlement.</param>
+    /// <param name="PremiumUiCapabilityProbe">Optional exact-store premium capability probe; missing injection fails closed on enablement.</param>
     /// <param name="InteractionTimeouts">
     /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
     /// callback acknowledgement is bounded at two seconds. Tests pass millisecond values. This value never affects
     /// tenant pricing, wallet debit, order fulfillment, or XUI exactly-once semantics.
     /// </param>
-    /// <remarks>The order is scoped to its tenant and reloaded under an order-specific gate. Wallet receipt keys are derived from that durable order identity.</remarks>
+    /// <param name="MandatoryJoinMembershipCache">Optional singleton positive forced-join cache; direct constructions without it use a private cache.</param>
+    /// <param name="TokenProbe">Optional injectable non-retrying getMe transport; null uses TelegramTokenProbe and raw tokens are never logged.</param>
+    /// <param name="OwnerTokenProbeCache">Optional bounded two-second owner-panel cache. Production injects its singleton; null creates a private per-service cache.</param>
+    /// <remarks>One handler scope owns one tenant selection and must not be reused concurrently. Order wallet receipt keys derive from durable order identity.
+    /// Production shares the foreground token cache across scopes; direct construction without cache injection does not share verification results.</remarks>
+    /// <example><code>var service = executionScope.ServiceProvider.GetRequiredService&lt;TenantBotService&gt;();</code></example>
     public TenantBotService(
         UserWorkflowStore UserDbContext,
         UserStateStore stateStore,
@@ -308,7 +325,9 @@ public partial class TenantBotService
         TenantCardProvisionalRevocationService TenantCardProvisionalRevocation,
         ITelegramPremiumUiCapabilityProbe PremiumUiCapabilityProbe = null,
         TelegramInteractionTimeouts InteractionTimeouts = null,
-        ITelegramMandatoryJoinMembershipCache MandatoryJoinMembershipCache = null)
+        ITelegramMandatoryJoinMembershipCache MandatoryJoinMembershipCache = null,
+        ITelegramTokenProbe TokenProbe = null,
+        TenantOwnerTokenProbeCache OwnerTokenProbeCache = null)
     {
         _workflow = UserDbContext;
         _state = stateStore;
@@ -345,6 +364,8 @@ public partial class TenantBotService
         _premiumUiCapabilityProbe = PremiumUiCapabilityProbe;
         _interactionTimeouts = InteractionTimeouts ?? TelegramInteractionTimeouts.Production;
         _mandatoryJoinMembershipCache = MandatoryJoinMembershipCache ?? new TelegramMandatoryJoinMembershipCache();
+        _tokenProbe = TokenProbe ?? new TelegramTokenProbe();
+        _ownerTokenProbeCache = OwnerTokenProbeCache ?? new TenantOwnerTokenProbeCache(_tokenProbe);
     }
 
     /// <summary>
@@ -1321,12 +1342,15 @@ public partial class TenantBotService
     /// Optional callback message currently visible in Telegram. When its rendered text and inline keyboard already
     /// equal the new panel, the edit request is skipped to avoid Telegram's <c>message is not modified</c> response.
     /// </param>
+    /// <returns>A task completing after the current owner-authorized storefront panel is rendered.</returns>
     /// <remarks>
-    /// Opening or refreshing the panel probes an existing tenant bot token with Telegram <c>getMe</c>. If Telegram
-    /// proves the token is revoked or unauthorized, the method clears only the token identity fields and disables
-    /// the tenant bot before rendering, while preserving card, support, tutorial, and historical order settings.
-    /// Transient Telegram failures are shown as a warning and never clear the owner configuration.
+    /// Opening or refreshing uses a dedicated two-second getMe budget and a bounded singleton identity cache,
+    /// independent of the twelve-second startup budget. A revoked or unauthorized token clears only the matching
+    /// saved identity and disables that storefront; card, support, tutorial, prices and historical orders survive.
+    /// Transient warnings are cached briefly in memory only. Handler cancellation always propagates.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The owner update was canceled, including during a cached probe.</exception>
+    /// <example><code>await SHOWOWNERPANELASYNC(client, ownerChat, owner, panelMessageId, updateCancellation);</code></example>
     private async Task SHOWOWNERPANELASYNC(
         ITelegramBotClient botClient,
         ChatId ChatId,
@@ -1337,6 +1361,7 @@ public partial class TenantBotService
     {
         var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, CancellationToken);
         var tokenNotice = await VALIDATETENANTTOKENFORPANELASYNC(tenant, CancellationToken);
+        CancellationToken.ThrowIfCancellationRequested();
         await _state.SaveUserStatus(new User { Id = owner.TelegramUserId, OwnerStoreId = tenant.Id });
         var Text = BUILDOWNERPANELTEXT(tenant, owner, tokenNotice);
         var keyboard = BUILDOWNERPANELKEYBOARD(tenant);
@@ -1748,7 +1773,11 @@ public partial class TenantBotService
     /// <remarks>
     /// Resets mutable storefront settings and soft-deletes its discount definitions in one users.db commit.
     /// Existing reserved and paid claims, orders, receipts, and financial history remain unchanged.
+    /// Removes every cached token identity immediately after commit; late probes cannot repopulate the removed entry.
     /// </remarks>
+    /// <returns>A task completing after the reset, probe/client cache invalidation, and refreshed owner panel.</returns>
+    /// <exception cref="OperationCanceledException">The owner update was canceled.</exception>
+    /// <example><code>await RESETTENANTSETTINGSASYNC(client, confirmation, owner, updateCancellation);</code></example>
     private async Task RESETTENANTSETTINGSASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -1779,6 +1808,7 @@ public partial class TenantBotService
             await transaction.CommitAsync(CancellationToken);
             return true;
         }, CancellationToken);
+        _ownerTokenProbeCache.Invalidate(tenant.Id);
         await _workflow.ReloadAsync(tenant, CancellationToken);
         _botRegistry.Upsert(tenant);
         _botClientProvider.Invalidate(tenant.Id);
@@ -1813,36 +1843,71 @@ public partial class TenantBotService
     /// The returned text is safe to include in a message sent with <see cref="ParseMode.Html" />.
     /// </returns>
     /// <remarks>
-    /// A clearly revoked or unauthorized token is cleaned immediately because keeping it in the panel causes the
-    /// owner to believe a dead storefront is still configured. Transient Telegram errors such as timeouts or 5xx
-    /// responses do not clear the token; the owner sees a temporary warning and can retry refresh later.
+    /// Uses the dedicated short foreground cache, measuring the complete handler wait as TelegramProbe.
+    /// A clearly revoked token is cleaned only while the saved token, owner, numeric identity and panel revision
+    /// still match the probed snapshot. Transient failures preserve every setting and are never persisted.
+    /// Workflow concurrency checks also prevent an old result from mutating a replacement made during a local write.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The owner update was canceled, even if the cache has a result.</exception>
+    /// <example><code>var notice = await VALIDATETENANTTOKENFORPANELASYNC(selectedStore, updateCancellation);</code></example>
     private async Task<string> VALIDATETENANTTOKENFORPANELASYNC(BotInstance tenant, CancellationToken CancellationToken)
     {
+        CancellationToken.ThrowIfCancellationRequested();
         if (tenant == null || string.IsNullOrWhiteSpace(tenant.Token))
             return null;
 
+        var token = tenant.Token;
+        var ownerId = tenant.OwnerTelegramUserId;
+        var botId = tenant.TelegramBotId;
+        var revision = tenant.UpdatedAtUtc ?? tenant.CreatedAtUtc;
+        TenantOwnerTokenProbeResult result;
+        using (TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.TelegramProbe))
+            result = await _ownerTokenProbeCache.ProbeAsync(tenant.Id, token, CancellationToken);
+        CancellationToken.ThrowIfCancellationRequested();
+
+        // A stopped/replaced identity can finish getMe later. Reload before using it, and let the workflow's
+        // original-value check reject any further change between this reload and the guarded local commit.
+        await _workflow.ReloadAsync(tenant, CancellationToken);
+        if (!string.Equals(tenant.Token, token, StringComparison.Ordinal) || tenant.OwnerTelegramUserId != ownerId ||
+            tenant.TelegramBotId != botId || (tenant.UpdatedAtUtc ?? tenant.CreatedAtUtc) != revision)
+            return null;
+
+        if (result.Status == TenantOwnerTokenProbeStatus.Transient)
+            return "⚠️ فعلاً امکان بررسی توکن ربات فروشگاهی نیست. اگر تلگرام مشکل موقت داشته باشد، دوباره بروزرسانی را بزنید.";
+        if (result.Status == TenantOwnerTokenProbeStatus.Unavailable)
+            return "⚠️ فعلاً امکان بررسی توکن ربات فروشگاهی نیست. تنظیمات شما پاک نشد؛ کمی بعد دوباره بروزرسانی را بزنید.";
+
         try
         {
-            var client = new TelegramBotClient(new TelegramBotClientOptions(tenant.Token) { RetryCount = 0 });
-            using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
-            var me = await client.GetMe(probeCts.Token);
+            if (result.Status == TenantOwnerTokenProbeStatus.Invalid)
+            {
+                await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
+                CancellationToken.ThrowIfCancellationRequested();
+                ResetTenantStorefrontSettings(tenant, clearAllStorefrontSettings: false);
+                await _workflow.SaveAsync(CancellationToken);
+                _ownerTokenProbeCache.Invalidate(tenant.Id);
+                _botRegistry.Upsert(tenant);
+                _botClientProvider.Invalidate(tenant.Id);
+                _logger.LogWarning(
+                    "Tenant bot token was invalid during owner panel refresh and was cleared. tenantBotId={TenantBotId}, owner={OwnerTelegramUserId}",
+                    tenant.Id, tenant.OwnerTelegramUserId);
+                return "⚠️ توکن ربات فروشگاهی معتبر نبود و از تنظیمات پاک شد. لطفاً توکن جدید ثبت کنید.";
+            }
+
+            var me = result.Identity;
             var username = me.Username?.Trim().TrimStart('@');
             var changed = false;
-
             if (!string.IsNullOrWhiteSpace(username) &&
                 !string.Equals(tenant.Username, username, StringComparison.OrdinalIgnoreCase))
             {
                 tenant.Username = username;
                 changed = true;
             }
-
             if (string.IsNullOrWhiteSpace(tenant.BrandName) && !string.IsNullOrWhiteSpace(me.FirstName))
             {
                 tenant.BrandName = me.FirstName;
                 changed = true;
             }
-
             if (changed)
             {
                 tenant.UpdatedAtUtc = DateTime.UtcNow;
@@ -1850,44 +1915,14 @@ public partial class TenantBotService
                 _botRegistry.Upsert(tenant);
                 _botClientProvider.Invalidate(tenant.Id);
             }
-
-            return null;
         }
-        catch (Exception ex) when (ISTELEGRAMTOKENINVALIDERROR(ex))
+        catch (DbUpdateConcurrencyException)
         {
-            await StopTenantRuntimeBestEffortAsync(tenant.Id, CancellationToken);
-
-            ResetTenantStorefrontSettings(tenant, clearAllStorefrontSettings: false);
-            await _workflow.SaveAsync(CancellationToken);
-            _botRegistry.Upsert(tenant);
-            _botClientProvider.Invalidate(tenant.Id);
-
-            _logger.LogWarning(
-                "Tenant bot token was invalid during owner panel refresh and was cleared. tenantBotId={TenantBotId}, owner={OwnerTelegramUserId}, reason={Reason}",
-                tenant.Id,
-                tenant.OwnerTelegramUserId,
-                ex.Message);
-
-            return "⚠️ توکن ربات فروشگاهی معتبر نبود و از تنظیمات پاک شد. لطفاً توکن جدید ثبت کنید.";
+            CancellationToken.ThrowIfCancellationRequested();
+            await _workflow.ReloadAsync(tenant, CancellationToken);
         }
-        catch (Exception ex) when (ISTELEGRAMTRANSIENTTOKENCHECKERROR(ex))
-        {
-            _logger.LogDebug(
-                ex,
-                "Tenant bot token validation skipped because Telegram returned a transient error. tenantBotId={TenantBotId}",
-                tenant.Id);
-
-            return "⚠️ فعلاً امکان بررسی توکن ربات فروشگاهی نیست. اگر تلگرام مشکل موقت داشته باشد، دوباره بروزرسانی را بزنید.";
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(
-                ex,
-                "Tenant bot token validation skipped because Telegram returned an unknown non-authoritative error. tenantBotId={TenantBotId}",
-                tenant.Id);
-
-            return "⚠️ فعلاً امکان بررسی توکن ربات فروشگاهی نیست. تنظیمات شما پاک نشد؛ کمی بعد دوباره بروزرسانی را بزنید.";
-        }
+        CancellationToken.ThrowIfCancellationRequested();
+        return null;
     }
 
     /// <summary>
@@ -1903,9 +1938,13 @@ public partial class TenantBotService
     /// <remarks>
     /// Reset and invalid-token cleanup must update users.db even when the receiver is already stopped or the hosted
     /// service is unavailable. For that reason this helper logs runtime stop failures and lets the caller continue.
+    /// Handler cancellation is not a best-effort failure and propagates before and after receiver shutdown.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The owner update was canceled.</exception>
+    /// <example><code>await StopTenantRuntimeBestEffortAsync(store.Id, updateCancellation);</code></example>
     private async Task StopTenantRuntimeBestEffortAsync(string tenantBotId, CancellationToken CancellationToken)
     {
+        CancellationToken.ThrowIfCancellationRequested();
         var runtime = _serviceProvider.GetService<MultiBotHostedService>();
         if (runtime == null || string.IsNullOrWhiteSpace(tenantBotId))
             return;
@@ -1913,9 +1952,11 @@ public partial class TenantBotService
         try
         {
             await runtime.StopBotAsync(tenantBotId);
+            CancellationToken.ThrowIfCancellationRequested();
         }
         catch (Exception ex)
         {
+            CancellationToken.ThrowIfCancellationRequested();
             _logger.LogWarning(
                 ex,
                 "Tenant bot receiver stop failed during settings cleanup. tenantBotId={TenantBotId}",
@@ -1973,64 +2014,6 @@ public partial class TenantBotService
         tenant.TenantTutorialsJson = JsonConvert.SerializeObject(Array.Empty<TenantTutorialLink>());
     }
 
-    /// <summary>
-    /// Determines whether a Telegram exception proves that a bot token is revoked, invalid, or unauthorized.
-    /// </summary>
-    /// <param name="exception">
-    /// Exception thrown by Telegram <c>getMe</c> or another bot-token validation call. The exception message is
-    /// inspected without logging or exposing the raw token.
-    /// </param>
-    /// <returns>
-    /// <c>true</c> when the token should be cleared from the tenant row; otherwise <c>false</c>.
-    /// </returns>
-    private static bool ISTELEGRAMTOKENINVALIDERROR(Exception exception)
-    {
-        if (exception is ApiRequestException apiException &&
-            (apiException.ErrorCode == 401 || CONTAINSTOKENINVALIDTEXT(apiException.Message)))
-            return true;
-
-        return CONTAINSTOKENINVALIDTEXT(exception?.Message);
-    }
-
-    /// <summary>
-    /// Determines whether a token validation failure is likely a temporary Telegram/network issue.
-    /// </summary>
-    /// <param name="exception">
-    /// Exception thrown while probing the tenant token. The raw token is never included in this value by callers.
-    /// </param>
-    /// <returns>
-    /// <c>true</c> for timeout, cancellation, rate-limit, and Telegram 5xx errors that should not clear settings.
-    /// </returns>
-    private static bool ISTELEGRAMTRANSIENTTOKENCHECKERROR(Exception exception)
-    {
-        if (exception is TimeoutException || exception is TaskCanceledException)
-            return true;
-
-        if (exception is ApiRequestException apiException)
-            return apiException.ErrorCode == 429 || apiException.ErrorCode >= 500;
-
-        var message = exception?.Message;
-        return !string.IsNullOrWhiteSpace(message) &&
-               (message.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
-                message.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
-                message.Contains("temporarily", StringComparison.OrdinalIgnoreCase));
-    }
-
-    /// <summary>
-    /// Checks Telegram error text for invalid-token keywords without exposing the token value.
-    /// </summary>
-    /// <param name="message">Telegram or client-library error message to inspect.</param>
-    /// <returns><c>true</c> when the message describes an invalid, revoked, or unauthorized bot token.</returns>
-    private static bool CONTAINSTOKENINVALIDTEXT(string message)
-    {
-        if (string.IsNullOrWhiteSpace(message))
-            return false;
-
-        return message.Contains("unauthorized", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("invalid token", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("bot token", StringComparison.OrdinalIgnoreCase) &&
-               message.Contains("invalid", StringComparison.OrdinalIgnoreCase);
-    }
 
     /// <summary>
     /// Starts a one-message owner input flow for a specific tenant setting.
@@ -2138,13 +2121,18 @@ public partial class TenantBotService
     /// <remarks>The returned numeric identity must match the token and be unique across tenant, owned and assistant bots.
     /// Stops only the selected receiver before replacement. The unique database identity closes concurrent registration races.
     /// A changed numeric bot or owner identity revokes all customer-wallet approval evidence before persistence.
+    /// Token registration retains its existing configured startup-sized budget, using the injectable transport.
+    /// Every successful save removes cached foreground checks, including checks for a replaced secret with the same bot id.
     /// Raw tokens and probe exception text are never sent to logs or replies. All financial history is preserved.</remarks>
+    /// <exception cref="OperationCanceledException">The owner update was canceled during validation or persistence.</exception>
+    /// <example><code>await SAVETENANTBOTTOKENASYNC(client, tokenMessage, owner, updateCancellation);</code></example>
     private async Task SAVETENANTBOTTOKENASYNC(
         ITelegramBotClient botClient,
         Message Message,
         CredUser owner,
         CancellationToken CancellationToken)
     {
+        CancellationToken.ThrowIfCancellationRequested();
         var Token = Message.Text?.Trim();
         if (string.IsNullOrWhiteSpace(Token) || !Token.Contains(':'))
         {
@@ -2158,12 +2146,13 @@ public partial class TenantBotService
         Telegram.Bot.Types.User me;
         try
         {
-            var TENANTCLIENT = new TelegramBotClient(new TelegramBotClientOptions(Token) { RetryCount = 0 });
             using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
-            me = await TENANTCLIENT.GetMe(probeCts.Token);
+            me = await _tokenProbe.GetMeAsync(Token, probeCts.Token);
+            CancellationToken.ThrowIfCancellationRequested();
         }
         catch (Exception)
         {
+            CancellationToken.ThrowIfCancellationRequested();
             await botClient.SendMessage(
                 Message.Chat.Id,
                 "اعتبارسنجی توکن ناموفق بود. توکن و اتصال تلگرام را بررسی کنید.",
@@ -2230,6 +2219,7 @@ public partial class TenantBotService
             await botClient.SendMessage(Message.Chat.Id, "این ربات هم‌زمان در فروشگاه دیگری ثبت شده است. توکن دیگری وارد کنید.", cancellationToken: CancellationToken);
             return;
         }
+        _ownerTokenProbeCache.Invalidate(tenant.Id);
         await _state.ClearUserStatus(new User { Id = owner.TelegramUserId });
         _botRegistry.Upsert(tenant);
         _botClientProvider.Invalidate(tenant.Id);
@@ -14069,25 +14059,65 @@ public partial class TenantBotService
             _logger, BotContextAccessor.CurrentBotId, timeout: _interactionTimeouts.CallbackAnswer);
     }
 
-    /// <summary>
-    /// edits A Telegram Message without ALLOWING HARMLESS edit failures to stop the Bot receiver.
-    /// </summary>
-    /// <param name="botClient">Telegram Bot client that owns the Message.</param>
-    /// <param name="ChatId">Telegram chat Id containing the Message to edit.</param>
-    /// <param name="MessageId">Telegram Message Id to edit.</param>
-    /// <param name="Text">new Message Text.</param>
-    /// <param name="ParseMode">optional Parse Mode used for the edited Text.</param>
-    /// <param name="replyMarkup">optional inline keyboard for the edited Message.</param>
-    /// <param name="CancellationToken">Cancellation Token for the Telegram API call.</param>
-    /// <remarks>
-    /// Telegram rejects edits when the new content and markup are IDENTICAL to the current Message.
-    /// that is A no-OP from our Business PERSPECTIVE and must not break owned Bot or tenant Bot flows.
-    /// </remarks>
+    /// <summary>Recognizes Telegram's authoritative confirmation that an edit already matches the visible message.</summary>
+    /// <param name="errorCode">Numeric Telegram API status; only 400 can identify this no-op.</param>
+    /// <param name="message">Nullable API error description inspected locally, never emitted by this classifier.</param>
+    /// <returns>True only for a 400 response containing Telegram's message-not-modified reason.</returns>
+    /// <remarks>Other API failures are not semantic success, even if their description mentions the same words.</remarks>
+    /// <example><code>var unchanged = ISTELEGRAMMESSAGENOTMODIFIED(exception.ErrorCode, exception.Message);</code></example>
     internal static bool ISTELEGRAMMESSAGENOTMODIFIED(int errorCode, string message) =>
         errorCode == 400 && message?.Contains("message is not modified", StringComparison.OrdinalIgnoreCase) == true;
 
     internal static bool ISTELEGRAMEDITTARGETMISSING(int errorCode, string message) =>
         errorCode == 400 && message?.Contains("message to edit not found", StringComparison.OrdinalIgnoreCase) == true;
+    /// <summary>Edits a message while treating only Telegram's message-not-modified response as success.</summary>
+    /// <param name="botClient">Required Telegram transport belonging to the bot that owns the message.</param>
+    /// <param name="chatId">Required Telegram chat identifier containing the message, not an internal tenant id.</param>
+    /// <param name="messageId">Positive Telegram message identifier in that chat.</param>
+    /// <param name="text">Required rendered message text; escaping must match the selected parse mode.</param>
+    /// <param name="parseMode">Optional Telegram text parsing mode; null sends plain text.</param>
+    /// <param name="replyMarkup">Optional inline keyboard; null removes existing inline markup.</param>
+    /// <param name="cancellationToken">Outer handler cancellation, propagated even when Telegram confirms a no-op.</param>
+    /// <returns>A task completing when the edit is accepted or already visible; it never changes local business state.</returns>
+    /// <remarks>Used by strict owner discount rendering and the legacy best-effort wrapper. No retries or replacement messages are sent.</remarks>
+    /// <exception cref="ApiRequestException">Telegram rejects the edit for any reason other than message-not-modified.</exception>
+    /// <exception cref="OperationCanceledException">The handler or Telegram request is cancelled.</exception>
+    /// <example><code>await EditMessageTextAllowNoOpAsync(client, ownerChatId, menuMessageId, renderedText, ParseMode.Html, keyboard, token);</code></example>
+    private static async Task EditMessageTextAllowNoOpAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        int messageId,
+        string text,
+        ParseMode? parseMode = null,
+        InlineKeyboardMarkup replyMarkup = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            await botClient.EditMessageText(
+                chatId, messageId, text, parseMode: parseMode ?? ParseMode.None,
+                replyMarkup: replyMarkup, cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ISTELEGRAMMESSAGENOTMODIFIED(ex.ErrorCode, ex.Message))
+        {
+            // Telegram confirms both requested content and markup are already present; no local replay is needed.
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>Retains best-effort menu editing for existing callers, using the shared no-op edit semantics.</summary>
+    /// <param name="botClient">Required Telegram transport belonging to the bot that owns the message.</param>
+    /// <param name="chatId">Telegram chat identifier containing the existing menu.</param>
+    /// <param name="messageId">Telegram message identifier to edit in that chat.</param>
+    /// <param name="text">Rendered menu text, escaped for the selected parse mode.</param>
+    /// <param name="parseMode">Optional parsing mode; null sends plain text.</param>
+    /// <param name="replyMarkup">Optional inline keyboard for the updated menu.</param>
+    /// <param name="cancellationToken">Handler cancellation; cancellation exceptions are never swallowed.</param>
+    /// <returns>A task after the edit succeeds, is unchanged, or a Telegram API rejection is logged.</returns>
+    /// <remarks>Legacy callers keep their logged best-effort rejection behavior. Discount menus instead use the strict helper directly.</remarks>
+    /// <exception cref="OperationCanceledException">The update or edit request is cancelled.</exception>
+    /// <example><code>await SafeEditMessageTextAsync(client, ownerChatId, menuMessageId, text, replyMarkup: keyboard, cancellationToken: token);</code></example>
 
     private async Task SafeEditMessageTextAsync(
         ITelegramBotClient botClient,
@@ -14100,17 +14130,8 @@ public partial class TenantBotService
     {
         try
         {
-            await botClient.EditMessageText(
-                chatId,
-                messageId,
-                text,
-                parseMode: parseMode ?? ParseMode.None,
-                replyMarkup: replyMarkup,
-                cancellationToken: cancellationToken);
-        }
-        catch (ApiRequestException ex) when (ISTELEGRAMMESSAGENOTMODIFIED(ex.ErrorCode, ex.Message))
-        {
-            // Telegram confirms the requested content and markup are already present: semantic success/no-op.
+            await EditMessageTextAllowNoOpAsync(
+                botClient, chatId, messageId, text, parseMode, replyMarkup, cancellationToken);
         }
         catch (ApiRequestException ex) when (ISTELEGRAMEDITTARGETMISSING(ex.ErrorCode, ex.Message))
         {
@@ -14533,7 +14554,7 @@ public partial class TenantBotService
     }
 
     /// <summary>
-    /// Creates a bounded cancellation scope for owner-panel Telegram validation calls.
+    /// Creates the existing startup-sized cancellation scope for token registration and forced-join capability checks.
     /// </summary>
     /// <param name="outerCancellationToken">Update-handler token that must also cancel the validation probe.</param>
     /// <returns>
@@ -14541,8 +14562,8 @@ public partial class TenantBotService
     /// five through sixty seconds.
     /// </returns>
     /// <remarks>
-    /// Panel refresh, token validation, and forced-join capability checks share this bound so none can hold a
-    /// Telegram callback open for the library's default one-hundred-second HTTP timeout.
+    /// Token registration and forced-join capability checks retain this configuration-based bound.
+    /// Owner-panel token refresh instead uses the dedicated short budget in TenantOwnerTokenProbeCache.
     /// </remarks>
     private CancellationTokenSource CreateTenantTelegramProbeCancellation(CancellationToken outerCancellationToken)
     {

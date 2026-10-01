@@ -34,7 +34,10 @@ public enum TelegramUpdateStage
     DatabaseWait,
 
     /// <summary>Durable business recovery work performed inside the handler.</summary>
-    BusinessRecovery
+    BusinessRecovery,
+
+    /// <summary>A Telegram token identity/GetMe probe; token and returned identity are never stage metadata.</summary>
+    TelegramProbe
 }
 
 /// <summary>

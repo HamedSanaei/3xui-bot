@@ -1,5 +1,17 @@
 # CODE_MAP.md
 
+- Tenant callback reliability (2026-10-01): discount rendering uses `EditMessageTextAllowNoOpAsync`,
+  shared with the existing best-effort editor: only Telegram 400/message-not-modified is success;
+  other discount edit errors and cancellation propagate to the durable inbox. Owner-panel getMe
+  uses singleton `TenantOwnerTokenProbeCache` / injectable `ITelegramTokenProbe`: fixed 2 s deadline,
+  512 LRU tenant/SHA-256-token entries, 3 min success / 20 s transient-or-unavailable TTL, single flight.
+  Save/reset/invalid cleanup invalidate immediately after commit; detached old probes cannot refill
+  the cache, and reload + identity/revision + workflow concurrency checks prevent stale cleanup.
+  Transients never persist invalid health or erase settings; only authoritative rejection cleans identity.
+  Probe waits report `TelegramProbe`; scheduler API failures keep `ErrorType`, add numeric `ErrorCode`
+  and shared sanitized `ReasonCode`, never exception payloads. Regressions: `TenantDiscountTests.cs`,
+  `TenantOwnerTokenProbeTests.cs`, `TelegramSchedulerDiagnosticsTests.cs`; FIFO/concurrency unchanged.
+
 - Tenant storefront pricing: `BotInstance.TenantPricingMode` defaults to `percent` (zero markup
   charges the public catalog, positive markup charges colleague cost plus percentage; unlimited
   `TenantUsesUserPrice` retains public priority). `manual` instead prices normal GB/day, national
@@ -346,7 +358,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Normal and unlimited services may share the same public inbounds. Renewal/search must trust metadata first; if metadata is missing, negative expiry means unlimited, otherwise shared public inbounds should resolve to normal metered service.
 - Tenant support contacts should be stored as canonical `@username`; `t.me` links are normalized before display so customers never see `@https://...`.
 - Tenant operational logs, lifecycle notifications, and payment audit logs are delivered through the default owned bot to the central logger channel. Tenant storefront bots are not expected to be members of the private logger channel.
-- Tenant owner-panel reset clears only owner-configured storefront settings and disables the tenant bot; it must preserve orders, receipts, payments, ledger entries, and customer state. Invalid-token cleanup on panel refresh clears only `Token`, `Username`, and `Enabled`, leaving card/support/tutorial settings intact.
+- Tenant owner-panel reset clears owner-configured settings and token identity, disables the bot and revokes identity-bound wallet approval; orders, receipts, payments, ledger entries and customer state survive. Authoritative invalid-token cleanup clears `Token`, `TelegramBotId`, `Username`, enabled state and wallet approval, preserving prices/card/support/tutorial settings.
 - Tenant owner toggle uses bounded runtime startup retries for transient Telegram/network timeouts. If the receiver still cannot start, the tenant row is rolled back to `Enabled=false` and no central tenant failure notification is sent for the transient timeout.
 
 ## Payment and Ledger Rules
@@ -639,7 +651,7 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   Existing 2 s callback-ack and 5 s mandatory-join budgets are unchanged;
   durable delivery retains its own `delivery_uncertain` semantics.
 - **Stage attribution** (`Services/TelegramUpdateLatencyScope.cs`): closed vocabulary `XuiRead`, `TelegramSend`,
-  `TelegramEdit`, `TelegramMembership`, `SiteLookup`, `ProviderRead`, `DatabaseWait`, `BusinessRecovery`, carried by
+  `TelegramEdit`, `TelegramMembership`, `TelegramProbe`, `SiteLookup`, `ProviderRead`, `DatabaseWait`, `BusinessRecovery`, carried by
   `AsyncLocal` for one update execution only. The scheduler pushes one scope per execution; the bounded client wrapper,
   `ApiServicev3` foreground reads, and `GozargahSiteApiClient.SendAsync` report stage durations. Only stages above
   `SlowStageThreshold` (default 2 s) are logged, and stage names come from the enum so no email, order id, callback
@@ -755,8 +767,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   the customer-facing sentence as literal `?` characters. The intended text
   `ایجاد پرداخت ارز دیجیتال ناموفق بود. جزئیات خطا در ترمینال ثبت شد.` was recovered verbatim from the revision that
   introduced that NOWPayments branch and is identical to the sibling messages on the same branch; it was not guessed.
-- Regression coverage: `Adminbot.Tests/TelegramForegroundLatencyTests.cs` (18 tests) and
-  `Adminbot.Tests/TelegramForegroundLatencyFollowUpTests.cs` (13 tests), plus the existing `TelegramLaneOwnerRoutingTests`
+- Regression coverage: `Adminbot.Tests/TelegramForegroundLatencyTests.cs` and
+  `Adminbot.Tests/TelegramForegroundLatencyFollowUpTests.cs`, plus the existing `TelegramLaneOwnerRoutingTests`
   interaction-timeout guards. The follow-up file covers operator-channel noise classification, callback sender
   attribution, the site-lookup budget and the background exclusion, edit/album delivery bounds, the owned
   installation-guide / main-menu / latest-client menus through the real owned dispatcher, the real `TN:svc:`
@@ -1073,7 +1085,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - `MultiBotHostedService` serializes start/stop/cleanup per `BotId`; never register a receiver outside that lifecycle
   gate or overwrite its CTS. A transient bounded `GetMe` probe starts one optimistic receiver and completes identity/
   command setup in the background with `initializing/degraded` status. Invalid and duplicate tokens remain fail-closed.
-- `telegramBotStartupProbeTimeoutSeconds` controls the short Telegram startup/panel probe (default 12 seconds).
+- `telegramBotStartupProbeTimeoutSeconds` controls startup, registration and forced-join capability probes (default 12 seconds);
+  owner-panel token refresh instead uses a fixed 2-second foreground deadline and bounded memory-only cache.
   `SetMyCommands` is background initialization and must not stop an already registered receiver.
 - Super-admins can use `🤖 وضعیت ربات‌ها` to see process-local receiver health for every owned, assistant, and tenant bot. The report comes from `BotRuntimeStatusStore`; it never exposes tokens and does not call Telegram.
 - Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel. They now also apply a bounded per-bot backoff through `Domain/Logging/TelegramPollingBackoffPolicy.cs`: `TelegramPollingBackoffTracker` keeps `ConsecutiveTransientFailures`/`LastFailureAtUtc`/`LastOperationalLogAtUtc` per internal `BotId` (in-memory only, no schema, no migration), the delay is `1s,2s,4s,8s,16s,…` capped at 30s with ±20% jitter, and it is awaited with the receiver token (shutdown during backoff is the normal stop path). State decays after a `HealthyResetSeconds` (60s) gap because Telegram.Bot 22.10.3 only invokes the error handler on failure and exposes no successful-empty-`getUpdates` callback, and it is cleared on 429, on a per-user delivery error, and when a receiver stops (`StopBotCore`), so historical tenant ids cannot accumulate state. `IsTransientGatewayFailure` is the single classifier shared by `MultiBotHostedService` and `TelegramBotService`; it trusts Telegram API error codes and `RequestException.HttpStatusCode` 5xx (the Telegram edge can return a plain status without a JSON error body), and it walks the exception chain so the Telegram.Bot 22.10.3 `RequestException -> HttpRequestException -> IOException -> SocketException` TLS/connection-reset shape (`Bot API Service Failure: ...`) is transient instead of falling through to the legacy polling logger; permanent evidence (400/401/403 and both 409 conflict variants) is evaluated first and always wins, and 408/425 stay transient. Bursts log at most one `Telegram polling degraded.` summary per bot per window (suppressed from the Telegram channel); only genuine non-transient polling errors reach the process console, and these failures are never written to `TelegramOutbox`.

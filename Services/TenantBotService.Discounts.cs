@@ -377,13 +377,17 @@ public partial class TenantBotService
     /// <param name="text">HTML-escaped owner-facing details and warnings.</param>
     /// <param name="rows">Owner-addressed inline buttons for the rendered menu.</param>
     /// <param name="token">Cancellation for Telegram delivery.</param>
-    /// <returns>A task after Telegram accepts the edit or new message.</returns>
+    /// <returns>A task after Telegram accepts the edit, confirms identical content/markup, or accepts the new message.</returns>
+    /// <remarks>Only message-not-modified is a successful no-op. No draft, revision, discount definition, or financial state is changed here.</remarks>
+    /// <exception cref="Telegram.Bot.Exceptions.ApiRequestException">Telegram rejects delivery for a reason other than an identical edit.</exception>
+    /// <exception cref="OperationCanceledException">The outer handler or Telegram delivery is cancelled.</exception>
+    /// <example><code>await ShowOwnerDiscountMessageAsync(client, ownerChatId, menuMessageId, text, addressedRows, token);</code></example>
     private static async Task ShowOwnerDiscountMessageAsync(ITelegramBotClient client, long chat, int? messageId,
         string text, IEnumerable<InlineKeyboardButton[]> rows, CancellationToken token)
     {
         var keyboard = new InlineKeyboardMarkup(rows);
         if (messageId.HasValue)
-            await client.EditMessageText(chat, messageId.Value, text, parseMode: ParseMode.Html,
+            await EditMessageTextAllowNoOpAsync(client, chat, messageId.Value, text, parseMode: ParseMode.Html,
                 replyMarkup: keyboard, cancellationToken: token);
         else await client.SendMessage(chat, text, parseMode: ParseMode.Html, replyMarkup: keyboard,
             cancellationToken: token);

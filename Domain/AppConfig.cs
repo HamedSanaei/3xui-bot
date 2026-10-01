@@ -137,8 +137,9 @@ namespace Adminbot.Domain
         /// </summary>
         /// <remarks>
         /// A transient probe timeout does not stop receiver creation. The runtime starts the receiver optimistically
-        /// and repeats identity and command initialization in the background. Values below five seconds are clamped
-        /// to protect normal Telegram latency, and values above sixty seconds are capped to keep owner callbacks responsive.
+        /// and repeats identity and command initialization in the background. Values are clamped to five through
+        /// sixty seconds. Token registration and forced-join capability checks also retain this configured budget;
+        /// owner-panel token refresh instead has an independent two-second foreground budget and memory-only cache.
         /// </remarks>
         public int TelegramBotStartupProbeTimeoutSeconds { get; set; } = 12;
         /// <summary>Global maximum simultaneously executing Telegram updates, from 1 to 256.</summary>
