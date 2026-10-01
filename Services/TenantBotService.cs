@@ -14079,7 +14079,7 @@ public partial class TenantBotService
     /// <param name="replyMarkup">Optional inline keyboard; null removes existing inline markup.</param>
     /// <param name="cancellationToken">Outer handler cancellation, propagated even when Telegram confirms a no-op.</param>
     /// <returns>A task completing when the edit is accepted or already visible; it never changes local business state.</returns>
-    /// <remarks>Used by strict owner discount rendering and the legacy best-effort wrapper. No retries or replacement messages are sent.</remarks>
+    /// <remarks>Used by owner discount menus, customer purchase quotes, and the legacy best-effort wrapper. No retries or replacement messages are sent.</remarks>
     /// <exception cref="ApiRequestException">Telegram rejects the edit for any reason other than message-not-modified.</exception>
     /// <exception cref="OperationCanceledException">The handler or Telegram request is cancelled.</exception>
     /// <example><code>await EditMessageTextAllowNoOpAsync(client, ownerChatId, menuMessageId, renderedText, ParseMode.Html, keyboard, token);</code></example>

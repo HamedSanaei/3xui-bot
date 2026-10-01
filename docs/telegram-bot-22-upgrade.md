@@ -1,7 +1,34 @@
-# Telegram.Bot 22.10.3 compatibility update
+# Telegram.Bot v22 compatibility and patch updates
 
 Pinned the explicitly requested Telegram.Bot version from 19.0.0 to 22.10.3. No business-policy, database-schema,
 receiver scheduling or payment changes are intended.
+
+## Stable patch follow-up (2026-10-01)
+
+The current package pin is **22.10.3.2**, the latest stable version in the
+[official NuGet index](https://api.nuget.org/v3-flatcontainer/telegram.bot/index.json).
+The [upstream release](https://github.com/TelegramBots/Telegram.Bot/releases/tag/v22.10.3.2)
+and [22.10.3-to-22.10.3.2 comparison](https://github.com/TelegramBots/Telegram.Bot/compare/v22.10.3...v22.10.3.2)
+include reply-markup serialization fixes, rich-message/media improvements and 64-bit draft identifiers.
+No application call-site migration was needed for this patch; application-owned retry and foreground budgets remain unchanged.
+
+An isolated runtime smoke used the actual SDK with controlled Bot API HTTP responses and temporary SQLite databases.
+Repeated customer code entry preserved the original quote/message and net price on an identical-edit confirmation;
+an unbound quote recovered its binding; a genuine missing target still created a replacement and expired the old buttons.
+Both owner help examples were entered through the real callbacks/text parser and saved with their exact fields.
+The changed discount/Telegram regression selection passed 55 cases. No live Telegram/provider call or production-data mutation was used;
+Telegram-client visual rendering was not exercised.
+
+Windows test execution was blocked by Defender quarantining the application assembly.
+Runtime verification used an isolated Linux source copy with SDK 10.0.302 and full ICU globalization instead;
+no Windows security settings or exclusions were changed.
+
+Final Linux verification: the complete existing Release suite passed **1051 tests, 0 failures** with the actual source
+commit supplied through `SourceRevisionId`. The earlier source-copy run lacked Git metadata and used Debug configuration;
+its provenance check failed before that verification prerequisite was corrected. Twelve existing test-fixture warnings remain.
+Standalone production `Adminbot.csproj` publish succeeded with `-c Release -f net10.0 -r linux-x64 --self-contained false`;
+no auxiliary test project is part of that publish dependency graph.
+The published application also completed `--migration-check`: both `UserDbContext` and `CredentialsDbContext` reported `OK`.
 
 ## Compatibility fixes
 

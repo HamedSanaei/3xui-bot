@@ -49,7 +49,7 @@ public partial class TenantBotService
     /// <param name="action">Decoded short discount action, not an authorization token.</param>
     /// <param name="token">Cancellation of local state, database, and Telegram operations.</param>
     /// <returns>A task after the nested menu or prompt is delivered.</returns>
-    /// <remarks>Never reachable through tenant customer updates. Every read and commit additionally checks exact store ownership.</remarks>
+    /// <remarks>Never reachable through tenant customer updates. Every read and commit additionally checks exact store ownership. Field prompts show ASCII input examples, toman units, and the shared paid/reserved usage limit without changing validation.</remarks>
     private async Task HandleOwnerDiscountCallbackAsync(ITelegramBotClient client, CallbackQuery callback,
         CredUser owner, User state, string action, CancellationToken token)
     {
@@ -104,11 +104,13 @@ public partial class TenantBotService
                     await SaveOwnerDiscountDraftAsync(owner.TelegramUserId, draft, "discount-" + field, token);
                     await client.SendMessage(chat, field switch
                     {
-                        "code" => "کد لاتین (۳ تا ۳۲ حرف/عدد، _ یا -) را وارد کنید:",
-                        "value" => draft.Kind == TenantDiscountKinds.Percent ? "درصد تخفیف (۱ تا ۱۰۰) را وارد کنید:" : "مبلغ تخفیف به تومان را وارد کنید:",
-                        "cap" => "سقف تخفیف به تومان را وارد کنید؛ برای حذف سقف از دکمه «بدون سقف» استفاده کنید:",
-                        "min" => "حداقل مبلغ سفارش قبل از تخفیف به تومان را وارد کنید (صفر مجاز است):",
-                        _ => "حداکثر تعداد استفاده (۱ تا ۱٬۰۰۰٬۰۰۰) را وارد کنید:"
+                        "code" => "کد لاتین (۳ تا ۳۲ حرف/عدد، _ یا -) را وارد کنید.\nمثال: SAVE50 یا OFF_20",
+                        "value" => draft.Kind == TenantDiscountKinds.Percent
+                            ? "درصد تخفیف (1 تا 100) را وارد کنید.\nمثال: 20 یعنی ۲۰٪ از مبلغ سفارش قبل از تخفیف.\nفقط ارقام انگلیسی، بدون جداکننده."
+                            : "مبلغ ثابت تخفیف به تومان را وارد کنید.\nمثال: 50000 یعنی ۵۰ هزار تومان.\nفقط ارقام انگلیسی، بدون جداکننده.",
+                        "cap" => "سقف مبلغ تخفیف به تومان را وارد کنید، نه حداقل خرید.\nمثال: 30000 یعنی تخفیف حداکثر ۳۰ هزار تومان.\nفقط ارقام انگلیسی، بدون جداکننده؛ برای حذف سقف از دکمه «بدون سقف» استفاده کنید.",
+                        "min" => "حداقل مبلغ سفارش قبل از تخفیف به تومان را وارد کنید.\nمثال: 200000 یعنی سفارش حداقل ۲۰۰ هزار تومان؛ 0 یعنی بدون حداقل.\nفقط ارقام انگلیسی، بدون جداکننده.",
+                        _ => "حداکثر تعداد استفاده از این کد (1 تا 1000000) را وارد کنید.\nمثال: 10 یعنی مجموعاً ۱۰ بار استفاده از این کد در این فروشگاه، نه برای هر مشتری.\nاستفاده‌های پرداخت‌شده و رزروهای در انتظار پرداخت هر دو ظرفیت را اشغال می‌کنند.\nفقط ارقام انگلیسی، بدون جداکننده."
                     }, replyMarkup: new ReplyKeyboardMarkup(new[] { new[] { new KeyboardButton("بازگشت به پنل") } })
                     { ResizeKeyboard = true }, cancellationToken: token);
                     await SafeAnswerCallbackQueryAsync(client, callback.Id, cancellationToken: token);
@@ -331,7 +333,7 @@ public partial class TenantBotService
             }, token);
     }
 
-    /// <summary>Shows unsaved draft choices and the exact validation reason before committing any owner edit.</summary>
+    /// <summary>Shows unsaved draft choices, practical fixed/percentage examples, and the exact validation reason before committing any owner edit.</summary>
     /// <param name="client">Owned-bot transport for the draft preview.</param>
     /// <param name="chat">Authenticated owner's numeric Telegram chat id.</param>
     /// <param name="messageId">Existing menu message id, or null to send a new draft message.</param>
@@ -340,6 +342,8 @@ public partial class TenantBotService
     /// <param name="error">Optional customer-safe validation or concurrency failure.</param>
     /// <param name="token">Cancellation for the Telegram message operation.</param>
     /// <returns>A task after the draft controls are displayed.</returns>
+    /// <remarks>Examples are presentation-only, not presets. Explains scope, shared usage capacity, final save, and the colleague-cost margin bound without changing defaults or financial rules.</remarks>
+    /// <example><code>await ShowOwnerDiscountDraftAsync(client, ownerChatId, callback.Message?.MessageId, store, draft, error: null, token);</code></example>
     private async Task ShowOwnerDiscountDraftAsync(ITelegramBotClient client, long chat, int? messageId,
         BotInstance store, OwnerDiscountDraft draft, string error, CancellationToken token)
     {
@@ -349,11 +353,21 @@ public partial class TenantBotService
         var validation = TenantDiscountService.ValidateOwnerInput(input);
         var text = "🎟 <b>پیش‌نویس کد تخفیف</b>\nتا ذخیره نهایی هیچ تنظیمی تغییر نمی‌کند.\n" +
             $"کد: <code>{Html(draft.Code ?? "ثبت نشده")}</code>\n" +
-            $"نوع: {Html(draft.Kind ?? "ثبت نشده")} | مقدار: {Html(draft.Kind == TenantDiscountKinds.Percent ? draft.Percent?.ToString() ?? "ثبت نشده" : draft.FixedAmountToman?.ToString("N0") ?? "ثبت نشده")}\n" +
+            $"نوع: {Html(draft.Kind ?? "ثبت نشده")} | مقدار: {Html(draft.Kind == TenantDiscountKinds.Percent ? draft.Percent?.ToString() ?? "ثبت نشده" : draft.FixedAmountToman?.ToString("N0") ?? "ثبت نشده")} {(draft.Kind == TenantDiscountKinds.Percent ? "درصد" : "تومان")}\n" +
             $"سقف: {(draft.MaxDiscountToman.HasValue ? $"{draft.MaxDiscountToman:N0} تومان" : "بدون سقف")}\n" +
             $"حداقل سفارش: {Html(draft.MinimumOrderToman?.ToString("N0") ?? "ثبت نشده")} تومان\n" +
             $"حداکثر استفاده: {Html(draft.MaxUses?.ToString("N0") ?? "ثبت نشده")}\n" +
-            $"کاربرد: {DiscountScopeText(draft.Scope)}";
+            $"کاربرد: {DiscountScopeText(draft.Scope)}\n\n" +
+            "<b>راهنمای کوتاه</b>\n" +
+            "اول «مبلغ ثابت» یا «درصدی» را انتخاب کنید، سپس مقدار تخفیف را وارد کنید.\n" +
+            "ثابت = مبلغ تومان؛ درصدی = درصد مبلغ قبل از تخفیف. سقف، بیشترین تخفیف است؛ حداقل سفارش، شرط مبلغ قبل از تخفیف.\n" +
+            "خرید = فقط خرید جدید؛ تمدید = فقط تمدید اکانت؛ هر دو = خرید و تمدید.\n" +
+            "حداکثر استفاده از هر کد برای مجموع مشتریان همین فروشگاه است، نه هر مشتری؛ پرداخت‌شده‌ها و رزروهای در انتظار پرداخت ظرفیت را اشغال می‌کنند.\n" +
+            "تخفیف واقعی از سود قابل‌استفاده بالای هزینه همکار بیشتر نمی‌شود؛ ممکن است از مبلغ یا درصد اسمی کمتر باشد.\n\n" +
+            "<b>دو نمونه برای ورود دستی</b> (اعداد انگلیسی، بدون جداکننده):\n" +
+            "• ثابت: کد <code>SAVE50</code>، مقدار 50000 تومان، بدون سقف، حداقل 200000 تومان، خرید، حداکثر 10 استفاده، فعال.\n" +
+            "• درصدی: کد <code>OFF_20</code>، مقدار 20 درصد، سقف 30000 تومان، حداقل 100000 تومان، هر دو، حداکثر 20 استفاده، فعال.\n" +
+            "نمونه‌ها خودکار اعمال نمی‌شوند؛ فیلدها را تنظیم کنید و پس از تکمیل، «✅ ذخیره نهایی» را بزنید.";
         if (error != null) text += $"\n\n⚠️ {Html(error)}";
         else if (validation != TenantDiscountFailure.None) text += $"\n\nبرای ذخیره: {Html(DiscountOwnerError(validation))}";
         var rows = new List<InlineKeyboardButton[]>

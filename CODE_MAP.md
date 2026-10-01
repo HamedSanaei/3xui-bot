@@ -10,9 +10,9 @@
   Historical 14177/14187 payloads/stage timings are absent from available archives: exact old slow path is unproven.
   Observe new local request records plus watchdog count/elapsed fields in production; local file minimum still applies.
 
-- Tenant callback reliability (2026-10-01): discount rendering uses `EditMessageTextAllowNoOpAsync`,
+- Tenant callback reliability (2026-10-01): owner discount rendering uses `EditMessageTextAllowNoOpAsync`,
   shared with the existing best-effort editor: only Telegram 400/message-not-modified is success;
-  other discount edit errors and cancellation propagate to the durable inbox. Owner-panel getMe
+  other owner discount edit errors and cancellation propagate to the durable inbox. Owner-panel getMe
   uses singleton `TenantOwnerTokenProbeCache` / injectable `ITelegramTokenProbe`: fixed 2 s deadline,
   512 LRU tenant/SHA-256-token entries, 3 min success / 20 s transient-or-unavailable TTL, single flight.
   Save/reset/invalid cleanup invalidate immediately after commit; detached old probes cannot refill
@@ -53,6 +53,12 @@
   after two hours without receipt, terminal unpaid invoices and verified wallet refunds, but
   never frees uncertain gateway attempts or submitted card receipts. See
   `Adminbot.Tests/TenantDiscountTests.cs` for cross-store, net-price, replay and expiry scenarios.
+  Purchase quote rendering also uses the no-op-aware editor: identical text/markup preserves or completes
+  the same message binding without warnings, replacement checkout messages, orders or reservations.
+  Genuine edit failures retain send/rebind plus an expired marker on the old message.
+  Owner draft/field prompts include ASCII numeric examples, fixed/capped-percent definitions, per-code
+  shared paid/reserved capacity, gross minimum, scope and margin guidance. Examples are not presets.
+  Code application in purchase/renewal is a typed message, not a live callback; no success popup is added.
 
 - Super-admin issuance passes the authenticated sender id from `XuiV3AdminFlowService` through confirmation,
   single creation and bulk creation to `XuiV3PurchaseService`. The global `AdminsUserIds` allow-list is rechecked;
@@ -84,7 +90,7 @@
   `20260924023225_TenantCustomerWalletOwnerActivation` adds the owner opt-in with default false, so existing and future
   storefronts remain fail-closed until the owner explicitly enables after grant. See `docs/tenant-customer-wallet.md`.
 
-- Telegram.Bot is pinned to 22.10.3. API methods no longer use Async suffixes (`SendMessage`, `SendRequest`);
+- Telegram.Bot is pinned to stable 22.10.3.2. API methods no longer use Async suffixes (`SendMessage`, `SendRequest`);
   markup uses `ReplyMarkup`, files use `TGFile`, and client BotId is non-nullable. Decorators retain delivery budgets.
   Runtime clients disable SDK automatic retries (`RetryCount=0`) to preserve application retry ownership.
   Durable updates use `JsonBotAPI.Options` with System.Text.Json, retaining the previous Bot API JSON wire format.
@@ -1120,7 +1126,7 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   `SetMyCommands` is background initialization and must not stop an already registered receiver.
 - Super-admins can use `🤖 وضعیت ربات‌ها` to see process-local receiver health for every owned, assistant, and tenant bot. The report comes from `BotRuntimeStatusStore`; it never exposes tokens and does not call Telegram.
 - Telegram polling 5xx bursts such as `502 Bad Gateway` and delivery timeouts such as `Request timed out` are transient Telegram-side noise. They are swallowed before operational Telegram logging and should not be sent repeatedly to the private logger channel. They now also apply a bounded per-bot backoff through `Domain/Logging/TelegramPollingBackoffPolicy.cs`: `TelegramPollingBackoffTracker` keeps `ConsecutiveTransientFailures`/`LastFailureAtUtc`/`LastOperationalLogAtUtc` per internal `BotId` (in-memory only, no schema, no migration), the delay is `1s,2s,4s,8s,16s,…` capped at 30s with ±20% jitter, and it is awaited with the receiver token (shutdown during backoff is the normal stop path). State decays after a `HealthyResetSeconds` (60s) gap because Telegram.Bot 22.10.3 only invokes the error handler on failure and exposes no successful-empty-`getUpdates` callback, and it is cleared on 429, on a per-user delivery error, and when a receiver stops (`StopBotCore`), so historical tenant ids cannot accumulate state. `IsTransientGatewayFailure` is the single classifier shared by `MultiBotHostedService` and `TelegramBotService`; it trusts Telegram API error codes and `RequestException.HttpStatusCode` 5xx (the Telegram edge can return a plain status without a JSON error body), and it walks the exception chain so the Telegram.Bot 22.10.3 `RequestException -> HttpRequestException -> IOException -> SocketException` TLS/connection-reset shape (`Bot API Service Failure: ...`) is transient instead of falling through to the legacy polling logger; permanent evidence (400/401/403 and both 409 conflict variants) is evaluated first and always wins, and 408/425 stay transient. Bursts log at most one `Telegram polling degraded.` summary per bot per window (suppressed from the Telegram channel); only genuine non-transient polling errors reach the process console, and these failures are never written to `TelegramOutbox`.
-- Telegram `429 Too Many Requests` is handled centrally through `Domain/Logging/TelegramRateLimitPolicy.cs`: the polling error handler pauses the receiver for Telegram's `RetryAfter` (+1s buffer, capped at 60s) before the next `getUpdates` (runtime clients set `RetryCount=0`, so Telegram.Bot 22.10.3 performs no automatic 429 retry and the receiver would otherwise tight-loop), the update wrapper swallows a 429 after the same backoff instead of letting it kill the receiver, and `Domain/Logging/TelegramLogSuppression.cs` suppresses any log entry whose exception is a Telegram 429 so the logger never amplifies the rate-limit storm. Receivers keep polling after the window and are never restarted, so no duplicate receiver instances can appear.
+- Telegram `429 Too Many Requests` is handled centrally through `Domain/Logging/TelegramRateLimitPolicy.cs`: the polling error handler pauses the receiver for Telegram's `RetryAfter` (+1s buffer, capped at 60s) before the next `getUpdates` (runtime clients set `RetryCount=0`, so Telegram.Bot performs no automatic 429 retry and the receiver would otherwise tight-loop), the update wrapper swallows a 429 after the same backoff instead of letting it kill the receiver, and `Domain/Logging/TelegramLogSuppression.cs` suppresses any log entry whose exception is a Telegram 429 so the logger never amplifies the rate-limit storm. Receivers keep polling after the window and are never restarted, so no duplicate receiver instances can appear.
 - `Domain/Logging/TelegramLogger.cs` also applies message-level channel suppression for known noncritical noise: stale Sales Assistant callbacks, unchanged Telegram edits, receipt-photo relay warnings that have a text fallback, repeated tenant forced-join probes, routine XUI v3 volume-reminder scan summaries, and Telegram polling 5xx/429/timeouts. Suppression is Telegram-provider-only, so standard/local logging retains these entries; payment/audit logs and real token/XUI/settlement failures still reach the private channel.
 - Tenant forced-join activation validates the tenant bot identity, channel access, administrator-list access, and that the
   bot itself is an administrator; it never probes the tenant owner's membership. Runtime storefront access still checks

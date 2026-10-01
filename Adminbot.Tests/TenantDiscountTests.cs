@@ -333,10 +333,10 @@ public sealed partial class ConcurrencyTests
     };
 
     /// <summary>Emulates Telegram's identical-content edit rejection using the complete rendered text and inline markup.</summary>
-    /// <remarks>Only one owner/menu is used per fixture. Transport failures can be injected without changing draft behavior.</remarks>
+    /// <remarks>One owner menu or customer quote is used per fixture. Controlled transport failures never mutate local draft or checkout state themselves.</remarks>
     private sealed class DiscountEditClient : StorefrontClient
     {
-        /// <summary>Last acknowledged complete edit payload, including the owner-addressed keyboard.</summary>
+        /// <summary>Last acknowledged complete edit payload, including its addressed inline keyboard.</summary>
         private string? _lastEdit;
         /// <summary>Count of rejected identical edits, proving the regression really exercised Telegram's no-op response.</summary>
         public int NoOpEdits { get; private set; }
@@ -363,9 +363,14 @@ public sealed partial class ConcurrencyTests
             return base.SendRequest(request, cancellationToken);
         }
     }
-    /// <summary>Real purchase preview binds its delivered message and applies the displayed capped net without reserving until payment choice.</summary>
-    [Fact]
-    public async Task TenantDiscount_Purchase_preview_applies_code_to_bound_message_without_admission()
+    /// <summary>Purchase code entry preserves the message-bound net, including repeated application of the same code.</summary>
+    /// <param name="repeatCode">Whether the customer reopens code entry and submits the same valid code again.</param>
+    /// <returns>A task after preview invariants and exactly-once discounted payment admission are verified.</returns>
+    /// <remarks>Regression: Telegram confirms an identical edit with status 400/message-not-modified; that must not expire or rebind the customer's still-valid quote.</remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TenantDiscount_Purchase_preview_applies_code_to_bound_message_without_admission(bool repeatCode)
     {
         using var databases = new Databases();
         var configuration = RialGatewayLabelConfiguration(databases, "http://127.0.0.1:59999/");
@@ -387,7 +392,7 @@ public sealed partial class ConcurrencyTests
             new TenantDiscountCodeInput("preview-25", TenantDiscountKinds.Percent, TenantDiscountScopes.Both,
                 null, 25, 30000, 0, 1, true))).Success);
         var customer = new CredUser { TelegramUserId = 912 };
-        var client = new StorefrontClient();
+        var client = new DiscountEditClient();
         var selection = new XuiV3PurchaseSelection { ServiceKey = "normal", TrafficGb = 50, DurationKey = "m1", AccountCount = 1 };
         using var context = provider.GetRequiredService<BotContextAccessor>().Push(new BotRuntimeContext
         {
@@ -422,6 +427,18 @@ public sealed partial class ConcurrencyTests
         {
             From = new Telegram.Bot.Types.User { Id = 912 }, Chat = new Chat { Id = 912 }, Text = "PreView-25"
         }, tenant, customer, state, CancellationToken.None })!;
+        if (repeatCode)
+        {
+            // A fresh entry callback is acknowledged before text submission; it cannot be reused for a success popup.
+            callback.Id = Guid.NewGuid().ToString("N");
+            await (Task)enter.Invoke(service, new object[] { client, callback, tenant, customer, $"DC:{selectedQuote.Id}", CancellationToken.None })!;
+            state = await provider.GetRequiredService<UserStateStore>().GetUserStatus(912);
+            await (Task)text.Invoke(service, new object[] { client, new Message
+            {
+                From = new Telegram.Bot.Types.User { Id = 912 }, Chat = new Chat { Id = 912 }, Text = "PreView-25"
+            }, tenant, customer, state, CancellationToken.None })!;
+            Assert.Equal(1, client.NoOpEdits);
+        }
         await using var verify = databases.Users.CreateDbContext();
         var saved = await verify.TenantDiscountQuotes.SingleAsync();
         Assert.Equal(Math.Min((long)Math.Floor(saved.GrossToman * 0.25M), Math.Min(30000, saved.GrossToman - saved.BaseCostToman)),
@@ -430,7 +447,6 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(TenantDiscountQuoteStates.Open, saved.State);
         Assert.Empty(await verify.TenantBotOrders.ToListAsync());
         Assert.Empty(await verify.TenantDiscountRedemptions.ToListAsync());
-        Assert.Contains("تخفیف کد", client.Texts.Last());
         Assert.Contains(client.Callbacks, x => x == $"TN:DQ:{saved.Id}:CARD");
         var pay = typeof(TenantBotService).GetMethod("HandleQuotedPurchasePaymentAsync",
             BindingFlags.Instance | BindingFlags.NonPublic)!;

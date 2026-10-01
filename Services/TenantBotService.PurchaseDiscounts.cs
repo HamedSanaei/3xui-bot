@@ -236,10 +236,10 @@ public partial class TenantBotService
     private bool HasPurchaseDiscountPaymentMethod(BotInstance tenant, long netToman) =>
         PurchaseDiscountPaymentMethods(tenant, netToman).Count != 0;
 
-    /// <summary>Renders the quote with its current persisted price, binding only a genuinely edited or sent Telegram message.</summary>
-    /// <param name="botClient">Transport whose edit/send response supplies the real message id.</param>
+    /// <summary>Renders the persisted quote and binds a newly delivered or Telegram-confirmed already-visible message.</summary>
+    /// <param name="botClient">Required transport for the tenant bot that owns this quote and its Telegram message.</param>
     /// <param name="chatId">Original Telegram chat of this quote.</param>
-    /// <param name="messageId">Requested edit target, null if a new message must be sent.</param>
+    /// <param name="messageId">Positive Telegram edit target in the quote's chat, or null to send a new message.</param>
     /// <param name="tenant">Storefront controlling gateway availability.</param>
     /// <param name="selection">Stored and freshly priced checkout selection.</param>
     /// <param name="quote">Open quote containing the actual displayed net; never a client-supplied price.</param>
@@ -247,8 +247,12 @@ public partial class TenantBotService
     /// <param name="displayCode">Optional normalized entered code to HTML-escape in this render only.</param>
     /// <returns>True only when the successfully displayed Telegram message is bound to the open quote.</returns>
     /// <remarks>Manual pricing also uses an undiscounted quote to bind the displayed rate to this exact message;
-    /// discount controls appear only when a code is active or already selected. An edit failure triggers a new
-    /// bound message; if both sends fail, the quote expires without admission.</remarks>
+    /// discount controls appear only when a code is active or already selected. Telegram's status 400/message-not-modified
+    /// confirms the existing text and keyboard, so it preserves or completes that binding without a replacement message,
+    /// warning, order, or reservation. Other edit failures retain the send/rebind fallback and expired old-message marker;
+    /// if delivery cannot be bound, the quote expires without admission.</remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels Telegram delivery or local quote binding.</exception>
+    /// <example><code>await RenderPurchaseDiscountQuoteAsync(client, customerChatId, quote.MessageId, tenant, selection, quote, token);</code></example>
     private async Task<bool> RenderPurchaseDiscountQuoteAsync(ITelegramBotClient botClient, ChatId chatId, int? messageId,
         BotInstance tenant, XuiV3PurchaseSelection selection, TenantDiscountQuote quote, CancellationToken token, string displayCode = null)
     {
@@ -281,17 +285,15 @@ public partial class TenantBotService
         {
             try
             {
-                var edited = await botClient.EditMessageText(chatId, messageId.Value, text,
+                await EditMessageTextAllowNoOpAsync(botClient, chatId, messageId.Value, text,
                     parseMode: ParseMode.Html, replyMarkup: keyboard, cancellationToken: token);
-                if (edited?.MessageId == messageId.Value)
-                {
-                    if (quote.MessageId == messageId.Value) return true;
-                    var bound = await discounts.BindQuoteMessageAsync(quote.Id, tenant.Id, quote.CustomerTelegramUserId,
-                        quote.ChatId, edited.MessageId, token);
-                    if (bound.Success) return true;
-                    await discounts.ExpireQuoteAsync(quote.Id, tenant.Id, quote.CustomerTelegramUserId, quote.ChatId, token);
-                    return false;
-                }
+                // An identical-edit confirmation belongs to this exact message, not a new checkout or payment event.
+                if (quote.MessageId == messageId.Value) return true;
+                var bound = await discounts.BindQuoteMessageAsync(quote.Id, tenant.Id, quote.CustomerTelegramUserId,
+                    quote.ChatId, messageId.Value, token);
+                if (bound.Success) return true;
+                await discounts.ExpireQuoteAsync(quote.Id, tenant.Id, quote.CustomerTelegramUserId, quote.ChatId, token);
+                return false;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (Exception ex) { _logger.LogWarning(ex, "Tenant discount quote edit failed. QuoteId={QuoteId}", quote.Id); }
