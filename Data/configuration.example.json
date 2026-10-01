@@ -11,6 +11,7 @@
   ],
   "adminsUserIds": [],
   "tenantMaxStoresPerOwner": 5,
+  "colleagueDailyFreeTrialLimit": 3,
   "gozargahSiteSyncRetentionDays": 30,
   "tenantOrderNotificationRetentionDays": 30,
   "tenantMinimumSiteWalletToman": 200000,

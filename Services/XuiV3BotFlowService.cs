@@ -18,8 +18,10 @@ using Adminbot.Domain.Logging;
 /// The service is reused by owned bots and tenant storefront bots under the active bot context. Account-management
 /// callbacks are bot-routed but must still reload panel clients and enforce Telegram ownership. Read-only
 /// configuration delivery keeps private SubId and proxy URLs out of callback data and operational logs.
+/// Active owned-bot colleagues share a durable Tehran-day free-test allowance; after exhaustion, the same test is
+/// sold at colleague rates only after a persisted quote and explicit confirmation. Tenant trial rules are unchanged.
 /// </remarks>
-public class XuiV3BotFlowService
+public partial class XuiV3BotFlowService
 {
     private const string RenewFlowName = "xui-v3-renew";
     private const string RenewStepAccount = "renew-account";
@@ -94,6 +96,12 @@ public class XuiV3BotFlowService
     private readonly XuiV3LinkChangeOperationStore _linkChangeOperationStore;
     private readonly XuiV3VolumeReminderStateStore _volumeReminderStateStore;
     private readonly XuiV3RenewalOperationStore _renewalOperationStore;
+    /// <summary>Global users.db receipts for owned-colleague daily tests and paid-test executor claims.</summary>
+    private readonly ColleagueTrialQuotaStore _colleagueTrialQuotaStore;
+    /// <summary>Immutable panel creation evidence used to reconcile paid tests without repeating a POST.</summary>
+    private readonly XuiV3CreationOperationStore _trialCreationOperations;
+    /// <summary>Startup-validated allowance from the singleton application options; the daily count is not rebound per execution.</summary>
+    private readonly int _colleagueDailyFreeTrialLimit;
 
     /// <summary>
     /// Immutable budget for UX-only callback acknowledgement inside this flow. Production uses the shared
@@ -147,6 +155,9 @@ public class XuiV3BotFlowService
     /// Durable users.db store that makes each renewal operation exactly-once: unique-key creation, lease-bound
     /// processing claims, the atomic applied transition, the settlement guard, and read-only timeout recovery.
     /// </param>
+    /// <param name="colleagueTrialQuotaStore">Required durable global-per-colleague Tehran-day quota and paid-test receipt store.</param>
+    /// <param name="trialCreationOperations">Required panel creation evidence store; ambiguous paid attempts are never refunded or replayed blindly.</param>
+    /// <param name="appConfig">Required singleton startup options supplying the nonnegative colleague daily free-test count; not rebound per Telegram execution.</param>
     /// <param name="interactionTimeouts">
     /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
     /// callback acknowledgement is bounded at two seconds. Tests pass millisecond values. This value is never read
@@ -171,6 +182,9 @@ public class XuiV3BotFlowService
         XuiV3LinkChangeOperationStore linkChangeOperationStore,
         XuiV3VolumeReminderStateStore volumeReminderStateStore,
         XuiV3RenewalOperationStore renewalOperationStore,
+        ColleagueTrialQuotaStore colleagueTrialQuotaStore,
+        XuiV3CreationOperationStore trialCreationOperations,
+        AppConfig appConfig,
         TelegramInteractionTimeouts interactionTimeouts = null)
     {
         _purchaseService = purchaseService;
@@ -187,6 +201,9 @@ public class XuiV3BotFlowService
         _linkChangeOperationStore = linkChangeOperationStore;
         _volumeReminderStateStore = volumeReminderStateStore;
         _renewalOperationStore = renewalOperationStore;
+        _colleagueTrialQuotaStore = colleagueTrialQuotaStore;
+        _trialCreationOperations = trialCreationOperations;
+        _colleagueDailyFreeTrialLimit = appConfig.ColleagueDailyFreeTrialLimit;
         _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
     }
 
@@ -3647,19 +3664,18 @@ public class XuiV3BotFlowService
     }
 
     /// <summary>
-    /// Handles the owned-bot XUI v3 free-trial flow for regular customers.
+    /// Handles shared customer free tests and owned-colleague daily free or explicitly confirmed paid tests.
     /// </summary>
     /// <param name="botClient">
-    /// Telegram bot client for the active owned bot that received the message. The method sends all trial prompts
-    /// and final account details through this client.
+    /// Telegram client for the active owned or tenant bot; all prompts and account details use this transport.
     /// </param>
     /// <param name="message">
-    /// Text message from the Telegram user. The message may start the trial flow with the free-account keyboard
-    /// button, select the trial service, cancel the flow, or continue an existing trial state.
+    /// Incoming sender message with its original chat/message identifiers. Starts a test, selects a service,
+    /// requests a paid-preview reminder, cancels, or continues this bot/user's persisted trial state. Paid approval is an inline callback.
     /// </param>
     /// <param name="credUser">
-    /// Shared credentials user profile for the sender. The numeric Telegram id is used for trial cooldown checks,
-    /// phone verification, account metadata, and clearing any stale purchase session.
+    /// Detached global Telegram sender profile. Owned-colleague eligibility is reloaded before granting a free
+    /// allowance or making a new debit; this snapshot alone never authorizes spending.
     /// </param>
     /// <param name="user">
     /// Bot-scoped conversation state from <c>users.db</c>. When the sender starts a trial from another flow, the
@@ -3677,15 +3693,22 @@ public class XuiV3BotFlowService
     /// </returns>
     /// <remarks>
     /// Both menus display «اکانت تست»; the previous free-account label is accepted only as a legacy input alias.
-    /// Owned and tenant menus share this policy: non-colleagues with verified phones, 100 MiB national or 1 GiB normal,
-    /// three days, and a separate thirty-day cooldown per type in the current bot/user state. Creation is durable and
-    /// free of order, wallet debit or partner-profit effects; no cross-bot quota is introduced.
+    /// Ordinary owned/tenant customers keep verified-phone eligibility, 100 MiB national or 1 GiB normal, three days,
+    /// and a separate thirty-day cooldown per type in the current bot/user state, without wallet/order/profit effects.
+    /// Active owned colleagues instead share the configurable daily allowance across all owned bots and both types,
+    /// without the ordinary thirty-day cooldown. An exhausted allowance offers the identical test at live colleague
+    /// traffic/day rates; a frozen preview, explicit confirmation and exactly-once debit precede its sole panel POST.
+    /// Definitive non-creation releases/refunds; ambiguous panel results hold the quota/debit. Successful creation is
+    /// recorded before notification, so a failed Telegram send never recreates an account or refunds a delivered test.
     /// Starting a trial from the main keyboard intentionally clears any half-built purchase session for the same
     /// Telegram user. Without that reset, a metered purchase could later reach the summary step without
     /// <c>TrafficGb</c> and throw an exception. Once creation begins, accepted and rejected panel outcomes are audited
     /// with accumulated panel API time and total delivery time.
     /// </remarks>
-    public async Task<bool> TryHandleFreeTrialAsync(
+    /// <exception cref="OperationCanceledException">Incoming delivery or panel execution is cancelled; an owned winning attempt settles its quota or debit before propagating.</exception>
+    /// <exception cref="InvalidOperationException">The configured test catalog, actor identity or durable creation evidence conflicts with this request.</exception>
+    /// <example><code>await flow.TryHandleTrialAsync(client, message, currentProfile, botScopedState, mainKeyboard, token);</code></example>
+    public async Task<bool> TryHandleTrialAsync(
         ITelegramBotClient botClient,
         Message message,
         CredUser credUser,
@@ -3709,6 +3732,14 @@ public class XuiV3BotFlowService
             _sessionStore.Clear(credUser.TelegramUserId);
         }
 
+        if (IsCancel(text) && user?.LastStep == TrialStepConfirmPaid &&
+            string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
+        {
+            var currentProfile = await _credentialsDbContext.GetUserStatusWithId(credUser.TelegramUserId) ?? credUser;
+            return await HandleOwnedColleagueTrialAsync(
+                botClient, message, currentProfile, user, mainReplyMarkup, cancellationToken);
+        }
+
         if (IsCancel(text))
         {
             await _state.ClearUserStatus(user);
@@ -3718,6 +3749,23 @@ public class XuiV3BotFlowService
                 replyMarkup: mainReplyMarkup,
                 cancellationToken: cancellationToken);
             return true;
+        }
+
+        if (string.Equals(BotContextAccessor.CurrentBotType, BotInstanceTypes.Owned, StringComparison.OrdinalIgnoreCase))
+        {
+            var currentProfile = await _credentialsDbContext.GetUserStatusWithId(credUser.TelegramUserId);
+            if (currentProfile == null)
+            {
+                // A removed persisted profile cannot inherit active colleague admission from the detached update snapshot.
+                await botClient.SendMessage(message.Chat.Id, "اطلاعات حساب شما در دسترس نیست؛ دوباره از منوی اصلی شروع کنید.",
+                    replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
+                return true;
+            }
+            if (currentProfile.IsColleague ||
+                (user?.Flow == TrialFlowName && user.LastStep == TrialStepConfirmPaid))
+                return await HandleOwnedColleagueTrialAsync(
+                    botClient, message, currentProfile, user, mainReplyMarkup, cancellationToken);
+            credUser = currentProfile;
         }
 
         if (credUser.IsColleague)
@@ -3799,6 +3847,7 @@ public class XuiV3BotFlowService
             TrialDays,
             trialKey,
             $"trial:{BotContextAccessor.CurrentBotId}:{credUser.TelegramUserId}:{serviceKey}:{lastTrial.Ticks}",
+            priceToman: 0,
             cancellationToken);
 
         if (!creation.Success)
@@ -3837,29 +3886,8 @@ public class XuiV3BotFlowService
         else
             await _state.SaveUserStatus(new User { Id = message.From.Id, LastFreeNormalAcc = now });
 
-        var accountText = _purchaseService.BuildCreatedAccountText(creation);
-        if (!string.IsNullOrWhiteSpace(creation.SubLink))
-        {
-            using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(creation.SubLink, 200));
-            await botClient.SendPhoto(
-                chatId: message.Chat.Id,
-                photo: InputFile.FromStream(qrStream, "trial-subscription-qr.png"),
-                caption: "✅ اکانت تست شما ساخته شد.\n\n" + accountText,
-                parseMode: ParseMode.Html,
-                replyMarkup: mainReplyMarkup,
-                cancellationToken: cancellationToken);
-        }
-        else
-        {
-            await botClient.SendMessage(
-                chatId: message.Chat.Id,
-                text: "✅ اکانت تست شما ساخته شد.\n\n" + accountText,
-                parseMode: ParseMode.Html,
-                replyMarkup: mainReplyMarkup,
-                cancellationToken: cancellationToken);
-        }
-
         await _state.ClearUserStatus(user);
+        await SendTrialAccountAsync(botClient, message.Chat.Id, creation, mainReplyMarkup, cancellationToken);
         LogXuiOperationOutcome(
             "ساخت اکانت تست نسخه ۳",
             "موفق",
@@ -4008,6 +4036,8 @@ public class XuiV3BotFlowService
     /// ownership before any SubId or configuration URL is requested, then sends the result in a separate message/file.
     /// The external <c>auren</c> route additionally requires current bot-scoped direct-search state matching the same
     /// client. TenantBotService intercepts all renewal callback variants before this owned-wallet dispatcher.
+    /// Owned paid-test callbacks bind approval to the durable grant and displayed amount, not transient navigation;
+    /// old-price callbacks cannot authorize a revised quote, and funded callbacks remain read-back-only after /start.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="cancellationToken"/> is cancelled during Telegram, database, or panel work.
@@ -4026,6 +4056,10 @@ public class XuiV3BotFlowService
         ReplyMarkup mainReplyMarkup,
         CancellationToken cancellationToken)
     {
+        if (callbackQuery.Data?.StartsWith("x3:ct", StringComparison.Ordinal) == true)
+            return await HandleColleagueTrialCallbackAsync(
+                botClient, callbackQuery, credUser, user, mainReplyMarkup, cancellationToken);
+
         if (!XuiV3PurchaseCallbacks.TryParse(callbackQuery.Data, out var callback))
             return false;
 

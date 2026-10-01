@@ -4029,8 +4029,8 @@ public partial class TenantBotService
             return;
         }
 
-        // Reuse owned trial eligibility, per-type cooldown and durable creation under the current storefront context.
-        if (await _xuiV3BotFlowService.TryHandleFreeTrialAsync(
+        // Tenant customers retain verified-phone eligibility and per-type cooldown; owned-colleague quotas never apply here.
+        if (await _xuiV3BotFlowService.TryHandleTrialAsync(
                 botClient, Message, customer, User, tenantReplyKeyboard, CancellationToken))
             return;
 

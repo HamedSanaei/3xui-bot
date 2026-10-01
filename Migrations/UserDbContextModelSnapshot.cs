@@ -8,9 +8,13 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 namespace Adminbot.Migrations
 {
+    /// <summary>Current users.db migration model, including durable global owned-colleague trial quota receipts.</summary>
     [DbContext(typeof(UserDbContext))]
     partial class UserDbContextModelSnapshot : ModelSnapshot
     {
+        /// <summary>Describes the latest users.db schema for additive migration comparisons.</summary>
+        /// <param name="modelBuilder">The EF Core migration model builder.</param>
+        /// <remarks>Colleague trial receipts retain unique delivery/operation identities and a global user/Tehran-date/state capacity index.</remarks>
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
@@ -530,6 +534,82 @@ namespace Adminbot.Migrations
                     b.HasIndex("TelegramUserId");
 
                     b.ToTable("BotUserStates", (string)null);
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.ColleagueTrialGrant", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BotId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("ConsumedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryRequestKey")
+                        .IsRequired()
+                        .HasMaxLength(240)
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("FreeCreationStarted")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(false);
+
+                    b.Property<DateTime>("GrantDateIran")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OperationKey")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("PaidCreationState")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("PaidQuoteToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("PaidRefundRecordedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("ReleasedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ServiceKey")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("State")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DeliveryRequestKey")
+                        .IsUnique();
+
+                    b.HasIndex("OperationKey")
+                        .IsUnique();
+
+                    b.HasIndex("PaidCreationState", "PaidRefundRecordedAtUtc", "CreatedAtUtc");
+
+                    b.HasIndex("TelegramUserId", "GrantDateIran", "State");
+
+                    b.ToTable("ColleagueTrialGrants", (string)null);
                 });
 
             modelBuilder.Entity("Adminbot.Domain.GozargahSiteSyncEvent", b =>

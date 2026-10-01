@@ -5,8 +5,8 @@ using System.Threading;
 /// <summary>
 /// Entity Framework context for <c>users.db</c>.
 /// It stores bot-scoped conversation state, payment metadata, tenant storefront definitions,
-/// tenant orders, tenant ledger rows, durable settlement-notification delivery, XUI volume-reminder cycles, cookies,
-/// and other runtime data that must not live in <c>credentials.db</c>.
+/// tenant orders, tenant ledger rows, durable settlement-notification delivery, global owned-colleague daily trial grants,
+/// XUI volume-reminder cycles, cookies, and other runtime data that must not live in <c>credentials.db</c>.
 /// </summary>
 /// <remarks>
 /// Multi-instance support is implemented here by routing the legacy <see cref="User"/> state API
@@ -47,6 +47,8 @@ public class UserDbContext : DbContext
     public DbSet<TelegramUpdateInboxEntry> TelegramUpdateInbox { get; set; }
     /// <summary>Private durable XUI creation identities that prevent a second addClient after a restart.</summary>
     public DbSet<XuiV3CreationOperation> XuiV3CreationOperations { get; set; }
+    /// <summary>Global owned-colleague trial receipts retained across all bots, services and conversation resets.</summary>
+    public DbSet<ColleagueTrialGrant> ColleagueTrialGrants { get; set; }
     /// <summary>Restart-safe step state for tenant card-to-card provisional finalize and revoke sagas.</summary>
     public DbSet<TenantCardProvisionalOperation> TenantCardProvisionalOperations { get; set; }
     public DbSet<BotInstance> BotInstances { get; set; }
@@ -150,10 +152,18 @@ public class UserDbContext : DbContext
     /// <summary>
     /// Defines the <c>users.db</c> schema, indexes, and field limits for payments, bot instances,
     /// tenant orders and renewal-category evidence, ledgers, bot-scoped conversation state, settlement-notification outbox delivery, idempotent
-    /// scheduled-report delivery, and durable per-client XUI volume-reminder cycles and claims.
+    /// scheduled-report delivery, global owned-colleague Tehran-day trial grants, and durable per-client XUI volume-reminder cycles and claims.
     /// </summary>
     /// <param name="modelBuilder">EF Core model builder used by migrations and runtime metadata.</param>
-    /// <remarks>Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide semaphore or shared tracker is retained.</remarks>
+    /// <remarks>
+    /// Conversation helpers delegate to a factory-backed store using BotId plus TelegramUserId; no database-wide
+    /// semaphore or shared tracker is retained. Colleague trial capacity instead uses global TelegramUserId plus
+    /// Tehran-local date, with a unique delivery request and operation key. Origin BotId and creation OperationKey
+    /// are logical audit links without cascading foreign keys. Grants begin at rollout without historical backfill;
+    /// retain even denied/released receipts indefinitely to prevent old requests from reserving afresh.
+    /// Denied grants also retain a separate paid executor lifecycle and frozen debit-price snapshot without occupying
+    /// free quota; paid creation uses the deterministic colleague-paid-trial:{Id} logical operation link.
+    /// </remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         // Exact inbox links complement the existing bot/user fallback for historical recovery records.
@@ -165,6 +175,22 @@ public class UserDbContext : DbContext
             entity.Property(x => x.OperationKey).HasMaxLength(240);
             entity.HasIndex(x => new { x.TelegramUserId, x.CreatedAtUtc });
             entity.HasIndex(x => x.InboxSequence);
+        });
+        modelBuilder.Entity<ColleagueTrialGrant>(entity =>
+        {
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).IsRequired().HasMaxLength(32);
+            entity.Property(x => x.BotId).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.ServiceKey).IsRequired().HasMaxLength(16);
+            entity.Property(x => x.DeliveryRequestKey).IsRequired().HasMaxLength(240);
+            entity.Property(x => x.OperationKey).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.FreeCreationStarted).HasDefaultValue(false);
+            entity.HasIndex(x => x.DeliveryRequestKey).IsUnique();
+            entity.HasIndex(x => x.OperationKey).IsUnique();
+            // Bot and service deliberately do not partition capacity: both trial types share one daily owned allowance.
+            entity.HasIndex(x => new { x.TelegramUserId, x.GrantDateIran, x.State });
+            // Rejected paid attempts with no recorded refund proof remain discoverable after conversation resets.
+            entity.HasIndex(x => new { x.PaidCreationState, x.PaidRefundRecordedAtUtc, x.CreatedAtUtc });
         });
         modelBuilder.Entity<TenantCardProvisionalOperation>(entity =>
         {

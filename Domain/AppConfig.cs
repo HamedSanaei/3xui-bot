@@ -19,6 +19,14 @@ namespace Adminbot.Domain
         /// <summary>Maximum storefront rows per colleague, including disabled and reset stores. Must be positive.</summary>
         /// <remarks>Lowering this limit prevents new allocation but never disables or deletes existing stores.</remarks>
         public int TenantMaxStoresPerOwner { get; set; } = 5;
+        /// <summary>Maximum free three-day test accounts per active colleague per Tehran calendar day in owned bots.</summary>
+        /// <remarks>
+        /// The optional startup-bound setting defaults to three. All owned bots and both national/normal test types
+        /// share one durable allowance per global Telegram user; tenant storefronts keep their existing trial policy.
+        /// Must be nonnegative. Zero disables free colleague tests without disabling colleague-priced paid tests.
+        /// Changes take effect when the application restarts; already consumed or uncertain grants are not removed.
+        /// </remarks>
+        public int ColleagueDailyFreeTrialLimit { get; set; } = 3;
         /// <summary>
         /// Minimum readable usable Gozargah website wallet balance, in Iranian toman, required to keep a tenant
         /// storefront active when the owner has no positive local bot wallet.

@@ -111,6 +111,18 @@ That procedure is now explicitly forbidden:
 block is documentation rather than configuration: the configuration binder ignores keys it does not know, and the
 application never reads the example at runtime.
 
+Owned-bot colleague test allowance uses the additive `colleagueDailyFreeTrialLimit` key (default **3**).
+Only nonnegative whole account counts are valid; **0** disables free admission but retains paid test purchase.
+The allowance is global per active colleague's Telegram user across owned bots and both test types, resetting
+at Tehran calendar midnight. Ordinary customers and tenant-bot trial cooldown/phone checks are unchanged.
+After exhaustion, the same normal **1 GiB** or national **100 MiB**, **three-day** test is quoted using ordinary
+colleague traffic/day rates, rounded upward to whole toman; an amount-bound inline approval is required before
+wallet debit. Repricing does not authorize a higher debit through an old button. Refund recovery is receipt-linked,
+independent of menu resets, and requires definitive non-creation; ambiguous creation remains held.
+This option is validated and captured at startup: editing JSON alone does not activate the new behavior.
+Deploy the matching application release/migration and restart through the normal release procedure.
+Apply the key to the existing production JSON and source example without reconstructing either file.
+
 Startup validation in `Domain/ConfigurationPreflight.cs` covers the failure class this incident exposed:
 
 - `ValidateEnabledFeatures` is **fatal** and runs beside the per-feature validators in `Program.Main`, before dependency

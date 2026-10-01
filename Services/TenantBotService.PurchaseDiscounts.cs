@@ -3,6 +3,7 @@ using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
@@ -249,9 +250,18 @@ public partial class TenantBotService
     /// <remarks>Manual pricing also uses an undiscounted quote to bind the displayed rate to this exact message;
     /// discount controls appear only when a code is active or already selected. Telegram's status 400/message-not-modified
     /// confirms the existing text and keyboard, so it preserves or completes that binding without a replacement message,
-    /// warning, order, or reservation. Other edit failures retain the send/rebind fallback and expired old-message marker;
-    /// if delivery cannot be bound, the quote expires without admission.</remarks>
-    /// <exception cref="OperationCanceledException">The caller cancels Telegram delivery or local quote binding.</exception>
+    /// warning, order, or reservation. Only definitive Telegram 4xx edit rejections permit a replacement send/rebind;
+    /// foreground deadlines, transport cancellation without caller cancellation, 5xx and other uncertain failures
+    /// tombstone the original message and expire the quote before propagating the original exception. No replacement
+    /// is sent when Telegram may already have applied the edit, and neither DQ nor legacy PAY* buttons can admit it.
+    /// If delivery cannot be bound, the quote expires without admission. Explicit caller cancellation propagates unchanged.</remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels Telegram delivery or local quote binding, or transport cancellation has an uncertain edit outcome.</exception>
+    /// <exception cref="TelegramForegroundDeliveryTimeoutException">The edit exceeded its foreground budget; the quote is retired without a replacement send.</exception>
+    /// <exception cref="ApiRequestException">Telegram returned an uncertain non-4xx edit failure; the quote is retired before the exception propagates.</exception>
+    /// <exception cref="RequestException">The Telegram SDK could not confirm the edit; the quote is retired without retrying.</exception>
+    /// <exception cref="HttpRequestException">The transport could not confirm the edit; the quote is retired without retrying.</exception>
+    /// <exception cref="IOException">The edit response stream failed; the quote is retired without a replacement send.</exception>
+    /// <exception cref="TimeoutException">The edit timed out without confirmation; the quote is retired without a replacement send.</exception>
     /// <example><code>await RenderPurchaseDiscountQuoteAsync(client, customerChatId, quote.MessageId, tenant, selection, quote, token);</code></example>
     private async Task<bool> RenderPurchaseDiscountQuoteAsync(ITelegramBotClient botClient, ChatId chatId, int? messageId,
         BotInstance tenant, XuiV3PurchaseSelection selection, TenantDiscountQuote quote, CancellationToken token, string displayCode = null)
@@ -296,7 +306,16 @@ public partial class TenantBotService
                 return false;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-            catch (Exception ex) { _logger.LogWarning(ex, "Tenant discount quote edit failed. QuoteId={QuoteId}", quote.Id); }
+            catch (ApiRequestException ex) when (ex.ErrorCode is >= 400 and < 500)
+            {
+                _logger.LogWarning(ex, "Tenant discount quote edit rejected. QuoteId={QuoteId}", quote.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Tenant discount quote edit outcome uncertain; expiring without replacement. QuoteId={QuoteId}", quote.Id);
+                await ExpireUndeliveredPurchaseQuoteAsync(discounts, quote, messageId, token);
+                throw;
+            }
         }
         try
         {
@@ -327,16 +346,33 @@ public partial class TenantBotService
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
         catch (Exception ex) { _logger.LogWarning(ex, "Tenant discount quote send failed. QuoteId={QuoteId}", quote.Id); }
+        await ExpireUndeliveredPurchaseQuoteAsync(discounts, quote, messageId, token);
+        return false;
+    }
+
+    /// <summary>Retires an unconfirmed purchase render while blocking the original message's legacy payment keyboard.</summary>
+    /// <param name="discounts">Required quote store for this tenant's users.db.</param>
+    /// <param name="quote">Unadmitted quote being retired; existing admitted orders are never changed.</param>
+    /// <param name="messageId">Original positive Telegram edit target, or null when no known message exists.</param>
+    /// <param name="token">Caller-owned cancellation of the short local binding and expiration operations.</param>
+    /// <returns>A task after the quote is expired and any previously unbound legacy edit target is bound as a tombstone.</returns>
+    /// <remarks>No Telegram request, wallet mutation, order or discount reservation occurs. The bot/customer/chat/message
+    /// binding remains queryable after expiration so legacy PAY* callbacks cannot silently bypass a failed discounted render.
+    /// Called before an uncertain edit exception propagates or when definitive-rejection replacement delivery cannot bind.</remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels the local state transition.</exception>
+    /// <example><code>await ExpireUndeliveredPurchaseQuoteAsync(discounts, quote, originalMessageId, token);</code></example>
+    private static async Task ExpireUndeliveredPurchaseQuoteAsync(TenantDiscountService discounts,
+        TenantDiscountQuote quote, int? messageId, CancellationToken token)
+    {
         if (quote.MessageId is not > 0 && messageId is > 0)
         {
-            // Even if Telegram cannot render either new quote, the original legacy preview must
-            // not remain a path to a silent full-price order after the discount attempt.
-            var old = await discounts.BindQuoteMessageAsync(quote.Id, tenant.Id, quote.CustomerTelegramUserId,
+            // An ambiguous edit may leave the old legacy PAY* keyboard or the new DQ keyboard visible.
+            // Keep the known original message bound so neither version can bypass the retired quote.
+            var old = await discounts.BindQuoteMessageAsync(quote.Id, quote.TenantBotId, quote.CustomerTelegramUserId,
                 quote.ChatId, messageId.Value, token);
             if (old.Success) quote.MessageId = messageId.Value;
         }
-        await discounts.ExpireQuoteAsync(quote.Id, tenant.Id, quote.CustomerTelegramUserId, quote.ChatId, token);
-        return false;
+        await discounts.ExpireQuoteAsync(quote.Id, quote.TenantBotId, quote.CustomerTelegramUserId, quote.ChatId, token);
     }
 
     /// <summary>Translates a named tenant discount rejection into a customer-visible reason without silently reverting to full price.</summary>

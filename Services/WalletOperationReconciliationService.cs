@@ -1,12 +1,13 @@
 using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
 
-/// <summary>Repairs the users.db side of committed credentials.db wallet events after a crash between commits.</summary>
+/// <summary>Repairs committed wallet audit metadata and exact paid-test refunds after a cross-database crash.</summary>
 /// <remarks>
-/// This worker never changes balances or calls payment/XUI providers. The immutable wallet receipt is the source of
-/// truth. Ledger idempotency permits a crash after its insert and before the credentials reconciliation timestamp.
+/// Immutable credentials.db receipts are the financial source of truth; ledger idempotency closes the separate
+/// users.db commit window. The worker never calls payment/XUI providers or creates an account. Its sole balance
+/// mutation is an idempotent exact debit-linked colleague-test refund after durable definitive non-creation.
 /// </remarks>
-public sealed class WalletOperationReconciliationService : BackgroundService
+public sealed partial class WalletOperationReconciliationService : BackgroundService
 {
     private readonly CredentialsDbContextFactory _credentials;
     private readonly UserDbContextFactory _users;
@@ -48,14 +49,18 @@ public sealed class WalletOperationReconciliationService : BackgroundService
 
     /// <summary>Repairs one batch of wallet events whose normal caller had time to finish its second commit.</summary>
     /// <param name="token">Cancellation of database-only recovery.</param>
-    /// <returns>Number of receipts whose ledger and supported settlement metadata were reconciled.</returns>
-    /// <remarks>Receipts younger than one minute remain with their active caller. No history is inferred from current balances.
+    /// <returns>Number of repaired wallet receipts plus newly proof-recorded exact paid-test refunds.</returns>
+    /// <remarks>Receipts and refund recovery candidates younger than one minute remain with their active caller. No history is inferred from current balances.
     /// Confirmed website debt transfers first repair their idempotent local credit; no website mutation is retried.
     /// Tenant customer receipts reconstruct exact order-linked debit/refund metadata; charge origin comes from persisted
-    /// provider rows so a background worker cannot mislabel tenant credit as owned or redirect its notification.</remarks>
+    /// provider rows so a background worker cannot mislabel tenant credit as owned or redirect its notification.
+    /// Owned paid-test receipts rebuild their grant-linked purchase/refund audit without starting panel work.
+    /// Rejected or durably proven-absent paid tests receive the exact original debit-linked refund once, independently
+    /// of cleared Telegram conversation state. Ambiguous/Applied creations never authorize compensation.</remarks>
     /// <example><code>var repaired = await reconciliation.ReconcileAsync(token);</code></example>
     public async Task<int> ReconcileAsync(CancellationToken token = default)
     {
+        var recoveredTrialRefunds = await RecoverColleagueTrialRefundsAsync(token);
         List<TenantDebtTransfer> transfers;
         await using (var db = _users.CreateDbContext())
             transfers = await db.Set<TenantDebtTransfer>().AsNoTracking()
@@ -127,6 +132,27 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                 {
                     await ReconcileTenantCardWalletChargeAsync(receipt, token);
                 }
+                else if (receipt.OperationKey.StartsWith("colleague-paid-trial:", StringComparison.Ordinal))
+                {
+                    var parts = receipt.OperationKey.Split(':');
+                    if (parts.Length != 3 || parts[2] is not ("debit" or "refund") ||
+                        (parts[2] == "refund") != credit)
+                        throw new InvalidOperationException("Invalid colleague paid-test wallet receipt identity.");
+                    await using var grants = _users.CreateDbContext();
+                    var grant = await grants.ColleagueTrialGrants.AsNoTracking().SingleAsync(x =>
+                        x.Id == parts[1] && x.TelegramUserId == receipt.TelegramUserId && x.BotId == receipt.BotId &&
+                        x.State == ColleagueTrialGrantState.Denied, token);
+                    if (credit && grant.PaidCreationState != ColleagueTrialPaidCreationState.Rejected)
+                        throw new InvalidOperationException("Paid-test refund lacks definitive non-creation proof.");
+                    // The committed receipt amount is authoritative even in the debit-before-executor crash window.
+                    await _ledger.RecordAsync(receipt.TelegramUserId,
+                        credit ? WalletLedgerDirections.Credit : WalletLedgerDirections.Debit,
+                        Math.Abs(receipt.AmountToman), receipt.BeforeBalance, receipt.AfterBalance,
+                        credit ? WalletLedgerReasons.ColleagueTrialRefund : WalletLedgerReasons.AccountPurchase,
+                        provider: "wallet", referenceType: "colleague_trial", referenceId: grant.Id,
+                        botId: grant.BotId, botType: BotInstanceTypes.Owned,
+                        idempotencyKey: receipt.OperationKey, cancellationToken: token);
+                }
                 else
                 {
                     var origin = await ReadChargeOriginAsync(receipt.OperationKey, token);
@@ -182,7 +208,7 @@ public sealed class WalletOperationReconciliationService : BackgroundService
                     receipt.OperationKey, ex.GetType().Name);
             }
         }
-        return repaired;
+        return repaired + recoveredTrialRefunds;
     }
 
     /// <summary>Repairs a personal-card tenant wallet top-up after credentials.db committed before users.db.</summary>

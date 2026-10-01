@@ -76,6 +76,7 @@ public class Program
         ReferralConfigurationValidator.ValidateConfigurationAndThrow(configuration);
         ValidateXuiV3LinkChangeConfiguration(appConfig);
         ValidateXuiV3VolumeReminderConfiguration(appConfig);
+        ValidateOwnedColleagueTrialConfiguration(appConfig);
         ValidateTetraminatorConfiguration(appConfig);
         ValidateAtlasPayConfiguration(appConfig);
         ValidateTenantStorefrontConfiguration(appConfig);
@@ -136,7 +137,8 @@ public class Program
     /// <param name="contentRootPath">Application content root for local configuration and logging outbox paths.</param>
     /// <remarks>Singletons never capture scoped database contexts. Legacy coordinated handler graphs are scoped to one execution; state and wallet stores own shorter contexts.
     /// Owner handlers share the bounded token-probe cache but retain isolated tenant selections.
-    /// Backup channels resolve nonblank global configuration before the default-owned channel; the dispatcher supplies durable fallback.</remarks>
+    /// Backup channels resolve nonblank global configuration before the default-owned channel; the dispatcher supplies durable fallback.
+    /// The colleague trial store shares a global per-user Tehran-day allowance across owned bots, without retaining a context.</remarks>
     /// <example><code>RegisterApplicationServices(services, configuration, validatedOptions, contentRootPath);</code></example>
     public static void RegisterApplicationServices(IServiceCollection services, IConfiguration configuration, AppConfig appConfig, string contentRootPath)
     {
@@ -271,6 +273,7 @@ public class Program
         // exactly-once creation-operation store the normal purchase path uses, so a provisional client can never be POSTed
         // twice; finalization and revocation share one forward-only saga table.
         services.AddSingleton<XuiV3CreationOperationStore>();
+        services.AddSingleton<ColleagueTrialQuotaStore>();
         services.AddScoped<TenantCardProvisionalOperationStore>();
         services.AddScoped<TenantCardProvisionalProvisioningService>();
         services.AddScoped<TenantCardProvisionalFinalizationService>();
@@ -605,6 +608,18 @@ public class Program
             if (string.IsNullOrWhiteSpace(appConfig.AtlasPayWebhookSecret))
                 throw new InvalidOperationException("AtlasPay webhook URL is configured but 'atlasPayWebhookSecret' is missing.");
         }
+    }
+
+    /// <summary>Rejects a negative owned-colleague daily free-test allowance before receivers and migrations start.</summary>
+    /// <param name="appConfig">Required startup options; a missing configuration key retains the default three tests.</param>
+    /// <remarks>Zero is valid and keeps paid colleague tests available. No quota rows or production configuration are rewritten.</remarks>
+    /// <exception cref="InvalidOperationException">The configured daily test-account count is negative.</exception>
+    /// <example><code>ValidateOwnedColleagueTrialConfiguration(appConfig);</code></example>
+    private static void ValidateOwnedColleagueTrialConfiguration(AppConfig appConfig)
+    {
+        ArgumentNullException.ThrowIfNull(appConfig);
+        if (appConfig.ColleagueDailyFreeTrialLimit < 0)
+            throw new InvalidOperationException("Configuration value 'colleagueDailyFreeTrialLimit' cannot be negative.");
     }
 
     /// <summary>

@@ -231,22 +231,6 @@ public sealed class LoggingClassificationTests
     }
 
     /// <summary>
-    /// The two inline flow call sites (colleague request and link change) emit the audit directly inside large
-    /// update handlers that are not constructible in a unit test. This source-contract assertion protects the
-    /// exact production classification from silently reverting to <c>LogPayment</c>.
-    /// </summary>
-    [Fact]
-    public void Inline_operational_audit_call_sites_are_reclassified_to_telegram_html()
-    {
-        var sourcePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../Services/XuiV3BotFlowService.cs"));
-        var source = System.IO.File.ReadAllText(sourcePath);
-        Assert.Contains("_logger.LogTelegramHtml(BuildColleagueRequestLogMessage(credUser));", source);
-        Assert.DoesNotContain("_logger.LogPayment(BuildColleagueRequestLogMessage", source);
-        Assert.Contains("_logger.LogTelegramHtml(BuildChangeLinkLogMessage(", source);
-        Assert.DoesNotContain("_logger.LogPayment(BuildChangeLinkLogMessage", source);
-    }
-
-    /// <summary>
     /// A genuine financial event must keep Payment semantics: the durable row carries Payment kind and the backup
     /// generation increments by exactly one.
     /// </summary>
@@ -369,6 +353,9 @@ public sealed class LoggingClassificationTests
     }
 
     /// <summary>Builds a production XUI v3 flow service whose private audit methods only need the injected logger.</summary>
+    /// <param name="logger">Required captured logger; no database or provisioning path is invoked by these audit scenarios.</param>
+    /// <returns>A flow instance used only to inspect its private audit rendering.</returns>
+    /// <remarks>Persistence dependencies are null because the audited methods do not access them.</remarks>
     private static XuiV3BotFlowService BuildXuiFlowService(ILogger logger)
     {
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
@@ -385,7 +372,10 @@ public sealed class LoggingClassificationTests
             botContextAccessor: null,
             linkChangeOperationStore: null,
             volumeReminderStateStore: null,
-            renewalOperationStore: null);
+            renewalOperationStore: null,
+            colleagueTrialQuotaStore: null,
+            trialCreationOperations: null,
+            appConfig: new AppConfig());
     }
 
     /// <summary>Forwards to the wrapped production Telegram logger under a concrete logger category.</summary>

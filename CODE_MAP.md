@@ -1,5 +1,20 @@
 # CODE_MAP.md
 
+- Owned colleague trials (2026-10-01): `TryHandleTrialAsync` admits active, unblocked colleagues without the
+  ordinary phone/30-day gate. Startup `colleagueDailyFreeTrialLimit` defaults to 3; nonnegative, zero=paid-only.
+  One global Telegram-user allowance spans all owned bots and both types, resetting at Tehran midnight.
+  `ColleagueTrialQuotaStore` / `ColleagueTrialGrant` / migration `20261001120000_AddColleagueTrialGrants`
+  retain request identities forever; Reserved/Uncertain/Consumed occupy slots, proven non-creation releases.
+  One durable executor per free/paid request; missing/Reserved after restart remains held, never a replay.
+  After exhaustion the SAME 1 GiB normal / 100 MiB national, three-day test is offered at colleague GiB/day
+  rates rounded upward to whole toman. `x3:ct` inline approval binds original bot/actor/grant/displayed price;
+  stale prices cannot debit, funded recovery survives /start. Debit/refund receipt keys are unique; only
+  definitive non-creation permits an exact original debit refund. Existing wallet worker repairs owed refunds
+  and ledger independently of conversation state; Applied/ambiguous creation never permits blind refunds.
+- Current uncompressed `errors-14050709.log` identifies QuoteId=1 as an 8 s foreground edit deadline,
+  not message-not-modified. Uncertain purchase quote edits expire/tombstone without replacement; only
+  definitive Telegram 4xx rejection permits replacement, and known 400 no-op remains success.
+
 - Telegram queue/request observability (2026-10-01): dominant predecessor = largest positive execution/wait
   overlap, exact SQLite ticks, lower sequence on ties; payload-free and bounded to the persisted claim time.
   `TelegramQueueDelayIncidentAggregator` coalesces connected lane waits: first report, fixed 10 s batches/idle
@@ -112,14 +127,13 @@
   website debit receipts; only confirmed debit authorizes unique local credit. One pending transfer per owner, no
   uncertain replay. `WalletOperationReconciliationService` recovers local credits after restart without remote calls.
   Migration `20260907120000_TenantDebtTransfers` creates empty audit storage; never downgrade with transfers present.
-  Menus display `🌟اکانت تست`; the former label remains input-only for old keyboards. Trial policy is unchanged.
+  Menus display `🌟اکانت تست`; the former label remains input-only for old keyboards. Ordinary trial policy is unchanged.
 
 - Tenant gateway/trial completion: `TenantBotService` logs readable customer gateways separately from owner funding
-  and routes `🌟اکانت تست` to `XuiV3BotFlowService.TryHandleFreeTrialAsync`. The shared v3 policy remains
-  non-colleagues/verified phone, 100 MiB national or 1 GiB normal, three days, thirty days per type and bot/user.
+  and routes `🌟اکانت تست` to `XuiV3BotFlowService.TryHandleTrialAsync`. Tenant and ordinary owned customers retain
+  non-colleague/verified-phone admission, 100 MiB national or 1 GiB normal, three days, thirty days per type/bot/user.
   `TelegramPhoneVerification` shares owned/tenant Contact validation with each bot's own support/menu.
-  `XuiV3PurchaseService` retains store, owner and recipient in trial metadata; no wallet/order/profit effects.
-  Incremental verification is diff/UTF-8 plus Release build only; the prior 146-test result predates these changes.
+  `XuiV3PurchaseService` retains store, owner and recipient in tenant trial metadata; no tenant wallet/order/profit effects.
 
 ## Purpose
 

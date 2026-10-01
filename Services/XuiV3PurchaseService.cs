@@ -1579,18 +1579,62 @@ public class XuiV3PurchaseService
         return result;
     }
 
-    /// <summary>Reserves and creates one free trial for the caller's bot/user eligibility cycle.</summary>
-    /// <param name="user">Detached global Telegram profile of the eligible customer.</param>
-    /// <param name="serverInfo">Required private panel endpoint and authentication.</param>
-    /// <param name="serviceKey">Required enabled trial service catalog key.</param>
-    /// <param name="displayTrafficGb">Positive display allowance in GB; the byte quota is authoritative.</param>
-    /// <param name="trafficBytes">Authoritative nonnegative panel quota in bytes.</param>
-    /// <param name="durationDays">Positive trial lifetime in whole days.</param>
-    /// <param name="trialKey">Catalog/audit identity of the free trial type.</param>
-    /// <param name="operationKey">Required stable bot/user/service eligibility-cycle key, reused until that trial is resolved.</param>
-    /// <param name="cancellationToken">Cancellation of reservation, HTTP and state persistence.</param>
-    /// <returns>Verified creation or a safe failure requiring read-back/review; never another POST for the same cycle.</returns>
-    /// <remarks>No wallet is charged. Eligibility remains with the caller and the last-success timestamp is unchanged on failure.</remarks>
+    /// <summary>Prices a finite test using the live colleague per-GiB and per-day rates, including fractional national traffic.</summary>
+    /// <param name="serviceKey">Required enabled global metered test catalog key, <c>national</c> or <c>normal</c>.</param>
+    /// <param name="trafficBytes">Positive authoritative panel allowance in bytes; one catalog GB means 1,073,741,824 bytes.</param>
+    /// <param name="durationDays">Positive whole-day lifetime of the test; the owned test flow passes three.</param>
+    /// <returns>Positive upward-rounded total in Iranian toman, safe for a preview but not itself payment authorization.</returns>
+    /// <remarks>
+    /// Uses the same finite formula as ordinary metered purchases: traffic × colleague volume rate plus days ×
+    /// colleague daily rate. A 100 MiB national test is billed as 100/1024 GiB, not a full display GB. The ordinary
+    /// purchase traffic minimum is unchanged; this explicit test policy does not enable small regular purchases.
+    /// No wallet, ledger, panel, or Telegram side effect occurs. Confirmers must recheck pricing before a new debit.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The byte allowance or finite lifetime is not positive.</exception>
+    /// <exception cref="InvalidOperationException">The test service is disabled, invalid, unlimited, or has negative/zero-payable colleague pricing.</exception>
+    /// <exception cref="OverflowException">The payable amount exceeds signed 64-bit toman.</exception>
+    /// <example><code>var price = purchaseService.ResolveColleagueTrialPriceToman("national", 100L * 1024 * 1024, 3);</code></example>
+    public long ResolveColleagueTrialPriceToman(string serviceKey, long trafficBytes, int durationDays)
+    {
+        if (trafficBytes <= 0) throw new ArgumentOutOfRangeException(nameof(trafficBytes));
+        if (durationDays <= 0) throw new ArgumentOutOfRangeException(nameof(durationDays));
+        if (serviceKey is not ("normal" or "national"))
+            throw new InvalidOperationException("Only normal and national test services are supported.");
+        var service = FindService(serviceKey);
+        if (service.IsUnlimited)
+            throw new InvalidOperationException("Test services must use metered pricing.");
+        var perGb = service.GetPricePerGb(true);
+        var perDay = service.GetPricePerDay(true);
+        if (perGb < 0 || perDay < 0)
+            throw new InvalidOperationException("Colleague test rates cannot be negative.");
+        var total = decimal.Ceiling((decimal)trafficBytes / (1024L * 1024L * 1024L) * perGb
+            + (decimal)durationDays * perDay);
+        if (total > long.MaxValue) throw new OverflowException("Colleague test price exceeds the supported toman range.");
+        if (total <= 0) throw new InvalidOperationException("A paid colleague test must have a positive price.");
+        return (long)total;
+    }
+
+    /// <summary>Reserves and creates one explicit-limit free or prepaid test using a stable business operation key.</summary>
+    /// <param name="user">Required detached global Telegram profile of the authorized customer or colleague.</param>
+    /// <param name="serverInfo">Required private panel endpoint and authentication; never expose its credentials.</param>
+    /// <param name="serviceKey">Required enabled global test-service catalog key.</param>
+    /// <param name="displayTrafficGb">Positive display allowance in GiB; the exact byte quota remains authoritative.</param>
+    /// <param name="trafficBytes">Positive authoritative panel allowance in bytes, including 100 MiB national tests.</param>
+    /// <param name="durationDays">Positive finite lifetime in whole days; test callers pass three.</param>
+    /// <param name="trialKey">Required catalog/audit identity distinguishing ordinary, daily colleague, and paid colleague tests.</param>
+    /// <param name="operationKey">Required immutable eligibility/grant purchase key; reuse it on every read-back or duplicate.</param>
+    /// <param name="priceToman">Authoritative nonnegative whole-toman price: zero for a quota-approved free test, or the committed paid-wallet receipt amount.</param>
+    /// <param name="cancellationToken">Cancellation of reservation, HTTP, and local persistence.</param>
+    /// <returns>Verified creation or a safe unresolved failure; an existing key can never authorize a second POST.</returns>
+    /// <remarks>
+    /// The caller owns eligibility, free quota, paid preview/confirmation, exactly-once wallet debit and compensation.
+    /// This method never mutates a wallet or ledger. A paid caller must persist its sufficient-balance debit and sole
+    /// executor claim before calling. Trial metadata records the actual price and byte limit; notification failure
+    /// cannot undo successful creation. Ordinary customer cooldown timestamps remain the caller's responsibility.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The supplied price is negative.</exception>
+    /// <exception cref="InvalidOperationException">The catalog or immutable creation identity conflicts with this request.</exception>
+    /// <example><code>await purchaseService.CreateTrialAccountAsync(user, panel, "normal", 1, 1073741824, 3, "normal-colleague-daily-free", grant.OperationKey, 0, token);</code></example>
     public async Task<XuiV3AccountCreationResult> CreateTrialAccountAsync(
         CredUser user,
         ServerInfo serverInfo,
@@ -1600,8 +1644,10 @@ public class XuiV3PurchaseService
         int durationDays,
         string trialKey,
         string operationKey,
+        long priceToman,
         CancellationToken cancellationToken = default)
     {
+        if (priceToman < 0) throw new ArgumentOutOfRangeException(nameof(priceToman));
         var service = FindService(serviceKey);
         var inboundIds = ResolveServiceInboundIds(service);
         var resolved = new XuiV3ResolvedPurchase
@@ -1617,7 +1663,7 @@ public class XuiV3PurchaseService
             TrafficBytes = trafficBytes,
             DurationDays = durationDays,
             LimitIp = 0,
-            PriceToman = 0,
+            PriceToman = priceToman,
             IsUnlimited = false
         };
 
@@ -1642,7 +1688,7 @@ public class XuiV3PurchaseService
             {
                 OperationKey = operationKey,
                 OperationStore = _creationOperations,
-                PriceToman = 0,
+                PriceToman = priceToman,
                 InboundIds = inboundIds,
                 TrafficGb = displayTrafficGb,
                 TrafficBytes = trafficBytes,
@@ -1658,14 +1704,14 @@ public class XuiV3PurchaseService
                         IsTrial = true,
                         TrialKey = trialKey,
                         TrafficBytes = trafficBytes,
-                        PriceTomanOverride = 0,
+                        PriceTomanOverride = priceToman,
                         CreatedByTelegramUserId = user.TelegramUserId,
                         LastUpdatedByTelegramUserId = user.TelegramUserId,
-                        LastAction = "trial-create",
+                        LastAction = priceToman == 0 ? "trial-create" : "paid-trial-create",
                         SaveUserStatus = true
                     },
                     trafficBytes,
-                    0),
+                    priceToman),
                 SaveUserStatus = true
             },
             cancellationToken);

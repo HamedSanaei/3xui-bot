@@ -6079,6 +6079,8 @@ public partial class TelegramBotService
     /// payloads are registered after the reset and retain their existing immutable relationship rules. Legacy
     /// insufficient-wallet branches show an inline shortcut into the canonical main-keyboard charge flow.
     /// Trial entry displays «اکانت تست» while accepting the previous free-account button as an input alias.
+    /// Active colleagues share the configured Tehran-day free-test quota across owned bots and can explicitly buy
+    /// the same test at colleague rates after exhausting it.
     /// </remarks>
     /// <example>
     /// <code>
@@ -6351,7 +6353,7 @@ public partial class TelegramBotService
         {
             return;
         }
-        else if (await _xuiV3BotFlowService.TryHandleFreeTrialAsync(
+        else if (await _xuiV3BotFlowService.TryHandleTrialAsync(
             botClient,
             message,
             credUser,

@@ -513,6 +513,9 @@ namespace Adminbot.Domain
     {
         public const string WalletCharge = "wallet_charge";
         public const string AccountPurchase = "account_purchase";
+        /// <summary>Positive exact-amount compensation of an owned colleague's paid test after durable non-creation proof.</summary>
+        /// <remarks>Links to the original debit and grant through receipt keys; never used for an ambiguous or applied panel attempt.</remarks>
+        public const string ColleagueTrialRefund = "colleague_trial_refund";
         public const string AccountRenew = "account_renew";
         public const string AdminAdjustment = "admin_adjustment";
         public const string TenantGatewayProfit = "tenant_gateway_profit";
