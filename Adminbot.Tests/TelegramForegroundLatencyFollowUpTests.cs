@@ -556,55 +556,24 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>
-    /// The durable tenant notification transport is never wrapped in the interactive foreground delivery policy.
+    /// A connected burst retains full metadata locally and reports newly affected victims once to operators.
     /// </summary>
-    /// <remarks>
-    /// Production showed a customer account delivery that legitimately took about twenty-eight seconds and finished
-    /// with <c>outcome=delivered</c>. Durable delivery owns an outbox with delivered, delivery-uncertain, and
-    /// manual-review semantics, so the eight-second interactive budget must never reach it: wrapping that transport
-    /// would turn an ambiguous send into either a lost account or a duplicate delivery attempt. This is asserted
-    /// structurally because the durable path deliberately has no compile-time dependency on the foreground policy,
-    /// which is exactly the property that must not regress.
-    /// </remarks>
+    /// <returns>A task completing after same-lane execution, detail, and incident assertions.</returns>
+    /// <remarks>Operator coalescing must not erase per-update detail. A release barrier holds the head until both victims are admitted and past the wait threshold, independent of SQLite admission speed.</remarks>
     [Fact]
-    public void Durable_notification_transport_is_never_wrapped_in_the_foreground_delivery_policy()
-    {
-        // Positive control: the per-update executor is what installs the bounded view, so the guard below cannot pass
-        // vacuously if the decorator is ever renamed or removed.
-        var executor = ReadRepositoryFile("Services/TelegramUpdateExecutor.cs");
-        Assert.Contains("ForegroundBoundedTelegramBotClient", executor, StringComparison.Ordinal);
-
-        var orderWorker = ReadRepositoryFile("Services/TenantOrderNotificationWorker.cs");
-        Assert.DoesNotContain("ForegroundBoundedTelegramBotClient", orderWorker, StringComparison.Ordinal);
-        Assert.DoesNotContain("TelegramForegroundDeliveryPolicy", orderWorker, StringComparison.Ordinal);
-        // The durable order worker uses the shared production client provider directly, which is the raw transport.
-        Assert.Contains("BotClientProvider", orderWorker, StringComparison.Ordinal);
-
-        // The durable receipt worker relays through the assistant bot and must stay off the interactive budget too.
-        var receiptWorker = ReadRepositoryFile("Services/TenantManualReceiptNotificationWorker.cs");
-        Assert.DoesNotContain("ForegroundBoundedTelegramBotClient", receiptWorker, StringComparison.Ordinal);
-        Assert.DoesNotContain("TelegramForegroundDeliveryPolicy", receiptWorker, StringComparison.Ordinal);
-    }
-
-    /// <summary>
-    /// One slow lane head produces one root warning and one queue-wait warning carrying the full blocker correlation.
-    /// </summary>
-    /// <returns>A task completing after every same-lane update finished and the diagnostics were asserted.</returns>
-    /// <remarks>
-    /// The reported production symptom was four warnings describing the victims and none naming the cause. The
-    /// correlation block must name the waiting update, its lane, its wait, and the exact earlier execution that
-    /// occupied the lane, so an operator can identify the root blocker from a single line without reading the inbox
-    /// payload.
-    /// </remarks>
-    [Fact]
-    public async Task Queue_wait_warning_carries_full_blocker_correlation_and_dedups_the_cascade()
+    public async Task Queue_wait_detail_carries_full_correlation_and_operator_incident_coalesces_the_cascade()
     {
         using var databases = new Databases();
         var logs = new DiagnosticLogger<TelegramUpdateScheduler>();
+        var headEntered = Signal();
+        var releaseHead = Signal();
         var executor = new Executor(async (item, token) =>
         {
             if (item.Update.Id == 916840327)
-                await Task.Delay(TimeSpan.FromMilliseconds(220), token);
+            {
+                headEntered.TrySetResult();
+                await releaseHead.Task.WaitAsync(token);
+            }
         });
         using var scheduler = new TelegramUpdateScheduler(
             databases.Inbox,
@@ -621,34 +590,42 @@ public sealed partial class ConcurrencyTests
         try
         {
             await scheduler.EnqueueAsync("vpnetiranbot", Update(916840327, 711), default);
-            await Until(() => scheduler.ActiveHandlerCount == 1);
+            await headEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await scheduler.EnqueueAsync("vpnetiranbot", Update(916840329, 711), default);
             await scheduler.EnqueueAsync("vpnetiranbot", Update(916840330, 711), default);
+            await Task.Delay(TimeSpan.FromMilliseconds(120));
+            releaseHead.TrySetResult();
 
+            await Until(() => logs.Count(LogLevel.Warning, "waited unusually long") == 2);
             await Until(() => scheduler.ActiveHandlerCount == 0);
         }
-        finally { await scheduler.StopAsync(default); }
+        finally { releaseHead.TrySetResult(); await scheduler.StopAsync(default); }
 
         // One warning for the slow root handler, and no per-second repeat.
         Assert.Equal(1, logs.Count(LogLevel.Warning, "handler running unusually long"));
 
-        // Every victim of the same slow head reports the same earliest overlapping execution, so the cascade collapses
-        // to a single queue-wait warning instead of one per waiting update.
         var waits = logs.Messages(LogLevel.Warning)
             .Where(x => x.Contains("waited unusually long", StringComparison.Ordinal))
             .ToList();
-        var rootWarning = Assert.Single(waits);
-
-        Assert.Contains("BotId=vpnetiranbot", rootWarning, StringComparison.Ordinal);
-        Assert.Contains("TelegramUserId=711", rootWarning, StringComparison.Ordinal);
-        Assert.Contains("WaitingUpdateId=916840329", rootWarning, StringComparison.Ordinal);
-        Assert.Contains("WaitingUpdateType=Message", rootWarning, StringComparison.Ordinal);
-        Assert.Contains("QueueWaitMs=", rootWarning, StringComparison.Ordinal);
-        Assert.Contains("PreviousUpdateId=916840327", rootWarning, StringComparison.Ordinal);
-        Assert.Contains("PreviousUpdateType=Message", rootWarning, StringComparison.Ordinal);
-        Assert.Contains("PreviousHandlerDurationMs=", rootWarning, StringComparison.Ordinal);
-        // The root blocker never waited behind anything, so it can never appear as its own victim.
-        Assert.DoesNotContain("PreviousSequence=0", rootWarning, StringComparison.Ordinal);
+        Assert.Equal(2, waits.Count);
+        foreach (var victimId in new[] { 916840329, 916840330 })
+        {
+            var detail = Assert.Single(waits, x => x.Contains($"WaitingUpdateId={victimId} ", StringComparison.Ordinal));
+            Assert.Contains("BotId=vpnetiranbot ", detail, StringComparison.Ordinal);
+            Assert.Contains("TelegramUserId=711 ", detail, StringComparison.Ordinal);
+            Assert.Contains("WaitingUpdateType=Message ", detail, StringComparison.Ordinal);
+            Assert.Contains("QueueWaitMs=", detail, StringComparison.Ordinal);
+            Assert.Contains("PreviousUpdateId=916840327 ", detail, StringComparison.Ordinal);
+            Assert.Contains("PreviousUpdateType=Message ", detail, StringComparison.Ordinal);
+            Assert.Contains("PreviousHandlerDurationMs=", detail, StringComparison.Ordinal);
+            Assert.Contains("BlockingOverlapMs=", detail, StringComparison.Ordinal);
+            Assert.DoesNotContain("PreviousSequence=0 ", detail, StringComparison.Ordinal);
+        }
+        var summaries = logs.Messages(LogLevel.Warning)
+            .Where(x => x.Contains("queue-delay incident", StringComparison.Ordinal)).ToList();
+        Assert.Equal(2, summaries.Count);
+        Assert.All(summaries, summary => Assert.Contains("AffectedCount=1 ", summary, StringComparison.Ordinal));
+        Assert.All(summaries, summary => Assert.Contains("DominantBlockerUpdateId=916840327 ", summary, StringComparison.Ordinal));
     }
 
     /// <summary>

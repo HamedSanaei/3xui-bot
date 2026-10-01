@@ -103,18 +103,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// </remarks>
     internal TimeSpan SlowStageThreshold { get; init; } = TimeSpan.FromSeconds(2);
 
-    /// <summary>
-    /// Per-lane record of the last queue-wait blocker that was reported, keyed by bot id and Telegram user id.
-    /// </summary>
-    /// <remarks>
-    /// One slow handler makes every later update in the same lane wait, so without this map a single incident produced
-    /// four or more warnings. Entries are written only for waits above the long-wait threshold, so the map grows with
-    /// distinct incidents rather than with traffic, and it is bounded explicitly to prevent unbounded growth.
-    /// </remarks>
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _reportedQueueBlockers = new(StringComparer.Ordinal);
-
-    /// <summary>Maximum lane entries retained for queue-wait deduplication before the map is reset.</summary>
-    private const int MaxReportedQueueBlockers = 20000;
+    /// <summary>Instance-owned, bounded queue incidents; observations never perform operator delivery.</summary>
+    private readonly TelegramQueueDelayIncidentAggregator _queueIncidents = new();
     /// <summary>Deterministic wait seam; production waits on the coalesced signal or the recovery timeout.</summary>
     internal Func<SemaphoreSlim, TimeSpan, CancellationToken, Task<bool>> WaitAsync { get; init; }
         = (signal, interval, token) => signal.WaitAsync(interval, token);
@@ -207,7 +197,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <summary>Runs eligible lane heads while maintaining a fixed upper bound on tracked handler tasks.</summary>
     /// <param name="token">Coordinator cancellation after shutdown draining has ended.</param>
     /// <returns>The complete coordinator lifetime, including observation of every started handler.</returns>
-    /// <remarks>The ready query excludes only earlier queued or running work. Round-robin bots cannot reorder live work in a lane.</remarks>
+    /// <remarks>The ready query excludes only earlier queued or running work. Round-robin bots cannot reorder live work in a lane. Queue diagnostics are flushed on the existing coordinator wake/recovery path; their failures are isolated.</remarks>
     private async Task RunAsync(CancellationToken token)
     {
         var active = new Dictionary<long, Task>();
@@ -218,6 +208,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         {
             while (!token.IsCancellationRequested)
             {
+                FlushQueueIncidents();
                 foreach (var pair in active.Where(x => x.Value.IsCompleted).ToArray())
                 {
                     await pair.Value;
@@ -277,7 +268,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         finally
         {
-            await Task.WhenAll(active.Values);
+            try { await Task.WhenAll(active.Values); }
+            finally { FlushQueueIncidents(shutdown: true); }
         }
     }
 
@@ -285,7 +277,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <param name="sequence">Internal inbox sequence; no secret data.</param>
     /// <param name="token">Cancellation propagated to the handler after drain expiry.</param>
     /// <returns>A tracked task that observes handler failures and attempts independent final persistence.</returns>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure. Telegram API failures retain numeric status and closed reason metadata, never exception messages or payloads; all failures retain their durable terminal outcome.</remarks>
+    /// <remarks>The host owns scheduler lifetime and FIFO/concurrency are unchanged. Foreground requests produce closed, local-only kind/outcome/timing observations; the watchdog distinguishes current-request age from handler age, and completion retains request count/aggregate duration. Telegram API failures keep numeric status/closed reason metadata, never exception bodies, and retain their durable terminal outcome.</remarks>
     private async Task ProcessAsync(long sequence, CancellationToken token)
     {
         _store.Executing.TryAdd(sequence, 0);
@@ -293,6 +285,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         var started = Stopwatch.GetTimestamp();
         string failure = null;
         var counted = false;
+        TelegramUpdateLatencyScope latencyScope = null;
         // Live long-handler diagnostics: one timer per execution and one flag that proves the handler was still
         // running when it fired. A StrongBox gives the timer callback a reference it can read atomically.
         var handlerFinished = new System.Runtime.CompilerServices.StrongBox<int>(0);
@@ -303,7 +296,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         {
             item = await _store.ClaimAsync(sequence, token);
             if (item == null) return;
-            var wait = (DateTime.UtcNow - item.AcceptedAtUtc).TotalMilliseconds;
+            var wait = Math.Max(0, (item.StartedAtUtc - item.AcceptedAtUtc).TotalMilliseconds);
             QueueWait.Record(wait);
             var active = Interlocked.Increment(ref _activeCount);
             counted = true;
@@ -316,12 +309,13 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             // that is actually blocking the lane. The scope is captured explicitly because the watchdog callback runs on
             // a timer thread whose ambient scope is not the handler's.
             using (TelegramUpdateExecutionScope.Push(sequence))
-            using (var latencyScope = TelegramUpdateLatencyScope.Push(
+            using (latencyScope = TelegramUpdateLatencyScope.Push(
                 sequence,
                 item.Key.BotId,
                 item.Update.Id,
                 SlowStageThreshold,
-                (stage, elapsedMs) => ReportSlowStage(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, stage, elapsedMs)))
+                (stage, elapsedMs) => ReportSlowStage(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, stage, elapsedMs),
+                observation => ReportTelegramRequest(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, observation)))
             {
                 // The watchdog fires once at the threshold. It reports the root blocker instead of the victims that
                 // merely waited behind it, and it never runs when the handler already finished.
@@ -335,12 +329,15 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     System.Threading.Volatile.Write(ref handlerWarningEmitted.Value, 1);
                     try
                     {
-                        // Stage is a closed enumeration member name or "none", never customer data, so an operator can
-                        // tell a stuck membership probe from a stuck panel read without exposing any payload.
+                        // Snapshot values are enums and timings only. Handler age and this one request's age are
+                        // distinct: several sequential requests can cross the watchdog without one ten-second send.
+                        var request = observedScope.CurrentTelegramRequest;
                         _logger.LogWarning(
-                            "Telegram update handler running unusually long. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} UpdateType={UpdateType} HandlerElapsedMs={HandlerElapsedMs} Stage={Stage} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}",
+                            "Telegram update handler running unusually long. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} UpdateType={UpdateType} HandlerElapsedMs={HandlerElapsedMs} Stage={Stage} RequestKind={RequestKind} RequestOutcome={RequestOutcome} RequestElapsedMs={RequestElapsedMs} TelegramRequestCount={TelegramRequestCount} TotalTelegramElapsedMs={TotalTelegramElapsedMs} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}",
                             claimedItem.Key.BotId, sequence, claimedItem.Update.Id, claimedItem.Update.Type,
-                            LongHandlerWarningThreshold.TotalMilliseconds, observedScope?.CurrentStage?.ToString() ?? "none",
+                            request?.HandlerElapsedMs ?? observedScope.Elapsed.TotalMilliseconds, observedScope.CurrentStage?.ToString() ?? "none",
+                            request?.Kind.ToString() ?? "none", request?.Outcome.ToString() ?? "none", request?.RequestElapsedMs ?? 0,
+                            request?.RequestCount ?? observedScope.RequestCount, request?.TotalTelegramElapsedMs ?? observedScope.TotalTelegramElapsedMs,
                             ActiveHandlerCount, _concurrency);
                     }
                     catch
@@ -395,7 +392,9 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                 failure,
                 item,
                 sequence,
-                System.Threading.Volatile.Read(ref handlerWarningEmitted.Value) != 0);
+                System.Threading.Volatile.Read(ref handlerWarningEmitted.Value) != 0,
+                latencyScope?.RequestCount ?? 0,
+                latencyScope?.TotalTelegramElapsedMs ?? 0);
             // Also resolves a committed claim whose payload could not be deserialized before ClaimAsync returned.
             using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             try { if (item != null || failure != null) await _store.FinishAsync(sequence, failure, persistence.Token); }
@@ -418,58 +417,69 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         return TelegramDeliveryFailureClassifier.Classify(exception);
     }
 
-    /// <summary>
-    /// Reports one long queue wait together with the previous execution that most likely caused it.
-    /// </summary>
-    /// <param name="item">The claimed work item whose wait is being reported; its payload is never logged.</param>
-    /// <param name="sequence">Internal inbox sequence of the waiting update.</param>
-    /// <param name="waitMilliseconds">Observed wait between durable acceptance and handler start.</param>
-    /// <param name="token">Coordinator/execution cancellation for the metadata-only blocker lookup.</param>
-    /// <returns>A task completing after the diagnostic (or its suppression) has been logged.</returns>
+    /// <summary>Retains full local wait detail and observes one connected operator incident without delivering it.</summary>
+    /// <param name="item">Claimed private work item; only identity and timing metadata are used.</param>
+    /// <param name="sequence">Internal inbox sequence of the victim.</param>
+    /// <param name="waitMilliseconds">Queue wait in milliseconds, ending at the persisted UTC claim time.</param>
+    /// <param name="token">Execution cancellation for the metadata-only predecessor read.</param>
+    /// <returns>A task completing after safe local diagnostics and memory-only aggregation.</returns>
     /// <remarks>
-    /// Strict FIFO means one slow predecessor makes every later update in the same lane wait, so the raw
-    /// "waited unusually long" warning was pure alert amplification: one incident produced four warnings naming only
-    /// the victims. This method names the predecessor instead and reports each lane/blocker pair once; further waits
-    /// behind the same blocker stay visible through the queue-wait histogram and a payload-free Debug line, while a
-    /// genuinely different blocker warns again. The lookup is diagnostics only and never affects scheduling.
+    /// Each delayed update retains a Warning detail locally, even if its attributed sequence changes. Operator
+    /// summaries are emitted separately by the coordinator. Ordinary lookup/aggregation/logger failures are
+    /// diagnostic-only. Cancellation still propagates to the existing execution_cancelled terminal policy before
+    /// business execution. No payload is loaded for attribution.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The predecessor read was cancelled; business execution must not begin.</exception>
+    /// <example><code>await ReportLongQueueWaitAsync(item, item.Sequence, waitMilliseconds, token);</code></example>
     private async Task ReportLongQueueWaitAsync(TelegramUpdateWorkItem item, long sequence, double waitMilliseconds, CancellationToken token)
     {
         TelegramLaneExecutionSummary blocker = null;
         try
         {
             blocker = await _store.FindPreviousLaneExecutionAsync(
-                sequence, item.Key.BotId, item.Key.TelegramUserId, item.AcceptedAtUtc, DateTime.UtcNow, token);
+                sequence, item.Key.BotId, item.Key.TelegramUserId, item.AcceptedAtUtc, item.StartedAtUtc, token);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            // Diagnostics must never delay or fail the update that is about to run.
-            _logger.LogDebug("Telegram lane blocker lookup failed. ErrorType={ErrorType}", ex.GetType().Name);
+            // Attribution failure is optional; cancellation must still prevent business effects.
         }
-
-        var blockerSequence = blocker?.Sequence ?? 0;
-        var laneKey = item.Key.BotId + "\u001f" + item.Key.TelegramUserId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        var alreadyReported = _reportedQueueBlockers.TryGetValue(laneKey, out var previous) && previous == blockerSequence;
-        if (_reportedQueueBlockers.Count >= MaxReportedQueueBlockers)
-            _reportedQueueBlockers.Clear();
-        _reportedQueueBlockers[laneKey] = blockerSequence;
-
-        if (alreadyReported)
+        try
         {
-            // Same lane incident, already reported once: keep the metric and a file diagnostic instead of another alert.
-            _logger.LogDebug(
-                "Telegram update waited behind an already reported lane blocker. BotId={BotId} TelegramUserId={TelegramUserId} WaitingSequence={WaitingSequence} WaitingUpdateId={WaitingUpdateId} QueueWaitMs={QueueWaitMs} PreviousSequence={PreviousSequence}",
-                item.Key.BotId, item.Key.TelegramUserId, sequence, item.Update.Id, waitMilliseconds, blockerSequence);
-            return;
+            _queueIncidents.Observe(item.Key, item.AcceptedAtUtc, item.StartedAtUtc, waitMilliseconds, blocker, DateTime.UtcNow);
+            Wake();
+            _logger.LogWarning(
+                "Telegram update waited unusually long. BotId={BotId} TelegramUserId={TelegramUserId} WaitingSequence={WaitingSequence} WaitingUpdateId={WaitingUpdateId} WaitingUpdateType={WaitingUpdateType} QueueWaitMs={QueueWaitMs} AcceptedAtUtc={AcceptedAtUtc} StartedAtUtc={StartedAtUtc} PreviousSequence={PreviousSequence} PreviousUpdateId={PreviousUpdateId} PreviousUpdateType={PreviousUpdateType} PreviousHandlerDurationMs={PreviousHandlerDurationMs} BlockingOverlapMs={BlockingOverlapMs}",
+                item.Key.BotId, item.Key.TelegramUserId, sequence, item.Update.Id, item.Update.Type, waitMilliseconds,
+                item.AcceptedAtUtc, item.StartedAtUtc, blocker?.Sequence ?? 0, blocker?.UpdateId ?? 0,
+                blocker?.UpdateType ?? string.Empty, blocker?.HandlerDurationMs ?? 0, blocker?.BlockingOverlapMs ?? 0);
         }
+        catch
+        {
+            // Memory-only diagnostics and local logging never participate in business success.
+        }
+    }
 
-        // The full correlation block: which update waited, on which lane, for how long, and the exact earlier
-        // execution that caused it. All values are identifiers already present in scheduler telemetry; the inbox
-        // payload is never loaded for correlation.
-        _logger.LogWarning(
-            "Telegram update waited unusually long. BotId={BotId} TelegramUserId={TelegramUserId} WaitingSequence={WaitingSequence} WaitingUpdateId={WaitingUpdateId} WaitingUpdateType={WaitingUpdateType} QueueWaitMs={QueueWaitMs} PreviousSequence={PreviousSequence} PreviousUpdateId={PreviousUpdateId} PreviousUpdateType={PreviousUpdateType} PreviousHandlerDurationMs={PreviousHandlerDurationMs}",
-            item.Key.BotId, item.Key.TelegramUserId, sequence, item.Update.Id, item.Update.Type, waitMilliseconds,
-            blockerSequence, blocker?.UpdateId ?? 0, blocker?.UpdateType ?? string.Empty, blocker?.HandlerDurationMs ?? 0);
+    /// <summary>Drains bounded incident summaries on the tracked coordinator, never on the handler path.</summary>
+    /// <param name="shutdown">True closes all pending windows before the coordinator exits.</param>
+    /// <remarks>The ordinary structured logger uses best-effort operator delivery; it is not durable financial logging. Sink exceptions are isolated and never retried.</remarks>
+    private void FlushQueueIncidents(bool shutdown = false)
+    {
+        try
+        {
+            _queueIncidents.Flush(DateTime.UtcNow, summary =>
+                _logger.LogWarning(
+                    "Telegram queue-delay incident. BotId={BotId} TelegramUserId={TelegramUserId} AffectedCount={AffectedCount} MaxQueueWaitMs={MaxQueueWaitMs} DominantBlockerSequence={DominantBlockerSequence} DominantBlockerUpdateId={DominantBlockerUpdateId} DominantBlockerType={DominantBlockerType} DominantBlockerDurationMs={DominantBlockerDurationMs} DominantBlockerOverlapMs={DominantBlockerOverlapMs} StartedAtUtc={StartedAtUtc} EndedAtUtc={EndedAtUtc} WindowStartedAtUtc={WindowStartedAtUtc} WindowEndedAtUtc={WindowEndedAtUtc} WindowMs={WindowMs} Reason={Reason} Overflow={Overflow}",
+                    summary.BotId, summary.TelegramUserId, summary.AffectedCount, summary.MaxQueueWaitMs,
+                    summary.DominantBlocker?.Sequence ?? 0, summary.DominantBlocker?.UpdateId ?? 0,
+                    summary.DominantBlocker?.UpdateType ?? string.Empty, summary.DominantBlocker?.HandlerDurationMs ?? 0,
+                    summary.DominantBlocker?.BlockingOverlapMs ?? 0, summary.StartedAtUtc, summary.EndedAtUtc,
+                    summary.WindowStartedAtUtc, summary.WindowEndedAtUtc, TelegramQueueDelayIncidentAggregator.Window.TotalMilliseconds,
+                    summary.Reason, summary.Overflow), shutdown);
+        }
+        catch
+        {
+            // A diagnostic maintenance fault cannot pause scheduling or weaken completion persistence.
+        }
     }
 
     /// <summary>
@@ -495,6 +505,27 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             botId, sequence, updateId, updateType, stage, elapsedMilliseconds);
     }
 
+    /// <summary>Records one completed foreground Telegram attempt as local-only, payload-free timing telemetry.</summary>
+    /// <param name="botId">Canonical runtime bot id owning this update; never a token.</param>
+    /// <param name="sequence">Internal durable inbox sequence of the executing handler.</param>
+    /// <param name="updateId">Telegram update id, not a message or chat id.</param>
+    /// <param name="updateType">Telegram SDK update category; no user content.</param>
+    /// <param name="observation">Closed request kind/outcome, millisecond timings, counts and optional numeric API code only.</param>
+    /// <remarks>
+    /// The scope isolates recorder failures from delivery. The operator provider withholds this exact family; original
+    /// API failures and budget incidents still use their existing routing. Healthy attempts are retained so sequential
+    /// calls can be distinguished from one slow call. File persistence follows the configured local minimum level.
+    /// </remarks>
+    /// <example><code>ReportTelegramRequest(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, observation);</code></example>
+    private void ReportTelegramRequest(string botId, long sequence, int updateId, UpdateType updateType,
+        TelegramForegroundRequestObservation observation)
+    {
+        _logger.LogInformation(
+            "Telegram foreground request completed. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} UpdateType={UpdateType} RequestKind={RequestKind} Outcome={Outcome} RequestElapsedMs={RequestElapsedMs} HandlerElapsedMs={HandlerElapsedMs} ErrorCode={ErrorCode} TelegramRequestCount={TelegramRequestCount} TotalTelegramElapsedMs={TotalTelegramElapsedMs}",
+            botId, sequence, updateId, updateType, observation.Kind, observation.Outcome, observation.RequestElapsedMs,
+            observation.HandlerElapsedMs, observation.ApiErrorCode, observation.RequestCount, observation.TotalTelegramElapsedMs);
+    }
+
     /// <summary>
     /// Records the completed handler duration so long updates stay visible even when they eventually succeed.
     /// </summary>
@@ -506,6 +537,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// True when the live long-handler watchdog already produced the single Warning for this execution, so the
     /// completion record must not add a second alert for the same root blocker.
     /// </param>
+    /// <param name="telegramRequestCount">Number of mapped foreground attempts started, including failed or cancelled calls; zero if no scope ran.</param>
+    /// <param name="totalTelegramElapsedMs">Sum of measured request durations in milliseconds; concurrent calls may exceed handler wall time.</param>
     /// <remarks>
     /// Exactly one Warning is emitted per slow root handler: the live watchdog normally fires while it is still
     /// running, and this completion record is then logged at Information. When the watchdog could not fire — for example
@@ -523,7 +556,9 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         string failureCode,
         TelegramUpdateWorkItem item,
         long sequence,
-        bool liveWarningEmitted)
+        bool liveWarningEmitted,
+        long telegramRequestCount,
+        double totalTelegramElapsedMs)
     {
         if (durationMilliseconds < InteractiveHandlerThreshold.TotalMilliseconds)
             return;
@@ -534,16 +569,16 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         var isLongHandler = durationMilliseconds >= LongHandlerWarningThreshold.TotalMilliseconds;
         if (isLongHandler && !liveWarningEmitted)
             _logger.LogWarning(
-                "Telegram update handler exceeded the interactive latency threshold. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome}",
-                botId, sequence, updateId, durationMilliseconds, outcome);
+                "Telegram update handler exceeded the interactive latency threshold. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome} TelegramRequestCount={TelegramRequestCount} TotalTelegramElapsedMs={TotalTelegramElapsedMs}",
+                botId, sequence, updateId, durationMilliseconds, outcome, telegramRequestCount, totalTelegramElapsedMs);
         else if (isLongHandler)
             _logger.LogInformation(
-                "Telegram long update handler completed. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome}",
-                botId, sequence, updateId, durationMilliseconds, outcome);
+                "Telegram long update handler completed. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome} TelegramRequestCount={TelegramRequestCount} TotalTelegramElapsedMs={TotalTelegramElapsedMs}",
+                botId, sequence, updateId, durationMilliseconds, outcome, telegramRequestCount, totalTelegramElapsedMs);
         else
             _logger.LogInformation(
-                "Telegram update handler exceeded the interactive latency threshold. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome}",
-                botId, sequence, updateId, durationMilliseconds, outcome);
+                "Telegram update handler exceeded the interactive latency threshold. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome} TelegramRequestCount={TelegramRequestCount} TotalTelegramElapsedMs={TotalTelegramElapsedMs}",
+                botId, sequence, updateId, durationMilliseconds, outcome, telegramRequestCount, totalTelegramElapsedMs);
     }
 
     private static readonly Histogram<int> RecoveryPending = Meter.CreateHistogram<int>("telegram.update.recovery.pending");
@@ -586,6 +621,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                 _logger.LogCritical("Telegram handlers did not stop within cancellation grace. ActiveHandlers={ActiveHandlers}", ActiveHandlerCount);
             }
         }
+        finally { FlushQueueIncidents(shutdown: true); }
     }
 
     /// <summary>Disposes scheduler cancellation resources after the host has awaited StopAsync.</summary>

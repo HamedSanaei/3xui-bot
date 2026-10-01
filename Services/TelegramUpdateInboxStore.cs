@@ -68,9 +68,12 @@ public sealed partial class TelegramUpdateInboxStore
     /// <summary>Claims one queued lane head before any external handler effect.</summary>
     /// <param name="sequence">Internal inbox sequence selected by this scheduler.</param>
     /// <param name="token">Cancellation of the local claim.</param>
-    /// <returns>A private work item, or null if another executor already claimed the row.</returns>
+    /// <returns>A private work item including the exact persisted UTC claim time, or null if another executor already claimed the row.</returns>
     /// <remarks>A process crash after the claim creates a terminal review receipt at recovery; unsafe business mutations are protected by their own durable operation records.
     /// Bot API serialization options read both newly accepted updates and existing v19 snake-case payloads.</remarks>
+    /// <example><code>var item = await store.ClaimAsync(sequence, token); // item.StartedAtUtc is the durable wait endpoint.</code></example>
+    /// <exception cref="InvalidOperationException">The committed claim contains an invalid durable update payload; recovery must preserve the claimed receipt for review.</exception>
+    /// <exception cref="OperationCanceledException">The local claim operation was cancelled before returning a work item.</exception>
     public Task<TelegramUpdateWorkItem> ClaimAsync(long sequence, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
@@ -81,7 +84,7 @@ public sealed partial class TelegramUpdateInboxStore
         var row = await db.TelegramUpdateInbox.AsNoTracking().SingleAsync(x => x.Sequence == sequence, ct);
         await transaction.CommitAsync(ct);
         return new TelegramUpdateWorkItem(row.Sequence, new(row.BotId, row.TelegramUserId),
-            System.Text.Json.JsonSerializer.Deserialize<Update>(row.Payload, Telegram.Bot.JsonBotAPI.Options) ?? throw new InvalidOperationException("Invalid durable update payload."), row.AcceptedAtUtc);
+            System.Text.Json.JsonSerializer.Deserialize<Update>(row.Payload, Telegram.Bot.JsonBotAPI.Options) ?? throw new InvalidOperationException("Invalid durable update payload."), row.AcceptedAtUtc, row.StartedAtUtc.Value);
     }, token);
 
     /// <summary>Finalizes a claim as a payload-free terminal receipt after the handler exits.</summary>
@@ -123,10 +126,7 @@ public sealed partial class TelegramUpdateInboxStore
         return count;
     }, token);
 
-    /// <summary>
-    /// Finds the previous execution in the same bot/user lane whose execution interval overlapped one update's
-    /// accepted-to-started wait.
-    /// </summary>
+    /// <summary>Finds the earlier same-lane execution contributing the largest positive overlap to the victim's wait.</summary>
     /// <param name="sequence">Internal inbox sequence of the currently starting (victim) update.</param>
     /// <param name="botId">Required canonical runtime bot id of the lane; never a token.</param>
     /// <param name="telegramUserId">Telegram actor id of the lane, or zero for the bot-scoped no-actor fallback lane.</param>
@@ -134,25 +134,23 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="startedAtUtc">UTC claim time of the victim update, which is when its wait ended.</param>
     /// <param name="token">Cancellation of the metadata-only read.</param>
     /// <returns>
-    /// The earliest earlier execution on the same lane whose run overlapped the victim's wait — the root of a slow-lane
-    /// chain — or <c>null</c> when no such execution exists, for example when the victim waited on admission pressure
-    /// rather than on a lane predecessor. The returned object is detached and never carries a payload.
+    /// Detached metadata for the greatest positive overlap, or <c>null</c> for an empty/reversed wait or when no
+    /// meaningful same-bot/user predecessor exists. Equal overlaps choose the smaller inbox sequence.
+    /// No payload is selected or materialized.
     /// </returns>
     /// <remarks>
-    /// This is diagnostics only and never changes scheduling. The overlap test is
-    /// <c>started &lt; victimStarted &amp;&amp; (completed == null || completed &gt; victimAccepted)</c>, which is true
-    /// for a predecessor that was still running when the victim arrived and for one that finished during the wait.
-    ///
-    /// Earliest rather than newest is deliberate. Strict FIFO makes every later update in a lane cascade behind one
-    /// slow handler, so the newest predecessor of victim C is simply victim B, which would make each cascade member look
-    /// like a separate incident and defeat warning deduplication. Every overlapping predecessor contributed to the wait,
-    /// so the earliest of them is the single root blocker the operator needs to see.
+    /// Compares <c>min(completed ?? victimStarted, victimStarted) - max(started, victimAccepted)</c> in integer ticks,
+    /// discarding zero/negative intervals. Completion after the victim starts is clipped; null completion is still running.
+    /// SQLite computes and orders the candidates, returning only one metadata row. EF's canonical UTC DateTime text
+    /// is converted to ticks without julianday floating-point rounding of sub-millisecond ties.
+    /// Diagnostics only: no scheduling, persistence or business state changes.
     /// </remarks>
     /// <example>
     /// <code>
     /// var blocker = await store.FindPreviousLaneExecutionAsync(sequence, botId, userId, acceptedAtUtc, startedAtUtc, token);
     /// </code>
     /// </example>
+    /// <exception cref="OperationCanceledException">The metadata read was cancelled; the scheduler retains its existing execution_cancelled review policy.</exception>
     public async Task<TelegramLaneExecutionSummary> FindPreviousLaneExecutionAsync(
         long sequence,
         string botId,
@@ -161,21 +159,36 @@ public sealed partial class TelegramUpdateInboxStore
         DateTime startedAtUtc,
         CancellationToken token)
     {
+        if (startedAtUtc <= acceptedAtUtc) return null;
         await using var db = _factory.CreateDbContext();
-        return await db.TelegramUpdateInbox.AsNoTracking()
-            .Where(x => x.BotId == botId && x.TelegramUserId == telegramUserId && x.Sequence < sequence
-                && x.StartedAtUtc != null && x.StartedAtUtc < startedAtUtc
-                && (x.CompletedAtUtc == null || x.CompletedAtUtc > acceptedAtUtc))
-            .OrderBy(x => x.Sequence)
-            .Select(x => new TelegramLaneExecutionSummary
-            {
-                Sequence = x.Sequence,
-                UpdateId = x.UpdateId,
-                UpdateType = x.UpdateType,
-                StartedAtUtc = x.StartedAtUtc.Value,
-                CompletedAtUtc = x.CompletedAtUtc
-            })
-            .FirstOrDefaultAsync(token);
+        return await db.Database.SqlQuery<TelegramLaneExecutionSummary>($"""
+            SELECT "Sequence", "UpdateId", "UpdateType", "StartedAtUtc", "CompletedAtUtc",
+                   {startedAtUtc} AS "ObservedAtUtc", ("OverlapTicks" / 10000.0) AS "BlockingOverlapMs"
+            FROM (
+                SELECT "Sequence", "UpdateId", "UpdateType", "StartedAtUtc", "CompletedAtUtc",
+                       MIN(COALESCE("CompletionTicks", {startedAtUtc.Ticks}), {startedAtUtc.Ticks})
+                       - MAX("StartTicks", {acceptedAtUtc.Ticks}) AS "OverlapTicks"
+                FROM (
+                    SELECT "Sequence", "UpdateId", "UpdateType", "StartedAtUtc", "CompletedAtUtc",
+                           CAST(strftime('%s', substr("StartedAtUtc", 1, 19)) AS INTEGER) * 10000000
+                             + 621355968000000000
+                             + CAST(substr(substr("StartedAtUtc", 21) || '0000000', 1, 7) AS INTEGER) AS "StartTicks",
+                           CASE WHEN "CompletedAtUtc" IS NULL THEN NULL ELSE
+                             CAST(strftime('%s', substr("CompletedAtUtc", 1, 19)) AS INTEGER) * 10000000
+                             + 621355968000000000
+                             + CAST(substr(substr("CompletedAtUtc", 21) || '0000000', 1, 7) AS INTEGER)
+                           END AS "CompletionTicks"
+                    FROM "TelegramUpdateInbox"
+                    WHERE "BotId" = {botId} AND "TelegramUserId" = {telegramUserId}
+                      AND "Sequence" < {sequence} AND "StartedAtUtc" IS NOT NULL
+                      AND "StartedAtUtc" < {startedAtUtc}
+                      AND ("CompletedAtUtc" IS NULL OR "CompletedAtUtc" > {acceptedAtUtc})
+                )
+            )
+            WHERE "OverlapTicks" > 0
+            ORDER BY "OverlapTicks" DESC, "Sequence" ASC
+            LIMIT 1
+            """).FirstOrDefaultAsync(token);
     }
 
     /// <summary>Measures unfinished admission pressure without loading private updates.</summary>

@@ -63,10 +63,8 @@ public sealed partial class ConcurrencyTests
     /// Genuine latency incidents, delivery failures, and financial failures still reach the operator channel.
     /// </summary>
     /// <remarks>
-    /// Hardening the routing must leave the channel actionable rather than silent: the live long-handler watchdog, a
-    /// handler at or above the ten-second incident threshold, any non-completed outcome, lane-delay proof, the real
-    /// foreground delivery budget expiry, funding delivery uncertainty, and payment/XUI/transport failures are all
-    /// delivered.
+    /// Hardening routing keeps live watchdogs, failed handlers, aggregate queue incidents, delivery uncertainty and
+    /// financial failures visible. Per-update queue details are local records, not separate operator incidents.
     /// </remarks>
     [Fact]
     public void Actionable_latency_and_failure_signals_remain_operator_visible()
@@ -87,11 +85,10 @@ public sealed partial class ConcurrencyTests
             "Telegram update handler exceeded the interactive latency threshold. BotId=b Sequence=1 UpdateId=1 " +
             "HandlerDurationMs=5500 Outcome=handler_exception", null));
 
-        // Lane-delay proof with its correlated root blocker remains useful to operators.
+        // Aggregate lane-delay proof stays actionable; the corresponding per-update detail is local-only.
         Assert.False(TelegramLogSuppression.ShouldSuppress(
-            "Telegram update waited unusually long. BotId=vpnetiranbot TelegramUserId=916840327 WaitingSequence=3546 " +
-            "WaitingUpdateId=916840329 WaitingUpdateType=Message QueueWaitMs=83616 PreviousSequence=3545 " +
-            "PreviousUpdateId=916840327 PreviousUpdateType=Message PreviousHandlerDurationMs=103780", null));
+            "Telegram queue-delay incident. BotId=vpnetiranbot TelegramUserId=916840327 AffectedUpdateCount=4 " +
+            "MaxQueueWaitMs=83616 DominantBlockingSequence=3545 DominantBlockerType=Message DominantBlockerDurationMs=103780", null));
 
         // The real foreground delivery budget expiry is an operational signal.
         Assert.False(TelegramLogSuppression.ShouldSuppress(
@@ -257,73 +254,65 @@ public sealed partial class ConcurrencyTests
         Assert.DoesNotContain(channelVisible, message => message.Contains("long update handler completed", StringComparison.Ordinal));
     }
 
-    /// <summary>
-    /// Withholding a message from the Telegram channel does not remove it from the other logging providers.
-    /// </summary>
-    /// <returns>A task completing after the fake channel sender and the local sink are inspected.</returns>
+    /// <summary>Routes the same event through real daily-file and Telegram providers without losing local evidence.</summary>
+    /// <param name="level">Original application severity; unrelated Information events must remain operator-visible.</param>
+    /// <param name="message">Safe routine-success, detail, incident or failure event family under test.</param>
+    /// <param name="operatorVisible">Whether the event is actionable and must reach the in-process operator transport.</param>
+    /// <param name="hasException">Whether an unexpected exception accompanies an otherwise successful-looking headline.</param>
+    /// <returns>A task completing after a FIFO delivery barrier and assertions against actual file/channel output.</returns>
     /// <remarks>
-    /// This is the distinction the incident required: the same five-second completed handler event must still be
-    /// written by the daily diagnostic file, the console/structured logger, and the metrics instruments, while the
-    /// private channel receives only the genuine lane-delay incident. The channel queue is FIFO, so observing the
-    /// incident alone proves the telemetry line was never enqueued for Telegram delivery.
+    /// The temporary daily-file provider admits Information explicitly, preserving its existing configurable minimum.
+    /// Both providers receive one real logging call; there is no manually echoed local sink or live provisioning.
     /// </remarks>
-    /// <example>
-    /// <code>
-    /// localSink: Information|Telegram update handler exceeded ... HandlerDurationMs=5373.7144 Outcome=completed
-    ///             Warning|Telegram update waited unusually long. ... QueueWaitMs=83616
-    /// channel  : Telegram update waited unusually long. ... QueueWaitMs=83616
-    /// </code>
-    /// </example>
-    [Fact]
-    public async Task Suppressed_telemetry_reaches_local_providers_but_not_the_telegram_channel()
+    [Theory]
+    [InlineData(LogLevel.Information, "Provisional tenant card account created. tenantBotId=tenant-routing orderId=test-order trafficGb=1 days=1", false, false)]
+    [InlineData(LogLevel.Information, "Provisional tenant card account created. tenantBotId=tenant-routing orderId=test-order trafficGb=1 days=1", true, true)]
+    [InlineData(LogLevel.Warning, "Provisional tenant card delivery failed after the receipt was persisted. orderId=12", true, true)]
+    [InlineData(LogLevel.Warning, "Provisional tenant card create did not produce a verified client. orderId=12", true, false)]
+    [InlineData(LogLevel.Warning, "Provisional tenant card delivery became uncertain. orderId=12", true, false)]
+    [InlineData(LogLevel.Warning, "Provisional tenant card account consistency mismatch. orderId=12", true, false)]
+    [InlineData(LogLevel.Warning, "Duplicate provisional tenant card account detected. orderId=12", true, false)]
+    [InlineData(LogLevel.Error, "Payment settlement failed. orderId=12", true, true)]
+    [InlineData(LogLevel.Warning, "ManualReview required for provisional tenant card order 12", true, false)]
+    [InlineData(LogLevel.Information, "Unrelated application information.", true, false)]
+    [InlineData(LogLevel.Warning, "Telegram update waited unusually long. BotId=route-detail TelegramUserId=91 QueueWaitMs=6161", false, false)]
+    [InlineData(LogLevel.Warning, "Telegram update waited unusually long. BotId=route-detail TelegramUserId=91 QueueWaitMs=6161", true, true)]
+    [InlineData(LogLevel.Warning, "Telegram queue-delay incident. BotId=route-summary TelegramUserId=91 AffectedUpdateCount=2 MaxQueueWaitMs=6161", true, false)]
+    [InlineData(LogLevel.Information, "Telegram foreground request completed. BotId=route-request RequestKind=TextSend Outcome=Completed RequestElapsedMs=50", false, false)]
+    [InlineData(LogLevel.Information, "Context mentions Provisional tenant card account created. but is not that event.", true, false)]
+    public async Task Telemetry_and_provisioning_events_keep_file_evidence_and_route_only_actionable_events(
+        LogLevel level, string message, bool operatorVisible, bool hasException)
     {
         await using var fixture = new BackupRecoveryTests.Fixture();
         var sender = new RecordingLogSender();
         await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
-        var logger = new TelegramLogger(
-            "noise-routing-test",
-            null,
-            new BotRegistry(new ConfigurationBuilder().Build()),
-            new BotContextAccessor(),
-            "-1001234567890",
-            "-1001234567891",
-            dispatcher);
-        var localSink = new ConcurrentQueue<string>();
+        var path = Path.Combine(Path.GetDirectoryName(fixture.Options.OutboxDatabasePath)!, "routing.log");
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["errorFileLogEnabled"] = "true",
+            ["errorFileLogMinimumLevel"] = "Information",
+            ["errorFileLogFilePath"] = path
+        }).Build();
+        var accessor = new BotContextAccessor();
+        using var factory = LoggerFactory.Create(builder => builder
+            .SetMinimumLevel(LogLevel.Information)
+            .AddProvider(new DailyErrorFileLoggerProvider(configuration, accessor))
+            .AddProvider(new TelegramLoggerProvider(null, new BotRegistry(configuration), accessor,
+                "-1001234567890", "-1001234567891", dispatcher)));
+        var logger = factory.CreateLogger("routing-regression");
+        var exception = hasException ? new InvalidOperationException("Unexpected operation failure.") : null;
+        logger.Log(level, new EventId(0), message, exception, static (text, _) => text);
+        const string barrier = "Routing delivery barrier.";
+        logger.LogWarning("{Message}", barrier);
+        await Until(() => sender.Texts.Contains(barrier));
 
-        var telemetry = SuppressedProductionMessages[0];
-        var incident =
-            "Telegram update waited unusually long. BotId=vpnetiranbot TelegramUserId=916840327 WaitingSequence=3546 " +
-            "WaitingUpdateId=916840329 QueueWaitMs=83616 PreviousUpdateId=916840327 PreviousHandlerDurationMs=103780";
-
-        // A local provider sees both events at their original levels.
-        LogLocally(localSink, LogLevel.Information, telemetry);
-        LogLocally(localSink, LogLevel.Warning, incident);
-
-        // The production Telegram logger withholds only the telemetry line.
-        logger.LogInformation("{Message}", telemetry);
-        logger.LogWarning("{Message}", incident);
-
-        await Until(() => sender.Texts.Count >= 1);
-        // Allow any late enqueue to arrive before proving the telemetry line never reached the channel.
-        await Task.Delay(TimeSpan.FromMilliseconds(150));
-
-        Assert.Equal(new[] { incident }, sender.Texts.ToArray());
-        // The local providers kept both events, each at its original severity.
-        Assert.Contains(LogLevel.Information + "|" + telemetry, localSink);
-        Assert.Contains(LogLevel.Warning + "|" + incident, localSink);
+        Assert.Equal(operatorVisible ? new[] { message, barrier } : new[] { barrier }, sender.Texts.ToArray());
+        var written = await File.ReadAllTextAsync(path);
+        Assert.Contains(message, written, StringComparison.Ordinal);
+        Assert.Contains(level + " routing-regression", written, StringComparison.Ordinal);
+        if (hasException)
+            Assert.Contains("Unexpected operation failure.", written, StringComparison.Ordinal);
     }
-
-    /// <summary>Records one locally-formatted log line the way a console/file provider would receive it.</summary>
-    /// <param name="sink">Shared local capture queue representing the non-Telegram providers.</param>
-    /// <param name="level">Level the caller used; recorded so the assertions prove the original level is preserved.</param>
-    /// <param name="message">Formatted message text.</param>
-    /// <remarks>
-    /// Test-only helper that records the level together with the text, because the incident requirement is that the
-    /// other providers keep both the message and its severity. It performs no routing of its own, so the Telegram
-    /// channel decision stays isolated in <see cref="TelegramLogSuppression"/>.
-    /// </remarks>
-    private static void LogLocally(ConcurrentQueue<string> sink, LogLevel level, string message)
-        => sink.Enqueue(level + "|" + message);
 
     /// <summary>Fake Telegram log sender that records delivered text instead of contacting Telegram.</summary>
     /// <remarks>Used to prove which events the production Telegram logger actually enqueued for channel delivery.</remarks>

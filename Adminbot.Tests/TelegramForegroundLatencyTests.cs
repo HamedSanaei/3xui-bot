@@ -22,7 +22,7 @@ using Xunit;
 /// <summary>
 /// Regression coverage for the head-of-line blocking incident: a foreground Telegram update must never be allowed to
 /// hold its strict FIFO lane for the full provider-oriented XUI timeout, a non-durable interactive Telegram send must
-/// release the lane promptly, and the scheduler must name the lane blocker instead of warning about each victim.
+/// release the lane promptly, and the scheduler must name dominant blockers locally while coalescing operator incidents.
 /// </summary>
 /// <remarks>
 /// These tests never contact real Telegram, XUI, or payment-provider endpoints. XUI coverage uses a loopback HTTP panel
@@ -429,21 +429,26 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>
-    /// One slow lane head produces exactly one live warning, one completion diagnostic, and one queue-wait warning that
-    /// names the blocker instead of warning separately for every victim.
+    /// One slow lane head retains local detail for every victim while operator reports count each victim once.
     /// </summary>
-    /// <returns>A task completing after all four same-lane updates finish and the log shape is asserted.</returns>
+    /// <returns>A task completing after FIFO, detailed correlation, and coalesced incident assertions.</returns>
+    /// <remarks>The head is held behind a barrier until every victim is accepted and has exceeded the test queue threshold, so slower database admission cannot let late victims escape the incident.</remarks>
     [Fact]
-    public async Task Slow_lane_head_is_reported_once_and_names_the_blocker()
+    public async Task Slow_lane_head_retains_each_victim_detail_and_coalesces_operator_incident()
     {
         using var databases = new Databases();
         var logs = new DiagnosticLogger<TelegramUpdateScheduler>();
         var started = new ConcurrentQueue<int>();
+        var headEntered = Signal();
+        var releaseHead = Signal();
         var executor = new Executor(async (item, token) =>
         {
             started.Enqueue(item.Update.Id);
             if (item.Update.Id == 1)
-                await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+            {
+                headEntered.TrySetResult();
+                await releaseHead.Task.WaitAsync(token);
+            }
         });
         using var scheduler = new TelegramUpdateScheduler(
             databases.Inbox,
@@ -463,14 +468,17 @@ public sealed partial class ConcurrencyTests
             // it holds the lane. Enqueueing all four updates at once would also charge the head for its own
             // enqueue-to-start latency, which is unrelated to the cascade this test proves.
             await scheduler.EnqueueAsync("owned", Update(1, 711), default);
-            await Until(() => scheduler.ActiveHandlerCount == 1);
+            await headEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             for (var id = 2; id <= 4; id++)
                 await scheduler.EnqueueAsync("owned", Update(id, 711), default);
+            // Age every accepted victim past the threshold while the head remains held, not while admission is still running.
+            await Task.Delay(TimeSpan.FromMilliseconds(120));
+            releaseHead.TrySetResult();
 
             await Until(() => started.Count >= 4);
             await Until(() => scheduler.ActiveHandlerCount == 0);
         }
-        finally { await scheduler.StopAsync(default); }
+        finally { releaseHead.TrySetResult(); await scheduler.StopAsync(default); }
 
         Assert.Equal(new[] { 1, 2, 3, 4 }, started.ToArray());
 
@@ -479,13 +487,18 @@ public sealed partial class ConcurrencyTests
         // Exactly one completion diagnostic for the long handler, recorded at Information because the live warning
         // already alerted for that incident.
         Assert.Equal(1, logs.Count(LogLevel.Information, "long update handler completed"));
-        // Queue-wait reporting is deduplicated to a single warning that names the ROOT blocker. Every victim of the
-        // slow head reports the same blocker, so the cascade produces one alert instead of one per victim, and the
-        // warning identifies both the blocking sequence and how long that handler ran.
         var waits = logs.Messages(LogLevel.Warning).Where(x => x.Contains("waited unusually long", StringComparison.Ordinal)).ToList();
-        var rootWarning = Assert.Single(waits, x => x.Contains("PreviousUpdateId=1", StringComparison.Ordinal));
-        Assert.Contains("PreviousHandlerDurationMs=", rootWarning, StringComparison.Ordinal);
-        Assert.DoesNotContain("PreviousSequence=0", rootWarning, StringComparison.Ordinal);
+        foreach (var victimId in new[] { 2, 3, 4 })
+        {
+            var detail = Assert.Single(waits, x => x.Contains($"WaitingUpdateId={victimId} ", StringComparison.Ordinal));
+            Assert.Contains("PreviousUpdateId=1 ", detail, StringComparison.Ordinal);
+            Assert.Contains("BlockingOverlapMs=", detail, StringComparison.Ordinal);
+        }
+        var summaries = logs.Messages(LogLevel.Warning).Where(x => x.Contains("queue-delay incident", StringComparison.Ordinal)).ToList();
+        Assert.Equal(2, summaries.Count);
+        Assert.Contains("AffectedCount=1 ", summaries[0], StringComparison.Ordinal);
+        Assert.Contains("AffectedCount=2 ", summaries[1], StringComparison.Ordinal);
+        Assert.All(summaries, x => Assert.Contains("DominantBlockerUpdateId=1 ", x, StringComparison.Ordinal));
         // The slow head itself waited behind nothing, so it must never be reported as a victim of a real predecessor.
         // This is expressed through the head's own waiting update id rather than through the absence of any
         // PreviousSequence=0 line, because a victim whose wait outlives its predecessor legitimately has no resolved
@@ -644,8 +657,7 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(916840327, blocker.UpdateId);
         Assert.Equal("Message", blocker.UpdateType);
         Assert.True(blocker.HandlerDurationMs >= 100_000, $"duration={blocker.HandlerDurationMs}");
-        // The projection has no payload member at all, which is asserted through the metadata-only type contract.
-        Assert.Null(typeof(TelegramLaneExecutionSummary).GetProperty("Payload"));
+        Assert.Equal(84_000, blocker.BlockingOverlapMs);
 
         // A different lane and a non-overlapping window must not be reported as the blocker.
         Assert.Null(await databases.Inbox.FindPreviousLaneExecutionAsync(

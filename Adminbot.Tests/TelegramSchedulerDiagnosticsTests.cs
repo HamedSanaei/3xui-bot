@@ -5,6 +5,9 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot.Exceptions;
+using Telegram.Bot;
+using Telegram.Bot.Requests;
+using Telegram.Bot.Requests.Abstractions;
 using Xunit;
 
 /// <summary>Behavioral coverage for safe scheduler failures and token-identity stage attribution.</summary>
@@ -113,6 +116,71 @@ public sealed partial class ConcurrencyTests
         Assert.DoesNotContain(sender.Texts, x => x.Contains("slow update stage", StringComparison.Ordinal));
     }
 
+    /// <summary>Separates a live request from whole-handler timing and keeps completed request telemetry local.</summary>
+    /// <param name="rejectSecond">Whether the controlled second send finishes with a real Telegram API rejection.</param>
+    /// <returns>A task completing after live watchdog delivery, request release, durable completion and operator drain.</returns>
+    /// <remarks>
+    /// Two sequential requests protect against diagnosing a ten-second handler as one ten-second send. The second
+    /// stays active behind a barrier until the watchdog observes it; request text and API descriptions must never leak.
+    /// </remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Foreground_request_watchdog_distinguishes_current_attempt_and_keeps_completions_local(bool rejectSecond)
+    {
+        using var databases = new Databases();
+        await using var fixture = new BackupRecoveryTests.Fixture();
+        var sender = new RecordingLogSender();
+        await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
+        var logs = new SchedulerRoutingLogger(new TelegramLogger("foreground-request-routing", null,
+            new BotRegistry(new ConfigurationBuilder().Build()), new BotContextAccessor(),
+            "-1001234567890", "-1001234567891", dispatcher));
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new ForegroundBoundedTelegramBotClient(
+            new WatchdogRequestClient(release, rejectSecond), TelegramForegroundDeliveryPolicy.Production);
+        var botId = "request-watchdog-" + Guid.NewGuid().ToString("N");
+        using var scheduler = new TelegramUpdateScheduler(databases.Inbox, new Executor(async (_, token) =>
+        {
+            await client.SendMessage(92003, "private-customer-receipt", cancellationToken: token);
+            await client.SendMessage(92003, "private-customer-receipt", cancellationToken: token);
+        }), new AppConfig { TelegramUpdateMaxConcurrency = 1, TelegramUpdateQueueCapacity = 4, TelegramUpdateShutdownDrainSeconds = 2 }, logs)
+        { LongHandlerWarningThreshold = TimeSpan.FromMilliseconds(40), SlowStageThreshold = TimeSpan.FromMilliseconds(10) };
+        await scheduler.StartAsync(default);
+        try
+        {
+            await scheduler.EnqueueAsync(botId, Update(1, 92003), default);
+            await Until(() => sender.Texts.Any(x => x.Contains("running unusually long", StringComparison.Ordinal)));
+            release.SetResult();
+            await Until(() => logs.Records.Count(x => x.Message.StartsWith("Telegram foreground request completed.", StringComparison.Ordinal)) == 2 &&
+                scheduler.ActiveHandlerCount == 0);
+        }
+        finally { release.TrySetResult(); await scheduler.StopAsync(default); }
+        var warning = Assert.Single(logs.Records, x => x.Message.Contains("running unusually long", StringComparison.Ordinal));
+        Assert.Equal("TextSend", warning.State["RequestKind"]);
+        Assert.Equal("InProgress", warning.State["RequestOutcome"]);
+        Assert.Equal(2L, Assert.IsType<long>(warning.State["TelegramRequestCount"]));
+        var requestElapsed = Assert.IsType<double>(warning.State["RequestElapsedMs"]);
+        Assert.True(requestElapsed > 0);
+        Assert.True(Assert.IsType<double>(warning.State["HandlerElapsedMs"]) >= requestElapsed);
+        var completions = logs.Records.Where(x => x.Message.StartsWith("Telegram foreground request completed.", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(TelegramForegroundRequestOutcome.Completed, completions[0].State["Outcome"]);
+        Assert.Equal(rejectSecond ? TelegramForegroundRequestOutcome.TelegramApiError : TelegramForegroundRequestOutcome.Completed,
+            completions[1].State["Outcome"]);
+        Assert.Equal(rejectSecond ? 403 : (int?)null, completions[1].State["ErrorCode"]);
+        Assert.All(completions, record => Assert.Null(record.Exception));
+        Assert.DoesNotContain(sender.Texts, text => text.StartsWith("Telegram foreground request completed.", StringComparison.Ordinal));
+        Assert.All(logs.Records, record =>
+        {
+            Assert.DoesNotContain("private-customer-receipt", record.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("private-api-description", record.Message, StringComparison.Ordinal);
+        });
+        await using var db = databases.Users.CreateDbContext();
+        var row = await db.TelegramUpdateInbox.SingleAsync(x => x.UpdateId == 1);
+        Assert.Equal(rejectSecond ? "execution_failed" : null, row.FailureCode);
+        Assert.Equal(rejectSecond ? "completed_with_error" : "completed", row.Status);
+        Assert.Null(row.Payload);
+    }
+
     /// <summary>Captures original structured local records and forwards the same event into the production operator logger.</summary>
     /// <param name="channel">Required production operator logger receiving the unchanged structured event.</param>
     private sealed class SchedulerRoutingLogger(ILogger channel) : ILogger<TelegramUpdateScheduler>
@@ -130,6 +198,25 @@ public sealed partial class ConcurrencyTests
                 ? values.ToDictionary(x => x.Key, x => x.Value) : new Dictionary<string, object?>();
             Records.Enqueue((logLevel, formatter(state, exception), metadata, exception));
             channel.Log(logLevel, eventId, state, exception, formatter);
+        }
+    }
+
+    /// <summary>Holds the second real foreground attempt active until the live watchdog has observed it.</summary>
+    /// <param name="release">Required test-owned completion barrier, released after operator delivery.</param>
+    /// <param name="rejectSecond">True makes the released second send throw an API error with deliberately sensitive text.</param>
+    private sealed class WatchdogRequestClient(TaskCompletionSource release, bool rejectSecond) : StorefrontClient
+    {
+        /// <summary>Number of sequential message attempts observed by this isolated client.</summary>
+        private int _attempts;
+        /// <inheritdoc />
+        public override async Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+        {
+            if (request is SendMessageRequest && ++_attempts == 2)
+            {
+                await release.Task.WaitAsync(cancellationToken);
+                if (rejectSecond) throw new ApiRequestException("private-api-description", 403);
+            }
+            return await base.SendRequest(request, cancellationToken);
         }
     }
 }

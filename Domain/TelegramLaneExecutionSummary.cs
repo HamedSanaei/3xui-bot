@@ -10,7 +10,7 @@ using System;
 /// 84, 43, 23, and 19 seconds without naming the single slow handler that caused them. Because a waiting row only
 /// becomes eligible after its predecessor turns terminal, the blocker is usually already completed by the time the
 /// victim starts, so querying currently running work is not enough. This summary lets the scheduler correlate a wait
-/// with the exact previous execution whose interval overlapped it.
+/// with the execution contributing the largest positive overlap to its accepted-to-started wait.
 /// </para>
 /// <para>
 /// Privacy:
@@ -35,14 +35,21 @@ public sealed class TelegramLaneExecutionSummary
     /// <summary>Gets the UTC terminal time of the previous execution, or null when it is still running.</summary>
     public DateTime? CompletedAtUtc { get; set; }
 
+    /// <summary>Gets the victim's actual UTC execution start at which this predecessor was observed.</summary>
+    /// <remarks>Required diagnostic snapshot endpoint; supplies a truthful elapsed duration when completion is still null.</remarks>
+    public required DateTime ObservedAtUtc { get; set; }
+
+    /// <summary>Gets the positive overlap with the victim's accepted-to-actual-start wait, in milliseconds.</summary>
+    /// <remarks>Both execution endpoints are clipped to the victim's wait; a running execution ends at the victim's start for this comparison.</remarks>
+    public double BlockingOverlapMs { get; set; }
+
     /// <summary>
-    /// Gets the previous execution's handler duration in milliseconds, computed from its claim and terminal times.
+    /// Gets the previous execution's duration in milliseconds, ending at its terminal time or this observation.
     /// </summary>
     /// <remarks>
-    /// The value is zero when the previous execution has not reached a terminal state yet; callers should treat that as
-    /// "still running" and report the live blocker sequence without a duration.
+    /// Completed receipts retain their full duration. A still-running predecessor reports elapsed time up to
+    /// <see cref="ObservedAtUtc" />, not a misleading zero. Blocking overlap is separately clipped to the victim wait.
     /// </remarks>
-    public double HandlerDurationMs => CompletedAtUtc is { } completed
-        ? Math.Max(0, (completed - StartedAtUtc).TotalMilliseconds)
-        : 0;
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public double HandlerDurationMs => Math.Max(0, ((CompletedAtUtc ?? ObservedAtUtc) - StartedAtUtc).TotalMilliseconds);
 }

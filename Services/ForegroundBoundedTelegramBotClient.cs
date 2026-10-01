@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using Telegram.Bot;
@@ -131,30 +132,40 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// Executes one Telegram request, applying the foreground delivery budget only to interactive UX request kinds.
     /// </summary>
     /// <typeparam name="TResponse">Response type required by the Telegram request.</typeparam>
-    /// <param name="request">Request built by the handler; only its runtime type is inspected.</param>
-    /// <param name="cancellationToken">The caller's own lane cancellation token.</param>
-    /// <returns>The inner client's response for the request.</returns>
+    /// <param name="request">Required SDK request built by the handler; only its explicit type is classified, never its private content.</param>
+    /// <param name="cancellationToken">Optional caller-owned lane cancellation; default permits the selected foreground deadline to own cancellation.</param>
+    /// <returns>The unchanged SDK response, safe only under the caller's existing exposure rules; a successful send must not be resent.</returns>
     /// <remarks>
     /// Non-interactive requests pass through unchanged. Interactive requests use one linked token with the selected
     /// deadline: media groups and documents get the bounded multipart upload budget, while other interactive calls
-    /// keep the ordinary deadline. The ambient <see cref="TelegramUpdateLatencyScope"/> measures the same request.
+    /// keep the ordinary deadline. The ambient <see cref="TelegramUpdateLatencyScope"/> measures the same awaited
+    /// inner request and records a metadata-only completion even for healthy calls. The recorder is local telemetry,
+    /// not an operator incident; recorder failures cannot alter the response or exception.
     /// When only that deadline expires — the caller's own token is still live — the typed
-    /// <see cref="TelegramForegroundDeliveryTimeoutException"/> is raised without retrying. Caller cancellation
-    /// and Telegram errors keep their original exception identity.
+    /// <see cref="TelegramForegroundDeliveryTimeoutException"/> is raised without retrying. Caller cancellation,
+    /// transport errors, and Telegram API errors keep their original exception identity. Cancellation is recorded as
+    /// caller-owned, deadline-owned, or independent transport cancellation according to the actual token states.
     /// </remarks>
     /// <exception cref="TelegramForegroundDeliveryTimeoutException">
     /// The overall interactive delivery budget expired before Telegram answered.
     /// </exception>
+    /// <exception cref="OperationCanceledException">The caller cancelled, or the inner transport cancelled independently.</exception>
+    /// <exception cref="ApiRequestException">Telegram rejected the request; only its numeric code enters diagnostics.</exception>
+    /// <example><code>var response = await client.SendRequest(request, laneCancellationToken);</code></example>
     public async Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
     {
-        if (!TryClassifyForegroundRequest(request, out var stage))
+        if (!TryClassifyForegroundRequest(request, out var stage, out var kind))
             return await _inner.SendRequest(request, cancellationToken);
 
         var overallBudget = request is SendMediaGroupRequest or SendDocumentRequest
             ? _policy.MediaGroupBudget : _policy.OverallBudget;
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(overallBudget);
-        using var measurement = TelegramUpdateLatencyScope.Current?.Measure(stage) ?? default;
+        var latencyScope = TelegramUpdateLatencyScope.Current;
+        using var measurement = latencyScope?.Measure(stage) ?? default;
+        var requestMeasurement = latencyScope?.MeasureTelegramRequest(kind) ?? default;
+        var outcome = TelegramForegroundRequestOutcome.Completed;
+        int? apiErrorCode = null;
 
         try
         {
@@ -162,16 +173,43 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && budget.IsCancellationRequested)
         {
+            outcome = TelegramForegroundRequestOutcome.ForegroundBudgetExpired;
             // An upload may have reached Telegram before its response was lost; never retry an ambiguous send.
             throw new TelegramForegroundDeliveryTimeoutException(DescribeRequestKind(request), overallBudget);
+        }
+        catch (ApiRequestException exception)
+        {
+            outcome = TelegramForegroundRequestOutcome.TelegramApiError;
+            apiErrorCode = exception.ErrorCode;
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            outcome = cancellationToken.IsCancellationRequested
+                ? TelegramForegroundRequestOutcome.CallerCancellation
+                : TelegramForegroundRequestOutcome.TransportError;
+            throw;
+        }
+        catch (Exception exception)
+        {
+            outcome = exception is HttpRequestException or IOException or RequestException or TimeoutException
+                ? TelegramForegroundRequestOutcome.TransportError
+                : TelegramForegroundRequestOutcome.UnexpectedError;
+            throw;
+        }
+        finally
+        {
+            requestMeasurement.Complete(outcome, apiErrorCode);
         }
     }
 
     /// <summary>
-    /// Classifies a Telegram request as an interactive foreground UX call with its latency stage.
+    /// Classifies an interactive foreground request with its closed-vocabulary stage and metadata kind.
     /// </summary>
+    /// <typeparam name="TResponse">SDK response type carried by the supplied request.</typeparam>
     /// <param name="request">Request instance built by the handler.</param>
     /// <param name="stage">Receives the closed-vocabulary stage for a bounded request.</param>
+    /// <param name="kind">Receives the explicit closed-vocabulary operation; no content or dynamic type name is used.</param>
     /// <returns>
     /// <c>true</c> when the request is an interactive UX call that must respect the foreground budget; otherwise
     /// <c>false</c> so the request is delegated untouched.
@@ -180,35 +218,51 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// The mapping is a fixed compile-time list. Unknown request kinds — including receiver long polling, webhook
     /// management, and file transfer — are never bounded, so this decorator cannot alter runtime or durable behavior.
     /// </remarks>
-    private static bool TryClassifyForegroundRequest<TResponse>(IRequest<TResponse> request, out TelegramUpdateStage stage)
+    /// <example><code>var isForeground = TryClassifyForegroundRequest(request, out var stage, out var kind);</code></example>
+    private static bool TryClassifyForegroundRequest<TResponse>(
+        IRequest<TResponse> request, out TelegramUpdateStage stage, out TelegramForegroundRequestKind kind)
     {
+        stage = TelegramUpdateStage.TelegramSend;
         switch (request)
         {
             case SendMessageRequest:
-            case SendPhotoRequest:
-            case SendMediaGroupRequest:
-            case SendDocumentRequest:
-            case AnswerCallbackQueryRequest:
-            case DeleteMessageRequest:
-                stage = TelegramUpdateStage.TelegramSend;
+                kind = TelegramForegroundRequestKind.TextSend;
                 return true;
-
+            case SendPhotoRequest:
+                kind = TelegramForegroundRequestKind.PhotoSend;
+                return true;
+            case SendMediaGroupRequest:
+                kind = TelegramForegroundRequestKind.MediaGroup;
+                return true;
+            case SendDocumentRequest:
+                kind = TelegramForegroundRequestKind.DocumentUpload;
+                return true;
+            case AnswerCallbackQueryRequest:
+                kind = TelegramForegroundRequestKind.CallbackAcknowledgement;
+                return true;
+            case DeleteMessageRequest:
+                kind = TelegramForegroundRequestKind.DeleteMessage;
+                return true;
             case EditMessageTextRequest:
             case EditMessageReplyMarkupRequest:
             case EditMessageMediaRequest:
             case EditMessageCaptionRequest:
                 stage = TelegramUpdateStage.TelegramEdit;
+                kind = TelegramForegroundRequestKind.MessageEdit;
                 return true;
-
             case GetChatRequest:
+                stage = TelegramUpdateStage.TelegramMembership;
+                kind = TelegramForegroundRequestKind.ChatLookup;
+                return true;
             case GetChatMemberRequest:
             case GetChatMemberCountRequest:
             case GetChatAdministratorsRequest:
                 stage = TelegramUpdateStage.TelegramMembership;
+                kind = TelegramForegroundRequestKind.MembershipLookup;
                 return true;
-
             default:
                 stage = default;
+                kind = default;
                 return false;
         }
     }
@@ -216,23 +270,27 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// <summary>
     /// Produces a closed-vocabulary kind for the abandoned request so the typed timeout carries no customer data.
     /// </summary>
+    /// <typeparam name="TResponse">SDK response type carried by the abandoned request.</typeparam>
     /// <param name="request">Request that exceeded the budget.</param>
-    /// <returns>A stable snake-case kind derived from the request type; never a chat id, payload, or token.</returns>
-    private static string DescribeRequestKind<TResponse>(IRequest<TResponse> request)
+    /// <returns>A stable explicit snake-case constant compatible with the existing typed timeout contract.</returns>
+    /// <remarks>The caller has already classified the request as foreground; unknown requests never reach this mapping.</remarks>
+    /// <example><code>throw new TelegramForegroundDeliveryTimeoutException(DescribeRequestKind(request), overallBudget);</code></example>
+    private static string DescribeRequestKind<TResponse>(IRequest<TResponse> request) => request switch
     {
-        var name = request.GetType().Name;
-        if (name.EndsWith("Request", StringComparison.Ordinal))
-            name = name[..^"Request".Length];
-
-        var builder = new System.Text.StringBuilder(name.Length + 4);
-        for (var index = 0; index < name.Length; index++)
-        {
-            var current = name[index];
-            if (index > 0 && char.IsUpper(current))
-                builder.Append('_');
-            builder.Append(char.ToLowerInvariant(current));
-        }
-
-        return builder.ToString();
-    }
+        SendMessageRequest => "send_message",
+        SendPhotoRequest => "send_photo",
+        SendMediaGroupRequest => "send_media_group",
+        SendDocumentRequest => "send_document",
+        AnswerCallbackQueryRequest => "answer_callback_query",
+        DeleteMessageRequest => "delete_message",
+        EditMessageTextRequest => "edit_message_text",
+        EditMessageReplyMarkupRequest => "edit_message_reply_markup",
+        EditMessageMediaRequest => "edit_message_media",
+        EditMessageCaptionRequest => "edit_message_caption",
+        GetChatRequest => "get_chat",
+        GetChatMemberRequest => "get_chat_member",
+        GetChatMemberCountRequest => "get_chat_member_count",
+        GetChatAdministratorsRequest => "get_chat_administrators",
+        _ => "foreground_request"
+    };
 }

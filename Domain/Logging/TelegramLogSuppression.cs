@@ -69,6 +69,15 @@ namespace Adminbot.Domain.Logging
         /// <summary>Exact summary family emitted after an XUI v3 renewal was applied exactly once.</summary>
         private const string XuiRenewalAppliedOnceMessage = "XUI v3 renewal applied exactly once.";
 
+        /// <summary>Exact successful courtesy-account creation family; provisioning failures use different messages.</summary>
+        private const string ProvisionalAccountCreatedMessage = "Provisional tenant card account created.";
+
+        /// <summary>Per-update queue timing detail; bounded queue-incident summaries remain operator-visible.</summary>
+        private const string QueueWaitDetailMessage = "Telegram update waited unusually long.";
+
+        /// <summary>Payload-free request completion telemetry; original delivery failures retain their existing routing.</summary>
+        private const string TelegramRequestObservationMessage = "Telegram foreground request completed.";
+
         /// <summary>Exact structured outcome value that marks a tenant post-commit notification as delivered.</summary>
         private const string DeliveredOutcome = "delivered";
 
@@ -164,17 +173,14 @@ namespace Adminbot.Domain.Logging
             if (ShouldSuppressControlledLatencyEvent(message, nowTicks))
                 return true;
 
-            // Latency measurements and successful bookkeeping are telemetry, not incidents. They stay fully visible in
-            // the daily diagnostic file, the console/structured logger, and the stage instruments, but the operator
-            // channel must not be used as a raw performance stream.
-            if (ShouldSuppressLatencyTelemetry(message))
+            // Channel-only filtering leaves local providers and measurements unchanged. File persistence still
+            // follows its configured minimum; the operator channel is not a raw performance stream.
+            if (ShouldSuppressLatencyTelemetry(message, exception))
                 return true;
 
-            // Routine success and bookkeeping telemetry: a successful fulfillment timing sample, a completed
-            // post-commit notification that was actually delivered, a routine reminder-state prune, and a renewal that
-            // was applied exactly once are all expected results. They stay in the daily diagnostic file, the console
-            // logger, and the metrics instruments but must not be treated as operator incidents.
-            if (ShouldSuppressRoutineSuccessTelemetry(message))
+            // Only explicit routine successes stay local. The provisional creation family must have no attached
+            // exception; uncertain creation, consistency failures and manual review keep their separate routing.
+            if (ShouldSuppressRoutineSuccessTelemetry(message, exception))
                 return true;
 
             // Repeated Warning families: the first occurrence of a condition is delivered as one bounded incident, and
@@ -239,9 +245,10 @@ namespace Adminbot.Domain.Logging
         /// channel.
         /// </summary>
         /// <param name="message">
-        /// Formatted log message. Only the three closed scheduler message families are inspected: the slow-stage
-        /// attribution line, the interactive-threshold completion line, and the long-handler completion line.
+        /// Formatted log message. Only closed scheduler/request telemetry families are inspected; queue-incident
+        /// summaries are separate events and remain eligible for operator delivery.
         /// </param>
+        /// <param name="exception">Optional original exception; new queue/request detail families fail open when one is attached.</param>
         /// <returns>
         /// <c>true</c> when the entry is a measurement or a completion echo rather than an incident; <c>false</c> for
         /// the live long-handler warning, for any handler that ended in a failure outcome, and whenever the duration
@@ -249,8 +256,8 @@ namespace Adminbot.Domain.Logging
         /// </returns>
         /// <remarks>
         /// <para>
-        /// The operator channel is meant to carry actionable incidents, not raw telemetry. Three distinct latency
-        /// families are classified here:
+        /// The operator channel carries actionable incidents, not raw measurements. Existing stage and handler
+        /// completion rules are retained; detailed queue/request records stay local while incident summaries remain visible.
         /// </para>
         /// <list type="bullet">
         /// <item>The <c>Telegram slow update stage.</c> line attributes one already-counted handler to a closed stage
@@ -261,6 +268,10 @@ namespace Adminbot.Domain.Logging
         /// handler is not a failure.</item>
         /// <item>The <c>Telegram long update handler completed.</c> echo only repeats a >= ten-second execution for
         /// which the live watchdog already delivered the single operator alert.</item>
+        /// <item>Per-update queue waits retain every detail locally; <c>Telegram queue-delay incident.</c>
+        /// summaries report the bounded aggregate to operators instead.</item>
+        /// <item><c>Telegram foreground request completed.</c> records describe request kind, timing and outcome.
+        /// They never replace the original error or timeout incident raised by the delivery caller.</item>
         /// </list>
         /// <para>
         /// The live <c>Telegram update handler running unusually long.</c> warning, any <c>Outcome</c> other than
@@ -271,10 +282,15 @@ namespace Adminbot.Domain.Logging
         /// reports once instead of once per watchdog interval.
         /// </para>
         /// </remarks>
-        private static bool ShouldSuppressLatencyTelemetry(string message)
+        private static bool ShouldSuppressLatencyTelemetry(string message, Exception exception)
         {
             if (string.IsNullOrWhiteSpace(message))
                 return false;
+
+            if (exception == null &&
+                (message.StartsWith(QueueWaitDetailMessage, StringComparison.Ordinal) ||
+                 message.StartsWith(TelegramRequestObservationMessage, StringComparison.Ordinal)))
+                return true;
 
             // Case A: per-stage attribution telemetry. Always local/metrics only.
             if (ContainsOrdinalIgnoreCase(message, SlowStageMessage))
@@ -363,13 +379,14 @@ namespace Adminbot.Domain.Logging
         /// Decides whether one routine success or bookkeeping success must be kept out of the operator Telegram channel.
         /// </summary>
         /// <param name="message">Formatted log message. Only exact closed-vocabulary success families are inspected.</param>
+        /// <param name="exception">Optional original exception; a provisional success carrying an exception is not treated as routine.</param>
         /// <returns>
         /// <c>true</c> when the entry reports an expected success rather than an incident; <c>false</c> for every other
-        /// message, and for a tenant post-commit notification whose outcome is not <c>delivered</c>.
+        /// message, for provisional creation with an attached exception, and for a post-commit notification not marked <c>delivered</c>.
         /// </returns>
         /// <remarks>
         /// <para>
-        /// Four production families are classified here:
+        /// Five production success families are classified here:
         /// </para>
         /// <list type="bullet">
         /// <item><c>Tenant fulfillment timing.</c> — a successful end-to-end duration sample. The durable financial and
@@ -383,16 +400,22 @@ namespace Adminbot.Domain.Logging
         /// schedule.</item>
         /// <item><c>XUI v3 renewal applied exactly once.</c> — the success echo of the renewal idempotency guard. The
         /// renewal is already recorded in the payment audit log and the renewal operation store.</item>
+        /// <item><c>Provisional tenant card account created.</c> without an attached exception — the existing
+        /// courtesy account was verified and its identity persisted. Only channel routing changes; provisioning,
+        /// payment review, notifications, idempotency and recovery are untouched.</item>
         /// </list>
         /// <para>
-        /// Every family stays fully visible in the daily diagnostic file, the console/structured logger, and the metrics
-        /// instruments. Only the operator channel routing changes.
+        /// Existing local provider levels, structured diagnostics and persisted audit records are unchanged.
+        /// File persistence follows the configured minimum; only operator-channel routing changes.
         /// </para>
         /// </remarks>
-        private static bool ShouldSuppressRoutineSuccessTelemetry(string message)
+        private static bool ShouldSuppressRoutineSuccessTelemetry(string message, Exception exception)
         {
             if (string.IsNullOrWhiteSpace(message))
                 return false;
+
+            if (exception == null && message.StartsWith(ProvisionalAccountCreatedMessage, StringComparison.Ordinal))
+                return true;
 
             if (ContainsOrdinalIgnoreCase(message, TenantFulfillmentTimingMessage) ||
                 ContainsOrdinalIgnoreCase(message, PrunedVolumeReminderStateMessage) ||

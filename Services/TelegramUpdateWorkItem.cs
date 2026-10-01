@@ -10,7 +10,8 @@ public readonly record struct TelegramUpdateExecutionKey(string BotId, long Tele
 /// <param name="Key">Bot/user serialization identity.</param>
 /// <param name="Update">Private Telegram update; never log this object.</param>
 /// <param name="AcceptedAtUtc">UTC time when the update was durably accepted.</param>
-public sealed record TelegramUpdateWorkItem(long Sequence, TelegramUpdateExecutionKey Key, Update Update, DateTime AcceptedAtUtc);
+/// <param name="StartedAtUtc">Persisted UTC claim time, used as the actual wait endpoint rather than a post-read clock sample.</param>
+public sealed record TelegramUpdateWorkItem(long Sequence, TelegramUpdateExecutionKey Key, Update Update, DateTime AcceptedAtUtc, DateTime StartedAtUtc);
 
 /// <summary>Determines stable actor identity for the Telegram.Bot version used by the application.</summary>
 public static class TelegramUpdateIdentity

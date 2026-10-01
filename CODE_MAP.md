@@ -1,5 +1,15 @@
 # CODE_MAP.md
 
+- Telegram queue/request observability (2026-10-01): dominant predecessor = largest positive execution/wait
+  overlap, exact SQLite ticks, lower sequence on ties; payload-free and bounded to the persisted claim time.
+  `TelegramQueueDelayIncidentAggregator` coalesces connected lane waits: first report, fixed 10 s batches/idle
+  expiry, >=30 s/doubling escalation; 1024 lanes/reports plus marked mixed-lane overflow; counts are NEW victims.
+  Full per-update waits and request outcomes stay local; `Telegram queue-delay incident.` summaries stay operator-visible.
+  Foreground kind/outcome/timing/API-code metadata distinguishes one request from sequential calls without new retries
+  or budget changes. `Provisional tenant card account created.` is local-only; provisioning runtime is untouched.
+  Historical 14177/14187 payloads/stage timings are absent from available archives: exact old slow path is unproven.
+  Observe new local request records plus watchdog count/elapsed fields in production; local file minimum still applies.
+
 - Tenant callback reliability (2026-10-01): discount rendering uses `EditMessageTextAllowNoOpAsync`,
   shared with the existing best-effort editor: only Telegram 400/message-not-modified is success;
   other discount edit errors and cancellation propagate to the durable inbox. Owner-panel getMe
@@ -660,17 +670,31 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   the live long-handler watchdog can name what is actually blocking the lane; the value is an enum member name only and
   is never used for authorization. When two instrumented stages overlap, the later stage keeps ownership of the value,
   which is sufficient for attribution and must not be read as an exact nesting stack.
+  `TelegramForegroundRequestObservation` adds explicit `TextSend`, `MessageEdit`, `CallbackAcknowledgement`,
+  `DocumentUpload`, `MediaGroup`, `PhotoSend`, `DeleteMessage`, `ChatLookup`, `MembershipLookup` kinds and
+  `InProgress`, `Completed`, `ForegroundBudgetExpired`, `TelegramApiError`, `CallerCancellation`, `TransportError`,
+  `UnexpectedError` outcomes. The thread-safe live snapshot selects the newest still-active request; per-request
+  completion records include request/handler milliseconds, numeric API code, count and summed Telegram time.
+  Summed overlapping requests can exceed handler wall time. Sequential measurements use an inline slot; additional
+  slots allocate only for overlap. All request-end records are local telemetry, including healthy fast attempts.
 - **Lane diagnostics** (`Services/TelegramUpdateScheduler.cs`): one live watchdog fires at `LongHandlerWarningThreshold`
   (default 10 s, once per execution, via a cancellation timer rather than a polling loop) with
-  `BotId/Sequence/UpdateId/UpdateType/HandlerElapsedMs/Stage/ActiveHandlers/MaxConcurrency`, where `Stage` is the
-  closed-vocabulary stage from `TelegramUpdateLatencyScope.CurrentStage` or `none` (captured when the scheduler pushes
-  the latency scope, because the timer callback does not inherit the handler's ambient scope); completion above
+  `BotId/Sequence/UpdateId/UpdateType/HandlerElapsedMs/Stage/RequestKind/RequestOutcome/RequestElapsedMs`,
+  request count/summed Telegram milliseconds and `ActiveHandlers/MaxConcurrency`. Stage is the existing closed
+  vocabulary; request kind/outcome are enum names or `none`, never payloads. The captured scope supports timer-thread reads;
   `InteractiveHandlerThreshold` (default 5 s) records the final duration and outcome, at Warning only when the live
-  warning could not fire, so a slow root handler yields exactly one alert. Queue-wait reporting uses
-  `LongQueueWaitThreshold` (default 5 s) and correlates the wait with the **root** blocker via
-  `TelegramUpdateInboxStore.FindPreviousLaneExecutionAsync` (earliest same-lane execution whose interval overlapped the
-  victim's accepted→started wait; metadata only, never a payload), emitting at most one Warning per lane/blocker pair and
-  falling back to Debug for further cascade waits. `Domain/TelegramLaneExecutionSummary.cs` is payload-free.
+  warning could not fire, so a slow root handler yields exactly one alert. Completion also records request count/sum.
+  Queue-wait threshold remains 5 s. `FindPreviousLaneExecutionAsync` chooses the largest positive same-lane overlap,
+  clipping completion (or running observation) to the victim's accepted→persisted-start interval; exact tick ties use
+  lower sequence. `TelegramLaneExecutionSummary` includes observed endpoint/overlap, with running duration measured
+  up to observation rather than zero. Every victim retains its full local Warning. Instance-owned aggregation reports
+  connected intervals regardless of predecessor changes: first immediately via coordinator wake, new-victim batches
+  every 10 s, idle expiry after 10 s, disjoint incidents separately, >=30 s then doubling escalation. Coordinator,
+  eviction and shutdown flush pending counts; at most 1024 lanes and 1024 reports plus one marked mixed-lane overflow.
+  Summary fields include identities/count/max wait/dominant sequence/type/duration/overlap and UTC window bounds.
+  Maintenance is bounded, monotonic-time driven, memory-only; callbacks run outside locks and cannot fault execution.
+  Cancellation of the attribution read is still control flow: no business executor call, terminal
+  `completed_with_review` / `execution_cancelled` receipt, private payload erased. Only ordinary diagnostic faults are optional.
 - **Diagnostic envelope identity** (`Domain/Logging/DailyErrorFileLoggerProvider.cs`): the ambient
   `BotContextAccessor.CurrentBotId` falls back to the hardcoded default owned bot, so a singleton scheduler warning
   about `BotId=tenant-...` could be filed under the wrong bot. The provider now prefers an explicit `BotId=`/`botId=`
@@ -698,11 +722,13 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   Critical, delivery-uncertain, manual-review, XUI, payment, and provider failure is still delivered. This is a narrow
   closed-list rule, not a general log-suppression framework.
 - **Operator-channel success/telemetry families and repeated-incident limits** (`Domain/Logging/TelegramLogSuppression.cs`):
-  four additional routine success families are withheld from the operator channel and stay fully visible in the daily
-  diagnostic file, the console/structured logger, and the metrics instruments: `Tenant fulfillment timing.`,
+  five routine success families are withheld from the operator channel while existing local providers, configured
+  file minimums and persisted audit evidence are unchanged: `Tenant fulfillment timing.`,
   `Tenant fulfillment post-commit notification completed.` ONLY when `outcome=delivered` (every other outcome —
   `deferred`, `delivery_uncertain`, `failed`, `manual_review`, `pre_send_route_unavailable` — and an unreadable outcome
-  remain visible), `Pruned expired missing XUI volume reminder state.`, and `XUI v3 renewal applied exactly once.`
+  remain visible), `Pruned expired missing XUI volume reminder state.`, `XUI v3 renewal applied exactly once.`,
+  and the exact prefix `Provisional tenant card account created.` ONLY without an attached exception. Failed,
+  partial, uncertain, duplicate/consistency and manual-review provisioning events retain their own operator routing.
   Two Warning families repeat for as long as one condition lasts and are therefore limited per key by
   `Domain/Logging/TelegramOperatorNotificationLimiter.cs` with a 10-minute window: `Telegram foreground delivery
   exceeded its interactive budget` keyed by `botId|requestKind`, and `Telegram update handler running unusually long.`
@@ -722,9 +748,10 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   storefront join-retry callback re-checks whenever nothing verified is cached, which is the normal state after a
   rejection. Fallback to a private instance when no cache is injected keeps unit-test constructions isolated.
 - **Central Telegram logger channel is actionable, not a telemetry stream** (`Domain/Logging/TelegramLogSuppression.cs`):
-  the private channel receives incidents only, while the daily diagnostic file, the console/structured logger, the
-  metrics instruments (`telegram.update.handler.duration`, `telegram.update.queue.wait`, stage timers), and the
-  watchdog keep every measurement at its existing level. Withheld from the channel: (1) `Telegram slow update stage.`
+  the private channel receives incidents only, while existing console/structured records, metrics and watchdogs
+  retain their measurements. Daily file records still honor `errorFileLogMinimumLevel` (default Warning); request-end
+  and routine-success Information records require Information minimum for file retention. Withheld from the channel:
+  (1) `Telegram slow update stage.`
   attribution lines, which by themselves only explain an already-counted handler; (2) a `completed`
   `Telegram update handler exceeded the interactive latency threshold.` record whose `HandlerDurationMs` is below
   10,000 ms — production sequence 4311 was exactly this shape (users.db: `completed`, no failure code, ~5.38 s), so a
@@ -732,9 +759,12 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   of a >= 10 s execution whose live `Telegram update handler running unusually long.` warning already delivered the one
   operator alert; (4) the two routine tenant storefront funding bookkeeping successes (`Underfunded tenant storefront
   customer-attempt alert queued.`, `Tenant storefront became underfunded.`) — the tenant owner still receives the
-  durable funding notification. Still visible: the live >= 10 s root-handler warning, any `Outcome` other than
+  durable funding notification; (5) individual `Telegram update waited unusually long.` records and
+  `Telegram foreground request completed.` records without attached exceptions. Their aggregate
+  `Telegram queue-delay incident.` reports remain visible, and exceptions fail open.
+  Still visible: the live >= 10 s root-handler warning, any `Outcome` other than
   `completed`, a duration at or above the threshold, unparseable/negative/`NaN`/`Infinity` durations (parsing fails
-  open), the deduplicated `Telegram update waited unusually long.` blocker correlation, foreground delivery/XUI/Gozargah
+  open), `Telegram queue-delay incident.` lane summaries, foreground delivery/XUI/Gozargah
   timeouts, funding `became uncertain.` / scan failures, `telegram_transport_error`, `channel_access_error`,
   `DeliveryUncertain`, `ManualReview`, and XUI/payment/provider failures. The 10 s boundary is one shared constant
   (`TelegramLogSuppression.LongHandlerOperatorThresholdMilliseconds`) that `TelegramUpdateScheduler` uses to initialize
