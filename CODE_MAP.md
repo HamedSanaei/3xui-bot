@@ -1,5 +1,19 @@
 # CODE_MAP.md
 
+- Owner official gateway recovery: selected-store **✅ تایید دستی پرداخت درگاه** prompts for the public
+  tenant `OrderId` (trim only; nonempty, max 140) through `TenantBotService.OwnerGatewayRecovery.cs`; cancel/
+  navigation clears only this owned-bot/user input. `TenantBotService.GatewayRecovery.cs` reloads exact
+  store/owner/order and reciprocal invoice links, freshly verifies AtlasPay/UniquePay/HooshPay/Tetraminator/
+  NOWPayments, then reuses existing idempotent purchase/renewal fulfillment and frozen financial amounts.
+  AtlasPay/UniquePay share callback/worker reconciliation gates; terminal caches and closed new-admission
+  flags cannot replace fresh proof or forfeit issued invoices. No owner provisional override or card/wallet
+  top-up conversion. Only a durable explicit-owner event plus definitive XUI rejection/no financial evidence
+  may reopen its exact quarantined fulfillment claim; uncertain/applied operations never get a blind POST.
+  UniquePay settlement now looks up solely persisted `TenantBotOrderId`, never merchant-hash OR fallback.
+  `Adminbot.Tests/TenantOwnerGatewayRecoveryTests.cs` covers cross-store/actor isolation, fresh proof and
+  concurrent rejected-attempt recovery without duplicate XUI/profit/ledger effects; operator steps in
+  `docs/multiple-storefronts.md` and `docs/deployment.md`.
+
 - Global commercial admission: `Domain/ServiceSalesAvailability.cs` publishes one singleton snapshot for every
   owned/tenant bot. Configured super-admins use owned **🗽 Admin → 📊 کنترل فروش و تمدید** for six independent
   normal/national/unlimited Sale/Renewal switches; missing root keys default open. `TelegramBotService.SalesControls.cs`

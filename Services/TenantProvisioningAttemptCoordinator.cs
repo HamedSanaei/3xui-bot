@@ -14,7 +14,7 @@ public enum TenantProvisioningRetryAuthorizationKind
 {
     /// <summary>Automatic fulfillment, provider callback, reconciliation, startup, or ordinary re-entry; never authorizes a new generation.</summary>
     None,
-    /// <summary>The tenant owner explicitly re-confirms an already-paid unfulfilled manual order.</summary>
+    /// <summary>The tenant owner explicitly re-confirms an officially funded gateway or approved manual order that remains unfulfilled.</summary>
     OwnerExplicit,
     /// <summary>A global super-admin explicitly confirms or retries the paid tenant order.</summary>
     SuperAdminExplicit,

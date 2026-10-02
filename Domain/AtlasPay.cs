@@ -1435,6 +1435,46 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
         finally { lease.Dispose(); }
     }
 
+    /// <summary>Freshly verifies the original AtlasPay invoice in an authenticated owner's exact selected store.</summary>
+    /// <param name="paymentId">Positive users.db AtlasPay primary key linked reciprocally from the tenant order.</param>
+    /// <param name="tenantBotId">Required internal id of the explicitly selected tenant bot, not a Telegram bot id.</param>
+    /// <param name="orderId">Required exact public TenantBotOrder.OrderId; merchant/provider references are not accepted.</param>
+    /// <param name="ownerTelegramUserId">Positive authenticated Telegram update sender id.</param>
+    /// <param name="cancellationToken">Cancels gate waiting, fresh authorization, official verification and settlement.</param>
+    /// <returns>Existing official settlement outcome; mismatched, unpaid, underpaid or uncertain rows have no financial effects.</returns>
+    /// <remarks>
+    /// Shares the worker/admin reconciliation gate and core, but never impersonates a configured global admin.
+    /// Fresh ownership, purpose, customer, reciprocal ids and immutable amounts precede requests. Terminal
+    /// expiration/exhaustion/escalation caches can be queried again; manual delivery and uncertain claims remain
+    /// quarantined. Only a durable current-inbox owner confirmation plus a proven definitive provisioning rejection
+    /// can reopen that particular fulfillment tail, and only after a fresh full-payment response.
+    /// </remarks>
+    /// <example><code>await reconciler.ReconcileTenantOrderByOwnerAsync(paymentId, selectedStoreId, publicOrderId, senderId, token);</code></example>
+    /// <exception cref="OperationCanceledException">Provider, persistence or gate waiting is cancelled.</exception>
+    public async Task<NowPaymentsSettlementResult> ReconcileTenantOrderByOwnerAsync(int paymentId,
+        string tenantBotId, string orderId, long ownerTelegramUserId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (paymentId <= 0) return NowPaymentsSettlementResult.NotFound();
+        using var lease = await Gate.EnterAsync(paymentId.ToString(CultureInfo.InvariantCulture), cancellationToken);
+        await using var db = _factory.CreateDbContext();
+        var order = await TenantBotService.ReadOwnerGatewayOrderAsync(db, tenantBotId, orderId, ownerTelegramUserId, cancellationToken);
+        var payment = await db.AtlasPayPaymentInfos.AsNoTracking().SingleOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
+        if (!TenantBotService.IsOwnerAtlasPayLinkValid(order, payment)) return NowPaymentsSettlementResult.NotFound();
+        if (order.IsFulfilled) return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+        var authorization = TenantProvisioningRetryAuthorization.TryTelegramConfirmation(
+            TenantProvisioningRetryAuthorizationKind.OwnerExplicit, ownerTelegramUserId, order.Id);
+        var recoverRejectedClaim = payment.SettlementState == AtlasPaySettlementStates.ManualReview &&
+            payment.ErrorCode == "tenant_fulfillment_ambiguous" && !payment.RequiresManualDelivery &&
+            await TenantBotService.CanRecoverOwnerRejectedGatewayClaimAsync(_factory, order, authorization, cancellationToken);
+        // This entry point alone proves owner scope; source text can never enable terminal or paid-cache bypass.
+        var result = await ReconcileCoreAsync(paymentId, TenantBotService.OwnerGatewayRecoverySource, true, cancellationToken,
+            allowTerminalRecheck: true, retryAuthorization: authorization, ownerRecheck: true,
+            recoverRejectedClaim: recoverRejectedClaim);
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
+
     /// <summary>Returns whether the payment has a durable signed webhook event that still needs handling.</summary>
     /// <param name="paymentId">Internal AtlasPay payment id.</param>
     /// <param name="cancellationToken">Cancellation token for the users.db read.</param>
@@ -1573,7 +1613,10 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
     /// <param name="source">Internal reconciliation trigger used only in safe financial audit labels.</param>
     /// <param name="useVerify">Whether to call the provider verify endpoint instead of GET order status.</param>
     /// <param name="token">Cancellation token for the provider call and durable settlement work.</param>
-    /// <param name="allowTerminalRecheck">Whether a configured super-admin independently authorized a fresh expired-order verification.</param>
+    /// <param name="allowTerminalRecheck">Whether a configured super-admin or freshly scoped owner authorized terminal-cache requery.</param>
+    /// <param name="retryAuthorization">Optional typed durable owner authorization passed only after fresh store/order/payment checks.</param>
+    /// <param name="ownerRecheck">True only for the authenticated owner entry point; bypasses cached paid evidence and freshly verifies it.</param>
+    /// <param name="recoverRejectedClaim">Whether the owner entry point proved the quarantined fulfillment attempt definitively rejected with no financial evidence.</param>
     /// <returns>Official settlement result or a non-credit result when the provider does not prove full payment.</returns>
     /// <remarks>
     /// Ordinary terminal caches are skipped. A durable authenticated late confirmation may also recheck expiration,
@@ -1583,7 +1626,8 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
     /// <example><code>await ReconcileCoreAsync(paymentId, "atlaspay-webhook", false, cancellationToken);</code></example>
     /// <exception cref="OperationCanceledException">Provider or database work is cancelled by the caller.</exception>
     private async Task<NowPaymentsSettlementResult> ReconcileCoreAsync(int paymentId, string source,
-        bool useVerify, CancellationToken token, bool allowTerminalRecheck = false)
+        bool useVerify, CancellationToken token, bool allowTerminalRecheck = false,
+        TenantProvisioningRetryAuthorization retryAuthorization = null, bool ownerRecheck = false, bool recoverRejectedClaim = false)
     {
         var context = new UserWorkflowStore(_factory);
         var payment = await context.ReadAsync(async db => await db.AtlasPayPaymentInfos.FirstOrDefaultAsync(x => x.Id == paymentId, token));
@@ -1600,13 +1644,12 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
         }
         if (!payment.ProviderOrderId.HasValue || payment.CreationState != AtlasPayCreationStates.Created)
             return NowPaymentsSettlementResult.ProviderNotPaid();
-        if (payment.SettlementState == AtlasPaySettlementStates.ManualReview || payment.RequiresManualDelivery)
+        if ((payment.SettlementState == AtlasPaySettlementStates.ManualReview && !recoverRejectedClaim) || payment.RequiresManualDelivery)
             return NowPaymentsSettlementResult.ProviderNotPaid();
 
-        // Once an authoritative provider inquiry has persisted a successful paid state, crash/retry recovery must reuse
-        // that durable evidence instead of generating another AtlasPay API request. Webhook remains the confirmation
-        // source; users.db and the existing idempotent settlement sagas recover only the local financial/fulfillment tail.
-        if (AtlasPayStatuses.IsSuccess(payment.ProviderStatus) && payment.PaidAtUtc.HasValue)
+        // Automatic crash/retry recovery reuses authoritative durable paid evidence for the local settlement tail.
+        // Explicit owner recovery deliberately bypasses this cache and obtains fresh official full-payment proof.
+        if (!ownerRecheck && AtlasPayStatuses.IsSuccess(payment.ProviderStatus) && payment.PaidAtUtc.HasValue)
         {
             if (awaitingOfficialAfterProvisional)
             {
@@ -1622,7 +1665,7 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
                 await using var tenantScope = _scopeFactory.CreateAsyncScope();
                 return await tenantScope.ServiceProvider
                     .GetRequiredService<TenantBotService>()
-                    .ApplyPaidTenantOrderAsync(payment, source, token);
+                    .ApplyPaidTenantOrderAsync(payment, source, token, retryAuthorization);
             }
 
             await using var walletScope = _scopeFactory.CreateAsyncScope();
@@ -1637,7 +1680,7 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
             string.Equals(source, "atlaspay-webhook", StringComparison.Ordinal) &&
             AtlasPayPollingPolicy.UsesWebhookPrimary(_configuration) &&
             NeedsExpiredConfirmationInquiry(payment);
-        if (AtlasPayStatuses.IsTerminal(payment.ProviderStatus) &&
+        if (!ownerRecheck && AtlasPayStatuses.IsTerminal(payment.ProviderStatus) &&
             (!(allowTerminalRecheck || lateConfirmationRecheck) ||
              !string.Equals(payment.ProviderStatus, "expired", StringComparison.OrdinalIgnoreCase)))
             return NowPaymentsSettlementResult.ProviderNotPaid();
@@ -1653,6 +1696,11 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
             if (string.IsNullOrWhiteSpace(payment.TrackingCode) && !string.IsNullOrWhiteSpace(response.TrackingCode)) payment.TrackingCode = response.TrackingCode;
 
             var verified = AtlasPayPaymentVerifier.IsVerifiedForAutomaticSettlement(payment, response, out var error, out var manual);
+            if (ownerRecheck && verified && response.ActualReceivedAmountToman.HasValue &&
+                response.ActualReceivedAmountToman.Value < response.TotalAmountToman)
+            {
+                verified = false; manual = true; error = "requires_manual_delivery";
+            }
             if (manual)
             {
                 payment.SettlementState = AtlasPaySettlementStates.ManualReview; payment.ErrorCode = error;
@@ -1691,6 +1739,14 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
             payment.ErrorMessage = null;
             payment.NextInquiryAtUtc = null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
+            if (recoverRejectedClaim)
+            {
+                // Fresh official proof and definitive rejection authorize only this local settlement tail.
+                // The immutable XUI attempt remains untouched; the durable coordinator owns any retry generation.
+                payment.SettlementState = AtlasPaySettlementStates.Pending;
+                payment.SettlementAttemptId = null;
+                payment.SettlementStartedAtUtc = null;
+            }
             await context.SaveAsync(token);
 
             if (awaitingOfficialAfterProvisional)
@@ -1705,7 +1761,7 @@ public sealed partial class AtlasPayReconciliationHostedService : BackgroundServ
             if (string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase))
             {
                 await using var scope = _scopeFactory.CreateAsyncScope();
-                return await scope.ServiceProvider.GetRequiredService<TenantBotService>().ApplyPaidTenantOrderAsync(payment, source, token);
+                return await scope.ServiceProvider.GetRequiredService<TenantBotService>().ApplyPaidTenantOrderAsync(payment, source, token, retryAuthorization);
             }
             await using var settlementScope = _scopeFactory.CreateAsyncScope();
             return await settlementScope.ServiceProvider.GetRequiredService<AtlasPaySettlementService>().ApplyOfficialPaymentAsync(payment, source, token);

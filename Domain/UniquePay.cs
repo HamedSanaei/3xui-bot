@@ -2070,6 +2070,43 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         }
     }
 
+    /// <summary>Freshly checks a UniquePay invoice in the authenticated owner's exact selected storefront.</summary>
+    /// <param name="paymentId">Positive users.db payment id reciprocally linked by the tenant order.</param>
+    /// <param name="tenantBotId">Required internal id of the explicitly selected tenant store, not a Telegram bot id.</param>
+    /// <param name="orderId">Required exact public tenant OrderId, not UniquePay HashId or provider reference.</param>
+    /// <param name="ownerTelegramUserId">Positive authenticated Telegram update sender id.</param>
+    /// <param name="cancellationToken">Cancels gate waiting, authorization, official inquiry and existing settlement.</param>
+    /// <returns>Existing official settlement result; unauthorized, mismatched, unpaid and uncertain rows fail closed.</returns>
+    /// <remarks>
+    /// Ownership and reciprocal purpose/store/customer/amount links are loaded afresh while the same serialized
+    /// reconciliation gate used by callbacks/workers is held. Local terminal caches may be rechecked without any
+    /// provisional approval. A quarantined fulfillment tail may reopen only after both fresh full-payment proof and
+    /// a durable current-inbox owner authorization for a definitive provisioning rejection, with no financial evidence.
+    /// </remarks>
+    /// <example><code>await reconciler.ReconcileTenantOrderByOwnerAsync(paymentId, selectedStoreId, publicOrderId, senderId, token);</code></example>
+    /// <exception cref="OperationCanceledException">Gate waiting, provider or database work is cancelled.</exception>
+    public async Task<NowPaymentsSettlementResult> ReconcileTenantOrderByOwnerAsync(int paymentId,
+        string tenantBotId, string orderId, long ownerTelegramUserId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (paymentId <= 0) return NowPaymentsSettlementResult.NotFound();
+        using var lease = await ReconciliationGate.EnterAsync(paymentId.ToString(CultureInfo.InvariantCulture), cancellationToken);
+        await using var db = _userDbContextFactory.CreateDbContext();
+        var order = await TenantBotService.ReadOwnerGatewayOrderAsync(db, tenantBotId, orderId, ownerTelegramUserId, cancellationToken);
+        var payment = await db.UniquePayPaymentInfos.AsNoTracking().SingleOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
+        if (!TenantBotService.IsOwnerUniquePayLinkValid(order, payment)) return NowPaymentsSettlementResult.NotFound();
+        if (order.IsFulfilled) return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+        var authorization = TenantProvisioningRetryAuthorization.TryTelegramConfirmation(
+            TenantProvisioningRetryAuthorizationKind.OwnerExplicit, ownerTelegramUserId, order.Id);
+        var recoverRejectedClaim = payment.SettlementState == UniquePaySettlementStates.ManualReview &&
+            payment.ErrorCode == "tenant_fulfillment_ambiguous" &&
+            await TenantBotService.CanRecoverOwnerRejectedGatewayClaimAsync(_userDbContextFactory, order, authorization, cancellationToken);
+        var result = await ReconcilePaymentCoreAsync(paymentId, TenantBotService.OwnerGatewayRecoverySource,
+            allowTerminalRecheck: true, cancellationToken, authorization, recoverRejectedClaim);
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
+
     /// <summary>
     /// Performs the final authoritative UniquePay inquiry and, only when it remains safely pending, applies one
     /// super-admin provisional OWNED wallet credit before releasing the reconciliation gate.
@@ -2149,10 +2186,12 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// <param name="paymentId">Internal users.db UniquePay payment id.</param>
     /// <param name="source">Safe settlement trigger label.</param>
     /// <param name="allowTerminalRecheck">
-    /// Whether a configured super-admin may bypass only the local terminal-state early return and obtain fresh official
-    /// provider data. All payment invariants remain mandatory.
+    /// Whether a configured super-admin or freshly scoped owner may bypass only the local terminal-state early return
+    /// and obtain fresh official provider data. All payment invariants remain mandatory.
     /// </param>
     /// <param name="cancellationToken">Cancellation token for provider and settlement operations.</param>
+    /// <param name="retryAuthorization">Optional durable owner authorization constructed after fresh exact-store payment checks.</param>
+    /// <param name="recoverRejectedClaim">True only when the owner entry point proved a quarantined provisioning attempt definitively rejected with no financial evidence.</param>
     /// <returns>Settlement result from the authoritative inquiry and downstream fulfillment.</returns>
     /// <remarks>
     /// Definitive creation failures are not queried automatically or interactively. Ambiguous and manual-review create
@@ -2160,11 +2199,15 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
     /// undocumented response cannot authorize another create mutation. Settlement continues through the existing
     /// wallet/tenant idempotency services only after full paid verification.
     /// </remarks>
+    /// <example><code>await ReconcilePaymentCoreAsync(paymentId, "reconciliation-worker", false, token);</code></example>
+    /// <exception cref="OperationCanceledException">Provider or settlement operations are cancelled.</exception>
     private async Task<NowPaymentsSettlementResult> ReconcilePaymentCoreAsync(
         int paymentId,
         string source,
         bool allowTerminalRecheck,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TenantProvisioningRetryAuthorization retryAuthorization = null,
+        bool recoverRejectedClaim = false)
     {
         var context = new UserWorkflowStore(_userDbContextFactory);
         var payment = await context.ReadAsync(async db => await db.UniquePayPaymentInfos
@@ -2179,7 +2222,7 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
         if (!UniquePayCreationStates.IsReadOnlyInquiryAllowed(payment.CreationState))
             return NowPaymentsSettlementResult.ProviderNotPaid();
         if ((!allowTerminalRecheck && UniquePayStatuses.IsTerminal(payment.PaymentStatus)) ||
-            string.Equals(payment.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal))
+            (string.Equals(payment.SettlementState, UniquePaySettlementStates.ManualReview, StringComparison.Ordinal) && !recoverRejectedClaim))
         {
             return NowPaymentsSettlementResult.ProviderNotPaid();
         }
@@ -2246,6 +2289,14 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
             payment.ErrorCode = null;
             payment.ErrorMessage = null;
             payment.UpdatedAtUtc = DateTime.UtcNow;
+            if (recoverRejectedClaim)
+            {
+                // Fresh provider proof permits only the definitively rejected fulfillment tail to resume.
+                // No XUI attempt is reset: the existing durable coordinator owns the authorized next generation.
+                payment.SettlementState = UniquePaySettlementStates.Pending;
+                payment.SettlementAttemptId = null;
+                payment.SettlementStartedAtUtc = null;
+            }
             await context.SaveAsync(cancellationToken);
 
             if (string.Equals(
@@ -2254,7 +2305,7 @@ public sealed class UniquePayReconciliationHostedService : BackgroundService
                     StringComparison.OrdinalIgnoreCase))
             {
                 await using var scope = _scopeFactory.CreateAsyncScope();
-                return await scope.ServiceProvider.GetRequiredService<TenantBotService>().ApplyPaidTenantOrderAsync(payment, source, cancellationToken);
+                return await scope.ServiceProvider.GetRequiredService<TenantBotService>().ApplyPaidTenantOrderAsync(payment, source, cancellationToken, retryAuthorization);
             }
 
             await using var settlementScope = _scopeFactory.CreateAsyncScope();

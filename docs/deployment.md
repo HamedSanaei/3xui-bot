@@ -243,6 +243,14 @@ a new authenticated `/orders/{id}/verify` call. If AtlasPay now reports full pay
 original order id, merchant reference and total, the normal idempotent settlement runs: **do not**
 use manual approval. A signed `order.confirmed` webhook is only a hint; it cannot replace verification.
 
+For a **tenant storefront order**, its active colleague owner can instead use the selected store's
+**✅ تایید دستی پرداخت درگاه** and enter the public tenant `OrderId`. This officially rechecks AtlasPay,
+UniquePay, HooshPay, Tetraminator or NOWPayments and resumes the exact order's existing idempotent fulfillment,
+even if new sales/gateway admission is now closed. It is not provisional approval, does not accept `AP:<id>` or
+provider hashes, and cannot settle sibling-store orders. Uncertain financial/XUI claims still require global
+operator review; only a proven rejected provisioning attempt permits the existing durable explicit-owner retry.
+See [the storefront recovery procedure](multiple-storefronts.md#store-owner-official-gateway-recovery-by-orderid).
+
 If a fresh response still says `expired`, the bot may offer **two-stage provisional wallet credit**
 only for an uncredited owned-bot `wallet_charge`. Before pressing either approval button, the
 super-admin must independently confirm receipt of the **entire customer-facing total in toman**,

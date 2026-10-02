@@ -405,7 +405,14 @@ public partial class TenantBotService
     /// The text button <c>بازگشت به پنل</c> is treated as a cancellation for any pending owner setting input,
     /// clears the temporary state, and returns the colleague to the tenant storefront panel without changing
     /// token, support, payment, card, or tutorial settings.
+    /// Gateway recovery consumes only an exact public OrderId for the persisted selected store and authenticated sender.
+    /// It delegates fresh official payment verification and idempotent settlement to the financial backend; it never
+    /// provisionally approves a gateway order. Blank or oversized gateway input keeps the prompt active for correction.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The incoming update is canceled during database, provider or Telegram work.</exception>
+    /// <exception cref="DbUpdateConcurrencyException">The explicitly selected store changed before a write or refreshed panel render.</exception>
+    /// <exception cref="ApiRequestException">Telegram rejects an owner prompt or result; completed financial settlement is not rolled back.</exception>
+    /// <example><code>await TryHandleOwnerMessageAsync(client, update.Message, owner, botScopedState, menu, cancellationToken);</code></example>
     public async Task<bool> TryHandleOwnerMessageAsync(
         ITelegramBotClient botClient,
         Message Message,
@@ -414,7 +421,10 @@ public partial class TenantBotService
         ReplyMarkup mainReplyMarkup,
         CancellationToken CancellationToken)
     {
-        if (Message?.From == null || string.IsNullOrWhiteSpace(Message.Text))
+        if (Message?.From == null)
+            return false;
+        if (string.IsNullOrWhiteSpace(Message.Text) &&
+            !(string.Equals(User?.Flow, OWNERFLOW, StringComparison.Ordinal) && User.LastStep == STEPOWNERGATEWAYORDERID))
             return false;
         if (CredUser != null && Message.From.Id != CredUser.TelegramUserId) return true;
 
@@ -460,7 +470,7 @@ public partial class TenantBotService
         }
         botClient = new TenantOwnerPanelClient(botClient, () => _selectedOwnerStore, Message.Chat.Id);
         var step = User.LastStep ?? string.Empty;
-        if (string.Equals(Message.Text.Trim(), "بازگشت به پنل", StringComparison.Ordinal))
+        if (string.Equals(Message.Text?.Trim(), "بازگشت به پنل", StringComparison.Ordinal))
         {
             await _state.ClearUserStatus(new User { Id = Message.From.Id });
             await botClient.SendMessage(
@@ -537,6 +547,12 @@ public partial class TenantBotService
             return true;
         }
 
+        if (step == STEPOWNERGATEWAYORDERID)
+        {
+            await HandleOwnerGatewayOrderIdAsync(botClient, Message, CredUser, CancellationToken);
+            return true;
+        }
+
         // Owner-configurable tutorials are disabled. A stale prompt from an old message must cancel the obsolete step
         // without writing anything into TenantTutorialsJson, then return the owner to the tenant panel.
         if (step == STEPTUTORIALTITLE || step == STEPTUTORIALURL)
@@ -565,7 +581,13 @@ public partial class TenantBotService
     /// <returns>true when the callback belongs to tenant owner management; otherwise false.</returns>
     /// <remarks>Every store action requires its stable number, fresh revision and expiry, then an owner-scoped database lookup.
     /// Legacy unaddressed buttons only display a new list. The response decorator labels the selected store and addresses every owner keyboard.
-    /// Selection clears pending input; the add button allocates a disabled independent row in a short transaction.</remarks>
+    /// Selection clears pending input; the add button allocates a disabled independent row in a short transaction.
+    /// The addressed gateway-confirm action acknowledges the callback before prompting for an exact public OrderId;
+    /// it saves the same bot/user/selected-store target as settings and does not authorize payment without provider proof.</remarks>
+    /// <exception cref="OperationCanceledException">The owner update is canceled during state, database or Telegram work.</exception>
+    /// <exception cref="DbUpdateConcurrencyException">The selected store changes between callback validation and a settings operation or panel render.</exception>
+    /// <exception cref="ApiRequestException">Telegram rejects an owner prompt or panel response.</exception>
+    /// <example><code>await TryHandleOwnerCallbackAsync(client, update.CallbackQuery, owner, botScopedState, cancellationToken);</code></example>
     public async Task<bool> TryHandleOwnerCallbackAsync(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -779,6 +801,12 @@ public partial class TenantBotService
         if (action == "manual-card-confirm")
         {
             await STARTMANUALCARDORDERCONFIRMASYNC(botClient, CallbackQuery, CancellationToken);
+            return true;
+        }
+
+        if (action == "gateway-confirm")
+        {
+            await StartOwnerGatewayOrderConfirmationAsync(botClient, CallbackQuery, CancellationToken);
             return true;
         }
 
@@ -1468,9 +1496,15 @@ public partial class TenantBotService
     /// <summary>
     /// Builds inline buttons for EDITING tenant settings and TOGGLING storefront status.
     /// </summary>
-    /// <param name="tenant">current tenant Bot row.</param>
-    /// <returns>inline keyboard for the owner panel.</returns>
-    /// <remarks>Gateway button checkmarks reflect saved owner preferences, not platform permission or customer visibility.</remarks>
+    /// <param name="tenant">The freshly selected, owner-authorized tenant Bot row used for revision-bound callbacks.</param>
+    /// <returns>A non-null inline keyboard that must be sent through TenantOwnerPanelClient to address each store action.</returns>
+    /// <remarks>
+    /// Gateway button checkmarks reflect saved owner preferences, not platform permission or customer visibility.
+    /// Gateway payment recovery is independent of card-to-card approval and stays available when new sales or gateways
+    /// are disabled: existing invoices require fresh authoritative full-payment proof and idempotent settlement.
+    /// The decorator binds gateway-confirm to this store's number, revision and expiry; the handler rechecks ownership.
+    /// </remarks>
+    /// <example><code>var keyboard = BUILDOWNERPANELKEYBOARD(selectedOwnerStore);</code></example>
     private static InlineKeyboardMarkup BUILDOWNERPANELKEYBOARD(BotInstance tenant)
     {
         var IsEnabled = tenant?.Enabled == true;
@@ -1576,6 +1610,10 @@ public partial class TenantBotService
             {
                 InlineKeyboardButton.WithCallbackData("🧪 تست دستیار فروش", OWNERCALLBACKPREFIX + "assistant-test"),
                 InlineKeyboardButton.WithCallbackData("✅ تایید دستی کارت‌به‌کارت", OWNERCALLBACKPREFIX + "manual-card-confirm")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("✅ تایید دستی پرداخت درگاه", OWNERCALLBACKPREFIX + "gateway-confirm")
             },
             new[]
             {
@@ -9001,8 +9039,8 @@ public partial class TenantBotService
     /// </code>
     /// </example>
     /// <param name="retryAuthorization">
-    /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
-    /// provider-driven settlement, which can never allocate a new retry generation.
+    /// Optional typed durable authorization from an authenticated owner, super-admin, or reviewed recovery.
+    /// Null marks automatic/provider-driven settlement, which can never allocate a new retry generation.
     /// </param>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         HooshPayPaymentInfo payment,
@@ -9031,7 +9069,7 @@ public partial class TenantBotService
     /// <param name="payment">Users.db tenant-order AtlasPay row already verified against the provider; never a wallet top-up.</param>
     /// <param name="Source">Non-secret callback, inquiry, or operator confirmation source.</param>
     /// <param name="CancellationToken">Cancels database, fulfillment, and audit operations.</param>
-    /// <param name="retryAuthorization">Optional explicit super-admin authorization for a rejected provisioning attempt.</param>
+    /// <param name="retryAuthorization">Optional typed durable authorization from an authenticated owner, super-admin, or reviewed recovery for a definitively rejected provisioning attempt.</param>
     /// <returns>The fulfillment result, or already added for a settled payment; no financial work is repeated on that path.</returns>
     /// <remarks>
     /// A successful settlement first persists the payment state and owner-wallet snapshots, then emits the separately
@@ -9235,14 +9273,18 @@ public partial class TenantBotService
     /// This method never accepts provisional approval. It only consumes an already provider-verified payment row;
     /// callers handling return, customer-check, or worker triggers must perform
     /// <see cref="UniquePayPaymentVerifier.IsVerifiedPaid" /> immediately before invoking it.
+    /// The persisted TenantBotOrderId is the sole order lookup identity; a merchant HashId is not a public tenant
+    /// OrderId and must never select a different order through a legacy fallback.
     /// Successful fulfillment records the effective currency, fee payer, stored base amount, provider-reported fee,
     /// and persisted owner-wallet before/after observations once in the protected payment channel; repeated
     /// fulfillment checks do not emit another provider-success log.
     /// </remarks>
     /// <param name="retryAuthorization">
-    /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
-    /// provider-driven settlement, which can never allocate a new retry generation.
+    /// Optional typed durable authorization from an authenticated owner, super-admin, or reviewed recovery.
+    /// Null marks automatic/provider-driven settlement, which can never allocate a new retry generation.
     /// </param>
+    /// <example><code>await tenantService.ApplyPaidTenantOrderAsync(verifiedUniquePayPayment, "provider-callback", token);</code></example>
+    /// <exception cref="OperationCanceledException">Provider-independent persistence or settlement work is cancelled.</exception>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         UniquePayPaymentInfo payment,
         string Source,
@@ -9274,8 +9316,9 @@ public partial class TenantBotService
         if (await RejectActiveOrAmbiguousUniquePayTenantClaimAsync(payment, CancellationToken))
             return NowPaymentsSettlementResult.ProviderNotPaid();
 
+        // The provider-specific merchant hash cannot act as an alternate tenant-order authorization boundary.
         var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
-            x => x.Id == payment.TenantBotOrderId || x.OrderId == payment.HashId,
+            x => x.Id == payment.TenantBotOrderId,
             CancellationToken));
         if (order == null)
         {
@@ -9461,8 +9504,8 @@ public partial class TenantBotService
     /// immediately before invoking it.
     /// </remarks>
     /// <param name="retryAuthorization">
-    /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
-    /// provider-driven settlement, which can never allocate a new retry generation.
+    /// Optional typed durable authorization from an authenticated owner, super-admin, or reviewed recovery.
+    /// Null marks automatic/provider-driven settlement, which can never allocate a new retry generation.
     /// </param>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         TetraminatorPaymentInfo payment,
@@ -9517,8 +9560,8 @@ public partial class TenantBotService
     /// <see cref="NowPaymentsSettlementStatus.ProviderNotPaid"/> unless the provider reports a paid status.
     /// </remarks>
     /// <param name="retryAuthorization">
-    /// Optional typed authorization passed by an explicit super-admin confirmation. Null marks automatic or
-    /// provider-driven settlement, which can never allocate a new retry generation.
+    /// Optional typed durable authorization from an authenticated owner, super-admin, or reviewed recovery.
+    /// Null marks automatic/provider-driven settlement, which can never allocate a new retry generation.
     /// </param>
     public async Task<NowPaymentsSettlementResult> ApplyPaidTenantOrderAsync(
         SwapinoPaymentInfo payment,

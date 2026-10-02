@@ -66,6 +66,32 @@ failed local receipt commit or process loss. It does **not** prove that the webs
 The application coordinates website balance checks and debits by owner in one process. It does not control
 website-side writers or provide a distributed transaction with the website or between the two SQLite databases.
 
+### Store owner: official gateway recovery by OrderId
+
+1. Open **🛒 فعالسازی ربات فروشگاهی** in an owned bot and select the exact storefront.
+2. Copy the public `OrderId` from that storefront's **سفارش‌ها** list. Do not use the integer database id,
+   AtlasPay `AP:<id>`/merchant reference, UniquePay hash, bank tracking code, or another storefront's OrderId.
+3. Press **✅ تایید دستی پرداخت درگاه**, beside the existing card-to-card confirmation, and send that OrderId.
+   Surrounding whitespace is trimmed; blank input or more than 140 characters keeps the prompt open.
+   **بازگشت به پنل**, opening the store list, or switching stores cancels the pending input.
+
+AtlasPay, UniquePay, HooshPay, Tetraminator and NOWPayments use their official provider inquiry, not an owner's
+assertion or a cached local paid flag. The exact store, current owner, customer, reciprocal payment/order links,
+original amount and provider invoice identity must match; fee or crypto-quote checks remain provider-specific.
+Other owners and sibling stores cannot inspect or settle this order. Card and customer-wallet orders retain
+their dedicated confirmation/recovery routes; this button does not create a card receipt or credit a wallet top-up.
+
+Full official payment resumes the existing purchase/renewal settlement with frozen sale/base/profit amounts and
+the same durable XUI operations, wallet receipts and ledger keys. A completed replay never creates, renews or
+credits profit again. Recovery of already-issued invoices remains available when new sales or gateway admission
+is closed. A definitively rejected purchase may use the existing explicit durable owner retry generation;
+reserved, started, ambiguous or applied operations never authorize a blind replacement POST.
+
+Unpaid, short-paid, mismatched, unavailable-provider and uncertain cases are **not approved**. An unresolved
+financial/XUI claim remains for the global super-admin's reviewed recovery. AtlasPay/UniquePay provisional
+financial approval stays global-super-admin-only; this owner button never grants it. The returned outcome clears
+only the active owned-bot/user input and refreshes the same storefront panel; notification failure cannot undo settlement.
+
 ## Deployment (manual)
 
 1. Run full tests, Release build and both `dotnet ef migrations has-pending-model-changes --context ...` checks.
@@ -91,6 +117,13 @@ those identities or receipts. Resolve financial uncertainty and prepare a delibe
 never restore only one database or replay historical financial effects to force a rollback.
 
 ## Verification coverage
+
+Owner gateway recovery verification passed 1,125 existing-suite cases, including the 25 new exact-store, fresh-proof
+and rejected-attempt/idempotency cases in `TenantOwnerGatewayRecoveryTests.cs`. A separate temporary executable
+drove the real update dispatcher and Telegram SDK through 15 purchase/renewal/ambiguous-creation scenarios across
+all five gateways, with controlled HTTP transports and real private SQLite databases. No live Telegram/provider/
+production-panel request was made. Production-only Linux publish passed without auxiliary test dependencies;
+temporary verification tooling is not part of the application or server publish.
 
 Tenant purchase and renewal audit messages display a fixed readable label from `PaymentProvider`, separately
 from owner settlement funding. Unknown provider values are never echoed. Storefronts expose `🌟اکانت تست`
