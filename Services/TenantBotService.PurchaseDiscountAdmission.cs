@@ -37,8 +37,10 @@ public partial class TenantBotService
     /// <param name="token">Cancellation of users.db admission, provider and Telegram operations.</param>
     /// <returns>A task after the original order's frozen payment path or actionable error.</returns>
     /// <remarks>The transaction reserves one code use before gateway I/O. An open quote with changed gross/base
-    /// is expired before replying so restoring an old rate cannot revive a stale preview. Admitted replay
-    /// retains its original stored order and payment method without repricing.</remarks>
+    /// is expired before replying so restoring an old rate cannot revive a stale preview. Admitted replay retains
+    /// its original stored order and payment method without repricing. Live global sale permission is required
+    /// for an open quote and again for an admitted but unstarted payment. Linked provider rows are replayed/recovered
+    /// without applying the new-admission gate.</remarks>
     private async Task HandleQuotedPurchasePaymentAsync(ITelegramBotClient botClient, CallbackQuery callback,
         BotInstance tenant, CredUser customer, string action, CancellationToken token)
     {
@@ -71,6 +73,8 @@ public partial class TenantBotService
         if (quote.State == TenantDiscountQuoteStates.Open)
         {
             var selection = PARSESELECTIONFROMPAYACTION(quote.SelectionKey);
+            if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, selection?.ServiceKey,
+                    ServiceSalesOperation.Sale, token, callback)) return;
             if (!TryCurrentPurchaseQuotePrice(tenant, selection, quote, out var price)
                 || quote.ExpiresAtUtc <= DateTime.UtcNow)
             {
@@ -88,6 +92,8 @@ public partial class TenantBotService
                     showAlert: true, cancellationToken: token);
                 return;
             }
+            if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, selection.ServiceKey,
+                    ServiceSalesOperation.Sale, token, callback)) return;
             newOrder = CreateTenantOrder(tenant, customer, chatId, selection, price,
                 QuotedPurchaseProvider(provider));
         }
@@ -149,7 +155,7 @@ public partial class TenantBotService
     /// <param name="provider">Canonical persisted provider, checked against any previous selection.</param>
     /// <param name="token">Cancellation of the users.db writer transaction.</param>
     /// <returns>True if the order is still payable through this exact provider; false otherwise.</returns>
-    /// <remarks>Locking the order writer row before reading prevents concurrent first-choice callbacks from switching methods.</remarks>
+    /// <remarks>Locking the order writer row prevents concurrent first-choice callbacks from switching methods. A pending first choice requires live global renewal permission; same-method replay still delegates invoice reuse/creation to its guarded core.</remarks>
     private async Task<bool> ClaimDiscountRenewalMethodAsync(ITelegramBotClient botClient, CallbackQuery callback,
         TenantBotOrder order, string provider, CancellationToken token)
     {
@@ -172,6 +178,8 @@ public partial class TenantBotService
                 return false;
             if (saved.PaymentProvider == "pending")
             {
+                if (!IsTenantSalesEnabled(saved.ServiceKey, ServiceSalesOperation.Renewal,
+                        string.IsNullOrWhiteSpace(saved.UnlimitedPlanKey) ? null : XuiV3ServiceKinds.Unlimited)) return false;
                 saved.PaymentProvider = provider;
                 saved.UpdatedAtUtc = DateTime.UtcNow;
                 await db.SaveChangesAsync(token);
@@ -194,7 +202,7 @@ public partial class TenantBotService
     /// <param name="order">Persisted frozen-net purchase or renewal order.</param>
     /// <param name="token">Cancellation of users.db, HooshPay and Telegram calls.</param>
     /// <returns>A task after one staged attempt or a replay-safe status alert.</returns>
-    /// <remarks>The linked local payment row and started marker commit before HTTP POST. An uncertain result never permits another POST.</remarks>
+    /// <remarks>The linked local payment row and started marker commit before HTTP POST. Global sale/renewal permission is re-read only for a first attempt; linked invoices and ambiguous attempts never permit another POST.</remarks>
     private async Task CreateTenantHooshPayInvoiceCoreAsync(ITelegramBotClient botClient, CallbackQuery callback,
         BotInstance tenant, CredUser customer, TenantBotOrder order, CancellationToken token)
     {
@@ -217,6 +225,7 @@ public partial class TenantBotService
                 "نتیجه ساخت فاکتور قبلی نامشخص است؛ درخواست دوباره ارسال نمی‌شود.", showAlert: true, cancellationToken: token);
             return;
         }
+        if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callback, order, token)) return;
         if (!IsTenantHooshPayAvailable(tenant, order.SalePriceToman))
         {
             await SafeAnswerCallbackQueryAsync(botClient, callback.Id, BuildTenantHooshPayUnavailableMessage(tenant, order.SalePriceToman),
@@ -288,7 +297,7 @@ public partial class TenantBotService
     /// <param name="order">Persisted frozen-net purchase or renewal order.</param>
     /// <param name="token">Cancellation of local, NOWPayments and Telegram operations.</param>
     /// <returns>A task after one staged provider attempt or a replay-safe alert.</returns>
-    /// <remarks>The users.db attempt and payment row precede the external create request; timeout is ambiguous, not a second invoice.</remarks>
+    /// <remarks>The users.db attempt and payment row precede the external create request. Global sale/renewal permission gates only new attempts; existing invoice recovery remains independent and timeout never creates a second invoice.</remarks>
     private async Task CreateTenantNowPaymentsInvoiceCoreAsync(ITelegramBotClient botClient, CallbackQuery callback,
         BotInstance tenant, CredUser customer, TenantBotOrder order, CancellationToken token)
     {
@@ -311,6 +320,7 @@ public partial class TenantBotService
                 "نتیجه ساخت فاکتور قبلی نامشخص است؛ درخواست دوباره ارسال نمی‌شود.", showAlert: true, cancellationToken: token);
             return;
         }
+        if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callback, order, token)) return;
         if (!TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.NowPayments, _gatewayAvailability.Snapshot))
         {
             await SafeAnswerCallbackQueryAsync(botClient, callback.Id, "درگاه ارز دیجیتال غیرفعال است.", showAlert: true, cancellationToken: token);
@@ -378,9 +388,11 @@ public partial class TenantBotService
     /// <param name="order">Persisted first-method card order with its immutable final net.</param>
     /// <param name="token">Cancellation of the local order update and Telegram delivery.</param>
     /// <returns>A task after instructions or an expiry/released-claim alert.</returns>
+    /// <remarks>Rechecks global sale/renewal permission before exposing personal-card payment. Existing submitted receipt confirmation and paid/provisional finalization use their original settlement paths, not this unpaid activation method.</remarks>
     private async Task SendTenantCardOrderInstructionsAsync(ITelegramBotClient botClient, CallbackQuery callback,
         BotInstance tenant, TenantBotOrder order, CancellationToken token)
     {
+        if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callback, order, token)) return;
         if ((order.PaymentStatus == TenantBotOrderStatuses.Pending &&
              !TenantPaymentGatewayPolicy.IsPersonalCardEnabled(tenant))
             || order.PaymentProvider != "tenant_card"

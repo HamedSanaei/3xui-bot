@@ -854,6 +854,8 @@ public partial class TelegramBotService
     /// handlers after the transient reset.
     /// Owned installation callbacks use the shared built-in tenant image albums and acknowledge before upload;
     /// tutorial platform/parent navigation never clears the requesting bot/user's active conversation.
+    /// Global sale/renewal controls are owned-only, super-admin-authorized high-priority navigation. Closing a
+    /// category blocks fresh customer admission across all bots, not the settlement of accepted paid/started work.
     /// </remarks>
     /// <example>
     /// <code>
@@ -907,6 +909,9 @@ public partial class TelegramBotService
                 await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, callbackCredUser, callbackUserState, cancellationToken);
                 return;
             }
+            if (await TryHandleSalesControlCallbackAsync(botClient, callbackQuery, cancellationToken))
+                return;
+
 
             // Tutorial callbacks are owned-only presentation; tenant routing above keeps storefront navigation isolated.
             if (await TryHandleOwnedTutorialCallbackAsync(botClient, callbackQuery, cancellationToken))
@@ -1079,6 +1084,9 @@ public partial class TelegramBotService
         // admin sub-flow and return to the owned-bot main menu without touching super-admin authorization.
         if (isOwnedBot && await TryHandleSuperAdminMenuExitAsync(botClient, message, cancellationToken))
             return;
+        if (isOwnedBot && await TryHandleSalesControlMessageAsync(botClient, message, isOwnedBot, cancellationToken))
+            return;
+
 
         // The manual-review screen lists XUI v3 renewals that bounded automatic reconciliation could not decide. It is
         // read-only, owned-bot and super-admin only, and it is routed at the same high-priority layer as the Admin entry
@@ -5872,6 +5880,8 @@ public partial class TelegramBotService
     /// Gets the reply-keyboard actions available to super-admin users.
     /// </summary>
     /// <returns>Ordered action labels shown in the super-admin keyboard.</returns>
+    /// <remarks>Includes independent global sale/renewal controls; only configured super-admins in owned bots receive this keyboard.</remarks>
+    /// <example><code>var actions = GetAdminActions();</code></example>
     private string[] GetAdminActions()
     {
         string[] actions = new string[]
@@ -5893,6 +5903,7 @@ public partial class TelegramBotService
             AdminWeeklyUsageAction,
             AdminMonthlyUsageAction,
             AdminPaymentGatewayAction,
+            AdminSalesControlAction,
             TenantBotService.TenantWalletAdminMenuAction,
             AdminClientDownloadAction,
             "🤖 وضعیت ربات‌ها",
@@ -7689,7 +7700,10 @@ public partial class TelegramBotService
     /// both wallet debit and ledger entry are persisted. This keeps weekly gross sales free from pending or failed work.
     /// Legacy panel calls are measured explicitly because this v2 route does not use the shared v3 HTTP transport. The
     /// central logger records both logical panel-call time and total renewal/settlement/delivery time.
+    /// Live global renewal permission is rechecked before the first panel mutation; a closed legacy request clears
+    /// only this bot/user conversation and performs no panel or financial mutation.
     /// </remarks>
+    /// <example><code>await FinalizeRenewCustomerAccount(client, state, currentProfile, confirmationMessage);</code></example>
     private async Task FinalizeRenewCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
     {
         if (message.Text == "انصراف")
@@ -7697,6 +7711,8 @@ public partial class TelegramBotService
             await _state.ClearUserStatus(user);
             return;
         }
+        if (await RejectClosedLegacySaleAsync(botClient, user, message, ServiceSalesOperation.Renewal))
+            return;
         await botClient.CustomSendTextMessageAsync(
                            chatId: message.Chat.Id,
                            text: "لطفاً تا تمدید شدن اکانت چند لحظه صبر کنید ...",
@@ -7762,6 +7778,8 @@ public partial class TelegramBotService
                 accountDto = new AccountDtoUpdate { TelegramUserId = message.From.Id, Client = client, ServerInfo = findedServer, SelectedCountry = findedcountry, SelectedPeriod = user.SelectedPeriod, AccType = "tunnel", TotoalGB = user.TotoalGB, ConfigLink = user.ConfigLink };
             }
             await _state.SaveUserStatus(new User { Id = user.Id, SelectedCountry = findedcountry });
+            if (await RejectClosedLegacySaleAsync(botClient, user, message, ServiceSalesOperation.Renewal))
+                return;
             var result = await operationTiming.MeasureLegacyPanelCallAsync(() => UpdateAccount(accountDto));
 
             if (result)
@@ -7872,7 +7890,10 @@ public partial class TelegramBotService
     /// enabled and the matching debit ledger entry exists. Wallet top-ups and failed creations are never sales events.
     /// Legacy create and read-back calls are measured explicitly; their sum is reported as panel API time while total
     /// time also includes wallet, persistence, activity logging, and customer delivery performed before the audit.
+    /// Paid legacy sales recheck global permission immediately before panel creation. Zero-price free-test behavior
+    /// remains unchanged, and no control check interrupts an accepted creation's settlement.
     /// </remarks>
+    /// <example><code>await FinalizeCustomerAccount(client, state, currentProfile, confirmationMessage);</code></example>
     private async Task FinalizeCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
     {
         if (message.Text == "انصراف")
@@ -7880,6 +7901,8 @@ public partial class TelegramBotService
             await _state.ClearUserStatus(user);
             return;
         }
+        if (user.ConfigPrice > 0 && await RejectClosedLegacySaleAsync(botClient, user, message, ServiceSalesOperation.Sale))
+            return;
 
         await botClient.CustomSendTextMessageAsync(
                            chatId: message.Chat.Id,
@@ -7910,6 +7933,8 @@ public partial class TelegramBotService
 
             AccountDto accountDto = new AccountDto { TelegramUserId = message.From.Id, IsColleague = credUser.IsColleague, AccountCounter = user.AccountCounter + 1, ServerInfo = serverInfo, SelectedCountry = user.SelectedCountry, SelectedPeriod = user.SelectedPeriod, AccType = user.Type, TotoalGB = user.TotoalGB };
 
+            if (user.ConfigPrice > 0 && await RejectClosedLegacySaleAsync(botClient, user, message, ServiceSalesOperation.Sale))
+                return;
             var result = await operationTiming.MeasureLegacyPanelCallAsync(() => CreateAccount(accountDto));
 
             if (result)

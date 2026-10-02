@@ -56,7 +56,9 @@ public sealed partial class ConcurrencyTests
                 new BotInstance { Id = "discount-b", Type = BotInstanceTypes.Tenant, OwnerTelegramUserId = 202, TenantStoreNumber = 1 });
             await db.SaveChangesAsync();
         }
-        var discounts = new TenantDiscountService(databases.Users);
+        var discounts = new TenantDiscountService(databases.Users, new ServiceSalesAvailabilityService(new AppConfig(),
+            System.IO.Path.Combine(System.IO.Path.GetTempPath(), "tenant-discount-fixture-policy.json"),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ServiceSalesAvailabilityService>.Instance));
         var definition = new TenantDiscountCodeInput(" sale-25 ", TenantDiscountKinds.Percent, TenantDiscountScopes.Both,
             null, 25, 30000, 200000, 1, true);
         var first = await discounts.SaveCodeAsync("discount-a", 101, definition);
@@ -718,7 +720,9 @@ public sealed partial class ConcurrencyTests
     {
         using var databases = new Databases();
         var (wallet, funding, _) = await SeedCustomerWalletOrderAsync(databases);
-        var discounts = new TenantDiscountService(databases.Users);
+        var discounts = new TenantDiscountService(databases.Users, new ServiceSalesAvailabilityService(new AppConfig(),
+            System.IO.Path.Combine(System.IO.Path.GetTempPath(), "tenant-discount-wallet-fixture-policy.json"),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ServiceSalesAvailabilityService>.Instance));
         var definition = await discounts.SaveCodeAsync("tenant-a", 456,
             new TenantDiscountCodeInput("wallet-30", TenantDiscountKinds.Fixed, TenantDiscountScopes.Purchase,
                 30000, null, null, 0, 2, true));

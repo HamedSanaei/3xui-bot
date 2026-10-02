@@ -19,10 +19,12 @@ public partial class TenantBotService
     /// <param name="customerTelegramUserId">Authenticated Telegram sender id for this checkout, not the chat id.</param>
     /// <param name="token">Cancellation of local database and Telegram operations.</param>
     /// <returns>A task after the preview is bound to the real delivered Telegram message or safely expired.</returns>
-    /// <remarks>Creates no order, invoice or reservation. Existing quoted messages are never overwritten by another quote; their buttons remain tied to their original message.</remarks>
+    /// <remarks>Checks the live global sale permission before creating a quote. Creates no order, invoice or reservation. Existing quoted messages are never overwritten by another quote; their buttons remain tied to their original message.</remarks>
     private async Task ShowCustomerDiscountConfirmAsync(ITelegramBotClient botClient, ChatId chatId, int? messageId,
         BotInstance tenant, XuiV3PurchaseSelection selection, long customerTelegramUserId, CancellationToken token)
     {
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, selection.ServiceKey,
+                ServiceSalesOperation.Sale, token)) return;
         var chat = chatId.Identifier ?? throw new InvalidOperationException("A numeric Telegram chat id is required for a purchase quote.");
         var discounts = _serviceProvider.GetRequiredService<TenantDiscountService>();
         var price = CalculateTenantPrice(tenant, selection);
@@ -53,7 +55,7 @@ public partial class TenantBotService
     /// <param name="action">Customer action without TN: prefix, either DC:&lt;id36&gt; or DR:&lt;id36&gt;.</param>
     /// <param name="token">Cancellation of database and Telegram work.</param>
     /// <returns>A task after the entry prompt, undiscounted re-render or stale-button alert.</returns>
-    /// <remarks>No payment admission occurs here. Expired and admitted quotes cannot be reactivated by old buttons.</remarks>
+    /// <remarks>Global sale closure blocks stale quote actions without expiring a valid quote. No payment admission occurs here. Expired and admitted quotes cannot be reactivated by old buttons.</remarks>
     private async Task HandlePurchaseDiscountCallbackAsync(ITelegramBotClient botClient, CallbackQuery callback,
         BotInstance tenant, CredUser customer, string action, CancellationToken token)
     {
@@ -74,6 +76,8 @@ public partial class TenantBotService
             return;
         }
         var selection = PARSESELECTIONFROMPAYACTION(quote.SelectionKey);
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chat, selection?.ServiceKey,
+                ServiceSalesOperation.Sale, token, callback)) return;
         if (!TryCurrentPurchaseQuotePrice(tenant, selection, quote, out var price))
         {
             await _serviceProvider.GetRequiredService<TenantDiscountService>()
@@ -113,7 +117,7 @@ public partial class TenantBotService
     /// <param name="user">Current bot-scoped conversation snapshot containing the pending quote id.</param>
     /// <param name="token">Cancellation of local state and Telegram work.</param>
     /// <returns>A task after displaying a validated quote or inviting a retry without reserving capacity.</returns>
-    /// <remarks>An invalid code does not replace a previous displayed discount or create an order. Navigation is routed before this step by the caller.</remarks>
+    /// <remarks>Restored discount input rechecks live global sale permission. An invalid code does not replace a previous displayed discount or create an order. Navigation is routed before this step by the caller.</remarks>
     private async Task HandlePurchaseDiscountTextAsync(ITelegramBotClient botClient, Message message, BotInstance tenant,
         CredUser customer, User user, CancellationToken token)
     {
@@ -130,6 +134,8 @@ public partial class TenantBotService
             return;
         }
         var selection = PARSESELECTIONFROMPAYACTION(quote.SelectionKey);
+        if (!await EnsureTenantSalesEnabledAsync(botClient, message.Chat.Id, selection?.ServiceKey,
+                ServiceSalesOperation.Sale, token)) return;
         if (!TryCurrentPurchaseQuotePrice(tenant, selection, quote, out var price))
         {
             await discounts.ExpireQuoteAsync(quote.Id, tenant.Id, customer.TelegramUserId, message.Chat.Id, token);

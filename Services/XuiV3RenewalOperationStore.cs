@@ -697,17 +697,20 @@ public class XuiV3RenewalOperationStore
     }
 
     /// <summary>
-    /// Marks an operation failed after a definitive, non-transient panel rejection.
+    /// Marks an operation failed after definitive non-acceptance, including global closure before mutation starts.
     /// </summary>
-    /// <param name="operation">Operation whose mutation was definitively rejected.</param>
+    /// <param name="operation">Claim-token-bound operation whose mutation was definitively rejected or never started.</param>
     /// <param name="error">Sanitized error text without panel secrets.</param>
     /// <param name="cancellationToken">Token that cancels the update.</param>
-    /// <param name="comparison">Optional immediate GET-only comparison whose sanitized evidence should be retained.</param>
     /// <returns>A task that completes after the failed status is persisted.</returns>
     /// <remarks>
     /// Failed operations are terminal: no settlement occurred and the mutation is never replayed. The user must
     /// start a fresh renewal flow for a new attempt.
+    /// A caller may also release its fresh claim when global renewal admission closes before MutationStartedAtUtc.
+    /// This transition is forbidden for uncertain, accepted or applied mutations; their existing recovery must settle.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The database update is cancelled.</exception>
+    /// <example><code>await store.MarkFailedAsync(operation, "Closed before mutation.", token);</code></example>
     public async Task MarkFailedAsync(
         XuiV3RenewalOperation operation,
         string error,

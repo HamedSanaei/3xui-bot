@@ -19,7 +19,7 @@ public partial class TenantBotService
     /// <param name="baseCostToman">Fresh colleague cost used only for discount validation.</param>
     /// <param name="token">Cancellation of the users.db transaction and Telegram delivery.</param>
     /// <returns><c>false</c> only if no code was selected; otherwise <c>true</c> after admission or an actionable failure.</returns>
-    /// <remarks>Admission reserves capacity with the pending order in one users.db commit. This method never invokes a provider, wallet, or XUI; any invalid selected code fails closed instead of charging the gross amount.</remarks>
+    /// <remarks>Admission rechecks the global renewal permission and reserves capacity with the pending order in one users.db commit. This method never invokes a provider, wallet, or XUI; any invalid selected code fails closed instead of charging the gross amount.</remarks>
     private async Task<bool> AdmitDiscountedRenewalFromStateAsync(
         ITelegramBotClient client, ChatId chatId, BotInstance tenant, CredUser customer, User user,
         TenantBotOrder order, long grossToman, long baseCostToman, CancellationToken token)
@@ -56,6 +56,8 @@ public partial class TenantBotService
             return true;
         }
 
+        if (!await EnsureTenantSalesEnabledAsync(client, chatId, order.ServiceKey,
+                ServiceSalesOperation.Renewal, token)) return true;
         var admitted = await _serviceProvider.GetRequiredService<TenantDiscountService>()
             .AdmitRenewalOrderAsync(order, saved.Value, grossToman, baseCostToman, token);
         if (!admitted.Success)

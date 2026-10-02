@@ -74,7 +74,11 @@ public partial class XuiV3BotFlowService
     /// <param name="mainReplyMarkup">Nullable owned main keyboard for terminal responses.</param>
     /// <param name="token">Cancellation of incoming execution and external requests, not post-attempt local settlement.</param>
     /// <returns>True after consuming this owned trial action; no tenant conversation or ordinary cooldown is changed.</returns>
-    /// <remarks>Colleagues use their active role instead of the ordinary customer's phone/cooldown gate. The allowance is global across owned bots/types, but the paid quote and confirmation belong to the original bot and sender.</remarks>
+    /// <remarks>
+    /// Colleagues use their active role instead of the ordinary customer's phone/cooldown gate. The allowance is
+    /// global across owned bots/types, but paid quote and confirmation belong to the original bot and sender.
+    /// Restored unpaid quote reminders check global sale permission; already-debited reminders remain reachable.
+    /// </remarks>
     /// <example><code>await HandleOwnedColleagueTrialAsync(client, message, currentProfile, state, keyboard, token);</code></example>
     private async Task<bool> HandleOwnedColleagueTrialAsync(ITelegramBotClient botClient, Message message,
         CredUser profile, User user, ReplyMarkup mainReplyMarkup, CancellationToken token)
@@ -105,6 +109,11 @@ public partial class XuiV3BotFlowService
             }
             var pending = await _colleagueTrialQuotaStore.FindAsync(user.PurchaseSessionId, profile.TelegramUserId,
                 BotContextAccessor.CurrentBotId, token);
+            if (pending != null &&
+                await _credentialsDbContext.GetWalletOperationAsync($"colleague-paid-trial:{pending.Id}:debit", token) == null &&
+                await RejectClosedServiceOperationAsync(
+                    botClient, message.Chat.Id, FindService(pending.ServiceKey), ServiceSalesOperation.Sale, token))
+                return true;
             await botClient.SendMessage(message.Chat.Id, "برای خرید تست، دکمه تأیید پیش‌فاکتور را بزنید یا انصراف دهید.",
                 replyMarkup: pending?.PaidQuoteToman is > 0
                     ? BuildPaidTrialInlineKeyboard(pending.Id, pending.PaidQuoteToman.Value) : mainReplyMarkup,
@@ -224,12 +233,21 @@ public partial class XuiV3BotFlowService
     /// <param name="grant">Denied exact actor/bot receipt; an already funded/started quote must not be repriced.</param>
     /// <param name="token">Cancellation of quote persistence and preview delivery.</param>
     /// <returns>A task completing after the price and approval keyboard are delivered; no wallet or panel mutation occurs.</returns>
-    /// <remarks>Charges actual byte volume plus three daily fees using the ordinary colleague rates. National 100 MiB never silently becomes a 1 GiB paid account. A changed price requires another explicit confirmation.</remarks>
+    /// <remarks>
+    /// Charges actual byte volume plus three daily fees using ordinary colleague rates. National 100 MiB never
+    /// silently becomes a 1 GiB paid account. A changed price requires another explicit confirmation. The global
+    /// sale switch must permit this category before a new unfunded quote is persisted; free allowances are unchanged.
+    /// </remarks>
     /// <exception cref="InvalidOperationException">The live test catalog cannot produce a valid positive price.</exception>
     /// <example><code>await OfferPaidColleagueTrialAsync(client, message.Chat.Id, profile, state, deniedGrant, token);</code></example>
     private async Task OfferPaidColleagueTrialAsync(ITelegramBotClient botClient, ChatId chatId, CredUser profile,
         User user, ColleagueTrialGrant grant, CancellationToken token)
     {
+        var service = FindService(grant.ServiceKey);
+        if (await RejectClosedServiceOperationAsync(
+                botClient, chatId, service, ServiceSalesOperation.Sale, token))
+            return;
+
         var bytes = TrialTrafficBytes(grant.ServiceKey);
         var price = _purchaseService.ResolveColleagueTrialPriceToman(grant.ServiceKey, bytes, TrialDays);
         grant = await _colleagueTrialQuotaStore.SetPaidQuoteAsync(grant.Id, profile.TelegramUserId, grant.BotId,
@@ -246,7 +264,6 @@ public partial class XuiV3BotFlowService
             user.PurchaseSessionId = grant.Id;
             await _state.SaveUserStatus(user);
         }
-        var service = FindService(grant.ServiceKey);
         await botClient.SendMessage(chatId,
             "سهمیه تست رایگان برای این درخواست در دسترس نیست؛ همین تست را می‌توانید با تعرفه عادی همکار بخرید.\n\n" +
             $"سرویس: {service.DisplayName}\nحجم: {XuiV3PurchaseService.FormatTrafficSize(bytes, 1)}\nمدت: {TrialDays} روز\n" +
@@ -270,6 +287,9 @@ public partial class XuiV3BotFlowService
     /// absent/Reserved evidence after its invocation stops. Definitive non-creation permits exactly one equal refund;
     /// ambiguous POST keeps the debit for reconciliation, never a blind refund or new POST. Applied creation survives
     /// notification failure. A prepaid retry honors the original receipt price even if rates or the current role change.
+    /// A new sufficient-balance debit also requires live global sale permission immediately before the debit.
+    /// Once that receipt commits, recovery ignores later category closure: creation/read-back/refund follows the
+    /// same original receipt without a second charge, blind refund or replay. Renewal permission is never consulted.
     /// No tenant owner balance, partner profit or payment-provider invoice is created.
     /// </remarks>
     /// <exception cref="OperationCanceledException">The caller cancels; any winning attempt is classified and safely refunded or held first.</exception>
@@ -304,6 +324,11 @@ public partial class XuiV3BotFlowService
                 await OfferPaidColleagueTrialAsync(botClient, message.Chat.Id, profile, user, grant, token);
                 return;
             }
+            // Only unfunded admission is gated. A committed debit below is a settlement obligation even after closure.
+            if (await RejectClosedServiceOperationAsync(
+                    botClient, message.Chat.Id, FindService(grant.ServiceKey), ServiceSalesOperation.Sale, token))
+                return;
+
             debit = await _credentialsDbContext.TryDebitWalletIfSufficientAsync(profile.TelegramUserId,
                 livePrice, debitKey, grant.BotId, token);
             if (debit == null)

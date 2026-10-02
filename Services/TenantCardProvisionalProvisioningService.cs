@@ -18,7 +18,7 @@ namespace Adminbot.Services
     /// </remarks>
     public enum TenantCardProvisionalProvisioningStatus
     {
-        /// <summary>The global provisional-delivery switch is off, so nothing was attempted.</summary>
+        /// <summary>The global provisional-delivery switch or new-sale admission is closed, so no new panel work was attempted.</summary>
         Disabled,
 
         /// <summary>The order is not a tenant card-to-card purchase, or is already financially fulfilled.</summary>
@@ -207,6 +207,8 @@ namespace Adminbot.Services
         /// Side effects: at most one panel client is created per order for the lifetime of the database, and the order's
         /// provisional identity columns and state are updated. This method never debits a wallet, writes a ledger row,
         /// marks the order paid or fulfilled, credits profit, or enqueues a final-sale notification.
+        /// Global sale closure blocks unstarted courtesy provisioning, including Reserved-only operations. Started,
+        /// applied and ambiguous operations retain their original exactly-once recovery path regardless of closure.
         /// </remarks>
         /// <example>
         /// <code>
@@ -259,6 +261,17 @@ namespace Adminbot.Services
             // never reach the panel create again.
             if (HasProvenIdentity(order))
                 return Existing(order, createdNow: false);
+            var creation = await _creationOperations.FindAsync(BuildCreateOperationKey(order.OrderId), cancellationToken).ConfigureAwait(false);
+            var started = creation != null && (creation.PostStartedAtUtc.HasValue ||
+                creation.Outcome is XuiV3CreationOutcome.PostStarted or XuiV3CreationOutcome.Applied or XuiV3CreationOutcome.Ambiguous);
+            var service = _purchaseService.GetEnabledServices().FirstOrDefault(candidate =>
+                string.Equals(candidate.Key, order.ServiceKey, StringComparison.OrdinalIgnoreCase))
+                ?? new XuiV3ServiceDefinition { Key = order.ServiceKey,
+                    Kind = string.IsNullOrWhiteSpace(order.UnlimitedPlanKey) ? XuiV3ServiceKinds.Metered : XuiV3ServiceKinds.Unlimited };
+            // Reserved alone proves no POST was admitted. Only started/applied/ambiguous work can recover
+            // after closure; a new courtesy client must not turn an unpaid stale order into panel work.
+            if (!started && !_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
+                return Failure(TenantCardProvisionalProvisioningStatus.Disabled, order.Id, order.OrderId, "service_sale_disabled");
 
             // Durable claim before the first mutation, so a crash between the claim and the POST is resumable rather than
             // invisible. A concurrent caller that loses the claim simply resumes the same operation key.
@@ -283,6 +296,8 @@ namespace Adminbot.Services
                 return Failure(TenantCardProvisionalProvisioningStatus.Retryable, order.Id, order.OrderId, "provisional_plan_unavailable");
             }
 
+            if (!started && !_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
+                return Failure(TenantCardProvisionalProvisioningStatus.Disabled, order.Id, order.OrderId, "service_sale_disabled");
             var created = await _purchaseService.CreateAccountWithExplicitLimitsAsync(
                 customer,
                 serverInfo,

@@ -52,14 +52,24 @@ public class XuiV3PurchaseService
     private readonly AppConfig _appConfig;
     private readonly XuiV3CreationOperationStore _creationOperations;
 
+    /// <summary>Shared live global sale/renewal permission, checked explicitly at unpaid admission rather than inside pricing or paid settlement.</summary>
+    public IServiceSalesAvailability SalesAvailability { get; }
+
     /// <summary>Creates the shared catalog and durable provisioning service.</summary>
     /// <param name="configuration">Required runtime pricing and private transport configuration.</param>
     /// <param name="contextFactory">Optional factory override for isolated tooling; production injects its configured users.db factory.</param>
-    /// <remarks>Retains catalog configuration and a context factory; no live database context is shared across customer provisioning calls.</remarks>
-    public XuiV3PurchaseService(IConfiguration configuration, UserDbContextFactory contextFactory = null)
+    /// <param name="salesAvailability">Optional explicit global policy. Production DI supplies the shared singleton; isolated callers without one receive a real policy initialized from their own configuration flags.</param>
+    /// <remarks>Retains catalog configuration and a context factory; no live database context is shared across customer provisioning calls. Pricing/audience resolvers remain independent of sale versus renewal permission so accepted payments can settle.</remarks>
+    /// <exception cref="ArgumentNullException">Runtime configuration is missing.</exception>
+    /// <example><code>var service = new XuiV3PurchaseService(configuration, factory, availability);</code></example>
+    public XuiV3PurchaseService(IConfiguration configuration, UserDbContextFactory contextFactory = null,
+        IServiceSalesAvailability salesAvailability = null)
     {
-        _configuration = configuration;
+        _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         _appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
+        SalesAvailability = salesAvailability ?? new ServiceSalesAvailabilityService(_appConfig,
+            Path.GetFullPath("./Data/configuration.json"),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ServiceSalesAvailabilityService>.Instance);
         _creationOperations = new(contextFactory ?? new UserDbContextFactory(
             new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<UserDbContext>()
                 .UseSqlite(SqliteOperation.ConnectionString(UserDbContext.DatabasePath)).Options));

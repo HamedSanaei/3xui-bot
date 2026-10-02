@@ -7,7 +7,7 @@ using Newtonsoft.Json;
 namespace Adminbot.Domain
 {
     /// <summary>Global application settings shared by owned bots, storefronts and background services.</summary>
-    /// <remarks>Tenant settings live on BotInstance; global gateway credentials and storefront allocation limits are not copied between stores.</remarks>
+    /// <remarks>Tenant settings live on BotInstance; global gateway credentials and storefront allocation limits are not copied between stores. The six startup sale/renewal flags seed one live IServiceSalesAvailability snapshot shared across all bots.</remarks>
     public class AppConfig
     {
         public AppConfig()
@@ -69,6 +69,25 @@ namespace Adminbot.Domain
         /// tenant, per owned bot, or in users.db.
         /// </remarks>
         public bool LatestClientDownloadEnabled { get; set; }
+
+        /// <summary>Initial global permission for new normal-service account sales; missing configuration keeps existing sales open.</summary>
+        /// <remarks>Runtime admission must read IServiceSalesAvailability, not this startup value. Existing invoices and funded work remain settleable after closure.</remarks>
+        public bool NormalSaleEnabled { get; set; } = true;
+        /// <summary>Initial global permission for new normal-service renewals, independent of normal sales; defaults open.</summary>
+        /// <remarks>Shared by all owned and tenant bots through IServiceSalesAvailability; never a tenant preference.</remarks>
+        public bool NormalRenewalEnabled { get; set; } = true;
+        /// <summary>Initial global permission for new national-service account sales; defaults open.</summary>
+        /// <remarks>All storefronts use the same live IServiceSalesAvailability snapshot after startup.</remarks>
+        public bool NationalSaleEnabled { get; set; } = true;
+        /// <summary>Initial global permission for new national-service renewals, independent of national sales; defaults open.</summary>
+        /// <remarks>Closing admission does not cancel accepted invoices, committed debits or started renewal recovery.</remarks>
+        public bool NationalRenewalEnabled { get; set; } = true;
+        /// <summary>Initial global permission for new sales of all unlimited fair-usage plans; defaults open.</summary>
+        /// <remarks>Catalog audience restrictions still apply; a tenant owner cannot override this global switch.</remarks>
+        public bool UnlimitedSaleEnabled { get; set; } = true;
+        /// <summary>Initial global permission for new unlimited-service renewals, independent of unlimited sales; defaults open.</summary>
+        /// <remarks>Runtime readers use IServiceSalesAvailability; existing paid/started work retains its settlement path.</remarks>
+        public bool UnlimitedRenewalEnabled { get; set; } = true;
         /// <summary>
         /// Globally requests premium visuals (Telegram custom emoji and semantic button colours) for configured owned
         /// bots.

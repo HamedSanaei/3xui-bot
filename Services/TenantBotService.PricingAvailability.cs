@@ -1,11 +1,84 @@
 using Adminbot.Domain;
 using Adminbot.Services;
+using Microsoft.EntityFrameworkCore;
 using System.Globalization;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 
 public partial class TenantBotService
 {
+    /// <summary>Checks the live global operation switch without replacing tenant catalog, audience or pricing validation.</summary>
+    /// <param name="serviceKey">Global catalog key from authorized state, a stored quote or an order.</param>
+    /// <param name="operation">Sale or renewal admission; these switches are independent.</param>
+    /// <param name="serviceKind">Optional frozen order kind used when a catalog entry has since been removed.</param>
+    /// <returns>True only when the selected global category permits new unpaid work.</returns>
+    /// <remarks>Global policy is shared by all storefronts and cannot be overridden by owner preferences. Never use this check in paid settlement.</remarks>
+    /// <example><code>if (!IsTenantSalesEnabled(order.ServiceKey, ServiceSalesOperation.Renewal)) return;</code></example>
+    private bool IsTenantSalesEnabled(string serviceKey, ServiceSalesOperation operation, string serviceKind = null)
+    {
+        var service = _purchaseService.GetEnabledServices().FirstOrDefault(candidate =>
+            string.Equals(candidate.Key, serviceKey, StringComparison.OrdinalIgnoreCase));
+        var category = service != null ? ServiceSalesPolicy.GetCategory(service)
+            : ServiceSalesPolicy.GetCategory(serviceKey, serviceKind);
+        return _purchaseService.SalesAvailability.Snapshot.IsEnabled(category, operation);
+    }
+
+    /// <summary>Rejects closed global admission with a category-specific customer-safe notice before financial side effects.</summary>
+    /// <param name="client">Transport for the active tenant storefront.</param>
+    /// <param name="chat">Telegram customer chat, not a tenant database id.</param>
+    /// <param name="serviceKey">Selected global catalog key; callers retain all normal authorization checks.</param>
+    /// <param name="operation">Explicit operation being admitted, never inferred from the customer role.</param>
+    /// <param name="token">Cancellation of Telegram notice delivery.</param>
+    /// <param name="callback">Optional stale callback to answer with an alert instead of a new message.</param>
+    /// <param name="serviceKind">Optional stored catalog kind for an admitted order.</param>
+    /// <returns>False when closed and notified; true when admission may continue to its remaining checks.</returns>
+    /// <remarks>Reads live permission on each call. Does not expire quotes, release reservations or alter payments; reopening restores valid choices without restart.</remarks>
+    /// <example><code>if (!await EnsureTenantSalesEnabledAsync(client, chat, selection.ServiceKey, ServiceSalesOperation.Sale, token, callback)) return;</code></example>
+    private async Task<bool> EnsureTenantSalesEnabledAsync(ITelegramBotClient client, ChatId chat,
+        string serviceKey, ServiceSalesOperation operation, CancellationToken token,
+        CallbackQuery callback = null, string serviceKind = null)
+    {
+        if (IsTenantSalesEnabled(serviceKey, operation, serviceKind)) return true;
+        var service = _purchaseService.GetEnabledServices().FirstOrDefault(candidate =>
+            string.Equals(candidate.Key, serviceKey, StringComparison.OrdinalIgnoreCase));
+        var category = service != null ? ServiceSalesPolicy.GetCategory(service)
+            : ServiceSalesPolicy.GetCategory(serviceKey, serviceKind);
+        var text = ServiceSalesPolicy.GetDisabledMessage(category, operation);
+        if (callback != null)
+            await SafeAnswerCallbackQueryAsync(client, callback.Id, text, showAlert: true, cancellationToken: token);
+        else
+            await client.SendMessage(chat, text, cancellationToken: token);
+        return false;
+    }
+
+    /// <summary>Rechecks explicit stored operation kind before activating an unpaid tenant order.</summary>
+    /// <param name="client">Current tenant Telegram transport.</param>
+    /// <param name="callback">Authenticated customer callback; its chat receives the denial.</param>
+    /// <param name="order">Authorized unpaid order with its immutable service and operation identity.</param>
+    /// <param name="token">Cancellation of the customer alert.</param>
+    /// <returns>True only while this category and operation allow new activation.</returns>
+    /// <remarks>Call only after linked invoices, committed debit receipts and started work have taken their recovery branch. This helper never authorizes settlement.</remarks>
+    /// <example><code>if (!await EnsureTenantOrderSalesEnabledAsync(client, callback, order, token)) return;</code></example>
+    private Task<bool> EnsureTenantOrderSalesEnabledAsync(ITelegramBotClient client, CallbackQuery callback,
+        TenantBotOrder order, CancellationToken token) =>
+        EnsureTenantSalesEnabledAsync(client, callback.Message?.Chat.Id ?? callback.From.Id, order.ServiceKey,
+            order.OrderKind == TenantBotOrderKinds.Renew ? ServiceSalesOperation.Renewal : ServiceSalesOperation.Sale,
+            token, callback, string.IsNullOrWhiteSpace(order.UnlimitedPlanKey) ? null : XuiV3ServiceKinds.Unlimited);
+
+    /// <summary>Checks whether a personal-card order already has submitted money evidence or an admitted panel mutation.</summary>
+    /// <param name="order">Already authorized storefront/customer order; this helper grants no identity access.</param>
+    /// <param name="token">Cancellation of read-only receipt and operation queries.</param>
+    /// <returns>True for a submitted receipt or started/applied/ambiguous provisional operation, never just an unpaid pending order.</returns>
+    /// <remarks>Preserves receipt replacement/recovery after closure without permitting a new unsubmitted card activation. Actual receipt images remain ingestible as proof of an external transfer.</remarks>
+    /// <example><code>var accepted = await HasAcceptedTenantCardWorkAsync(order, token);</code></example>
+    private Task<bool> HasAcceptedTenantCardWorkAsync(TenantBotOrder order, CancellationToken token) =>
+        _workflow.ReadAsync(async db =>
+            await db.TenantManualPaymentReceipts.AsNoTracking().AnyAsync(receipt => receipt.TenantBotOrderId == order.Id, token)
+            || await db.XuiV3CreationOperations.AsNoTracking().AnyAsync(operation =>
+                operation.OperationKey == "tenant-card-provisional-create:" + order.OrderId &&
+                (operation.PostStartedAtUtc != null || operation.Outcome == XuiV3CreationOutcome.PostStarted
+                    || operation.Outcome == XuiV3CreationOutcome.Applied || operation.Outcome == XuiV3CreationOutcome.Ambiguous), token));
+
     /// <summary>Loads a saved manual plan map once per customer list; corrupt pricing hides only unlimited choices.</summary>
     /// <param name="tenant">Current tenant row whose fixed-plan prices are store-scoped.</param>
     /// <returns>Decoded map, or empty map if its saved manual plan JSON is corrupt; null for percentage mode.</returns>
@@ -78,9 +151,11 @@ public partial class TenantBotService
     /// <param name="service">Enabled service authorized for the renewal target.</param>
     /// <param name="prompt">Current customer selection prompt without owner costs.</param>
     /// <returns>The prompt, or an unavailable-price notice with cancellation guidance.</returns>
-    /// <remarks>No catalog/provider error is suppressed; this only evaluates saved manual rates.</remarks>
-    private static string TenantRenewPricingPrompt(BotInstance tenant, XuiV3ServiceDefinition service, string prompt) =>
-        IsTenantServicePriced(tenant, service, TenantUnlimitedPricesForList(tenant))
+    /// <remarks>Global renewal closure takes precedence over a pricing notice, independently of sale permission. Catalog/provider errors are not suppressed.</remarks>
+    private string TenantRenewPricingPrompt(BotInstance tenant, XuiV3ServiceDefinition service, string prompt) =>
+        !_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal)
+            ? ServiceSalesPolicy.GetDisabledMessage(service, ServiceSalesOperation.Renewal)
+            : IsTenantServicePriced(tenant, service, TenantUnlimitedPricesForList(tenant))
             ? prompt : "قیمت گزینه‌های این سرویس در حال تنظیم است. می‌توانید انصراف دهید و بعداً دوباره تلاش کنید.";
 
     /// <summary>Restores a renewal selector when its live manual price is missing or below colleague cost.</summary>

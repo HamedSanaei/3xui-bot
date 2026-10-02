@@ -143,6 +143,30 @@ know: unknown keys are ignored by the configuration binder, so a newer configura
 an older configuration stays usable by a newer build. Every message it produces names a configuration key and never
 echoes a configured value, a chat id, a bot token, or a panel secret.
 
+## Global service sale and renewal controls
+
+Configured super-admins can use **🗽 Admin → 📊 کنترل فروش و تمدید** in an owned bot to close or reopen
+**sale** and **renewal** independently for normal, national and unlimited services. Every owned and tenant
+storefront in the application reads the same live policy; a tenant owner or colleague cannot override it.
+Changes take effect without restarting and persist through restart.
+
+The six additive root keys are `normalSaleEnabled`, `normalRenewalEnabled`, `nationalSaleEnabled`,
+`nationalRenewalEnabled`, `unlimitedSaleEnabled`, and `unlimitedRenewalEnabled`. Missing keys default to `true`.
+Use the panel for live changes; manual JSON changes are startup values until the application restarts.
+The configuration file must be writable by the application account. A failed save leaves live permissions
+unchanged and reports failure. Target-state buttons expire after ten minutes; refresh after another admin changes policy.
+
+Closing a category stops new unpaid work, including old buttons, restored input and unfunded pending orders.
+It does **not** strand an issued provider invoice, a committed customer-wallet debit or a started/ambiguous panel
+mutation: original inquiry, settlement and exactly-once recovery remain available. Incoming personal-card receipt
+images are still retained as evidence of an external transfer; no new courtesy client is created while sales are closed.
+Free trial allowances and explicit admin compensation issuance remain separate from paid sale admission.
+
+Commercial, payment-gateway and download controls use serialized, byte-preserving root-boolean edits in the existing
+`Data/configuration.json`; unrelated settings, secrets, Persian text and formatting are not regenerated.
+Do not replace production configuration with the example, and do not run an external manual rewrite concurrently.
+
+
 ## AtlasPay callback activation
 
 `POST /atlaspay-webhook` is the public HTTPS receiver. AtlasPay section 3.8 requires a merchant

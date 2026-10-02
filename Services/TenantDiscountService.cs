@@ -86,11 +86,17 @@ public readonly record struct TenantDiscountUsage(int Consumed, int Reserved, in
 public sealed class TenantDiscountService
 {
     private readonly UserDbContextFactory _factory;
+    /// <summary>Process-wide commercial admission policy; never controls existing claims or paid settlement.</summary>
+    private readonly IServiceSalesAvailability _salesAvailability;
     private static readonly TimeSpan QuoteLifetime = TimeSpan.FromHours(2);
 
     /// <summary>Creates a service with independently owned users.db contexts.</summary>
     /// <param name="factory">Users.db factory; each short operation owns its own EF context.</param>
-    public TenantDiscountService(UserDbContextFactory factory) => _factory = factory;
+    /// <param name="salesAvailability">Production singleton for all bots; optional only for definition/recovery-only callers.</param>
+    /// <remarks>Missing policy fails closed for new order insertion. Owner discount editing and historical claim settlement remain independent.</remarks>
+    /// <example><code>var discounts = new TenantDiscountService(users, globalSalesAvailability);</code></example>
+    public TenantDiscountService(UserDbContextFactory factory, IServiceSalesAvailability salesAvailability = null)
+    { _factory = factory; _salesAvailability = salesAvailability; }
 
     /// <summary>Trims and canonicalizes only ASCII letters, digits, underscore and hyphen, length 3–32; null means invalid.</summary>
     /// <param name="input">Optional user-entered ASCII code, with surrounding whitespace allowed.</param>
@@ -764,8 +770,9 @@ public sealed class TenantDiscountService
     /// <param name="price">Fresh gross, base, realized discount and immutable net in whole toman.</param>
     /// <param name="provider">Persisted first payment provider or pending renewal choice.</param>
     /// <param name="token">Cancellation of the users.db insert and claim.</param>
-    /// <returns>Tracked inserted order, or a named missing-store/invalid-identity failure.</returns>
-    private static async Task<TenantDiscountResult<TenantBotOrder>> InsertOrderAsync(UserDbContext db,
+    /// <returns>The tracked inserted order, or a named identity/store failure or Disabled when global admission is closed or its policy is missing.</returns>
+    /// <remarks>Rechecks the live global sale/renewal switch immediately before insertion. Existing invoice/receipt recovery never calls this new-order primitive, so accepted money is not stranded by closure.</remarks>
+    private async Task<TenantDiscountResult<TenantBotOrder>> InsertOrderAsync(UserDbContext db,
         TenantBotOrder order, TenantDiscountCode code, TenantDiscountPrice price, string provider, CancellationToken token)
     {
         var store = await db.BotInstances.AsNoTracking().SingleOrDefaultAsync(x => x.Id == order.TenantBotId
@@ -785,6 +792,13 @@ public sealed class TenantDiscountService
             order.TenantDiscountCodeId = code.Id;
             order.AppliedDiscountCode = code.Code;
         }
+        // Re-read after the asynchronous store/code/capacity checks and before the first persisted order.
+        // A quoted pending order is still unpaid; reopening must not reactivate a released or stale claim.
+        var operation = order.OrderKind == TenantBotOrderKinds.Renew ? ServiceSalesOperation.Renewal : ServiceSalesOperation.Sale;
+        var category = ServiceSalesPolicy.GetCategory(order.ServiceKey,
+            string.IsNullOrWhiteSpace(order.UnlimitedPlanKey) ? null : XuiV3ServiceKinds.Unlimited);
+        if (_salesAvailability == null || !_salesAvailability.Snapshot.IsEnabled(category, operation))
+            return TenantDiscountResult<TenantBotOrder>.Fail(TenantDiscountFailure.Disabled);
         db.TenantBotOrders.Add(order);
         await db.SaveChangesAsync(token);
         if (code != null)

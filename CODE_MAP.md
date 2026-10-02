@@ -1,5 +1,19 @@
 # CODE_MAP.md
 
+- Global commercial admission: `Domain/ServiceSalesAvailability.cs` publishes one singleton snapshot for every
+  owned/tenant bot. Configured super-admins use owned **🗽 Admin → 📊 کنترل فروش و تمدید** for six independent
+  normal/national/unlimited Sale/Renewal switches; missing root keys default open. `TelegramBotService.SalesControls.cs`
+  uses explicit target state, revision and 10-minute expiry; tenant owners/colleagues cannot change global policy.
+  Persist-before-publish edits only `normalSaleEnabled`, `normalRenewalEnabled`, `nationalSaleEnabled`,
+  `nationalRenewalEnabled`, `unlimitedSaleEnabled`, `unlimitedRenewalEnabled` in the existing runtime JSON.
+  `RootBooleanJsonFileEditor` serializes per-file writes across commercial, gateway and download toggles.
+  Owned/tenant selectors, stale/restored selections, pending order/quote insertion and first invoice/debit/panel
+  admission recheck the operation; pricing and paid fulfillment remain ungated. Issued invoices, exact committed
+  debit receipts and started/applied/ambiguous mutations keep recovery/settlement. Actual card receipt images
+  remain evidence; closure prevents fresh courtesy clients. Free trials/admin compensation are not paid sales.
+  Discount/wallet admission requires the shared policy (missing injection fails closed); recovery-only construction
+  remains valid. A closure before any wallet call releases only its exact unused frozen claim, never uncertain money.
+
 - Owned colleague trials (2026-10-01): `TryHandleTrialAsync` admits active, unblocked colleagues without the
   ordinary phone/30-day gate. Startup `colleagueDailyFreeTrialLimit` defaults to 3; nonnegative, zero=paid-only.
   One global Telegram-user allowance spans all owned bots and both types, resetting at Tehran midnight.

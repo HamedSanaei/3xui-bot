@@ -21,6 +21,8 @@ public partial class TenantBotService
     /// <param name="token">Cancellation of admission and the existing fulfillment saga.</param>
     /// <returns>True for wallet actions, including rejected stale actions.</returns>
     /// <remarks>Fresh persisted approval is mandatory. Callback data never supplies a trusted price or wallet owner.
+    /// New order activation and first debit require the live global sale/renewal switch. Exact committed receipts bypass
+    /// admission and continue settlement/recovery even when the category or storefront approval later closes.
     /// The wallet home displays only the customer's numeric Telegram id and current balance, retaining charge/history/back actions.</remarks>
     private async Task<bool> TryHandleCustomerWalletAsync(ITelegramBotClient client, Update update, CredUser customer, User state, CancellationToken token)
     {
@@ -237,6 +239,23 @@ public partial class TenantBotService
                     await client.SendMessage(chat, "این پیش‌فاکتور به کد تخفیف متصل است؛ از دکمه‌های همان پیش‌فاکتور استفاده کنید.", cancellationToken: token);
                     return true;
                 }
+                if (selection != null && callback?.Message != null)
+                {
+                    var admissionKey = $"tcw:{store.Id}:{actor}:{chat}:{callback.Message.MessageId}";
+                    var original = await _workflow.ReadAsync(db => db.TenantBotOrders.AsNoTracking().SingleOrDefaultAsync(x =>
+                        x.CustomerWalletAdmissionKey == admissionKey && x.TenantBotId == store.Id
+                        && x.CustomerTelegramUserId == actor && x.CustomerChatId == chat && x.PaymentProvider == "wallet"
+                        && x.OrderKind == TenantBotOrderKinds.Purchase && x.ServiceKey == selection.ServiceKey
+                        && x.TrafficGb == selection.TrafficGb && x.DurationKey == selection.DurationKey
+                        && x.UnlimitedPlanKey == selection.UnlimitedPlanKey, token));
+                    // Receipt proof, not an admitted unpaid row, authorizes replay before the live sale/catalog gate.
+                    if (original != null && await funding.ReadPaidEvidenceAsync(original, token) is { } receipt)
+                    {
+                        await funding.ReconcileReceiptAsync(original, receipt, token);
+                        await FULFILLPAIDTENANTORDERASYNC(original, "customer-wallet", null, null, false, token);
+                        return true;
+                    }
+                }
                 if (selection == null || callback.Message == null || !await EnsureTenantPurchaseSelectionIsCurrentAsync(client, callback, store, selection, token)) return true;
                 var price = CalculateTenantPrice(store, selection);
                 order = CreateTenantOrder(store, customer, chat, selection, price, "wallet");
@@ -287,6 +306,8 @@ public partial class TenantBotService
                     return true;
                 }
             }
+            if (await funding.ReadPaidEvidenceAsync(order, token) == null &&
+                !await EnsureTenantOrderSalesEnabledAsync(client, callback, order, token)) return true;
             bool paid;
             try { paid = await funding.DebitAsync(order, token, freshGross, freshBase); }
             catch (InvalidOperationException)

@@ -320,6 +320,9 @@ public sealed class PaymentGatewayAvailabilityService : IPaymentGatewayAvailabil
 /// </summary>
 public static class RootBooleanJsonFileEditor
 {
+    /// <summary>Serializes read/replace cycles per configuration path so independent gateway, download and sales controls cannot lose each other's changes.</summary>
+    private static readonly AsyncKeyedGate ConfigurationWrites = new();
+
     /// <summary>
     /// Sets one case-sensitive root boolean property without reserializing unrelated JSON content.
     /// </summary>
@@ -332,7 +335,13 @@ public static class RootBooleanJsonFileEditor
     /// The method replaces only the four or five bytes of an existing <c>true</c>/<c>false</c> token. When the key is
     /// absent it inserts one ASCII root property immediately before the root closing brace. A temporary file in the
     /// same directory is flushed with write-through semantics before <see cref="File.Replace(string,string,string)"/>.
+    /// All in-process boolean editors share a per-file gate across read and replacement. Windows path keys are
+    /// case-insensitive; unrelated configuration files remain independent. External/manual writers are not locked.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels while waiting, reading or writing before replacement.</exception>
+    /// <exception cref="IOException">The configuration file cannot be read or atomically replaced.</exception>
+    /// <exception cref="UnauthorizedAccessException">The configuration path is not writable.</exception>
+    /// <exception cref="InvalidDataException">The target root property is not a boolean or the root object is invalid.</exception>
     /// <example>
     /// <code>
     /// await RootBooleanJsonFileEditor.SetAsync(
@@ -354,6 +363,8 @@ public static class RootBooleanJsonFileEditor
             throw new ArgumentException("The root property name must contain only ASCII letters, digits, or underscore.", nameof(propertyName));
 
         var fullPath = Path.GetFullPath(path);
+        using var lease = await ConfigurationWrites.EnterAsync(
+            OperatingSystem.IsWindows() ? fullPath.ToUpperInvariant() : fullPath, cancellationToken);
         var original = await File.ReadAllBytesAsync(fullPath, cancellationToken);
         var updated = ReplaceOrInsertRootBoolean(original, propertyName, value);
         var directory = Path.GetDirectoryName(fullPath) ?? throw new IOException("Configuration directory could not be resolved.");

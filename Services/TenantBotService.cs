@@ -1041,6 +1041,7 @@ public partial class TenantBotService
     /// callbacks grant renewal only and never configuration, mutation, or ownership access. Before a selector is shown,
     /// the per-email detail comment is read and identity-checked so a positive-expiry unlimited account sharing normal
     /// inbounds cannot be misclassified from an incomplete list row.
+    /// The resolved category must also allow global renewal admission; sale permission is not consulted.
     /// </remarks>
     private async Task HANDLETENANTRENEWFROMCALLBACKASYNC(
         ITelegramBotClient botClient,
@@ -1130,6 +1131,8 @@ public partial class TenantBotService
                 cancellationToken);
             return;
         }
+        if (serviceAuthorized && !await EnsureTenantSalesEnabledAsync(botClient, chatId, service.Key,
+                ServiceSalesOperation.Renewal, cancellationToken, callbackQuery)) return;
 
         var belongsToCustomer = ClientBelongsToTenantCustomer(client, customer.TelegramUserId, tenant.Id);
         if (!TryNormalizeTenantClientUuid(client.Uuid, out var targetUuid) && !belongsToCustomer)
@@ -4150,6 +4153,7 @@ public partial class TenantBotService
     /// selections. Both values are validated by the same global policy used by owned bots before an order, gateway
     /// invoice, tenant balance movement, or XUI request can be created. A stale duration is cleared with an explicit
     /// empty value because null is intentionally treated as "preserve" by legacy partial state updates.
+    /// Restored traffic/duration state rechecks the live global sale switch before accepting any input.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="cancellationToken"/> is cancelled during users.db or Telegram work.
@@ -4191,6 +4195,8 @@ public partial class TenantBotService
             await SendServiceSelectionAsync(botClient, message.Chat.Id, tenant, cancellationToken);
             return true;
         }
+        if (!await EnsureTenantSalesEnabledAsync(botClient, message.Chat.Id, service.Key,
+                ServiceSalesOperation.Sale, cancellationToken)) return true;
 
         if (user.LastStep == TENANTPURCHASESTEPTRAFFIC)
         {
@@ -4427,6 +4433,7 @@ public partial class TenantBotService
     /// creating an order or calling a payment provider. Metadata-free accounts that still match both normal and unlimited
     /// services enter an explicit category step; only a choice from the freshly recomputed compatible set is persisted.
     /// A disabled unlimited sub-plan returns to the active tenant-priced plan keyboard before any order is created.
+    /// Global renewal permission is checked for restored state and again for the freshly resolved category.
     /// </remarks>
     /// <returns>A task that completes after the current state transition and its Telegram response.</returns>
     /// <exception cref="OperationCanceledException">
@@ -4448,6 +4455,9 @@ public partial class TenantBotService
             await botClient.SendMessage(message.Chat.Id, "فرایند تمدید لغو شد.", replyMarkup: mainReplyMarkup, cancellationToken: cancellationToken);
             return;
         }
+        if (!string.IsNullOrWhiteSpace(user.SelectedCountry) &&
+            !await EnsureTenantSalesEnabledAsync(botClient, message.Chat.Id, user.SelectedCountry,
+                ServiceSalesOperation.Renewal, cancellationToken)) return;
         if (user.LastStep == "renew-discount-entry")
         {
             if (await TryResumeTenantRenewalWithoutDiscountAsync(botClient, message.Chat.Id, tenant, customer,
@@ -4506,6 +4516,8 @@ public partial class TenantBotService
                         cancellationToken: cancellationToken);
                     return;
                 }
+                if (!await EnsureTenantSalesEnabledAsync(botClient, message.Chat.Id, selectedService.Key,
+                        ServiceSalesOperation.Renewal, cancellationToken)) return;
 
                 user.Flow = TENANTRENEWFLOW;
                 user.LastStep = selectedService.IsUnlimited
@@ -4569,6 +4581,8 @@ public partial class TenantBotService
                 cancellationToken);
             return;
         }
+        if (!await EnsureTenantSalesEnabledAsync(botClient, message.Chat.Id, service.Key,
+                ServiceSalesOperation.Renewal, cancellationToken)) return;
 
         if (!string.Equals(service.Key, user.SelectedCountry, StringComparison.OrdinalIgnoreCase))
         {
@@ -4919,6 +4933,7 @@ public partial class TenantBotService
     /// <remarks>
     /// No tenant order, payment, wallet movement, or panel mutation occurs. The fixed callback contains no client
     /// identity and can continue only this tenant bot plus Telegram user's matching warning state.
+    /// A resolved target whose global renewal category is closed cannot advance to the ownership warning.
     /// </remarks>
     private async Task SAVETENANTEXTERNALRENEWWARNINGASYNC(
         ITelegramBotClient botClient,
@@ -4931,6 +4946,8 @@ public partial class TenantBotService
         int messageId,
         CancellationToken cancellationToken)
     {
+        if (service != null && !await EnsureTenantSalesEnabledAsync(botClient, chatId, service.Key,
+                ServiceSalesOperation.Renewal, cancellationToken)) return;
         // Persist the sensitive target only in this tenant bot's conversation row; the confirmation callback is fixed.
         await _state.ClearUserStatus(new User { Id = customerTelegramUserId });
         await _state.SaveUserStatus(new User
@@ -4994,6 +5011,7 @@ public partial class TenantBotService
     /// No service is authorized at this stage: <c>SelectedCountry</c> and the resolution mode are deliberately empty.
     /// The next text handler accepts only one service still present in a fresh compatible candidate set. This method
     /// creates no order, provider request, wallet entry, payment, or XUI mutation.
+    /// Only globally open renewal categories are presented; reopening restores valid choices on the next request.
     /// </remarks>
     private async Task STARTTENANTRENEWSERVICECATEGORYSELECTIONASYNC(
         ITelegramBotClient botClient,
@@ -5007,6 +5025,7 @@ public partial class TenantBotService
     {
         var candidates = candidateServices?
             .Where(IsTenantRenewalServiceVisible)
+            .Where(service => _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal))
             .DistinctBy(service => service.Key, StringComparer.OrdinalIgnoreCase)
             .ToList() ?? new List<XuiV3ServiceDefinition>();
         if (client == null ||
@@ -5087,6 +5106,7 @@ public partial class TenantBotService
     /// <remarks>
     /// The target lock is stored whenever the panel supplies a valid UUID, including accounts already belonging to the
     /// customer. Owned legacy clients without UUID retain owner checks. No payable order or XUI side effect occurs here.
+    /// Global renewal permission is re-read before installing this bot-scoped selector state.
     /// </remarks>
     private async Task STARTTENANTRENEWPLANSELECTIONASYNC(
         ITelegramBotClient botClient,
@@ -5100,6 +5120,8 @@ public partial class TenantBotService
         int messageId,
         CancellationToken cancellationToken)
     {
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, service.Key,
+                ServiceSalesOperation.Renewal, cancellationToken)) return;
         // Replace the warning/search state before showing prices so a stale tenant callback cannot swap the target.
         await _state.ClearUserStatus(new User { Id = customerTelegramUserId });
         await _state.SaveUserStatus(new User
@@ -5378,6 +5400,7 @@ public partial class TenantBotService
     /// detail comment is resolved before price resolution, and a service mismatch returns the same exact target to the
     /// correct category selector instead of rendering a payable summary. Unlimited state is also checked against the
     /// current tenant-visible catalog before the summary can expose a payable action.
+    /// A closed global renewal category cannot expose confirmation, independently of the category's sale switch.
     /// </remarks>
     private async Task SendTenantRenewSummaryAsync(
         ITelegramBotClient botClient,
@@ -5387,6 +5410,8 @@ public partial class TenantBotService
         User user,
         CancellationToken cancellationToken)
     {
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, user.SelectedCountry,
+                ServiceSalesOperation.Renewal, cancellationToken)) return;
         var serverInfo = BuildConfiguredPanelServerInfo();
         var client = await GetAuthorizedTenantRenewClientAsync(
             serverInfo,
@@ -5562,6 +5587,7 @@ public partial class TenantBotService
     /// The displayed gross/base snapshot is compared against fresh tenant pricing before an order is inserted;
     /// stale or unavailable rates return the customer to selection without any wallet or gateway effects.
     /// The target's live service metadata is also rechecked and its evidence mode is copied to the order.
+    /// Global renewal permission is re-read immediately before pending-order insertion; an unpaid order is not grandfathered payment.
     /// </remarks>
     private async Task CreateTenantRenewOrderFromStateAsync(
         ITelegramBotClient botClient,
@@ -5571,6 +5597,8 @@ public partial class TenantBotService
         User user,
         CancellationToken cancellationToken)
     {
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, user.SelectedCountry,
+                ServiceSalesOperation.Renewal, cancellationToken)) return;
         var serverInfo = BuildConfiguredPanelServerInfo();
         var client = await GetAuthorizedTenantRenewClientAsync(
             serverInfo,
@@ -5676,6 +5704,10 @@ public partial class TenantBotService
             await SendTenantRenewSummaryAsync(botClient, chatId, tenant, customer, user, cancellationToken);
             return;
         }
+        // Target and tariff reads can outlive an operator switch. Even an unpaid pending order needs live
+        // renewal admission; sale closure is deliberately independent of this check.
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, service.Key,
+                ServiceSalesOperation.Renewal, cancellationToken)) return;
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "pending");
         order.OrderKind = TenantBotOrderKinds.Renew;
         order.TargetAccountEmail = client.Email;
@@ -5689,6 +5721,8 @@ public partial class TenantBotService
                 price.SalePriceToman, price.BaseCostToman, cancellationToken))
             return;
 
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, service.Key,
+                ServiceSalesOperation.Renewal, cancellationToken)) return;
         _workflow.Add(order);
         await _workflow.SaveAsync(cancellationToken);
         await _state.ClearUserStatus(user);
@@ -5769,12 +5803,14 @@ public partial class TenantBotService
     /// <remarks>
     /// Buttons are presentation only. Typed labels and stale keyboards are accepted only after a new panel read proves
     /// the selected key is still in the compatible candidate set.
+    /// Live global renewal permission filters category rows without changing catalog compatibility or sale admission.
     /// </remarks>
-    private static ReplyKeyboardMarkup BuildTenantRenewServiceCategoryKeyboard(
+    private ReplyKeyboardMarkup BuildTenantRenewServiceCategoryKeyboard(
         IEnumerable<XuiV3ServiceDefinition> candidateServices)
     {
         var rows = (candidateServices ?? Array.Empty<XuiV3ServiceDefinition>())
             .Where(IsTenantRenewalServiceVisible)
+            .Where(service => _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal))
             .DistinctBy(service => service.Key, StringComparer.OrdinalIgnoreCase)
             .OrderBy(service => service.DisplayName, StringComparer.Ordinal)
             .Select(service => new[] { new KeyboardButton($"{service.DisplayName} [{service.Key}]") })
@@ -5818,10 +5854,11 @@ public partial class TenantBotService
     /// <param name="service">Enabled metered XUI service definition.</param>
     /// <param name="tenant">Storefront whose unit rates determine whether traffic choices are available.</param>
     /// <returns>Reply keyboard containing traffic options when priced, plus cancel in all cases.</returns>
-    /// <remarks>Unpriced metered services cannot start a renewal checkout; typed input is independently checked.</remarks>
-    private static ReplyKeyboardMarkup BuildTenantRenewTrafficKeyboard(XuiV3ServiceDefinition service, BotInstance tenant)
+    /// <remarks>Closed renewal categories and unpriced metered services expose only cancel; typed input is independently checked.</remarks>
+    private ReplyKeyboardMarkup BuildTenantRenewTrafficKeyboard(XuiV3ServiceDefinition service, BotInstance tenant)
     {
-        var rows = IsTenantMeteredServicePriced(tenant, service)
+        var rows = _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal)
+            && IsTenantMeteredServicePriced(tenant, service)
             ? XuiV3PurchaseService.GetVisibleTrafficOptions(service)
                 .Chunk(3)
                 .Select(chunk => chunk.Select(x => new KeyboardButton($"{x} GB")).ToArray())
@@ -5837,12 +5874,13 @@ public partial class TenantBotService
     /// <param name="tenant">Storefront whose manual rates may make individual durations unavailable.</param>
     /// <param name="trafficGb">Selected renewal traffic in whole GB, from bot-scoped state.</param>
     /// <returns>Currently priced durations and a cancel button, including when no duration is available.</returns>
-    /// <remarks>Typed duration input and order admission repeat live pricing; no order or debit occurs here.</remarks>
+    /// <remarks>Live renewal permission filters this keyboard independently of sales. Typed duration input and order admission repeat live checks; no order or debit occurs here.</remarks>
     private ReplyKeyboardMarkup BuildTenantRenewDurationKeyboard(XuiV3ServiceDefinition service, BotInstance tenant, int trafficGb)
     {
         var rows = new List<KeyboardButton[]>();
         foreach (var duration in XuiV3PurchaseService.GetEnabledDurationOptions(service).OrderBy(x => x.Days))
         {
+            if (!_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal)) break;
             if (trafficGb <= 0 || !TryGetTenantSalePrice(tenant,
                     new XuiV3PurchaseSelection { ServiceKey = service.Key, TrafficGb = trafficGb, DurationKey = duration.Key },
                     null, out _)) continue;
@@ -5860,7 +5898,7 @@ public partial class TenantBotService
     /// Tenant bot whose authoritative pricing policy controls the displayed customer price.
     /// </param>
     /// <returns>Currently priced tenant-visible unlimited plans and an explicit cancel row.</returns>
-    /// <remarks>Only a manual price failure hides a plan. Typed selections and final state are revalidated before payment.</remarks>
+    /// <remarks>Global renewal closure hides every plan in this category, independently of sale permission. Typed selections and final state are revalidated before payment.</remarks>
     /// <example>
     /// <code>
     /// var keyboard = BuildTenantRenewUnlimitedKeyboard(service, tenant);
@@ -5872,6 +5910,7 @@ public partial class TenantBotService
         var rows = new List<KeyboardButton[]>();
         foreach (var plan in XuiV3PurchaseService.GetUnlimitedPlansForTenant(service).OrderBy(x => x.Days))
         {
+            if (!_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal)) break;
             var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
             if (!TryGetTenantSalePrice(tenant, selection, prices, out var price)) continue;
             rows.Add(new[] { new KeyboardButton($"{plan.DisplayName} [{plan.Key}] - {price.FormatCurrency()}") });
@@ -6196,6 +6235,8 @@ public partial class TenantBotService
     /// the freshly loaded catalog before tenant state advances or a payable order can be created. Removed services,
     /// below-minimum traffic, disabled durations, and disabled unlimited plans reset only this tenant bot/customer
     /// conversation to the earliest valid menu. Stale callback data never creates an order or payment invoice.
+    /// Stale service, traffic, duration and unlimited-plan callbacks re-read global sale permission before state advances.
+    /// Provider/order activation repeats this check at its final boundary; payment inquiry and settlement remain independent.
     /// </remarks>
     /// <returns>A task that completes after the callback is rejected, recovered, or routed to its tenant operation.</returns>
     /// <exception cref="OperationCanceledException">
@@ -6279,6 +6320,14 @@ public partial class TenantBotService
             await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
             return;
+        }
+
+        if (action.StartsWith("svc:", StringComparison.Ordinal) || action.StartsWith("GB:", StringComparison.Ordinal)
+            || action.StartsWith("dur:", StringComparison.Ordinal) || action.StartsWith("upl:", StringComparison.Ordinal))
+        {
+            var parts = action.Split(':');
+            if (parts.Length > 1 && !await EnsureTenantSalesEnabledAsync(botClient, ChatId, parts[1],
+                    ServiceSalesOperation.Sale, CancellationToken, CallbackQuery)) return;
         }
 
         if (action.StartsWith("svc:", StringComparison.Ordinal))
@@ -6793,15 +6842,15 @@ public partial class TenantBotService
                username.All(ch => char.IsAsciiLetterOrDigit(ch) || ch == '_');
     }
 
-    /// <summary>Sends the live tenant service selector, omitting choices without a valid manual sale price.</summary>
+    /// <summary>Sends the live tenant service selector, omitting globally closed sale categories and unpriced manual choices.</summary>
     /// <param name="botClient">Telegram client for the tenant storefront in the active bot context.</param>
     /// <param name="ChatId">Telegram chat id of the customer choosing an enabled tenant service.</param>
     /// <param name="tenant">Persisted tenant bot row whose pricing mode and rates control this menu; never use another owner's store.</param>
     /// <param name="CancellationToken">Token for Telegram delivery; no payment or database write occurs.</param>
     /// <param name="MessageId">Existing customer message id to edit, or null to send a new selection.</param>
     /// <returns>A task after delivering available service buttons and a back action.</returns>
-    /// <remarks>When no choice remains priced, the customer sees a configuration notice instead of a public-price fallback.
-    /// Pricing is rechecked at selection and checkout; the menu itself never reserves an order.</remarks>
+    /// <remarks>When no globally open and priced choice remains, the customer sees an unavailable notice rather than a public-price fallback.
+    /// Live sale permission and pricing are rechecked at selection and checkout; this menu never reserves an order.</remarks>
     private async Task SendServiceSelectionAsync(
         ITelegramBotClient botClient,
         ChatId ChatId,
@@ -6811,7 +6860,7 @@ public partial class TenantBotService
     {
         var keyboard = BUILDTENANTSERVICEKEYBOARD(tenant);
         var Text = keyboard.InlineKeyboard.Count() == 1
-            ? "قیمت گزینه‌های این فروشگاه در حال تنظیم است. بعداً دوباره تلاش کنید."
+            ? "در حال حاضر گزینه‌ای برای خرید در دسترس نیست. لطفاً بعداً دوباره تلاش کنید."
             : "نوع سرویس مورد نظر را انتخاب کنید:";
         if (MessageId.HasValue)
         {
@@ -6825,11 +6874,12 @@ public partial class TenantBotService
     /// <summary>Builds the currently priced service selector for one tenant storefront.</summary>
     /// <param name="tenant">Storefront owning the active pricing mode and nullable manual prices.</param>
     /// <returns>Available service buttons and a back action even when nothing is priced.</returns>
-    /// <remarks>Unknown manual service keys and stale prices are hidden without changing other stores.</remarks>
+    /// <remarks>Live global sale permission filters every category, independently of renewal. Unknown manual service keys and stale prices remain hidden without changing other stores.</remarks>
     private InlineKeyboardMarkup BUILDTENANTSERVICEKEYBOARD(BotInstance tenant)
     {
         var prices = TenantUnlimitedPricesForList(tenant);
         var rows = _purchaseService.GetEnabledServices()
+            .Where(service => _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
             .Where(service => IsTenantServicePriced(tenant, service, prices))
             .Select(service => new[]
             {
@@ -6858,6 +6908,7 @@ public partial class TenantBotService
     /// Selecting a metered service clears previous temporary choices before installing the traffic step. Removed,
     /// hidden, or unpriced manual choices return to the live menu. Unlimited plans decode one saved price map for
     /// the list and omit only unavailable plans. No order, wallet, payment, or XUI operation is performed.
+    /// Global sale permission is checked before any selector state is installed, including stale service buttons.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="CancellationToken"/> is cancelled during users.db or Telegram work.
@@ -6884,6 +6935,8 @@ public partial class TenantBotService
             await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             return;
         }
+        if (!await EnsureTenantSalesEnabledAsync(botClient, ChatId, service.Key,
+                ServiceSalesOperation.Sale, CancellationToken)) return;
         var unlimitedPrices = service.IsUnlimited ? TenantUnlimitedPricesForList(tenant) : null;
         if (!IsTenantServicePriced(tenant, service, unlimitedPrices))
         {
@@ -6973,6 +7026,7 @@ public partial class TenantBotService
     /// custom durations, the prompt also publishes its inclusive day range. Each currently priced button uses
     /// <see cref="CalculateTenantPrice" />; missing or below-cost manual choices are unavailable rather than
     /// falling back to public. It sends Telegram text but creates no order or wallet mutation.
+    /// Global sale closure prevents preset/custom-duration choices independently of renewal permission.
     /// </remarks>
     private async Task SHOWDURATIONOPTIONSASYNC(
         ITelegramBotClient botClient,
@@ -6990,6 +7044,8 @@ public partial class TenantBotService
             await SendServiceSelectionAsync(botClient, ChatId, tenant, CancellationToken, MessageId);
             return;
         }
+        if (!await EnsureTenantSalesEnabledAsync(botClient, ChatId, service.Key,
+                ServiceSalesOperation.Sale, CancellationToken)) return;
         if (!IsTenantMeteredServicePriced(tenant, service))
         {
             await EDITORSENDASYNC(botClient, ChatId, MessageId, "قیمت این گزینه در حال تنظیم است.",
@@ -7055,6 +7111,7 @@ public partial class TenantBotService
     /// hidden by <c>TenantVisible</c> are restored to the current tenant plan selector. Full price validation is also
     /// repeated so malformed configuration cannot reach order, gateway, wallet, ledger, or XUI side effects.
     /// The duration is cleared with an explicit empty string because null preserves legacy partial state.
+    /// The live global sale switch is mandatory even for otherwise valid catalog, audience and tenant pricing selections.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="cancellationToken"/> is cancelled during users.db or Telegram recovery work.
@@ -7091,6 +7148,8 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
             return false;
         }
+        if (!await EnsureTenantSalesEnabledAsync(botClient, callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+                service.Key, ServiceSalesOperation.Sale, cancellationToken, callbackQuery)) return false;
 
         if (!service.IsUnlimited &&
             (!selection.TrafficGb.HasValue ||
@@ -7226,9 +7285,12 @@ public partial class TenantBotService
     /// idempotent settlement behavior are unaffected by these display labels. A shared notice distinguishes automatic
     /// verified online fulfillment from card-to-card fulfillment that waits for the tenant owner's receipt approval and
     /// may take longer.
+    /// Global sale permission is checked before rendering any purchase confirmation or creating its discount quote.
     /// </remarks>
     private async Task SHOWCUSTOMERCONFIRMASYNC(ITelegramBotClient botClient, ChatId ChatId, long customerTelegramUserId, int? MessageId, BotInstance tenant, XuiV3PurchaseSelection selection, CancellationToken CancellationToken)
     {
+        if (!await EnsureTenantSalesEnabledAsync(botClient, ChatId, selection.ServiceKey,
+                ServiceSalesOperation.Sale, CancellationToken)) return;
         if (tenant.TenantPricingMode == TenantPricingModes.Manual ||
             await _serviceProvider.GetRequiredService<TenantDiscountService>()
                 .HasActiveScopeAsync(tenant.Id, TenantDiscountScopes.Purchase, CancellationToken))
@@ -7290,7 +7352,9 @@ public partial class TenantBotService
     /// The global and tenant-specific HooshPay switches are checked before creating either the tenant order or its
     /// linked payment row. Existing HooshPay orders remain eligible for inquiry and settlement after either switch is
     /// disabled, but stale purchase callbacks cannot create a new invoice.
+    /// The selected global category must also permit sale admission before the order or linked invoice is allocated.
     /// </remarks>
+    /// <returns>A task after the admitted HooshPay invoice or a safe rejection before new financial work.</returns>
     private async Task CreateTenantOrderINVOICEASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -7299,6 +7363,8 @@ public partial class TenantBotService
         XuiV3PurchaseSelection selection,
         CancellationToken CancellationToken)
     {
+        if (!await EnsureTenantSalesEnabledAsync(botClient, CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                selection.ServiceKey, ServiceSalesOperation.Sale, CancellationToken, CallbackQuery)) return;
         var ChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
         var Price = CalculateTenantPrice(tenant, selection);
         if (!IsTenantHooshPayAvailable(tenant, Price.SalePriceToman))
@@ -7318,6 +7384,7 @@ public partial class TenantBotService
         _workflow.Add(order);
         await _workflow.SaveAsync(CancellationToken);
 
+        if (!await EnsureTenantOrderSalesEnabledAsync(botClient, CallbackQuery, order, CancellationToken)) return;
         var payment = new HooshPayPaymentInfo
         {
             OrderId = order.OrderId,
@@ -7401,7 +7468,9 @@ public partial class TenantBotService
     /// <remarks>
     /// the created <see cref="SwapinoPaymentInfo" /> is marked with <see cref="TenantBotPaymentPurposes.TenantOrder" />
     /// so the NowPayments ipn endpoint routes paid invoices to tenant fulfillment instead of wallet top-Up settlement.
+    /// Live global sale permission is re-read after pricing and before the first order/invoice side effect.
     /// </remarks>
+    /// <returns>A task after the admitted crypto invoice or a safe rejection before new financial work.</returns>
     private async Task CreateTenantNowPaymentsInvoiceAsync(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -7423,11 +7492,14 @@ public partial class TenantBotService
 
         var ChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
         var Price = CalculateTenantPrice(tenant, selection);
+        if (!await EnsureTenantSalesEnabledAsync(botClient, ChatId, selection.ServiceKey,
+                ServiceSalesOperation.Sale, CancellationToken, CallbackQuery)) return;
         var order = CreateTenantOrder(tenant, customer, ChatId, selection, Price, "NowPayments");
 
         _workflow.Add(order);
         await _workflow.SaveAsync(CancellationToken);
 
+        if (!await EnsureTenantOrderSalesEnabledAsync(botClient, CallbackQuery, order, CancellationToken)) return;
         var payment = SwapinoPaymentInfo.CreateCryptoCharge(
             customer.TelegramUserId,
             order.SalePriceToman,
@@ -7510,7 +7582,9 @@ public partial class TenantBotService
     /// Invoice creation is not retried because Tetraminator does not provide a merchant idempotency key. The local
     /// order and payment row are persisted first so a later unsigned callback can only locate data and must still
     /// pass authoritative pay-id, paid-status, and amount verification.
+    /// The selected global category must allow sales before an unpaid order is inserted; the core repeats admission before a first provider attempt.
     /// </remarks>
+    /// <returns>A task after the admitted Tetraminator invoice or a safe rejection before new financial work.</returns>
     private async Task CreateTenantTetraminatorInvoiceAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -7531,6 +7605,8 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
             return;
         }
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, selection.ServiceKey,
+                ServiceSalesOperation.Sale, cancellationToken, callbackQuery)) return;
 
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "Tetraminator");
         _workflow.Add(order);
@@ -7550,7 +7626,9 @@ public partial class TenantBotService
     /// <remarks>
     /// the customer PAYS the owner outside the PLATFORM. after the sales assistant CONFIRMS the receipt,
     /// fulfillment debits the tenant owner's base cost from the Shared wallet and may LEAVE the balance negative.
+    /// Global sale permission is mandatory before order creation and card details; submitted receipt settlement remains ungated.
     /// </remarks>
+    /// <returns>A task after admitted personal-card instructions or denial without a new order.</returns>
     private async Task CreateTenantCardOrderAsync(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -7559,6 +7637,8 @@ public partial class TenantBotService
         XuiV3PurchaseSelection selection,
         CancellationToken CancellationToken)
     {
+        if (!await EnsureTenantSalesEnabledAsync(botClient, CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                selection.ServiceKey, ServiceSalesOperation.Sale, CancellationToken, CallbackQuery)) return;
         var ChatId = CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id;
         var Price = CalculateTenantPrice(tenant, selection);
         var order = CreateTenantOrder(tenant, customer, ChatId, selection, Price, "tenant_card");
@@ -7594,7 +7674,9 @@ public partial class TenantBotService
     /// <remarks>
     /// The global and tenant-specific HooshPay switches are rechecked before loading or mutating the pending renewal
     /// order. Previously created invoices remain checkable and settleable through their existing status/IPN paths.
+    /// Pending orders with no accepted invoice require live global renewal permission again before first activation.
     /// </remarks>
+    /// <returns>A task after renewal invoice admission or denial without a new payment attempt.</returns>
     private async Task CreateTenantHooshPayInvoiceForExistingOrderAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -7627,6 +7709,7 @@ public partial class TenantBotService
             return;
         }
 
+        if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callbackQuery, order, cancellationToken)) return;
         order.PaymentProvider = "HooshPay";
         order.UpdatedAtUtc = DateTime.UtcNow;
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
@@ -7708,6 +7791,8 @@ public partial class TenantBotService
     /// <param name="customer">Customer who owns the order.</param>
     /// <param name="orderDbId">Internal users.db id of the pending renewal order.</param>
     /// <param name="cancellationToken">Cancellation token for database, gateway, and Telegram calls.</param>
+    /// <returns>A task after the renewal invoice or a safe unpaid-admission rejection.</returns>
+    /// <remarks>Live renewal permission gates the first payment row, not later provider inquiry or paid settlement.</remarks>
     private async Task CreateTenantNowPaymentsInvoiceForExistingOrderAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -7740,6 +7825,7 @@ public partial class TenantBotService
             return;
         }
 
+        if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callbackQuery, order, cancellationToken)) return;
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
         order.PaymentProvider = "NowPayments";
         order.UpdatedAtUtc = DateTime.UtcNow;
@@ -7812,6 +7898,15 @@ public partial class TenantBotService
         }
     }
 
+    /// <summary>Reuses an accepted tenant AtlasPay invoice or admits a new sale at the current global operation boundary.</summary>
+    /// <param name="botClient">Telegram transport for the active tenant storefront.</param>
+    /// <param name="callbackQuery">Authenticated customer's purchase callback.</param>
+    /// <param name="tenant">Storefront whose current price and local gateway preference apply.</param>
+    /// <param name="customer">Global customer credentials identified by the callback sender.</param>
+    /// <param name="selection">Authorized catalog/audience selection used for the whole-toman price.</param>
+    /// <param name="cancellationToken">Cancellation of local admission, provider creation and Telegram delivery.</param>
+    /// <returns>A task after original invoice reuse, new invoice admission or a safe rejection.</returns>
+    /// <remarks>The owner/customer selection gate protects duplicate admission. A new order requires live global sale permission after the read-only reuse lookup; accepted invoices retain their existing recovery path.</remarks>
     private async Task CreateTenantAtlasPayInvoiceAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery,
         BotInstance tenant, CredUser customer, XuiV3PurchaseSelection selection, CancellationToken cancellationToken)
     {
@@ -7851,6 +7946,8 @@ public partial class TenantBotService
             return;
         }
 
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, selection.ServiceKey,
+                ServiceSalesOperation.Sale, cancellationToken, callbackQuery)) return;
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "atlaspay");
         _workflow.Add(order); await _workflow.SaveAsync(cancellationToken);
         await CreateTenantAtlasPayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
@@ -7935,6 +8032,15 @@ public partial class TenantBotService
         await CreateTenantAtlasPayInvoiceCoreAsync(botClient, callbackQuery, tenant, customer, order, cancellationToken);
     }
 
+    /// <summary>Creates the first AtlasPay invoice for an admitted tenant order or safely reuses its durable attempt.</summary>
+    /// <param name="botClient">Current tenant Telegram transport.</param>
+    /// <param name="callbackQuery">Authenticated customer's payment-method callback.</param>
+    /// <param name="tenant">Storefront owning this order and provider settings.</param>
+    /// <param name="customer">Global payer profile bound to the tenant order.</param>
+    /// <param name="order">Authorized purchase or renewal order containing immutable whole-toman sale/base snapshots.</param>
+    /// <param name="cancellationToken">Cancellation of the order gate, local commits and provider I/O.</param>
+    /// <returns>A task after one invoice attempt or safe replay/ambiguity presentation.</returns>
+    /// <remarks>Live global sale/renewal permission is re-read only in the new-payment branch. Existing linked provider rows recover regardless of closure and never authorize another POST.</remarks>
     private async Task CreateTenantAtlasPayInvoiceCoreAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery,
         BotInstance tenant, CredUser customer, TenantBotOrder order, CancellationToken cancellationToken)
     {
@@ -7971,6 +8077,7 @@ public partial class TenantBotService
             }
             else
             {
+                if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callbackQuery, order, cancellationToken)) return;
                 payment = new AtlasPayPaymentInfo
                 {
                     MerchantOrderRef = AtlasPayPaymentInfo.CreateMerchantOrderRef(), BaseAmountToman = order.SalePriceToman,
@@ -8081,7 +8188,9 @@ public partial class TenantBotService
     /// The global/live and tenant switches are checked before order creation. The local order and UniquePay row are
     /// persisted before the one non-retried create call so an ambiguous response is auditable and cannot be duplicated
     /// by a stale callback.
+    /// Live global sale permission is re-read before first order insertion and again at invoice admission.
     /// </remarks>
+    /// <returns>A task after the admitted UniquePay invoice or a safe rejection before new financial work.</returns>
     private async Task CreateTenantUniquePayInvoiceAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -8103,6 +8212,8 @@ public partial class TenantBotService
         }
 
         var chatId = callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id;
+        if (!await EnsureTenantSalesEnabledAsync(botClient, chatId, selection.ServiceKey,
+                ServiceSalesOperation.Sale, cancellationToken, callbackQuery)) return;
         var order = CreateTenantOrder(tenant, customer, chatId, selection, price, "UniquePay");
         _workflow.Add(order);
         await _workflow.SaveAsync(cancellationToken);
@@ -8177,6 +8288,7 @@ public partial class TenantBotService
     /// second provider invoice. The invoice-specific callback is only an authoritative-inquiry trigger. Bounded
     /// recovery polling verifies either the provider's
     /// <c>user</c>/<c>buyer</c>-paid or owner-paid amount contract when notification delivery is lost.
+    /// Live sale/renewal permission applies only to a missing payment row; linked invoice reuse and ambiguous recovery remain independent.
     /// </remarks>
     /// <returns>A task completing after the invoice is durably reserved and its known link or safe failure is presented.</returns>
     private async Task CreateTenantUniquePayInvoiceCoreAsync(
@@ -8237,6 +8349,7 @@ public partial class TenantBotService
             }
             else
             {
+                if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callbackQuery, order, cancellationToken)) return;
                 payment = new UniquePayPaymentInfo
                 {
                     HashId = UniquePayPaymentInfo.CreateHashId(customer.TelegramUserId),
@@ -8491,6 +8604,7 @@ public partial class TenantBotService
     /// manual review instead of sending another provider mutation.
     /// A new local invoice requires current global permission and this storefront's preference, including an admitted
     /// quote replay that has not started provider creation. Existing linked invoices bypass this admission-only guard.
+    /// Global commercial sale/renewal permission is independently re-read in that first-invoice branch.
     /// </remarks>
     /// <returns>A task completing after the order's invoice attempt and customer response; uncertain attempts stay reserved.</returns>
     private async Task CreateTenantTetraminatorInvoiceCoreAsync(
@@ -8537,6 +8651,7 @@ public partial class TenantBotService
             }
             else
             {
+                if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callbackQuery, order, cancellationToken)) return;
                 // A quote can already be admitted while invoice creation has not started. Recheck at this last local
                 // creation boundary; reuse of a previously linked invoice must remain independent of later disablement.
                 if (!IsTenantTetraminatorAvailable(tenant, order.SalePriceToman))
@@ -8662,6 +8777,8 @@ public partial class TenantBotService
     /// <param name="customer">Customer who owns the order.</param>
     /// <param name="orderDbId">Internal users.db id of the pending renewal order.</param>
     /// <param name="cancellationToken">Cancellation token for users.db and Telegram operations.</param>
+    /// <returns>A task after card instructions or safe rejection without a new payment activation.</returns>
+    /// <remarks>Global renewal permission is re-read after pending-order validation and before card activation; later submitted receipt confirmation is settlement and does not call this method.</remarks>
     private async Task ActivateTenantCardPaymentForExistingOrderAsync(
         ITelegramBotClient botClient,
         CallbackQuery callbackQuery,
@@ -8679,6 +8796,7 @@ public partial class TenantBotService
         if (order.TenantDiscountCodeId.HasValue &&
             !await ClaimDiscountRenewalMethodAsync(botClient, callbackQuery, order, "tenant_card", cancellationToken)) return;
 
+        if (!await EnsureTenantOrderSalesEnabledAsync(botClient, callbackQuery, order, cancellationToken)) return;
         order.PaymentProvider = "tenant_card";
         order.PaymentStatus = TenantBotOrderStatuses.AwaitingReceipt;
         order.UpdatedAtUtc = DateTime.UtcNow;
@@ -8731,7 +8849,7 @@ public partial class TenantBotService
     /// <param name="cancellationToken">Cancellation of detached reads and read-only XUI lookup.</param>
     /// <param name="allowCustomerWallet">True only for wallet revalidation before a first debit; false prevents gateway switching on wallet orders.</param>
     /// <returns>The authorized workflow snapshot, or null when ownership, identity, live eligibility or price changed.</returns>
-    /// <remarks>No money or XUI state changes. Paid wallet recovery uses receipt proof instead and never re-enters this unpaid admission check.</remarks>
+    /// <remarks>No money or XUI state changes. Live global renewal permission is required before and after read-only target/price resolution; an unfunded pending order cannot bypass closure. Paid wallet recovery uses receipt proof instead and never re-enters this unpaid admission check.</remarks>
     private async Task<TenantBotOrder> GetPendingTenantRenewOrderCoreAsync(
         int orderDbId,
         BotInstance tenant,
@@ -8749,6 +8867,7 @@ public partial class TenantBotService
             cancellationToken));
         if (order == null || (order.PaymentProvider == "wallet" && !allowCustomerWallet))
             return null;
+        if (!IsTenantSalesEnabled(order.ServiceKey, ServiceSalesOperation.Renewal)) return null;
 
         XuiV3Client client;
         try
@@ -8836,6 +8955,8 @@ public partial class TenantBotService
                 return null;
             }
 
+            if (!IsTenantSalesEnabled(order.ServiceKey, ServiceSalesOperation.Renewal,
+                    string.IsNullOrWhiteSpace(order.UnlimitedPlanKey) ? null : XuiV3ServiceKinds.Unlimited)) return null;
             return order;
         }
         catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
@@ -10074,6 +10195,8 @@ public partial class TenantBotService
     /// <see cref="UserStateStore.SetPendingReceiptTargetAsync" />, scoped to the active tenant bot plus
     /// <paramref name="CustomerTelegramUserId" />. That binding is what makes the following image attach to this order
     /// instead of to whichever card order happened to become the newest one before the upload arrived.
+    /// Closed global operations cannot start a fresh unpaid receipt-upload prompt; an existing submitted receipt or
+    /// started provisional mutation remains replaceable/recoverable. Actual transfer evidence ingestion is not discarded.
     /// </remarks>
     private async Task PromptTenantReceiptUploadAsync(
         ITelegramBotClient botClient,
@@ -10084,6 +10207,7 @@ public partial class TenantBotService
     {
         var order = await _workflow.ReadAsync(async db => await db.TenantBotOrders.FirstOrDefaultAsync(
             x => x.Id == ORDERDBID &&
+                 x.TenantBotId == BotContextAccessor.CurrentBotId &&
                  x.CustomerTelegramUserId == CustomerTelegramUserId &&
                  x.PaymentProvider == "tenant_card" &&
                  !x.IsFulfilled,
@@ -10095,6 +10219,11 @@ public partial class TenantBotService
             return;
         }
 
+        if (order.OrderKind != TenantBotOrderKinds.WalletCharge &&
+            !await HasAcceptedTenantCardWorkAsync(order, CancellationToken) &&
+            !await EnsureTenantSalesEnabledAsync(botClient, ChatId, order.ServiceKey,
+                order.OrderKind == TenantBotOrderKinds.Renew ? ServiceSalesOperation.Renewal : ServiceSalesOperation.Sale,
+                CancellationToken, serviceKind: string.IsNullOrWhiteSpace(order.UnlimitedPlanKey) ? null : XuiV3ServiceKinds.Unlimited)) return;
         order.PaymentStatus = TenantBotOrderStatuses.AwaitingReceipt;
         order.UpdatedAtUtc = DateTime.UtcNow;
         await _workflow.SaveAsync(CancellationToken);

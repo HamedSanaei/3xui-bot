@@ -98,7 +98,7 @@ public partial class XuiV3BotFlowService
     private readonly XuiV3RenewalOperationStore _renewalOperationStore;
     /// <summary>Global users.db receipts for owned-colleague daily tests and paid-test executor claims.</summary>
     private readonly ColleagueTrialQuotaStore _colleagueTrialQuotaStore;
-    /// <summary>Immutable panel creation evidence used to reconcile paid tests without repeating a POST.</summary>
+    /// <summary>Immutable panel creation evidence for paid-test recovery and already-started owned sale-batch admission.</summary>
     private readonly XuiV3CreationOperationStore _trialCreationOperations;
     /// <summary>Startup-validated allowance from the singleton application options; the daily count is not rebound per execution.</summary>
     private readonly int _colleagueDailyFreeTrialLimit;
@@ -156,7 +156,7 @@ public partial class XuiV3BotFlowService
     /// processing claims, the atomic applied transition, the settlement guard, and read-only timeout recovery.
     /// </param>
     /// <param name="colleagueTrialQuotaStore">Required durable global-per-colleague Tehran-day quota and paid-test receipt store.</param>
-    /// <param name="trialCreationOperations">Required panel creation evidence store; ambiguous paid attempts are never refunded or replayed blindly.</param>
+    /// <param name="trialCreationOperations">Required shared panel creation evidence store; preserves funded paid-test recovery and started owned-batch settlement across later global sales closure.</param>
     /// <param name="appConfig">Required singleton startup options supplying the nonnegative colleague daily free-test count; not rebound per Telegram execution.</param>
     /// <param name="interactionTimeouts">
     /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
@@ -1049,6 +1049,7 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// No wallet, order, ledger, or XUI mutation occurs. The callback contains no target identifier; continuation
     /// reloads this bot/user state and compares the saved email plus UUID with fresh panel data.
+    /// A closed global renewal category is rejected before warning-state replacement; sale closure is irrelevant.
     /// </remarks>
     private async Task SaveOwnedExternalRenewWarningAsync(
         ITelegramBotClient botClient,
@@ -1060,6 +1061,10 @@ public partial class XuiV3BotFlowService
         int messageId,
         CancellationToken cancellationToken)
     {
+        if (await RejectClosedServiceOperationAsync(
+                botClient, chatId, service, ServiceSalesOperation.Renewal, cancellationToken))
+            return;
+
         // Keep the sensitive email/UUID pair only in this bot-scoped row; x3:rgo carries no reusable target identity.
         await _state.ClearUserStatus(new User { Id = telegramUserId });
         await _state.SaveUserStatus(new User
@@ -1103,6 +1108,7 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// Every client with a valid panel UUID, including an owned account selected by email, receives the same exact
     /// lock. An owned legacy client without a UUID retains owner checks; a non-owned client without a UUID is rejected.
+    /// Current global renewal permission is required before replacing state or exposing plan choices, including stale warnings.
     /// </remarks>
     private async Task StartOwnedRenewPlanSelectionAsync(
         ITelegramBotClient botClient,
@@ -1115,6 +1121,10 @@ public partial class XuiV3BotFlowService
         int messageId,
         CancellationToken cancellationToken)
     {
+        if (await RejectClosedServiceOperationAsync(
+                botClient, chatId, service, ServiceSalesOperation.Renewal, cancellationToken))
+            return;
+
         // Replace the warning/search state atomically at the conversation level so stale callbacks cannot change target.
         await _state.ClearUserStatus(new User { Id = telegramUserId });
         await _state.SaveUserStatus(new User
@@ -1584,6 +1594,8 @@ public partial class XuiV3BotFlowService
     /// When a duration is disabled between preview and confirmation, an explicit empty string clears only the stored
     /// duration while the bot-scoped target-account UUID lock and the other renewal fields remain intact. A disabled
     /// unlimited sub-plan similarly returns to the current plan keyboard without consuming confirmation or charging.
+    /// Restored non-confirmation steps require current global renewal permission. Confirmation delegates its admission
+    /// to the execution method so already-started operations remain recoverable after category closure.
     /// </remarks>
     /// <returns>A task that completes after the current state transition and Telegram response.</returns>
     /// <exception cref="OperationCanceledException">
@@ -1619,6 +1631,11 @@ public partial class XuiV3BotFlowService
                 cancellationToken);
             return;
         }
+
+        if (user.LastStep != RenewStepConfirm &&
+            await RejectClosedServiceOperationAsync(
+                botClient, message.Chat.Id, service, ServiceSalesOperation.Renewal, cancellationToken))
+            return;
 
         if (user.LastStep == RenewStepTraffic)
         {
@@ -1905,6 +1922,11 @@ public partial class XuiV3BotFlowService
     /// a role or catalog change cannot turn a colleague-only plan into an ordinary-customer renewal.
     /// The final central audit includes accumulated panel API time and total time from execution start through
     /// settlement and customer delivery; customer decision and payment waiting time are excluded.
+    /// Global renewal permission is checked only after resolving an existing operation, then immediately before new
+    /// operation admission and the durable mutation-start claim. Applied/ambiguous work bypasses later closures so
+    /// its immutable settlement can finish once. A fresh claim closed before mutation is failed without a panel call.
+    /// Existing operation lookup precedes unfunded balance/site-wallet prechecks, since an already-applied renewal
+    /// is a settlement obligation and must not be rejected as a new purchase using the payer's current balance.
     /// </remarks>
     private async Task CompleteRenewAsync(
         ITelegramBotClient botClient,
@@ -1926,6 +1948,23 @@ public partial class XuiV3BotFlowService
 
         var resolved = _purchaseService.ResolveOwnedPurchase(selection, credUser.IsColleague);
         var useSiteWallet = string.Equals(user.PaymentMethod, "gozargah_site_wallet", StringComparison.OrdinalIgnoreCase);
+        // Deduplicate before any unfunded precheck. An applied or ambiguous row must use its existing recovery
+        // path even when current balance, website eligibility or global renewal permission has since changed.
+        var renewalOperationKey = BuildOwnedRenewalOperationKey(user, service, resolved, credUser);
+        var existingOperation = await _renewalOperationStore.GetByKeyAsync(renewalOperationKey, cancellationToken);
+        if (existingOperation != null)
+        {
+            using var recoveryTiming = XuiOperationTiming.Start();
+            await HandleExistingOwnedRenewalOperationAsync(
+                botClient, message, credUser, user, mainReplyMarkup, service, resolved, useSiteWallet,
+                existingOperation, recoveryTiming, cancellationToken);
+            return;
+        }
+
+        if (await RejectClosedServiceOperationAsync(
+                botClient, message.Chat.Id, service, ServiceSalesOperation.Renewal, cancellationToken))
+            return;
+
         if (!useSiteWallet && credUser.AccountBalance < resolved.PriceToman)
         {
             await _activityLog.LogWarningAsync(
@@ -1984,27 +2023,9 @@ public partial class XuiV3BotFlowService
         Console.WriteLine(
             $"[XUIv3] renew confirm user={credUser.TelegramUserId}, service={service.Key}, authorization={(hasExactTargetLock ? "target-lock" : "legacy-owner")}");
 
-        // Exactly-once renewal guard: one stable operation row per confirmation session. Telegram redelivery,
-        // repeated confirm presses, concurrent duplicate requests, XUI timeouts, and process restarts all resolve
-        // to the same row, so only one executor ever sends the XUI mutation and settles the wallet.
-        var renewalOperationKey = BuildOwnedRenewalOperationKey(user, service, resolved, credUser);
-        var existingOperation = await _renewalOperationStore.GetByKeyAsync(renewalOperationKey, cancellationToken);
-        if (existingOperation != null)
-        {
-            await HandleExistingOwnedRenewalOperationAsync(
-                botClient,
-                message,
-                credUser,
-                user,
-                mainReplyMarkup,
-                service,
-                resolved,
-                useSiteWallet,
-                existingOperation,
-                operationTiming,
-                cancellationToken);
+        if (await RejectClosedServiceOperationAsync(
+                botClient, message.Chat.Id, service, ServiceSalesOperation.Renewal, cancellationToken))
             return;
-        }
 
         var client = await GetAuthorizedRenewClientAsync(serverInfo, user, credUser.TelegramUserId, cancellationToken);
         client = await LoadFreshRenewClientSnapshotAsync(serverInfo, client, cancellationToken);
@@ -2027,6 +2048,11 @@ public partial class XuiV3BotFlowService
                 cancellationToken);
             return;
         }
+
+        var targetService = ResolveServiceForClient(client);
+        if (await RejectClosedServiceOperationAsync(
+                botClient, message.Chat.Id, targetService, ServiceSalesOperation.Renewal, cancellationToken))
+            return;
 
         var currentExpiryBeforeRenew = GetExpiryTime(client);
 
@@ -2055,6 +2081,12 @@ public partial class XuiV3BotFlowService
         var payload = renewal.Payload;
         Console.WriteLine(
             $"[XUIv3] renew payload user={credUser.TelegramUserId}, clientId={client.Id}, durationDays={resolved.DurationDays}, currentExpiry={currentExpiryBeforeRenew}, newExpiry={payload.ExpiryTime}, resetTraffic={renewal.ShouldResetTraffic}, totalBytesAfter={renewal.TotalBytesAfterRenew}, targetAvailableBytes={renewal.TargetAvailableTrafficBytes}");
+
+        if (await RejectClosedServiceOperationAsync(
+                botClient, message.Chat.Id, service, ServiceSalesOperation.Renewal, cancellationToken) ||
+            await RejectClosedServiceOperationAsync(
+                botClient, message.Chat.Id, targetService, ServiceSalesOperation.Renewal, cancellationToken))
+            return;
 
         // Persist the absolute target exactly once before the mutation. If a concurrent duplicate inserted the
         // same operation first, resolve that row instead of computing or sending anything new.
@@ -2120,6 +2152,23 @@ public partial class XuiV3BotFlowService
                 renewalOperation,
                 operationTiming,
                 cancellationToken);
+            return;
+        }
+
+        // The fresh claim has not authorized any panel effect yet. Closure releases this row as failed;
+        // after MarkMutationStartedAsync succeeds, later closures must not interrupt reconciliation or debit.
+        var closedService = !_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal)
+            ? service
+            : targetService != null && !_purchaseService.SalesAvailability.IsEnabled(targetService, ServiceSalesOperation.Renewal)
+                ? targetService
+                : null;
+        if (closedService != null)
+        {
+            await _renewalOperationStore.MarkFailedAsync(
+                renewalOperation, "Global renewal admission closed before panel mutation.", CancellationToken.None);
+            await SendOwnedRenewTerminalAsync(
+                botClient, message.Chat.Id, user,
+                ServiceSalesPolicy.GetDisabledMessage(closedService, ServiceSalesOperation.Renewal), cancellationToken);
             return;
         }
 
@@ -3317,6 +3366,7 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// The method first removes the persistent reply keyboard before sending inline service buttons. This prevents owned-bot
     /// users from pressing main-menu buttons in the middle of service, traffic, duration, or unlimited-plan selection.
+    /// Service buttons read the global sale switches on every display; closure never changes renewal visibility.
     /// Users can still return to the main menu with <c>/start</c>, which is exposed in the owned-bot command menu.
     /// </remarks>
     public async Task<bool> TryStartPurchaseAsync(
@@ -3349,8 +3399,8 @@ public partial class XuiV3BotFlowService
 
         await botClient.SendMessage(
             chatId: message.Chat.Id,
-            text: "نوع سرویس را انتخاب کنید:",
-            replyMarkup: _purchaseService.BuildServiceKeyboard(),
+            text: BuildAvailableSaleServicePrompt("نوع سرویس را انتخاب کنید:"),
+            replyMarkup: BuildAvailableSaleServiceKeyboard(),
             cancellationToken: cancellationToken);
 
         user.Flow = PurchaseFlowName;
@@ -3410,6 +3460,7 @@ public partial class XuiV3BotFlowService
     /// or confirmation text is consumed. Invalid state is lazily reset in the current bot only and the triggering text
     /// is not saved as an order value. A valid comment preview resolves pricing once and reuses that snapshot for the
     /// summary, total amount, and site-wallet eligibility; confirmation resolves the live catalog again before effects.
+    /// Restored and typed selections also require live sale permission; denial retains state so reopening can resume.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="cancellationToken"/> is cancelled during Telegram, database, or payment-precheck work.
@@ -3450,14 +3501,18 @@ public partial class XuiV3BotFlowService
         if (service != null)
             RehydratePurchaseSelectionFromState(selection, service, user);
 
+        if (await RejectClosedServiceOperationAsync(
+                botClient, message.Chat.Id, service, ServiceSalesOperation.Sale, cancellationToken))
+            return true;
+
         if (service == null &&
             string.Equals(user.LastStep, PurchaseStepSelectService, StringComparison.Ordinal) &&
             string.IsNullOrWhiteSpace(serviceKey))
         {
             await botClient.SendMessage(
                 chatId: message.Chat.Id,
-                text: "نوع سرویس را از دکمه‌های فعال انتخاب کنید.",
-                replyMarkup: _purchaseService.BuildServiceKeyboard(),
+                text: BuildAvailableSaleServicePrompt("نوع سرویس را از دکمه‌های فعال انتخاب کنید."),
+                replyMarkup: BuildAvailableSaleServiceKeyboard(),
                 cancellationToken: cancellationToken);
             return true;
         }
@@ -4038,6 +4093,9 @@ public partial class XuiV3BotFlowService
     /// client. TenantBotService intercepts all renewal callback variants before this owned-wallet dispatcher.
     /// Owned paid-test callbacks bind approval to the durable grant and displayed amount, not transient navigation;
     /// old-price callbacks cannot authorize a revised quote, and funded callbacks remain read-back-only after /start.
+    /// Stale sale-navigation callbacks recheck the exact category; final bulk admission rechecks after all awaited
+    /// prechecks. Already-started stable batches continue their existing panel recovery and wallet settlement even
+    /// after closure, while new and merely Reserved work is rejected before provisioning.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="cancellationToken"/> is cancelled during Telegram, database, or panel work.
@@ -4466,14 +4524,24 @@ public partial class XuiV3BotFlowService
                     botClient,
                     chatId: chatId,
                     messageId: messageId,
-                    text: "نوع سرویس را انتخاب کنید:",
-                    replyMarkup: _purchaseService.BuildServiceKeyboard(),
+                    text: BuildAvailableSaleServicePrompt("نوع سرویس را انتخاب کنید:"),
+                    replyMarkup: BuildAvailableSaleServiceKeyboard(),
                     cancellationToken: cancellationToken);
             }
             return true;
         }
 
         var selectionState = _sessionStore.GetOrCreate(credUser.TelegramUserId);
+
+        if (callback.Action is "svc" or "gb" or "dur" or "upl" or "cnt")
+        {
+            var admissionServiceKey = callback.Action == "cnt"
+                ? (string.IsNullOrWhiteSpace(selectionState.ServiceKey) ? user.SelectedCountry : selectionState.ServiceKey)
+                : callback.ServiceKey;
+            if (await RejectClosedServiceOperationAsync(
+                    botClient, chatId, FindService(admissionServiceKey), ServiceSalesOperation.Sale, cancellationToken))
+                return true;
+        }
 
         if (callback.Action == "cnt")
         {
@@ -4852,6 +4920,10 @@ public partial class XuiV3BotFlowService
             if (confirmationService != null)
                 RehydratePurchaseSelectionFromState(selection, confirmationService, user);
 
+            if (confirmationService != null && !await AdmitOwnedSaleExecutionAsync(
+                    botClient, chatId, credUser, user, confirmationService, cancellationToken))
+                return true;
+
             var confirmationRecoveryTarget = DeterminePurchaseRecoveryTarget(
                 confirmationService,
                 selection,
@@ -4964,6 +5036,12 @@ public partial class XuiV3BotFlowService
                     user.PurchaseSessionId = Guid.NewGuid().ToString("N");
                     await _state.SaveUserStatus(user);
                 }
+
+                // This is the last admission boundary before provisioning. Once the durable batch starts, both
+                // bot-wallet and site-wallet settlement must finish even if the global switch closes afterwards.
+                if (!await AdmitOwnedSaleExecutionAsync(
+                        botClient, chatId, credUser, user, resolved.Service, cancellationToken))
+                    return true;
 
                 var bulkResult = await _purchaseService.CreateBulkAccountsAsync(
                     credUser,
@@ -5676,6 +5754,7 @@ public partial class XuiV3BotFlowService
     /// This route remains owner-only because numeric client ids are routing data, not one of the four customer proofs.
     /// A fresh panel UUID is still persisted so email reuse cannot redirect later preview or settlement.
     /// TenantBotService intercepts tenant renewal callbacks before they reach this owned-wallet state machine.
+    /// After ownership and live catalog resolution, a closed global renewal category rejects even a stale account-card button.
     /// </remarks>
     private async Task HandleAccountRenewCallbackAsync(
         ITelegramBotClient botClient,
@@ -5721,6 +5800,10 @@ public partial class XuiV3BotFlowService
                 cancellationToken);
             return;
         }
+
+        if (await RejectClosedServiceOperationAsync(
+                botClient, chatId, service, ServiceSalesOperation.Renewal, cancellationToken))
+            return;
 
         var targetUuid = TryNormalizeClientUuid(client.Uuid, out var normalizedTargetUuid)
             ? normalizedTargetUuid
@@ -6885,8 +6968,8 @@ public partial class XuiV3BotFlowService
     /// <returns>A task that completes after terminal cleanup or delivery of the renewal plan selector.</returns>
     /// <remarks>
     /// Every successful selection persists a normalized UUID separately from <see cref="User.PaymentMethod"/>.
-    /// A non-owner result pauses at the explicit third-party warning before plan selection. Rejection clears temporary
-    /// state and causes no wallet, order, configuration-disclosure, ownership, or panel side effect.
+    /// A non-owner result pauses at the explicit third-party warning before plan selection. Invalid-target rejection
+    /// clears temporary state; a global renewal closure retains it for reopening. Neither creates financial or panel effects.
     /// </remarks>
     private async Task HandleAccountSearchRenewCallbackAsync(
         ITelegramBotClient botClient,
@@ -6938,6 +7021,10 @@ public partial class XuiV3BotFlowService
                 cancellationToken);
             return;
         }
+
+        if (await RejectClosedServiceOperationAsync(
+                botClient, chatId, service, ServiceSalesOperation.Renewal, cancellationToken))
+            return;
 
         var isOwner = ClientBelongsToUser(client, credUser.TelegramUserId);
         if (!TryNormalizeClientUuid(client.Uuid, out var targetUuid) && !isOwner)
@@ -8164,6 +8251,101 @@ public partial class XuiV3BotFlowService
         }
     }
 
+    /// <summary>Builds current catalog sale choices using the global live category switches.</summary>
+    /// <returns>An inline keyboard of enabled sale services in catalog order, or Home when all sales are closed.</returns>
+    /// <remarks>Sale visibility is independent of renewal and does not replace the final execution admission check.</remarks>
+    /// <example><code>var keyboard = BuildAvailableSaleServiceKeyboard();</code></example>
+    private InlineKeyboardMarkup BuildAvailableSaleServiceKeyboard()
+    {
+        var rows = _purchaseService.GetEnabledServices()
+            .Where(service => _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
+            .Select(service => new[]
+            {
+                InlineKeyboardButton.WithCallbackData(service.DisplayName, XuiV3PurchaseCallbacks.Service(service.Key))
+            }).ToList();
+        if (rows.Count == 0)
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) });
+        return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>Chooses a sale-selection prompt without offering a nonexistent open category.</summary>
+    /// <param name="availablePrompt">Readable Persian prompt used when at least one catalog service permits sales.</param>
+    /// <returns>The supplied prompt or a customer-safe all-sales-closed explanation.</returns>
+    /// <remarks>Reads current switches on each prompt; reopening requires no bot restart or state migration.</remarks>
+    /// <example><code>var text = BuildAvailableSaleServicePrompt("نوع سرویس را انتخاب کنید:");</code></example>
+    private string BuildAvailableSaleServicePrompt(string availablePrompt)
+    {
+        return _purchaseService.GetEnabledServices()
+            .Any(service => _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
+            ? availablePrompt
+            : "خرید سرویس در حال حاضر غیرفعال است. لطفاً بعداً دوباره تلاش کنید.";
+    }
+
+    /// <summary>Rejects a closed category and operation without discarding recoverable or bot-scoped conversation state.</summary>
+    /// <param name="botClient">Required active owned or tenant Telegram transport.</param>
+    /// <param name="chatId">Original Telegram chat receiving the category-specific denial.</param>
+    /// <param name="service">Validated live catalog service; null leaves existing catalog validation to the caller.</param>
+    /// <param name="operation">Sale or renewal admission, never inferred from the selected pricing plan.</param>
+    /// <param name="cancellationToken">Cancellation of denial delivery only.</param>
+    /// <returns>True after a closed operation was denied; false when it remains enabled or the catalog service is absent.</returns>
+    /// <remarks>No wallet, order, ledger, panel or conversation mutation occurs. Call before unfunded side effects, never after admission.</remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels the denial delivery.</exception>
+    /// <example><code>if (await RejectClosedServiceOperationAsync(client, chatId, service, ServiceSalesOperation.Sale, token)) return;</code></example>
+    private async Task<bool> RejectClosedServiceOperationAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        XuiV3ServiceDefinition service,
+        ServiceSalesOperation operation,
+        CancellationToken cancellationToken)
+    {
+        if (service == null || _purchaseService.SalesAvailability.IsEnabled(service, operation))
+            return false;
+        await botClient.SendMessage(chatId, ServiceSalesPolicy.GetDisabledMessage(service, operation),
+            cancellationToken: cancellationToken);
+        return true;
+    }
+
+    /// <summary>Admits a new owned sale or preserves the exact already-started batch's idempotent settlement.</summary>
+    /// <param name="botClient">Required active owned-bot Telegram transport.</param>
+    /// <param name="chatId">Original buyer chat receiving an unfunded admission denial.</param>
+    /// <param name="credUser">Global buyer profile whose Telegram identity must match durable creation evidence.</param>
+    /// <param name="user">Current bot/user confirmation state carrying the trusted durable purchase session id.</param>
+    /// <param name="service">Validated live catalog service being sold.</param>
+    /// <param name="cancellationToken">Cancellation of receipt lookup and denial delivery.</param>
+    /// <returns>True for enabled sales or the same batch whose first creation may have started; false for closed new work.</returns>
+    /// <remarks>
+    /// Called immediately before bulk provisioning, which precedes bot/site-wallet debit. A Reserved identity alone
+    /// is unfunded and grants no exemption. POST-started, applied or ambiguous evidence admits only the same stable
+    /// bot/session batch, so a later closure cannot strand already-created accounts or prevent their existing settlement.
+    /// After this admission, the batch and its debit continue without another switch check.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels the durable evidence lookup or denial delivery.</exception>
+    /// <example><code>if (!await AdmitOwnedSaleExecutionAsync(client, chatId, buyer, state, service, token)) return true;</code></example>
+    private async Task<bool> AdmitOwnedSaleExecutionAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        CredUser credUser,
+        User user,
+        XuiV3ServiceDefinition service,
+        CancellationToken cancellationToken)
+    {
+        if (_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
+            return true;
+        if (!string.IsNullOrWhiteSpace(user.PurchaseSessionId))
+        {
+            var firstCreation = await _trialCreationOperations.FindAsync(
+                $"create:purchase:{BotContextAccessor.CurrentBotId}:{user.PurchaseSessionId}:1", cancellationToken);
+            if (firstCreation?.TelegramUserId == credUser.TelegramUserId &&
+                (firstCreation.PostStartedAtUtc.HasValue ||
+                 firstCreation.Outcome == XuiV3CreationOutcome.Applied ||
+                 firstCreation.Outcome == XuiV3CreationOutcome.Ambiguous))
+                return true;
+        }
+        // Re-read after the receipt lookup: reopening during an awaited read must immediately restore admission.
+        return !await RejectClosedServiceOperationAsync(
+            botClient, chatId, service, ServiceSalesOperation.Sale, cancellationToken);
+    }
+
     private XuiV3ServiceDefinition FindService(string serviceKey)
     {
         if (string.IsNullOrWhiteSpace(serviceKey))
@@ -9183,6 +9365,7 @@ public partial class XuiV3BotFlowService
     /// values; wallets, ledger entries, orders, payments, XUI accounts, and states in other bots are untouched. The
     /// triggering user message is intentionally not reused after recovery, preventing ordinary text from becoming an
     /// order comment under a stale catalog selection.
+    /// Recovery service keyboards filter live global sale switches independently from renewal.
     /// </remarks>
     /// <example>
     /// <code>
@@ -9284,8 +9467,8 @@ public partial class XuiV3BotFlowService
                 selection.UnlimitedPlanKey = null;
                 replacement.LastStep = PurchaseStepSelectService;
                 replacement.SelectedCountry = string.Empty;
-                prompt = "انتخاب قبلی شما دیگر فعال نیست. لطفاً نوع سرویس را دوباره انتخاب کنید.";
-                keyboard = _purchaseService.BuildServiceKeyboard();
+                prompt = BuildAvailableSaleServicePrompt("انتخاب قبلی شما دیگر فعال نیست. لطفاً نوع سرویس را دوباره انتخاب کنید.");
+                keyboard = BuildAvailableSaleServiceKeyboard();
                 break;
         }
 

@@ -138,7 +138,8 @@ public class Program
     /// <remarks>Singletons never capture scoped database contexts. Legacy coordinated handler graphs are scoped to one execution; state and wallet stores own shorter contexts.
     /// Owner handlers share the bounded token-probe cache but retain isolated tenant selections.
     /// Backup channels resolve nonblank global configuration before the default-owned channel; the dispatcher supplies durable fallback.
-    /// The colleague trial store shares a global per-user Tehran-day allowance across owned bots, without retaining a context.</remarks>
+    /// The colleague trial store shares a global per-user Tehran-day allowance across owned bots, without retaining a context.
+    /// The single IServiceSalesAvailability snapshot governs customer sale/renewal admission in every owned and tenant bot.</remarks>
     /// <example><code>RegisterApplicationServices(services, configuration, validatedOptions, contentRootPath);</code></example>
     public static void RegisterApplicationServices(IServiceCollection services, IConfiguration configuration, AppConfig appConfig, string contentRootPath)
     {
@@ -157,6 +158,12 @@ public class Program
                 appConfig,
                 Path.Combine(contentRootPath, "Data", "configuration.json"),
                 sp.GetRequiredService<ILogger<ClientDownloadAvailabilityService>>()));
+        // One persisted permission snapshot governs unpaid sale/renewal admission across every owned and tenant bot.
+        services.AddSingleton<IServiceSalesAvailability>(sp =>
+            new ServiceSalesAvailabilityService(
+                appConfig,
+                Path.Combine(contentRootPath, "Data", "configuration.json"),
+                sp.GetRequiredService<ILogger<ServiceSalesAvailabilityService>>()));
         // One shared release resolver for owned and tenant bots, so the asset-selection rules cannot diverge between them.
         services.AddSingleton<IClientReleaseService>(sp =>
             new ClientReleaseService(sp.GetRequiredService<ILogger<ClientReleaseService>>()));

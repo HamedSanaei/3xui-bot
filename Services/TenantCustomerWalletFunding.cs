@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 
 /// <summary>Bridges tenant order identity to the existing global customer wallet and ledger without a cross-database transaction.</summary>
-/// <remarks>Only committed credentials.db receipts prove money moved. Approval gates admission, never receipt reconciliation.</remarks>
+/// <remarks>Only committed credentials.db receipts prove money moved. Approval and global commercial permission gate new admission, never receipt reconciliation.</remarks>
 public sealed class TenantCustomerWalletFunding
 {
     private readonly UserDbContextFactory _users;
@@ -14,6 +14,8 @@ public sealed class TenantCustomerWalletFunding
     private readonly ILogger<TenantCustomerWalletFunding> _logger;
     /// <summary>Shared users.db quote and one-time capacity reservation logic.</summary>
     private readonly TenantDiscountService _discounts;
+    /// <summary>Shared live commercial admission policy; absent injection fails closed for new work, never for receipt repair.</summary>
+    private readonly IServiceSalesAvailability _salesAvailability;
 
     /// <summary>Creates an operation-local financial bridge.</summary>
     /// <param name="users">Factory for tenant orders in users.db.</param>
@@ -21,10 +23,30 @@ public sealed class TenantCustomerWalletFunding
     /// <param name="ledger">Existing idempotent audit writer, not a balance authority.</param>
     /// <param name="logger">Optional central audit sink; omitted in isolated store fixtures.</param>
     /// <param name="discounts">Shared users.db quote and reservation primitive, also used by gateway admission.</param>
+    /// <param name="salesAvailability">Production singleton shared by every bot. Required for admission/debit; recovery-only callers may omit it.</param>
+    /// <remarks>Orders are isolated by internal tenant bot id; balances and immutable debit receipts belong to the global Telegram user. Construction moves no money. Production admission must share the global policy singleton; committed-receipt repair remains available to recovery-only callers.</remarks>
+    /// <example><code>var funding = new TenantCustomerWalletFunding(users, wallet, ledger, salesAvailability: globalSalesAvailability);</code></example>
     public TenantCustomerWalletFunding(UserDbContextFactory users, CredentialsStore wallet, WalletLedgerService ledger,
-        ILogger<TenantCustomerWalletFunding> logger = null, TenantDiscountService discounts = null)
+        ILogger<TenantCustomerWalletFunding> logger = null, TenantDiscountService discounts = null,
+        IServiceSalesAvailability salesAvailability = null)
     { _users = users; _wallet = wallet; _ledger = ledger; _logger = logger ?? NullLogger<TenantCustomerWalletFunding>.Instance;
-        _discounts = discounts ?? new TenantDiscountService(users); }
+        _salesAvailability = salesAvailability; _discounts = discounts ?? new TenantDiscountService(users, salesAvailability); }
+
+    /// <summary>Enforces the global service/operation permission for new wallet admission or first debit.</summary>
+    /// <param name="order">Authorized tenant order with its stored service, fixed-plan and operation identity.</param>
+    /// <remarks>No tenant preference or customer role bypasses this global check. Committed receipt reconciliation must run before calling it.</remarks>
+    /// <exception cref="InvalidOperationException">The policy dependency is missing or the operation is closed; no new debit is permitted.</exception>
+    /// <example><code>EnsureSalesAdmission(unpaidOrder);</code></example>
+    private void EnsureSalesAdmission(TenantBotOrder order)
+    {
+        if (_salesAvailability == null)
+            throw new InvalidOperationException("Global sales admission policy is required.");
+        var operation = order.OrderKind == TenantBotOrderKinds.Renew ? ServiceSalesOperation.Renewal : ServiceSalesOperation.Sale;
+        var category = ServiceSalesPolicy.GetCategory(order.ServiceKey,
+            string.IsNullOrWhiteSpace(order.UnlimitedPlanKey) ? null : XuiV3ServiceKinds.Unlimited);
+        if (!_salesAvailability.Snapshot.IsEnabled(category, operation))
+            throw new InvalidOperationException(ServiceSalesPolicy.GetDisabledMessage(category, operation));
+    }
 
     /// <summary>Returns the immutable customer debit identity for one persisted tenant order.</summary>
     /// <param name="orderId">Positive users.db TenantBotOrder primary key.</param>
@@ -53,8 +75,8 @@ public sealed class TenantCustomerWalletFunding
     /// <param name="admissionKey">Stable confirmation identity scoped to storefront/customer, at most 240 characters.</param>
     /// <param name="token">Cancellation of short local operations; no provider calls run inside the transaction.</param>
     /// <returns>A detached admitted order, reusing the same order for repeated confirmation.</returns>
-    /// <exception cref="InvalidOperationException">Approval or identity changed, or the existing order is already funded through another channel.</exception>
-    /// <remarks>This creates no money. A crash before debit leaves an unpaid order. Recovery never automatically debits an unconfirmed customer.</remarks>
+    /// <exception cref="InvalidOperationException">New commercial admission is closed or lacks its policy, approval or identity changed, or the existing order is funded through another channel.</exception>
+    /// <remarks>This creates no money. Global sale/renewal permission is re-read before first admission. A crash before debit leaves an unpaid order; recovery never automatically debits an unconfirmed customer.</remarks>
     /// <example><code>var admitted = await funding.AdmitAsync(pricedOrder, confirmationKey, token);</code></example>
     public Task<TenantBotOrder> AdmitAsync(TenantBotOrder order, string admissionKey, CancellationToken token = default) =>
         AdmitCoreAsync(order, admissionKey, null, token);
@@ -69,9 +91,9 @@ public sealed class TenantCustomerWalletFunding
     /// <param name="baseCostToman">Fresh colleague cost, compared inside the admission transaction.</param>
     /// <param name="token">Cancellation of local users.db work.</param>
     /// <returns>The one admitted order; retries return its original immutable sale.</returns>
-    /// <exception cref="InvalidOperationException">The quote was already admitted elsewhere or its discount changed.</exception>
+    /// <exception cref="InvalidOperationException">New commercial admission is closed or lacks its policy, the quote was admitted elsewhere, or its discount changed.</exception>
     /// <example><code>var order = await funding.AdmitQuotedAsync(pricedOrder, confirmationKey, quote.Id, messageId, quote.SelectionKey, gross, cost, token);</code></example>
-    /// <remarks>The selection and tariff must be resolved from the stored, message-bound quote by the caller; no wallet debit occurs in this transaction.</remarks>
+    /// <remarks>The caller resolves selection and tariff from the stored, message-bound quote. First admission requires live global sale permission; no wallet debit occurs in this transaction and committed-receipt reconciliation is separate.</remarks>
     public Task<TenantBotOrder> AdmitQuotedAsync(TenantBotOrder order, string admissionKey, int quoteId,
         int messageId, string selectionKey, long grossToman, long baseCostToman, CancellationToken token = default) =>
         AdmitCoreAsync(order, admissionKey, new WalletQuoteAdmission(quoteId, messageId, selectionKey, grossToman, baseCostToman), token);
@@ -90,7 +112,7 @@ public sealed class TenantCustomerWalletFunding
     /// <param name="quote">Exact bound quote and fresh tariff, or null for legacy flow.</param>
     /// <param name="token">Cancellation of local users.db work.</param>
     /// <returns>Persisted order and its original wallet charge identity.</returns>
-    /// <remarks>Writes are committed once with any discount redemption; credentials.db is not accessed here.</remarks>
+    /// <remarks>Writes are committed once with any discount redemption. Live global sale/renewal permission is re-read before new admission and final staging; committed-receipt recovery is separate. Credentials.db is not accessed here.</remarks>
     /// <exception cref="InvalidOperationException">The store, method, selection, price or claim changed.</exception>
     /// <exception cref="ArgumentException">The admission key or wallet sale identity is invalid.</exception>
     private Task<TenantBotOrder> AdmitCoreAsync(TenantBotOrder order, string admissionKey,
@@ -136,6 +158,7 @@ public sealed class TenantCustomerWalletFunding
                     throw new InvalidOperationException("Wallet discount claim was released.");
                 return existing;
             }
+            EnsureSalesAdmission(order);
             if (order.Id > 0)
             {
                 var candidate = await db.TenantBotOrders.SingleAsync(x => x.Id == order.Id, ct);
@@ -166,6 +189,7 @@ public sealed class TenantCustomerWalletFunding
             }
             order.PaymentProvider = "wallet";
             order.CustomerWalletAdmissionKey = admissionKey;
+            EnsureSalesAdmission(order);
             order.CustomerWalletState = "admitted";
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
@@ -179,8 +203,8 @@ public sealed class TenantCustomerWalletFunding
     /// <param name="freshGrossToman">Current gross tariff for a discounted order; must match its original snapshot before any debit.</param>
     /// <param name="freshBaseCostToman">Current colleague base for a discounted order; must match its original snapshot.</param>
     /// <returns>True when the exact debit receipt exists; false when no receipt was created or the order is terminal.</returns>
-    /// <remarks>The caller supplies fresh gross/base for an unpaid discounted order. After the first frozen debit attempt, retries can only reconcile an immutable receipt; insufficient funds terminate that order, while uncertain outcomes retain its claim.</remarks>
-    /// <exception cref="InvalidOperationException">Persisted admission, fresh approval or receipt parameters do not match.</exception>
+    /// <remarks>The caller supplies fresh gross/base for an unpaid discounted order. Global closure blocks a first debit, not reconciliation of an exact committed receipt. After the first frozen debit attempt, retries can only reconcile immutable receipt evidence; insufficient funds terminate that order, while uncertain outcomes retain its claim.</remarks>
+    /// <exception cref="InvalidOperationException">A first debit is globally closed or lacks its policy, or persisted admission, fresh approval or receipt parameters do not match.</exception>
     /// <example><code>bool paid = await funding.DebitAsync(admitted, token, freshGrossToman: gross, freshBaseCostToman: baseCost);</code></example>
     public async Task<bool> DebitAsync(TenantBotOrder order, CancellationToken token = default,
         long? freshGrossToman = null, long? freshBaseCostToman = null)
@@ -205,8 +229,21 @@ public sealed class TenantCustomerWalletFunding
             var store = await db.BotInstances.AsNoTracking().SingleOrDefaultAsync(x => x.Id == order.TenantBotId, token);
             if (!TenantCustomerWalletPolicy.IsApproved(store)) throw new InvalidOperationException("Wallet admission was revoked.");
         }
+        // Immutable debit evidence was reconciled above. A pending admission/insufficient balance is not
+        // grandfathered money, so re-read the global operation before claiming or touching either wallet.
+        EnsureSalesAdmission(order);
+        DateTime? claimAtUtc = null;
         if (order.DiscountInvoiceAttemptState != null)
-            await ClaimFrozenWalletDebitAsync(order, token);
+            claimAtUtc = await ClaimFrozenWalletDebitAsync(order, token);
+        try { EnsureSalesAdmission(order); }
+        catch (InvalidOperationException)
+        {
+            // This invocation owns the unique first claim and has not called credentials.db at all.
+            // Undo only that exact unused claim, not a receipt/refund or an ambiguous debit attempt.
+            if (claimAtUtc.HasValue)
+                await ReleaseUnspentClosedWalletClaimAsync(order.Id, claimAtUtc.Value, CancellationToken.None);
+            throw;
+        }
         WalletOperation receipt;
         try
         {
@@ -237,9 +274,9 @@ public sealed class TenantCustomerWalletFunding
     /// <summary>Locks a quote-admitted purchase or discounted renewal to its first wallet debit before touching credentials.db.</summary>
     /// <param name="order">Persisted wallet order with an unstarted frozen payment attempt.</param>
     /// <param name="token">Cancellation of the users.db write.</param>
-    /// <returns>A completed lock transition; no wallet mutation has happened yet.</returns>
-    /// <remarks>Only the first claimant may attempt the debit; later callbacks reconcile immutable receipt evidence instead.</remarks>
-    private Task ClaimFrozenWalletDebitAsync(TenantBotOrder order, CancellationToken token) =>
+    /// <returns>The exact UTC claim instant identifying this invocation; no wallet mutation has happened yet.</returns>
+    /// <remarks>Only the first claimant may attempt the debit. A closure before credentials.db is called releases only this unspent claim; started/ambiguous money attempts and committed receipts are never reset.</remarks>
+    private Task<DateTime> ClaimFrozenWalletDebitAsync(TenantBotOrder order, CancellationToken token) =>
         SqliteOperation.RunAsync(async ct =>
         {
             await using var db = _users.CreateDbContext();
@@ -251,12 +288,31 @@ public sealed class TenantCustomerWalletFunding
                 || (row.TenantDiscountCodeId.HasValue && !await db.TenantDiscountRedemptions.AnyAsync(x => x.TenantBotOrderId == row.Id
                     && x.CodeId == row.TenantDiscountCodeId && x.State == TenantDiscountRedemptionStates.Reserved, ct)))
                 throw new InvalidOperationException("Wallet debit attempt is already started or the discount claim is unavailable.");
+            EnsureSalesAdmission(row);
             row.DiscountInvoiceAttemptState = "started";
-            row.DiscountInvoiceAttemptedAtUtc = DateTime.UtcNow;
+            var claimAtUtc = DateTime.UtcNow;
+            row.DiscountInvoiceAttemptedAtUtc = claimAtUtc;
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
-            return 0;
+            return claimAtUtc;
         }, token);
+
+    /// <summary>Restores only this invocation's frozen claim when global closure prevented any wallet call.</summary>
+    /// <param name="orderId">Persisted users.db order claimed by this invocation.</param>
+    /// <param name="claimAtUtc">Exact stored UTC instant returned by the unique first-claim transaction.</param>
+    /// <param name="token">Cancellation of the short local reset; callers use an uncancelled token after denial.</param>
+    /// <returns>A task completing after the guarded reset; the original discount reservation and quote remain intact.</returns>
+    /// <remarks>Call exclusively before the wallet API is invoked. Never use for timeout, insufficient funds, existing receipts or recovery, because those outcomes have different financial evidence.</remarks>
+    /// <example><code>await ReleaseUnspentClosedWalletClaimAsync(order.Id, claimAtUtc, CancellationToken.None);</code></example>
+    private async Task ReleaseUnspentClosedWalletClaimAsync(int orderId, DateTime claimAtUtc, CancellationToken token)
+    {
+        await using var db = _users.CreateDbContext();
+        await db.TenantBotOrders.Where(row => row.Id == orderId && row.PaymentProvider == "wallet"
+            && row.CustomerWalletState == "admitted" && row.DiscountInvoiceAttemptState == "started"
+            && row.DiscountInvoiceAttemptedAtUtc == claimAtUtc && row.PaidAtUtc == null)
+            .ExecuteUpdateAsync(set => set.SetProperty(row => row.DiscountInvoiceAttemptState, "none")
+                .SetProperty(row => row.DiscountInvoiceAttemptedAtUtc, (DateTime?)null), token);
+    }
 
     /// <summary>Holds a frozen wallet order after uncertain cross-database debit; only persisted wallet evidence resolves it.</summary>
     /// <param name="orderId">Wallet order with a started local attempt.</param>

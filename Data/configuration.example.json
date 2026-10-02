@@ -7,11 +7,17 @@
     "NEVER prune or rebuild a production configuration.json from this file. Never run: jq '{keys copied from this example}' production/configuration.json > new-file",
     "Configuration changes must be additive and targeted: add or edit only the keys you intend to change, and keep everything else exactly as it is.",
     "Telegram destination format for loggerChannel and backupChannel: a numeric chat id such as -1001234567890, or an @username. A blank value and the numeric 0 both mean 'not configured'.",
-    "The application validates configuration at startup (Domain/ConfigurationPreflight.cs) and NEVER reads, rewrites, or prunes a configuration file. See docs/deployment.md, section 'Configuration change safety'."
+    "Startup ConfigurationPreflight never reads, rewrites, or prunes a configuration file. Authorized runtime admin controls update only their exact root booleans in the existing writable configuration.json, preserving unrelated bytes. See docs/deployment.md, section 'Configuration change safety'."
   ],
   "adminsUserIds": [],
   "tenantMaxStoresPerOwner": 5,
   "colleagueDailyFreeTrialLimit": 3,
+  "normalSaleEnabled": true,
+  "normalRenewalEnabled": true,
+  "nationalSaleEnabled": true,
+  "nationalRenewalEnabled": true,
+  "unlimitedSaleEnabled": true,
+  "unlimitedRenewalEnabled": true,
   "gozargahSiteSyncRetentionDays": 30,
   "tenantOrderNotificationRetentionDays": 30,
   "tenantMinimumSiteWalletToman": 200000,

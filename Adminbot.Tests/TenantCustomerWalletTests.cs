@@ -299,7 +299,11 @@ public sealed partial class ConcurrencyTests
                 TenantCustomerWalletApprovedOwnerId = 456, TenantCustomerWalletApprovedBotId = 789 });
             await db.SaveChangesAsync();
         }
-        var funding = new TenantCustomerWalletFunding(databases.Users, wallet, new WalletLedgerService(databases.Users, wallet));
+        var sales = new ServiceSalesAvailabilityService(new AppConfig(),
+            System.IO.Path.Combine(System.IO.Path.GetTempPath(), "tenant-wallet-fixture-policy.json"),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ServiceSalesAvailabilityService>.Instance);
+        var funding = new TenantCustomerWalletFunding(databases.Users, wallet, new WalletLedgerService(databases.Users, wallet),
+            salesAvailability: sales);
         var order = await funding.AdmitAsync(new TenantBotOrder { TenantBotId = "tenant-a", OwnerTelegramUserId = 456,
             CustomerTelegramUserId = 123, CustomerChatId = 123, OrderId = "fixture-order", OrderKind = TenantBotOrderKinds.Purchase,
             SalePriceToman = 100_000, BaseCostToman = 80_000, ProfitToman = 20_000, ServiceKey = "normal", AccountCount = 1 }, "fixture-admission");
