@@ -42,7 +42,7 @@
     <None Include="Assets\Fonts\OFL.txt"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
-    <!-- Built-in tenant installation tutorial images. These are ordinary publish files, deliberately not embedded
+    <!-- Built-in installation tutorial images shared by owned and tenant bots. These are ordinary publish files, deliberately not embedded
          resources, so they travel to production through the normal CI publish artifact and can be inspected or replaced
          on the host without rebuilding. `Update` (not `Include`) is required: the SDK already globs these files into the
          None item group, and including them twice would produce duplicate-item build errors. Deployment refuses to

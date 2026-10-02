@@ -6,7 +6,7 @@ using System.Linq;
 namespace Adminbot.Services
 {
     /// <summary>
-    /// Identifies one built-in installation tutorial that a tenant storefront customer can request.
+    /// Identifies one built-in installation tutorial that an owned-bot or tenant-storefront customer can request.
     /// </summary>
     /// <remarks>
     /// These are compile-time constants rather than free-form values because they are the only thing an incoming
@@ -90,14 +90,14 @@ namespace Adminbot.Services
     }
 
     /// <summary>
-    /// Resolves built-in tenant installation-tutorial image sets from the application's deployed asset directory.
+    /// Resolves built-in installation-tutorial image sets shared by owned bots and tenant storefronts.
     /// </summary>
     /// <remarks>
     /// <para>
     /// This service exists so that tutorial assets are described in exactly one place. It maps a closed set of tutorial
     /// kinds to fixed directories, enumerates only Telegram-compatible image files, sorts them in natural step order, and
-    /// reports availability. It performs no Telegram I/O and no database work, and it never reads tenant configuration:
-    /// customer tutorials are built in, not owner-configured.
+    /// reports availability. It performs no Telegram I/O and no database work, and it never reads per-bot tutorial URLs:
+    /// owned and tenant customer tutorials share the same built-in images, not owner-configured links.
     /// </para>
     /// <para>
     /// Asset resolution is deliberately independent of the process current working directory. The root is derived from

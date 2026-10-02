@@ -1209,21 +1209,26 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   for production options, the read-only backup snapshot, and the shared-cache outbox, and the fixture directory delete
   then failed with `IOException: The process cannot access the file ... because it is being used by another process`.
   Fixture connections declare `Pooling=false`, and the helper refuses any directory outside the OS temp root.
-- **Tenant storefront installation tutorials are built in, not owner-configured.** Three fixed photo albums ship
+- **Owned and tenant installation tutorials share the same built-in photo albums, not configured URLs.** Three albums ship
   under `Assets/tutorials/` (`android_v2rayng`, `windows_v2rayn`, `ios_android_v2box`). The original numbered
   instructional slides remain PNG without lossy recompression; the six-slide iOS album is about 8.19 MiB. A clean
   publish directory must contain exactly one version of each slide: leftover JPEG copies would be uploaded as
   duplicate steps because the resolver also accepts JPEG.
-  `Services/TenantTutorialAssetService.cs` owns the closed kind set (`TenantTutorialKinds.android|ios|windows`),
+  `Services/TenantTutorialAssetService.cs` owns the closed kind set (`TenantTutorialKinds.Android|Ios|Windows`),
   directory mapping, supported formats (`.jpg/.jpeg/.png`, case-insensitive; `.webp` excluded), natural step ordering,
   and batching. `Services/TenantTutorialAlbumSender.cs` uploads each batch as a real Telegram media group (at most
   10 items; caption on the first slide of the first group only); a single image uses `SendPhoto`. Streams open per
   batch and are disposed when its request finishes.
-  The customer menu is reached by the existing `راهنما نصب` / `💡راهنما نصب`
-  aliases and by the callbacks `TN:tutorial:android`, `TN:tutorial:ios`, `TN:tutorial:windows`; the callback payload
-  can only select one of the three compile-time kinds, never a path or another bot. Requesting a tutorial writes nothing
-  to users.db (the callback branch deliberately does not clear conversation state, so an in-progress purchase survives),
-  and the menu never reads `TenantTutorialsJson`. Owner configuration is disabled: the `🎓 آموزش‌ها` button is no longer
+  Tenant customers retain `راهنما نصب` / `💡راهنما نصب` and `TN:tutorial:android|ios|windows`.
+  Owned navigation lives in `Services/TelegramBotService.Tutorials.cs`: `⚙️ مدیریت اکانت` → `📚 آموزش‌های متفرقه`
+  → `💡راهنما نصب` → Android/iOS/Windows choices; neither tutorial action appears on the owned home keyboard.
+  `owned:tutorial:android|ios|windows` uploads the same original files; `owned:tutorial:back` returns to miscellaneous
+  tutorials. Tutorial/account-parent navigation precedes purchase/APN text handling and preserves the active
+  bot/user conversation; callbacks acknowledge before file I/O. Tutorial handlers perform no financial writes and
+  accept only closed platform kinds, never paths or configured URLs. Normal dispatcher profile/last-seen touches
+  remain unchanged. Tenant routing runs before owned tutorial callbacks, preserving namespace isolation.
+  The menus do not read legacy per-bot platform URLs or `TenantTutorialsJson`. Tenant owner configuration is disabled:
+  the `🎓 آموزش‌ها` button is no longer
   rendered, and stale `TBM:tutorials` / `TBM:tutorial-add` / `TBM:tutorial-del:*` callbacks and obsolete
   `tutorial-title` / `tutorial-url` input steps answer with a "disabled" notice and write nothing.
   **`TenantTutorialsJson` is preserved, not dropped or cleared** — the column, its historical migration, and existing

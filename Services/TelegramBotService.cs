@@ -253,9 +253,6 @@ public partial class TelegramBotService
     private string CurrentSupportAccount => CurrentBot != null
         ? CurrentBot.SupportAccount
         : _appConfig.SupportAccount;
-    private string[] CurrentIosTutorial => CurrentBot?.IosTutorial ?? _appConfig.IosTutorial;
-    private string[] CurrentAndroidTutorial => CurrentBot?.AndroidTutorial ?? _appConfig.AndroidTutorial;
-    private string[] CurrentWindowsTutorial => CurrentBot?.WindowsTutorial ?? _appConfig.WindowsTutorial;
     private string CurrentNowPaymentsSuccessUrl => CurrentBot?.BuildTelegramStartUrl("payment_success") ?? _appConfig.NowpaymentSuccessUrl;
     private string CurrentNowPaymentsCancelUrl => CurrentBot?.BuildTelegramStartUrl("payment_cancel") ?? _appConfig.NowpaymentCancelUrl;
     private string CurrentHooshPayReturnUrl => CurrentBot?.BuildTelegramStartUrl("payment_success") ?? _appConfig.HooshPayReturnUrl;
@@ -855,12 +852,15 @@ public partial class TelegramBotService
     /// menu can be displayed. Reset never mutates credentials, wallet balances, ledgers, payments, orders, referrals,
     /// XUI accounts, or another bot's state. Known payment and referral start payloads continue through their existing
     /// handlers after the transient reset.
+    /// Owned installation callbacks use the shared built-in tenant image albums and acknowledge before upload;
+    /// tutorial platform/parent navigation never clears the requesting bot/user's active conversation.
     /// </remarks>
     /// <example>
     /// <code>
     /// await HandleUpdateCoreAsync(botClient, update, cancellationToken);
     /// </code>
     /// </example>
+    /// <exception cref="OperationCanceledException">The current update is cancelled during Telegram, state or external-service work.</exception>
     private async Task HandleUpdateCoreAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
         if (_salesAssistantService.IsAssistantBot)
@@ -907,6 +907,10 @@ public partial class TelegramBotService
                 await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, callbackCredUser, callbackUserState, cancellationToken);
                 return;
             }
+
+            // Tutorial callbacks are owned-only presentation; tenant routing above keeps storefront navigation isolated.
+            if (await TryHandleOwnedTutorialCallbackAsync(botClient, callbackQuery, cancellationToken))
+                return;
 
             // Apple APN callback actions are admitted only after the same owned-bot mandatory-join gate as normal
             // customer messages. A best-effort ACK may run first because it grants no access and performs no profile action.
@@ -6081,12 +6085,16 @@ public partial class TelegramBotService
     /// Trial entry displays «اکانت تست» while accepting the previous free-account button as an input alias.
     /// Active colleagues share the configured Tehran-day free-test quota across owned bots and can explicitly buy
     /// the same test at colleague rates after exhausting it.
+    /// Account management contains miscellaneous tutorials, then installation guidance with Android/iOS/Windows
+    /// image choices. These navigation actions run before purchase/APN text handling and preserve that bot/user state.
     /// </remarks>
     /// <example>
     /// <code>
     /// await HandleUpdateRegularUsers(botClient, update, cancellationToken);
     /// </code>
     /// </example>
+    /// <exception cref="OperationCanceledException">The current owned update is cancelled during Telegram, state or external-service work.</exception>
+    /// <exception cref="TelegramForegroundDeliveryTimeoutException">An interactive menu exceeds its foreground delivery budget without automatic resend.</exception>
     private async Task HandleUpdateRegularUsers(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
 
@@ -6191,6 +6199,16 @@ public partial class TelegramBotService
                 chatId: message.Chat.Id,
                 text: "پس از عضویت روی دکمه زیر کلیک کنید.",
                 replyMarkup: replyKeyboardMarkup);
+            return;
+        }
+
+        // Educational navigation must win over pending purchase/APN input without discarding that bot/user state.
+        if (await TryHandleOwnedTutorialMessageAsync(botClient, message, cancellationToken))
+            return;
+        if (message.Text == "⚙️ مدیریت اکانت")
+        {
+            await botClient.SendMessage(message.Chat.Id, "یک گزینه را انتخاب نمائید.",
+                replyMarkup: BuildOwnedAccountManagementKeyboard(credUser), cancellationToken: cancellationToken);
             return;
         }
 
@@ -6570,120 +6588,6 @@ public partial class TelegramBotService
 
         }
 
-        else if (message.Text.Contains("راهنما"))
-        {
-
-            await _state.ClearUserStatus(new User { Id = message.From.Id });
-            var rkm = new ReplyKeyboardMarkup(new[]
-                {
-                    new KeyboardButton[] { "راهنمای اپل 📱" },
-                    new KeyboardButton[] { "راهنمای اندروید 📱" },
-                    new KeyboardButton[] { "راهنمای ویندوز 💻" }
-                })
-            {
-                ResizeKeyboard = true, // Optional: to fit the keyboard to the button sizes
-                OneTimeKeyboard = true // Optional: to hide the keyboard after a button is pressed
-            };
-            if (message.Text == "💡راهنما نصب")
-            {
-
-                await botClient.CustomSendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: "منوی راهنما",
-                    replyMarkup: rkm);
-                return;
-            }
-            else if (message.Text == "راهنمای اپل 📱")
-            {
-                List<InlineKeyboardButton[]> rows = (CurrentIosTutorial ?? Array.Empty<string>()).Select((url, index) => new InlineKeyboardButton[]
-                    {
-                        InlineKeyboardButton.WithUrl(GetTutorialButtonText(index), url)
-                    }).ToList();
-
-                // Create the InlineKeyboardMarkup
-                InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows);
-
-                await ActiveBotClient.CustomSendTextMessageAsync(chatId: message.Chat.Id,
-                     text: "برای دریافت آموزش روی دکمه زیر کلیک کنید.",
-                     replyMarkup: inlineKeyboard);
-
-
-                // foreach (var item in _appConfig.IosTutorial)
-                // {
-                // var forwardMessage = GetChannelAndPost(item);
-                // await ActiveBotClient.CustomForwardMessage(chatId: message.Chat.Id,
-                // fromChatId: forwardMessage.ChannelName,
-                // messageId: forwardMessage.PostNumber);
-
-
-                // }
-            }
-            else if (message.Text == "راهنمای اندروید 📱")
-            {
-                List<InlineKeyboardButton[]> rows = (CurrentAndroidTutorial ?? Array.Empty<string>()).Select((url, index) => new InlineKeyboardButton[]
-                    {
-                        InlineKeyboardButton.WithUrl(GetTutorialButtonText(index), url)
-                    }).ToList();
-
-                // Create the InlineKeyboardMarkup
-                InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows);
-
-                await ActiveBotClient.CustomSendTextMessageAsync(chatId: message.Chat.Id,
-                     text: "برای دریافت آموزش روی دکمه زیر کلیک کنید.",
-                     replyMarkup: inlineKeyboard);
-
-                // foreach (var item in _appConfig.AndroidTutorial)
-                // {
-                //     var forwardMessage = GetChannelAndPost(item);
-                //     await ActiveBotClient.CustomForwardMessage(chatId: message.Chat.Id,
-                //     fromChatId: forwardMessage.ChannelName,
-                //     messageId: forwardMessage.PostNumber);
-                // }
-            }
-            else if (message.Text == "راهنمای ویندوز 💻")
-            {
-
-                List<InlineKeyboardButton[]> rows = (CurrentWindowsTutorial ?? Array.Empty<string>()).Select((url, index) => new InlineKeyboardButton[]
-                    {
-                        InlineKeyboardButton.WithUrl(GetTutorialButtonText(index), url)
-                    }).ToList();
-
-                // Create the InlineKeyboardMarkup
-                InlineKeyboardMarkup inlineKeyboard = new InlineKeyboardMarkup(rows);
-
-                await ActiveBotClient.CustomSendTextMessageAsync(chatId: message.Chat.Id,
-                     text: "برای دریافت آموزش روی دکمه زیر کلیک کنید.",
-                     replyMarkup: inlineKeyboard);
-
-                // foreach (var item in _appConfig.WindowsTutorial)
-                // {
-                //     var forwardMessage = GetChannelAndPost(item);
-                //     await ActiveBotClient.CustomForwardMessage(chatId: message.Chat.Id,
-                //     fromChatId: forwardMessage.ChannelName,
-                //     messageId: forwardMessage.PostNumber);
-                // }
-            }
-            else
-            {
-                await botClient.CustomSendTextMessageAsync(
-                              chatId: message.Chat.Id,
-                              text: "آموزش مورد نظر وجود ندارد",
-                              replyMarkup: MainReplyMarkupKeyboardFa());
-            }
-            await botClient.CustomSendTextMessageAsync(
-                              chatId: message.Chat.Id,
-                              text: "منوی اصلی",
-                              replyMarkup: MainReplyMarkupKeyboardFa());
-        }
-
-        else if (message.Text == "⚙️ مدیریت اکانت")
-        {
-            await botClient.CustomSendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: "یک گزینه را انتخاب نمائید.",
-                replyMarkup: BuildOwnedAccountManagementKeyboard(credUser),
-                parseMode: ParseMode.Markdown);
-        }
         else if (user.LastStep == "confirmation" && user.Flow == "charge")
         {
             await _state.ClearUserStatus(new User { Id = message.From.Id });
@@ -10196,15 +10100,6 @@ public partial class TelegramBotService
         return text;
     }
 
-    private static string GetTutorialButtonText(int index)
-    {
-        return index switch
-        {
-            0 => "آموزش نصب کانفیگ لینک",
-            1 => "آموزش نصب سابلینک",
-            _ => $"آموزش شماره {index + 1}"
-        };
-    }
 
     string[] GetPrices(bool isColleague, bool isForRenew)
     {
@@ -10302,6 +10197,8 @@ public partial class TelegramBotService
     /// <summary>Builds the owned-bot account-management submenu with stable two-column customer actions.</summary>
     /// <param name="credUser">Current owned-bot customer; colleague status controls the lower management rows.</param>
     /// <returns>The reply keyboard shown after the customer opens account management.</returns>
+    /// <remarks>Miscellaneous tutorials are nested here; installation guidance and platform image albums are not exposed on the owned home keyboard. Rendering never alters customer state.</remarks>
+    /// <example><code>var keyboard = BuildOwnedAccountManagementKeyboard(currentProfile);</code></example>
     private ReplyKeyboardMarkup BuildOwnedAccountManagementKeyboard(CredUser credUser)
     {
         var rows = new List<KeyboardButton[]>
@@ -10309,6 +10206,7 @@ public partial class TelegramBotService
             new KeyboardButton[] { OwnedWalletViewAction, OwnedRenewAction },
             new KeyboardButton[] { OwnedMyConfigsAction, "🔎 جستجوی اکانت" },
         };
+        rows.Add(new KeyboardButton[] { OwnedTutorialsAction });
 
         if (_clientDownloadAvailability.Snapshot.Enabled)
             rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand, ClientDownloadCallbacks.OpenCommand });
@@ -10339,19 +10237,22 @@ public partial class TelegramBotService
     /// <remarks>
     /// The referral button is available only in owned routing. Tenant payment inquiry receives only /start,
     /// which reloads its fresh storefront menu and cannot expose owned wallet or referral navigation.
+    /// Owned customers reach miscellaneous tutorials through account management, then select an installation
+    /// platform there; neither educational entry appears on this home keyboard.
     /// </remarks>
+    /// <example><code>var keyboard = MainReplyMarkupKeyboardFa();</code></example>
     ReplyKeyboardMarkup MainReplyMarkupKeyboardFa()
     {
         if (BotContextAccessor.CurrentBotType == BotInstanceTypes.Tenant)
             return new ReplyKeyboardMarkup(new[] { new KeyboardButton[] { "/start" } }) { ResizeKeyboard = true };
-        // Latest-client download and iOS APN setup live under account management so the home keyboard stays compact.
-        // The download switch is re-read when that submenu is rendered; the APN generator itself is always locally available.
+        // Downloads, APN setup and miscellaneous tutorials live under account management; installation guidance is nested one level further.
+        // Availability is re-read when the account submenu is rendered. Tutorial assets are shared with tenant storefronts.
         var rows = new List<KeyboardButton[]>
         {
             new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
             new KeyboardButton[] { "📋 تعرفه‌ها", "📒 تراکنش‌های من" },
             new KeyboardButton[] { "⚙️ مدیریت اکانت", OwnedRenewAction },
-            new KeyboardButton[] { "🌟اکانت تست", "💡راهنما نصب" },
+            new KeyboardButton[] { "🌟اکانت تست" },
             new KeyboardButton[] { "🎁 دعوت از دوستان", "💻 ارتباط با ادمین" }
         };
 
@@ -10363,16 +10264,6 @@ public partial class TelegramBotService
         };
         return replyKeyboardMarkup;
 
-        // var buttons = new[]
-        // {
-        // new[] { "💳خرید اکانت جدید", "🏠منو","💻 ارتباط با ادمین" },
-        // new[] { "💡راهنما نصب", "🌟اکانت تست", "⚙️مدیریت اکانت ها" }
-        // };
-
-        // var keyboardButtons = buttons
-        //     .Select(row => row.Select(buttonText => new KeyboardButton(buttonText)))
-        //     .ToArray();
-        // return new ReplyKeyboardMarkup(keyboardButtons, ResizeKeyboard = false);
     }
 
 

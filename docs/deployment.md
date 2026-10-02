@@ -76,15 +76,20 @@ service; a failing gate exits before the protected `Data` directory or systemd i
 preflight all precede synchronization, and synchronization precedes the restart) so the gate cannot be dropped or moved
 by a later edit on a machine without rsync or systemd.
 
-## Tenant installation tutorial assets
+## Shared owned and tenant installation tutorial assets
 
 `Assets/tutorials/{android_v2rayng,windows_v2rayn,ios_android_v2box}/` is application content, not persistent
 `Data` state. Publish and synchronize all three directories with the release. The original numbered PNG slides
 are retained without lossy recompression. Use a clean publish directory: old JPEG substitutes left beside the
 original PNGs would make the image resolver send duplicate steps, because it accepts both formats.
 
+Owned customers open `⚙️ مدیریت اکانت` → `📚 آموزش‌های متفرقه` → `💡راهنما نصب`, then select Android, iOS or Windows.
+Tenant customers retain their existing installation entry and platform chooser. Both routes upload the same original
+files; changing legacy per-bot tutorial URLs does not change these albums. Viewing guides preserves pending
+purchase/APN input and does not create a purchase or change a wallet.
+
 An album upload has a bounded 24-second foreground deadline; ordinary Telegram interaction still has eight seconds.
-If `Tenant tutorial album delivery failed` reports `send_media_group` timing out, check Telegram connectivity and the
+If `Installation tutorial album delivery failed` reports `send_media_group` timing out, check Telegram connectivity and the
 number/size of shipped slides before changing any bot configuration. A timeout is ambiguous (Telegram may already
 have received the group), so the application never re-sends it automatically. No database row stores tutorial progress
 or proves recipient delivery.

@@ -16,7 +16,7 @@ namespace Adminbot.Services
     /// <para>
     /// Albums, not separate messages: Telegram renders a media group as one swipeable slideshow, which is what an
     /// installation guide needs. This helper exists so that batching, caption placement, and file-stream lifetime are
-    /// handled in exactly one place instead of inside <c>TenantBotService</c>.
+    /// handled in exactly one place for both <c>TelegramBotService</c> and <c>TenantBotService</c>.
     /// </para>
     /// <para>
     /// The helper performs no database work and touches no customer, order, wallet, XUI, or tenant configuration state.
@@ -32,7 +32,7 @@ namespace Adminbot.Services
         /// <summary>
         /// Sends every image of one tutorial as one or more Telegram photo albums.
         /// </summary>
-        /// <param name="botClient">Tenant bot client that serves the requesting customer.</param>
+        /// <param name="botClient">Required owned or tenant bot client serving the original requesting customer.</param>
         /// <param name="chatId">Customer chat that requested the tutorial.</param>
         /// <param name="assets">
         /// Resolved image set for one tutorial. Must be available; callers handle the unavailable case separately so the
@@ -62,6 +62,8 @@ namespace Adminbot.Services
         /// on every slide.
         /// </para>
         /// </remarks>
+        /// <exception cref="ArgumentNullException">The bot transport is missing.</exception>
+        /// <exception cref="OperationCanceledException">The caller cancels an upload; opened streams are still disposed.</exception>
         /// <example>
         /// <code>
         /// var assets = TenantTutorialAssetService.Resolve(TenantTutorialKinds.Android);
@@ -103,7 +105,7 @@ namespace Adminbot.Services
         /// <summary>
         /// Sends one already-batched slice of a tutorial as either a single photo or one media group.
         /// </summary>
-        /// <param name="botClient">Tenant bot client that serves the requesting customer.</param>
+        /// <param name="botClient">Owned or tenant bot client serving the original requesting customer.</param>
         /// <param name="chatId">Customer chat that requested the tutorial.</param>
         /// <param name="batch">One to ten ordered absolute image paths.</param>
         /// <param name="caption">Caption for this batch, or <c>null</c> when the batch carries no caption.</param>
@@ -116,6 +118,7 @@ namespace Adminbot.Services
         /// handles. The failure log records only the tutorial kind, the relative directory, and the batch size; it never
         /// records an absolute server path or a raw Telegram response.
         /// </remarks>
+        /// <exception cref="OperationCanceledException">The caller cancels this upload; no automatic retry occurs.</exception>
         private static async Task<bool> SendBatchAsync(
             ITelegramBotClient botClient,
             ChatId chatId,
@@ -172,7 +175,7 @@ namespace Adminbot.Services
                 // Local operational log only. Absolute paths and raw provider payloads are deliberately not logged, and
                 // this never reaches the Telegram logger channel, so an outage cannot recursively amplify itself.
                 logger?.LogWarning(ex,
-                    "Tenant tutorial album delivery failed. kind={TutorialKind}, dir={RelativeDirectory}, images={ImageCount}",
+                    "Installation tutorial album delivery failed. kind={TutorialKind}, dir={RelativeDirectory}, images={ImageCount}",
                     assets.Kind,
                     assets.RelativeDirectory,
                     batch.Count);
