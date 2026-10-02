@@ -14535,15 +14535,18 @@ public partial class TenantBotService
     /// <summary>
     /// Verifies that the tenant bot can access and administer its configured forced-join channels.
     /// </summary>
-    /// <param name="tenant">Tenant bot whose token identity and tenant-scoped channel list are validated.</param>
-    /// <param name="CancellationToken">Token that cancels the bounded Telegram capability probe.</param>
-    /// <returns>An activation result containing an actionable Persian owner-facing error when validation fails.</returns>
+    /// <param name="tenant">Required owner-authorized tenant row, including a currently disabled storefront, whose own token and channels are probed.</param>
+    /// <param name="CancellationToken">Token that cancels the bounded Telegram capability probe before activation can proceed.</param>
+    /// <returns>True with no error only when the tenant bot can administer every channel; otherwise false with an owner-safe Persian explanation.</returns>
     /// <remarks>
     /// The check uses the tenant bot token, not the default owned bot. It verifies bot identity, channel access,
     /// administrator-list access, and that the tenant bot itself is an administrator. It deliberately never probes
     /// <c>OwnerTelegramUserId</c>: owner membership is unrelated to the bot capability used later for customers.
+    /// The pre-activation transport allows a disabled storefront to be checked without enabling it, starting a receiver,
+    /// or weakening ordinary delivery guards. Only the authorized owner setting/activation workflows call this method.
     /// Successful and failed outcomes retain the existing tenant/token/channel-scoped cache lifetimes.
     /// </remarks>
+    /// <example><code>var validation = await VALIDATETENANTMANDATORYJOINASYNC(tenant, cancellationToken);</code></example>
     private async Task<(bool ISVALID, string ErrorMessage)> VALIDATETENANTMANDATORYJOINASYNC(BotInstance tenant, CancellationToken CancellationToken)
     {
         var Channels = GETTENANTCHANNELIDS(tenant).ToList();
@@ -14560,7 +14563,7 @@ public partial class TenantBotService
         string activeChannel = null;
         try
         {
-            var client = _botClientProvider.GetClient(tenant.Id);
+            var client = _botClientProvider.GetClientForCapabilityProbe(tenant.Id);
             using var probeCts = CreateTenantTelegramProbeCancellation(CancellationToken);
             var me = await client.GetMe(probeCts.Token);
             foreach (var channel in Channels)

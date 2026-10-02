@@ -62,8 +62,14 @@ public partial class TenantBotService
     /// <param name="action">Decoded short p: action; it is not an authorization grant.</param>
     /// <param name="token">Cancellation of state, catalog, database and Telegram operations.</param>
     /// <returns>A task after replying with an edit prompt, result or owner-only pricing menu.</returns>
-    /// <remarks>Store membership and revision are checked again before committing. Cancel discards only unsaved owner state.</remarks>
+    /// <remarks>
+    /// Store membership and revision are checked again before committing. Cancel discards only unsaved owner state.
+    /// Validation details remain complete in the pricing message; explanations over Telegram's 200-character callback
+    /// limit use a short alert instead. An incomplete manual draft never changes the active storefront pricing mode.
+    /// </remarks>
     /// <example><code>await HandleOwnerPricingCallbackAsync(client, callback, owner, state, "p:open", token);</code></example>
+    /// <exception cref="OperationCanceledException">The owner update is cancelled during state, database or Telegram work.</exception>
+    /// <exception cref="Telegram.Bot.Exceptions.ApiRequestException">Telegram rejects the pricing message or editor update.</exception>
     private async Task HandleOwnerPricingCallbackAsync(ITelegramBotClient client, CallbackQuery callback,
         CredUser owner, User state, string action, CancellationToken token)
     {
@@ -184,7 +190,9 @@ public partial class TenantBotService
             }
             else error = "این دکمه قدیمی یا نامعتبر است؛ ویرایشگر را دوباره باز کنید.";
         }
-        await SafeAnswerCallbackQueryAsync(client, callback.Id, error, showAlert: error != null, cancellationToken: token);
+        // Missing-plan lists can exceed answerCallbackQuery's limit; retain every detail in the editor, not the alert.
+        var alert = error?.Length > 200 ? "خطای قیمت‌گذاری؛ جزئیات کامل را در پیام قیمت‌گذاری ببینید." : error;
+        await SafeAnswerCallbackQueryAsync(client, callback.Id, alert, showAlert: error != null, cancellationToken: token);
         await ShowPricingDraftAsync(client, chat, messageId, store, draft, catalog, error, token);
     }
 

@@ -310,6 +310,10 @@ public sealed class BotTransportUnavailableException : InvalidOperationException
 /// <summary>
 /// Lazily creates and caches TelegramBotClient instances per BotId.
 /// </summary>
+/// <remarks>
+/// Runtime delivery refuses disabled tenants. An explicitly owner-authorized activation capability probe can resolve
+/// the exact disabled tenant's transport without enabling its storefront or registering a receiver.
+/// </remarks>
 public class BotClientProvider
 {
     private readonly BotRegistry _registry;
@@ -384,8 +388,37 @@ public class BotClientProvider
     public ITelegramBotClient GetClient(string botId, long expectedTelegramBotId)
         => GetClientCore(botId, expectedTelegramBotId);
 
-    /// <summary>Resolves one transport while optionally binding it to an immutable Telegram bot identity.</summary>
-    private ITelegramBotClient GetClientCore(string botId, long? expectedTelegramBotId)
+    /// <summary>Resolves an exact bot transport for read-only capability checks before a tenant is enabled.</summary>
+    /// <param name="botId">
+    /// Required persisted internal bot id selected by an authorized owner workflow, not a Telegram bot, user or chat id.
+    /// Empty ids are rejected rather than falling back to the default owned bot.
+    /// </param>
+    /// <returns>The shared client for that bot's configured token; the caller must not dispose it or use it for delivery.</returns>
+    /// <remarks>
+    /// Use only for bounded identity and channel-capability lookups after ownership has been checked. Disabled tenants
+    /// are allowed solely for this pre-activation path; ordinary and historical delivery still requires an enabled
+    /// tenant. This method changes neither registry settings nor receiver state, and never substitutes another bot.
+    /// </remarks>
+    /// <exception cref="ArgumentException">The internal bot id is null, empty or whitespace.</exception>
+    /// <exception cref="BotTransportUnavailableException">The exact bot is missing or has no configured token.</exception>
+    /// <exception cref="InvalidOperationException">The configured client factory returned no transport.</exception>
+    /// <example><code>var client = provider.GetClientForCapabilityProbe(tenant.Id);</code></example>
+    internal ITelegramBotClient GetClientForCapabilityProbe(string botId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(botId);
+        return GetClientCore(botId, expectedTelegramBotId: null, allowDisabledTenant: true);
+    }
+
+    /// <summary>Resolves one exact cached transport while preserving runtime availability and historical identity guards.</summary>
+    /// <param name="botId">Internal registry bot id; only ordinary default-bot callers may omit it.</param>
+    /// <param name="expectedTelegramBotId">Optional immutable BotFather numeric id captured by historical work.</param>
+    /// <param name="allowDisabledTenant">True only for an authorized pre-activation capability probe, never for delivery.</param>
+    /// <returns>The cached or newly created client belonging to the resolved registry bot; its lifetime remains shared.</returns>
+    /// <remarks>Availability and identity are checked before reading the cache, so a prior probe cannot unlock delivery.</remarks>
+    /// <exception cref="BotTransportUnavailableException">The bot, token, enabled state or required identity is unavailable.</exception>
+    /// <exception cref="InvalidOperationException">The configured client factory returned no transport.</exception>
+    /// <example><code>var client = GetClientCore(botId, expectedTelegramBotId);</code></example>
+    private ITelegramBotClient GetClientCore(string botId, long? expectedTelegramBotId, bool allowDisabledTenant = false)
     {
         var requestedBotId = botId?.Trim();
         var bot = _registry.GetById(requestedBotId);
@@ -396,7 +429,8 @@ public class BotClientProvider
         }
 
         if (bot == null || string.IsNullOrWhiteSpace(bot.Token) ||
-            (string.Equals(bot.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) && !bot.Enabled))
+            (string.Equals(bot.Type, BotInstanceTypes.Tenant, StringComparison.OrdinalIgnoreCase) &&
+             !bot.Enabled && !allowDisabledTenant))
         {
             throw new BotTransportUnavailableException("bot_disabled_or_token_missing");
         }

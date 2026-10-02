@@ -65,6 +65,14 @@
   and shared sanitized `ReasonCode`, never exception payloads. Regressions: `TenantDiscountTests.cs`,
   `TenantOwnerTokenProbeTests.cs`, `TelegramSchedulerDiagnosticsTests.cs`; FIFO/concurrency unchanged.
 
+- Tenant activation/pricing fixes (2026-10-02): `BotClientProvider.GetClientForCapabilityProbe` resolves only an exact,
+  non-tokenless bot for authorized pre-activation reads, including disabled tenants. `GetClient` keeps enabled/identity
+  checks BEFORE cache access; a successful probe cannot enable delivery or register a receiver. Forced-join activation
+  uses this path so a disabled storefront can prove its own channel-administrator capability before being enabled.
+  Pricing errors longer than 200 characters use a short callback alert; the editor retains the complete diagnostics
+  and incomplete manual saves retain the draft and active pricing mode. Native Windows verification: two targeted
+  regressions, real-SDK isolated activation/pricing replay, and single-project Linux publish; no WSL or production DB writes.
+
 - Tenant storefront pricing: `BotInstance.TenantPricingMode` defaults to `percent` (zero markup
   charges the public catalog, positive markup charges colleague cost plus percentage; unlimited
   `TenantUsesUserPrice` retains public priority). `manual` instead prices normal GB/day, national
@@ -78,6 +86,8 @@
   Migration `20260929160000_AddTenantStorefrontPricingModes` changes only users.db and preserves
   legacy percent settings. Full storefront reset clears the manual fields; invalid-token cleanup
   preserves them. See `Adminbot.Tests/TenantPricingModesTests.cs` for real owner/customer callbacks.
+  Validation diagnostics can exceed `answerCallbackQuery`'s 200-character limit; keep full details in the editor,
+  not in the callback alert. Never hide missing rates or activate manual mode after a failed completeness check.
 
 - Tenant storefront discount codes: `Domain/TenantDiscount.cs`, `TenantDiscountService`, and
   `20260929150000_AddTenantDiscountCodes` add per-bot owner definitions, message-bound two-hour

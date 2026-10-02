@@ -9,8 +9,11 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Telegram.Bot;
 using Xunit;
 
+/// <summary>Protects exact storefront transports and durable historical business state across runtime changes.</summary>
 public sealed partial class ConcurrencyTests
 {
+    /// <summary>Allows pre-activation probes without unlocking ordinary or historical delivery for a disabled tenant.</summary>
+    /// <remarks>Regression: caching a probe client must not bypass the enabled-state guard or substitute the owned bot.</remarks>
     [Fact]
     public void Bot_client_provider_requires_exact_enabled_transport()
     {
@@ -22,11 +25,18 @@ public sealed partial class ConcurrencyTests
         var clients = new ConcurrentDictionary<string, StorefrontClient>(StringComparer.OrdinalIgnoreCase);
         var provider = new BotClientProvider(registry, bot => clients.GetOrAdd(bot.Id, _ => new StorefrontClient()));
 
-        Assert.Same(provider.GetDefaultClient(), provider.GetClient("main"));
-        Assert.Same(provider.GetClient("tenant-good"), provider.GetClient("TENANT-GOOD"));
+        provider.GetDefaultClient();
+        provider.GetClient("TENANT-GOOD");
         Assert.Throws<BotTransportUnavailableException>(() => provider.GetClient("missing"));
         Assert.Throws<BotTransportUnavailableException>(() => provider.GetClient("tenant-disabled"));
         Assert.Throws<BotTransportUnavailableException>(() => provider.GetClient("tenant-tokenless"));
+        provider.GetClientForCapabilityProbe("tenant-disabled");
+        Assert.False(registry.GetById("tenant-disabled").Enabled);
+        Assert.Throws<BotTransportUnavailableException>(() => provider.GetClient("tenant-disabled"));
+        Assert.Throws<BotTransportUnavailableException>(() => provider.GetClient("tenant-disabled", 20002));
+        Assert.Throws<BotTransportUnavailableException>(() => provider.GetClientForCapabilityProbe("missing"));
+        Assert.Throws<BotTransportUnavailableException>(() => provider.GetClientForCapabilityProbe("tenant-tokenless"));
+        Assert.Throws<ArgumentException>(() => provider.GetClientForCapabilityProbe(""));
         Assert.False(clients.ContainsKey("missing"));
     }
 

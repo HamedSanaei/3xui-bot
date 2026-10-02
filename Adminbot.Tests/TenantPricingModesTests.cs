@@ -15,7 +15,10 @@ public sealed partial class ConcurrencyTests
 {
     /// <summary>Owner edits remain drafts until complete; manual checkout and national/unlimited previews use saved sale rates.</summary>
     /// <returns>A task after owner/customer messages, quote admission, and persisted order and plan values are checked.</returns>
-    /// <remarks>Regression: missing plans, below-cost rates, changed catalog costs, and stale quotes must not admit a payment.</remarks>
+    /// <remarks>
+    /// Regression: missing plans, below-cost rates, changed catalog costs, and stale quotes must not admit a payment.
+    /// An incomplete draft must keep every staged rate and use an accepted callback alert within Telegram's 200-character limit.
+    /// </remarks>
     [Fact]
     public async Task Storefront_manual_prices_require_complete_owner_draft_and_charge_current_quote()
     {
@@ -39,21 +42,24 @@ public sealed partial class ConcurrencyTests
         {
             await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(store, "panel"));
             await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(store, "p:open"));
-            Assert.Contains(ownerClient.Texts, text => text.Contains("قیمت همکار") && text.Contains("قیمت مشتری") && text.Contains("GB") && text.Contains("روز") && text.Contains("پلن"));
             var nonce = JObject.Parse((await state.GetUserStatus(711)).OwnerPricingDraftJson!)["Nonce"]!.Value<string>()!;
             await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(store, $"p:r:ng:{nonce}"));
             await PricingOwnerTextAsync(provider, ownerClient, owner, state, "3499");
-            Assert.Contains(ownerClient.Texts, text => text.Contains("3,500") && text.Contains("قیمت همکار"));
             Assert.Null((await stores.ListAsync(711))[0].TenantNormalPricePerGbToman);
             foreach (var (key, amount) in new[] { ("ng", "4200"), ("nd", "600"), ("ig", "110000") })
             {
                 await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(store, $"p:r:{key}:{nonce}"));
                 await PricingOwnerTextAsync(provider, ownerClient, owner, state, amount);
             }
+            var answerCount = ownerClient.Answers.Count;
             await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(store, $"p:save:m:{nonce}"));
             Assert.Equal(TenantPricingModes.Percent, (await stores.ListAsync(711))[0].TenantPricingMode);
-            Assert.Contains(ownerClient.Texts, text => text.Contains("کامل نیست"));
+            var incompleteAlert = Assert.Single(ownerClient.Answers.Skip(answerCount));
+            Assert.InRange(incompleteAlert.Length, 1, 200);
             var draft = JObject.Parse((await state.GetUserStatus(711)).OwnerPricingDraftJson!);
+            Assert.Equal(4200, draft["NormalGb"]!.Value<long>());
+            Assert.Equal(600, draft["NormalDay"]!.Value<long>());
+            Assert.Equal(110000, draft["NationalGb"]!.Value<long>());
             var ordered = (JArray)draft["Plans"]!;
             for (var index = 0; index < ordered.Count; index++)
             {
