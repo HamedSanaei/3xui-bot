@@ -10219,47 +10219,51 @@ public partial class TelegramBotService
     private static InlineKeyboardMarkup BuildOwnedRenewStartKeyboard()
         => new(new[] { new[] { InlineKeyboardButton.WithCallbackData("اکانت های من", OwnedRenewMyAccountsCallback) } });
 
-    /// <summary>Builds the owned-bot account-management submenu with stable two-column customer actions.</summary>
-    /// <param name="credUser">Current owned-bot customer; colleague status controls the lower management rows.</param>
-    /// <returns>The reply keyboard shown after the customer opens account management.</returns>
-    /// <remarks>Miscellaneous tutorials are nested here; installation guidance and platform image albums are not exposed on the owned home keyboard. Rendering never alters customer state.</remarks>
+    /// <summary>Builds the owned-bot account-management submenu by packing eligible customer actions into two-column rows.</summary>
+    /// <param name="credUser">Owned-bot customer profile from the credentials store; colleague status enables owner management and account top-up actions. A null profile uses ordinary-customer visibility.</param>
+    /// <returns>A resized, one-time reply keyboard with two buttons per row; only the final row can contain one button when the visible action count is odd.</returns>
+    /// <remarks>
+    /// Reads the live global download switch on each render and applies customer-role visibility before grouping buttons,
+    /// preserving action order without leaving singleton rows between actions. This owned-bot menu reads no tenant settings
+    /// and never alters customer conversation state. Miscellaneous tutorials are nested here; installation guidance and
+    /// platform image albums are not exposed on the owned home keyboard.
+    /// </remarks>
     /// <example><code>var keyboard = BuildOwnedAccountManagementKeyboard(currentProfile);</code></example>
     private ReplyKeyboardMarkup BuildOwnedAccountManagementKeyboard(CredUser credUser)
     {
-        var rows = new List<KeyboardButton[]>
+        var isColleague = credUser?.IsColleague == true;
+        var buttons = new List<KeyboardButton>(13)
         {
-            new KeyboardButton[] { OwnedWalletViewAction, OwnedRenewAction },
-            new KeyboardButton[] { OwnedMyConfigsAction, "🔎 جستجوی اکانت" },
+            OwnedWalletViewAction, OwnedRenewAction,
+            OwnedMyConfigsAction, "🔎 جستجوی اکانت",
+            OwnedTutorialsAction, AppleMobileConfigText.MenuCommand
         };
-        rows.Add(new KeyboardButton[] { OwnedTutorialsAction });
 
+        // Apply visibility before pairing so optional actions cannot leave full-width rows in the middle.
         if (_clientDownloadAvailability.Snapshot.Enabled)
-            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand, ClientDownloadCallbacks.OpenCommand });
-        else
-            rows.Add(new KeyboardButton[] { AppleMobileConfigText.MenuCommand });
+            buttons.Add(ClientDownloadCallbacks.OpenCommand);
 
-        if (credUser?.IsColleague != true)
-            rows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "🤝 درخواست همکاری" });
-        else
-            rows.Add(new KeyboardButton[] { "حذف اکانت های منقضی", "📌 قابلیت‌های ربات" });
-
-        if (credUser?.IsColleague != true)
-            rows.Add(new KeyboardButton[] { "📌 قابلیت‌های ربات", "💳خرید اکانت جدید" });
-        else
+        buttons.Add("حذف اکانت های منقضی");
+        buttons.Add(isColleague ? "📌 قابلیت‌های ربات" : "🤝 درخواست همکاری");
+        if (!isColleague)
+            buttons.Add("📌 قابلیت‌های ربات");
+        buttons.Add("💳خرید اکانت جدید");
+        if (isColleague)
         {
-            rows.Add(new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" });
-            rows.Add(new KeyboardButton[] { TenantBotService.OwnerMenuButton });
+            buttons.Add("💰شارژ حساب کاربری");
+            buttons.Add(TenantBotService.OwnerMenuButton);
         }
 
-        rows.Add(new KeyboardButton[] { "منوی اصلی" });
-        return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true, OneTimeKeyboard = true };
+        buttons.Add("منوی اصلی");
+        return new ReplyKeyboardMarkup(buttons.Chunk(2)) { ResizeKeyboard = true, OneTimeKeyboard = true };
     }
 
     /// <summary>
     /// Builds the Persian owned-bot main keyboard or a minimal tenant return action after shared payment inquiry.
     /// </summary>
-    /// <returns>A resized reply keyboard whose final row is the single full-width main-menu button.</returns>
+    /// <returns>A resized reply keyboard with five two-button owned-menu rows, or the single tenant /start return action.</returns>
     /// <remarks>
+    /// Owned regular customers and colleagues share the same two-column home layout, including the final menu action.
     /// The referral button is available only in owned routing. Tenant payment inquiry receives only /start,
     /// which reloads its fresh storefront menu and cannot expose owned wallet or referral navigation.
     /// Owned customers reach miscellaneous tutorials through account management, then select an installation
@@ -10272,16 +10276,14 @@ public partial class TelegramBotService
             return new ReplyKeyboardMarkup(new[] { new KeyboardButton[] { "/start" } }) { ResizeKeyboard = true };
         // Downloads, APN setup and miscellaneous tutorials live under account management; installation guidance is nested one level further.
         // Availability is re-read when the account submenu is rendered. Tutorial assets are shared with tenant storefronts.
-        var rows = new List<KeyboardButton[]>
+        var rows = new[]
         {
             new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
             new KeyboardButton[] { "📋 تعرفه‌ها", "📒 تراکنش‌های من" },
             new KeyboardButton[] { "⚙️ مدیریت اکانت", OwnedRenewAction },
-            new KeyboardButton[] { "🌟اکانت تست" },
-            new KeyboardButton[] { "🎁 دعوت از دوستان", "💻 ارتباط با ادمین" }
+            new KeyboardButton[] { "🌟اکانت تست", "🎁 دعوت از دوستان" },
+            new KeyboardButton[] { "💻 ارتباط با ادمین", "🏠منو" }
         };
-
-        rows.Add(new KeyboardButton[] { "🏠منو" });
 
         ReplyKeyboardMarkup replyKeyboardMarkup = new(rows)
         {

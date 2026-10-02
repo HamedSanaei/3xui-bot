@@ -613,9 +613,10 @@ public sealed partial class ConcurrencyTests
         Assert.Contains(AppleMobileConfigText.MenuCommand, OwnedAccountManagementLabels(service, new CredUser()));
     }
 
-    /// <summary>The owned home keyboard exposes renewal directly and keeps account management at normal half width.</summary>
+    /// <summary>All owned home actions occupy paired rows, including the trial and return-to-menu actions.</summary>
+    /// <remarks>Regression: independently appended trial and home buttons left two full-width rows despite an even action count.</remarks>
     [Fact]
-    public void Owned_customer_keyboard_pairs_account_management_with_direct_renewal()
+    public void Owned_customer_keyboard_packs_all_actions_in_two_columns()
     {
         using var databases = new Databases();
         var service = BuildClientDownloadTelegramService(
@@ -625,40 +626,36 @@ public sealed partial class ConcurrencyTests
             new GatewayTelegramClient());
 
         var rows = OwnedKeyboardRows(service);
-        var accountRow = Assert.Single(rows, row => row.Contains("⚙️ مدیریت اکانت"));
-        Assert.Equal(2, accountRow.Length);
-        Assert.DoesNotContain(AppleMobileConfigText.MenuCommand, rows.SelectMany(row => row));
-        Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, rows.SelectMany(row => row));
-        Assert.Contains(TelegramBotService.OwnedRenewAction, accountRow);
-
-        var renewDetector = typeof(XuiV3BotFlowService).GetMethod(
-            "IsRenewCommand", BindingFlags.Static | BindingFlags.NonPublic)!;
-        Assert.True((bool)renewDetector.Invoke(null, new object[] { "تمدید اکانت" })!);
-        Assert.True((bool)renewDetector.Invoke(null, new object[] { TelegramBotService.OwnedRenewAction })!);
+        Assert.Equal(5, rows.Count);
+        Assert.All(rows, row => Assert.Equal(2, row.Length));
     }
 
-    /// <summary>The owned account-management submenu exposes the renamed wallet and configuration actions.</summary>
-    [Fact]
-    public void Owned_account_management_uses_wallet_and_my_configs_labels()
+    /// <summary>Account-management rows remain paired after role-specific and optional actions are selected.</summary>
+    /// <param name="isColleague">Whether the owned customer's credentials profile grants colleague-only account actions.</param>
+    /// <param name="downloadsEnabled">The live global download-menu visibility used while rendering the submenu.</param>
+    /// <param name="finalRowWidth">Expected final-row button count: one for an odd visible action count, otherwise two.</param>
+    /// <remarks>Regression: tutorial, APN and colleague owner-management rows stayed full-width even when later actions could complete them.</remarks>
+    [Theory]
+    [InlineData(false, false, 1)]
+    [InlineData(false, true, 2)]
+    [InlineData(true, false, 2)]
+    [InlineData(true, true, 1)]
+    public void Owned_account_management_packs_visible_actions_in_two_columns(
+        bool isColleague, bool downloadsEnabled, int finalRowWidth)
     {
         using var databases = new Databases();
         var service = BuildClientDownloadTelegramService(
             databases,
-            new ClientDownloadAvailabilityProbe(enabled: true),
+            new ClientDownloadAvailabilityProbe(enabled: downloadsEnabled),
             new CountingReleaseService(),
             new GatewayTelegramClient());
-        var rows = OwnedAccountManagementRows(service, new CredUser());
+        var rows = OwnedAccountManagementRows(service, new CredUser { IsColleague = isColleague });
+        var labels = rows.SelectMany(row => row);
 
-        Assert.Equal(new[] { TelegramBotService.OwnedWalletViewAction, TelegramBotService.OwnedRenewAction }, rows[0]);
-        Assert.Equal(new[] { TelegramBotService.OwnedMyConfigsAction, "🔎 جستجوی اکانت" }, rows[1]);
-        Assert.Contains(AppleMobileConfigText.MenuCommand, rows.SelectMany(x => x));
-        Assert.Contains(ClientDownloadCallbacks.OpenCommand, rows.SelectMany(x => x));
-        Assert.DoesNotContain(rows.SelectMany(x => x), x => x == "مشاهده وضعیت حساب" || x == "وضعیت اکانت های من");
-
-        var myAccountsDetector = typeof(XuiV3BotFlowService).GetMethod(
-            "IsMyAccountsCommand", BindingFlags.Static | BindingFlags.NonPublic)!;
-        Assert.True((bool)myAccountsDetector.Invoke(null, new object[] { TelegramBotService.OwnedMyConfigsAction })!);
-        Assert.True((bool)myAccountsDetector.Invoke(null, new object[] { "وضعیت اکانت های من" })!);
+        Assert.All(rows.Take(rows.Count - 1), row => Assert.Equal(2, row.Length));
+        Assert.Equal(finalRowWidth, rows[^1].Length);
+        Assert.Equal(isColleague, labels.Contains(TenantBotService.OwnerMenuButton));
+        Assert.Equal(downloadsEnabled, labels.Contains(ClientDownloadCallbacks.OpenCommand));
     }
 
     /// <summary>Both owned renewal entry paths expose the same inline account-list shortcut.</summary>

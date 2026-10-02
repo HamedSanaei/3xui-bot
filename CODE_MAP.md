@@ -1247,6 +1247,11 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   for production options, the read-only backup snapshot, and the shared-cache outbox, and the fixture directory delete
   then failed with `IOException: The process cannot access the file ... because it is being used by another process`.
   Fixture connections declare `Pooling=false`, and the helper refuses any directory outside the OS temp root.
+- **Owned customer keyboard layout:** `Services/TelegramBotService.cs` renders the home menu as five two-button rows
+  for both ordinary customers and colleagues. Account management applies role visibility and the live download switch
+  before `Chunk(2)` packing; only an odd final action may occupy a single-button row. Labels, row-major action order,
+  handlers and the tenant `/start` return remain unchanged. `Adminbot.Tests/ClientDownloadTests.cs` covers both roles
+  with downloads enabled/disabled and the live-switch transition.
 - **Owned and tenant installation tutorials share the same built-in photo albums, not configured URLs.** Three albums ship
   under `Assets/tutorials/` (`android_v2rayng`, `windows_v2rayn`, `ios_android_v2box`). The original numbered
   instructional slides remain PNG without lossy recompression; the six-slide iOS album is about 8.19 MiB. A clean
