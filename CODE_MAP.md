@@ -1,5 +1,17 @@
 # CODE_MAP.md
 
+- Tenant weekly dashboards: `TenantWeeklyUsageReportHostedService` starts **Saturday 00:00 Tehran**
+  (midnight ending Friday), independently of the global weekly flag/schedule; startup catches up only the latest week.
+  Each configured store created before the boundary, including disabled stores, gets its own owner report via
+  `SalesAssistantService.SendTenantWeeklyReportPhotoAsync` only; current store/owner/BotFather identity is rechecked.
+  `UsageAnalyticsService.GetTenantWeeklyReportsAsync` scans fourteen daily logs once and queries fulfilled orders once:
+  daily distinct users/interactions exclude super-admins, gross toman sales match both store and current owner.
+  `WeeklyUsageReportContent` shares the existing Persian comparison caption; unchanged renderer makes three panels.
+  Existing users.db dispatch keys and atomic `SendStarted` prevent concurrent/restart duplicates. Definite 429/no-route
+  failures may retry; ambiguous delivery never automatically replays. No schema/configuration/financial change.
+  Existing-project `TenantWeekly*Tests.cs` cover boundaries/isolation/real-SDK delivery; operator details in
+  `docs/multiple-storefronts.md` and `docs/deployment.md`.
+
 - Trial logger controls (2026-10-05): owned **🗽 Admin → 🔔 لاگ اکانت تست** uses
   `TelegramBotService.TrialAccountLogging.cs` and singleton `TrialAccountLoggingSettings`; root
   `trialAccountLoggingEnabled` defaults **false**, persists via the shared byte-preserving root-boolean editor.

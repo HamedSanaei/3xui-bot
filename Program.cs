@@ -142,6 +142,8 @@ public class Program
     /// The single IServiceSalesAvailability snapshot governs customer sale/renewal admission in every owned and tenant bot.
     /// TrialAccountLoggingSettings is shared by the super-admin UI and Telegram logger provider; it has no logger dependency
     /// and suppresses only new trial channel audits, retaining local diagnostics and financial backup intents.
+    /// TenantWeeklyUsageReportHostedService batches storefront-only analytics after Friday midnight Tehran and
+    /// delivers owner charts exclusively through scoped Sales Assistant services, independently of the global report flag.
     /// PublicChannelPostManager is one shared singleton/hosted instance; it owns process-local preview/publication
     /// jobs without retaining scoped handlers, database contexts or foreground clients.</remarks>
     /// <example><code>RegisterApplicationServices(services, configuration, validatedOptions, contentRootPath);</code></example>
@@ -302,6 +304,7 @@ public class Program
         services.AddHostedService<GozargahSiteSyncRetryService>();
         services.AddHostedService<ReferralReconciliationHostedService>();
         services.AddHostedService<WeeklyUsageReportHostedService>();
+        services.AddHostedService<TenantWeeklyUsageReportHostedService>();
         // Delivery-only workers read users.db outboxes and Telegram; they cannot repeat settlement or XUI mutations.
         services.AddHostedService<PaymentSettlementNotificationWorker>();
         services.AddHostedService<TenantManualReceiptNotificationWorker>();

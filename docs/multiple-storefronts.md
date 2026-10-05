@@ -40,6 +40,26 @@ The owner menu lists stores; every panel/prompt identifies its selected store. G
 mandatory channels, welcome, markup, card details and tutorials are local to that store. Online API keys and
 global gateway switches remain central. All stores share the owner's credentials.db wallet and Gozargah account.
 
+## Automatic weekly owner reports
+
+Each configured storefront receives its own Saturday-through-Friday report through Sales Assistant at
+**Saturday 00:00 Tehran**, the midnight ending Friday. Owners must have started the configured assistant and
+must not block it. One owner with several stores receives several separately labelled reports; configured
+disabled stores remain eligible. Reset/unconfigured stores and stores created at/after the reporting boundary
+are skipped. Startup catches up only the latest completed week, without historical backfill.
+
+The existing three-panel chart compares daily distinct customers, message/callback interactions and successful
+gross sales in toman against the preceding week. The caption includes totals and percentage changes; its user
+total is the **sum of daily distinct users**, not a weekly distinct-user count. Configured super-admins are excluded.
+Sales count only fulfilled orders matching both the storefront and its current owner, not pending orders or net
+profit. Missing/malformed interaction logs are disclosed for either comparison week; sales still come from orders.
+The global weekly-report flag and 00:01 schedule do not control these owner reports.
+
+Delivery is recorded in users.db. Concurrent scans/restarts cannot blindly repeat a report whose send has started.
+A definite rate-limit rejection or unavailable assistant route can retry; ambiguous timeout/network/server results
+require review instead of automatic resend. Reports never use the storefront token to contact the owner and never
+change wallets, orders, profit or ledger balances.
+
 ## Public-channel posts
 
 In an owned bot, configured super-admins open **🗽 Admin → 📣 پست عمومی کانال‌ها**, send text or 1–10 photos

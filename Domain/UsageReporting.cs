@@ -1,7 +1,7 @@
 namespace Adminbot.Domain;
 
 /// <summary>
-/// Durable delivery state for one scheduled usage report sent to the central Telegram logger channel.
+/// Durable delivery state for one scheduled global-channel or tenant-owner usage report.
 /// </summary>
 /// <remarks>
 /// Rows live only in <c>users.db</c>. The unique <see cref="ReportKey"/> prevents concurrent workers or service
@@ -12,7 +12,7 @@ public sealed class UsageReportDispatch
     /// <summary>Database-generated users.db row identifier.</summary>
     public int Id { get; set; }
 
-    /// <summary>Stable global report key, such as <c>weekly:20260718</c>, unique across the application.</summary>
+    /// <summary>Unique bounded key: global <c>weekly:yyyyMMdd</c>, or tenant week plus hashed storefront/owner/identity.</summary>
     public string ReportKey { get; set; }
 
     /// <summary>Inclusive UTC start of the completed reporting period.</summary>
@@ -24,16 +24,16 @@ public sealed class UsageReportDispatch
     /// <summary>Current processing state from <see cref="UsageReportDispatchStatuses"/>.</summary>
     public string Status { get; set; } = UsageReportDispatchStatuses.Pending;
 
-    /// <summary>Number of times a worker has claimed this report for generation or delivery.</summary>
+    /// <summary>Number of global processing claims or tenant durable send-start transitions.</summary>
     public int AttemptCount { get; set; }
 
-    /// <summary>UTC lease expiry that prevents another worker from processing the same report concurrently.</summary>
+    /// <summary>UTC global processing lease expiry; tenant SendStarted rows never use or reclaim this lease.</summary>
     public DateTime? LeaseUntilUtc { get; set; }
 
     /// <summary>Last sanitized generation or Telegram delivery error; never contains bot tokens or API secrets.</summary>
     public string LastError { get; set; }
 
-    /// <summary>Telegram message id returned after the report image is accepted by the central logger channel.</summary>
+    /// <summary>Positive Telegram message id returned for the global channel or exact tenant owner.</summary>
     public int? TelegramMessageId { get; set; }
 
     /// <summary>UTC creation timestamp for audit and retry diagnostics.</summary>
@@ -60,6 +60,15 @@ public static class UsageReportDispatchStatuses
     /// <summary>Generation or a definite pre-delivery failure occurred and the report may be retried.</summary>
     public const string Failed = "failed";
 
+    /// <summary>The tenant send boundary is durable; never reclaimed, including after a crash or shutdown.</summary>
+    public const string SendStarted = "send_started";
+
+    /// <summary>Telegram may have accepted the tenant photo; operator reconciliation is required before any resend.</summary>
+    public const string DeliveryUncertain = "delivery_uncertain";
+
+    /// <summary>Telegram definitively rejected delivery permanently; automatic retries are disabled.</summary>
+    public const string Rejected = "rejected";
+
     /// <summary>Telegram accepted the image and returned its message identifier.</summary>
     public const string Sent = "sent";
 
@@ -68,7 +77,7 @@ public static class UsageReportDispatchStatuses
     /// </summary>
     /// <remarks>
     /// This state is intentionally not retryable because sending the same completed-week image again would create a
-    /// duplicate channel report. Operators can use the stored Telegram message id and error for manual reconciliation.
+    /// duplicate channel or owner report. Operators can use the stored Telegram message id and error for manual reconciliation.
     /// </remarks>
     public const string DeliveryRecordedWithError = "delivery_recorded_with_error";
 

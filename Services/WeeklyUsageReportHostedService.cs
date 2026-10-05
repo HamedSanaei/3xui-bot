@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Net;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
@@ -13,6 +12,7 @@ using Telegram.Bot.Types.Enums;
 /// <remarks>
 /// The database unique key is the final concurrency guard. The service never uses <c>credentials.db</c> and every
 /// operation owns an independent EF context so Telegram receivers and hosted workers do not share tracking state.
+/// Global reports retain their processing lease; tenant reports use a non-reclaimable SendStarted HTTP boundary.
 /// </remarks>
 public sealed class UsageReportDispatchStore
 {
@@ -75,11 +75,92 @@ public sealed class UsageReportDispatchStore
         return affected == 1;
     }
 
+    /// <summary>Loads already-consumed tenant keys before expensive weekly log parsing and chart generation.</summary>
+    /// <param name="reportKeys">Bounded unique keys for the current inventory and latest completed week.</param>
+    /// <param name="cancellationToken">Host cancellation token for the users.db read.</param>
+    /// <returns>Non-retryable keys; an empty set means all supplied targets remain eligible.</returns>
+    /// <remarks>Any state other than Pending or Failed is conservatively consumed; SendStarted has no expiry.</remarks>
+    /// <example><code>var consumed = await store.GetNonRetryableKeysAsync(keys, cancellationToken);</code></example>
+    public async Task<HashSet<string>> GetNonRetryableKeysAsync(
+        IReadOnlyCollection<string> reportKeys, CancellationToken cancellationToken)
+    {
+        if (reportKeys.Count == 0)
+            return new HashSet<string>(StringComparer.Ordinal);
+        await using var context = _contextFactory.CreateDbContext();
+        var keys = await context.UsageReportDispatches.AsNoTracking()
+            .Where(x => reportKeys.Contains(x.ReportKey) &&
+                        x.Status != UsageReportDispatchStatuses.Pending &&
+                        x.Status != UsageReportDispatchStatuses.Failed)
+            .Select(x => x.ReportKey).ToListAsync(cancellationToken);
+        return new HashSet<string>(keys, StringComparer.Ordinal);
+    }
+
+    /// <summary>Durably crosses the tenant photo send boundary exactly once across concurrent processes.</summary>
+    /// <param name="reportKey">Tenant key at most 64 characters, derived from week, internal bot id, owner and identity.</param>
+    /// <param name="periodStartUtc">Inclusive completed-week UTC boundary.</param>
+    /// <param name="periodEndUtc">Exclusive completed-week UTC boundary.</param>
+    /// <param name="cancellationToken">Token for the database operation, before any Telegram request.</param>
+    /// <returns>True only for the caller that atomically changes Pending or Failed to SendStarted.</returns>
+    /// <remarks>
+    /// Generate the chart and validate ownership first. SendStarted is deliberately never leased or reclaimed:
+    /// a crash after this barrier requires reconciliation, not a blind resend. The global lease API is unchanged.
+    /// </remarks>
+    /// <exception cref="ArgumentException">The key is empty or exceeds the existing database limit.</exception>
+    /// <example><code>if (await store.TryStartTenantSendAsync(key, startUtc, endUtc, token)) await SendPhotoAsync();</code></example>
+    public async Task<bool> TryStartTenantSendAsync(
+        string reportKey, DateTime periodStartUtc, DateTime periodEndUtc, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(reportKey) || reportKey.Length > 64)
+            throw new ArgumentException("A bounded usage report key is required.", nameof(reportKey));
+        var now = DateTime.UtcNow;
+        await EnsureRowExistsAsync(reportKey, periodStartUtc, periodEndUtc, now, cancellationToken);
+        await using var context = _contextFactory.CreateDbContext();
+        // The unique insert plus this database CAS protects multiple hosted cycles and processes, without a lease.
+        var affected = await context.UsageReportDispatches
+            .Where(x => x.ReportKey == reportKey &&
+                        (x.Status == UsageReportDispatchStatuses.Pending || x.Status == UsageReportDispatchStatuses.Failed))
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, UsageReportDispatchStatuses.SendStarted)
+                .SetProperty(x => x.AttemptCount, x => x.AttemptCount + 1)
+                .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
+                .SetProperty(x => x.LastError, (string)null)
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+        return affected == 1;
+    }
+
+    /// <summary>Records the outcome of a tenant send without releasing ambiguous requests for retry.</summary>
+    /// <param name="reportKey">Exact key whose SendStarted transition this caller won.</param>
+    /// <param name="status">Failed for definite no-send/429, Rejected for permanent rejection, or DeliveryUncertain.</param>
+    /// <param name="errorCode">Sanitized diagnostic code or exception type, never raw API messages or credentials.</param>
+    /// <param name="cancellationToken">Token for persistence; callers normally use an independent cleanup token.</param>
+    /// <returns>A task completing after the outcome is durable, or no change if the send was already acknowledged.</returns>
+    /// <exception cref="ArgumentException">The requested state is not an allowed tenant failure outcome.</exception>
+    /// <remarks>Only SendStarted is updated. A failed persistence leaves that non-retryable boundary in place.</remarks>
+    /// <example><code>await store.MarkTenantSendOutcomeAsync(key, UsageReportDispatchStatuses.DeliveryUncertain, "telegram_500", token);</code></example>
+    public async Task MarkTenantSendOutcomeAsync(
+        string reportKey, string status, string errorCode, CancellationToken cancellationToken)
+    {
+        if (status != UsageReportDispatchStatuses.Failed &&
+            status != UsageReportDispatchStatuses.Rejected &&
+            status != UsageReportDispatchStatuses.DeliveryUncertain)
+            throw new ArgumentException("Invalid tenant send outcome.", nameof(status));
+        var now = DateTime.UtcNow;
+        var safeError = string.IsNullOrWhiteSpace(errorCode) ? "tenant_delivery_failure" :
+            errorCode.Length <= 1800 ? errorCode : errorCode[..1800];
+        await using var context = _contextFactory.CreateDbContext();
+        await context.UsageReportDispatches.Where(x => x.ReportKey == reportKey &&
+                x.Status == UsageReportDispatchStatuses.SendStarted)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, status)
+                .SetProperty(x => x.LastError, safeError)
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+    }
+
     /// <summary>
     /// Marks a claimed report as delivered after Telegram returns a concrete message.
     /// </summary>
     /// <param name="reportKey">Stable report key previously claimed by the worker.</param>
-    /// <param name="telegramMessageId">Positive Telegram message id returned from the logger channel.</param>
+    /// <param name="telegramMessageId">Positive Telegram message id returned for the logger channel or exact tenant owner.</param>
     /// <param name="cancellationToken">Token used for the users.db update.</param>
     /// <returns>A task that completes after the sent state is durable.</returns>
     public async Task MarkSentAsync(string reportKey, int telegramMessageId, CancellationToken cancellationToken)
@@ -114,13 +195,13 @@ public sealed class UsageReportDispatchStore
     /// Records a terminal, non-retryable state when Telegram accepted the report but normal sent-state persistence failed.
     /// </summary>
     /// <param name="reportKey">Stable report key previously claimed by the worker.</param>
-    /// <param name="telegramMessageId">Positive message id already returned by Telegram for the logger-channel photo.</param>
+    /// <param name="telegramMessageId">Positive message id already returned by Telegram for the global or tenant-owner photo.</param>
     /// <param name="error">Sanitized persistence error retained for operator reconciliation.</param>
     /// <param name="cancellationToken">Token used for this best-effort users.db update.</param>
     /// <returns>A task that completes after the duplicate-prevention state is persisted.</returns>
     /// <remarks>
     /// The row is removed from the retryable state set because Telegram delivery is known to have succeeded. Retrying
-    /// the send after a database-only failure would duplicate the weekly report in the private logger channel.
+    /// the send after a database-only failure would duplicate the weekly report for its channel or exact owner.
     /// </remarks>
     /// <example>
     /// <code>
@@ -342,7 +423,7 @@ public sealed class WeeklyUsageReportHostedService : BackgroundService
                 includeSales: true,
                 cancellationToken);
             var png = _chartRenderer.RenderWeeklyComparison(currentWeek, previousWeek);
-            var caption = BuildCaption(currentWeek, previousWeek);
+            var caption = WeeklyUsageReportContent.BuildCaption(currentWeek, previousWeek);
             var defaultBot = _botRegistry.DefaultBot
                              ?? throw new InvalidOperationException("Default owned bot is not available for weekly report delivery.");
             // Resolved through the shared destination contract so a malformed legacy value fails with the same clear
@@ -454,54 +535,5 @@ public sealed class WeeklyUsageReportHostedService : BackgroundService
         return saturday;
     }
 
-    /// <summary>
-    /// Builds the HTML-safe Persian comparison caption sent with the weekly PNG.
-    /// </summary>
-    /// <param name="currentWeek">Latest completed week.</param>
-    /// <param name="previousWeek">Preceding comparison week.</param>
-    /// <returns>Telegram HTML caption containing totals, changes, and data-quality warnings.</returns>
-    private static string BuildCaption(UsageAnalyticsReport currentWeek, UsageAnalyticsReport previousWeek)
-    {
-        var start = UsageAnalyticsService.FormatPersianDate(currentWeek.StartDateIran);
-        var end = UsageAnalyticsService.FormatPersianDate(currentWeek.EndDateIran.AddDays(-1));
-        var warningParts = new List<string>();
-        if (currentWeek.MissingActivityLogDays > 0)
-            warningParts.Add($"{currentWeek.MissingActivityLogDays} روز فایل فعالیت موجود نبود");
-        if (currentWeek.MalformedLines > 0)
-            warningParts.Add($"{currentWeek.MalformedLines} خط خراب نادیده گرفته شد");
-        var warning = warningParts.Count == 0
-            ? string.Empty
-            : "\n⚠️ " + WebUtility.HtmlEncode(string.Join("؛ ", warningParts));
-
-        return
-            "📊 <b>گزارش هفتگی مصرف کل مجموعه</b>\n" +
-            $"بازه: <code>{start}</code> تا <code>{end}</code>\n\n" +
-            $"👤 مجموع کاربران یکتای روزانه: <code>{currentWeek.TotalDailyUniqueUsers:N0}</code> " +
-            $"({BuildChangeText(currentWeek.TotalDailyUniqueUsers, previousWeek.TotalDailyUniqueUsers)})\n" +
-            $"💬 تعامل‌ها: <code>{currentWeek.TotalInteractions:N0}</code> " +
-            $"({BuildChangeText(currentWeek.TotalInteractions, previousWeek.TotalInteractions)})\n" +
-            $"💰 فروش موفق: <code>{currentWeek.TotalSalesToman:N0}</code> تومان " +
-            $"({BuildChangeText(currentWeek.TotalSalesToman, previousWeek.TotalSalesToman)})" +
-            warning;
-    }
-
-    /// <summary>
-    /// Formats growth or decline against a prior-period value without dividing by zero.
-    /// </summary>
-    /// <param name="current">Current-period non-negative total.</param>
-    /// <param name="previous">Previous-period non-negative total.</param>
-    /// <returns>Persian growth, decline, unchanged, or growth-from-zero text.</returns>
-    private static string BuildChangeText(long current, long previous)
-    {
-        if (previous == 0)
-            return current == 0 ? "بدون تغییر" : "رشد از صفر";
-
-        var percent = Math.Abs((current - previous) * 100d / previous);
-        if (Math.Abs(current - previous) == 0)
-            return "بدون تغییر";
-        return current > previous
-            ? $"رشد {percent:0.#}٪ نسبت به هفته قبل"
-            : $"کاهش {percent:0.#}٪ نسبت به هفته قبل";
-    }
 
 }

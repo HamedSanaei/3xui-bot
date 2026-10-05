@@ -289,3 +289,24 @@ The general concurrency fixture in `Adminbot.Tests/ConcurrencyTests.cs` uses `En
 and concurrency databases that need the current schema and do not claim migration coverage. Every migration,
 startup-compatibility, deployment, historical-upgrade, and artifact-preflight test uses `Database.Migrate` and the real
 migration assembly. No migration guard uses `EnsureCreated` or `EnsureCreatedAsync`.
+
+## Tenant weekly dashboards through Sales Assistant
+
+Deploy the normal single application artifact; this feature adds no schema migration or configuration flag.
+The registered tenant worker is independent of `WeeklyUsageReportEnabled` and begins the completed-week cycle
+at **Saturday 00:00 Tehran** (midnight ending Friday); the global logger report remains at 00:01.
+Keep Sales Assistant enabled with its existing protected token, and have each storefront owner start it.
+Reports use only that assistant transport, never tenant/owned-bot fallback. Startup considers only the latest
+completed week and configured stores created before its boundary, including disabled stores.
+
+Retain the daily activity JSONL files for both comparison weeks. Missing/malformed files produce explicit
+interaction-data warnings rather than fabricated data; successful gross sales come from fulfilled users.db
+orders matching both store and current owner. See [report semantics](multiple-storefronts.md#automatic-weekly-owner-reports).
+
+`UsageReportDispatches` in users.db retains one bounded `tenantweekly:` key per week/store/owner/identity.
+`SendStarted` is a durable non-reclaimable send barrier, not an expiring lease. `Sent` and
+`DeliveryRecordedWithError` include a known Telegram acknowledgement; `DeliveryUncertain` or a stranded
+`SendStarted` requires checking the owner's conversation before any manual resend. Never delete/reset these
+rows just to replay a cycle. `Rejected` means a definitive permanent Telegram rejection; `Failed` permits
+retry only for a definite no-send condition or 429. Structured warnings retain sanitized codes/types, not
+bot tokens or raw API messages. No report operation changes balances, profit, ledger entries or orders.

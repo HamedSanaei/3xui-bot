@@ -144,6 +144,61 @@ public class SalesAssistantService
         return sent.MessageId;
     }
 
+    /// <summary>Sends one tenant weekly dashboard only through the configured Sales Assistant to its exact owner.</summary>
+    /// <param name="tenantBotId">Required internal users.db BotInstance.Id captured from the tenant inventory; not a Telegram id.</param>
+    /// <param name="ownerTelegramUserId">Positive global Telegram user id of that storefront's persisted owner.</param>
+    /// <param name="expectedTelegramBotId">Positive BotFather numeric identity captured with the inventory; not the assistant identity.</param>
+    /// <param name="photoStream">Readable PNG stream rendered by UsageReportChartRenderer, positioned at its beginning; caller owns disposal.</param>
+    /// <param name="caption">HTML-encoded shared weekly caption, at most 1024 Telegram caption characters, scoped to this tenant.</param>
+    /// <param name="cancellationToken">Token for ownership reload and the single Telegram HTTP request.</param>
+    /// <returns>Positive Telegram message id, or null only when ownership/configuration changed or the assistant route is unavailable before HTTP.</returns>
+    /// <remarks>
+    /// Reloads users.db ownership and BotFather identity immediately before sending, including disabled configured
+    /// storefronts. Never sends through tenant/owned bots and never changes balances, financial records or dispatch
+    /// state. The caller must persist SendStarted before calling and must not blindly retry ambiguous exceptions.
+    /// </remarks>
+    /// <exception cref="ArgumentException">A required identifier or caption is invalid.</exception>
+    /// <exception cref="ArgumentNullException">The photo stream is null.</exception>
+    /// <exception cref="ApiRequestException">Telegram definitively rejects or cannot confirm the request; caller classifies the status.</exception>
+    /// <exception cref="HttpRequestException">The transport failed and delivery may be ambiguous.</exception>
+    /// <exception cref="OperationCanceledException">Database or HTTP work was canceled; after HTTP begins delivery may be ambiguous.</exception>
+    /// <exception cref="InvalidOperationException">Telegram returned no positive message identifier; delivery may be ambiguous.</exception>
+    /// <example><code>var id = await assistant.SendTenantWeeklyReportPhotoAsync(tenant.Id, ownerId, identity, image, caption, token);</code></example>
+    public async Task<int?> SendTenantWeeklyReportPhotoAsync(
+        string tenantBotId, long ownerTelegramUserId, long expectedTelegramBotId,
+        Stream photoStream, string caption, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantBotId);
+        ArgumentNullException.ThrowIfNull(photoStream);
+        if (ownerTelegramUserId <= 0 || expectedTelegramBotId <= 0)
+            throw new ArgumentException("Positive tenant owner and Telegram identity are required.");
+        if (string.IsNullOrWhiteSpace(caption) || caption.Length > 1024)
+            throw new ArgumentException("A bounded weekly caption is required.", nameof(caption));
+
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var tenant = await context.BotInstances.AsNoTracking().Where(
+            x => x.Id == tenantBotId && x.Type == BotInstanceTypes.Tenant &&
+                 x.OwnerTelegramUserId == ownerTelegramUserId && x.TelegramBotId == expectedTelegramBotId)
+            .Select(x => new { x.Token, x.Username }).SingleOrDefaultAsync(cancellationToken);
+        if (tenant == null || string.IsNullOrWhiteSpace(tenant.Token) || string.IsNullOrWhiteSpace(tenant.Username))
+            return null;
+        var assistant = GetAssistantBot();
+        if (assistant == null || !assistant.Enabled || string.IsNullOrWhiteSpace(assistant.Token))
+            return null;
+        ITelegramBotClient client;
+        try { client = _botClientProvider.GetClient(assistant.Id); }
+        catch (BotTransportUnavailableException) { return null; }
+
+        // The durable caller has crossed SendStarted. Only this assistant makes HTTP; the storefront token is never used.
+        var sent = await client.SendPhoto(
+            chatId: ownerTelegramUserId,
+            photo: InputFile.FromStream(photoStream, "tenant-weekly-usage.png"),
+            caption: caption, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
+        if (sent == null || sent.MessageId <= 0)
+            throw new InvalidOperationException("telegram_message_id_missing");
+        return sent.MessageId;
+    }
+
     /// <summary>
     /// Formats the persisted tenant purchase and settlement facts for one owner-facing sale notification.
     /// </summary>

@@ -178,6 +178,175 @@ public sealed class UsageAnalyticsService
     }
 
     /// <summary>
+    /// Builds isolated current/previous completed-week comparisons for all requested storefronts in one batch.
+    /// </summary>
+    /// <param name="periodEndIran">
+    /// Exclusive Tehran-local end at Saturday 00:00 after the completed Friday; its Kind is ignored. The caller
+    /// selects the latest completed week, not a future boundary.
+    /// </param>
+    /// <param name="targets">
+    /// Persisted tenant internal bot ids and current positive owner Telegram user ids. An empty collection returns
+    /// no reports; duplicate bot/owner pairs coalesce case-insensitively, but conflicting owners are rejected.
+    /// </param>
+    /// <param name="cancellationToken">Token cancelling activity-file and read-only users.db queries.</param>
+    /// <returns>
+    /// A non-null dictionary keyed by internal bot id with ordinal-ignore-case lookup. Each value contains exactly
+    /// seven current and seven previous daily buckets, including zero days and file diagnostics.
+    /// </returns>
+    /// <remarks>
+    /// Reads each of the fourteen JSONL files once, sharing the global report's parser, date/path normalization,
+    /// interaction rules, and super-admin exclusion. Unattributed and other-bot events never count. Gross sales
+    /// come only from fulfilled orders matching BOTH the target bot and current owner, using the same completion
+    /// timestamp fallback as the global report. Owned-sale activity events are never added, even with bad bot-type
+    /// metadata. This operation changes no orders, wallets, ledgers, or delivery state.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when targets is null.</exception>
+    /// <exception cref="ArgumentException">Thrown for a non-Saturday-midnight boundary or invalid/conflicting targets.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when the caller cancels file or database reads.</exception>
+    /// <example>
+    /// <code>
+    /// var reports = await analytics.GetTenantWeeklyReportsAsync(
+    ///     completedSaturday, new[] { new TenantWeeklyReportTarget(store.Id, store.OwnerTelegramUserId.Value) }, token);
+    /// </code>
+    /// </example>
+    public async Task<IReadOnlyDictionary<string, TenantWeeklyUsageComparison>> GetTenantWeeklyReportsAsync(
+        DateTime periodEndIran,
+        IReadOnlyCollection<TenantWeeklyReportTarget> targets,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        if (periodEndIran.DayOfWeek != DayOfWeek.Saturday || periodEndIran.TimeOfDay != TimeSpan.Zero)
+            throw new ArgumentException("The tenant weekly boundary must be Tehran Saturday midnight.", nameof(periodEndIran));
+
+        var periodStartIran = periodEndIran.Date.AddDays(-14);
+        var byBotId = new Dictionary<string, TenantWeeklyBuckets>(targets.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var target in targets)
+        {
+            if (target == null || string.IsNullOrWhiteSpace(target.BotId) || target.OwnerTelegramUserId <= 0)
+                throw new ArgumentException("A tenant target requires an internal bot id and a positive owner id.", nameof(targets));
+
+            if (byBotId.TryGetValue(target.BotId, out var existing))
+            {
+                if (existing.Target.OwnerTelegramUserId != target.OwnerTelegramUserId)
+                    throw new ArgumentException("A tenant bot cannot have conflicting report owners.", nameof(targets));
+                continue;
+            }
+
+            byBotId.Add(target.BotId, new TenantWeeklyBuckets(target, periodStartIran));
+        }
+
+        var results = new Dictionary<string, TenantWeeklyUsageComparison>(byBotId.Count, StringComparer.OrdinalIgnoreCase);
+        if (byBotId.Count == 0)
+            return results;
+
+        var appConfig = _configuration.Get<AppConfig>() ?? new AppConfig();
+        var superAdmins = (appConfig.AdminsUserIds ?? new List<long>()).ToHashSet();
+        var diagnosticSource = byBotId.Values.First();
+        var activityDayIndex = 0;
+        Action<NormalizedActivityEvent> consumeEvent = activityEvent =>
+        {
+            if (activityEvent.TelegramUserId <= 0 ||
+                superAdmins.Contains(activityEvent.TelegramUserId) ||
+                !IsInteractionEvent(activityEvent.EventName) ||
+                !byBotId.TryGetValue(activityEvent.BotId, out var tenant))
+            {
+                return;
+            }
+
+            // A customer's same-day presence is distinct independently in each storefront, not by owner.
+            tenant.Days[activityDayIndex].Interactions++;
+            tenant.DailyUsers.Add(activityEvent.TelegramUserId);
+        };
+        for (; activityDayIndex < 14; activityDayIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var diagnostics = diagnosticSource.Days[activityDayIndex];
+            await ReadActivityEventsAsync(diagnostics, appConfig, consumeEvent, cancellationToken);
+
+            foreach (var tenant in byBotId.Values)
+            {
+                tenant.Days[activityDayIndex].UniqueUsers = tenant.DailyUsers.Count;
+                // Only daily counts survive in the chart; reuse each store's set instead of retaining fourteen user sets.
+                tenant.DailyUsers.Clear();
+                tenant.Days[activityDayIndex].ActivityLogMissing = diagnostics.ActivityLogMissing;
+                tenant.Days[activityDayIndex].MalformedLines = diagnostics.MalformedLines;
+            }
+        }
+
+        var startUtc = ConvertIranTimeToUtc(periodStartIran);
+        var endUtc = ConvertIranTimeToUtc(periodEndIran);
+        var botIds = byBotId.Keys.ToArray();
+        await using var context = _userDbContextFactory.CreateDbContext();
+        var orders = await context.TenantBotOrders
+            .AsNoTracking()
+            .Where(x => x.IsFulfilled &&
+                        botIds.Contains(EF.Functions.Collate(x.TenantBotId, "NOCASE")) &&
+                        (x.FulfilledAtUtc ?? x.UpdatedAtUtc ?? x.PaidAtUtc ?? x.CreatedAtUtc) >= startUtc &&
+                        (x.FulfilledAtUtc ?? x.UpdatedAtUtc ?? x.PaidAtUtc ?? x.CreatedAtUtc) < endUtc)
+            .Select(x => new
+            {
+                x.TenantBotId,
+                x.OwnerTelegramUserId,
+                x.CustomerTelegramUserId,
+                x.SalePriceToman,
+                CompletedAtUtc = x.FulfilledAtUtc ?? x.UpdatedAtUtc ?? x.PaidAtUtc ?? x.CreatedAtUtc
+            })
+            .ToListAsync(cancellationToken);
+
+        foreach (var order in orders)
+        {
+            if (order.SalePriceToman <= 0 ||
+                superAdmins.Contains(order.CustomerTelegramUserId) ||
+                !byBotId.TryGetValue(order.TenantBotId, out var tenant) ||
+                order.OwnerTelegramUserId != tenant.Target.OwnerTelegramUserId)
+            {
+                continue;
+            }
+
+            // Matching the owner as well as the store prevents historical ownership crossing the report boundary.
+            var dayIndex = (ConvertUtcToIranTime(order.CompletedAtUtc).Date - periodStartIran).Days;
+            if (dayIndex is >= 0 and < 14)
+                tenant.Days[dayIndex].SalesToman += order.SalePriceToman;
+        }
+
+        foreach (var tenant in byBotId.Values)
+        {
+            results.Add(tenant.Target.BotId, new TenantWeeklyUsageComparison(
+                new UsageAnalyticsReport(periodEndIran.Date.AddDays(-7), new ArraySegment<UsageDailyStat>(tenant.Days, 7, 7)),
+                new UsageAnalyticsReport(periodStartIran, new ArraySegment<UsageDailyStat>(tenant.Days, 0, 7))));
+        }
+
+        return results;
+    }
+
+    /// <summary>Owns fourteen daily metric buckets and one reusable daily distinct-user set for a storefront-owner pair.</summary>
+    /// <remarks>Only bot-scoped interaction events and current-owner-matched fulfilled orders populate these buckets.</remarks>
+    private sealed class TenantWeeklyBuckets
+    {
+        /// <summary>Persisted storefront and current owner used to isolate authoritative sales.</summary>
+        public TenantWeeklyReportTarget Target { get; }
+
+        /// <summary>Chronological previous/current week buckets; never shared with a different storefront.</summary>
+        public UsageDailyStat[] Days { get; } = new UsageDailyStat[14];
+
+        /// <summary>Distinct Telegram users for the current streaming date; cleared after its count is captured.</summary>
+        public HashSet<long> DailyUsers { get; } = new();
+
+        /// <summary>Creates zero-valued buckets for one tenant across both completed weeks.</summary>
+        /// <param name="target">Required internal bot id and current owner Telegram user id.</param>
+        /// <param name="startDateIran">Inclusive Tehran-local midnight fourteen days before the reporting boundary.</param>
+        /// <remarks>The two weeks share one chronological array so chart/report segments do not copy daily buckets.</remarks>
+        public TenantWeeklyBuckets(TenantWeeklyReportTarget target, DateTime startDateIran)
+        {
+            Target = target;
+            for (var index = 0; index < Days.Length; index++)
+            {
+                Days[index] = new UsageDailyStat { DateIran = startDateIran.AddDays(index) };
+            }
+        }
+    }
+
+    /// <summary>
     /// Reads one activity JSONL file and updates its daily bucket without failing the whole report for bad lines.
     /// </summary>
     /// <param name="bucket">Target completed-day bucket.</param>
@@ -188,7 +357,8 @@ public sealed class UsageAnalyticsService
     /// <param name="includeSales">Whether successful owned-bot account sale events should be summed.</param>
     /// <param name="cancellationToken">Token that cancels asynchronous file reads.</param>
     /// <returns>A task that completes after the file is read or marked missing.</returns>
-    private async Task ReadActivityDayAsync(
+    /// <remarks>Delegates streaming/parsing to the shared single-pass reader while retaining the existing global/filter semantics.</remarks>
+    private Task ReadActivityDayAsync(
         UsageDailyStat bucket,
         HashSet<long> dailyUsers,
         AppConfig appConfig,
@@ -197,14 +367,55 @@ public sealed class UsageAnalyticsService
         bool includeSales,
         CancellationToken cancellationToken)
     {
-        var path = ResolveActivityLogPath(appConfig, bucket.DateIran);
+        return ReadActivityEventsAsync(bucket, appConfig, activityEvent =>
+        {
+            if (!string.IsNullOrWhiteSpace(botIdFilter) &&
+                !string.Equals(activityEvent.BotId, botIdFilter, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (activityEvent.TelegramUserId <= 0 || superAdmins.Contains(activityEvent.TelegramUserId))
+                return;
+
+            if (IsInteractionEvent(activityEvent.EventName))
+            {
+                bucket.Interactions++;
+                dailyUsers.Add(activityEvent.TelegramUserId);
+            }
+
+            if (includeSales && IsOwnedSaleEvent(activityEvent) && activityEvent.PriceToman > 0)
+                bucket.SalesToman += activityEvent.PriceToman;
+        }, cancellationToken);
+    }
+
+    /// <summary>
+    /// Streams and normalizes one daily activity file once, sharing exact legacy/flat parsing and diagnostics.
+    /// </summary>
+    /// <param name="diagnosticBucket">Daily bucket whose date resolves the file and receives missing/malformed diagnostics.</param>
+    /// <param name="appConfig">Configuration snapshot containing the shared activity-log path template.</param>
+    /// <param name="consumeEvent">Synchronous consumer of each valid date-matching normalized event; applies report scope and exclusions.</param>
+    /// <param name="cancellationToken">Token that cancels asynchronous UTF-8 file reads.</param>
+    /// <returns>A task completing after the file is streamed or marked unreadable; valid earlier events remain counted.</returns>
+    /// <remarks>
+    /// A tenant batch fans events out by exact internal bot id through one consumer rather than reopening each file
+    /// per storefront. Diagnostics describe the shared file and must be copied to every participating daily bucket.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">Thrown when the supplied cancellation token stops the read.</exception>
+    private async Task ReadActivityEventsAsync(
+        UsageDailyStat diagnosticBucket,
+        AppConfig appConfig,
+        Action<NormalizedActivityEvent> consumeEvent,
+        CancellationToken cancellationToken)
+    {
+        var path = ResolveActivityLogPath(appConfig, diagnosticBucket.DateIran);
         if (!File.Exists(path))
         {
-            bucket.ActivityLogMissing = true;
+            diagnosticBucket.ActivityLogMissing = true;
             return;
         }
 
-        var expectedPersianDate = FormatPersianDate(bucket.DateIran);
+        var expectedPersianDate = FormatPersianDate(diagnosticBucket.DateIran);
         try
         {
             await using var stream = new FileStream(
@@ -227,31 +438,11 @@ public sealed class UsageAnalyticsService
 
                 if (!TryParseActivityEvent(line, expectedPersianDate, out var activityEvent))
                 {
-                    bucket.MalformedLines++;
+                    diagnosticBucket.MalformedLines++;
                     continue;
                 }
 
-                if (!string.IsNullOrWhiteSpace(botIdFilter) &&
-                    !string.Equals(activityEvent.BotId, botIdFilter, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                if (activityEvent.TelegramUserId <= 0 || superAdmins.Contains(activityEvent.TelegramUserId))
-                    continue;
-
-                if (IsInteractionEvent(activityEvent.EventName))
-                {
-                    bucket.Interactions++;
-                    dailyUsers.Add(activityEvent.TelegramUserId);
-                }
-
-                if (includeSales &&
-                    IsOwnedSaleEvent(activityEvent) &&
-                    activityEvent.PriceToman > 0)
-                {
-                    bucket.SalesToman += activityEvent.PriceToman;
-                }
+                consumeEvent(activityEvent);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -260,7 +451,7 @@ public sealed class UsageAnalyticsService
         }
         catch (Exception ex)
         {
-            bucket.ActivityLogMissing = true;
+            diagnosticBucket.ActivityLogMissing = true;
             _logger.LogWarning(
                 ex,
                 "Usage activity log could not be read. dateIran={DateIran}, path={Path}",
