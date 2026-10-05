@@ -3758,7 +3758,8 @@ public partial class XuiV3BotFlowService
     /// Starting a trial from the main keyboard intentionally clears any half-built purchase session for the same
     /// Telegram user. Without that reset, a metered purchase could later reach the summary step without
     /// <c>TrafficGb</c> and throw an exception. Once creation begins, accepted and rejected panel outcomes are audited
-    /// with accumulated panel API time and total delivery time.
+    /// with accumulated panel API time and total delivery time. Typed trial acquisition audits follow the global
+    /// Telegram channel preference only; issuance, eligibility and local activity diagnostics are unchanged.
     /// </remarks>
     /// <exception cref="OperationCanceledException">Incoming delivery or panel execution is cancelled; an owned winning attempt settles its quota or debit before propagating.</exception>
     /// <exception cref="InvalidOperationException">The configured test catalog, actor identity or durable creation evidence conflicts with this request.</exception>
@@ -3925,7 +3926,8 @@ public partial class XuiV3BotFlowService
                 "ناموفق",
                 credUser,
                 operationTiming,
-                source: serviceKey);
+                source: serviceKey,
+                isTrialAccount: true);
 
             await botClient.SendMessage(
                 chatId: message.Chat.Id,
@@ -3951,7 +3953,8 @@ public partial class XuiV3BotFlowService
             accountEmail: creation.Email,
             source: serviceKey,
             requestedCount: 1,
-            successfulCount: 1);
+            successfulCount: 1,
+            isTrialAccount: true);
         return true;
     }
 
@@ -8401,10 +8404,13 @@ public partial class XuiV3BotFlowService
     /// after execution began; total time also includes settlement, persistence, and any Telegram delivery completed
     /// before the financial audit is emitted.
     /// </param>
+    /// <param name="isTrialAccount">True only for paid-trial acquisition; false preserves ordinary purchase and renewal events.</param>
     /// <remarks>
     /// This method preserves the existing purchase metadata and adds the actual wallet source to the same central
     /// payment log. When a site-wallet debit fails after a renewal and the local bot wallet is used as compensation,
     /// callers must report the bot wallet as the source and mention the fallback in the supplied label.
+    /// Paid trials emit an explicit TrialAccountPayment event whose Telegram audit visibility follows the global
+    /// trial preference while retaining financial backup intent and all local logging.
     /// </remarks>
     /// <example>
     /// <code>
@@ -8427,7 +8433,8 @@ public partial class XuiV3BotFlowService
         long? afterBalance,
         string paymentWalletSource,
         IEnumerable<string> details,
-        XuiOperationTimingSnapshot timing)
+        XuiOperationTimingSnapshot timing,
+        bool isTrialAccount = false)
     {
         var message = new StringBuilder();
         var normalizedDetails = new List<string>();
@@ -8481,7 +8488,10 @@ public partial class XuiV3BotFlowService
         message.AppendLine();
         message.Append(XuiOperationTiming.BuildHtmlLines(timing));
 
-        _logger.LogPayment(message.ToString());
+        if (isTrialAccount)
+            _logger.LogTrialAccountPayment(message.ToString());
+        else
+            _logger.LogPayment(message.ToString());
     }
 
     /// <summary>
@@ -8498,11 +8508,15 @@ public partial class XuiV3BotFlowService
     /// <param name="source">Optional fixed UI source such as list, search, command, or trial.</param>
     /// <param name="requestedCount">Optional number of accounts requested by a bulk operation.</param>
     /// <param name="successfulCount">Optional number of accounts completed by a bulk operation.</param>
+    /// <param name="isTrialAccount">True for free-trial acquisition outcomes, including terminal failures; false for other operations.</param>
     /// <remarks>
     /// This audit is operational and therefore uses HTML logging without the payment logger's database-backup side
     /// effect. It must be called for both accepted and terminally failed panel mutations so the timings remain useful
     /// for API-health comparison.
+    /// Trial acquisition emits a typed TrialAccount event so only its Telegram channel visibility follows the global
+    /// trial preference; no message text is used for classification and local diagnostics remain unchanged.
     /// </remarks>
+    /// <example><code>LogXuiOperationOutcome("Trial creation", "Succeeded", actor, timer, isTrialAccount: true);</code></example>
     private void LogXuiOperationOutcome(
         string title,
         string result,
@@ -8511,7 +8525,8 @@ public partial class XuiV3BotFlowService
         string accountEmail = null,
         string source = null,
         int? requestedCount = null,
-        int? successfulCount = null)
+        int? successfulCount = null,
+        bool isTrialAccount = false)
     {
         if (timing == null)
             return;
@@ -8524,7 +8539,8 @@ public partial class XuiV3BotFlowService
             accountEmail,
             source,
             requestedCount,
-            successfulCount);
+            successfulCount,
+            isTrialAccount);
     }
 
     /// <summary>
@@ -8538,10 +8554,13 @@ public partial class XuiV3BotFlowService
     /// <param name="source">Optional stable route label such as list, search, purchase, or recovery.</param>
     /// <param name="requestedCount">Optional number of requested accounts for bulk activity.</param>
     /// <param name="successfulCount">Optional number of successful accounts for bulk activity.</param>
+    /// <param name="isTrialAccount">True for free-trial acquisition audit classification; false keeps ordinary operational HTML.</param>
     /// <remarks>
     /// Snapshot input is required for durable workflows such as link-change recovery, where total time can span a
     /// process restart and cannot be represented by the current in-memory timer alone.
+    /// Typed trial events are filtered only by the Telegram provider's live global preference and never request backups.
     /// </remarks>
+    /// <example><code>LogXuiOperationOutcomeSnapshot("Trial creation", "Failed", actor, snapshot, isTrialAccount: true);</code></example>
     private void LogXuiOperationOutcomeSnapshot(
         string title,
         string result,
@@ -8550,7 +8569,8 @@ public partial class XuiV3BotFlowService
         string accountEmail = null,
         string source = null,
         int? requestedCount = null,
-        int? successfulCount = null)
+        int? successfulCount = null,
+        bool isTrialAccount = false)
     {
         var builder = new StringBuilder();
         builder.AppendLine($"<b>{Html(title)}</b>");
@@ -8569,7 +8589,10 @@ public partial class XuiV3BotFlowService
         builder.AppendLine($"BotType: <code>{Html(BotContextAccessor.CurrentBotType)}</code>");
         builder.AppendLine();
         builder.Append(XuiOperationTiming.BuildHtmlLines(timing));
-        _logger.LogTelegramHtml(builder.ToString());
+        if (isTrialAccount)
+            _logger.LogTrialAccount(builder.ToString());
+        else
+            _logger.LogTelegramHtml(builder.ToString());
     }
 
     /// <summary>

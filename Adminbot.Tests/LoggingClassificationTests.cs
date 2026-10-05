@@ -2,6 +2,7 @@ using System.Reflection;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot.Types;
 using Xunit;
@@ -10,10 +11,11 @@ using Xunit;
 /// Regression coverage for the logging classification contract: non-financial operational/security/admin audits
 /// must stay durable through the Telegram outbox as Html (EventId 1001/TelegramHtml) and must never request a
 /// database backup, while genuine financial events keep Payment semantics (EventId 1000) that increment the
-/// backup generation. The five converted call sites are exercised through their real production methods (the
-/// private log builders invoked reflectively on null-dependency service instances, the same pattern used by
-/// <see cref="BackupRecoveryTests"/>), and the two inline flow call sites are protected by a source-contract
-/// assertion so a future reclassification to <c>LogPayment</c> fails the build.
+/// backup generation. Production audit builders are exercised reflectively on focused service instances,
+/// using the same pattern as <see cref="BackupRecoveryTests"/>. Assertions inspect persisted outbox rows
+/// and financial backup generation rather than source text.
+/// Explicit trial acquisition events obey a global Telegram-only visibility preference, preserving local file
+/// diagnostics and paid-trial backup generation even when the channel audit is disabled.
 /// </summary>
 public sealed class LoggingClassificationTests
 {
@@ -299,12 +301,200 @@ public sealed class LoggingClassificationTests
             await Task.Delay(10, drain.Token);
     }
 
+    /// <summary>Default-off trial events remain in the daily file while unrelated HTML, payment and plain logs remain active.</summary>
+    /// <returns>A task completing after durable classification, local file evidence and paid-trial backup delivery assertions.</returns>
+    /// <remarks>Uses the real provider pipeline and isolated SQLite fixtures; no Telegram requests are made.</remarks>
+    [Fact]
+    public async Task Disabled_trial_events_keep_local_diagnostics_backup_and_nontrial_logs()
+    {
+        await using var fixture = new BackupRecoveryTests.Fixture();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sender = new BackupRecoveryTests.Sender { TextBarrier = release.Task };
+        await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
+        var localPath = fixture.Options.OutboxDatabasePath + ".log";
+        var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["errorFileLogEnabled"] = "true",
+                ["errorFileLogMinimumLevel"] = "Information",
+                ["errorFileLogFilePath"] = localPath
+            }).Build();
+        var accessor = new BotContextAccessor();
+        var settings = new TrialAccountLoggingSettings(new AppConfig(), fixture.Options.OutboxDatabasePath + ".settings.json");
+        using var factory = LoggerFactory.Create(builder => builder
+            .SetMinimumLevel(LogLevel.Information)
+            .AddProvider(new DailyErrorFileLoggerProvider(configuration, accessor))
+            .AddProvider(new TelegramLoggerProvider(null, new BotRegistry(configuration), accessor,
+                "-1001234567890", "-1001234567891", dispatcher, settings)));
+        var logger = factory.CreateLogger("trial-classification");
+        try
+        {
+            Assert.False(settings.Snapshot.Enabled);
+            logger.LogTrialAccount("free trial acquisition");
+            logger.LogTrialAccountPayment("paid trial acquisition");
+            Assert.Empty(await ReadRowsAsync(fixture.Options.OutboxDatabasePath));
+            Assert.Equal(1, await RequestedGenerationsAsync(fixture.Options.OutboxDatabasePath));
+
+            // Trial-looking text in untyped events must never be suppressed.
+            logger.LogTelegramHtml("ordinary audit mentioning trial");
+            logger.LogPayment("ordinary payment mentioning trial");
+            logger.LogInformation("ordinary information mentioning trial");
+            var rows = await ReadRowsAsync(fixture.Options.OutboxDatabasePath);
+            Assert.Equal(2, rows.Count);
+            Assert.Contains(rows, row => row.Message == "ordinary audit mentioning trial" &&
+                row.DeliveryKind == (int)TelegramLogDeliveryKind.Html);
+            Assert.Contains(rows, row => row.Message == "ordinary payment mentioning trial" &&
+                row.DeliveryKind == (int)TelegramLogDeliveryKind.Payment);
+            Assert.Equal(2, await RequestedGenerationsAsync(fixture.Options.OutboxDatabasePath));
+
+            var local = await File.ReadAllTextAsync(localPath);
+            Assert.Contains("free trial acquisition", local);
+            Assert.Contains("paid trial acquisition", local);
+            Assert.Contains("ordinary information mentioning trial", local);
+            release.TrySetResult();
+            await BackupRecoveryTests.Until(() => sender.Texts == 3 && sender.Documents >= 2);
+            Assert.All(sender.Channels, destination => Assert.Equal("-1001234567891", destination));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+    }
+
+    /// <summary>Disabled typed events bypass formatting entirely, retaining only the paid event's sanitized backup intent.</summary>
+    /// <param name="paid">True for the financial trial event; false for the non-financial free-trial event.</param>
+    /// <param name="tenant">True to prove a tenant update still uses the shared setting and default-owned backup route.</param>
+    /// <returns>A task completing after zero channel admission and exact backup watermark assertions.</returns>
+    /// <remarks>A throwing formatter proves the preference is checked before any channel message is built.</remarks>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task Disabled_trial_events_skip_formatter_and_channel_admission(bool paid, bool tenant)
+    {
+        await using var fixture = new BackupRecoveryTests.Fixture();
+        var sender = new BackupRecoveryTests.Sender();
+        await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
+        var settings = new TrialAccountLoggingSettings(new AppConfig(), fixture.Options.OutboxDatabasePath + ".settings.json");
+        var registry = new BotRegistry(new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?> { ["BotToken"] = "1:test-token" }).Build());
+        var accessor = new BotContextAccessor();
+        using var context = tenant ? accessor.Push(new BotRuntimeContext
+        {
+            Config = new BotInstanceConfig
+            {
+                Id = "tenant-trial", Type = BotInstanceTypes.Tenant,
+                LoggerChannel = "-1001234567898", BackupChannel = "-1001234567899"
+            }
+        }) : null;
+        var logger = new TelegramLogger("trial-formatting", null, registry, accessor,
+            "-1001234567890", " -1001234567891 ", dispatcher, settings);
+        logger.Log(LogLevel.Information,
+            paid ? new EventId(1003, "TrialAccountPayment") : new EventId(1002, "TrialAccount"),
+            "unused", null, static (_, _) => throw new InvalidOperationException("Formatter must not run."));
+
+        Assert.Empty(await ReadRowsAsync(fixture.Options.OutboxDatabasePath));
+        await using var outbox = new TelegramLogOutbox(fixture.Options.OutboxDatabasePath);
+        var state = await outbox.ReadBackupAsync();
+        Assert.Equal(paid ? 1 : 0, state.Requested);
+        if (paid)
+        {
+            Assert.Equal("-1001234567891", state.ChannelId);
+            Assert.Equal(registry.DefaultBot.Id, state.BotId);
+            await BackupRecoveryTests.Until(() => sender.Documents == 2);
+        }
+        Assert.Equal(0, sender.Texts);
+    }
+
+    /// <summary>The same provider loggers observe enable and re-disable immediately without purging already queued trial audits.</summary>
+    /// <returns>A task completing after real settings persistence, durable delivery-kind and retained-backup assertions.</returns>
+    /// <remarks>Each transition uses the current revision and the fixture's temporary configuration, never production configuration.</remarks>
+    [Fact]
+    public async Task Trial_channel_preference_is_live_and_queued_events_survive_redisabling()
+    {
+        await using var fixture = new BackupRecoveryTests.Fixture();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sender = new BackupRecoveryTests.Sender { TextBarrier = release.Task };
+        await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
+        var settingsPath = fixture.Options.OutboxDatabasePath + ".settings.json";
+        await File.WriteAllTextAsync(settingsPath, "{}");
+        var settings = new TrialAccountLoggingSettings(new AppConfig(), settingsPath);
+        using var provider = new TelegramLoggerProvider(null,
+            new BotRegistry(new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build()),
+            new BotContextAccessor(), "-1001234567890", "-1001234567891", dispatcher, settings);
+        var first = provider.CreateLogger("trial-first");
+        var second = provider.CreateLogger("trial-second");
+        try
+        {
+            first.LogTrialAccount("initially hidden");
+            Assert.Empty(await ReadRowsAsync(fixture.Options.OutboxDatabasePath));
+            Assert.True((await settings.SetEnabledAsync(true, settings.Snapshot.Revision)).Applied);
+            first.LogTrialAccount("enabled free trial");
+            second.LogTrialAccountPayment("enabled paid trial");
+            var enabledRows = await ReadRowsAsync(fixture.Options.OutboxDatabasePath);
+            Assert.Equal(2, enabledRows.Count);
+            Assert.Contains(enabledRows, row => row.Message == "enabled free trial" &&
+                row.DeliveryKind == (int)TelegramLogDeliveryKind.Html);
+            Assert.Contains(enabledRows, row => row.Message == "enabled paid trial" &&
+                row.DeliveryKind == (int)TelegramLogDeliveryKind.Payment);
+            Assert.Equal(1, await RequestedGenerationsAsync(fixture.Options.OutboxDatabasePath));
+
+            Assert.True((await settings.SetEnabledAsync(false, settings.Snapshot.Revision)).Applied);
+            second.LogTrialAccount("hidden again free");
+            first.LogTrialAccountPayment("hidden again paid");
+            Assert.Equal(2, (await ReadRowsAsync(fixture.Options.OutboxDatabasePath)).Count);
+            Assert.Equal(2, await RequestedGenerationsAsync(fixture.Options.OutboxDatabasePath));
+            release.TrySetResult();
+            await BackupRecoveryTests.Until(() => sender.Texts == 2 && sender.Documents >= 2);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+    }
+
+    /// <summary>Production free-success, free-failure and paid-trial builders emit typed events rather than ordinary audit events.</summary>
+    /// <returns>A task completing after real builders are exercised against a disabled production logger.</returns>
+    /// <remarks>Only the audit helpers execute; account creation, wallet state and eligibility are not touched.</remarks>
+    [Fact]
+    public async Task Trial_audit_builders_classify_free_outcomes_and_paid_purchase_explicitly()
+    {
+        await using var fixture = new BackupRecoveryTests.Fixture();
+        var sender = new BackupRecoveryTests.Sender();
+        await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
+        var flow = BuildXuiFlowService(BuildLogger(dispatcher));
+        var actor = new CredUser { TelegramUserId = 777, ChatID = 777, Username = "trial-customer" };
+        var timing = new XuiOperationTimingSnapshot(TimeSpan.FromMilliseconds(2), TimeSpan.FromMilliseconds(5));
+        var outcome = typeof(XuiV3BotFlowService).GetMethod("LogXuiOperationOutcomeSnapshot",
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        foreach (var result in new[] { "موفق", "ناموفق" })
+            outcome.Invoke(flow, ["trial outcome", result, actor, timing, "trial-account", "normal", (int?)1, (int?)1, true]);
+        using var activeTiming = XuiOperationTiming.Start();
+        typeof(XuiV3BotFlowService).GetMethod("LogXuiOperationOutcome",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(flow,
+            ["trial wrapper", "موفق", actor, activeTiming, "trial-account", "normal", (int?)1, (int?)1, true]);
+        var purchase = typeof(XuiV3BotFlowService).GetMethod("LogV3Purchase",
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        purchase.Invoke(flow, ["paid trial", actor, (long)1000, (long?)2000, (long?)1000, "bot wallet",
+            Array.Empty<string>(), timing, true]);
+
+        Assert.Empty(await ReadRowsAsync(fixture.Options.OutboxDatabasePath));
+        Assert.Equal(1, await RequestedGenerationsAsync(fixture.Options.OutboxDatabasePath));
+        await BackupRecoveryTests.Until(() => sender.Documents == 2);
+        Assert.Equal(0, sender.Texts);
+    }
+
     /// <summary>Builds a production Telegram logger bound to a real durable dispatcher and outbox database.</summary>
+    /// <param name="dispatcher">Required real durable dispatcher bound to the test's temporary outbox.</param>
+    /// <returns>A production logger with a real default-off trial preference.</returns>
+    /// <remarks>The unused settings path is never read or written because this helper does not toggle the preference.</remarks>
     private static TelegramLogger BuildLogger(TelegramLogDispatcher dispatcher)
     {
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
         var registry = new BotRegistry(configuration);
-        return new TelegramLogger("classification-test", null, registry, new BotContextAccessor(), "-1001234567890", "-1001234567891", dispatcher);
+        return new TelegramLogger("classification-test", null, registry, new BotContextAccessor(), "-1001234567890", "-1001234567891", dispatcher,
+            new TrialAccountLoggingSettings(new AppConfig(), Path.Combine(Path.GetTempPath(), "unused-trial-settings.json")));
     }
 
     /// <summary>Builds a production service instance whose private audit methods only need the injected logger.</summary>
@@ -354,7 +544,8 @@ public sealed class LoggingClassificationTests
             botRuntimeStatusStore: null,
             botContextAccessor: null,
             referralService: null,
-            publicChannelPosts: PublicChannelPostTestSupport.CreateInactiveManager(configuration));
+            publicChannelPosts: PublicChannelPostTestSupport.CreateInactiveManager(configuration),
+            trialAccountLogging: new TrialAccountLoggingSettings(new AppConfig(), Path.Combine(Path.GetTempPath(), "unused-trial-settings.json")));
     }
 
     /// <summary>Builds a production XUI v3 flow service whose private audit methods only need the injected logger.</summary>
@@ -374,7 +565,7 @@ public sealed class LoggingClassificationTests
             activityLog: null,
             walletLedgerService: null,
             gozargahSiteSyncService: null,
-            botContextAccessor: null,
+            botContextAccessor: new BotContextAccessor(),
             linkChangeOperationStore: null,
             volumeReminderStateStore: null,
             renewalOperationStore: null,

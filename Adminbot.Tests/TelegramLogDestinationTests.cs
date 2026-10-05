@@ -493,12 +493,14 @@ public sealed class TelegramLogDestinationTests
     /// <param name="loggerChannel">Fallback logger channel passed as the legacy global configuration value.</param>
     /// <param name="backupChannel">Fallback backup channel passed as the legacy global configuration value.</param>
     /// <returns>A logger whose default owned bot has no per-bot destinations, matching the production shape.</returns>
+    /// <remarks>Uses real default-off trial settings without persisting or altering any destination behavior.</remarks>
     private static TelegramLogger BuildLogger(TelegramLogDispatcher dispatcher, string loggerChannel, string backupChannel)
     {
         // The default owned bot has no per-bot values, so every resolved destination comes from the fallback pair.
         var registry = new BotRegistry(new ConfigurationBuilder().AddInMemoryCollection(
             new Dictionary<string, string?> { ["BotToken"] = "1:test-token" }).Build());
-        return new TelegramLogger("destination-test", null, registry, new BotContextAccessor(), loggerChannel, backupChannel, dispatcher);
+        return new TelegramLogger("destination-test", null, registry, new BotContextAccessor(), loggerChannel, backupChannel, dispatcher,
+            new TrialAccountLoggingSettings(new AppConfig(), Path.Combine(Path.GetTempPath(), "unused-trial-logging-settings.json")));
     }
 
     /// <summary>Builds a non-secret durable row that mirrors a row produced by the defective build.</summary>

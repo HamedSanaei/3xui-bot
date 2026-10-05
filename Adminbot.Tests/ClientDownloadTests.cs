@@ -884,7 +884,8 @@ public sealed partial class ConcurrencyTests
             new UserActivityLogService(configuration),
             // analytics, chart renderer, wallet ledger, notification, gozargah, registry, runtime status.
             null!, null!, null!, null!, null!, null!, null!, null!,
-            accessor, null!, PublicChannelPostTestSupport.CreateInactiveManager(configuration));
+            accessor, null!, PublicChannelPostTestSupport.CreateInactiveManager(configuration),
+            new TrialAccountLoggingSettings(new AppConfig(), Path.Combine(databases.DirectoryPath, "configuration.json")));
     }
 
     /// <summary>

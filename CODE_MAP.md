@@ -1,5 +1,15 @@
 # CODE_MAP.md
 
+- Trial logger controls (2026-10-05): owned **🗽 Admin → 🔔 لاگ اکانت تست** uses
+  `TelegramBotService.TrialAccountLogging.cs` and singleton `TrialAccountLoggingSettings`; root
+  `trialAccountLoggingEnabled` defaults **false**, persists via the shared byte-preserving root-boolean editor.
+  Explicit targets, 10-minute expiry, allow-list checks and revision rejection protect live changes.
+  Typed `1002/TrialAccount` (Html) and `1003/TrialAccountPayment` (Payment) are gated only by the Telegram
+  provider before enqueue/formatting; all owned/tenant free and paid test acquisition audits share the flag.
+  Issuance, eligibility, local diagnostics, other logs and paid-trial backup intents remain unchanged;
+  previously queued logs are not purged. Existing logging/callback suites cover persistence, authorization,
+  stale/expired controls and financial backup invariants; operator guidance in `docs/deployment.md`.
+
 - Public-channel posts: owned super-admin **📣 پست عمومی کانال‌ها** uses
   `TelegramBotService.ChannelPosts.cs` / singleton-hosted `PublicChannelPostManager` (core, Preparation,
   Publication partials) / immutable `Domain/PublicChannelPost.cs`. Private real preview precedes one-shot

@@ -298,7 +298,8 @@ public sealed partial class ConcurrencyTests
             .SetMinimumLevel(LogLevel.Information)
             .AddProvider(new DailyErrorFileLoggerProvider(configuration, accessor))
             .AddProvider(new TelegramLoggerProvider(null, new BotRegistry(configuration), accessor,
-                "-1001234567890", "-1001234567891", dispatcher)));
+                "-1001234567890", "-1001234567891", dispatcher,
+                new TrialAccountLoggingSettings(new AppConfig(), fixture.Options.OutboxDatabasePath + ".settings.json"))));
         var logger = factory.CreateLogger("routing-regression");
         var exception = hasException ? new InvalidOperationException("Unexpected operation failure.") : null;
         logger.Log(level, new EventId(0), message, exception, static (text, _) => text);

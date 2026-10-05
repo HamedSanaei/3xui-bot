@@ -140,6 +140,8 @@ public class Program
     /// Backup channels resolve nonblank global configuration before the default-owned channel; the dispatcher supplies durable fallback.
     /// The colleague trial store shares a global per-user Tehran-day allowance across owned bots, without retaining a context.
     /// The single IServiceSalesAvailability snapshot governs customer sale/renewal admission in every owned and tenant bot.
+    /// TrialAccountLoggingSettings is shared by the super-admin UI and Telegram logger provider; it has no logger dependency
+    /// and suppresses only new trial channel audits, retaining local diagnostics and financial backup intents.
     /// PublicChannelPostManager is one shared singleton/hosted instance; it owns process-local preview/publication
     /// jobs without retaining scoped handlers, database contexts or foreground clients.</remarks>
     /// <example><code>RegisterApplicationServices(services, configuration, validatedOptions, contentRootPath);</code></example>
@@ -160,6 +162,9 @@ public class Program
                 appConfig,
                 Path.Combine(contentRootPath, "Data", "configuration.json"),
                 sp.GetRequiredService<ILogger<ClientDownloadAvailabilityService>>()));
+        // No logger dependency: the Telegram logger provider itself consumes this global preference.
+        services.AddSingleton(new TrialAccountLoggingSettings(
+            appConfig, Path.Combine(contentRootPath, "Data", "configuration.json")));
         // One persisted permission snapshot governs unpaid sale/renewal admission across every owned and tenant bot.
         services.AddSingleton<IServiceSalesAvailability>(sp =>
             new ServiceSalesAvailabilityService(
@@ -366,7 +371,8 @@ public class Program
                 // diagnostic rather than a durable row that can never be delivered.
                 TelegramDestination.Sanitize(configuration["loggerChannel"]),
                 TelegramDestination.Sanitize(configuration["backupChannel"]),
-                sp.GetRequiredService<TelegramLogDispatcher>()
+                sp.GetRequiredService<TelegramLogDispatcher>(),
+                sp.GetRequiredService<TrialAccountLoggingSettings>()
                 ));
             // Keep the complete operational diagnostic trail on disk even when the Telegram channel suppresses noise.
             loggingBuilder.Services.AddSingleton<ILoggerProvider>(sp => new DailyErrorFileLoggerProvider(

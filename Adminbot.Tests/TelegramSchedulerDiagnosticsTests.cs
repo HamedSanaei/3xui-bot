@@ -41,7 +41,8 @@ public sealed partial class ConcurrencyTests
         await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
         var channel = new TelegramLogger("scheduler-diagnostics", null,
             new BotRegistry(new ConfigurationBuilder().Build()), new BotContextAccessor(),
-            "-1001234567890", "-1001234567891", dispatcher);
+            "-1001234567890", "-1001234567891", dispatcher,
+            new TrialAccountLoggingSettings(new AppConfig(), fixture.Options.OutboxDatabasePath + ".settings.json"));
         var logs = new SchedulerRoutingLogger(channel);
         const string sensitive = "token=123456:secret https://example.test/private callback=secret-message card=1234 payment=private";
         Exception failure = code == 0 ? new InvalidOperationException(sensitive) :
@@ -90,7 +91,8 @@ public sealed partial class ConcurrencyTests
         await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
         var logs = new SchedulerRoutingLogger(new TelegramLogger("probe-diagnostics", null,
             new BotRegistry(new ConfigurationBuilder().Build()), new BotContextAccessor(),
-            "-1001234567890", "-1001234567891", dispatcher));
+            "-1001234567890", "-1001234567891", dispatcher,
+            new TrialAccountLoggingSettings(new AppConfig(), fixture.Options.OutboxDatabasePath + ".settings.json")));
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var scheduler = new TelegramUpdateScheduler(databases.Inbox, new Executor(async (_, token) =>
         {
@@ -134,7 +136,8 @@ public sealed partial class ConcurrencyTests
         await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
         var logs = new SchedulerRoutingLogger(new TelegramLogger("foreground-request-routing", null,
             new BotRegistry(new ConfigurationBuilder().Build()), new BotContextAccessor(),
-            "-1001234567890", "-1001234567891", dispatcher));
+            "-1001234567890", "-1001234567891", dispatcher,
+            new TrialAccountLoggingSettings(new AppConfig(), fixture.Options.OutboxDatabasePath + ".settings.json")));
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var client = new ForegroundBoundedTelegramBotClient(
             new WatchdogRequestClient(release, rejectSecond), TelegramForegroundDeliveryPolicy.Production);

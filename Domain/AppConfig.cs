@@ -70,6 +70,10 @@ namespace Adminbot.Domain
         /// </remarks>
         public bool LatestClientDownloadEnabled { get; set; }
 
+        /// <summary>Initial global permission for test-account acquisition logs in the Telegram logger channel; defaults off.</summary>
+        /// <remarks>Runtime readers use TrialAccountLoggingSettings.Snapshot. Applies to owned and tenant bots; never disables trials, local diagnostics or financial backups.</remarks>
+        public bool TrialAccountLoggingEnabled { get; set; }
+
         /// <summary>Initial global permission for new normal-service account sales; missing configuration keeps existing sales open.</summary>
         /// <remarks>Runtime admission must read IServiceSalesAvailability, not this startup value. Existing invoices and funded work remain settleable after closure.</remarks>
         public bool NormalSaleEnabled { get; set; } = true;

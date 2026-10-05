@@ -26,6 +26,9 @@ namespace Adminbot.Domain.Logging
         private readonly string _fallbackBackupChannelId;
         private readonly TelegramLogDispatcher _dispatcher;
 
+        /// <summary>Global live preference governing only typed trial acquisition channel events.</summary>
+        private readonly TrialAccountLoggingSettings _trialAccountLoggingSettings;
+
         /// <summary>Minimum spacing between two local diagnostics for the same missing-destination reason.</summary>
         private static readonly TimeSpan DestinationDiagnosticInterval = TimeSpan.FromMinutes(1);
 
@@ -47,11 +50,14 @@ namespace Adminbot.Domain.Logging
         /// <param name="fallbackChannelId">Fallback private logger channel id from legacy configuration.</param>
         /// <param name="fallbackBackupChannelId">Fallback backup channel id used when the current bot has no backup channel.</param>
         /// <param name="dispatcher">Shared durable outbox dispatcher; must not be null.</param>
+        /// <param name="trialAccountLoggingSettings">Required shared global trial-channel preference for owned and tenant bots.</param>
         /// <remarks>
+        /// The required live trial preference affects only explicit trial channel events, never payment backup intent.
         /// Payment logs retain their logger destination; backup intents coalesce into the configured global destination.
         /// Both operations are best-effort at the Telegram layer and durable for Payment/Html at the outbox layer;
         /// they must never fail payment settlement or Telegram update handling.
         /// </remarks>
+        /// <exception cref="ArgumentNullException">The dispatcher or shared trial logging settings are null.</exception>
         internal TelegramLogger(
             string categoryName,
             Func<string, LogLevel, bool> filter,
@@ -59,7 +65,8 @@ namespace Adminbot.Domain.Logging
             BotContextAccessor botContextAccessor,
             string fallbackChannelId,
             string fallbackBackupChannelId,
-            TelegramLogDispatcher dispatcher)
+            TelegramLogDispatcher dispatcher,
+            TrialAccountLoggingSettings trialAccountLoggingSettings)
         {
             _categoryName = categoryName;
             _filter = filter;
@@ -68,6 +75,7 @@ namespace Adminbot.Domain.Logging
             _fallbackChannelId = fallbackChannelId;
             _fallbackBackupChannelId = fallbackBackupChannelId;
             _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+            _trialAccountLoggingSettings = trialAccountLoggingSettings ?? throw new ArgumentNullException(nameof(trialAccountLoggingSettings));
         }
 
         public IDisposable BeginScope<TState>(TState state) => default;
@@ -81,14 +89,16 @@ namespace Adminbot.Domain.Logging
         /// <param name="logLevel">Severity evaluated against the configured category filter before delivery.</param>
         /// <param name="eventId">
         /// Event identity selecting payment HTML with backups (<c>1000/Payment</c>), operational HTML
-        /// (<c>1001/TelegramHtml</c>), or ordinary plain text.
+        /// (<c>1001/TelegramHtml</c>), trial HTML (<c>1002/TrialAccount</c>), paid trial
+        /// (<c>1003/TrialAccountPayment</c>), or ordinary plain text.
         /// </param>
         /// <param name="state">Structured event state passed to <paramref name="formatter"/>; it may be null.</param>
         /// <param name="exception">Optional exception used by channel-noise suppression and the formatter.</param>
         /// <param name="formatter">Required formatter that produces the final channel message from state and exception.</param>
         /// <remarks>
-        /// Event 1000/Payment and 1001/TelegramHtml are committed to the durable SQLite outbox synchronously —
-        /// the SQLite INSERT/COMMIT completes before this method returns — so the record survives process crash,
+        /// Event 1000/Payment and 1001/TelegramHtml, including their enabled typed trial variants, are committed to the
+        /// durable SQLite outbox synchronously — the SQLite INSERT/COMMIT completes before this method returns —
+        /// so the record survives process crash,
         /// systemctl restart, reboot, Telegram outage, and lost in-memory wake-ups. Delivery itself is asynchronous
         /// and serialized by <see cref="TelegramLogDispatcher"/>. All other events stay plain text in a bounded
         /// memory-only queue so arbitrary application logs cannot be interpreted as Telegram markup and cannot grow
@@ -102,11 +112,25 @@ namespace Adminbot.Domain.Logging
         /// it dead-lettered while masking the configuration fault. Payment events keep their durable database-backup
         /// request even when the audit line is not queued, so a logging misconfiguration never stops payment backups.
         /// This method never throws: settlement and Telegram update handling are protected from logging failure.
+        /// Typed trial acquisition events are suppressed before formatting and destination admission when the global
+        /// setting is disabled. Paid trials still request a durable backup using the existing sanitized default route.
+        /// Other providers and already-enqueued rows are unaffected.
         /// </remarks>
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
         {
             if (!IsEnabled(logLevel))
             {
+                return;
+            }
+
+            var isTrialAccount = eventId.Id == 1002 && eventId.Name == "TrialAccount";
+            var isTrialAccountPayment = eventId.Id == 1003 && eventId.Name == "TrialAccountPayment";
+            if ((isTrialAccount || isTrialAccountPayment) && !_trialAccountLoggingSettings.Snapshot.Enabled)
+            {
+                if (isTrialAccountPayment)
+                    _dispatcher.RequestBackupIntent(
+                        CurrentLoggingBotConfig?.Id ?? string.Empty,
+                        TelegramDestination.Sanitize(CurrentBackupChannelId));
                 return;
             }
 
@@ -118,9 +142,9 @@ namespace Adminbot.Domain.Logging
                 return;
             }
 
-            var delivery = eventId.Id == 1000 && eventId.Name == "Payment"
+            var delivery = (eventId.Id == 1000 && eventId.Name == "Payment") || isTrialAccountPayment
                 ? TelegramLogDeliveryKind.Payment
-                : eventId.Id == 1001 && eventId.Name == "TelegramHtml"
+                : (eventId.Id == 1001 && eventId.Name == "TelegramHtml") || isTrialAccount
                     ? TelegramLogDeliveryKind.Html
                     : TelegramLogDeliveryKind.Plain;
 

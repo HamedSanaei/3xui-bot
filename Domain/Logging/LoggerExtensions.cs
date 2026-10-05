@@ -18,8 +18,8 @@ namespace Adminbot.Domain.Logging
         /// HTML-safe payment text. Every external or user-controlled value must be encoded before inclusion.
         /// </param>
         /// <remarks>
-        /// This is the only logger event that requests a database backup: the durable outbox increments the global
-        /// backup generation atomically with the Payment insertion. Use it only for financial events (settlement,
+        /// Payment events, including <see cref="LogTrialAccountPayment"/>, request a database backup: the durable outbox
+        /// increments the global backup generation atomically with the Payment insertion. Use it only for financial events (settlement,
         /// wallet credit/debit/refund, purchase, renewal, referral reward, admin wallet adjustment) and never for
         /// operational audits such as phone verification, role changes, colleague requests, link changes, or account
         /// deletion, which must use <see cref="LogTelegramHtml"/> instead.
@@ -52,6 +52,33 @@ namespace Adminbot.Domain.Logging
         public static void LogTelegramHtml(this ILogger logger, string message)
         {
             logger.Log(LogLevel.Information, new EventId(1001, "TelegramHtml"), message, null, (msg, ex) => msg);
+        }
+
+        /// <summary>Records a free-trial acquisition outcome using the explicit trial HTML audit event.</summary>
+        /// <param name="logger">Required application logger; all configured providers receive the event.</param>
+        /// <param name="message">HTML-safe acquisition audit with every dynamic value encoded by the caller.</param>
+        /// <remarks>
+        /// Event 1002/TrialAccount uses the ordinary HTML audit route without financial backup intent when trial
+        /// channel logging is enabled. The Telegram provider alone suppresses it when disabled; local diagnostics remain.
+        /// </remarks>
+        /// <example><code>logger.LogTrialAccount("Trial account created: &lt;code&gt;example&lt;/code&gt;");</code></example>
+        public static void LogTrialAccount(this ILogger logger, string message)
+        {
+            logger.Log(LogLevel.Information, new EventId(1002, "TrialAccount"), message, null, (msg, ex) => msg);
+        }
+
+        /// <summary>Records a paid-trial acquisition using an explicit financial trial audit event.</summary>
+        /// <param name="logger">Required application logger; all configured providers receive the event.</param>
+        /// <param name="message">HTML-safe completed purchase audit with every dynamic value encoded by the caller.</param>
+        /// <remarks>
+        /// Event 1003/TrialAccountPayment uses ordinary Payment delivery when trial channel logging is enabled.
+        /// When disabled, only its Telegram audit line is suppressed: durable financial backup intent is retained.
+        /// This does not disable settlement, other payment logs, or local diagnostics.
+        /// </remarks>
+        /// <example><code>logger.LogTrialAccountPayment("Paid trial: &lt;code&gt;example&lt;/code&gt;");</code></example>
+        public static void LogTrialAccountPayment(this ILogger logger, string message)
+        {
+            logger.Log(LogLevel.Information, new EventId(1003, "TrialAccountPayment"), message, null, (msg, ex) => msg);
         }
     }
 

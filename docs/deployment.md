@@ -143,6 +143,20 @@ know: unknown keys are ignored by the configuration binder, so a newer configura
 an older configuration stays usable by a newer build. Every message it produces names a configuration key and never
 echoes a configured value, a chat id, a bot token, or a panel secret.
 
+## Test-account logger channel controls
+
+Configured super-admins use **🗽 Admin → 🔔 لاگ اکانت تست** in an owned bot to turn test-account
+acquisition reports on or off globally for owned and tenant bots, including free and paid colleague tests.
+The additive root key `trialAccountLoggingEnabled` defaults to **false** when absent, so deploying this
+release stops new trial acquisition reports by default without requiring a production configuration rewrite.
+The panel saves the exact boolean before applying the change immediately; the preference survives restart.
+Manual JSON changes take effect at startup. Failed saves leave the current state unchanged and display an alert.
+
+This controls only trial acquisition audits entering the Telegram logger channel. Trial issuance and eligibility,
+ordinary purchases, other logs, local diagnostics and paid-trial financial backup intents are unchanged.
+Previously queued reports may still arrive; disabling does not purge the durable outbox. Buttons expire after
+ten minutes and reject stale revisions; use **🔄 تازه‌سازی** after another administrator changes the state.
+
 ## Global service sale and renewal controls
 
 Configured super-admins can use **🗽 Admin → 📊 کنترل فروش و تمدید** in an owned bot to close or reopen

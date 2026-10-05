@@ -100,7 +100,8 @@ public sealed class AdminPanelRoutingTests
                 botRuntimeStatusStore: null,
                 botContextAccessor: botContextAccessor,
                 referralService: null,
-                publicChannelPosts: PublicChannelPostTestSupport.CreateInactiveManager(configuration))
+                publicChannelPosts: PublicChannelPostTestSupport.CreateInactiveManager(configuration),
+                trialAccountLogging: new TrialAccountLoggingSettings(new AppConfig(), Path.Combine(Path.GetTempPath(), "unused-trial-settings.json")))
         {
         }
 

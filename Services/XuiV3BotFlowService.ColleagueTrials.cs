@@ -169,7 +169,7 @@ public partial class XuiV3BotFlowService
     /// <param name="mainReplyMarkup">Nullable main keyboard after delivery or failure.</param>
     /// <param name="token">Cancellation of progress, panel requests and delivery.</param>
     /// <returns>A task completing after delivery or an explicit unresolved/terminal notice.</returns>
-    /// <remarks>Only the persisted executor winner may settle missing/Reserved creation evidence. Losing/restarted executions are GET-only and never release another execution's slot. A failed progress or result send cannot grant a second POST.</remarks>
+    /// <remarks>Only the persisted executor winner may settle missing/Reserved creation evidence. Losing/restarted executions are GET-only and never release another execution's slot. A failed progress or result send cannot grant a second POST. The successful typed trial audit follows the Telegram-only global logging preference.</remarks>
     /// <exception cref="OperationCanceledException">The caller cancels; local quota settlement still runs after a winning attempt.</exception>
     /// <example><code>await CompleteFreeColleagueTrialAsync(client, message, profile, state, grant, keyboard, token);</code></example>
     private async Task CompleteFreeColleagueTrialAsync(ITelegramBotClient botClient, Message message, CredUser profile,
@@ -220,7 +220,8 @@ public partial class XuiV3BotFlowService
             return;
         }
         LogXuiOperationOutcome("ساخت اکانت تست روزانه همکار", "موفق", profile, timing,
-            accountEmail: creation.Email, source: grant.ServiceKey, requestedCount: 1, successfulCount: 1);
+            accountEmail: creation.Email, source: grant.ServiceKey, requestedCount: 1, successfulCount: 1,
+            isTrialAccount: true);
         await _state.ClearUserStatus(user);
         await SendTrialAccountAsync(botClient, message.Chat.Id, creation, mainReplyMarkup, token);
     }
@@ -291,6 +292,8 @@ public partial class XuiV3BotFlowService
     /// Once that receipt commits, recovery ignores later category closure: creation/read-back/refund follows the
     /// same original receipt without a second charge, blind refund or replay. Renewal permission is never consulted.
     /// No tenant owner balance, partner profit or payment-provider invoice is created.
+    /// The successful typed paid-trial audit follows the global Telegram channel preference without disabling
+    /// financial backup intent, wallet receipts or local diagnostics.
     /// </remarks>
     /// <exception cref="OperationCanceledException">The caller cancels; any winning attempt is classified and safely refunded or held first.</exception>
     /// <exception cref="InvalidOperationException">Persisted actor/amount/creation identities conflict, or live pricing is invalid.</exception>
@@ -412,7 +415,8 @@ public partial class XuiV3BotFlowService
             () => _gozargahSiteSyncService.QueueCreateAsync(ResolveGozargahSiteOwnerTelegramUserId(profile),
                 profile.TelegramUserId, creation, paidKey, ResolveGozargahTenantBotId(), cancellationToken: token));
         LogV3Purchase("خرید اکانت تست همکار", profile, price, debit.BeforeBalance, debit.AfterBalance,
-            "کیف پول ربات", new[] { $"نام اکانت `{creation.Email}`", $"مدت `{TrialDays} روز`" }, timing.Snapshot());
+            "کیف پول ربات", new[] { $"نام اکانت `{creation.Email}`", $"مدت `{TrialDays} روز`" }, timing.Snapshot(),
+            isTrialAccount: true);
         await ClearMatchingPaidTrialStateAsync(user, grant.Id);
         await SendTrialAccountAsync(botClient, message.Chat.Id, creation, mainReplyMarkup, token);
     }

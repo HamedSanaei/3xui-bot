@@ -23,6 +23,9 @@ namespace Adminbot.Domain.Logging
         private readonly string _fallbackBackupChannelId;
         private readonly TelegramLogDispatcher _dispatcher;
 
+        /// <summary>Shared live trial-channel preference passed to every logger created by this provider.</summary>
+        private readonly TrialAccountLoggingSettings _trialAccountLoggingSettings;
+
         /// <summary>
         /// Initializes a provider that creates <see cref="TelegramLogger"/> instances.
         /// </summary>
@@ -35,13 +38,17 @@ namespace Adminbot.Domain.Logging
         /// <param name="fallbackChannelId">Fallback Telegram log channel id when the active bot has no logger channel.</param>
         /// <param name="fallbackBackupChannelId">Fallback Telegram backup channel id used by payment logs.</param>
         /// <param name="dispatcher">Shared durable outbox dispatcher; must not be null.</param>
+        /// <param name="trialAccountLoggingSettings">Required global preference shared by owned and tenant bot loggers.</param>
+        /// <remarks>Trial acquisition filtering happens inside each logger without affecting other providers or backup intent.</remarks>
+        /// <exception cref="ArgumentNullException">The dispatcher or shared trial logging settings are null.</exception>
         internal TelegramLoggerProvider(
             Func<string, LogLevel, bool> filter,
             BotRegistry botRegistry,
             BotContextAccessor botContextAccessor,
             string fallbackChannelId,
             string fallbackBackupChannelId,
-            TelegramLogDispatcher dispatcher)
+            TelegramLogDispatcher dispatcher,
+            TrialAccountLoggingSettings trialAccountLoggingSettings)
         {
             _filter = filter;
             _botRegistry = botRegistry;
@@ -49,8 +56,13 @@ namespace Adminbot.Domain.Logging
             _fallbackChannelId = fallbackChannelId;
             _fallbackBackupChannelId = fallbackBackupChannelId;
             _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+            _trialAccountLoggingSettings = trialAccountLoggingSettings ?? throw new ArgumentNullException(nameof(trialAccountLoggingSettings));
         }
 
+        /// <summary>Creates a category logger using the shared routing, dispatcher and live trial preference.</summary>
+        /// <param name="categoryName">Application or framework category supplied by Microsoft.Extensions.Logging.</param>
+        /// <returns>A logger that applies Telegram-only forwarding and trial acquisition filtering.</returns>
+        /// <remarks>The host owns the dispatcher and settings; logger creation does not snapshot the preference.</remarks>
         public ILogger CreateLogger(string categoryName)
         {
             return new TelegramLogger(
@@ -60,7 +72,8 @@ namespace Adminbot.Domain.Logging
                 _botContextAccessor,
                 _fallbackChannelId,
                 _fallbackBackupChannelId,
-                _dispatcher);
+                _dispatcher,
+                _trialAccountLoggingSettings);
         }
 
         /// <summary>Releases this lightweight provider; the host owns and asynchronously drains the shared dispatcher.</summary>

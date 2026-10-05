@@ -138,7 +138,8 @@ public sealed class BackupRecoveryTests
         await using var dispatcher = new TelegramLogDispatcher(_ => sender, fixture.Options);
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
         var registry = new BotRegistry(configuration);
-        var logger = new TelegramLogger("lifecycle", null, registry, new Adminbot.Domain.BotContextAccessor(), "-1001234567890", "-1001234567891", dispatcher);
+        var logger = new TelegramLogger("lifecycle", null, registry, new Adminbot.Domain.BotContextAccessor(), "-1001234567890", "-1001234567891", dispatcher,
+            new Adminbot.Domain.TrialAccountLoggingSettings(new Adminbot.Domain.AppConfig(), fixture.Options.OutboxDatabasePath + ".settings.json"));
         var service = new MultiBotHostedService(null, null, null, null, null, null, configuration,
             new TypedLogger(logger));
         var method = typeof(MultiBotHostedService).GetMethod("LogTenantRuntimeEvent",

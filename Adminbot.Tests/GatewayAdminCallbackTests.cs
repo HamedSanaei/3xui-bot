@@ -15,6 +15,88 @@ public sealed partial class ConcurrencyTests
 {
     private const long GatewaySuperAdminId = 85758085;
 
+
+    /// <summary>Trial logger controls persist explicit states, reject stale replays and remain restricted to configured super-admins.</summary>
+    /// <returns>A task completing after saved state, restart restoration and unauthorized/stale rejection assertions.</returns>
+    /// <remarks>Regression: disabling noisy trial audits must not be undone by replaying an old button or by a customer forging a callback. The same saved flag must survive restart.</remarks>
+    [Fact]
+    public async Task Trial_logger_toggle_persists_and_rejects_stale_or_unauthorized_changes()
+    {
+        using var databases = new Databases();
+        var path = Path.Combine(databases.DirectoryPath, "configuration.json");
+        const string original = "{\n  \"supportText\": \"💬 پشتیبانی\",\n  \"normalSaleEnabled\": true\n}\n";
+        await File.WriteAllTextAsync(path, original, new System.Text.UTF8Encoding(false));
+        var client = new GatewayTelegramClient();
+        var (service, accessor, _) = BuildGatewayCallbackService(databases, new GatewayAvailabilityProbe(), client);
+        var settings = (TrialAccountLoggingSettings)typeof(TelegramBotService)
+            .GetField("_trialAccountLogging", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(service)!;
+        Assert.False(settings.Snapshot.Enabled);
+
+        await InvokeTrialLoggingCallbackAsync(service, accessor, client, "1", settings.Snapshot.Revision);
+        Assert.True(settings.Snapshot.Enabled);
+        var saved = await File.ReadAllTextAsync(path, System.Text.Encoding.UTF8);
+        Assert.Contains("\"supportText\": \"💬 پشتیبانی\"", saved);
+        Assert.Contains("\"normalSaleEnabled\": true", saved);
+        var restoredConfig = new ConfigurationBuilder().AddJsonFile(path).Build().Get<AppConfig>()!;
+        Assert.True(new TrialAccountLoggingSettings(restoredConfig, path).Snapshot.Enabled);
+
+        // A stale off button and a fresh unauthorized off button cannot overwrite the accepted on decision.
+        await InvokeTrialLoggingCallbackAsync(service, accessor, client, "0", 1);
+        Assert.True(settings.Snapshot.Enabled);
+        await InvokeTrialLoggingCallbackAsync(service, accessor, client, "0", settings.Snapshot.Revision, actor: 123456);
+        Assert.True(settings.Snapshot.Enabled);
+        Assert.Equal(saved, await File.ReadAllTextAsync(path, System.Text.Encoding.UTF8));
+
+        await InvokeTrialLoggingCallbackAsync(service, accessor, client, "0", settings.Snapshot.Revision);
+        Assert.False(settings.Snapshot.Enabled);
+        restoredConfig = new ConfigurationBuilder().AddJsonFile(path).Build().Get<AppConfig>()!;
+        Assert.False(new TrialAccountLoggingSettings(restoredConfig, path).Snapshot.Enabled);
+        Assert.Empty(client.Documents);
+    }
+
+    /// <summary>Expired controls and failed persistence cannot publish an unsaved trial logger preference.</summary>
+    /// <returns>A task completing after expiry and failed-write state invariants are checked.</returns>
+    /// <remarks>The live false default stays false when an old callback is received or configuration storage is unavailable.</remarks>
+    [Fact]
+    public async Task Trial_logger_expiry_and_write_failure_leave_runtime_unchanged()
+    {
+        using var databases = new Databases();
+        var client = new GatewayTelegramClient();
+        var (service, accessor, _) = BuildGatewayCallbackService(databases, new GatewayAvailabilityProbe(), client);
+        await InvokeTrialLoggingCallbackAsync(service, accessor, client, "1", 1,
+            issued: DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 601);
+        Assert.False(File.Exists(Path.Combine(databases.DirectoryPath, "configuration.json")));
+        var settings = new TrialAccountLoggingSettings(new AppConfig(), Path.Combine(databases.DirectoryPath, "missing", "configuration.json"));
+        var result = await settings.SetEnabledAsync(true, settings.Snapshot.Revision);
+        Assert.False(result.Applied);
+        Assert.False(settings.Snapshot.Enabled);
+        Assert.Equal(1, settings.Snapshot.Revision);
+    }
+
+    /// <summary>Exercises the real authenticated control handler with an owned runtime context and local recording transport.</summary>
+    /// <param name="service">Required production handler with isolated stores and synthetic admin configuration.</param>
+    /// <param name="accessor">Required runtime accessor used to establish the owned-bot boundary.</param>
+    /// <param name="client">Required recording Telegram transport; no network requests are made.</param>
+    /// <param name="target">Closed target token: zero, one, or refresh.</param>
+    /// <param name="revision">Positive process-local panel revision under test.</param>
+    /// <param name="actor">Global Telegram sender id; defaults to the configured test super-admin.</param>
+    /// <param name="issued">Optional UTC Unix timestamp in seconds; null means the current time.</param>
+    /// <returns>A task completing after the real preference write, rejection and panel refresh.</returns>
+    /// <remarks>No account creation or financial collaborators are invoked.</remarks>
+    /// <example><code>await InvokeTrialLoggingCallbackAsync(service, accessor, client, "1", settings.Snapshot.Revision);</code></example>
+    private static async Task InvokeTrialLoggingCallbackAsync(TelegramBotService service, BotContextAccessor accessor,
+        ITelegramBotClient client, string target, long revision, long actor = GatewaySuperAdminId, long? issued = null)
+    {
+        var callback = GatewayCallback("refresh", 0, revision, actor);
+        callback.Data = $"triallog:{revision}:{issued ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds()}:{target}";
+        using var scope = accessor.Push(new BotRuntimeContext
+        {
+            Config = new BotInstanceConfig { Id = "owned-trial-test", Type = BotInstanceTypes.Owned },
+            Client = client
+        });
+        var method = typeof(TelegramBotService).GetMethod("TryHandleTrialAccountLoggingCallbackAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        Assert.True(await (Task<bool>)method.Invoke(service, new object[] { client, callback, CancellationToken.None })!);
+    }
     [Fact]
     public async Task Super_admin_gateway_refresh_message_not_modified_is_noop_and_never_shows_customer_menu()
     {
@@ -161,7 +243,8 @@ public sealed partial class ConcurrencyTests
             null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, gateway,
             null!, null!,
             null!, null!, null!, null!, null!, null!, null!, new UserActivityLogService(configuration), null!, null!,
-            null!, null!, null!, null!, null!, null!, accessor, null!, PublicChannelPostTestSupport.CreateInactiveManager(configuration));
+            null!, null!, null!, null!, null!, null!, accessor, null!, PublicChannelPostTestSupport.CreateInactiveManager(configuration),
+            new TrialAccountLoggingSettings(new AppConfig(), Path.Combine(databases.DirectoryPath, "configuration.json")));
         return (service, accessor, activityLogPath);
     }
 

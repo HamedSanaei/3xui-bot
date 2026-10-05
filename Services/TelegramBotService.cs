@@ -139,6 +139,7 @@ public partial class TelegramBotService
         AdminChannelPostAction,
         TenantBotService.TenantWalletAdminMenuAction,
         AdminClientDownloadAction,
+        AdminTrialAccountLoggingAction,
         "🤖 وضعیت ربات‌ها",
         AdminManualReviewAction,
         "📑 Menu"
@@ -234,6 +235,8 @@ public partial class TelegramBotService
     private readonly AtlasPayReconciliationHostedService _atlasPayReconciliation;
     private readonly IPaymentGatewayAvailability _gatewayAvailability;
     private readonly IClientDownloadAvailability _clientDownloadAvailability;
+    /// <summary>Shared persisted preference for Telegram-only trial acquisition audits across all bots.</summary>
+    private readonly TrialAccountLoggingSettings _trialAccountLogging;
     private readonly IClientReleaseService _clientReleaseService;
     private readonly AppleMobileConfigTelegramFlow _appleMobileConfigFlow;
     private readonly XuiV3PurchaseService _xuiV3PurchaseService;
@@ -335,9 +338,13 @@ public partial class TelegramBotService
     /// <param name="uniquePayReconciliation">
     /// Shared authoritative UniquePay inquiry coordinator reused by customer check buttons.
     /// </param>
+    /// <param name="atlasPay">Global AtlasPay client used for invoice creation and verification; credentials remain private.</param>
+    /// <param name="atlasPayReconciliation">Shared AtlasPay reconciliation coordinator used by customer verification callbacks.</param>
     /// <param name="gatewayAvailability">
     /// Live global gateway switches used by every button and hard invoice-creation guard.
     /// </param>
+    /// <param name="clientDownloadAvailability">Global live download-menu availability; owned and tenant customers share the same setting.</param>
+    /// <param name="clientReleaseService">Shared release resolver for supported customer download targets.</param>
     /// <param name="xuiV3PurchaseService">Shared XuiV3 purchase/account creation service.</param>
     /// <param name="xuiV3BotFlowService">Regular user XuiV3 purchase and account-management flow.</param>
     /// <param name="xuiV3PurchaseSessionStore">
@@ -345,6 +352,7 @@ public partial class TelegramBotService
     /// customer flow, preventing stale plan selections from resuming after the referral dashboard is shown.
     /// </param>
     /// <param name="xuiV3AdminFlowService">Super-admin XuiV3 management flow.</param>
+    /// <param name="xuiV3RenewalManualReviewAdminService">Read-only super-admin renewal recovery view; never bypasses financial proof.</param>
     /// <param name="tenantBotService">Tenant storefront owner and customer flow service.</param>
     /// <param name="salesAssistantService">Tenant receipt and colleague notification assistant flow.</param>
     /// <param name="userActivityLog">File-based user activity logger.</param>
@@ -371,6 +379,7 @@ public partial class TelegramBotService
     /// Global owned-bot referral service used by start payloads, user reporting, and final legacy Zibal settlement.
     /// </param>
     /// <param name="publicChannelPosts">Required singleton public-channel draft/job manager; private-customer broadcasts remain separate.</param>
+    /// <param name="trialAccountLogging">Required singleton global trial-channel preference; never changes trial eligibility or issuance.</param>
     /// <param name="interactionTimeouts">
     /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used:
     /// two seconds for callback acknowledgement and one overall five-second budget for mandatory-join
@@ -379,6 +388,8 @@ public partial class TelegramBotService
     /// instance. This value is never read from configuration, so a deployment cannot raise it back to the
     /// pathological default Telegram HTTP timeout.
     /// </param>
+    /// <param name="mandatoryJoinMembershipCache">Optional owned-bot membership cache; null creates the standard cache without changing join requirements.</param>
+    /// <param name="appleMobileConfigFlow">Optional Apple APN profile flow; null leaves that integration unavailable.</param>
     /// <remarks>
     /// The service belongs to one execution/request scope. Conversation and financial stores create independent
     /// users.db contexts through their factories. Runtime bot identity always comes from <see cref="BotContextAccessor"/>
@@ -386,7 +397,7 @@ public partial class TelegramBotService
     /// Public-channel composition and publication are delegated to the shared manager using the explicit source bot
     /// and sender/private-chat identity; this scoped service never performs target probes or media downloads.
     /// </remarks>
-    /// <exception cref="ArgumentNullException">The required public-channel manager dependency is null.</exception>
+    /// <exception cref="ArgumentNullException">The required public-channel manager or trial logging settings dependency is null.</exception>
     /// <example><code>var handler = scope.ServiceProvider.GetRequiredService&lt;TelegramBotService&gt;();</code></example>
     public TelegramBotService(
         ITelegramBotClient botClient,
@@ -428,6 +439,7 @@ public partial class TelegramBotService
         BotContextAccessor botContextAccessor,
         ReferralService referralService,
         PublicChannelPostManager publicChannelPosts,
+        TrialAccountLoggingSettings trialAccountLogging,
         TelegramInteractionTimeouts interactionTimeouts = null,
         ITelegramMandatoryJoinMembershipCache mandatoryJoinMembershipCache = null,
         AppleMobileConfigTelegramFlow appleMobileConfigFlow = null)
@@ -475,6 +487,7 @@ public partial class TelegramBotService
         _botContextAccessor = botContextAccessor;
         _referralService = referralService;
         _publicChannelPosts = publicChannelPosts ?? throw new ArgumentNullException(nameof(publicChannelPosts));
+        _trialAccountLogging = trialAccountLogging ?? throw new ArgumentNullException(nameof(trialAccountLogging));
         _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
         _mandatoryJoinMembershipCache = mandatoryJoinMembershipCache ?? new TelegramMandatoryJoinMembershipCache();
     }
@@ -961,6 +974,8 @@ public partial class TelegramBotService
                 return;
             if (await TryHandleSalesControlCallbackAsync(botClient, callbackQuery, cancellationToken))
                 return;
+            if (await TryHandleTrialAccountLoggingCallbackAsync(botClient, callbackQuery, cancellationToken))
+                return;
 
 
             // Tutorial callbacks are owned-only presentation; tenant routing above keeps storefront navigation isolated.
@@ -1141,6 +1156,8 @@ public partial class TelegramBotService
         if (isOwnedBot && await TryHandleSuperAdminMenuExitAsync(botClient, message, cancellationToken))
             return;
         if (isOwnedBot && await TryHandleSalesControlMessageAsync(botClient, message, isOwnedBot, cancellationToken))
+            return;
+        if (isOwnedBot && await TryHandleTrialAccountLoggingMessageAsync(botClient, message, isOwnedBot, cancellationToken))
             return;
 
 

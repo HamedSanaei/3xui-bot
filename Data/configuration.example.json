@@ -12,6 +12,7 @@
   "adminsUserIds": [],
   "tenantMaxStoresPerOwner": 5,
   "colleagueDailyFreeTrialLimit": 3,
+  "trialAccountLoggingEnabled": false,
   "normalSaleEnabled": true,
   "normalRenewalEnabled": true,
   "nationalSaleEnabled": true,
