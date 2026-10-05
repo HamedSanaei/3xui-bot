@@ -135,6 +135,13 @@ public sealed partial class ConcurrencyTests
         Assert.False(string.IsNullOrWhiteSpace(answer.Text));
         Assert.Empty(client.Sends);
     }
+    /// <summary>Builds focused gateway callback routing with isolated state and a real inactive publisher.</summary>
+    /// <param name="databases">Required fixture owning this test's users/credentials databases.</param>
+    /// <param name="gateway">Required controllable global gateway availability, never a remote payment provider.</param>
+    /// <param name="client">Required recording Telegram transport used only by the gateway scenario.</param>
+    /// <returns>The focused handler, context accessor to push, and fixture-local activity log path.</returns>
+    /// <remarks>The public-channel worker remains unstarted; this helper makes no Telegram or financial calls.</remarks>
+    /// <example><code>var (service, accessor, _) = BuildGatewayCallbackService(databases, gateway, client);</code></example>
     private static (TelegramBotService Service, BotContextAccessor Accessor, string ActivityLogPath) BuildGatewayCallbackService(
         Databases databases,
         GatewayAvailabilityProbe gateway,
@@ -154,7 +161,7 @@ public sealed partial class ConcurrencyTests
             null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, null!, gateway,
             null!, null!,
             null!, null!, null!, null!, null!, null!, null!, new UserActivityLogService(configuration), null!, null!,
-            null!, null!, null!, null!, null!, null!, accessor, null!);
+            null!, null!, null!, null!, null!, null!, accessor, null!, PublicChannelPostTestSupport.CreateInactiveManager(configuration));
         return (service, accessor, activityLogPath);
     }
 

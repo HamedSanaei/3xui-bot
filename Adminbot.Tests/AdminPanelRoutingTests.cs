@@ -46,7 +46,15 @@ public sealed class AdminPanelRoutingTests
         /// <summary>Exact keyboard the production panel content builder would attach.</summary>
         public ReplyKeyboardMarkup? LastPanelMarkup { get; private set; }
 
-        /// <summary>Creates the probe with production collaborators intentionally null except the tested local stores.</summary>
+        /// <summary>Creates the panel probe with local stores and a real inactive channel-post manager.</summary>
+        /// <param name="stateStore">Required isolated per-bot/user conversation store used by navigation.</param>
+        /// <param name="sessions">Required bot-scoped XUI selection store whose reset is under test.</param>
+        /// <param name="configuration">Required synthetic admin configuration; never production tokens.</param>
+        /// <param name="botContextAccessor">Required accessor pushed with the test's exact Owned/Tenant context.</param>
+        /// <param name="credentials">Optional isolated profile store for actor/role scenarios.</param>
+        /// <remarks>No publisher worker or Telegram probe is started. Unrelated production collaborators remain null.</remarks>
+        /// <exception cref="ArgumentNullException">The required configuration is null.</exception>
+        /// <example><code>var probe = new ProbeTelegramBotService(state, sessions, config, accessor);</code></example>
         public ProbeTelegramBotService(
             UserStateStore stateStore,
             XuiV3PurchaseSessionStore sessions,
@@ -91,7 +99,8 @@ public sealed class AdminPanelRoutingTests
                 botRegistry: null,
                 botRuntimeStatusStore: null,
                 botContextAccessor: botContextAccessor,
-                referralService: null)
+                referralService: null,
+                publicChannelPosts: PublicChannelPostTestSupport.CreateInactiveManager(configuration))
         {
         }
 

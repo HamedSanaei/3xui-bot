@@ -32,11 +32,12 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Regression tests are intentionally separate from the single production application. -->
-    <Compile Remove="Adminbot.Tests\**" />
-    <None Remove="Adminbot.Tests\**" />
-    <Content Remove="Adminbot.Tests\**" />
-    <EmbeddedResource Remove="Adminbot.Tests\**" />
+    <!-- Tests and local build/publish artifacts are not production source or content. Old artifacts may contain
+         nested Data/configuration files, so exclude whole output trees rather than just the root Data directory. -->
+    <Compile Remove="Adminbot.Tests\**;artifacts\**;published\**" />
+    <None Remove="Adminbot.Tests\**;artifacts\**;published\**" />
+    <Content Remove="Adminbot.Tests\**;artifacts\**;published\**" />
+    <EmbeddedResource Remove="Adminbot.Tests\**;artifacts\**;published\**" />
     <EmbeddedResource Include="Assets\Fonts\NotoSans-Regular.ttf"
                       LogicalName="Adminbot.Assets.Fonts.NotoSans-Regular.ttf" />
     <None Include="Assets\Fonts\OFL.txt"

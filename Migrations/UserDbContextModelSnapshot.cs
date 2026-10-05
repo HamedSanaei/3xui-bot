@@ -358,6 +358,11 @@ namespace Adminbot.Migrations
                         .HasColumnType("INTEGER")
                         .HasDefaultValue(false);
 
+                    b.Property<bool>("TenantPublicChannelPostsEnabled")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(true);
+
                     b.Property<int>("TenantPriceMarkupPercent")
                         .HasColumnType("INTEGER");
 

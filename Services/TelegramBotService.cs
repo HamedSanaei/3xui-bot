@@ -111,6 +111,39 @@ public partial class TelegramBotService
     /// </summary>
     private const string AdminPaymentGatewayAction = "⚙️ مدیریت درگاه‌ها";
 
+    /// <summary>Owned super-admin composer for associated public channels, never private-customer broadcasts.</summary>
+    private const string AdminChannelPostAction = "📣 پست عمومی کانال‌ها";
+
+    /// <summary>Shared ordered admin labels; navigation checks reuse this array rather than allocate on each update.</summary>
+    /// <remarks>Private callers only inspect these labels; never mutate the shared array.</remarks>
+    private static readonly string[] AdminActions =
+    {
+        "🚫 Ban user",
+        "✅ Unban user",
+        "➕ Add credit",
+        "➖ Reduce credit",
+        PromoteColleagueAction,
+        DemoteColleagueAction,
+        "ℹ️ See User Account",
+        "📨 Send message to all",
+        "✉️ Send message to user",
+        "ℹ️ See All account of user",
+        "🗑 Delete expired accounts",
+        "Sync Gozargah Site",
+        "✔️ Verify payment",
+        AdminVerifyPhoneAction,
+        AdminWeeklyUsageAction,
+        AdminMonthlyUsageAction,
+        AdminPaymentGatewayAction,
+        AdminSalesControlAction,
+        AdminChannelPostAction,
+        TenantBotService.TenantWalletAdminMenuAction,
+        AdminClientDownloadAction,
+        "🤖 وضعیت ربات‌ها",
+        AdminManualReviewAction,
+        "📑 Menu"
+    };
+
     /// <summary>
     /// Conversation-state step that waits for the target user's numeric Telegram id.
     /// </summary>
@@ -187,6 +220,8 @@ public partial class TelegramBotService
     private readonly AppConfig _appConfig;
     private readonly ILogger<TelegramBotService> _logger;
     private BroadcastManager _broadcastManager;
+    /// <summary>Required process-local composer and one-shot channel publisher; no scoped handler/client is retained.</summary>
+    private readonly PublicChannelPostManager _publicChannelPosts;
     private readonly NowPayments _nowPayments;
     private readonly NowPaymentsSettlementService _nowPaymentsSettlementService;
     private readonly HooshPay _hooshPay;
@@ -335,6 +370,7 @@ public partial class TelegramBotService
     /// <param name="referralService">
     /// Global owned-bot referral service used by start payloads, user reporting, and final legacy Zibal settlement.
     /// </param>
+    /// <param name="publicChannelPosts">Required singleton public-channel draft/job manager; private-customer broadcasts remain separate.</param>
     /// <param name="interactionTimeouts">
     /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used:
     /// two seconds for callback acknowledgement and one overall five-second budget for mandatory-join
@@ -347,7 +383,11 @@ public partial class TelegramBotService
     /// The service belongs to one execution/request scope. Conversation and financial stores create independent
     /// users.db contexts through their factories. Runtime bot identity always comes from <see cref="BotContextAccessor"/>
     /// so support, activity attribution, and Telegram delivery remain scoped to the active owned or tenant bot.
+    /// Public-channel composition and publication are delegated to the shared manager using the explicit source bot
+    /// and sender/private-chat identity; this scoped service never performs target probes or media downloads.
     /// </remarks>
+    /// <exception cref="ArgumentNullException">The required public-channel manager dependency is null.</exception>
+    /// <example><code>var handler = scope.ServiceProvider.GetRequiredService&lt;TelegramBotService&gt;();</code></example>
     public TelegramBotService(
         ITelegramBotClient botClient,
         UserWorkflowStore dbContext,
@@ -387,6 +427,7 @@ public partial class TelegramBotService
         BotRuntimeStatusStore botRuntimeStatusStore,
         BotContextAccessor botContextAccessor,
         ReferralService referralService,
+        PublicChannelPostManager publicChannelPosts,
         TelegramInteractionTimeouts interactionTimeouts = null,
         ITelegramMandatoryJoinMembershipCache mandatoryJoinMembershipCache = null,
         AppleMobileConfigTelegramFlow appleMobileConfigFlow = null)
@@ -433,6 +474,7 @@ public partial class TelegramBotService
         _botRuntimeStatusStore = botRuntimeStatusStore;
         _botContextAccessor = botContextAccessor;
         _referralService = referralService;
+        _publicChannelPosts = publicChannelPosts ?? throw new ArgumentNullException(nameof(publicChannelPosts));
         _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
         _mandatoryJoinMembershipCache = mandatoryJoinMembershipCache ?? new TelegramMandatoryJoinMembershipCache();
     }
@@ -626,6 +668,8 @@ public partial class TelegramBotService
     /// long-lived counters unchanged. Both stores are bot-scoped, so resetting one storefront does not affect the same
     /// Telegram user in another bot. The method may create an empty bot-state row when none existed, matching the
     /// established <see cref="UserDbContext.ClearUserStatus(User)"/> behavior.
+    /// Only this bot/user's unpublished public-channel draft is cancelled; an admitted publication keeps its frozen
+    /// content, destination inventory and original progress control even when the conversation is reset.
     /// </remarks>
     /// <example>
     /// <code>
@@ -645,6 +689,7 @@ public partial class TelegramBotService
             throw new ArgumentOutOfRangeException(nameof(telegramUserId), "A positive Telegram user id is required.");
 
         cancellationToken.ThrowIfCancellationRequested();
+        _publicChannelPosts.CancelDraft(CurrentBot?.Id ?? BotContextAccessor.CurrentBotId, telegramUserId);
         await _state.ClearUserStatus(new User { Id = telegramUserId });
         _xuiV3PurchaseSessionStore.Clear(telegramUserId);
     }
@@ -856,6 +901,9 @@ public partial class TelegramBotService
     /// tutorial platform/parent navigation never clears the requesting bot/user's active conversation.
     /// Global sale/renewal controls are owned-only, super-admin-authorized high-priority navigation. Closing a
     /// category blocks fresh customer admission across all bots, not the settlement of accepted paid/started work.
+    /// Owned super-admin channel-post callbacks and text/photo intake delegate to the bounded shared manager after
+    /// Tenant isolation, before legacy state/non-text dispatch. Administrative navigation abandons unpublished
+    /// composition only; admitted jobs keep their immutable content and destinations.
     /// </remarks>
     /// <example>
     /// <code>
@@ -909,6 +957,8 @@ public partial class TelegramBotService
                 await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, callbackCredUser, callbackUserState, cancellationToken);
                 return;
             }
+            if (await TryHandleChannelPostCallbackAsync(botClient, callbackQuery, cancellationToken))
+                return;
             if (await TryHandleSalesControlCallbackAsync(botClient, callbackQuery, cancellationToken))
                 return;
 
@@ -1071,6 +1121,12 @@ public partial class TelegramBotService
             return;
         }
 
+        // Administrative navigation must abandon a composition even when its existing dispatcher preempts intake.
+        // CancelDraft is safe for any sender and cannot recall an already admitted channel publication.
+        if (isSuperAdmin && isOwnedBot && message.Text != null && message.Text != AdminChannelPostAction &&
+            GetAdminActions().Contains(message.Text, StringComparer.Ordinal))
+            _publicChannelPosts.CancelDraft(CurrentBot?.Id ?? BotContextAccessor.CurrentBotId, message.From.Id);
+
         // Approval commands preempt stale conversation flows; the shared policy rechecks sender authority.
         if (isOwnedBot && await _tenantBotService.TryHandleWalletAdminAsync(botClient, update, cancellationToken))
             return;
@@ -1108,6 +1164,9 @@ public partial class TelegramBotService
             await _tenantBotService.TryHandleTenantUpdateAsync(botClient, update, messageCredUser, tenantUserState, cancellationToken);
             return;
         }
+        if (await TryHandleChannelPostMessageAsync(botClient, message, isOwnedBot, cancellationToken))
+            return;
+
 
         if (await TryHandleNowPaymentsReturnStartAsync(
             botClient,
@@ -5879,39 +5938,11 @@ public partial class TelegramBotService
     /// <summary>
     /// Gets the reply-keyboard actions available to super-admin users.
     /// </summary>
-    /// <returns>Ordered action labels shown in the super-admin keyboard.</returns>
-    /// <remarks>Includes independent global sale/renewal controls; only configured super-admins in owned bots receive this keyboard.</remarks>
+    /// <returns>Shared ordered action labels shown in the super-admin keyboard; callers must not mutate this array.</returns>
+    /// <remarks>Includes independent global sale/renewal controls and public-channel composition; only configured
+    /// super-admins in owned bots receive this keyboard. Private-customer broadcasting remains a separate action.</remarks>
     /// <example><code>var actions = GetAdminActions();</code></example>
-    private string[] GetAdminActions()
-    {
-        string[] actions = new string[]
-        {
-            "🚫 Ban user",
-            "✅ Unban user",
-            "➕ Add credit",
-            "➖ Reduce credit",
-            PromoteColleagueAction,
-            DemoteColleagueAction,
-            "ℹ️ See User Account",
-            "📨 Send message to all",
-            "✉️ Send message to user",
-            "ℹ️ See All account of user",
-            "🗑 Delete expired accounts",
-            "Sync Gozargah Site",
-            "✔️ Verify payment",
-            AdminVerifyPhoneAction,
-            AdminWeeklyUsageAction,
-            AdminMonthlyUsageAction,
-            AdminPaymentGatewayAction,
-            AdminSalesControlAction,
-            TenantBotService.TenantWalletAdminMenuAction,
-            AdminClientDownloadAction,
-            "🤖 وضعیت ربات‌ها",
-            AdminManualReviewAction,
-            "📑 Menu"
-        };
-        return actions;
-    }
+    private string[] GetAdminActions() => AdminActions;
 
     /// <summary>
     /// Builds the super-admin reply keyboard while keeping the main-menu action on its own final row.

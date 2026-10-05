@@ -858,7 +858,9 @@ public sealed partial class ConcurrencyTests
     /// <param name="flag">Controllable availability probe substituted for the live global switch.</param>
     /// <param name="releases">Counting release resolver, used to prove no provider work happens while disabled.</param>
     /// <param name="client">Fake Telegram client capturing sends, answers, and edits.</param>
-    /// <returns>A service instance plus the bot context accessor the caller must push a runtime context onto.</returns>
+    /// <returns>A focused service ready for the private download paths; its real channel-post manager remains unstarted.</returns>
+    /// <remarks>No channel-publication transport, background worker or database initialization is started.</remarks>
+    /// <example><code>var service = BuildClientDownloadTelegramService(databases, flag, releases, client);</code></example>
     private static TelegramBotService BuildClientDownloadTelegramService(
         Databases databases,
         ClientDownloadAvailabilityProbe flag,
@@ -882,7 +884,7 @@ public sealed partial class ConcurrencyTests
             new UserActivityLogService(configuration),
             // analytics, chart renderer, wallet ledger, notification, gozargah, registry, runtime status.
             null!, null!, null!, null!, null!, null!, null!, null!,
-            accessor, null!);
+            accessor, null!, PublicChannelPostTestSupport.CreateInactiveManager(configuration));
     }
 
     /// <summary>

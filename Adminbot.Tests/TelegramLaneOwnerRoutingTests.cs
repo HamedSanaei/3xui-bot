@@ -425,6 +425,8 @@ public sealed partial class ConcurrencyTests
     /// injects its own instance here.
     /// </param>
     /// <returns>A configured service instance ready for the private callback and mandatory-join paths under test.</returns>
+    /// <remarks>The required real public-channel manager is inactive; it cannot issue Telegram requests or start a worker.</remarks>
+    /// <example><code>var service = BuildBareTelegramService(databases, client, out var accessor, timeouts);</code></example>
     private static TelegramBotService BuildBareTelegramService(
         Databases databases,
         ITelegramBotClient client,
@@ -449,7 +451,7 @@ public sealed partial class ConcurrencyTests
             new UserActivityLogService(configuration),
             // analytics, chart renderer, wallet ledger, notification, gozargah, registry, runtime status.
             null!, null!, null!, null!, null!, null!, null!, null!,
-            accessor, null!, timeouts, membershipCache);
+            accessor, null!, PublicChannelPostTestSupport.CreateInactiveManager(configuration), timeouts, membershipCache);
     }
 
     private static Task<bool> InvokeMandatoryJoinAsync(

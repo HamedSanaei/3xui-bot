@@ -1373,12 +1373,15 @@ public partial class TenantBotService
     /// Optional callback message currently visible in Telegram. When its rendered text and inline keyboard already
     /// equal the new panel, the edit request is skipped to avoid Telegram's <c>message is not modified</c> response.
     /// </param>
+    /// <param name="probeToken">True for ordinary panel opening/refresh. False after a channelposts action, which must
+    /// render saved consent without token validation, identity cleanup, or a receiver restart.</param>
     /// <returns>A task completing after the current owner-authorized storefront panel is rendered.</returns>
     /// <remarks>
     /// Opening or refreshing uses a dedicated two-second getMe budget and a bounded singleton identity cache,
     /// independent of the twelve-second startup budget. A revoked or unauthorized token clears only the matching
     /// saved identity and disables that storefront; card, support, tutorial, prices and historical orders survive.
     /// Transient warnings are cached briefly in memory only. Handler cancellation always propagates.
+    /// A channelposts rerender deliberately skips identity probes; participation remains independent of token health.
     /// </remarks>
     /// <exception cref="OperationCanceledException">The owner update was canceled, including during a cached probe.</exception>
     /// <example><code>await SHOWOWNERPANELASYNC(client, ownerChat, owner, panelMessageId, updateCancellation);</code></example>
@@ -1388,10 +1391,11 @@ public partial class TenantBotService
         CredUser owner,
         int? MessageId,
         CancellationToken CancellationToken,
-        Message CurrentMessage = null)
+        Message CurrentMessage = null,
+        bool probeToken = true)
     {
         var tenant = await GetSelectedOwnerStoreAsync(owner.TelegramUserId, CancellationToken);
-        var tokenNotice = await VALIDATETENANTTOKENFORPANELASYNC(tenant, CancellationToken);
+        var tokenNotice = probeToken ? await VALIDATETENANTTOKENFORPANELASYNC(tenant, CancellationToken) : null;
         CancellationToken.ThrowIfCancellationRequested();
         await _state.SaveUserStatus(new User { Id = owner.TelegramUserId, OwnerStoreId = tenant.Id });
         var Text = BUILDOWNERPANELTEXT(tenant, owner, tokenNotice);
@@ -1431,7 +1435,10 @@ public partial class TenantBotService
     /// <remarks>
     /// Each gateway line distinguishes the saved owner preference from its effective customer availability. Global
     /// disablement hides the gateway without erasing the preference, which takes effect again when management enables it.
+    /// Public-channel participation is this store's saved consent, not forced-join enforcement or customer broadcasting;
+    /// only active storefronts can receive platform posts in their configured public join channels.
     /// </remarks>
+    /// <example><code>var text = BUILDOWNERPANELTEXT(selectedStore, authenticatedOwner);</code></example>
     private string BUILDOWNERPANELTEXT(BotInstance tenant, CredUser owner, string tokenNotice = null)
     {
         var hasToken = !string.IsNullOrWhiteSpace(tenant?.Token);
@@ -1478,6 +1485,8 @@ public partial class TenantBotService
                $"{STATUSICON(CUSTOMERWALLETACTIVE)} کیف پول مشتری: <b>{Html(CUSTOMERWALLETSTATUS)}</b>\n" +
                $"{STATUSICON(tenant?.TenantCardPaymentEnabled == true)} کارت به کارت همکار: <code>{Html(card)}</code>\n" +
                $"{STATUSICON(tenant?.TenantMandatoryJoinEnabled == true)} جوین اجباری فروشگاه: <code>{Html(TENANTJOIN)}</code>\n" +
+               $"📣 پست عمومی کانال: {(tenant?.TenantPublicChannelPostsEnabled != false ? "فعال" : "غیرفعال")}\n" +
+               "پست‌های سوپرادمین فقط هنگام فعال بودن فروشگاه، در کانال جوین تنظیم‌شده همین فروشگاه منتشر می‌شوند؛ نه در گفت‌وگوی خصوصی مشتریان.\n" +
                $"{STATUSICON(tenant?.TenantPremiumUiEnabled == true)} ظاهر پریمیوم فروشگاه: <b>{Html(tenant?.TenantPremiumUiEnabled == true ? "فعال" : "غیرفعال")}</b>\n" +
                $"{STATUSICON(IsEnabled)} وضعیت: <b>{Html(IsEnabled ? "روشن" : "خاموش")}</b>\n\n" +
                "در حالت درصدی، سود صفر قیمت تعرفه کاربر عادی را به‌کار می‌برد و سود مثبت روی قیمت همکار محاسبه می‌شود. در حالت دستی درصد سود اثری ندارد.";
@@ -1503,6 +1512,8 @@ public partial class TenantBotService
     /// Gateway payment recovery is independent of card-to-card approval and stays available when new sales or gateways
     /// are disabled: existing invoices require fresh authoritative full-payment proof and idempotent settlement.
     /// The decorator binds gateway-confirm to this store's number, revision and expiry; the handler rechecks ownership.
+    /// The channelposts button controls only this store's independent public-channel participation and never probes
+    /// a token/channel, restarts a receiver, changes Enabled, or alters customer forced-join enforcement.
     /// </remarks>
     /// <example><code>var keyboard = BUILDOWNERPANELKEYBOARD(selectedOwnerStore);</code></example>
     private static InlineKeyboardMarkup BUILDOWNERPANELKEYBOARD(BotInstance tenant)
@@ -1515,6 +1526,7 @@ public partial class TenantBotService
         var ATLASPAYENABLED = tenant?.TenantAtlasPayEnabled == true;
         var CARDENABLED = tenant?.TenantCardPaymentEnabled == true;
         var JOINENABLED = tenant?.TenantMandatoryJoinEnabled == true;
+        var CHANNELPOSTSENABLED = tenant?.TenantPublicChannelPostsEnabled != false;
         var PREMIUMUIENABLED = tenant?.TenantPremiumUiEnabled == true;
         var CUSTOMERWALLETGRANTED = TenantCustomerWalletPolicy.HasValidGrant(tenant);
         var CUSTOMERWALLETOWNERENABLED = tenant?.TenantCustomerWalletOwnerEnabled == true;
@@ -1569,6 +1581,12 @@ public partial class TenantBotService
             new[]
             {
                 InlineKeyboardButton.WithCallbackData(JOINENABLED ? "✅ جوین اجباری" : "❌ جوین اجباری", BuildTenantSettingCallback("join", !JOINENABLED, revision, issuedAt))
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    CHANNELPOSTSENABLED ? "🚫 غیرفعال‌سازی پست عمومی کانال" : "✅ فعال‌سازی پست عمومی کانال",
+                    BuildTenantSettingCallback("channelposts", !CHANNELPOSTSENABLED, revision, issuedAt))
             },
             new[]
             {
@@ -2013,14 +2031,16 @@ public partial class TenantBotService
     /// method returns.
     /// </param>
     /// <param name="clearAllStorefrontSettings">
-    /// When true, all owner-configured settings including both pricing modes/rates are cleared. When false,
-    /// token identity and enabled state alone are cleared; every price and the owner's markup remain intact.
+    /// When true, owner-configured settings including both pricing modes/rates are cleared except public-channel
+    /// participation consent. When false, only token identity and enabled state are cleared; prices and markup remain.
     /// </param>
     /// <remarks>
     /// This method deliberately does not delete tenant orders, receipts, ledger entries, customer states, or payment
     /// rows. Those records are separate audit history and must survive both owner-requested resets and revoked-token
     /// cleanup. Both paths revoke customer-wallet approval and all identity-bound approval evidence.
+    /// Both paths preserve TenantPublicChannelPostsEnabled: resetting identity/settings must never undo an owner opt-out.
     /// </remarks>
+    /// <example><code>ResetTenantStorefrontSettings(selectedStore, clearAllStorefrontSettings: true); await db.SaveChangesAsync();</code></example>
     private static void ResetTenantStorefrontSettings(BotInstance tenant, bool clearAllStorefrontSettings)
     {
         TenantCustomerWalletPolicy.Revoke(tenant);
@@ -2743,7 +2763,7 @@ public partial class TenantBotService
     /// <param name="botClient">Main owned Bot client used to answer the owner callback.</param>
     /// <param name="CallbackQuery">Callback carrying the owner panel revision and Telegram callback id.</param>
     /// <param name="owner">colleague User who owns the tenant storefront.</param>
-    /// <param name="setting">Short setting key from callback data: card, HooshPay, Tetraminator, UniquePay, AtlasPay, NowPayments, wallet, join, or premium.</param>
+    /// <param name="setting">Required closed callback key: card, HooshPay, Tetraminator, UniquePay, AtlasPay, NowPayments, wallet, join, premium, or channelposts; scoped to the selected internal store id.</param>
     /// <param name="desiredEnabled">Desired final value. Repeating the same callback does not invert the setting.</param>
     /// <param name="expectedRevision">Revision embedded in the panel keyboard that must match the current tenant row.</param>
     /// <param name="issuedAt">Hexadecimal Unix timestamp used to reject mutation buttons older than ten minutes.</param>
@@ -2756,7 +2776,10 @@ public partial class TenantBotService
     /// receives a post-save warning and customer invoice admission remains gated by the independent global switch.
     /// The authenticated selected store, panel revision, and timestamp still protect each write; replay never inverts
     /// its target state. Customer wallet opt-in can only be enabled while that store has a valid super-admin grant.
+    /// Public-channel consent is saved through the same optimistic workflow then registry upsert, without network probes
+    /// or receiver restart; it does not affect Enabled, forced join, customer broadcasts, prices, or financial records.
     /// </remarks>
+    /// <example><code>await SETTENANTSETTINGASYNC(client, callback, owner, "channelposts", false, revision, issuedAt, cancellationToken);</code></example>
     private async Task SETTENANTSETTINGASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -2781,7 +2804,8 @@ public partial class TenantBotService
                 owner,
                 CallbackQuery.Message?.MessageId,
                 CancellationToken,
-                CallbackQuery.Message);
+                CallbackQuery.Message,
+                probeToken: setting != "channelposts");
             return;
         }
 
@@ -2798,7 +2822,8 @@ public partial class TenantBotService
                 owner,
                 CallbackQuery.Message?.MessageId,
                 CancellationToken,
-                CallbackQuery.Message);
+                CallbackQuery.Message,
+                probeToken: setting != "channelposts");
             return;
         }
 
@@ -2851,6 +2876,9 @@ public partial class TenantBotService
                 break;
             case "join":
                 currentEnabled = tenant.TenantMandatoryJoinEnabled;
+                break;
+            case "channelposts":
+                currentEnabled = tenant.TenantPublicChannelPostsEnabled;
                 break;
             case "premium":
                 currentEnabled = tenant.TenantPremiumUiEnabled;
@@ -2976,6 +3004,9 @@ public partial class TenantBotService
             case "join":
                 tenant.TenantMandatoryJoinEnabled = desiredEnabled;
                 break;
+            case "channelposts":
+                tenant.TenantPublicChannelPostsEnabled = desiredEnabled;
+                break;
         }
 
         tenant.UpdatedAtUtc = DateTime.UtcNow;
@@ -2995,7 +3026,8 @@ public partial class TenantBotService
             CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
             owner,
             CallbackQuery.Message?.MessageId,
-            CancellationToken);
+            CancellationToken,
+            probeToken: setting != "channelposts");
     }
 
     /// <summary>

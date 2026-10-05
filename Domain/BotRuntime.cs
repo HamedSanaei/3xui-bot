@@ -43,6 +43,11 @@ namespace Adminbot.Domain
         public string TenantUnlimitedPlanPricesJson { get; set; }
         public string TenantWelcomeText { get; set; }
         public bool TenantMandatoryJoinEnabled { get; set; }
+        /// <summary>Allows platform super-admin posts in this active Tenant store's associated public channels.</summary>
+        /// <remarks>New stores default enrolled. The exact storefront owner may opt out independently of other stores;
+        /// resets and token changes preserve that choice. Ignored for Owned bots. This never authorizes private-customer
+        /// delivery and is independent of customer forced-join enforcement.</remarks>
+        public bool TenantPublicChannelPostsEnabled { get; set; } = true;
         public List<string> TenantChannelIds { get; set; } = new();
         public bool TenantCardPaymentEnabled { get; set; }
         public string TenantCardNumber { get; set; }
@@ -159,6 +164,12 @@ namespace Adminbot.Domain
         public string TenantUnlimitedPlanPricesJson { get; set; }
         public string TenantWelcomeText { get; set; }
         public bool TenantMandatoryJoinEnabled { get; set; }
+        /// <summary>Persists this Tenant storefront owner's participation in platform public-channel posts.</summary>
+        /// <remarks>Defaults true for existing and new stores. Only active bots deliver, exclusively to their associated
+        /// public channels through their own bot. An explicit false survives full reset and token cleanup/rotation;
+        /// another store of the same owner has independent consent. Ignored for Owned bots and unrelated to
+        /// TenantMandatoryJoinEnabled or private-customer broadcasts.</remarks>
+        public bool TenantPublicChannelPostsEnabled { get; set; } = true;
         public string TenantChannelIdsJson { get; set; }
         public bool TenantCardPaymentEnabled { get; set; }
         public string TenantCardNumber { get; set; }

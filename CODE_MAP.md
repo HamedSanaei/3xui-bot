@@ -1,5 +1,29 @@
 # CODE_MAP.md
 
+- Public-channel posts: owned super-admin **📣 پست عمومی کانال‌ها** uses
+  `TelegramBotService.ChannelPosts.cs` / singleton-hosted `PublicChannelPostManager` (core, Preparation,
+  Publication partials) / immutable `Domain/PublicChannelPost.cs`. Private real preview precedes one-shot
+  confirmation; text or 1–10 photos, one caption, explicit UTF-16 entities and per-bot/channel footer links.
+  Inventory is current Owned registry + detached Tenant DB rows; only enabled, identity-bound bots with public
+  associated channels and actual post permission participate. Alias dedup is per bot/channel, not global;
+  each target uploads cached source-photo bytes through its own bot, never cross-token file IDs/private customers.
+  Worker freezes targets/content, rechecks consent/identity/association/permission before each POST/retry;
+  only explicit 429 + nonnegative RetryAfter retries. Ambiguous sends are uncertain, never automatically resent.
+  Bounded nonwaiting queue, cancellable previews, owned temp assets, ten-minute drafts/results; restart drops
+  jobs without replay. `PublicChannelPostTests.cs` covers real-SDK authorization/media/limits/races/failures;
+  constructor-only callers use the real inactive manager from `PublicChannelPostTestSupport.cs`.
+  Production `Adminbot.csproj` excludes `Adminbot.Tests/**`, `artifacts/**` and `published/**` from all item
+  kinds; local old publish trees otherwise leak nested Data/configuration into a new release. Publish only the
+  application to a fresh external output directory; root Data is also never copied. Never delete user-owned old artifacts.
+
+- Tenant public-channel consent: `BotInstance`/runtime `TenantPublicChannelPostsEnabled` defaults true via
+  `20261005120000_AddTenantPublicChannelPostsEnabled` (users.db only). Selected-store owner `channelposts`
+  callbacks reuse store addressing, explicit state, expiry/revision and optimistic writes; no token/channel
+  probe, receiver restart, Enabled/forced-join/customer-broadcast/financial change. Reset and invalid-token
+  cleanup deliberately preserve an explicit opt-out. Registry load/upsert retains it independently per store.
+  `Adminbot.Tests/PublicChannelPostPreferenceTests.cs` covers migration/EF/raw-SQL defaults, false persistence,
+  allocator replay, owner/store/revision isolation and probe-free toggles.
+
 - Owner official gateway recovery: selected-store **✅ تایید دستی پرداخت درگاه** prompts for the public
   tenant `OrderId` (trim only; nonempty, max 140) through `TenantBotService.OwnerGatewayRecovery.cs`; cancel/
   navigation clears only this owned-bot/user input. `TenantBotService.GatewayRecovery.cs` reloads exact

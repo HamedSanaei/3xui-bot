@@ -163,6 +163,8 @@ public class UserDbContext : DbContext
     /// retain even denied/released receipts indefinitely to prevent old requests from reserving afresh.
     /// Denied grants also retain a separate paid executor lifecycle and frozen debit-price snapshot without occupying
     /// free quota; paid creation uses the deterministic colleague-paid-trial:{Id} logical operation link.
+    /// Public-channel participation is independent per BotInstances.Id and defaults true for existing/new Tenant rows.
+    /// Explicit false is an owner opt-out, preserved by runtime mapping and storefront reset; no customer/financial schema changes.
     /// </remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -398,6 +400,8 @@ public class UserDbContext : DbContext
             entity.Property(x => x.TenantTetraminatorEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantUniquePayEnabled).HasDefaultValue(true);
             entity.Property(x => x.TenantAtlasPayEnabled).HasDefaultValue(true);
+            // Default enrollment belongs to the exact storefront; false remains an explicit owner opt-out.
+            entity.Property(x => x.TenantPublicChannelPostsEnabled).HasDefaultValue(true);
             // Premium visuals default to disabled for every existing and future storefront, so the migration cannot
             // silently opt a tenant in. The column is written only by the owner-panel toggle and the durable
             // auto-disable path; owned-bot synchronization never touches it.

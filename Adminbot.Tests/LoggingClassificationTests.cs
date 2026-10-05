@@ -308,6 +308,10 @@ public sealed class LoggingClassificationTests
     }
 
     /// <summary>Builds a production service instance whose private audit methods only need the injected logger.</summary>
+    /// <param name="logger">Required capture logger used to classify audit events without starting background delivery.</param>
+    /// <returns>A focused handler whose required real public-channel manager is inactive and never used by audit methods.</returns>
+    /// <remarks>No publisher worker, SQLite initialization or Telegram probe is started.</remarks>
+    /// <example><code>var service = BuildTelegramBotService(capturedLogger);</code></example>
     private static TelegramBotService BuildTelegramBotService(ILogger logger)
     {
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
@@ -349,7 +353,8 @@ public sealed class LoggingClassificationTests
             botRegistry: null,
             botRuntimeStatusStore: null,
             botContextAccessor: null,
-            referralService: null);
+            referralService: null,
+            publicChannelPosts: PublicChannelPostTestSupport.CreateInactiveManager(configuration));
     }
 
     /// <summary>Builds a production XUI v3 flow service whose private audit methods only need the injected logger.</summary>

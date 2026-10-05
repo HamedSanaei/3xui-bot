@@ -40,6 +40,35 @@ The owner menu lists stores; every panel/prompt identifies its selected store. G
 mandatory channels, welcome, markup, card details and tutorials are local to that store. Online API keys and
 global gateway switches remain central. All stores share the owner's credentials.db wallet and Gozargah account.
 
+## Public-channel posts
+
+In an owned bot, configured super-admins open **🗽 Admin → 📣 پست عمومی کانال‌ها**, send text or 1–10 photos
+with one common caption, then press **👁 پیش‌نمایش**. Preview is private and sends nothing to any channel.
+Review each destination's bot/channel footer before **✅ ارسال به همه کانال‌ها**. Editing content or changing
+the preview invalidates the older confirmation. Including the footer, the composer conservatively permits 4096
+UTF-16 code units for text or 1024 for a photo caption; overlong content is blocked rather than truncated.
+
+Only enabled Owned/Tenant bots' associated **public channels** qualify. Each channel must have a username and
+grant its own associated bot administrator post permission. Private channels, groups, unavailable transports
+and denied destinations are reported as skipped. Aliases within one bot publish once; a channel associated
+with different bots receives one post per association, with that bot's own clickable footer. This is separate
+from **📢 پیام عمومی**, which remains the existing private-customer broadcast.
+
+In the owned-bot owner menu, select the exact storefront and use **🚫 غیرفعال‌سازی پست عمومی کانال** or
+**✅ فعال‌سازی پست عمومی کانال**. Participation defaults enabled for existing/new stores but is independent
+per store, even for one shared owner. Disabling the store also excludes it. Turning customer forced-join off
+does not opt the store out: the saved channel association still identifies the publication destination.
+An explicit opt-out survives reset, token cleanup/rotation and restart; only a fresh enable action reverses it.
+Changing this preference does not probe the token/channel, restart receivers or change balances.
+
+Confirmation queues one immutable job; duplicate confirmation/status failures never publish it again.
+Navigation/cancel abandons only unpublished composition, not an already queued job. The worker rechecks each
+destination and owner consent immediately before sending and before a rate-limit retry. Inspect the private
+progress report for skipped, failed and uncertain results: only an explicit 429 with RetryAfter is retried;
+an uncertain result may already be visible in the channel and must not be blindly resent. Unpublished drafts
+expire after ten minutes of inactivity/preview readiness; completed progress is retained for ten minutes.
+Drafts/jobs are process-local and restart never automatically replays publication.
+
 ## Financial recovery
 
 An order retains its owner, originating tenant and customer separately. Online gateway profit goes to the owner

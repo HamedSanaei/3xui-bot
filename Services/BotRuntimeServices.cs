@@ -102,11 +102,12 @@ public class BotRegistry
     }
 
     /// <summary>
-    /// Converts a persisted bot row into the runtime configuration, retaining storefront-specific pricing.
+    /// Converts a persisted bot row into runtime configuration, retaining storefront pricing and public-channel consent.
     /// </summary>
-    /// <param name="bot">Persisted users.db bot row; tenant-owned prices are scoped to this bot's database id.</param>
-    /// <returns>Runtime configuration with the stored pricing mode and nullable manual rates unchanged; no database write occurs.</returns>
-    /// <remarks>An invalid stored mode stays invalid. Consumers must not silently use percent/public pricing for unknown modes.</remarks>
+    /// <param name="bot">Required persisted users.db row; prices and public-channel consent belong to this exact internal store id.</param>
+    /// <returns>A detached runtime configuration with prices and explicit participation opt-out unchanged; no database write occurs.</returns>
+    /// <remarks>An invalid stored pricing mode stays invalid. Public-channel consent never inherits another store's value.</remarks>
+    /// <example><code>registry.Upsert(savedTenant); // Retains the saved public-channel opt-out in runtime.</code></example>
     private static BotInstanceConfig ToConfig(BotInstance bot)
     {
         return new BotInstanceConfig
@@ -138,6 +139,7 @@ public class BotRegistry
             TenantUnlimitedPlanPricesJson = bot.TenantUnlimitedPlanPricesJson,
             TenantWelcomeText = bot.TenantWelcomeText,
             TenantMandatoryJoinEnabled = bot.TenantMandatoryJoinEnabled,
+            TenantPublicChannelPostsEnabled = bot.TenantPublicChannelPostsEnabled,
             TenantChannelIds = DeserializeStringList(bot.TenantChannelIdsJson),
             TenantCardPaymentEnabled = bot.TenantCardPaymentEnabled,
             TenantCardNumber = bot.TenantCardNumber,
@@ -229,7 +231,9 @@ public class BotRegistry
     /// becomes empty. Malformed non-empty destinations are retained for downstream validation. Pricing fields are
     /// copied only from this configured bot; they are not inferred from another tenant or the application fallback.
     /// An unknown pricing mode remains invalid instead of silently becoming percentage pricing. No network call occurs.
+    /// Public-channel participation is copied unchanged from this store, never inherited from fallback configuration.
     /// </remarks>
+    /// <example><code>var configured = NormalizeBot(bot, applicationConfig);</code></example>
     private static BotInstanceConfig NormalizeBot(BotInstanceConfig bot, AppConfig fallback)
     {
         var username = string.IsNullOrWhiteSpace(bot.Username)
@@ -278,6 +282,7 @@ public class BotRegistry
             TenantUnlimitedPlanPricesJson = bot.TenantUnlimitedPlanPricesJson,
             TenantWelcomeText = bot.TenantWelcomeText,
             TenantMandatoryJoinEnabled = bot.TenantMandatoryJoinEnabled,
+            TenantPublicChannelPostsEnabled = bot.TenantPublicChannelPostsEnabled,
             TenantChannelIds = bot.TenantChannelIds?.Where(c => !string.IsNullOrWhiteSpace(c)).ToList() ?? new List<string>(),
             TenantCardPaymentEnabled = bot.TenantCardPaymentEnabled,
             TenantCardNumber = bot.TenantCardNumber,

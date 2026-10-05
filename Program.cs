@@ -139,7 +139,9 @@ public class Program
     /// Owner handlers share the bounded token-probe cache but retain isolated tenant selections.
     /// Backup channels resolve nonblank global configuration before the default-owned channel; the dispatcher supplies durable fallback.
     /// The colleague trial store shares a global per-user Tehran-day allowance across owned bots, without retaining a context.
-    /// The single IServiceSalesAvailability snapshot governs customer sale/renewal admission in every owned and tenant bot.</remarks>
+    /// The single IServiceSalesAvailability snapshot governs customer sale/renewal admission in every owned and tenant bot.
+    /// PublicChannelPostManager is one shared singleton/hosted instance; it owns process-local preview/publication
+    /// jobs without retaining scoped handlers, database contexts or foreground clients.</remarks>
     /// <example><code>RegisterApplicationServices(services, configuration, validatedOptions, contentRootPath);</code></example>
     public static void RegisterApplicationServices(IServiceCollection services, IConfiguration configuration, AppConfig appConfig, string contentRootPath)
     {
@@ -343,6 +345,8 @@ public class Program
         services.AddSingleton<CredentialsStore>();
         services.AddSingleton<BroadcastManager>();
         services.AddHostedService(sp => sp.GetRequiredService<BroadcastManager>());
+        services.AddSingleton<PublicChannelPostManager>();
+        services.AddHostedService(sp => sp.GetRequiredService<PublicChannelPostManager>());
 
         services.AddSingleton<ITelegramBotClient>(sp =>
         {
