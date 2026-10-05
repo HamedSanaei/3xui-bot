@@ -44,9 +44,10 @@ public enum XuiV3RequestRetryMode
 /// because a background lane is not waiting interactively.
 /// </para>
 /// <para>
-/// <see cref="IdempotentMutation"/> and <see cref="NoAutomaticRetryMutation"/> document mutation callers. They never
-/// receive a foreground budget and never make a non-idempotent mutation retryable: <see cref="NoAutomaticRetryMutation"/>
-/// maps to exactly one HTTP attempt exactly like <see cref="XuiV3RequestRetryMode.NoAutomaticRetry"/>.
+/// <see cref="IdempotentMutation"/> and <see cref="NoAutomaticRetryMutation"/> document mutation callers. Neither
+/// receives this foreground-read budget or makes a non-idempotent mutation retryable. Durable creation may opt into
+/// the separate <see cref="XuiV3CreateAccountOptions.ForegroundNetworkBudget"/> lifetime; its POST still has exactly
+/// one attempt and any unresolved expiry remains non-replayable.
 /// </para>
 /// </remarks>
 public enum XuiV3RequestExecutionPolicy
@@ -216,10 +217,18 @@ public class ApiServicev3
     /// </summary>
     /// <param name="accountDto">Required detached account request and panel descriptor; never log its credentials.</param>
     /// <param name="configuration">Runtime transport configuration containing private panel authentication.</param>
-    /// <param name="options">Creation options; durable business keys make repeated calls GET-only recovery.</param>
-    /// <param name="cancellationToken">Cancellation of reservation, the single POST, and read-back calls.</param>
-    /// <returns>A verified creation result or a safe failure. Ambiguous results never authorize another POST.</returns>
-    /// <remarks>Client identity is persisted before POST when a durable operation key is supplied. No SQLite transaction spans HTTP.</remarks>
+    /// <param name="options">Creation options; durable business keys make repeated calls GET-only recovery. An optional foreground network budget requires a durable key/store and never changes the immutable business intent.</param>
+    /// <param name="cancellationToken">Caller shutdown/cancellation, distinct from the optional local network deadline.</param>
+    /// <returns>A verified creation result or a safe unresolved/failed result. An unresolved result never proves non-creation or authorizes another POST.</returns>
+    /// <remarks>
+    /// Client identity is persisted before POST when a durable operation key is supplied. No SQLite transaction spans HTTP.
+    /// A foreground network budget starts after reservation and covers the single POST, GET-only recovery, and optional
+    /// detail/link retrieval together. Expiry retains ambiguity unless positive proof exists; positive proof is persisted
+    /// independently of the network token and survives unavailable optional links. Caller cancellation still propagates.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The supplied foreground network budget is not positive.</exception>
+    /// <exception cref="InvalidOperationException">Bounded creation lacks a durable key/store, or reserved identity/placement conflicts with this request.</exception>
+    /// <example><code>var result = await ApiServicev3.CreateUserAccountAsync(request, configuration, durableOptions, cancellationToken);</code></example>
     public static async Task<XuiV3AccountCreationResult> CreateUserAccountAsync(
         AccountDto accountDto,
         IConfiguration configuration,
@@ -227,9 +236,20 @@ public class ApiServicev3
         CancellationToken cancellationToken = default)
     {
         options ??= new XuiV3CreateAccountOptions();
+        if (options.ForegroundNetworkBudget is { } requestedBudget)
+        {
+            if (requestedBudget <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(options), "Foreground creation network budget must be positive.");
+            if (string.IsNullOrWhiteSpace(options.OperationKey) || options.OperationStore == null)
+                throw new InvalidOperationException("Bounded creation requires a durable operation key and store.");
+        }
+        using var networkCancellation = options.ForegroundNetworkBudget.HasValue
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+            : null;
+        var networkToken = networkCancellation?.Token ?? cancellationToken;
         var client = BuildClientPayload(accountDto, options);
         if (string.IsNullOrWhiteSpace(options.OperationKey))
-            return await CreateUserAccountCoreAsync(accountDto, configuration, options, client, cancellationToken);
+            return await CreateUserAccountCoreAsync(accountDto, configuration, options, client, cancellationToken, networkToken);
         if (options.OperationStore == null) throw new InvalidOperationException("Durable creation requires its operation store.");
         var inbounds = options.InboundIds?.Distinct().Order().ToList() ?? new List<int>();
         if (inbounds.Count == 0) throw new InvalidOperationException("No inbound IDs were provided for the v3 account.");
@@ -248,6 +268,10 @@ public class ApiServicev3
             CreatedAtUtc = DateTime.UtcNow
         }, cancellationToken);
         client = JsonConvert.DeserializeObject<XuiV3ClientPayload>(reservation.Operation.ClientJson);
+        if (networkCancellation != null)
+            networkCancellation.CancelAfter(options.ForegroundNetworkBudget.Value > ForegroundReadOverallHardCap
+                ? ForegroundReadOverallHardCap
+                : options.ForegroundNetworkBudget.Value);
         XuiV3AccountCreationResult result;
         if (reservation.Operation.Outcome == XuiV3CreationOutcome.Applied)
         {
@@ -255,7 +279,7 @@ public class ApiServicev3
             var knownGb = options.TrafficGb > 0 ? options.TrafficGb : Convert.ToInt32(accountDto.TotoalGB);
             var knownBytes = options.TrafficBytes > 0 ? options.TrafficBytes : ApiService.ConvertGBToBytes(knownGb);
             return await BuildAccountCreationResultFromKnownClientAsync(accountDto, configuration, client, null,
-                inbounds, knownGb, knownBytes, options, null, cancellationToken);
+                inbounds, knownGb, knownBytes, options, null, cancellationToken, networkToken);
         }
         if (reservation.Operation.Outcome == XuiV3CreationOutcome.DefinitiveRejected)
             return new XuiV3AccountCreationResult { Success = false, ApiVersion = XuiPanelApiVersion.V3,
@@ -264,7 +288,7 @@ public class ApiServicev3
         {
             try
             {
-                result = await CreateUserAccountCoreAsync(accountDto, configuration, options, client, cancellationToken);
+                result = await CreateUserAccountCoreAsync(accountDto, configuration, options, client, cancellationToken, networkToken);
             }
             finally
             {
@@ -280,13 +304,12 @@ public class ApiServicev3
             var trafficGb = options.TrafficGb > 0 ? options.TrafficGb : Convert.ToInt32(accountDto.TotoalGB);
             var trafficBytes = options.TrafficBytes > 0 ? options.TrafficBytes : ApiService.ConvertGBToBytes(trafficGb);
             result = await TryRecoverCreatedClientAsync(accountDto, configuration, client, inbounds, trafficGb,
-                trafficBytes, options, null, cancellationToken) ?? new XuiV3AccountCreationResult
+                trafficBytes, options, null, cancellationToken, networkToken) ?? new XuiV3AccountCreationResult
                 {
                     Success = false, ApiVersion = XuiPanelApiVersion.V3, Email = client.Email,
                     Message = XuiV3UserSafeError.ForAccountCreation("creation result requires reconciliation")
                 };
         }
-        if (result.Success) await options.OperationStore.MarkAppliedAsync(options.OperationKey, cancellationToken);
         return result;
     }
 
@@ -295,12 +318,15 @@ public class ApiServicev3
     /// <param name="configuration">Private transport configuration.</param>
     /// <param name="options">Validated creation options.</param>
     /// <param name="client">Exact generated or durably reserved client identity, never regenerated during recovery.</param>
-    /// <param name="cancellationToken">Cancellation of external calls and local state persistence.</param>
-    /// <returns>Verified creation or safe ambiguous/failed result; callers must not blindly retry creation.</returns>
-    /// <remarks>NoAutomaticRetry remains the addClient transport boundary; only GETs resolve uncertain outcomes.</remarks>
+    /// <param name="cancellationToken">Caller cancellation; it is not cancelled merely because the local network budget expires.</param>
+    /// <param name="networkCancellationToken">One cooperative deadline shared by POST, read-back and optional links; never used to discard authoritative local proof.</param>
+    /// <returns>Verified creation or a safe ambiguous/failed result; callers must not blindly retry creation.</returns>
+    /// <remarks>NoAutomaticRetry remains the addClient transport boundary. Expired network work is awaited before returning; only GETs resolve uncertainty and positive proof survives optional read failures.</remarks>
+    /// <example><code>var result = await CreateUserAccountCoreAsync(request, configuration, options, reservedClient, callerToken, networkToken);</code></example>
+    /// <exception cref="OperationCanceledException">The caller cancels; durable uncertainty is preserved by the outer wrapper.</exception>
     private static async Task<XuiV3AccountCreationResult> CreateUserAccountCoreAsync(
         AccountDto accountDto, IConfiguration configuration, XuiV3CreateAccountOptions options,
-        XuiV3ClientPayload client, CancellationToken cancellationToken)
+        XuiV3ClientPayload client, CancellationToken cancellationToken, CancellationToken networkCancellationToken)
     {
         options ??= new XuiV3CreateAccountOptions();
 
@@ -313,11 +339,12 @@ public class ApiServicev3
         XuiV3ApiResponse<JToken> response;
         try
         {
+            using var stage = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiMutation) ?? default;
             response = await AddClientAsync(
                 accountDto.ServerInfo,
                 configuration,
                 new XuiV3ClientCreateRequest { Client = client, InboundIds = inboundIds },
-                cancellationToken);
+                networkCancellationToken);
         }
         catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken))
         {
@@ -330,7 +357,8 @@ public class ApiServicev3
                 trafficBytes,
                 options,
                 responseObj: null,
-                cancellationToken);
+                cancellationToken,
+                networkCancellationToken);
 
             return recovered ?? BuildTransientCreationFailure(configuration, client.Email, ex);
         }
@@ -345,7 +373,8 @@ public class ApiServicev3
                 trafficBytes,
                 options,
                 responseObj: null,
-                cancellationToken);
+                cancellationToken,
+                networkCancellationToken);
 
             if (recovered != null)
                 return recovered;
@@ -370,7 +399,8 @@ public class ApiServicev3
                     trafficBytes,
                     options,
                     response.Obj,
-                    cancellationToken);
+                    cancellationToken,
+                    networkCancellationToken);
 
                 if (recovered != null)
                     return recovered;
@@ -386,8 +416,7 @@ public class ApiServicev3
         }
 
         // Authoritative add success proves application even when subsequent GET/link retrieval fails.
-        if (options.OperationStore != null && !string.IsNullOrWhiteSpace(options.OperationKey))
-            await options.OperationStore.MarkAppliedAsync(options.OperationKey, cancellationToken);
+        await MarkCreationAppliedAsync(options);
         try
         {
             return await BuildAccountCreationResultAsync(
@@ -399,14 +428,33 @@ public class ApiServicev3
                 trafficBytes,
                 options,
                 response.Obj,
-                cancellationToken);
+                cancellationToken,
+                networkCancellationToken);
         }
         catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken) || ex is XuiV3ApiException)
         {
             // POST success is authoritative; optional read-back failure cannot turn it into failed provisioning.
             return await BuildAccountCreationResultFromKnownClientAsync(accountDto, configuration, client, null,
-                inboundIds, trafficGb, trafficBytes, options, response.Obj, cancellationToken);
+                inboundIds, trafficGb, trafficBytes, options, response.Obj, cancellationToken, networkCancellationToken);
         }
+    }
+
+    /// <summary>Persists authoritative creation proof even when its network lifetime or caller has just been cancelled.</summary>
+    /// <param name="options">Required creation options containing the original durable key/store; untracked legacy creations require no receipt write.</param>
+    /// <returns>A task completing after Applied proof commits, or immediately when no durable operation is configured.</returns>
+    /// <remarks>
+    /// Called only after an accepted POST or exact identity/inbound read-back. A separate fifteen-second local token
+    /// prevents optional HTTP expiry from losing proof and authorizing compensation for an account that exists.
+    /// No network request, wallet, ledger or tenant balance mutation runs inside this persistence step.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">The independent local persistence deadline expires; callers must not replay the POST.</exception>
+    /// <example><code>await MarkCreationAppliedAsync(options);</code></example>
+    private static async Task MarkCreationAppliedAsync(XuiV3CreateAccountOptions options)
+    {
+        if (options.OperationStore == null || string.IsNullOrWhiteSpace(options.OperationKey))
+            return;
+        using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await options.OperationStore.MarkAppliedAsync(options.OperationKey, persistence.Token);
     }
 
     /// <summary>
@@ -423,14 +471,18 @@ public class ApiServicev3
     /// <param name="trafficBytes">Traffic limit in bytes that was sent to the panel.</param>
     /// <param name="options">Resolved creation options that control duration, status persistence, and metadata.</param>
     /// <param name="responseObj">Raw successful add-client API response from the panel, stored for diagnostics.</param>
-    /// <param name="cancellationToken">Cancellation token for follow-up panel reads and optional state persistence.</param>
+    /// <param name="cancellationToken">Caller cancellation, distinct from the network deadline after positive creation proof.</param>
+    /// <param name="networkCancellationToken">Shared creation network token cancelling this detail read and optional links.</param>
     /// <returns>
     /// A successful creation result using the real panel client when it can be read, including the real UUID and subId.
     /// </returns>
     /// <remarks>
     /// The add-client endpoint can succeed while later reads are slow after a 3x-ui update. This method is deliberately
     /// separated from the add step so callers can retry/recover the read side without sending another add request.
+    /// These GETs consume the remaining original network lifetime rather than starting a new timeout window.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The caller or shared network lifetime cancels the optional detail read; the already-persisted Applied proof remains valid.</exception>
+    /// <example><code>var result = await BuildAccountCreationResultAsync(request, configuration, client, inbounds, gb, bytes, options, response, callerToken, networkToken);</code></example>
     private static async Task<XuiV3AccountCreationResult> BuildAccountCreationResultAsync(
         AccountDto accountDto,
         IConfiguration configuration,
@@ -440,9 +492,10 @@ public class ApiServicev3
         long trafficBytes,
         XuiV3CreateAccountOptions options,
         JToken responseObj,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CancellationToken networkCancellationToken)
     {
-        var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
+        var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, networkCancellationToken);
         var panelClient = panelClientResponse.Success && panelClientResponse.Obj != null
             ? panelClientResponse.Obj
             : null;
@@ -457,7 +510,8 @@ public class ApiServicev3
             trafficBytes,
             options,
             responseObj,
-            cancellationToken);
+            cancellationToken,
+            networkCancellationToken);
     }
 
     /// <summary>
@@ -472,7 +526,8 @@ public class ApiServicev3
     /// <param name="trafficBytes">Traffic amount in bytes stored in the result for downstream sync and logs.</param>
     /// <param name="options">Creation options that control whether legacy user state is saved.</param>
     /// <param name="responseObj">Raw successful add-client response, when available.</param>
-    /// <param name="cancellationToken">Cancellation token for optional link lookup and state persistence.</param>
+    /// <param name="cancellationToken">Caller cancellation; never cancelled by local network expiry alone.</param>
+    /// <param name="networkCancellationToken">Original creation network lifetime for the optional link read; an expired lifetime skips that read.</param>
     /// <returns>
     /// A successful creation result. The config link may be <c>null</c> when link retrieval fails after the account row
     /// is already confirmed on the panel.
@@ -480,7 +535,11 @@ public class ApiServicev3
     /// <remarks>
     /// Link lookup is best-effort once the panel client has been confirmed. Returning the real panel UUID is more
     /// important than failing the whole purchase because the link endpoint timed out.
+    /// A local network deadline cannot downgrade positive proof. Subscription URLs are built locally from the
+    /// accepted or durably reserved SubId; state persistence remains outside that network deadline.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels; no second add request is made.</exception>
+    /// <example><code>var result = await BuildAccountCreationResultFromKnownClientAsync(request, configuration, submitted, observed, inbounds, gb, bytes, options, response, callerToken, networkToken);</code></example>
     private static async Task<XuiV3AccountCreationResult> BuildAccountCreationResultFromKnownClientAsync(
         AccountDto accountDto,
         IConfiguration configuration,
@@ -491,12 +550,15 @@ public class ApiServicev3
         long trafficBytes,
         XuiV3CreateAccountOptions options,
         JToken responseObj,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CancellationToken networkCancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         XuiV3ApiResponse<List<string>> links = null;
         try
         {
-            links = await GetClientLinksAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
+            if (!networkCancellationToken.IsCancellationRequested)
+                links = await GetClientLinksAsync(accountDto.ServerInfo, configuration, client.Email, networkCancellationToken);
         }
         catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken) || ex is XuiV3ApiException)
         {
@@ -619,7 +681,8 @@ public class ApiServicev3
     /// <param name="trafficBytes">Traffic amount in bytes that should be reported if recovery succeeds.</param>
     /// <param name="options">Creation options used for state persistence and metadata.</param>
     /// <param name="responseObj">Raw add-client response, when the add call completed before the later failure.</param>
-    /// <param name="cancellationToken">Cancellation token for the recovery lookup.</param>
+    /// <param name="cancellationToken">Caller cancellation used to distinguish shutdown from a handled local network expiry.</param>
+    /// <param name="networkCancellationToken">Original creation network lifetime; an expired token prevents further recovery HTTP.</param>
     /// <returns>
     /// A successful creation result when the panel contains the client; otherwise <c>null</c> so the caller can return a
     /// controlled transient failure without creating a duplicate account.
@@ -627,7 +690,11 @@ public class ApiServicev3
     /// <remarks>
     /// This is the duplicate-protection path for ambiguous network failures. It never sends another add-client request;
     /// it only reads the panel by email and builds the result from the existing row.
+    /// Recovery consumes only the remaining shared network lifetime. Positive exact-identity proof is persisted with
+    /// a separate live local token; optional link expiry cannot erase it or release a paid debit/free quota.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels; uncertainty remains durably non-replayable.</exception>
+    /// <example><code>var recovered = await TryRecoverCreatedClientAsync(request, configuration, reservedClient, inbounds, gb, bytes, options, response, callerToken, networkToken);</code></example>
     private static async Task<XuiV3AccountCreationResult> TryRecoverCreatedClientAsync(
         AccountDto accountDto,
         IConfiguration configuration,
@@ -637,16 +704,20 @@ public class ApiServicev3
         long trafficBytes,
         XuiV3CreateAccountOptions options,
         JToken responseObj,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CancellationToken networkCancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (networkCancellationToken.IsCancellationRequested)
+            return null;
+        using var stage = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.BusinessRecovery) ?? default;
         try
         {
-            var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, cancellationToken);
+            var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, networkCancellationToken);
             if (!panelClientResponse.Success || !MatchesReservedCreation(client, panelClientResponse.Obj)
                 || !inboundIds.All(id => panelClientResponse.Obj.InboundIds.Contains(id)))
                 return null;
-            if (options.OperationStore != null && !string.IsNullOrWhiteSpace(options.OperationKey))
-                await options.OperationStore.MarkAppliedAsync(options.OperationKey, cancellationToken);
+            await MarkCreationAppliedAsync(options);
             Console.WriteLine("[XUIv3] Creation recovered by identity-safe read-back.");
             return await BuildAccountCreationResultFromKnownClientAsync(
                 accountDto,
@@ -658,7 +729,8 @@ public class ApiServicev3
                 trafficBytes,
                 options,
                 responseObj,
-                cancellationToken);
+                cancellationToken,
+                networkCancellationToken);
         }
         catch (Exception ex) when (IsTransientXuiTransportException(ex, cancellationToken) || ex is XuiV3ApiException)
         {
@@ -3306,7 +3378,11 @@ public class XuiV3ApiException : Exception
 }
 
 /// <summary>Resolved provisioning inputs and private persistence dependencies for one XUI v3 account.</summary>
-/// <remarks>OperationKey identifies the business intent. Mutable display identifiers never replace its durable reservation.</remarks>
+/// <remarks>
+/// OperationKey identifies the business intent. Mutable display identifiers and an optional foreground network
+/// lifetime never replace its durable reservation. Only positive panel proof authorizes successful delivery/settlement;
+/// expiry does not prove rejection, authorize another POST, or release a financial/quota claim.
+/// </remarks>
 public class XuiV3CreateAccountOptions
 {
     /// <summary>Optional stable purchase/order-account key; repeated invocations become GET-only recovery.</summary>
@@ -3314,6 +3390,14 @@ public class XuiV3CreateAccountOptions
     /// <summary>Required durable reservation store when OperationKey is provided; never serialized or logged.</summary>
     [JsonIgnore]
     public XuiV3CreationOperationStore OperationStore { get; set; }
+    /// <summary>Optional positive overall network lifetime for a foreground durable creation; null preserves background/provider behavior.</summary>
+    /// <remarks>
+    /// Starts after identity reservation and is capped at fifteen seconds. The single POST, read-back and optional
+    /// links share this lifetime; local proof/state writes do not. Expiry is ambiguous without positive proof and
+    /// never grants replay or compensation. Excluded from immutable business identity and serialized payloads.
+    /// </remarks>
+    [JsonIgnore]
+    public TimeSpan? ForegroundNetworkBudget { get; set; }
     /// <summary>
     /// Optional durable identity of the explicit event that authorized a tenant retry generation; persisted on the
     /// reservation and reused only for replay detection. Restricted non-secret value, never customer text.

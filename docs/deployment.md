@@ -94,6 +94,36 @@ number/size of shipped slides before changing any bot configuration. A timeout i
 have received the group), so the application never re-sends it automatically. No database row stores tutorial progress
 or proves recipient delivery.
 
+## Foreground account latency and uncertain creation
+
+Account-id selection, renewal preview, search-proof reload and pre-mutation snapshot reads use the existing
+`xuiV3ForegroundReadTimeoutSeconds` budget: **12 seconds** when absent, at most **15 seconds**. Direct email lookup
+and full-list fallback share one window; cancellation does not start another lookup. My-accounts renders one fresh
+panel response, not a second full download. These limits do not change per-user FIFO or background read retries.
+
+Ordinary, free-colleague and paid-colleague test creation uses the same configured duration as a **separate overall
+creation network lifetime**, beginning after durable identity reservation. One POST, immediate GET-only recovery and
+optional detail/config-link retrieval share that lifetime. This is not a foreground-read retry policy: **add POST
+is still sent at most once**. Local receipt/cooldown/financial persistence and subsequent bounded Telegram delivery
+are outside that network lifetime, so it is not a promise that the complete handler ends in twelve seconds.
+
+- Without positive proof, deadline expiry stays ambiguous. Re-entering the same business key reads the reserved
+  identity only; never delete/reset its receipt to issue a replacement POST.
+- Accepted POST or exact-identity/inbound read-back persists Applied independently of the expired HTTP token.
+  Optional configuration-link failure cannot downgrade that proof, refund a paid trial, or release its quota.
+- `XuiMutation` identifies the creation POST wait; `BusinessRecovery` identifies read-back. `Stage=none` is an
+  uninstrumented instant, not evidence that Telegram caused the delay.
+- Owned/admin/paid-trial create/update website mirrors now persist locally and use the existing deferred sync worker.
+  Website owner lookup/send no longer holds the interactive lane. Website-wallet debit remains synchronous and
+  receipt-backed; explicit historical sync still reports completed remote results.
+
+October 5 receipts show three slow free trials reached Applied despite their failed TLS response: roughly
+32–41 seconds passed between POST authorization and `record layer failure`, then positive proof arrived within
+0.9–1.5 seconds. Client cancellation cannot prove the server stopped creating the account. Investigate the panel,
+reverse proxy/TLS terminator and network at **18:08:16.921, 18:17:49.822 and 19:00:58.819 UTC** in the supplied logs.
+Those logs already show HTTP/1.1 and no connection reuse; they do not identify the physical TLS fault. Never disable
+certificate verification, guess a TLS downgrade, or replay a business POST to diagnose it.
+
 ## Configuration change safety
 
 `Data/configuration.json` is persistent runtime state, not a build artifact. It is excluded from publish and from

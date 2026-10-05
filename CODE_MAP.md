@@ -1,5 +1,13 @@
 # CODE_MAP.md
 
+- Foreground latency gaps (October 5 evidence): owned account-id/renewal/snapshot lookups now use the existing
+  12 s read budget; email direct/fallback share one lifetime, and my-accounts renders its one fresh response.
+  Trial creation opts into `XuiV3CreateAccountOptions.ForegroundNetworkBudget` (12 s default, 15 s cap) for
+  POST + GET recovery + optional links; local proof writes stay independent, ambiguous attempts remain GET-only,
+  and `XuiMutation` names the creation wait. Five owned/admin/paid-trial create/update mirrors now explicitly
+  defer to the existing site outbox, with no foreground website HTTP. FIFO, wallet settlement and TLS verification
+  are unchanged; TLS record-integrity failures still need panel/proxy evidence. See `docs/deployment.md`.
+
 - Customer top-up confirmations: `PaymentSettlementNotification.CreateWalletCredit` now requires the committed
   receipt's post-credit toman balance for owned and admitted wallet-enabled tenant origins. Shared
   `BuildWalletCreditMessage` combines provider/admin confirmation, balance and explicit purchase/renewal guidance:
@@ -766,6 +774,18 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   reconciliation, and recovery workers keep `BackgroundRead`. **Mutation safety is unchanged:** explicit retry modes
   still win, `NoAutomaticRetry` still performs exactly one POST, and a timeout never makes an ambiguous mutation
   replayable (a regression test asserts one POST against a transient status).
+  Previously omitted owned-id, search-proof, preview/confirmation and pre-snapshot readers now use that policy.
+  Email direct/fallback reads share one linked lifetime and never fall back after cancellation. My-accounts
+  renders its authorized snapshot rather than fetching the complete list twice; each later navigation update stays fresh.
+- **Trial creation network lifetime** (`XuiV3CreateAccountOptions.ForegroundNetworkBudget`,
+  `XuiV3PurchaseService.CreateTrialAccountAsync`): after durable identity reservation, one opt-in cooperative budget
+  spans the sole add POST, GET-only recovery and optional detail/links. Trials reuse the configured 12 s read-budget
+  value, hard-capped at 15 s. Null preserves provider/background behavior; the lifetime is not business identity.
+  No detached HTTP work survives the execution scope. Local expiry without proof retains Ambiguous; a new invocation
+  of the same key gets a fresh GET-only lifetime. POST acceptance/exact-identity read-back persists Applied with a
+  separate bounded local token; optional link expiry returns successful known-identity delivery data without refund.
+  Caller cancellation remains cancellation. `TelegramUpdateStage.XuiMutation` names the creation POST;
+  read-back uses `BusinessRecovery`. This contains network waits, not the later durable state/Telegram time.
 - **Foreground Telegram delivery budget** (`Services/TelegramForegroundDeliveryPolicy.cs`,
   `Services/ForegroundBoundedTelegramBotClient.cs`): ordinary non-durable interactive calls have an 8 s overall
   budget; `sendMediaGroup` and `sendDocument` share a separate 24 s bounded multipart-upload budget. The six-slide iOS
@@ -819,10 +839,11 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   `GozargahSiteApiClient.OptionalLookupTimeout` = 4 s, `OptionalLookupHardMaximum` = 5 s): the one website lookup that
   runs while a user waits — owned-bot colleague-role refresh, the profile wallet line, and storefront wallet-button
   eligibility behind the tenant access decision — is bounded by ONE overall budget through
-  `CreateOptionalLookupCancellation`, which also clamps to the hard maximum. Background website work (sync outbox
-  `QueueAndSendAsync`, its retry worker, the funding monitor, post-commit mirroring) does **not** create this scope and
-  keeps its own caller token plus the provider-oriented 30 s transport ceiling; the budget is opt-in, and a test
-  outlasts the real 4 s window to prove it is not silently imposed on the background path. On expiry the existing
+  `CreateOptionalLookupCancellation`, which also clamps to the hard maximum. All owned/admin/paid-colleague
+  post-success create/update mirrors now pass `deferSend:true`, like tenant fulfillment: local draft + short queue gate,
+  then owner enrichment/send in the existing outbox worker. Explicit historical sync still waits for terminal results;
+  receipt-backed website wallet debit is still synchronous. Worker/funding-monitor HTTP retains its own caller token
+  and provider-oriented 30 s ceiling rather than inheriting the optional lookup budget. On expiry the existing
   business rule applies: colleague promotion keeps the locally known role, wallet eligibility reports the site as
   unavailable, and no financial state is mutated from an unknown website answer.
 - **Operator-channel latency-noise policy** (`Domain/Logging/TelegramLogSuppression.cs`): production review classified

@@ -294,6 +294,8 @@ public partial class XuiV3BotFlowService
     /// No tenant owner balance, partner profit or payment-provider invoice is created.
     /// The successful typed paid-trial audit follows the global Telegram channel preference without disabling
     /// financial backup intent, wallet receipts or local diagnostics.
+    /// Applied paid trials queue optional website mirroring as a local durable draft; the sync worker performs
+    /// website owner enrichment and sending. The paid receipt and ledger are not deferred or recalculated.
     /// </remarks>
     /// <exception cref="OperationCanceledException">The caller cancels; any winning attempt is classified and safely refunded or held first.</exception>
     /// <exception cref="InvalidOperationException">Persisted actor/amount/creation identities conflict, or live pricing is invalid.</exception>
@@ -411,9 +413,11 @@ public partial class XuiV3BotFlowService
                 BuildPaidTrialInlineKeyboard(grant.Id, price), true, token);
             return;
         }
+        // The paid creation is already applied; website availability must not hold up its account delivery.
         await QueueGozargahSyncBestEffortAsync("create",
             () => _gozargahSiteSyncService.QueueCreateAsync(ResolveGozargahSiteOwnerTelegramUserId(profile),
-                profile.TelegramUserId, creation, paidKey, ResolveGozargahTenantBotId(), cancellationToken: token));
+                profile.TelegramUserId, creation, paidKey, ResolveGozargahTenantBotId(),
+                cancellationToken: token, deferSend: true));
         LogV3Purchase("خرید اکانت تست همکار", profile, price, debit.BeforeBalance, debit.AfterBalance,
             "کیف پول ربات", new[] { $"نام اکانت `{creation.Email}`", $"مدت `{TrialDays} روز`" }, timing.Snapshot(),
             isTrialAccount: true);

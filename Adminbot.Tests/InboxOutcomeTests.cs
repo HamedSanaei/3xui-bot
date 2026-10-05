@@ -105,6 +105,137 @@ public sealed partial class ConcurrencyTests
         finally { await app.StopAsync(); }
     }
 
+    /// <summary>A foreground deadline cannot turn a committed-but-unacknowledged creation into a retryable new POST.</summary>
+    /// <returns>A task completing after ambiguity, GET-only recovery and exact mutation-count checks.</returns>
+    /// <remarks>
+    /// Regression for the trial handler's long TLS-response wait. The panel accepts the exact identity but withholds
+    /// its response. Local expiry must preserve the same durable reservation, not reject/refund it or restart creation.
+    /// </remarks>
+    [Fact]
+    public async Task Foreground_creation_deadline_retains_ambiguity_and_recovers_without_reposting()
+    {
+        using var databases = new Databases();
+        var posts = 0;
+        var gets = 0;
+        JObject? identity = null;
+        var builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var app = builder.Build();
+        app.Run(async context =>
+        {
+            if (context.Request.Method == "POST")
+            {
+                Interlocked.Increment(ref posts);
+                identity = (JObject)JObject.Parse(await new StreamReader(context.Request.Body).ReadToEndAsync())["client"]!;
+                identity["inboundIds"] = new JArray(1);
+                // The server-side account exists before client cancellation; no HTTP acknowledgement is sent.
+                await Task.Delay(Timeout.InfiniteTimeSpan, context.RequestAborted);
+                return;
+            }
+            Interlocked.Increment(ref gets);
+            await context.Response.WriteAsync(context.Request.Path.Value!.Contains("links")
+                ? "{\"success\":true,\"obj\":[]}"
+                : new JObject { ["success"] = true, ["obj"] = identity }.ToString());
+        });
+        await app.StartAsync();
+        try
+        {
+            var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+            { ["xuiV3TransientRetryCount"] = "3", ["xuiV3RequestTimeoutSeconds"] = "30",
+                ["errorFileLogFilePath"] = Path.Combine(databases.DirectoryPath, "errors-{shamsiDate}.log") }).Build();
+            var request = new AccountDto { TelegramUserId = 123, TotoalGB = "1",
+                ServerInfo = new() { Url = app.Urls.Single(), ApiToken = "test-only" } };
+            var options = new XuiV3CreateAccountOptions
+            {
+                InboundIds = [1], DurationDays = 3, TrafficGb = 1, SaveUserStatus = false,
+                OperationKey = "bounded-lost-ack", OperationStore = new(databases.Users),
+                ForegroundNetworkBudget = TimeSpan.FromMilliseconds(500)
+            };
+            using var outer = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var execution = TelegramUpdateExecutionScope.Push(501);
+            var elapsed = Stopwatch.StartNew();
+            var first = await ApiServicev3.CreateUserAccountAsync(request, configuration, options, outer.Token);
+            Assert.False(first.Success);
+            Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(5), $"elapsed={elapsed.Elapsed}");
+            Assert.Equal(1, Volatile.Read(ref posts));
+            Assert.Equal(0, Volatile.Read(ref gets));
+            await using (var db = databases.Users.CreateDbContext())
+                Assert.Equal(XuiV3CreationOutcome.Ambiguous, (await db.XuiV3CreationOperations.SingleAsync()).Outcome);
+            Assert.True(await databases.Inbox.HasUnresolvedCreationAsync(501, default));
+
+            // A new invocation gets a fresh read lifetime but never a new mutation authorization.
+            var recovered = await ApiServicev3.CreateUserAccountAsync(request, configuration, options, outer.Token);
+            Assert.True(recovered.Success);
+            Assert.Equal(1, Volatile.Read(ref posts));
+            await using (var db = databases.Users.CreateDbContext())
+                Assert.Equal(XuiV3CreationOutcome.Applied, (await db.XuiV3CreationOperations.SingleAsync()).Outcome);
+            Assert.False(await databases.Inbox.HasUnresolvedCreationAsync(501, default));
+        }
+        finally { await app.StopAsync(); }
+    }
+
+    /// <summary>Optional configuration-link expiry preserves authoritative Applied proof and successful account delivery data.</summary>
+    /// <returns>A task completing after the bounded optional read and durable positive-proof checks.</returns>
+    /// <remarks>
+    /// The panel acknowledges creation and returns the same client, but its links endpoint never responds. A deadline
+    /// must not turn that already-created account into failure, compensation eligibility or a second create attempt.
+    /// </remarks>
+    [Fact]
+    public async Task Foreground_creation_deadline_preserves_applied_proof_when_optional_links_hang()
+    {
+        using var databases = new Databases();
+        var posts = 0;
+        JObject? identity = null;
+        var builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var app = builder.Build();
+        app.Run(async context =>
+        {
+            if (context.Request.Method == "POST")
+            {
+                Interlocked.Increment(ref posts);
+                identity = (JObject)JObject.Parse(await new StreamReader(context.Request.Body).ReadToEndAsync())["client"]!;
+                identity["inboundIds"] = new JArray(1);
+                await context.Response.WriteAsync("{\"success\":true,\"obj\":{}}");
+                return;
+            }
+            if (context.Request.Path.Value!.Contains("links"))
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, context.RequestAborted);
+                return;
+            }
+            await context.Response.WriteAsync(new JObject { ["success"] = true, ["obj"] = identity }.ToString());
+        });
+        await app.StartAsync();
+        try
+        {
+            var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+            { ["xuiV3TransientRetryCount"] = "3", ["xuiV3RequestTimeoutSeconds"] = "30",
+                ["errorFileLogFilePath"] = Path.Combine(databases.DirectoryPath, "errors-{shamsiDate}.log") }).Build();
+            var request = new AccountDto { TelegramUserId = 123, TotoalGB = "1",
+                ServerInfo = new() { Url = app.Urls.Single(), ApiToken = "test-only" } };
+            var options = new XuiV3CreateAccountOptions
+            {
+                InboundIds = [1], DurationDays = 3, TrafficGb = 1, SaveUserStatus = false,
+                OperationKey = "bounded-optional-link", OperationStore = new(databases.Users),
+                ForegroundNetworkBudget = TimeSpan.FromMilliseconds(500)
+            };
+            using var outer = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var elapsed = Stopwatch.StartNew();
+            var result = await ApiServicev3.CreateUserAccountAsync(request, configuration, options, outer.Token);
+            Assert.True(result.Success);
+            Assert.Null(result.ConfigLink);
+            Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(5), $"elapsed={elapsed.Elapsed}");
+            await using var db = databases.Users.CreateDbContext();
+            Assert.Equal(XuiV3CreationOutcome.Applied, (await db.XuiV3CreationOperations.SingleAsync()).Outcome);
+            Assert.Equal(1, Volatile.Read(ref posts));
+        }
+        finally { await app.StopAsync(); }
+    }
+
+
     /// <summary>Old nullable timestamps migrate conservatively and new empty databases reach the same current schema.</summary>
     /// <returns>A task completing after pre-change data and all migrations have been verified.</returns>
     [Fact]

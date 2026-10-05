@@ -825,6 +825,8 @@ public partial class XuiV3AdminFlowService
     /// every dynamic value encoded before it enters a <c>code</c> entity, so comments or panel values cannot break the
     /// logger message markup. Partial failures remain visible in both the admin response and the audit. The audit also
     /// reports summed panel API time and total operation time; deliberate bulk pacing affects only the latter.
+    /// Optional site mirroring only commits a local draft here; the existing outbox worker resolves website ownership
+    /// and sends it later, so an unavailable website does not retain the admin's Telegram lane.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// Thrown when the saved target Telegram user id is missing or invalid before the XUI request is created.
@@ -914,6 +916,7 @@ public partial class XuiV3AdminFlowService
         {
             foreach (var createdAccount in bulkResult.CreatedAccounts)
             {
+                // Persist optional mirroring locally; remote website work belongs to the sync worker.
                 await QueueGozargahSyncBestEffortAsync(
                     "admin-create",
                     () => _gozargahSiteSyncService.QueueCreateAsync(
@@ -921,7 +924,8 @@ public partial class XuiV3AdminFlowService
                         syncTargetTelegramUserId,
                         createdAccount,
                         bulkResult.BulkOrderId,
-                        cancellationToken: cancellationToken));
+                        cancellationToken: cancellationToken,
+                        deferSend: true));
             }
         }
 
@@ -1152,7 +1156,10 @@ public partial class XuiV3AdminFlowService
     /// and any required counter reset succeed, it advances the volume-reminder cycle best-effort. Reminder persistence
     /// never changes the panel outcome and has no wallet, payment, order, or ledger effect. Terminal failure and
     /// success audits include accumulated panel API time and end-to-end execution time.
+    /// The optional website mirror is a durable deferred draft after panel success; no website lookup or send runs
+    /// in this handler, and the admin renewal still has no customer wallet debit.
     /// </remarks>
+    /// <example><code>await HandleRenewConfirmAsync(botClient, message, currentUser, mainMenu, cancellationToken);</code></example>
     private async Task HandleRenewConfirmAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -1354,7 +1361,8 @@ public partial class XuiV3AdminFlowService
                     serverInfo,
                     $"admin-renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
                     renewalOwnership.TenantBotId,
-                    cancellationToken: cancellationToken));
+                    cancellationToken: cancellationToken,
+                    deferSend: true));
         }
 
     }

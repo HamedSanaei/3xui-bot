@@ -1641,6 +1641,9 @@ public class XuiV3PurchaseService
     /// This method never mutates a wallet or ledger. A paid caller must persist its sufficient-balance debit and sole
     /// executor claim before calling. Trial metadata records the actual price and byte limit; notification failure
     /// cannot undo successful creation. Ordinary customer cooldown timestamps remain the caller's responsibility.
+    /// Foreground trial network work shares the configured interactive budget (twelve seconds by default, at most
+    /// fifteen) across the single POST and read-back/optional links. Expiry holds ambiguity; repeated keys are GET-only.
+    /// Positive proof, cooldown/quota ownership and paid-wallet compensation remain separate from this network deadline.
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">The supplied price is negative.</exception>
     /// <exception cref="InvalidOperationException">The catalog or immutable creation identity conflicts with this request.</exception>
@@ -1698,6 +1701,7 @@ public class XuiV3PurchaseService
             {
                 OperationKey = operationKey,
                 OperationStore = _creationOperations,
+                ForegroundNetworkBudget = ApiServicev3.ResolveForegroundReadOverallBudget(_appConfig),
                 PriceToman = priceToman,
                 InboundIds = inboundIds,
                 TrafficGb = displayTrafficGb,

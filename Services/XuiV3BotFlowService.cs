@@ -267,6 +267,18 @@ public partial class XuiV3BotFlowService
                string.Equals(normalized, TelegramBotService.OwnedRenewAction, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>Loads the sender's owned accounts once and renders their first page from that same fresh panel response.</summary>
+    /// <param name="botClient">Required Telegram client for the active owned or tenant bot.</param>
+    /// <param name="message">Incoming chat message; unrecognized or missing account-list text is declined.</param>
+    /// <param name="credUser">Required current sender profile whose global Telegram user id filters panel ownership.</param>
+    /// <param name="mainReplyMarkup">Optional current bot's main keyboard restored when the list is empty or unavailable.</param>
+    /// <param name="cancellationToken">Current update token cancelling panel reads and Telegram sends.</param>
+    /// <returns>True when the account-list command was handled, including an empty result or bounded read failure; otherwise false.</returns>
+    /// <remarks>
+    /// The one read uses the foreground budget. Rendering never downloads the complete panel list again, and no
+    /// account identity is cached across updates or bots. This read-only route changes no wallet or conversation state.
+    /// </remarks>
+    /// <example><code>await flow.TryHandleMyAccountsAsync(botClient, message, profile, mainMenu, cancellationToken);</code></example>
     public async Task<bool> TryHandleMyAccountsAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -301,7 +313,8 @@ public partial class XuiV3BotFlowService
 
             var accounts = response.Obj?
                 .Where(client => ClientBelongsToUser(client, credUser.TelegramUserId))
-                .OrderBy(client => client.Email)
+                .OrderBy(client => IsExpiredOrDepleted(client) ? 0 : 1)
+                .ThenBy(client => client.Email)
                 .ToList() ?? new List<XuiV3Client>();
 
             Console.WriteLine($"[XUIv3] my accounts found user={credUser.TelegramUserId} count={accounts.Count}");
@@ -316,7 +329,7 @@ public partial class XuiV3BotFlowService
                 return true;
             }
 
-            await SendV3AccountListPageAsync(botClient, message.Chat.Id, 0, credUser, cancellationToken);
+            await RenderV3AccountListPageAsync(botClient, message.Chat.Id, 0, accounts, cancellationToken);
 
 
             return true;
@@ -372,6 +385,7 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// The panel result is filtered by the sender's Telegram ownership metadata before the card is shown. A successful
     /// result uses the same complete menu as list and search cards, including read-only configuration retrieval.
+    /// The lookup uses the foreground panel-read budget and performs no account or financial mutation on expiry.
     /// </remarks>
     /// <example>
     /// <code>
@@ -403,7 +417,7 @@ public partial class XuiV3BotFlowService
             cancellationToken: cancellationToken);
 
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
         if (!response.Success)
         {
             await botClient.SendMessage(
@@ -2844,7 +2858,18 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// This method is invoked only by the executor that atomically transitioned the operation to applied, so the
     /// traffic reset, wallet settlement, and central log run once even when duplicates arrive concurrently.
+    /// Optional website mirroring persists a local outbox draft only; owner lookup and remote send run in the existing
+    /// sync worker. Receipt-backed website-wallet settlement remains synchronous and is not moved to that outbox.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The current update is cancelled during post-apply persistence or notification; the existing Applied receipt must not authorize another renewal POST.</exception>
+    /// <example>
+    /// <code>
+    /// // Only the executor that won the durable Applied transition enters this completion path.
+    /// await CompleteAppliedOwnedRenewalAsync(botClient, message, credUser, user, mainReplyMarkup, service,
+    ///     resolved, useSiteWallet, renewalOperation, client, renewal, payload, siteWalletEligibility,
+    ///     operationTiming, cancellationToken);
+    /// </code>
+    /// </example>
     private async Task CompleteAppliedOwnedRenewalAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -3027,6 +3052,7 @@ public partial class XuiV3BotFlowService
             },
             cancellationToken);
 
+        // Optional mirroring must not wait for website ownership lookup after the renewal has already settled.
         await QueueGozargahSyncBestEffortAsync(
             "renew",
             () => _gozargahSiteSyncService.QueueUpdateAsync(
@@ -3036,7 +3062,8 @@ public partial class XuiV3BotFlowService
                 serverInfo,
                 $"renew-{client.Email}-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
                 ResolveGozargahTenantBotId(),
-                cancellationToken: cancellationToken));
+                cancellationToken: cancellationToken,
+                deferSend: true));
     }
 
     /// <summary>
@@ -4099,6 +4126,8 @@ public partial class XuiV3BotFlowService
     /// Stale sale-navigation callbacks recheck the exact category; final bulk admission rechecks after all awaited
     /// prechecks. Already-started stable batches continue their existing panel recovery and wallet settlement even
     /// after closure, while new and merely Reserved work is rejected before provisioning.
+    /// Successful creates enqueue their website mirror locally with deferred send; website outages cannot delay
+    /// customer account delivery or make a completed creation depend on a remote ownership lookup.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="cancellationToken"/> is cancelled during Telegram, database, or panel work.
@@ -5206,6 +5235,7 @@ public partial class XuiV3BotFlowService
 
                 foreach (var createdAccount in bulkResult.CreatedAccounts)
                 {
+                    // Queue the committed account snapshot before delivery, without any foreground website HTTP.
                     await QueueGozargahSyncBestEffortAsync(
                         "create",
                         () => _gozargahSiteSyncService.QueueCreateAsync(
@@ -5214,7 +5244,8 @@ public partial class XuiV3BotFlowService
                             createdAccount,
                             bulkResult.BulkOrderId,
                             ResolveGozargahTenantBotId(),
-                            cancellationToken: cancellationToken));
+                            cancellationToken: cancellationToken,
+                            deferSend: true));
 
                     var createdAccountText = _purchaseService.BuildCreatedAccountText(createdAccount);
                     if (!string.IsNullOrWhiteSpace(createdAccount.SubLink))
@@ -5601,6 +5632,17 @@ public partial class XuiV3BotFlowService
             cancellationToken);
     }
 
+    /// <summary>Reloads an owned-account list page for a navigation callback under the foreground panel-read budget.</summary>
+    /// <param name="botClient">Required Telegram client for the active bot.</param>
+    /// <param name="chatId">Telegram chat id containing the account menu.</param>
+    /// <param name="page">Requested zero-based page, clamped to the fresh owned-account count.</param>
+    /// <param name="credUser">Required current sender profile whose Telegram user id must own every displayed row.</param>
+    /// <param name="cancellationToken">Update token cancelling the panel read and menu delivery.</param>
+    /// <param name="messageId">Menu message id to edit; zero sends a new message.</param>
+    /// <returns>A task completing after a failed panel response or the refreshed page is delivered.</returns>
+    /// <remarks>No previous update's snapshot is reused; the detached result is filtered before rendering. No wallet or account mutation occurs.</remarks>
+    /// <exception cref="XuiV3ForegroundReadTimeoutException">The complete panel read exceeded its interactive budget; callers must stop this lookup.</exception>
+    /// <example><code>await SendV3AccountListPageAsync(botClient, chatId, page, profile, token, messageId);</code></example>
     private async Task SendV3AccountListPageAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -5610,7 +5652,7 @@ public partial class XuiV3BotFlowService
         int messageId = 0)
     {
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
         if (!response.Success)
         {
             await botClient.SendMessage(
@@ -5625,6 +5667,28 @@ public partial class XuiV3BotFlowService
             .OrderBy(client => IsExpiredOrDepleted(client) ? 0 : 1)
             .ThenBy(client => client.Email)
             .ToList() ?? new List<XuiV3Client>();
+
+        await RenderV3AccountListPageAsync(botClient, chatId, page, accounts, cancellationToken, messageId);
+    }
+
+    /// <summary>Renders one already-authorized owned-account page without issuing another panel request.</summary>
+    /// <param name="botClient">Required Telegram client of the bot that owns the current menu.</param>
+    /// <param name="chatId">Telegram chat id receiving the account page.</param>
+    /// <param name="page">Zero-based page clamped to the supplied snapshot.</param>
+    /// <param name="accounts">Required detached rows filtered by the current sender's Telegram ownership and sorted depleted-first, then by email; may be empty.</param>
+    /// <param name="cancellationToken">Update token cancelling only Telegram delivery.</param>
+    /// <param name="messageId">Existing menu message id to edit, or zero to send a new page.</param>
+    /// <returns>A task completing after the empty-list notice or page text and keyboard are delivered.</returns>
+    /// <remarks>The snapshot belongs to this update only; rendering does not cache it, read XUI, or change state, accounts, or balances.</remarks>
+    /// <example><code>await RenderV3AccountListPageAsync(botClient, chatId, 0, ownedAccounts, token);</code></example>
+    private async Task RenderV3AccountListPageAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        int page,
+        IReadOnlyList<XuiV3Client> accounts,
+        CancellationToken cancellationToken,
+        int messageId = 0)
+    {
 
         if (accounts.Count == 0)
         {
@@ -7816,6 +7880,14 @@ public partial class XuiV3BotFlowService
         return builder.ToString();
     }
 
+    /// <summary>Reloads a callback-selected account under the foreground budget and verifies the requesting user's ownership.</summary>
+    /// <param name="telegramUserId">Positive Telegram sender id, not a chat or tenant database id; ownership must match this user on the fresh panel row.</param>
+    /// <param name="clientId">Optional numeric XUI client id from the callback; null or nonpositive ids return null without HTTP.</param>
+    /// <param name="cancellationToken">Current update token cancelling the complete panel-list read.</param>
+    /// <returns>The detached owned client, or null when the id is invalid, the panel response fails, or ownership does not match.</returns>
+    /// <remarks>The active bot selects the panel configuration. Callback ids alone grant no access; no stale cross-update cache, state write, or financial effect is used.</remarks>
+    /// <exception cref="XuiV3ForegroundReadTimeoutException">The read exhausted its interactive budget; no account mutation was attempted.</exception>
+    /// <example><code>var client = await GetOwnedClientByIdAsync(sender.Id, callback.ClientId, token);</code></example>
     private async Task<XuiV3Client> GetOwnedClientByIdAsync(
         long telegramUserId,
         int? clientId,
@@ -7825,7 +7897,7 @@ public partial class XuiV3BotFlowService
             return null;
 
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
         if (!clientsResponse.Success)
             return null;
 
@@ -7833,6 +7905,13 @@ public partial class XuiV3BotFlowService
             .FirstOrDefault(client => client.Id == clientId.Value && ClientBelongsToUser(client, telegramUserId));
     }
 
+    /// <summary>Reloads a numeric client id for a separately authorized external-renewal search under the foreground budget.</summary>
+    /// <param name="clientId">Optional numeric XUI client id selected by the callback; null or nonpositive ids are declined.</param>
+    /// <param name="cancellationToken">Current update token cancelling the panel-list read.</param>
+    /// <returns>The detached client, or null for an invalid id, unsuccessful panel response, or missing row. This result does not authorize access.</returns>
+    /// <remarks>The caller must revalidate this row against the active bot/user's saved search proof before offering renewal; configuration delivery and mutations remain owner-only.</remarks>
+    /// <exception cref="XuiV3ForegroundReadTimeoutException">The read exceeded its interactive budget; no state or financial effect occurred.</exception>
+    /// <example><code>var client = await GetAnyClientByIdAsync(callback.ClientId, token);</code></example>
     private async Task<XuiV3Client> GetAnyClientByIdAsync(
         int? clientId,
         CancellationToken cancellationToken)
@@ -7841,7 +7920,7 @@ public partial class XuiV3BotFlowService
             return null;
 
         var serverInfo = BuildConfiguredPanelServerInfo();
-        var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
         if (!clientsResponse.Success)
             return null;
 
@@ -9051,7 +9130,10 @@ public partial class XuiV3BotFlowService
     /// The exact target lock is valid for renewal only. It does not authorize configuration reads, link/comment
     /// changes, deletion, state changes, or any other account action. Duplicate email rows fail closed unless the same
     /// row also has the persisted UUID.
+    /// The read uses the foreground budget before preview or settlement; expiry cannot authorize a debit or POST.
     /// </remarks>
+    /// <exception cref="XuiV3ForegroundReadTimeoutException">The target could not be read within the interactive budget.</exception>
+    /// <example><code>var client = await GetAuthorizedRenewClientAsync(server, state, sender.Id, token);</code></example>
     private async Task<XuiV3Client> GetAuthorizedRenewClientAsync(
         ServerInfo serverInfo,
         User user,
@@ -9070,7 +9152,7 @@ public partial class XuiV3BotFlowService
         if (!TryNormalizeClientUuid(user.RenewTargetUuid, out var targetUuid))
             return null;
 
-        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
         if (!response.Success)
             return null;
 
@@ -9094,8 +9176,10 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// Renewal does not modify inbound membership, so attachment state is deliberately not a precondition or target
     /// criterion. This method performs no wallet, operation, or panel mutation.
+    /// The pre-mutation list reload uses the foreground budget; background renewal recovery keeps its own read policy.
     /// </remarks>
     /// <example><code>client = await LoadFreshRenewClientSnapshotAsync(server, client, token)</code></example>
+    /// <exception cref="XuiV3ForegroundReadTimeoutException">The snapshot read exceeded its interactive budget before a durable renewal or panel mutation was started.</exception>
     private async Task<XuiV3Client> LoadFreshRenewClientSnapshotAsync(
         ServerInfo serverInfo,
         XuiV3Client authorizedClient,
@@ -9104,7 +9188,7 @@ public partial class XuiV3BotFlowService
         if (authorizedClient == null)
             return null;
 
-        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+        var response = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
         if (!response.Success)
             return null;
 
@@ -9141,7 +9225,12 @@ public partial class XuiV3BotFlowService
     /// Returning a non-owner match is intentional so callers can produce a generic mismatch result. This method grants
     /// no authorization by itself and never accepts UUID possession as ownership. Account names, response messages,
     /// UUIDs, SubIds, metadata values, and identifier-bearing request URIs are omitted from diagnostics.
+    /// Direct lookup, any transient retry delay, and the complete-list fallback share one foreground budget. Budget
+    /// expiry or caller cancellation never starts a fallback read and changes no account, conversation, or balance.
     /// </remarks>
+    /// <exception cref="XuiV3ForegroundReadTimeoutException">The direct lookup or fallback exhausted their shared interactive budget.</exception>
+    /// <exception cref="OperationCanceledException">The current update was cancelled.</exception>
+    /// <example><code>var client = await FindClientByEmailAsync(server, accountEmail, sender.Id, token);</code></example>
     private async Task<XuiV3Client> FindClientByEmailAsync(
         ServerInfo serverInfo,
         string email,
@@ -9149,41 +9238,59 @@ public partial class XuiV3BotFlowService
         CancellationToken cancellationToken)
     {
         var normalizedEmail = NormalizeAccountNameInput(email);
-        XuiV3Client directClient = null;
+        var budget = ApiServicev3.ResolveForegroundReadOverallBudget(_appConfig);
+        using var lookupCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        lookupCancellation.CancelAfter(budget);
+        using var stage = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
 
         try
         {
-            var directResponse = await ApiServicev3.GetClientAsync(serverInfo, _configuration, normalizedEmail, cancellationToken);
-            directClient = directResponse.Obj;
-            if (directClient != null && !EmailEquals(directClient.Email, normalizedEmail))
-                directClient = null;
+            XuiV3Client directClient = null;
+            try
+            {
+                var directResponse = await ApiServicev3.GetClientAsync(
+                    serverInfo, _configuration, normalizedEmail, lookupCancellation.Token);
+                directClient = directResponse.Obj;
+                if (directClient != null && !EmailEquals(directClient.Email, normalizedEmail))
+                    directClient = null;
+                Console.WriteLine(
+                    $"[XUIv3] find client direct user={telegramUserId}, success={directResponse.Success}, found={(directClient == null ? "no" : "yes")}");
+            }
+            catch (OperationCanceledException) when (lookupCancellation.IsCancellationRequested)
+            {
+                // An expired deadline is not a missing direct row; starting a full-list fallback would stall the lane again.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[XUIv3] find client direct failed user={telegramUserId}, errorType={ex.GetType().Name}");
+            }
+
+            if (directClient != null && EmailEquals(directClient.Email, normalizedEmail) && ClientBelongsToUser(directClient, telegramUserId))
+                return directClient;
+
+            lookupCancellation.Token.ThrowIfCancellationRequested();
+            var listResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, lookupCancellation.Token);
+            var matches = listResponse.Obj?
+                .Where(client => EmailEquals(client.Email, normalizedEmail))
+                .ToList() ?? new List<XuiV3Client>();
+
             Console.WriteLine(
-                $"[XUIv3] find client direct user={telegramUserId}, success={directResponse.Success}, found={(directClient == null ? "no" : "yes")}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[XUIv3] find client direct failed user={telegramUserId}, errorType={ex.GetType().Name}");
-        }
+                $"[XUIv3] find client list user={telegramUserId}, success={listResponse.Success}, total={listResponse.Obj?.Count ?? 0}, matches={matches.Count}, ownerMatches={matches.Count(client => ClientBelongsToUser(client, telegramUserId))}");
 
-        if (directClient != null && EmailEquals(directClient.Email, normalizedEmail) && ClientBelongsToUser(directClient, telegramUserId))
+            var ownerMatch = matches.FirstOrDefault(client => ClientBelongsToUser(client, telegramUserId));
+            if (ownerMatch != null)
+                return ownerMatch;
+
+            if (matches.Count > 0)
+                return matches[0];
+
             return directClient;
-
-        var listResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
-        var matches = listResponse.Obj?
-            .Where(client => EmailEquals(client.Email, normalizedEmail))
-            .ToList() ?? new List<XuiV3Client>();
-
-        Console.WriteLine(
-            $"[XUIv3] find client list user={telegramUserId}, success={listResponse.Success}, total={listResponse.Obj?.Count ?? 0}, matches={matches.Count}, ownerMatches={matches.Count(client => ClientBelongsToUser(client, telegramUserId))}");
-
-        var ownerMatch = matches.FirstOrDefault(client => ClientBelongsToUser(client, telegramUserId));
-        if (ownerMatch != null)
-            return ownerMatch;
-
-        if (matches.Count > 0)
-            return matches[0];
-
-        return directClient;
+        }
+        catch (OperationCanceledException) when (lookupCancellation.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new XuiV3ForegroundReadTimeoutException(budget);
+        }
     }
 
     private static bool ClientBelongsToUser(XuiV3Client client, long telegramUserId)
@@ -12663,7 +12770,10 @@ public partial class XuiV3BotFlowService
     /// keeps the account card on its previous page and restores the same full action menu, including read-only
     /// configuration retrieval. It does not change wallet, order, renewal, or conversation-state records. Every
     /// terminal panel outcome includes API and total elapsed durations in the private central audit.
+    /// The ownership preflight is a foreground-bounded read; its expiry occurs before any enable/disable POST.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The current update is cancelled before its account-card delivery completes.</exception>
+    /// <example><code>await HandleAccountStateCallbackAsync(botClient, chatId, messageId, profile, callbackClientId, page: 0, enable: true, cancellationToken: token);</code></example>
     private async Task HandleAccountStateCallbackAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
@@ -12689,7 +12799,7 @@ public partial class XuiV3BotFlowService
             var serverInfo = BuildConfiguredPanelServerInfo();
             Console.WriteLine($"[XUIv3] account state callback user={credUser.TelegramUserId}, clientId={clientId}, enable={enable}, panel={serverInfo.Url}, rootPath={serverInfo.RootPath}");
 
-            var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+            var clientsResponse = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken, XuiV3RequestExecutionPolicy.ForegroundRead);
             if (!clientsResponse.Success)
             {
                 LogXuiOperationOutcome(

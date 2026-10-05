@@ -11,15 +11,22 @@ equivalent updates, while a previous update could incorrectly suppress a later r
 Queue admission now compares parsed canonical request state with the most recently completed successful account state,
 preferring UUID and falling back to email only when UUID is absent. Ownership changes do not change the gate key;
 BotId, TenantBotId, owner, buyer, account email, UUID, SubId and subscription link participate in comparison.
-All payload fields participate except top-level tracking_code: plan, arranged plan, inbound set, name, UUID, comment,
-price, volume, duration/date, username, subscription, trial and bot flags. Object keys and structured comments are sorted
+Payload fields participate except top-level tracking_code and website-owned username enrichment: plan, arranged plan,
+inbound set, name, UUID, comment, price, volume, duration/date, subscription, trial and bot flags. Object keys and structured comments are sorted
 recursively; array order and arbitrary text are preserved. Rename state is compared using its final name. Malformed
 historical payloads do not suppress a new event. Historical sync generates tracking identity only when sending is needed.
 
-A per-account gate spans queue decision and send; retries take the same gate before the per-event gate. No global
-network lock or SQLite write transaction spans HTTP. Equivalent unresolved requests reuse their event; retry sends also
+A short per-account queue gate protects database-only admission separately from the account/event gates used by
+website sends and retries. A blocked remote send cannot hold deferred enqueue. No global network lock or SQLite
+write transaction spans HTTP. Equivalent unresolved requests reuse their event; retry sends also
 check successful state before HTTP. Successful and skipped deletes preserve tombstones so an absent website account
 cannot be mistaken for an unchanged existing account. The deployment continues to require one polling process.
+
+Interactive owned purchase/renewal, paid-colleague test and admin create/renew paths explicitly use `deferSend:true`,
+matching tenant fulfillment. They persist the confirmed XUI snapshot and pinned owner/buyer/bot ids without website
+HTTP; the existing worker resolves the website username before sending. Transient lookup errors remain retryable
+outbox events rather than failing before queue persistence. This mirror never repeats XUI provisioning or settles a
+wallet. Website-wallet debits remain synchronous and receipt-backed; explicit historical sync retains terminal summaries.
 
 ## Retention and indexes
 
@@ -46,9 +53,3 @@ reused by SQLite. Optional physical reclamation: schedule downtime, stop every d
 backups of both databases, ensure free disk space, then run `sqlite3 users.db 'VACUUM;'` manually and restart normally.
 Never run VACUUM as part of startup or periodic cleanup. No production operation was performed for this task.
 
-The user's latest instruction excludes test creation and execution. Existing unrelated working-tree changes, including
-test and migration edits, are preserved. Build and model-check results are reported separately in the delivery response.
-
-Verification for this increment: Release solution build passed with zero warnings/errors. Both UserDbContext and
-CredentialsDbContext `has-pending-model-changes --configuration Release --no-build` reported no model changes.
-Diff whitespace and strict UTF-8 checks passed. No tests were added or run; no publish/deployment/database mutation.

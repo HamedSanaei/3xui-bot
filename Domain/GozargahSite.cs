@@ -1113,7 +1113,7 @@ namespace Adminbot.Domain
         }
 
         /// <summary>
-        /// Queues and immediately attempts to send a create-order event for a newly created XUI account.
+        /// Persists a create-order mirror for a confirmed XUI account, with optional immediate website delivery.
         /// </summary>
         /// <param name="siteOwnerTelegramUserId">Telegram id of the website user that should own the order.</param>
         /// <param name="buyerTelegramUserId">Actual Telegram buyer. This differs from owner for tenant sales.</param>
@@ -1121,7 +1121,14 @@ namespace Adminbot.Domain
         /// <param name="trackingCode">Local operation or order id used for audit.</param>
         /// <param name="tenantBotId">Tenant bot id when the event belongs to a tenant storefront.</param>
         /// <param name="cancellationToken">Cancellation token for database and API work.</param>
-        /// <returns>The outbox event row, or null when sync is disabled or payload cannot be built.</returns>
+        /// <param name="deferSend">True for interactive post-success mirroring: commit a local payload draft and wake the existing sync worker without website HTTP. False resolves the website owner and attempts delivery before returning.</param>
+        /// <returns>A detached outbox row or reused equivalent event; null when synchronization is disabled or the local/remote payload cannot be built. A deferred row does not prove website delivery.</returns>
+        /// <remarks>
+        /// The persisted owner id and buyer id preserve tenant isolation; deferred owner enrichment happens before
+        /// the worker sends the immutable account snapshot. Transient website failures remain retryable outbox work.
+        /// This mirror never creates another XUI account or settles a wallet, order, ledger, or partner balance.
+        /// </remarks>
+        /// <example><code>await sync.QueueCreateAsync(ownerTelegramId, buyerTelegramId, created, orderId, tenantBotId, token, deferSend: true);</code></example>
         public async Task<GozargahSiteSyncEvent> QueueCreateAsync(
             long siteOwnerTelegramUserId,
             long buyerTelegramUserId,
@@ -1170,7 +1177,7 @@ namespace Adminbot.Domain
         }
 
         /// <summary>
-        /// Queues and sends an update-order event after renewal or metadata edit succeeds on XUI.
+        /// Persists an update-order mirror after XUI success, with optional immediate website delivery.
         /// </summary>
         /// <param name="siteOwnerTelegramUserId">Telegram id of the website user that owns the order.</param>
         /// <param name="buyerTelegramUserId">Actual Telegram buyer or actor.</param>
@@ -1179,8 +1186,14 @@ namespace Adminbot.Domain
         /// <param name="trackingCode">Optional local operation id for audit; blank generates an id only after a real mutation is required.</param>
         /// <param name="tenantBotId">Tenant bot id when applicable.</param>
         /// <param name="cancellationToken">Cancellation token for database and API work.</param>
-        /// <returns>The sent/reused row, or the previous successful row with WasUnchanged when no mutation is needed; null when disabled.</returns>
-        /// <remarks>All semantic fields and ownership are compared under account admission; tracking code does not affect equality.</remarks>
+        /// <param name="deferSend">True to persist a local payload draft and wake the sync worker without foreground website HTTP; false resolves the website owner and attempts delivery synchronously.</param>
+        /// <returns>A detached sent/reused or pending outbox row, or the previous successful row with WasUnchanged when no mutation is needed; null when disabled. Pending does not prove delivery.</returns>
+        /// <remarks>
+        /// Account state and pinned owner/buyer/bot identity are compared under short database-only queue admission.
+        /// Tracking code and website-owned username enrichment do not affect equality. Deferred remote lookup and
+        /// sending occur in the worker; wallet and renewal settlement are never part of this optional mirror.
+        /// </remarks>
+        /// <example><code>await sync.QueueUpdateAsync(ownerTelegramId, buyerTelegramId, client, server, operationId, tenantBotId, token, deferSend: true);</code></example>
         public async Task<GozargahSiteSyncEvent> QueueUpdateAsync(
             long siteOwnerTelegramUserId,
             long buyerTelegramUserId,
@@ -1854,9 +1867,9 @@ namespace Adminbot.Domain
         }
 
         /// <summary>
-        /// Builds the website order payload from XUI metadata, panel values, and the owning Gozargah user.
+        /// Builds a local website mirror draft from confirmed XUI metadata without making any remote request.
         /// </summary>
-        /// <param name="siteOwnerTelegramUserId">Telegram id used by <c>get_user</c> to resolve the website username.</param>
+        /// <param name="siteOwnerTelegramUserId">Positive Telegram owner id pinned on the outbox row; no website lookup is performed here.</param>
         /// <param name="buyerTelegramUserId">Telegram id of the actual buyer, included in the website comment for tenant sales.</param>
         /// <param name="name">Current or lookup XUI email/name for the website order.</param>
         /// <param name="newName">Replacement XUI email/name for link-change operations; null for create/update/delete.</param>
@@ -1868,14 +1881,16 @@ namespace Adminbot.Domain
         /// <param name="fallbackTrafficGb">Traffic allowance in GB when metadata and bytes are incomplete.</param>
         /// <param name="fallbackDurationDays">Duration in days when metadata does not provide a plan duration.</param>
         /// <param name="trackingCode">Local order id or operation id passed to the website for audit.</param>
-        /// <param name="cancellationToken">Cancellation token for the website <c>get_user</c> lookup.</param>
         /// <returns>
-        /// Normalized payload ready for create/update, or null when the site user does not exist, is banned, or name is empty.
+        /// A local create/update draft with a null Username, or null when owner id is nonpositive or the account name is empty. Persist it with the same owner id before sending.
         /// </returns>
         /// <remarks>
-        /// Website ownership is resolved before queueing so missing or banned site users are skipped instead of being retried forever.
-        /// Blank tracking codes remain blank here; queue admission generates one only after semantic comparison requires a mutation.
+        /// This local draft performs no website lookup and leaves Username null. The outbox stores the exact owner
+        /// Telegram id separately, and its sender enriches the username before delivery, treating missing or banned
+        /// owners as terminal while keeping transient website failures retryable. Blank tracking codes are generated
+        /// only after queue admission determines that a real state change is required.
         /// </remarks>
+        /// <example><code>var payload = BuildPayloadDraft(ownerId, buyerId, email, null, uuid, subId, subLink, comment, trafficBytes, trafficGb, durationDays, trackingCode);</code></example>
         private static GozargahSiteOrderPayload BuildPayloadDraft(
             long siteOwnerTelegramUserId, long buyerTelegramUserId, string name, string newName, string uuid,
             string subId, string subLink, string comment, long trafficBytes, int fallbackTrafficGb,

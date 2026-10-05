@@ -398,8 +398,8 @@ public sealed partial class ConcurrencyTests
     /// <summary>A non-idempotent mutation still performs exactly one POST when the panel answers a transient status.</summary>
     /// <returns>A task completing after the single-POST assertion.</returns>
     /// <remarks>
-    /// Guard against the foreground hardening accidentally making an ambiguous mutation retryable: the foreground budget
-    /// must never be combined with <c>NoAutomaticRetry</c>.
+    /// Guard against foreground hardening making an ambiguous mutation retryable. Any opt-in durable creation
+    /// network lifetime must retain <c>NoAutomaticRetry</c>; expiry never grants a second POST.
     /// </remarks>
     [Fact]
     public async Task NoAutomaticRetry_mutation_performs_exactly_one_post()

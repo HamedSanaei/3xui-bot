@@ -36,7 +36,10 @@ public enum TelegramUpdateStage
     BusinessRecovery,
 
     /// <summary>A Telegram token identity/GetMe probe; token and returned identity are never stage metadata.</summary>
-    TelegramProbe
+    TelegramProbe,
+
+    /// <summary>One awaited XUI mutation attempt; measurement never changes retry or financial authorization.</summary>
+    XuiMutation
 }
 
 /// <summary>
