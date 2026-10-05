@@ -1162,7 +1162,10 @@ public sealed class UniquePaySettlementService
     /// Each attempt reloads the payment through an independent users.db context so the paid state written by the
     /// authoritative reconciliation context cannot be hidden by a stale singleton EF Core change tracker. The first
     /// credit and unique notification row are committed in one users.db save; retry delivery cannot call settlement.
+    /// The one combined customer confirmation includes the committed wallet receipt balance and explains that credit
+    /// can buy or renew an account; funding alone does not activate it or change its status.
     /// </remarks>
+    /// <example><code>var result = await service.ApplyOfficialPaymentAsync(payment, "customer-check", cancellationToken: token);</code></example>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(
         UniquePayPaymentInfo payment,
         string source,
@@ -1302,7 +1305,7 @@ public sealed class UniquePaySettlementService
                     chatId: notificationChatId,
                     amountToman: tracked.BaseAmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.",
-                    createdAtUtc: tracked.SettledAtUtc.Value, botType: tracked.WalletOriginBotType, balanceAfter: tracked.BalanceAfter,
+                    createdAtUtc: tracked.SettledAtUtc.Value, botType: tracked.WalletOriginBotType, balanceAfter: after,
                     walletOriginTelegramBotId: tracked.WalletOriginTelegramBotId));
             await context.SaveAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, before, after, cancellationToken);
@@ -1337,6 +1340,8 @@ public sealed class UniquePaySettlementService
     /// independent users.db context so an older tracked status cannot authorize or reject the administrator's action.
     /// The provisional first-credit marker and customer notification are saved together; later official confirmation
     /// does not create a second notification.
+    /// That combined confirmation preserves provisional approval, includes the committed wallet receipt balance,
+    /// and explains that funding alone does not activate an account or change its status before purchase or renewal.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1447,7 +1452,7 @@ public sealed class UniquePaySettlementService
                     chatId: notificationChatId,
                     amountToman: tracked.BaseAmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت.",
-                    createdAtUtc: tracked.SettledAtUtc.Value, botType: tracked.WalletOriginBotType, balanceAfter: tracked.BalanceAfter,
+                    createdAtUtc: tracked.SettledAtUtc.Value, botType: tracked.WalletOriginBotType, balanceAfter: after,
                     walletOriginTelegramBotId: tracked.WalletOriginTelegramBotId));
             await context.SaveAsync(cancellationToken);
 

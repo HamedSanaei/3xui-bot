@@ -461,7 +461,10 @@ public sealed class TetraminatorSettlementService
     /// <remarks>
     /// The first wallet credit and unique notification row share one users.db save. Telegram delivery runs later and
     /// cannot repeat this settlement path.
+    /// The one combined customer confirmation includes the committed wallet receipt balance and explains that credit
+    /// can buy or renew an account; funding alone does not activate it or change its status.
     /// </remarks>
+    /// <example><code>var result = await service.ApplyOfficialPaymentAsync(payment, "callback", cancellationToken: token);</code></example>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(
         TetraminatorPaymentInfo payment,
         string source,
@@ -539,7 +542,7 @@ public sealed class TetraminatorSettlementService
                     chatId: notificationChatId,
                     amountToman: payment.AmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
-                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: after,
                     walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
             await _workflow.SaveAsync(cancellationToken);
             await EnsureOfficialLedgerAsync(payment, before, after, cancellationToken);
@@ -569,7 +572,12 @@ public sealed class TetraminatorSettlementService
     /// <param name="notifyChatId">Optional customer chat id override.</param>
     /// <param name="cancellationToken">Cancellation token for wallet, users.db, ledger, and outbox operations.</param>
     /// <returns>Applied for the first provisional credit or a non-mutating settlement status.</returns>
-    /// <remarks>Later official confirmation cannot enqueue or deliver a second customer notification.</remarks>
+    /// <remarks>
+    /// The one combined confirmation preserves provisional approval, includes the committed wallet receipt balance,
+    /// and explains that funding alone does not activate an account or change its status before purchase or renewal.
+    /// Later official confirmation cannot enqueue or deliver a second customer notification.
+    /// </remarks>
+    /// <example><code>var result = await service.ApplyProvisionalPaymentAsync(payment, admin.Id, cancellationToken: token);</code></example>
     public async Task<NowPaymentsSettlementResult> ApplyProvisionalPaymentAsync(
         TetraminatorPaymentInfo payment,
         long approvedByTelegramUserId,
@@ -629,7 +637,7 @@ public sealed class TetraminatorSettlementService
                     chatId: notificationChatId,
                     amountToman: payment.AmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر افزایش یافت.",
-                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: after,
                     walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
             await _workflow.SaveAsync(cancellationToken);
 

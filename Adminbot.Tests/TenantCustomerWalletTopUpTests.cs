@@ -227,13 +227,16 @@ public sealed partial class ConcurrencyTests
             x.IdempotencyKey == mirrorKey && x.Reason == WalletLedgerReasons.TenantWalletTopUpMirror));
     }
 
+    /// <summary>Personal-card approval sends a combined receipt-backed customer notice without mirroring owner funds or creating an account.</summary>
+    /// <returns>A task completing after two production approvals and captured Telegram delivery with real SQLite financial checks.</returns>
+    /// <remarks>Checks the first delivered confirmation and financial replay invariants without changing the existing personal-card notification replay behavior.</remarks>
     [Fact]
     public async Task TenantCustomerWallet_Personal_card_approval_credits_only_customer_once()
     {
         using var databases = new Databases();
         var configuration = AtlasTenantConfiguration(databases, "http://127.0.0.1:1");
         await using var provider = AtlasTenantProvider(
-            databases, configuration, new AtlasPay(configuration), out var registry, out _);
+            databases, configuration, new AtlasPay(configuration), out var registry, out var clients);
         var wallet = provider.GetRequiredService<CredentialsStore>();
         await wallet.AddEmptyUser(123);
         await wallet.MutateWalletAsync(123, 10_000, "fixture:card-customer");
@@ -305,11 +308,11 @@ public sealed partial class ConcurrencyTests
 
         await using var scope = provider.CreateAsyncScope();
         var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
-        var first = await service.APPROVEMANUALRECEIPTASYNC(receiptId, 456, default);
-        var second = await service.APPROVEMANUALRECEIPTASYNC(receiptId, 456, default);
+        await service.APPROVEMANUALRECEIPTASYNC(receiptId, 456, default);
 
-        Assert.Contains("100,000", first);
-        Assert.Contains("100,000", second);
+        var text = Assert.Single(clients[store.Id].Texts);
+        AssertCombinedWalletChargeNotice(text);
+        await service.APPROVEMANUALRECEIPTASYNC(receiptId, 456, default);
         Assert.Equal(110_000, await wallet.GetAccountBalance(123));
         Assert.Equal(70_000, await wallet.GetAccountBalance(456));
 
@@ -320,6 +323,7 @@ public sealed partial class ConcurrencyTests
             var credit = await credentials.WalletOperations.SingleAsync(x => x.OperationKey == key);
             Assert.Equal(100_000, credit.AmountToman);
             Assert.Equal(123, credit.TelegramUserId);
+            Assert.Contains(credit.AfterBalance.ToString("N0", System.Globalization.CultureInfo.CurrentCulture), text);
         }
         await using (var verify = databases.Users.CreateDbContext())
         {
@@ -337,6 +341,8 @@ public sealed partial class ConcurrencyTests
             Assert.True(order.IsFulfilled);
             Assert.False(order.IsOwnerCredited);
             Assert.Equal(0, order.OwnerWalletDelta);
+            Assert.Empty(await verify.XuiV3CreationOperations.ToListAsync());
+            Assert.Empty(await verify.XuiV3RenewalOperations.ToListAsync());
         }
     }
 

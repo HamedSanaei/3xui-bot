@@ -10831,11 +10831,22 @@ public partial class TenantBotService
     }
 
     /// <summary>Applies an approved personal-card tenant wallet top-up exactly once.</summary>
+    /// <param name="candidate">Persisted tenant wallet-charge order with the originating storefront, customer Telegram id and positive amount in toman.</param>
+    /// <param name="source">Non-secret approval/recovery source recorded on the order; never provider payloads or credentials.</param>
+    /// <param name="cancellationToken">Cancellation token for committed receipt reconciliation, users.db updates and the customer confirmation.</param>
+    /// <returns>The immutable credentials.db credit receipt, including the actual post-credit customer balance in toman; the caller may report it but must not credit again.</returns>
     /// <remarks>
     /// The card transfer is already in the tenant owner's bank account, so this operation credits only the customer.
     /// The immutable credentials receipt is the balance authority; users.db ledger/order repair is retry-safe after a crash.
     /// No owner mirror, referral, XUI mutation, provisional account, or base-cost settlement is performed.
+    /// The original tenant sends one combined plain-text confirmation showing the receipt balance and explaining
+    /// that the customer must still buy or renew to change account status. Wallet approval gates admission only;
+    /// already approved payment evidence remains settleable if wallet availability subsequently changes.
     /// </remarks>
+    /// <exception cref="ArgumentNullException">The candidate order is null.</exception>
+    /// <exception cref="InvalidOperationException">The charge, approved card receipt or committed wallet receipt identity conflicts.</exception>
+    /// <exception cref="OperationCanceledException">Database or Telegram work was canceled; a committed credit is never rolled back.</exception>
+    /// <example><code>var receipt = await APPLYTENANTCARDWALLETCHARGEASYNC(order, "owner-orderid-wallet-charge", token);</code></example>
     private async Task<WalletOperation> APPLYTENANTCARDWALLETCHARGEASYNC(
         TenantBotOrder candidate,
         string source,
@@ -10918,7 +10929,9 @@ public partial class TenantBotService
             {
                 await _botClientProvider.GetClient(order.TenantBotId).SendMessage(
                     order.CustomerChatId,
-                    $"✅ واریز کارت‌به‌کارت تایید شد و کیف پول شما {order.SalePriceToman:N0} تومان شارژ شد.\nموجودی جدید: {walletReceipt.AfterBalance:N0} تومان",
+                    PaymentSettlementNotification.BuildWalletCreditMessage(
+                        $"✅ واریز کارت‌به‌کارت تایید شد و کیف پول شما {order.SalePriceToman:N0} تومان شارژ شد.",
+                        walletReceipt.AfterBalance),
                     cancellationToken: cancellationToken);
             }
         }

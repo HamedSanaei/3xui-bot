@@ -32,8 +32,8 @@ only, never the customer's whole balance. Existing tenant owner suspension/debt 
 
 `WalletChargeApplicationService` shares amount policies, live gateway admission and invoice transport with the
 owned flow. Tenant amounts are entered in toman; gateway selection also requires the store's switch. Supported
-central providers: HooshPay, Tetraminator, UniquePay, AtlasPay and NOWPayments. Personal storefront cards are
-never top-up sources. Platform gateway credentials remain central.
+central providers: HooshPay, Tetraminator, UniquePay, AtlasPay and NOWPayments. Platform gateway credentials remain
+central; the existing personal-storefront-card approval path credits only the customer, without a central owner mirror.
 
 The bot/user confirmation state is consumed before provider creation. A `wallet_charge` payment row, including
 tenant BotId, username, customer/chat and immutable `WalletOriginBotType`, commits **before** external I/O.
@@ -53,6 +53,28 @@ repaired after failure. Owned notification keys remain `owned-wallet:{provider}:
 `tenant-wallet:{provider}:{id}`. Delivery uses the saved tenant BotId and original payment chat, with amount and
 receipt balance. `PaymentSettlementNotificationWorker` remains delivery-only; uncertain Telegram delivery is
 reviewed, not blindly resent. A disabled/unavailable runtime can delay delivery without reversing the credit.
+
+### Combined customer confirmation in owned and tenant bots
+
+After a successful top-up, the existing confirmation is one combined message: provider/admin confirmation,
+the committed receipt's **post-credit balance in toman**, and these customer instructions:
+
+> می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.
+> تا زمانی که خرید یا تمدید را انجام ندهید، وضعیت اکانت شما مانند قبل باقی می‌ماند.
+> شارژ حساب به‌تنهایی به معنی فعال شدن اکانت نیست.
+
+This applies to owned gateway/manual top-ups, legacy Zibal and admitted wallet-enabled tenant gateway or
+personal-card top-ups. A tenant grant alone is insufficient: existing owner activation and identity-bound admission
+still apply. Revocation does not suppress confirmation/recovery of already committed payment evidence.
+The balance comes from that credit's immutable credentials.db receipt, not a later live balance. No account is
+created, renewed, enabled or otherwise changed by sending this message; the customer must initiate purchase/renewal.
+
+Gateway notification keys, origin routing and first-credit replay rules remain unchanged. Provisional and partial
+confirmation headers retain their financial meaning. Receipt recovery restores a missing combined notice once;
+it never credits again or overwrites an existing notice. Owned manual-credit fanout now uses only the combined
+body rather than additional customer credit/profile messages. The personal-card path retains its existing
+best-effort delivery/repeated-approval behavior. No schema migration, configuration flag or historical message backfill.
+
 
 ## Wallet purchase and renewal
 

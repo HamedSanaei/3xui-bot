@@ -792,9 +792,12 @@ public sealed partial class AtlasPaySettlementService
     /// <returns>Applied with receipt balances, AlreadyAdded for a duplicate, or a non-applied validation result.</returns>
     /// <remarks>Only a verified paid wallet_charge can settle. Receipt and balance commit atomically in credentials.db;
     /// marker and notification commit separately in users.db. Repeated calls repair the ledger without another credit.
+    /// The one combined customer confirmation includes the committed wallet receipt balance and explains that credit
+    /// can buy or renew an account; funding alone does not activate it or change its status.
     /// Approval revocation does not block a previously created invoice's legitimate settlement.</remarks>
     /// <remarks>Tenant wallet top-ups use the shared receipt-backed customer/owner report and durable Sales Assistant
     /// notification after mirror credit; owned audit formatting and all financial operation keys remain unchanged.</remarks>
+    /// <example><code>var result = await service.ApplyOfficialPaymentAsync(payment, "webhook-inquiry", token);</code></example>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(AtlasPayPaymentInfo payment, string source,
         CancellationToken cancellationToken = default)
     {
@@ -865,7 +868,7 @@ public sealed partial class AtlasPaySettlementService
             tracked.SettledAtUtc ??= DateTime.UtcNow; tracked.NextInquiryAtUtc = null; tracked.ErrorCode = null; tracked.ErrorMessage = null; tracked.UpdatedAtUtc = DateTime.UtcNow;
             context.Add(PaymentSettlementNotification.CreateWalletCredit("atlaspay", tracked.Id, tracked.BotId,
                 tracked.TelegramUserId, tracked.ChatId, tracked.BaseAmountToman,
-                $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.", tracked.SettledAtUtc.Value, tracked.WalletOriginBotType, tracked.BalanceAfter,
+                $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.", tracked.SettledAtUtc.Value, tracked.WalletOriginBotType, receipt.AfterBalance,
                 tracked.WalletOriginTelegramBotId));
             await context.SaveAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, receipt.BeforeBalance, receipt.AfterBalance, cancellationToken);
@@ -923,7 +926,10 @@ public sealed partial class AtlasPaySettlementService
     /// permits that explicit exception. Pending and expired credits retain their provider status and audited admin id.
     /// A later official confirmation records audit only, without another wallet credit, ledger row, referral or notice.
     /// The wallet receipt commits independently of the users.db marker; ambiguous claims require manual recovery.
+    /// The one combined customer confirmation preserves provisional approval, includes the committed wallet receipt
+    /// balance, and explains that funding alone does not activate an account or change its status before purchase or renewal.
     /// </remarks>
+    /// <example><code>var result = await service.ApplyProvisionalPaymentAsync(payment, admin.Id, cancellationToken: token);</code></example>
     public async Task<NowPaymentsSettlementResult> ApplyProvisionalPaymentAsync(
         AtlasPayPaymentInfo payment,
         long approvedByTelegramUserId,
@@ -1032,7 +1038,7 @@ public sealed partial class AtlasPaySettlementService
                 $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} به صورت موقت توسط مدیر تایید و افزایش یافت.",
                 tracked.SettledAtUtc.Value,
                 tracked.WalletOriginBotType,
-                tracked.BalanceAfter,
+                receipt.AfterBalance,
                 tracked.WalletOriginTelegramBotId));
             await context.SaveAsync(cancellationToken);
 

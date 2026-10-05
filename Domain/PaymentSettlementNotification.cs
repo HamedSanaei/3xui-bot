@@ -55,37 +55,52 @@ public sealed class PaymentSettlementNotification
     public bool IsTenantOwnerReport => NotificationKey?.StartsWith(TenantOwnerReportPrefix, StringComparison.Ordinal) == true;
 
     /// <summary>Creates an origin-aware wallet-credit delivery intent while retaining historical owned keys.</summary>
-    /// <param name="provider">Stable central provider label without secrets.</param>
-    /// <param name="providerPaymentId">Local provider payment row id.</param>
-    /// <param name="botId">Persisted originating runtime bot id.</param>
-    /// <param name="telegramUserId">Customer's global Telegram identity.</param>
-    /// <param name="chatId">Original payment's destination Telegram chat id.</param>
-    /// <param name="amountToman">Positive credited amount in toman.</param>
-    /// <param name="messageText">Safe customer-facing plain text, without provider payloads.</param>
-    /// <param name="createdAtUtc">Original settlement timestamp in UTC.</param>
-    /// <param name="botType">Immutable payment origin: owned for historical rows, tenant for approved tenant invoices.</param>
-    /// <param name="balanceAfter">Optional authoritative post-credit receipt balance in toman, displayed for tenant charges.</param>
-    /// <param name="walletOriginTelegramBotId">Exact numeric BotFather identity captured from the approved tenant storefront when the invoice was created.</param>
-    /// <returns>A detached outbox intent for insertion with the payment settlement marker.</returns>
+    /// <param name="provider">Non-secret central provider label from settlement; historical null/empty labels become unknown.</param>
+    /// <param name="providerPaymentId">Positive local users.db payment-row id committed before settlement; not the remote provider invoice id.</param>
+    /// <param name="botId">Persisted originating internal bot id, required for tenant delivery; null/empty legacy owned origins use the default owned bot.</param>
+    /// <param name="telegramUserId">Positive global Telegram user id whose wallet received the credit; for tenants this is the customer, not the store owner.</param>
+    /// <param name="chatId">Nonzero destination Telegram chat id from the persisted payment or authoritative customer profile, not callback-supplied input.</param>
+    /// <param name="amountToman">Positive credited amount in whole Iranian toman from the committed receipt; fees and owner mirror credits are excluded.</param>
+    /// <param name="messageText">Safe provider-specific plain-text confirmation without payloads or a repeated balance/instruction footer.</param>
+    /// <param name="createdAtUtc">Required original settlement timestamp in UTC, used for notification due time rather than the time of a later replay.</param>
+    /// <param name="botType">Immutable persisted invoice origin; tenant selects tenant delivery, while historical null/non-tenant values retain owned delivery.</param>
+    /// <param name="balanceAfter">Required authoritative credentials.db receipt balance immediately after this credit, in toman; may remain negative after debt repayment.</param>
+    /// <param name="walletOriginTelegramBotId">Optional positive numeric BotFather identity captured at tenant invoice admission; historical missing identities require manual review, and owned delivery ignores this value.</param>
+    /// <returns>A detached outbox intent containing one confirmation, receipt balance and purchase/renewal guidance; persist it with the payment marker.</returns>
     /// <remarks>
     /// The worker remains delivery-only. Owned notification keys never change; tenant keys cannot collide with them.
     /// Historical tenant rows that predate numeric identity capture are never rebound to the current token; delivery is
     /// parked for manual review while the already-committed financial settlement remains final.
+    /// Both owned and approved tenant charges include the receipt balance and explain that funding alone never
+    /// purchases, renews or activates an account. Existing payment admission and delivery identity checks remain unchanged.
     /// </remarks>
+    /// <example><code>var notice = CreateWalletCredit("hooshpay", payment.Id, payment.BotId, payment.TelegramUserId, payment.ChatId, receipt.AmountToman, confirmation, receipt.CreatedAtUtc, payment.WalletOriginBotType, receipt.AfterBalance, payment.WalletOriginTelegramBotId);</code></example>
     public static PaymentSettlementNotification CreateWalletCredit(string provider, int providerPaymentId, string botId,
         long telegramUserId, long chatId, long amountToman, string messageText, DateTime createdAtUtc, string botType,
-        long? balanceAfter = null, long? walletOriginTelegramBotId = null)
+        long balanceAfter, long? walletOriginTelegramBotId = null)
     {
-        var result = CreateOwnedWalletCredit(provider, providerPaymentId, botId, telegramUserId, chatId, amountToman, messageText, createdAtUtc);
+        var result = CreateOwnedWalletCredit(provider, providerPaymentId, botId, telegramUserId, chatId, amountToman,
+            BuildWalletCreditMessage(messageText, balanceAfter), createdAtUtc);
         result.WalletOriginBotType = botType == BotInstanceTypes.Tenant ? BotInstanceTypes.Tenant : BotInstanceTypes.Owned;
         if (botType == BotInstanceTypes.Tenant)
         {
             result.NotificationKey = $"tenant-wallet:{result.Provider}:{providerPaymentId}";
             result.WalletOriginTelegramBotId = walletOriginTelegramBotId;
-            if (balanceAfter.HasValue) result.MessageText += $"\nموجودی جدید: {balanceAfter.Value:N0} تومان";
         }
         return result;
     }
+
+    /// <summary>Combines one successful charge confirmation with its committed balance and account-activation guidance.</summary>
+    /// <param name="confirmationText">Required safe plain-text provider or administrator confirmation; must not contain secrets, markup or a duplicate balance footer.</param>
+    /// <param name="balanceAfter">Authoritative global Telegram-user wallet balance from the committed credentials.db credit receipt, in whole toman; may be negative.</param>
+    /// <returns>One Persian plain-text message showing the post-credit balance and stating that only a later purchase or renewal changes the account.</returns>
+    /// <remarks>
+    /// Shared by owned charges and admitted wallet-enabled tenant charges. This formatter changes no balance, order,
+    /// ledger or XUI state and makes no Telegram call. The caller sends or persists this body instead of adding a second notice.
+    /// </remarks>
+    /// <example><code>var text = BuildWalletCreditMessage("✅ واریز شما تایید شد.", receipt.AfterBalance);</code></example>
+    public static string BuildWalletCreditMessage(string confirmationText, long balanceAfter) =>
+        $"{confirmationText}\n\n💰 موجودی حساب شما پس از شارژ: {balanceAfter:N0} تومان\n\nمی‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.\n⚠️ تا زمانی که خرید یا تمدید را انجام ندهید، وضعیت اکانت شما مانند قبل باقی می‌ماند. شارژ حساب به‌تنهایی به معنی فعال شدن اکانت نیست.";
 
     /// <summary>Auto-generated users.db primary key.</summary>
     public int Id { get; set; }

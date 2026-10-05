@@ -917,6 +917,9 @@ public partial class TelegramBotService
     /// Owned super-admin channel-post callbacks and text/photo intake delegate to the bounded shared manager after
     /// Tenant isolation, before legacy state/non-text dispatch. Administrative navigation abandons unpublished
     /// composition only; admitted jobs keep their immutable content and destinations.
+    /// Successful super-admin wallet credits use the committed credentials receipt balance in one combined
+    /// plain-text notice per previously started owned bot, without an additional customer profile/credit message.
+    /// Funding changes only credit and audit records, not any XUI account's activation or expiry state.
     /// </remarks>
     /// <example>
     /// <code>
@@ -2257,19 +2260,12 @@ public partial class TelegramBotService
                         replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
 
 
-                        await botClient.CustomSendTextMessageAsync(
-                                                    chatId: (findedUser).ChatID,
-                                                    text: $"حساب شما به میزان {amount} تومان از طرف مدیریت شارژ شد.",
-                                                    replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
                         await _ownedBotNotificationService.NotifyUserAcrossOwnedBotsAsync(
                             findedUser.TelegramUserId,
-                            $"✅ حساب شما به میزان {amount.FormatCurrency()} از طرف مدیریت شارژ شد.\nموجودی جدید: {afterBalance.FormatCurrency()}",
+                            PaymentSettlementNotification.BuildWalletCreditMessage(
+                                $"✅ حساب شما به میزان {amount.FormatCurrency()} از طرف مدیریت شارژ شد.", afterBalance),
                             cancellationToken: cancellationToken);
 
-                        await botClient.CustomSendTextMessageAsync(
-                        chatId: findedUser.ChatID,
-                        text: await GetUserProfileMessage(findedUser),
-                        replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
                     }
 
                     else
@@ -4499,7 +4495,10 @@ public partial class TelegramBotService
     /// <remarks>
     /// The amount is converted from rial to Iranian toman by dividing by ten. Only rows with <c>IsPaid=true</c>
     /// reach referral settlement. Repeated calls repair missing audit/referral work but never credit the wallet twice.
+    /// The customer receives one combined confirmation with the committed post-credit toman balance and guidance
+    /// to buy or renew explicitly; credit alone never activates an account. Duplicate customer/admin chat destinations coalesce.
     /// </remarks>
+    /// <example><code>await ZibalAddtoBalance(payment, _appConfig, customer, customer.ChatID, isAdmin: false);</code></example>
     public async Task ZibalAddtoBalance(ZibalPaymentInfo zpi, AppConfig appConfig, CredUser credUser, long chatid, bool isAdmin)
     {
         if (zpi == null)
@@ -4605,20 +4604,23 @@ public partial class TelegramBotService
                 CancellationToken.None);
         }
 
+        var creditMessage = PaymentSettlementNotification.BuildWalletCreditMessage(
+            $"اعتبار کیف پول شما به میزان {(zpi.Amount / 10).FormatCurrency()} افزایش یافت.", afterBalance);
         if (isAdmin)
         {
             // Provider verification can be initiated by an admin, but the user receives the same final-credit notice.
             await ActiveBotClient.CustomSendTextMessageAsync(
                 chatId: findedUser.ChatID,
-                text: $"اعتبار کیف پول شما به میزان {(zpi.Amount / 10).FormatCurrency()} افزایش یافت. با اسفتاده از این اعتبار میتوانید اکانت مورد نیاز خودرا تهیه بفرمایید.",
+                text: creditMessage,
                 replyMarkup: MainReplyMarkupKeyboardFa());
         }
 
-        //notify user ( admin)
-        await ActiveBotClient.CustomSendTextMessageAsync(
-            chatId: chatid,
-            text: $"اعتبار کیف پول شما به میزان {(zpi.Amount / 10).FormatCurrency()} افزایش یافت. با اسفتاده از این اعتبار میتوانید اکانت مورد نیاز خودرا تهیه بفرمایید.",
-            replyMarkup: MainReplyMarkupKeyboardFa());
+        // Admin verification can target the customer's own chat; do not send that destination a second copy.
+        if (!isAdmin || chatid != findedUser.ChatID)
+            await ActiveBotClient.CustomSendTextMessageAsync(
+                chatId: chatid,
+                text: creditMessage,
+                replyMarkup: MainReplyMarkupKeyboardFa());
 
         var msg = await GetZipalPaymentMessage(credUser, true, zpi, $"https://gateway.zibal.ir/start/{zpi.TrackId}");
 

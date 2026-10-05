@@ -1,5 +1,15 @@
 # CODE_MAP.md
 
+- Customer top-up confirmations: `PaymentSettlementNotification.CreateWalletCredit` now requires the committed
+  receipt's post-credit toman balance for owned and admitted wallet-enabled tenant origins. Shared
+  `BuildWalletCreditMessage` combines provider/admin confirmation, balance and explicit purchase/renewal guidance:
+  funding itself never activates an account. All five gateway branches and receipt recovery retain existing unique
+  outbox keys; provisional/partial facts remain visible. Owned manual credits, legacy Zibal and tenant personal-card
+  approval reuse the same body. Owned admin duplicate customer credit/profile sends were removed; card best-effort
+  replay/delivery rules, financial effects, tenant admission and owner reports remain unchanged. No schema/config change.
+  Coverage: existing `TenantCustomerWalletSettlementTests.cs` / `TenantCustomerWalletTopUpTests.cs`; operator guidance
+  in `docs/tenant-customer-wallet.md`.
+
 - Tenant weekly dashboards: `TenantWeeklyUsageReportHostedService` starts **Saturday 00:00 Tehran**
   (midnight ending Friday), independently of the global weekly flag/schedule; startup catches up only the latest week.
   Each configured store created before the boundary, including disabled stores, gets its own owner report via
@@ -182,7 +192,8 @@
   metadata; attempting to enable before a valid grant fails closed. Super-admin revocation clears both grant and owner
   opt-in immediately for new work, while paid-invoice settlement and committed-debit recovery remain independent.
   This exposes the existing GLOBAL TelegramUserId wallet, never a tenant balance. `WalletChargeApplicationService` shares
-  central gateway creation with owned flow; personal tenant cards cannot top up. Five providers persist immutable origin,
+  central gateway creation with owned flow; existing personal-card approval credits only the customer without owner mirror.
+  Five central providers persist immutable origin,
   exclude tenant referrals and enqueue delivery through the original tenant. `TenantCustomerWalletFunding` uses atomic
   sufficient-balance debit `tenant-customer-wallet:{orderId}:debit`, existing tenant creation/renewal sagas and owner
   profit only (no owner base debit). Proven rejection refunds once with `:refund`; ambiguity never refunds. Migration

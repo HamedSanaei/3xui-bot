@@ -446,7 +446,10 @@ namespace Adminbot.Domain
         /// <c>AlreadyAdded</c>; official reconciliation is recorded separately before this method is called. The first
         /// credit enqueues one notification in the same users.db save as <c>IsAddedToBalance</c>; Telegram delivery is
         /// performed later and can never re-enter this method.
+        /// The single customer notice includes the committed receipt balance and explains that funding alone does
+        /// not activate an account; owned and admitted tenant wallets still require a later purchase or renewal.
         /// </remarks>
+        /// <example><code>var result = await service.ApplyFinishedPaymentAsync(payment, "ipn", cancellationToken: token);</code></example>
         public async Task<NowPaymentsSettlementResult> ApplyFinishedPaymentAsync(
             HooshPayPaymentInfo payment,
             string source,
@@ -516,9 +519,8 @@ namespace Adminbot.Domain
                         telegramUserId: payment.TelegramUserId,
                         chatId: notificationChatId,
                         amountToman: payment.AmountToman,
-                        messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
-                                     "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
-                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                        messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
+                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: afterBalance,
                         walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
                 await _workflow.SaveAsync(cancellationToken);
 
@@ -574,7 +576,10 @@ namespace Adminbot.Domain
         /// This is intentionally restricted to wallet charges. It does not create tenant accounts and it does not
         /// overwrite the provider's pending status. A later official HooshPay paid callback is reconciled by
         /// <see cref="RecordProviderConfirmationAfterProvisionalAsync"/> without another balance mutation or outbox row.
+        /// Its one provisional confirmation includes the actual credited receipt balance and the same purchase/
+        /// renewal requirement; it never activates an account or adds a second notice on official reconciliation.
         /// </remarks>
+        /// <example><code>var result = await service.ApplyProvisionalWalletPaymentAsync(payment, admin.Id, cancellationToken: token);</code></example>
         public async Task<NowPaymentsSettlementResult> ApplyProvisionalWalletPaymentAsync(
             HooshPayPaymentInfo payment,
             long approvedByTelegramUserId,
@@ -632,7 +637,7 @@ namespace Adminbot.Domain
                         amountToman: payment.AmountToman,
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} به صورت موقت توسط مدیر تایید و افزایش یافت.\n" +
                                      "پس از تایید نهایی HooshPay، وضعیت درگاه نیز ثبت می‌شود.",
-                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: afterBalance,
                         walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
                 await _workflow.SaveAsync(cancellationToken);
 

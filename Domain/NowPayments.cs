@@ -836,7 +836,10 @@ namespace Adminbot.Domain
         /// Tenant, partial, provisional, pending, failed, and refunded rows are not eligible for this referral path.
         /// The first credit and its unique customer-notification row are saved together; Telegram retries are handled
         /// by a delivery-only worker that has no wallet or settlement dependency.
+        /// The single combined customer confirmation includes the committed wallet receipt balance and explains that
+        /// credit can buy or renew an account; funding alone does not activate it or change its status.
         /// </remarks>
+        /// <example><code>var result = await service.ApplyFinishedPaymentAsync(payment, "ipn", cancellationToken: token);</code></example>
         public async Task<NowPaymentsSettlementResult> ApplyFinishedPaymentAsync(
             SwapinoPaymentInfo payment,
             string source,
@@ -904,9 +907,8 @@ namespace Adminbot.Domain
                         telegramUserId: payment.TelegramUserId,
                         chatId: notificationChatId,
                         amountToman: payment.AmountToman,
-                        messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
-                                     "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
-                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                        messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
+                        createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: afterBalance,
                         walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
                 await _workflow.SaveAsync(cancellationToken);
 
@@ -955,7 +957,10 @@ namespace Adminbot.Domain
         /// Partial payments share the invoice's wallet and ledger key with final settlement and preserve partial approval evidence. They never call the referral service
         /// and therefore cannot consume first eligible payment status. Its one customer notification is enqueued with
         /// the first-credit marker and delivered independently.
+        /// The combined confirmation preserves the partial-payment fact, includes the committed wallet receipt balance,
+        /// and explains that funding alone does not activate an account or change its status before purchase or renewal.
         /// </remarks>
+        /// <example><code>var result = await service.ApplyPartialPaymentAsync(payment, verifiedPartialAmountToman, "customer-check", cancellationToken: token);</code></example>
         public async Task<NowPaymentsSettlementResult> ApplyPartialPaymentAsync(
             SwapinoPaymentInfo payment,
             long creditedAmountToman,
@@ -1024,9 +1029,8 @@ namespace Adminbot.Domain
                     telegramUserId: payment.TelegramUserId,
                     chatId: notificationChatId,
                     amountToman: payment.AmountToman,
-                    messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.\n" +
-                                 "اکنون می‌توانید از این اعتبار برای خرید یا تمدید اکانت استفاده کنید.",
-                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: payment.BalanceAfter,
+                    messageText: $"اعتبار کیف پول شما بابت پرداخت جزئی به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
+                    createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: afterBalance,
                         walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
 
             await _workflow.SaveAsync(cancellationToken);

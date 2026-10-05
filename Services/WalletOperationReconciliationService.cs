@@ -316,7 +316,10 @@ public sealed partial class WalletOperationReconciliationService : BackgroundSer
     /// <param name="token">Cancellation of the short users.db transaction.</param>
     /// <returns>A task completing after all supported local settlement fields commit.</returns>
     /// <remarks>Tenant order fulfillment and XUI delivery remain with their existing sagas; a wallet receipt alone does not prove delivery.
-    /// A missing or mismatched payment target throws and leaves the receipt pending for operator review.</remarks>
+    /// A missing or mismatched payment target throws and leaves the receipt pending for operator review.
+    /// A missing first-credit notice is restored once with the receipt's post-credit balance and purchase/renewal
+    /// guidance; this repair never treats wallet funding as account activation or replaces an existing notice.</remarks>
+    /// <example><code>await RepairSettlementAsync(committedReceipt, token);</code></example>
     private async Task RepairSettlementAsync(WalletOperation receipt, CancellationToken token)
     {
         await SqliteOperation.RunAsync(async ct =>
@@ -420,7 +423,7 @@ public sealed partial class WalletOperationReconciliationService : BackgroundSer
                 {
                     var notification = PaymentSettlementNotification.CreateWalletCredit(parts[1], id, botId,
                         receipt.TelegramUserId, chatId, receipt.AmountToman,
-                        "اعتبار کیف پول شما افزایش یافت. اکنون می‌توانید خرید یا تمدید اکانت را ادامه دهید.", receipt.CreatedAtUtc, botType, receipt.AfterBalance,
+                        "اعتبار کیف پول شما افزایش یافت.", receipt.CreatedAtUtc, botType, receipt.AfterBalance,
                         walletOriginTelegramBotId);
                     if (!await db.PaymentSettlementNotifications.AnyAsync(x => x.NotificationKey == notification.NotificationKey, ct))
                         db.PaymentSettlementNotifications.Add(notification);
