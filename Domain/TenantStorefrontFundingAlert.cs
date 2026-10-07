@@ -1,13 +1,38 @@
 ﻿namespace Adminbot.Domain;
 
+/// <summary>Classifies the exact stored owner's access restrictions and shared-wallet financial mode.</summary>
+/// <remarks>
+/// Funding eligibility is a positive shared bot wallet OR a usable Gozargah wallet at the configured minimum.
+/// Insufficient funding changes new payment admission, not customer access; owner restrictions still deny access.
+/// The tenant's manual Enabled switch is enforced separately by the storefront handler.
+/// </remarks>
 public enum TenantAccessDecision
 {
+    /// <summary>The owner is present, unblocked, and meets either side of the existing OR funding rule.</summary>
     Allowed,
+    /// <summary>The shared owner is blocked; customers must not access any of that owner's storefronts.</summary>
     OwnerBlocked,
+    /// <summary>The exact stored owner's credentials are missing; customer access fails closed.</summary>
     OwnerMissing,
+    /// <summary>
+    /// The unblocked owner meets neither funding condition. Customer access remains available, but new payments
+    /// require the live central owned-bot gateways and must not use the tenant's personal card.
+    /// </summary>
     InsufficientFunding
 }
 
+/// <summary>Immutable owner-scoped funding classification used for customer access, payment admission, and alerts.</summary>
+/// <param name="Decision">The financial mode or owner restriction for the exact stored tenant owner.</param>
+/// <param name="BotBalanceToman">Shared owner bot-wallet balance in toman, or null when the owner is missing.</param>
+/// <param name="SiteWalletToman">Observed usable owner Gozargah balance in toman, or null when not read or unusable.</param>
+/// <param name="SiteWalletUsable">Whether the observed Gozargah wallet is eligible for website funding.</param>
+/// <param name="MinimumSiteWalletToman">Configured nonnegative website funding threshold in toman.</param>
+/// <remarks>
+/// Never reuse a snapshot for another owner. Allowed means bot balance &gt; 0 OR usable website balance at least
+/// MinimumSiteWalletToman; it does not require both wallets to be positive. InsufficientFunding remains distinct
+/// for payment fallback and alert recovery, although both financial modes permit navigation.
+/// </remarks>
+/// <example><code>var useCentralOnly = evaluation.RequiresPlatformPayments;</code></example>
 public sealed record TenantAccessEvaluation(
     TenantAccessDecision Decision,
     long? BotBalanceToman,
@@ -15,12 +40,21 @@ public sealed record TenantAccessEvaluation(
     bool SiteWalletUsable,
     long MinimumSiteWalletToman)
 {
-    public bool IsAllowed => Decision == TenantAccessDecision.Allowed;
+    /// <summary>Whether owner status permits customer access, including the central-payment fallback mode.</summary>
+    /// <remarks>Does not override a tenant's manual Enabled switch or authorize personal-card payments.</remarks>
+    public bool IsAllowed => Decision is TenantAccessDecision.Allowed or TenantAccessDecision.InsufficientFunding;
+
+    /// <summary>Whether new payments must use live central gateways and exclude the tenant's personal card.</summary>
+    /// <remarks>True exactly for InsufficientFunding; blocked or missing owners must instead be denied access.</remarks>
+    public bool RequiresPlatformPayments => Decision == TenantAccessDecision.InsufficientFunding;
+
+    /// <summary>Customer-facing owner restriction, or null in either accessible financial mode.</summary>
+    /// <remarks>Insufficient funding never emits a debt refusal; missing and unknown owner states fail closed.</remarks>
     public string RestrictionMessage => Decision switch
     {
-        TenantAccessDecision.Allowed => null,
+        TenantAccessDecision.Allowed or TenantAccessDecision.InsufficientFunding => null,
         TenantAccessDecision.OwnerBlocked => TenantAccessService.BlockedMessage,
-        _ => TenantAccessService.DebtMessage
+        _ => "فروشگاه در حال حاضر غیرفعال است."
     };
 }
 

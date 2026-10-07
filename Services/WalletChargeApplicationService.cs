@@ -5,15 +5,17 @@ using Microsoft.EntityFrameworkCore;
 /// <param name="workflow">Operation-local users.db persistence; no context survives provider I/O.</param>
 /// <param name="config">Platform-controlled gateway configuration, never tenant credentials.</param>
 /// <param name="availability">Live global gateway switches.</param>
-    /// <param name="policy">Fresh exact-store approval policy; null is allowed only for the owned-only legacy caller.</param>
+/// <param name="policy">Fresh exact-store approval policy; null is allowed only for the owned-only legacy caller.</param>
+/// <param name="fundingAccess">Read-only exact-owner funding evaluator; null is allowed only for owned-origin creation, never tenant admission.</param>
 /// <param name="hoosh">Existing HooshPay transport.</param>
 /// <param name="tetra">Existing Tetraminator transport.</param>
 /// <param name="unique">Existing UniquePay transport.</param>
 /// <param name="atlas">Existing AtlasPay transport.</param>
 /// <param name="now">Existing NOWPayments transport.</param>
-/// <remarks>Provider settlement, wallet receipts, referrals and delivery stay in existing services. Personal storefront cards are never funding providers.</remarks>
+/// <remarks>Provider settlement, wallet receipts, referrals and delivery stay in existing services. Personal storefront cards are never funding providers.
+/// Tenant first creation rechecks stored approval and owner funding immediately before provider POST; insufficient funding ignores saved provider opt-outs.</remarks>
 public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, AppConfig config,
-    IPaymentGatewayAvailability availability, TenantCustomerWalletPolicy policy, HooshPay hoosh,
+    IPaymentGatewayAvailability availability, TenantCustomerWalletPolicy policy, TenantAccessService fundingAccess, HooshPay hoosh,
     Tetraminator tetra, UniquePay unique, AtlasPay atlas, NowPayments now)
 {
     /// <summary>Customer-safe invoice delivery data; raw provider responses and API credentials are never exposed.</summary>
@@ -28,7 +30,11 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="payment">Persisted wallet-charge row, including immutable origin and amount.</param>
     /// <param name="token">Cancellation of admission revalidation and the non-retried provider call.</param>
     /// <returns>Provider creation result for the caller to apply and persist before Telegram delivery.</returns>
-    /// <remarks>No provider request runs inside a database transaction. Failures do not authorize another create.</remarks>
+    /// <remarks>No provider request runs inside a database transaction. Tenant origins freshly recheck exact-owner funding;
+    /// debt mode ignores saved provider opt-outs. Failures never authorize another create or gate issued-invoice settlement.</remarks>
+    /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels admission or provider I/O.</exception>
+    /// <example><code>payment.Apply((await charges.CreateHooshPayAsync(payment, token))?.data);</code></example>
     public async Task<HooshPayCreateInvoiceResponse> CreateHooshPayAsync(HooshPayPaymentInfo payment, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.HooshPay, payment.AmountToman, token);
@@ -39,7 +45,11 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="payment">Persisted wallet charge with central callback URL.</param>
     /// <param name="token">Cancellation of revalidation and provider I/O.</param>
     /// <returns>The provider result to persist; not proof of payment.</returns>
-    /// <remarks>Automatic creation retry is forbidden after any ambiguous result.</remarks>
+    /// <remarks>Tenant first POST freshly classifies exact-owner funding without wallet mutation; underfunding ignores opt-outs.
+    /// Automatic retry remains forbidden after any ambiguous provider result; existing invoice settlement is unchanged.</remarks>
+    /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels admission or provider I/O.</exception>
+    /// <example><code>payment.Apply(await charges.CreateTetraminatorAsync(payment, token));</code></example>
     public async Task<TetraminatorCreateInvoiceResponse> CreateTetraminatorAsync(TetraminatorPaymentInfo payment, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.Tetraminator, payment.AmountToman, token);
@@ -52,7 +62,11 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="callbackUrl">Configured central inquiry-trigger endpoint; it is not payment proof.</param>
     /// <param name="token">Cancellation of revalidation and provider I/O.</param>
     /// <returns>Provider invoice metadata to persist before displaying its link.</returns>
-    /// <remarks>The row must be committed first. External creation runs outside a write transaction and is never automatically retried.</remarks>
+    /// <remarks>The row must be committed first. Tenant funding is freshly checked immediately before POST; insufficient funding ignores opt-outs.
+    /// External creation stays outside write transactions and is never automatically retried. Issued invoices retain recovery.</remarks>
+    /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels admission or provider I/O.</exception>
+    /// <example><code>payment.Apply(await charges.CreateUniquePayAsync(payment, returnUrl, callbackUrl, token));</code></example>
     public async Task<UniquePayCreateInvoiceResponse> CreateUniquePayAsync(UniquePayPaymentInfo payment, string returnUrl, string callbackUrl, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.UniquePay, payment.BaseAmountToman, token);
@@ -63,7 +77,11 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="payment">Persisted wallet row with BeginCreationAttempt already saved.</param>
     /// <param name="token">Cancellation of revalidation and non-retried creation.</param>
     /// <returns>Provider invoice metadata; settlement still requires official inquiry.</returns>
-    /// <remarks>The caller records creation failure/ambiguity on the existing attempt; neither an exception nor a Telegram retry authorizes another create.</remarks>
+    /// <remarks>Tenant first POST freshly evaluates the exact owner's funding, overriding saved provider opt-outs only during underfunding.
+    /// The caller records failure/ambiguity on the existing attempt; no exception or Telegram retry authorizes another create.</remarks>
+    /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels admission or provider I/O.</exception>
+    /// <example><code>var invoice = await charges.CreateAtlasPayAsync(payment, token);</code></example>
     public async Task<AtlasPayCreateOrderResponse> CreateAtlasPayAsync(AtlasPayPaymentInfo payment, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.AtlasPay, payment.BaseAmountToman, token);
@@ -77,7 +95,11 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="cancelUrl">Customer cancellation return URL for this originating bot.</param>
     /// <param name="token">Cancellation of revalidation, canonical rate read and non-retried provider request.</param>
     /// <returns>Invoice data, including the canonical rate evidence for persistence by the caller.</returns>
-    /// <remarks>The existing transport converts toman using its canonical quote. Invoice creation is not payment proof and remains outside SQLite transactions.</remarks>
+    /// <remarks>Tenant first POST freshly evaluates exact-owner funding; underfunding ignores saved provider opt-outs.
+    /// The canonical toman conversion, non-retried transport and issued-invoice settlement remain unchanged; creation is outside SQLite transactions.</remarks>
+    /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels admission, canonical rate lookup or provider I/O.</exception>
+    /// <example><code>var invoice = await charges.CreateNowPaymentsAsync(payment, currency, successUrl, cancelUrl, token);</code></example>
     public async Task<NowPaymentsInvoiceResponse> CreateNowPaymentsAsync(SwapinoPaymentInfo payment, string currency, string successUrl, string cancelUrl, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.NowPayments, payment.AmountToman, token);
@@ -93,26 +115,40 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="amount">Positive wallet credit amount in toman.</param>
     /// <param name="token">Cancellation of fresh permission reads.</param>
     /// <returns>A task completing only when creation remains permitted.</returns>
-    /// <exception cref="InvalidOperationException">Saved intent, gateway, amount or exact-store approval is invalid.</exception>
+    /// <remarks>Tenant origin always requires both scoped policies. Owned origin never enters tenant admission and may omit them.
+    /// Reads do not transfer website funds or mutate owner wallets; previously issued invoices settle outside this admission guard.</remarks>
+    /// <exception cref="InvalidOperationException">Saved intent, gateway, amount, exact-store approval or owner funding admission is invalid.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels approval or funding reads.</exception>
+    /// <example><code>await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, gateway, amountToman, token);</code></example>
     private async Task ValidateCreationAsync(int id, string purpose, string botId, string botType, PaymentGateway gateway, long amount, CancellationToken token)
     {
         if (id <= 0 || purpose != TenantBotPaymentPurposes.WalletCharge || !availability.Snapshot.IsEnabled(gateway)
             || !IsValidAmount(gateway, amount, config)) throw new InvalidOperationException("Wallet charge admission is invalid.");
         if (botType == BotInstanceTypes.Tenant)
         {
-            if (policy == null || !IsAvailable(gateway, await policy.RequireAsync(botId, token)))
+            if (policy == null || fundingAccess == null)
+                throw new InvalidOperationException("Tenant wallet admission is unavailable.");
+            var store = await policy.RequireAsync(botId, token);
+            var funding = store.OwnerTelegramUserId.HasValue
+                ? await fundingAccess.EvaluateFundingSnapshotAsync(store.OwnerTelegramUserId.Value, token)
+                : null;
+            if (!IsAvailable(gateway, store, funding))
                 throw new InvalidOperationException("Tenant wallet admission was revoked.");
         }
         else if (botType != BotInstanceTypes.Owned) throw new InvalidOperationException("Unknown wallet charge origin.");
     }
 
-    /// <summary>Checks global and per-store gateway availability, excluding personal card payments.</summary>
+    /// <summary>Checks central wallet-charge availability for an approved store in its current owner financial mode.</summary>
     /// <param name="gateway">One of the supported central automatic payment gateways.</param>
-    /// <param name="store">Fresh approved storefront snapshot.</param>
-    /// <returns>True only when the central switch and this store's switch both permit invoice creation.</returns>
-    public bool IsAvailable(PaymentGateway gateway, BotInstance store)
+    /// <param name="store">Fresh approved storefront snapshot with persisted exact-owner identity.</param>
+    /// <param name="funding">Required read-only snapshot for that exact owner; null or owner restrictions fail closed.</param>
+    /// <returns>True only for approved stores and live central providers, also requiring the saved preference when funding is eligible.</returns>
+    /// <remarks>Insufficient funding overrides tenant provider opt-outs, never central disablement. Personal cards are excluded.
+    /// A menu snapshot cannot authorize POST; creation freshly evaluates funding again.</remarks>
+    /// <example><code>charges.IsAvailable(gateway, store, funding);</code></example>
+    public bool IsAvailable(PaymentGateway gateway, BotInstance store, TenantAccessEvaluation funding)
         => TenantCustomerWalletPolicy.IsApproved(store) &&
-           TenantPaymentGatewayPolicy.IsEnabled(store, gateway, availability.Snapshot);
+           TenantPaymentGatewayPolicy.IsEnabled(store, gateway, availability.Snapshot, funding);
 
     /// <summary>Validates the authoritative toman amount using the same provider policies as owned wallet charging.</summary>
     /// <param name="gateway">Supported central payment gateway.</param>
@@ -137,14 +173,20 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="gateway">Explicit central gateway chosen by this customer.</param>
     /// <param name="token">Cancellation of database and external calls; provider calls never run inside a transaction.</param>
     /// <returns>A customer invoice link and ownership-checked inquiry callback.</returns>
-    /// <exception cref="InvalidOperationException">Approval, gateway or amount is invalid.</exception>
+    /// <exception cref="InvalidOperationException">Approval, owner identity, funding evaluator, gateway or amount is invalid.</exception>
     /// <remarks>The row commits before the non-retried provider create. Uncertain creation must never be automatically repeated.
-    /// PaymentPurpose always remains wallet_charge; legitimate settlement continues after approval is revoked.</remarks>
+    /// Required read-only owner funding is refreshed at admission and again before POST. Insufficient funding uses only live central providers regardless of tenant opt-outs.
+    /// PaymentPurpose always remains wallet_charge; legitimate settlement continues after approval or funding changes.</remarks>
     /// <example><code>var invoice = await charges.CreateTenantAsync(store.Id, sender.Id, chat.Id, amountToman, gateway, token);</code></example>
     public async Task<Invoice> CreateTenantAsync(string botId, long customerId, long chatId, long amount, PaymentGateway gateway, CancellationToken token)
     {
+        if (policy == null || fundingAccess == null)
+            throw new InvalidOperationException("Tenant wallet admission is unavailable.");
         var store = await policy.RequireAsync(botId, token);
-        if (!IsAvailable(gateway, store) || !IsValidAmount(gateway, amount, config))
+        var funding = store.OwnerTelegramUserId.HasValue
+            ? await fundingAccess.EvaluateFundingSnapshotAsync(store.OwnerTelegramUserId.Value, token)
+            : null;
+        if (!IsAvailable(gateway, store, funding) || !IsValidAmount(gateway, amount, config))
             throw new InvalidOperationException("Wallet charge gateway or amount is unavailable.");
         var returnUrl = $"https://t.me/{store.Username?.TrimStart('@')}?start=payment_success";
         const string notice = "فاکتور افزایش موجودی کیف پول سراسری ساخته شد. اعتبار فقط پس از تأیید رسمی درگاه افزوده می‌شود.";

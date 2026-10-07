@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using System.Reflection;
 using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
@@ -87,7 +88,7 @@ public sealed partial class ConcurrencyTests
         Assert.Empty(await verify.TenantBotLedgerEntries.ToListAsync());
         Assert.Empty(await verify.WalletLedgerEntries.ToListAsync());
         await using var wallets = databases.Credentials.CreateDbContext();
-        Assert.Empty(await wallets.Users.ToListAsync());
+        Assert.Equal(1_000_000, (await wallets.Users.SingleAsync(x => x.TelegramUserId == 711)).AccountBalance);
         Assert.Empty(await wallets.WalletOperations.ToListAsync());
     }
 
@@ -176,8 +177,12 @@ public sealed partial class ConcurrencyTests
     /// <param name="provider">Application services registered against that fixture.</param>
     /// <param name="service">Scoped storefront service used to resolve the real catalog price.</param>
     /// <param name="alreadyBound">True binds message 41 and selects a code before attempting its price-changing edit.</param>
-    /// <returns>Persisted storefront, server-resolved selection and detached open quote; no wallet, order or redemption is created.</returns>
-    /// <remarks>An unbound quote models an existing legacy Pay/PAY* preview. Wallet permission is real, so stale wallet rejection cannot pass merely because wallet access is disabled.</remarks>
+    /// <returns>Persisted storefront, server-resolved selection and detached open quote; no wallet operation, order or redemption is created.</returns>
+    /// <remarks>
+    /// Seeds the exact stored owner with a positive bot-wallet balance so personal-card admission is genuinely eligible.
+    /// An unbound quote models an existing legacy Pay/PAY* preview. Wallet permission is real, so stale wallet rejection
+    /// cannot pass merely because wallet access is disabled. Delivery failures must leave the seeded owner balance unchanged.
+    /// </remarks>
     /// <example><code>var (tenant, selection, quote) = await PreparePurchaseDeliveryQuoteAsync(databases, provider, service, true);</code></example>
     private static async Task<(BotInstance Tenant, XuiV3PurchaseSelection Selection, TenantDiscountQuote Quote)>
         PreparePurchaseDeliveryQuoteAsync(Databases databases, ServiceProvider provider, TenantBotService service, bool alreadyBound)
@@ -195,6 +200,12 @@ public sealed partial class ConcurrencyTests
         {
             db.BotInstances.Add(tenant);
             await db.SaveChangesAsync();
+        }
+        // Seed an eligible owner without a wallet operation: these scenarios isolate quote delivery and payment admission.
+        await using (var credentials = databases.Credentials.CreateDbContext())
+        {
+            credentials.Users.Add(new CredUser { TelegramUserId = 711, AccountBalance = 1_000_000 });
+            await credentials.SaveChangesAsync();
         }
         var selection = new XuiV3PurchaseSelection { ServiceKey = "normal", TrafficGb = 50, DurationKey = "m1", AccountCount = 1 };
         var key = (string)typeof(TenantBotService).GetMethod("BUILDPAYACTION", BindingFlags.Static | BindingFlags.NonPublic)!
@@ -294,4 +305,36 @@ public sealed partial class ConcurrencyTests
                 : response;
         }
     }
+
+    /// <summary>
+    /// Builds a tenant-storefront configuration that has every gateway both enabled and fully configured.
+    /// </summary>
+    /// <param name="databases">Fixture owning the temporary users.db and credentials.db paths.</param>
+    /// <param name="xuiUrl">Loopback XUI base URL used only so startup validation succeeds.</param>
+    /// <returns>
+    /// The standard AtlasPay tenant test configuration with the five gateway switches turned on and the minimum
+    /// credentials each readiness check requires. Only placeholder secrets are used; no live provider is contacted.
+    /// </returns>
+    /// <remarks>
+    /// Placeholder credentials satisfy the live UniquePay and AtlasPay readiness checks. The remaining global provider
+    /// switches are enabled explicitly so quote admission cannot pass by silently removing an otherwise valid method.
+    /// </remarks>
+    /// <example><code>var configuration = RialGatewayLabelConfiguration(databases, "http://127.0.0.1:59999/");</code></example>
+    private static IConfiguration RialGatewayLabelConfiguration(Databases databases, string xuiUrl)
+        => new ConfigurationBuilder()
+            .AddConfiguration(AtlasTenantConfiguration(databases, xuiUrl))
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["hooshPayEnabled"] = "true",
+                ["hooshPayApiKey"] = "test-only-hooshpay-key",
+                ["hooshPayIpnSecretKey"] = "test-only-hooshpay-ipn",
+                ["tetraminatorEnabled"] = "true",
+                ["tetraminatorApiKey"] = "test-only-tetraminator-key",
+                ["uniquePayEnabled"] = "true",
+                ["uniquePayBusinessToken"] = "test-only-uniquepay-token",
+                ["nowPaymentsEnabled"] = "true",
+                ["nowPaymentApiKey"] = "test-only-nowpayments-key",
+                ["ipnSecretKey"] = "test-only-nowpayments-ipn"
+            })
+            .Build();
 }

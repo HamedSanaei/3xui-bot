@@ -13,6 +13,9 @@ using Xunit;
 
 public sealed partial class ConcurrencyTests
 {
+    /// <summary>Financial eligibility follows either wallet independently while underfunding still allows navigation.</summary>
+    /// <returns>A task completing after allowed observations produce no underfunding alert.</returns>
+    /// <remarks>Negative bot debt does not defeat an eligible site wallet; unusable website funds never satisfy the rule.</remarks>
     [Fact]
     public async Task Funding_decision_reuses_existing_or_policy_with_dynamic_minimum()
     {
@@ -26,9 +29,15 @@ public sealed partial class ConcurrencyTests
 
         Assert.Equal(TenantAccessDecision.Allowed, access.ClassifyFundingSnapshot(1, false, null).Decision);
         Assert.Equal(TenantAccessDecision.Allowed, access.ClassifyFundingSnapshot(0, true, 350_000).Decision);
+        Assert.Equal(TenantAccessDecision.Allowed, access.ClassifyFundingSnapshot(-1, true, 350_000).Decision);
         Assert.Equal(TenantAccessDecision.InsufficientFunding, access.ClassifyFundingSnapshot(0, true, 349_999).Decision);
         Assert.Equal(TenantAccessDecision.InsufficientFunding, access.ClassifyFundingSnapshot(0, false, null).Decision);
         Assert.Equal(350_000, access.ClassifyFundingSnapshot(0, true, 349_999).MinimumSiteWalletToman);
+        var underfunded = access.ClassifyFundingSnapshot(-1, true, 349_999);
+        Assert.True(underfunded.IsAllowed);
+        Assert.True(underfunded.RequiresPlatformPayments);
+        Assert.Null(underfunded.RestrictionMessage);
+        Assert.Equal(TenantAccessDecision.InsufficientFunding, access.ClassifyFundingSnapshot(0, false, 350_000).Decision);
 
         var alerts = FundingAlertService(databases, configuration);
         var tenant = FundingTenant("tenant-allowed-or-policy");
@@ -115,6 +124,9 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(2, (await db.TenantStorefrontFundingAlertStates.SingleAsync()).EpisodeNumber);
     }
 
+    /// <summary>Manual storefront restrictions and denied owners do not become financial fallback alerts.</summary>
+    /// <returns>A task completing after all denied observations leave the durable alert queue empty.</returns>
+    /// <remarks>Funding fallback remains accessible, but blocked and missing owner evaluations fail closed independently.</remarks>
     [Fact]
     public async Task Disabled_or_reset_tenant_and_nonfunding_denials_do_not_queue_low_balance_alert()
     {
@@ -124,6 +136,14 @@ public sealed partial class ConcurrencyTests
         var underfunded = FundingEvaluation(TenantAccessDecision.InsufficientFunding, 0, null, false, 200_000);
         var blocked = FundingEvaluation(TenantAccessDecision.OwnerBlocked, 0, null, false, 200_000);
         var missing = FundingEvaluation(TenantAccessDecision.OwnerMissing, 0, null, false, 200_000);
+        Assert.True(underfunded.IsAllowed);
+        Assert.True(underfunded.RequiresPlatformPayments);
+        Assert.False(blocked.IsAllowed);
+        Assert.False(blocked.RequiresPlatformPayments);
+        Assert.Equal(TenantAccessService.BlockedMessage, blocked.RestrictionMessage);
+        Assert.False(missing.IsAllowed);
+        Assert.False(missing.RequiresPlatformPayments);
+        Assert.NotNull(missing.RestrictionMessage);
         var disabled = FundingTenant("tenant-disabled-alert"); disabled.Enabled = false;
         var tokenless = FundingTenant("tenant-tokenless-alert"); tokenless.Token = null;
 
@@ -137,22 +157,6 @@ public sealed partial class ConcurrencyTests
 
         await using var verify = databases.Users.CreateDbContext();
         Assert.Empty(await verify.TenantStorefrontFundingAlerts.ToListAsync());
-    }
-
-    [Fact]
-    public void Funding_alert_message_uses_dynamic_minimum_and_unknown_site_balance()
-    {
-        var alert = new TenantStorefrontFundingAlert
-        {
-            TenantBotId = "tenant-message", TenantBotUsername = "store_bot", OwnerTelegramUserId = 711,
-            Kind = TenantStorefrontFundingAlertKinds.UnderfundedTransition,
-            BotBalanceToman = -10_000, SiteWalletToman = null, MinimumSiteWalletToman = 350_000
-        };
-        var text = TenantStorefrontFundingAlertDeliveryService.BuildMessage(alert);
-        Assert.Contains(350_000L.FormatCurrency(), text);
-        Assert.Contains("نامشخص / در دسترس نیست", text);
-        Assert.Contains("@store_bot", text);
-        Assert.DoesNotContain(200_000L.FormatCurrency(), text);
     }
 
     [Theory]
@@ -186,14 +190,18 @@ public sealed partial class ConcurrencyTests
         }
     }
 
+    /// <summary>An underfunded customer can open the configured storefront home while its owner receives a financial alert.</summary>
+    /// <returns>A task completing real customer navigation and inspecting the durable customer-attempt notification.</returns>
+    /// <remarks>The scheduled monitor being disabled does not suppress interaction-driven alerts or customer access.</remarks>
     [Fact]
-    public async Task Monitor_disabled_customer_underfunded_storefront_queues_one_immediate_customer_alert()
+    public async Task Monitor_disabled_underfunded_customer_opens_home_and_queues_one_immediate_customer_alert()
     {
         using var databases = new Databases();
         var (provider, registry, clients) = IncidentProvider(databases, fundingMonitorEnabled: false);
         await using (provider)
         {
             var tenant = FundingTenant("tenant-customer-lane");
+            tenant.TenantWelcomeText = "customer-home-" + Guid.NewGuid().ToString("N");
             await using (var db = databases.Users.CreateDbContext()) { db.BotInstances.Add(tenant); await db.SaveChangesAsync(); }
             registry.Upsert(tenant);
             await using var scope = provider.CreateAsyncScope();
@@ -204,14 +212,16 @@ public sealed partial class ConcurrencyTests
             var clientProvider = scope.ServiceProvider.GetRequiredService<BotClientProvider>();
             var botClient = clientProvider.GetClient(tenant.Id);
             var accessor = scope.ServiceProvider.GetRequiredService<BotContextAccessor>();
+            var update = Update(98001, 722);
+            update.Message!.Text = "/start";
             using (accessor.Push(new BotRuntimeContext { Config = registry.GetById(tenant.Id), Client = botClient }))
             {
                 var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
-                var handled = await service.TryHandleTenantUpdateAsync(botClient, Update(98001, 722), customer, new User { Id = 722 }, default)
+                var handled = await service.TryHandleTenantUpdateAsync(botClient, update, customer, new User { Id = 722 }, default)
                     .WaitAsync(TimeSpan.FromSeconds(2));
                 Assert.True(handled);
             }
-            Assert.Contains(clients[tenant.Id].Texts, x => x.Contains(TenantAccessService.DebtMessage, StringComparison.Ordinal));
+            Assert.Contains(clients[tenant.Id].Texts, x => x.Contains(tenant.TenantWelcomeText, StringComparison.Ordinal));
             await using var verify = databases.Users.CreateDbContext();
             var alert = Assert.Single(await verify.TenantStorefrontFundingAlerts.ToListAsync());
             Assert.Equal(TenantStorefrontFundingAlertKinds.CustomerAttempt, alert.Kind);
@@ -241,6 +251,9 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(1, await delivery.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
+    /// <summary>A delayed owner notification transport never blocks an underfunded customer's storefront navigation.</summary>
+    /// <returns>A task completing real customer navigation before releasing the blocked durable-alert sender.</returns>
+    /// <remarks>Customer access and attempt alerts coexist in financial fallback; owner delivery remains out of the customer handler lane.</remarks>
     [Fact]
     public async Task Blocked_owner_transport_does_not_hold_real_customer_handler_lane()
     {
@@ -249,6 +262,7 @@ public sealed partial class ConcurrencyTests
         await using (provider)
         {
             var tenant = FundingTenant("tenant-real-blocked-lane");
+            tenant.TenantWelcomeText = "customer-home-" + Guid.NewGuid().ToString("N");
             await using (var db = databases.Users.CreateDbContext()) { db.BotInstances.Add(tenant); await db.SaveChangesAsync(); }
             registry.Upsert(tenant);
             await using var scope = provider.CreateAsyncScope();
@@ -264,15 +278,17 @@ public sealed partial class ConcurrencyTests
             await sender.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             var botClient = scope.ServiceProvider.GetRequiredService<BotClientProvider>().GetClient(tenant.Id);
             var accessor = scope.ServiceProvider.GetRequiredService<BotContextAccessor>();
+            var update = Update(98002, 722);
+            update.Message!.Text = "/start";
             using (accessor.Push(new BotRuntimeContext { Config = registry.GetById(tenant.Id), Client = botClient }))
             {
                 var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
-                var handled = await service.TryHandleTenantUpdateAsync(botClient, Update(98002, 722), customer, new User { Id = 722 }, default)
+                var handled = await service.TryHandleTenantUpdateAsync(botClient, update, customer, new User { Id = 722 }, default)
                     .WaitAsync(TimeSpan.FromSeconds(2));
                 Assert.True(handled);
             }
             Assert.False(delivery.IsCompleted);
-            Assert.Contains(clients[tenant.Id].Texts, x => x.Contains(TenantAccessService.DebtMessage, StringComparison.Ordinal));
+            Assert.Contains(clients[tenant.Id].Texts, x => x.Contains(tenant.TenantWelcomeText, StringComparison.Ordinal));
             await using (var verify = databases.Users.CreateDbContext())
                 Assert.Equal(1, await verify.TenantStorefrontFundingAlerts.CountAsync(x => x.Kind == TenantStorefrontFundingAlertKinds.CustomerAttempt));
             sender.Release.TrySetResult();
@@ -298,7 +314,6 @@ public sealed partial class ConcurrencyTests
         var row = Assert.Single(await db.TenantStorefrontFundingAlerts.ToListAsync());
         Assert.Equal(TenantStorefrontFundingAlertKinds.CustomerAttempt, row.Kind);
         Assert.Equal(TenantStorefrontFundingAlertStatuses.Delivered, row.Status);
-        Assert.Contains("یک مشتری", TenantStorefrontFundingAlertDeliveryService.BuildMessage(row));
     }
 
     [Fact]
@@ -428,7 +443,6 @@ public sealed partial class ConcurrencyTests
     [Fact]
     public void Funding_alert_cooldown_configuration_is_positive_and_validated()
     {
-        Assert.Equal(15, new AppConfig().TenantUnderfundedCustomerAttemptNotificationCooldownMinutes);
         var validator = typeof(Program).GetMethod("ValidateTenantStorefrontConfiguration", BindingFlags.Static | BindingFlags.NonPublic)!;
         var thrown = Assert.Throws<TargetInvocationException>(() => validator.Invoke(null,
             new object[] { new AppConfig { TenantUnderfundedCustomerAttemptNotificationCooldownMinutes = 0 } }));

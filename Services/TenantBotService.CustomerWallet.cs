@@ -21,9 +21,13 @@ public partial class TenantBotService
     /// <param name="token">Cancellation of admission and the existing fulfillment saga.</param>
     /// <returns>True for wallet actions, including rejected stale actions.</returns>
     /// <remarks>Fresh persisted approval is mandatory. Callback data never supplies a trusted price or wallet owner.
+    /// Underfunded owners keep customer access and use the live owned-bot central gateway set, ignoring saved store
+    /// provider preferences. Personal-card top-ups require restored owner funding before a new receipt order is created.
     /// New order activation and first debit require the live global sale/renewal switch. Exact committed receipts bypass
-    /// admission and continue settlement/recovery even when the category or storefront approval later closes.
+    /// admission and continue settlement/recovery even when the category, owner funding, or storefront approval later closes.
     /// The wallet home displays only the customer's numeric Telegram id and current balance, retaining charge/history/back actions.</remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels approval, funding, state, or fulfillment work.</exception>
+    /// <example><code>if (await TryHandleCustomerWalletAsync(client, update, customer, state, token)) return;</code></example>
     private async Task<bool> TryHandleCustomerWalletAsync(ITelegramBotClient client, Update update, CredUser customer, User state, CancellationToken token)
     {
         var callback = update.CallbackQuery;
@@ -73,9 +77,10 @@ public partial class TenantBotService
             await _state.SaveUserStatus(new User { Id = actor, Flow = "tenant-wallet-charge", LastStep = "gateway",
                 ConfigLink = amount.ToString(System.Globalization.CultureInfo.InvariantCulture), SubLink = nonce });
             var gateways = new[] { PaymentGateway.HooshPay, PaymentGateway.Tetraminator, PaymentGateway.UniquePay, PaymentGateway.AtlasPay, PaymentGateway.NowPayments };
-            var rows = gateways.Where(g => charges.IsAvailable(g, store) && WalletChargeApplicationService.IsValidAmount(g, amount, _appConfig))
+            var funding = await GetTenantPaymentAccessAsync(store, token);
+            var rows = gateways.Where(g => charges.IsAvailable(g, store, funding) && WalletChargeApplicationService.IsValidAmount(g, amount, _appConfig))
                 .Select(g => new[] { InlineKeyboardButton.WithCallbackData(TenantPaymentProviderLabel(g.ToString()), $"TCW:g:{(int)g}:{nonce}") }).ToList();
-            if (TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store))
+            if (TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store, funding))
                 rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🧾 کارت‌به‌کارت به فروشگاه | ریالی", $"TCW:card:{nonce}") });
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت به کیف پول", "TCW:home") });
             await client.SendMessage(chat, $"مبلغ افزایش موجودی: {amount:N0} تومان\nیکی از روش‌های پرداخت فعال این فروشگاه را انتخاب کنید. درگاه‌های مرکزی پس از تایید، هم کیف پول شما و هم کیف پول مالک فروشگاه را شارژ می‌کنند؛ کارت‌به‌کارت شخصی فقط کیف پول شما را افزایش می‌دهد.",
@@ -88,7 +93,7 @@ public partial class TenantBotService
             if (parts.Length != 3 || state.Flow != "tenant-wallet-charge" || state.LastStep != "gateway" ||
                 state.SubLink != parts[2] || !long.TryParse(state.ConfigLink, out var amount))
             { await client.SendMessage(chat, "این درخواست منقضی شده است. کیف پول را دوباره باز کنید.", cancellationToken: token); return true; }
-            if (!TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store))
+            if (!TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store, await GetTenantPaymentAccessAsync(store, token)))
             { await client.SendMessage(chat, "کارت‌به‌کارت شخصی این فروشگاه در حال حاضر فعال نیست.", cancellationToken: token); return true; }
             await _state.ClearUserStatus(state);
             await CreateTenantWalletCardChargeAsync(client, store, customer, chat, amount, token);
@@ -209,7 +214,7 @@ public partial class TenantBotService
                     await client.SendMessage(chat, "تعرفه تغییر کرده است؛ خرید را دوباره آغاز کنید.", cancellationToken: token);
                     return true;
                 }
-                if (!PurchaseDiscountPaymentMethods(store, quote.NetToman).Any(x => x.Provider == "W"))
+                if (!PurchaseDiscountPaymentMethods(store, quote.NetToman, await GetTenantPaymentAccessAsync(store, token)).Any(x => x.Provider == "W"))
                 {
                     await client.SendMessage(chat, "پرداخت با کیف پول برای مبلغ این پیش‌فاکتور فعال نیست؛ پیش‌فاکتور تازه بگیرید.", cancellationToken: token);
                     return true;
@@ -357,11 +362,25 @@ public partial class TenantBotService
         await FULFILLPAIDTENANTORDERASYNC(order, "customer-wallet-recovery", null, null, false, token);
     }
 
-    /// <summary>Creates a manual personal-card wallet top-up bound to the current tenant and customer.</summary>
+    /// <summary>Creates a manual personal-card wallet top-up only while the exact store owner's funding permits it.</summary>
+    /// <param name="client">Required Telegram client for the current tenant; card details are sent only through this bot.</param>
+    /// <param name="store">Required persisted tenant snapshot; its global owner Telegram id selects the shared owner funding.</param>
+    /// <param name="customer">Required authenticated customer's global Telegram profile, never the store owner substituted for the sender.</param>
+    /// <param name="chatId">Telegram chat id of this customer's conversation in the current tenant bot.</param>
+    /// <param name="amountToman">Requested wallet credit in whole Iranian toman; must be greater than zero.</param>
+    /// <param name="token">Cancellation of the fresh funding read, order persistence, bot-scoped state and Telegram delivery.</param>
+    /// <returns>A task completing after the receipt order is saved and this store's card instructions are sent.</returns>
     /// <remarks>
+    /// Admission requires a positive owner bot wallet or a usable Gozargah wallet at the configured site threshold.
+    /// This read is financial-mode admission only: it never transfers owner funds or changes saved card preferences.
     /// The owner receives the card transfer outside the platform. Approval credits only the customer's shared wallet;
     /// no owner mirror, XUI fulfillment, provisional account, base-cost debit, or referral side effect is allowed.
+    /// Already-issued receipt evidence remains settleable after owner funding falls; only new top-ups use this gate.
+    /// The receipt target is scoped by the current tenant bot plus customer Telegram id, not by the owner.
     /// </remarks>
+    /// <exception cref="InvalidOperationException">The amount is nonpositive, card configuration is absent, or fresh owner funding forbids personal-card payment.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels an admission read, persistence, or delivery operation.</exception>
+    /// <example><code>await CreateTenantWalletCardChargeAsync(client, store, customer, chatId, 100_000, token);</code></example>
     private async Task CreateTenantWalletCardChargeAsync(
         ITelegramBotClient client,
         BotInstance store,
@@ -370,7 +389,7 @@ public partial class TenantBotService
         long amountToman,
         CancellationToken token)
     {
-        if (amountToman <= 0 || !TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store))
+        if (amountToman <= 0 || !TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store, await GetTenantPaymentAccessAsync(store, token)))
             throw new InvalidOperationException("Tenant personal card wallet charge is unavailable.");
 
         var order = new TenantBotOrder

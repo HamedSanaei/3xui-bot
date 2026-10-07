@@ -28,12 +28,15 @@ namespace Adminbot.Domain
         /// </remarks>
         public int ColleagueDailyFreeTrialLimit { get; set; } = 3;
         /// <summary>
-        /// Minimum readable usable Gozargah website wallet balance, in Iranian toman, required to keep a tenant
-        /// storefront active when the owner has no positive local bot wallet.
+        /// Minimum readable usable Gozargah website wallet balance, in Iranian toman, that restores the tenant's
+        /// saved payment preferences when the shared owner has no positive bot wallet.
         /// </summary>
         /// <remarks>
-        /// Values below zero are rejected at startup because a negative threshold would silently allow every storefront
-        /// through the website-based debt gate. A missing configuration key keeps the documented default.
+        /// Financial eligibility remains owner bot balance &gt; 0 OR usable website balance at least this threshold;
+        /// neither side requires the other to be positive. Underfunded stores remain accessible with live central
+        /// owned-bot gateways, ignoring saved provider opt-outs and excluding new personal-card payments.
+        /// Values below zero are rejected at startup. A missing key keeps the 200000-toman default.
+        /// Automatic website-to-bot debt repayment and blocked/missing-owner restrictions remain unchanged.
         /// </remarks>
         public long TenantMinimumSiteWalletToman { get; set; } = 200_000;
         /// <summary>Persisted cooldown, in minutes, between owner alerts for customer attempts on an underfunded storefront.</summary>

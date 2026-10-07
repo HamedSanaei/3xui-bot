@@ -11,7 +11,7 @@ using Xunit;
 
 public sealed partial class ConcurrencyTests
 {
-    /// <summary>All central gateways persist tenant origin before I/O and recover exactly one customer credit after revocation.</summary>
+    /// <summary>All live central gateways override debt-mode tenant opt-outs and recover one customer/owner credit after revocation.</summary>
     /// <param name="gateway">One of the five supported central automatic providers.</param>
     /// <param name="providerKey">Stable key used by existing provider wallet receipts.</param>
     /// <returns>A task completing after fake HTTP creation and real two-database recovery checks.</returns>
@@ -26,6 +26,13 @@ public sealed partial class ConcurrencyTests
         using var databases = new Databases();
         var (wallet, _, _) = await SeedCustomerWalletOrderAsync(databases);
         await wallet.AddEmptyUser(456);
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var store = await db.BotInstances.SingleAsync();
+            store.TenantHooshPayEnabled = store.TenantTetraminatorEnabled = store.TenantUniquePayEnabled =
+                store.TenantAtlasPayEnabled = store.TenantNowPaymentsEnabled = false;
+            await db.SaveChangesAsync();
+        }
         var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["hooshPayApiKey"] = "test-only", ["hooshPayBaseUrl"] = "https://hoosh.example/", ["hooshPayIpnUrl"] = "https://merchant.example/hp",
@@ -68,6 +75,7 @@ public sealed partial class ConcurrencyTests
         var policy = new TenantCustomerWalletPolicy(databases.Users, config.Get<AppConfig>()!, NullLogger<TenantCustomerWalletPolicy>.Instance);
         var workflow = new UserWorkflowStore(databases.Users);
         var charges = new WalletChargeApplicationService(workflow, config.Get<AppConfig>()!, availability, policy,
+            TenantWalletFundingAccess(databases, config),
             new HooshPay(config, Client()), new Tetraminator(config, Client()), new UniquePay(config, Client()),
             new AtlasPay(config, Client()), new NowPayments(config, Client(), new TenantWalletQuote()));
         var invoice = await charges.CreateTenantAsync("tenant-a", 123, 123, 100000, gateway, default);
@@ -121,7 +129,8 @@ public sealed partial class ConcurrencyTests
     public async Task TenantCustomerWallet_AtlasPay_400_persists_provider_reason_without_retry()
     {
         using var databases = new Databases();
-        await SeedCustomerWalletOrderAsync(databases);
+        var (wallet, _, _) = await SeedCustomerWalletOrderAsync(databases);
+        await wallet.AddEmptyUser(456);
         var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["atlasPayApiKey"] = "test-only",
@@ -144,6 +153,7 @@ public sealed partial class ConcurrencyTests
             config.Get<AppConfig>()!,
             availability,
             policy,
+            TenantWalletFundingAccess(databases, config),
             new HooshPay(config, Client()),
             new Tetraminator(config, Client()),
             new UniquePay(config, Client()),
@@ -227,7 +237,7 @@ public sealed partial class ConcurrencyTests
             x.IdempotencyKey == mirrorKey && x.Reason == WalletLedgerReasons.TenantWalletTopUpMirror));
     }
 
-    /// <summary>Personal-card approval sends a combined receipt-backed customer notice without mirroring owner funds or creating an account.</summary>
+    /// <summary>Actual personal-card receipt evidence stays approvable in owner debt, crediting only the customer once without creating an account.</summary>
     /// <returns>A task completing after two production approvals and captured Telegram delivery with real SQLite financial checks.</returns>
     /// <remarks>Checks the first delivered confirmation and financial replay invariants without changing the existing personal-card notification replay behavior.</remarks>
     [Fact]
@@ -305,6 +315,7 @@ public sealed partial class ConcurrencyTests
             orderId = order.Id;
         }
         registry.Upsert(store);
+        await wallet.MutateWalletAsync(456, -140_000, "fixture:card-owner-existing-receipt-debt");
 
         await using var scope = provider.CreateAsyncScope();
         var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
@@ -314,7 +325,7 @@ public sealed partial class ConcurrencyTests
         AssertCombinedWalletChargeNotice(text);
         await service.APPROVEMANUALRECEIPTASYNC(receiptId, 456, default);
         Assert.Equal(110_000, await wallet.GetAccountBalance(123));
-        Assert.Equal(70_000, await wallet.GetAccountBalance(456));
+        Assert.Equal(-70_000, await wallet.GetAccountBalance(456));
 
         await using (var credentials = databases.Credentials.CreateDbContext())
         {
@@ -344,6 +355,108 @@ public sealed partial class ConcurrencyTests
             Assert.Empty(await verify.XuiV3CreationOperations.ToListAsync());
             Assert.Empty(await verify.XuiV3RenewalOperations.ToListAsync());
         }
+    }
+
+    /// <summary>All five persisted tenant wallet-charge transports freshly recheck owner recovery before their first provider POST.</summary>
+    /// <param name="gateway">Provider selected while underfunding overrode its saved storefront opt-out.</param>
+    /// <returns>A task after funded-mode admission rejection proves no external request or financial mutation occurred.</returns>
+    /// <remarks>Staging durable intent or passing a prior menu snapshot never bypasses the current saved preference after recovery.</remarks>
+    [Theory]
+    [InlineData(PaymentGateway.HooshPay)]
+    [InlineData(PaymentGateway.Tetraminator)]
+    [InlineData(PaymentGateway.UniquePay)]
+    [InlineData(PaymentGateway.AtlasPay)]
+    [InlineData(PaymentGateway.NowPayments)]
+    public async Task TenantCustomerWallet_First_provider_POST_rechecks_funding_after_recovery(PaymentGateway gateway)
+    {
+        using var databases = new Databases();
+        var (wallet, _, _) = await SeedCustomerWalletOrderAsync(databases);
+        await wallet.AddEmptyUser(456);
+        await wallet.MutateWalletAsync(456, -1, "wallet-menu-owner-debt");
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var store = await db.BotInstances.SingleAsync();
+            store.TenantHooshPayEnabled = store.TenantTetraminatorEnabled = store.TenantUniquePayEnabled =
+                store.TenantAtlasPayEnabled = store.TenantNowPaymentsEnabled = false;
+            await db.SaveChangesAsync();
+        }
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        { ["tetraminatorMinimumAmountToman"] = "10000" }).Build();
+        var posts = 0;
+        var handler = new AtlasHttpHandler((_, _, _, _) =>
+        {
+            Interlocked.Increment(ref posts);
+            return Task.FromResult(JsonResponse(HttpStatusCode.InternalServerError, "{}"));
+        });
+        HttpClient Client() => new(handler, disposeHandler: false);
+        var availability = new GatewayAvailabilityProbe();
+        await availability.SetEnabledAsync(gateway, true, availability.Snapshot.Revision);
+        var access = TenantWalletFundingAccess(databases, configuration);
+        var workflow = new UserWorkflowStore(databases.Users);
+        var charges = new WalletChargeApplicationService(workflow, configuration.Get<AppConfig>()!, availability,
+            new TenantCustomerWalletPolicy(databases.Users, configuration.Get<AppConfig>()!, NullLogger<TenantCustomerWalletPolicy>.Instance),
+            access, new HooshPay(configuration, Client()), new Tetraminator(configuration, Client()),
+            new UniquePay(configuration, Client()), new AtlasPay(configuration, Client()),
+            new NowPayments(configuration, Client(), new TenantWalletQuote()));
+        await using (var db = databases.Users.CreateDbContext())
+            Assert.True(charges.IsAvailable(gateway, await db.BotInstances.SingleAsync(),
+                await access.EvaluateFundingSnapshotAsync(456, default)));
+        Func<Task> create;
+        switch (gateway)
+        {
+            case PaymentGateway.HooshPay:
+            {
+                var payment = HooshPayPaymentInfo.CreateWalletCharge(123, 100000, "https://merchant.example/hp", "https://merchant.example/return", 123);
+                payment.BotId = "tenant-a"; payment.WalletOriginBotType = BotInstanceTypes.Tenant;
+                workflow.Add(payment); create = () => charges.CreateHooshPayAsync(payment, default); break;
+            }
+            case PaymentGateway.Tetraminator:
+            {
+                var payment = TetraminatorPaymentInfo.CreateWalletCharge(123, 100000, "https://merchant.example/tm", 123);
+                payment.BotId = "tenant-a"; payment.WalletOriginBotType = BotInstanceTypes.Tenant;
+                workflow.Add(payment); create = () => charges.CreateTetraminatorAsync(payment, default); break;
+            }
+            case PaymentGateway.UniquePay:
+            {
+                var payment = UniquePayPaymentInfo.CreateWalletCharge(123, 123, 100000, 12);
+                payment.BotId = "tenant-a"; payment.WalletOriginBotType = BotInstanceTypes.Tenant;
+                workflow.Add(payment); create = () => charges.CreateUniquePayAsync(payment, "https://merchant.example/return", "https://merchant.example/up", default); break;
+            }
+            case PaymentGateway.AtlasPay:
+            {
+                var payment = AtlasPayPaymentInfo.CreateWalletCharge(123, 123, 100000);
+                payment.BotId = "tenant-a"; payment.WalletOriginBotType = BotInstanceTypes.Tenant;
+                payment.BeginCreationAttempt(DateTime.UtcNow);
+                workflow.Add(payment); create = () => charges.CreateAtlasPayAsync(payment, default); break;
+            }
+            default:
+            {
+                var payment = SwapinoPaymentInfo.CreateCryptoCharge(123, 100000, "https://merchant.example/np", 123);
+                payment.BotId = "tenant-a"; payment.WalletOriginBotType = BotInstanceTypes.Tenant;
+                workflow.Add(payment); create = () => charges.CreateNowPaymentsAsync(payment, "usdtbsc", "https://merchant.example/return", "https://merchant.example/cancel", default); break;
+            }
+        }
+        await workflow.SaveAsync();
+        await wallet.MutateWalletAsync(456, 2, "wallet-post-owner-recovery");
+        await Assert.ThrowsAsync<InvalidOperationException>(create);
+        Assert.Equal(0, posts);
+        Assert.Equal(1, await wallet.GetAccountBalance(456));
+        Assert.Equal(500000, await wallet.GetAccountBalance(123));
+    }
+
+    /// <summary>Builds the production read-only owner evaluator for isolated wallet-charge fixtures.</summary>
+    /// <param name="databases">Disposable users/credentials SQLite factories, never production paths.</param>
+    /// <param name="configuration">Fixture provider configuration; site-wallet access stays disabled unless explicitly configured.</param>
+    /// <returns>A fresh owner evaluator using the existing OR rule without wallet mutations.</returns>
+    /// <remarks>Missing owners fail closed. Underfunded existing owners use live central gateways irrespective of tenant preferences.</remarks>
+    /// <example><code>var access = TenantWalletFundingAccess(databases, configuration);</code></example>
+    private static TenantAccessService TenantWalletFundingAccess(Databases databases, IConfiguration configuration)
+    {
+        var credentials = new CredentialsStore(databases.Credentials);
+        var site = new GozargahSiteSyncService(databases.Users, credentials,
+            new GozargahSiteApiClient(configuration, NullLogger<GozargahSiteApiClient>.Instance),
+            configuration, NullLogger<GozargahSiteSyncService>.Instance);
+        return new TenantAccessService(databases.Users, credentials, site, configuration, NullLogger<TenantAccessService>.Instance);
     }
 
     /// <summary>Supplies a deterministic canonical IRT exchange rate without contacting a live pricing service.</summary>

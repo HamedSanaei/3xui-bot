@@ -136,7 +136,8 @@ public sealed partial class ConcurrencyTests
     /// <returns>A task after real owner/customer handlers and isolated persisted financial state are checked.</returns>
     /// <remarks>
     /// Regression: management disablement must not reject owner saves or be bypassed by a saved preference or old button.
-    /// Re-enabling management restores customer visibility without another owner edit; sibling stores remain unchanged.
+    /// Re-enabling management restores funded customer visibility without another owner edit. Debt ignores saved opt-outs,
+    /// stale personal-card callbacks create nothing, and owner recovery restores unchanged saved preferences.
     /// </remarks>
     [Theory]
     [InlineData(PaymentGateway.HooshPay, "HP")]
@@ -177,6 +178,7 @@ public sealed partial class ConcurrencyTests
         var wallet = provider.GetRequiredService<CredentialsStore>();
         await wallet.SaveUserStatus(owner);
         await wallet.MutateWalletAsync(711, 500000, "gateway-preference-owner-access");
+        var funded = await provider.GetRequiredService<TenantAccessService>().EvaluateFundingSnapshotAsync(711, default);
         var state = provider.GetRequiredService<UserStateStore>();
         var ownerClient = new StorefrontClient();
         var context = provider.GetRequiredService<BotContextAccessor>();
@@ -188,8 +190,8 @@ public sealed partial class ConcurrencyTests
             a = (await stores.ListAsync(711))[0];
             // A fully enabled platform snapshot isolates which persisted storefront switch was changed.
             var globallyEnabled = new PaymentGatewayAvailabilitySnapshot(true, true, true, true, true, 1);
-            Assert.True(TenantPaymentGatewayPolicy.IsEnabled(a, gateway, globallyEnabled));
-            Assert.False(TenantPaymentGatewayPolicy.IsEnabled(a, gateway, availability.Snapshot));
+            Assert.True(TenantPaymentGatewayPolicy.IsEnabled(a, gateway, globallyEnabled, funded));
+            Assert.False(TenantPaymentGatewayPolicy.IsEnabled(a, gateway, availability.Snapshot, funded));
             var savedRevision = a.UpdatedAtUtc;
             await OwnerCallback(provider, ownerClient, owner, enable);
             await OwnerCallback(provider, ownerClient, owner, TenantOwnerCallback.Encode(a, "panel"));
@@ -206,9 +208,9 @@ public sealed partial class ConcurrencyTests
                 TenantOwnerCallback.Encode(a, $"set-setting:{gateway}:0"));
             var persisted = await stores.ListAsync(711);
             Assert.Equal(savedRevision, persisted[0].UpdatedAtUtc);
-            Assert.True(TenantPaymentGatewayPolicy.IsEnabled(persisted[0], gateway, globallyEnabled));
+            Assert.True(TenantPaymentGatewayPolicy.IsEnabled(persisted[0], gateway, globallyEnabled, funded));
             Assert.All(Enum.GetValues<PaymentGateway>(), g =>
-                Assert.False(TenantPaymentGatewayPolicy.IsEnabled(persisted[1], g, globallyEnabled)));
+                Assert.False(TenantPaymentGatewayPolicy.IsEnabled(persisted[1], g, globallyEnabled, funded)));
         }
 
         var customerClient = new StorefrontClient();
@@ -242,7 +244,8 @@ public sealed partial class ConcurrencyTests
                 var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
                 var keyboard = (InlineKeyboardMarkup)typeof(TenantBotService).GetMethod(
                     "BuildTenantRenewPaymentProviderKeyboard", BindingFlags.Instance | BindingFlags.NonPublic)!
-                    .Invoke(service, new object[] { new TenantBotOrder { Id = 42, SalePriceToman = 100000 }, a })!;
+                    .Invoke(service, new object[] { new TenantBotOrder { Id = 42, SalePriceToman = 100000 }, a,
+                        await scope.ServiceProvider.GetRequiredService<TenantAccessService>().EvaluateFundingSnapshotAsync(711, default) })!;
                 Assert.Equal(visible, keyboard.InlineKeyboard.SelectMany(x => x).Any(x => x.CallbackData == $"TN:RN{method}:42"));
             }
             await RenderPaymentChoices();
@@ -268,7 +271,182 @@ public sealed partial class ConcurrencyTests
             Assert.Empty(await verify.AtlasPayPaymentInfos.ToListAsync());
             Assert.Empty(await verify.SwapinoPaymentInfos.ToListAsync());
             Assert.Equal(500000, await wallet.GetAccountBalance(711));
+
+            // Debt overrides saved opt-outs; recovery must immediately restore them without rewriting preferences.
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                var store = await db.BotInstances.SingleAsync(x => x.Id == a.Id);
+                store.TenantHooshPayEnabled = store.TenantTetraminatorEnabled = store.TenantUniquePayEnabled =
+                    store.TenantAtlasPayEnabled = store.TenantNowPaymentsEnabled = false;
+                store.TenantCardPaymentEnabled = true;
+                store.TenantCardNumber = "6037991234567890";
+                await db.SaveChangesAsync();
+            }
+            a = (await stores.ListAsync(711))[0];
+            await RenderPaymentChoices();
+            var stalePersonalCard = Assert.Single(customerClient.Callbacks, x => x.StartsWith("TN:PAYCARD:", StringComparison.Ordinal));
+            await wallet.MutateWalletAsync(711, -600000, "gateway-preference-owner-debt");
+            await availability.SetEnabledAsync(gateway, true, availability.Snapshot.Revision);
+            await RenderPaymentChoices();
+            Assert.Contains(customerClient.Callbacks, x => x.StartsWith($"TN:PAY{method}:", StringComparison.Ordinal));
+            Assert.Contains(customerClient.Callbacks, x => x.StartsWith($"TCW:g:{(int)gateway}:", StringComparison.Ordinal));
+            Assert.DoesNotContain(customerClient.Callbacks, x => x.StartsWith("TN:PAYCARD:", StringComparison.Ordinal) || x.StartsWith("TCW:card:", StringComparison.Ordinal));
+            await AssertRenewalVisibility(true);
+            await Press(Callback(stalePersonalCard));
+            Assert.Empty(await verify.TenantBotOrders.AsNoTracking().ToListAsync());
+            Assert.Equal(-100000, await wallet.GetAccountBalance(711));
+            await wallet.MutateWalletAsync(711, 100001, "gateway-preference-owner-recovery");
+            await RenderPaymentChoices();
+            Assert.DoesNotContain(customerClient.Callbacks, x => x.StartsWith($"TN:PAY{method}:", StringComparison.Ordinal));
+            Assert.DoesNotContain(customerClient.Callbacks, x => x.StartsWith($"TCW:g:{(int)gateway}:", StringComparison.Ordinal));
+            Assert.Contains(customerClient.Callbacks, x => x.StartsWith("TN:PAYCARD:", StringComparison.Ordinal));
+            await AssertRenewalVisibility(false);
+            var recovered = (await stores.ListAsync(711))[0];
+            Assert.False(TenantPaymentGatewayPolicy.IsEnabled(recovered, gateway, availability.Snapshot,
+                await provider.GetRequiredService<TenantAccessService>().EvaluateFundingSnapshotAsync(711, default)));
+            Assert.Equal(a.UpdatedAtUtc, recovered.UpdatedAtUtc);
         }
+    }
+
+    /// <summary>Message-bound manual purchase quotes use exactly the live central set in debt and resume saved card preferences after funding recovers.</summary>
+    /// <returns>A task after real quote rendering verifies provider choices and unchanged persisted switches across the funding transition.</returns>
+    /// <remarks>Exercises the consumer keyboard, not policy implementation or incidental customer wording.</remarks>
+    [Fact]
+    public async Task Store_manual_purchase_quote_uses_exact_live_gateway_set_during_debt()
+    {
+        using var databases = new Databases();
+        var availability = new GatewayAvailabilityProbe();
+        foreach (var gateway in Enum.GetValues<PaymentGateway>())
+            await availability.SetEnabledAsync(gateway, gateway is not (PaymentGateway.Tetraminator or PaymentGateway.NowPayments),
+                availability.Snapshot.Revision);
+        await using var provider = StorefrontProvider(databases, gatewayAvailability: availability);
+        var tenant = await provider.GetRequiredService<TenantStoreStore>().CreateAsync(711, Guid.NewGuid().ToString("N"));
+        tenant.Enabled = true;
+        tenant.TenantPricingMode = TenantPricingModes.Manual;
+        tenant.TenantNormalPricePerGbToman = 10000; tenant.TenantNormalPricePerDayToman = 1000;
+        tenant.TenantHooshPayEnabled = tenant.TenantTetraminatorEnabled = tenant.TenantUniquePayEnabled =
+            tenant.TenantAtlasPayEnabled = tenant.TenantNowPaymentsEnabled = false;
+        tenant.TenantCardPaymentEnabled = true; tenant.TenantCardNumber = "6037991234567890";
+        await using (var db = databases.Users.CreateDbContext()) { db.Update(tenant); await db.SaveChangesAsync(); }
+        var wallet = provider.GetRequiredService<CredentialsStore>();
+        await wallet.AddEmptyUser(711);
+        await wallet.MutateWalletAsync(711, -1, "quote-owner-debt");
+        var client = new StorefrontClient();
+        var selection = new XuiV3PurchaseSelection { ServiceKey = "normal", TrafficGb = 10, DurationKey = "m1", AccountCount = 1 };
+        async Task<string[]> RenderMethods()
+        {
+            client.Callbacks.Clear();
+            await using var scope = provider.CreateAsyncScope();
+            await (Task)typeof(TenantBotService).GetMethod("SHOWCUSTOMERCONFIRMASYNC", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(scope.ServiceProvider.GetRequiredService<TenantBotService>(),
+                    new object[] { client, new ChatId(912), 912L, null!, tenant, selection, CancellationToken.None })!;
+            return client.Callbacks.Where(x => x.StartsWith("TN:DQ:", StringComparison.Ordinal)).Select(x => x.Split(':')[3]).Order().ToArray();
+        }
+        Assert.Equal(new[] { "AP", "HP", "UP" }, await RenderMethods());
+        await wallet.MutateWalletAsync(711, 2, "quote-owner-recovery");
+        Assert.Equal(new[] { "CARD" }, await RenderMethods());
+        await using var verify = databases.Users.CreateDbContext();
+        var unchanged = await verify.BotInstances.SingleAsync();
+        Assert.All(Enum.GetValues<PaymentGateway>(), gateway => Assert.False(TenantPaymentGatewayPolicy.IsEnabled(unchanged,
+            gateway, new PaymentGatewayAvailabilitySnapshot(true, true, true, true, true, 1),
+            new TenantAccessEvaluation(TenantAccessDecision.Allowed, 1, null, false, 200000))));
+        Assert.True(unchanged.TenantCardPaymentEnabled);
+        Assert.Empty(await verify.TenantBotOrders.ToListAsync());
+        Assert.Equal(1, await wallet.GetAccountBalance(711));
+    }
+
+    /// <summary>Every direct first-invoice core rechecks recovered owner funding before admitting an opted-out provider.</summary>
+    /// <param name="gateway">Central provider whose live switch was available during the prior debt-mode menu.</param>
+    /// <param name="providerName">Canonical persisted provider of the already admitted unpaid order.</param>
+    /// <param name="coreName">Existing invoice boundary exercised through the production scoped service.</param>
+    /// <returns>A task after fresh funded-mode rejection leaves every payment table and the pending attempt untouched.</returns>
+    /// <remarks>Protects the insufficient-to-funded transition between selection and provider creation without relying on alert wording.</remarks>
+    [Theory]
+    [InlineData(PaymentGateway.HooshPay, "HooshPay", "CreateTenantHooshPayInvoiceCoreAsync")]
+    [InlineData(PaymentGateway.Tetraminator, "Tetraminator", "CreateTenantTetraminatorInvoiceCoreAsync")]
+    [InlineData(PaymentGateway.UniquePay, "UniquePay", "CreateTenantUniquePayInvoiceCoreAsync")]
+    [InlineData(PaymentGateway.AtlasPay, "atlaspay", "CreateTenantAtlasPayInvoiceCoreAsync")]
+    [InlineData(PaymentGateway.NowPayments, "NowPayments", "CreateTenantNowPaymentsInvoiceCoreAsync")]
+    public async Task Store_first_invoice_boundary_restores_opt_out_after_owner_recovery(
+        PaymentGateway gateway, string providerName, string coreName)
+    {
+        using var databases = new Databases();
+        var availability = new GatewayAvailabilityProbe();
+        await availability.SetEnabledAsync(gateway, true, availability.Snapshot.Revision);
+        await using var provider = StorefrontProvider(databases, gatewayAvailability: availability);
+        var tenant = await provider.GetRequiredService<TenantStoreStore>().CreateAsync(711, Guid.NewGuid().ToString("N"));
+        tenant.Enabled = true;
+        tenant.TenantHooshPayEnabled = tenant.TenantTetraminatorEnabled = tenant.TenantUniquePayEnabled =
+            tenant.TenantAtlasPayEnabled = tenant.TenantNowPaymentsEnabled = false;
+        var order = new TenantBotOrder
+        {
+            OrderId = "admitted-before-owner-recovery", TenantBotId = tenant.Id, OwnerTelegramUserId = 711,
+            CustomerTelegramUserId = 912, CustomerChatId = 912, SalePriceToman = 100000, ServiceKey = "normal",
+            PaymentProvider = providerName, PaymentStatus = TenantBotOrderStatuses.Pending, DiscountInvoiceAttemptState = "none"
+        };
+        await using (var db = databases.Users.CreateDbContext())
+        { db.Update(tenant); db.Add(order); await db.SaveChangesAsync(); }
+        var wallet = provider.GetRequiredService<CredentialsStore>();
+        await wallet.AddEmptyUser(711);
+        await wallet.MutateWalletAsync(711, -1, "invoice-menu-owner-debt");
+        var access = provider.GetRequiredService<TenantAccessService>();
+        Assert.True(TenantPaymentGatewayPolicy.IsEnabled(tenant, gateway, availability.Snapshot,
+            await access.EvaluateFundingSnapshotAsync(711, default)));
+        await wallet.MutateWalletAsync(711, 2, "invoice-admission-owner-recovery");
+        await using var scope = provider.CreateAsyncScope();
+        var callback = new CallbackQuery
+        {
+            Id = "recovered-owner-stale-invoice", From = new Telegram.Bot.Types.User { Id = 912 },
+            Message = new Message { Id = 1, Chat = new Chat { Id = 912 } }
+        };
+        await (Task)typeof(TenantBotService).GetMethod(coreName, BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(scope.ServiceProvider.GetRequiredService<TenantBotService>(), new object[]
+                { new StorefrontClient(), callback, tenant, new CredUser { TelegramUserId = 912 }, order, CancellationToken.None })!;
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Empty(await verify.HooshPayPaymentInfos.ToListAsync());
+        Assert.Empty(await verify.TetraminatorPaymentInfos.ToListAsync());
+        Assert.Empty(await verify.UniquePayPaymentInfos.ToListAsync());
+        Assert.Empty(await verify.AtlasPayPaymentInfos.ToListAsync());
+        Assert.Empty(await verify.SwapinoPaymentInfos.ToListAsync());
+        Assert.Equal("none", (await verify.TenantBotOrders.SingleAsync()).DiscountInvoiceAttemptState);
+        Assert.Equal(1, await wallet.GetAccountBalance(711));
+    }
+
+    /// <summary>A previously pending quoted personal-card route cannot expose fresh instructions after owner debt begins.</summary>
+    /// <returns>A task after the direct AwaitingReceipt replay is denied without changing the saved card preference or issuing work.</returns>
+    /// <remarks>AwaitingReceipt without actual submitted evidence is not paid recovery and cannot bypass funding admission.</remarks>
+    [Fact]
+    public async Task Store_stale_awaiting_receipt_instructions_do_not_admit_personal_card_in_debt()
+    {
+        using var databases = new Databases();
+        await using var provider = StorefrontProvider(databases);
+        var tenant = await provider.GetRequiredService<TenantStoreStore>().CreateAsync(711, Guid.NewGuid().ToString("N"));
+        tenant.Enabled = true; tenant.TenantCardPaymentEnabled = true; tenant.TenantCardNumber = "6037991234567890";
+        var order = new TenantBotOrder
+        {
+            OrderId = "unpaid-quoted-card-before-debt", TenantBotId = tenant.Id, OwnerTelegramUserId = 711,
+            CustomerTelegramUserId = 912, CustomerChatId = 912, SalePriceToman = 100000, ServiceKey = "normal",
+            PaymentProvider = "tenant_card", PaymentStatus = TenantBotOrderStatuses.AwaitingReceipt
+        };
+        await using (var db = databases.Users.CreateDbContext())
+        { db.Update(tenant); db.Add(order); await db.SaveChangesAsync(); }
+        var wallet = provider.GetRequiredService<CredentialsStore>();
+        await wallet.AddEmptyUser(711);
+        await wallet.MutateWalletAsync(711, -100000, "stale-card-owner-debt");
+        var client = new StorefrontClient();
+        var callback = new CallbackQuery
+        { Id = "stale-quoted-card", From = new Telegram.Bot.Types.User { Id = 912 }, Message = new Message { Id = 1, Chat = new Chat { Id = 912 } } };
+        await using var scope = provider.CreateAsyncScope();
+        await (Task)typeof(TenantBotService).GetMethod("SendTenantCardOrderInstructionsAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(scope.ServiceProvider.GetRequiredService<TenantBotService>(),
+                new object[] { client, callback, tenant, order, CancellationToken.None })!;
+        Assert.Empty(client.Texts);
+        Assert.NotEmpty(client.Answers);
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Empty(await verify.TenantManualPaymentReceipts.ToListAsync());
+        Assert.True((await verify.BotInstances.SingleAsync()).TenantCardPaymentEnabled);
+        Assert.Equal(TenantBotOrderStatuses.AwaitingReceipt, (await verify.TenantBotOrders.SingleAsync()).PaymentStatus);
+        Assert.Equal(-100000, await wallet.GetAccountBalance(711));
     }
 
     /// <summary>An admitted Tetraminator order without a started invoice must recheck live permission before creating a payment.</summary>
@@ -283,13 +461,17 @@ public sealed partial class ConcurrencyTests
         await using var provider = StorefrontProvider(databases, gatewayAvailability: availability);
         var tenant = await provider.GetRequiredService<TenantStoreStore>().CreateAsync(711, Guid.NewGuid().ToString("N"));
         tenant.TenantTetraminatorEnabled = true;
+        tenant.Enabled = true;
+        var ownerWallet = provider.GetRequiredService<CredentialsStore>();
+        await ownerWallet.AddEmptyUser(711);
+        await ownerWallet.MutateWalletAsync(711, 1, "disabled-provider-funded-owner");
         var order = new TenantBotOrder
         {
             OrderId = "admitted-before-global-disable", TenantBotId = tenant.Id, OwnerTelegramUserId = 711,
-            CustomerTelegramUserId = 912, SalePriceToman = 100000, PaymentProvider = "Tetraminator",
+            CustomerTelegramUserId = 912, SalePriceToman = 100000, ServiceKey = "normal", PaymentProvider = "Tetraminator",
             PaymentStatus = TenantBotOrderStatuses.Pending, DiscountInvoiceAttemptState = "none"
         };
-        await using (var db = databases.Users.CreateDbContext()) { db.Add(order); await db.SaveChangesAsync(); }
+        await using (var db = databases.Users.CreateDbContext()) { db.Update(tenant); db.Add(order); await db.SaveChangesAsync(); }
         await using var scope = provider.CreateAsyncScope();
         var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
         var callback = new CallbackQuery
@@ -488,18 +670,19 @@ public sealed partial class ConcurrencyTests
         await (Task)method.Invoke(service, new object[] { order, owner, debitBaseCost, "tenant-order", CancellationToken.None })!;
     }
 
-    /// <summary>Online gateway sales in two stores credit profit to one owner wallet once per order.</summary>
+    /// <summary>Online gateway sales in two stores reduce one shared owner's negative wallet debt once per order.</summary>
     /// <returns>A task completing after duplicate settlements and immutable receipt verification.</returns>
     [Fact]
     public async Task Two_store_gateway_profits_share_one_wallet_with_distinct_order_receipts()
     {
         using var databases = new Databases(); await using var provider = StorefrontProvider(databases);
         var wallet = provider.GetRequiredService<CredentialsStore>(); await wallet.AddEmptyUser(711);
+        await wallet.MutateWalletAsync(711, -500, "gateway-profit-existing-owner-debt");
         var a = new TenantBotOrder { Id = 801, OrderId = "gateway-a", TenantBotId = "tenant-711-1", OwnerTelegramUserId = 711, ProfitToman = 120, PaymentProvider = "hooshpay" };
         var b = new TenantBotOrder { Id = 802, OrderId = "gateway-b", TenantBotId = "tenant-711-2", OwnerTelegramUserId = 711, ProfitToman = 230, PaymentProvider = "hooshpay" };
         await Task.WhenAll(SettleStoreOrder(provider, a, false), SettleStoreOrder(provider, b, false));
         await Task.WhenAll(SettleStoreOrder(provider, a, false), SettleStoreOrder(provider, b, false));
-        Assert.Equal(350, await wallet.GetAccountBalance(711));
+        Assert.Equal(-150, await wallet.GetAccountBalance(711));
         Assert.Equal(120, (await wallet.GetWalletOperationAsync("tenant:801:profit")).AmountToman);
         Assert.Equal(230, (await wallet.GetWalletOperationAsync("tenant:802:profit")).AmountToman);
     }

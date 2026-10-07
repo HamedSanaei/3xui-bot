@@ -2,14 +2,17 @@ using Adminbot.Domain;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 
-/// <summary>Evaluates all storefronts against their shared owner's suspension and funding, with durable debt repayment.</summary>
-/// <remarks>One polling process. Website calls never run in SQLite transactions. Receiver configuration is not changed.</remarks>
+/// <summary>Evaluates the exact shared owner's restrictions and payment funding mode, preserving durable debt repayment.</summary>
+/// <remarks>
+/// All stores owned by the same Telegram user share funding; another owner's wallet is never consulted.
+/// Insufficient funding permits customer access through live central gateways but excludes new personal-card payments.
+/// Website calls never run in SQLite transactions. Automatic website-to-bot debt repayment and receiver configuration
+/// are unchanged; this service does not enforce the tenant's separate manual Enabled switch.
+/// </remarks>
 public sealed class TenantAccessService
 {
     /// <summary>Customer-facing suspension without a support identifier.</summary>
     public const string BlockedMessage = "ربات به علت تخلف مسدود است. به پشتیبانی پیام دهید.";
-    /// <summary>Customer-facing insufficient owner funding without a support identifier.</summary>
-    public const string DebtMessage = "ربات به علت بدهی غیرفعال است. به پشتیبانی پیام دهید.";
     private static readonly AsyncKeyedGate Owners = new();
     private readonly UserDbContextFactory _factory;
     private readonly CredentialsStore _credentials;
@@ -23,7 +26,7 @@ public sealed class TenantAccessService
     /// <param name="site">Website integration using owner-wide debit admission.</param>
     /// <param name="configuration">
     /// Runtime configuration bound from <c>Data/configuration.json</c>; supplies the configurable minimum site-wallet
-    /// threshold (<c>tenantMinimumSiteWalletToman</c>) used by the storefront access gate.
+    /// threshold (<c>tenantMinimumSiteWalletToman</c>) used to classify the storefront payment mode.
     /// </param>
     /// <param name="logger">Operational diagnostics containing operation ids, never credentials or payloads.</param>
     public TenantAccessService(UserDbContextFactory factory, CredentialsStore credentials, GozargahSiteSyncService site, IConfiguration configuration, ILogger<TenantAccessService> logger)
@@ -33,19 +36,35 @@ public sealed class TenantAccessService
         _logger = logger;
     }
 
-    /// <summary>Repays available debt and returns the current customer access restriction.</summary>
-    /// <param name="ownerId">Required storefront owner's Telegram id, never the customer's id.</param>
+    /// <summary>Preserves automatic website debt repayment and returns only a blocking owner-status restriction.</summary>
+    /// <param name="ownerId">Required exact stored storefront owner's global Telegram user id, never the customer's id.</param>
     /// <param name="token">Cancellation for owner admission, database operations and website calls.</param>
-    /// <returns>Null when allowed, otherwise the fixed violation or debt message.</returns>
+    /// <returns>Null for Allowed or InsufficientFunding; otherwise a fixed blocked-owner or unavailable message.</returns>
     /// <exception cref="OperationCanceledException">The execution is cancelled; any reserved transfer remains recoverable.</exception>
-    /// <remarks>Violation takes priority. Uncertain debits are not replayed. A positive local balance permits access;
-    /// otherwise a readable usable website balance at or above the configured minimum site-wallet threshold
-    /// (<see cref="AppConfig.TenantMinimumSiteWalletToman"/>, key <c>tenantMinimumSiteWalletToman</c>) is required.</remarks>
+    /// <remarks>
+    /// Owner blocking takes priority. Funding eligibility remains bot balance &gt; 0 OR usable website balance at
+    /// least <see cref="AppConfig.TenantMinimumSiteWalletToman"/>; neither side requires the other to be positive.
+    /// Falling below both conditions permits access but requires central payments. Negative bot debt is still repaid
+    /// from usable positive website funds up to the smaller of debt and website balance, with durable receipt-backed
+    /// local credit and no replay of uncertain debits. Check the tenant's manual Enabled switch separately.
+    /// </remarks>
     /// <example><code>var restriction = await access.EvaluateAsync(tenant.OwnerTelegramUserId.Value, token);</code></example>
     public async Task<string> EvaluateAsync(long ownerId, CancellationToken token)
         => (await EvaluateDecisionAsync(ownerId, token)).RestrictionMessage;
 
-    /// <summary>Runs the existing owner funding policy and exposes its exact denial reason plus safe balance snapshots.</summary>
+    /// <summary>Preserves owner debt repayment and returns owner restrictions or an accessible financial payment mode.</summary>
+    /// <param name="ownerId">Required exact stored tenant owner's global Telegram user id; never use a customer or another owner.</param>
+    /// <param name="token">Cancellation for owner serialization, database access, and website lookup or repayment.</param>
+    /// <returns>A non-null immutable owner-scoped evaluation; both funding modes allow access, but only Allowed retains saved payment preferences.</returns>
+    /// <remarks>
+    /// Serializes repayment per shared owner, recovers pending receipt-backed credits idempotently, and preserves the
+    /// existing website debit up to the smaller of negative bot debt and usable positive site funds. Uncertain debits
+    /// are never replayed. Funding remains bot balance &gt; 0 OR usable site balance at least the configured minimum,
+    /// including after repayment; insufficient funds classify central-payment fallback rather than suspension.
+    /// Missing or blocked owners fail closed before financial work. Manual tenant enablement remains a caller check.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">Owner admission, database access, or website work is cancelled; durable transfer recovery remains possible.</exception>
+    /// <example><code>var evaluation = await access.EvaluateDecisionAsync(tenant.OwnerTelegramUserId.Value, token);</code></example>
     public async Task<TenantAccessEvaluation> EvaluateDecisionAsync(long ownerId, CancellationToken token)
     {
         using var gate = await Owners.EnterAsync(ownerId.ToString(System.Globalization.CultureInfo.InvariantCulture), token);
@@ -113,19 +132,22 @@ public sealed class TenantAccessService
     }
 
     /// <summary>
-    /// Evaluates the same owner funding policy as <see cref="EvaluateDecisionAsync"/> without any financial side
-    /// effect, for read-only background monitoring of externally funded Gozargah wallets.
+    /// Evaluates owner restrictions and the existing OR funding rule without financial side effects, for fresh
+    /// payment admission and read-only background monitoring of externally funded Gozargah wallets.
     /// </summary>
-    /// <param name="ownerId">Required storefront owner's Telegram id, never the customer's id.</param>
+    /// <param name="ownerId">Required exact stored tenant owner's global Telegram user id, never the customer's or another owner's id.</param>
     /// <param name="token">Cancellation for the credential read and the optional website wallet lookup.</param>
     /// <returns>
-    /// The same <see cref="TenantAccessEvaluation"/> the access gate would produce, with safe balance snapshots.
+    /// A non-null owner-scoped snapshot; InsufficientFunding still permits access but requires central payments.
     /// </returns>
     /// <remarks>
     /// Read-only by construction: it never creates a <see cref="TenantDebtTransfer"/>, never debits the Gozargah
     /// site wallet, never repays debt, and never mutates wallets, orders, payments, or XUI state. A positive local
-    /// balance short-circuits before any website lookup, matching the production OR rule.
+    /// balance short-circuits before any website lookup. Otherwise only a usable site balance at least the configured
+    /// minimum restores saved payment preferences. An unavailable website provides no funding credit; neither mode
+    /// overrides missing or blocked owners or the caller's manual tenant Enabled check.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The credential or website lookup is cancelled.</exception>
     /// <example><code>var evaluation = await access.EvaluateFundingSnapshotAsync(tenant.OwnerTelegramUserId.Value, token);</code></example>
     public async Task<TenantAccessEvaluation> EvaluateFundingSnapshotAsync(long ownerId, CancellationToken token)
     {
@@ -140,7 +162,16 @@ public sealed class TenantAccessService
         return ClassifyFundingSnapshot(owner.AccountBalance, site.CanUse, site.CanUse ? (long?)site.WalletToman : null);
     }
 
-    /// <summary>Applies the single existing OR funding rule to already-observed balances without another website request.</summary>
+    /// <summary>Classifies observed funding using the unchanged OR rule, independently of customer access permission.</summary>
+    /// <param name="botBalanceToman">The exact tenant owner's shared bot balance in toman; zero and negative values do not satisfy local funding.</param>
+    /// <param name="siteWalletUsable">Whether this owner's observed website wallet is eligible for funding.</param>
+    /// <param name="siteWalletToman">Observed website balance in toman, or null when unavailable; ignored when unusable.</param>
+    /// <returns>Allowed for bot balance &gt; 0 OR usable site balance at least the configured minimum; otherwise accessible InsufficientFunding.</returns>
+    /// <remarks>
+    /// Pure classification with no website requests or wallet mutation. The caller must first exclude missing and
+    /// blocked owners and must not mix balances from different owners. Manual tenant enablement is checked elsewhere.
+    /// </remarks>
+    /// <example><code>var evaluation = access.ClassifyFundingSnapshot(owner.AccountBalance, site.CanUse, site.WalletToman);</code></example>
     internal TenantAccessEvaluation ClassifyFundingSnapshot(long botBalanceToman, bool siteWalletUsable, long? siteWalletToman)
     {
         var allowed = botBalanceToman > 0 ||
@@ -156,7 +187,7 @@ public sealed class TenantAccessService
     /// <param name="ownerId">Global owner Telegram id.</param>
     /// <param name="token">Execution cancellation, which is not swallowed.</param>
     /// <returns>Fresh eligibility or unavailable; only CanUse authorizes website funding.</returns>
-    /// <remarks>When the website is unavailable, access depends on the local wallet only.</remarks>
+    /// <remarks>Website unavailability leaves only the local wallet to satisfy financial eligibility; otherwise an unblocked owner uses central-payment fallback.</remarks>
     private async Task<GozargahSiteWalletEligibility> ReadSiteAsync(long ownerId, CancellationToken token)
     {
         try { return await _site.CheckSiteWalletEligibilityAsync(ownerId, 0, token); }

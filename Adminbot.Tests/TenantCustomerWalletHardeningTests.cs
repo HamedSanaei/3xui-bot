@@ -12,6 +12,8 @@ using Xunit;
 public sealed partial class ConcurrencyTests
 {
     /// <summary>Mandatory join gates every new tenant-wallet admission step but never becomes financial settlement policy.</summary>
+    /// <returns>A task after unjoined actions create no invoice and verified membership permits exactly one central invoice.</returns>
+    /// <remarks>The persisted store's exact owner is present and funded; financial admission must not conceal the membership transition.</remarks>
     [Fact]
     public async Task TenantCustomerWallet_MandatoryJoin_gates_new_wallet_admission_until_membership_is_verified()
     {
@@ -32,6 +34,8 @@ public sealed partial class ConcurrencyTests
         });        await using var provider = AtlasTenantProvider(
             databases, configuration, new AtlasPay(configuration, new HttpClient(atlasHandler)), out _, out _);
         var (wallet, _, _) = await SeedCustomerWalletOrderAsync(databases);
+        await wallet.AddEmptyUser(456);
+        await wallet.MutateWalletAsync(456, 1_000_000, "fixture:mandatory-join-owner");
         await using (var db = databases.Users.CreateDbContext())
         {
             var store = await db.BotInstances.SingleAsync();

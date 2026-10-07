@@ -117,7 +117,10 @@ public partial class TenantBotService
     /// <param name="user">Current bot-scoped conversation snapshot containing the pending quote id.</param>
     /// <param name="token">Cancellation of local state and Telegram work.</param>
     /// <returns>A task after displaying a validated quote or inviting a retry without reserving capacity.</returns>
-    /// <remarks>Restored discount input rechecks live global sale permission. An invalid code does not replace a previous displayed discount or create an order. Navigation is routed before this step by the caller.</remarks>
+    /// <remarks>Restored input rechecks live global sale permission and read-only exact-owner funding for payable methods.
+    /// Insufficient funding overrides provider opt-outs and excludes personal card. Invalid codes do not replace an existing discount or create an order.</remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels funding, quote validation, state, or Telegram delivery.</exception>
+    /// <example><code>await HandlePurchaseDiscountTextAsync(client, message, tenant, customer, state, token);</code></example>
     private async Task HandlePurchaseDiscountTextAsync(ITelegramBotClient botClient, Message message, BotInstance tenant,
         CredUser customer, User user, CancellationToken token)
     {
@@ -151,7 +154,7 @@ public partial class TenantBotService
             await botClient.SendMessage(message.Chat.Id, PurchaseDiscountError(resolved.Failure) + " کد دیگری وارد کنید یا از دکمه پیش‌فاکتور کد را حذف کنید.", cancellationToken: token);
             return;
         }
-        if (!HasPurchaseDiscountPaymentMethod(tenant, resolved.Value.Price.NetToman))
+        if (!HasPurchaseDiscountPaymentMethod(tenant, resolved.Value.Price.NetToman, await GetTenantPaymentAccessAsync(tenant, token)))
         {
             await botClient.SendMessage(message.Chat.Id,
                 $"کد <code>{Html(code)}</code> معتبر است اما مبلغ پس از تخفیف با هیچ روش پرداخت فعلی این فروشگاه قابل پرداخت نیست. کد دیگری وارد کنید یا از دکمه حذف کد روی پیش‌فاکتور استفاده کنید.",
@@ -218,20 +221,24 @@ public partial class TenantBotService
     /// <summary>Determines which currently enabled purchase payment buttons can accept the actual final net amount.</summary>
     /// <param name="tenant">Current tenant gateway preferences and customer-wallet approval.</param>
     /// <param name="netToman">Final discounted or undiscounted payable amount in whole toman.</param>
+    /// <param name="funding">Required exact-owner snapshot shared by all choices; insufficient funding uses live central gateways only.</param>
     /// <returns>Independent callback-code/caption pairs; an empty list means the customer cannot pay this quote.</returns>
-    /// <remarks>The eventual admission must recheck each gateway against the persisted net; this is only a preview.</remarks>
-    private List<(string Provider, string Caption)> PurchaseDiscountPaymentMethods(BotInstance tenant, long netToman)
+    /// <remarks>The eventual first invoice/card admission re-evaluates funding against the persisted net; this is a read-only preview.
+    /// Saved preferences remain unchanged. Blocked or missing owner evaluations never offer a payment route.</remarks>
+    /// <example><code>var methods = PurchaseDiscountPaymentMethods(tenant, quote.NetToman, funding);</code></example>
+    private List<(string Provider, string Caption)> PurchaseDiscountPaymentMethods(BotInstance tenant, long netToman, TenantAccessEvaluation funding)
     {
+        if (funding?.IsAllowed != true) return new List<(string, string)>();
         var methods = new List<(string, string)>();
         if (TenantCustomerWalletPolicy.IsApproved(tenant)) methods.Add(("W", "💰 کیف پول مشتری"));
-        if (IsTenantHooshPayAvailable(tenant, netToman)) methods.Add(("HP", "⚡ هوش‌پی آنی | کارمزد ۱۵٪ | ریالی"));
-        if (IsTenantTetraminatorAvailable(tenant, netToman)) methods.Add(("TM", "⚡ تترامیناتور آنی | کارمزد ۱۲٪ | ریالی"));
-        if (IsTenantUniquePayAvailable(tenant, netToman)) methods.Add(("UP", "⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی"));
-        if (IsTenantAtlasPayAvailable(tenant) && AtlasPay.IsSupportedBaseAmount(netToman))
+        if (IsTenantHooshPayAvailable(tenant, netToman, funding)) methods.Add(("HP", "⚡ هوش‌پی آنی | کارمزد ۱۵٪ | ریالی"));
+        if (IsTenantTetraminatorAvailable(tenant, netToman, funding)) methods.Add(("TM", "⚡ تترامیناتور آنی | کارمزد ۱۲٪ | ریالی"));
+        if (IsTenantUniquePayAvailable(tenant, netToman, funding)) methods.Add(("UP", "⚡ یونیک‌پی آنی | کارمزد ۱۲٪ | ریالی"));
+        if (IsTenantAtlasPayAvailable(tenant, funding) && AtlasPay.IsSupportedBaseAmount(netToman))
             methods.Add(("AP", "💳 اطلس‌پی | کارت‌به‌کارت آنی | کارمزد ۱۲٪ | ریالی"));
-        if (TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.NowPayments, _gatewayAvailability.Snapshot))
+        if (TenantPaymentGatewayPolicy.IsEnabled(tenant, PaymentGateway.NowPayments, _gatewayAvailability.Snapshot, funding))
             methods.Add(("NP", "⚡ ارز دیجیتال آنی | کارمزد ۰٪"));
-        if (TenantPaymentGatewayPolicy.IsPersonalCardEnabled(tenant))
+        if (TenantPaymentGatewayPolicy.IsPersonalCardEnabled(tenant, funding))
             methods.Add(("CARD", "🧾 کارت‌به‌کارت به فروشگاه | ریالی"));
         return methods;
     }
@@ -239,9 +246,12 @@ public partial class TenantBotService
     /// <summary>Checks if a valid discount can actually be purchased through any currently available net-priced method.</summary>
     /// <param name="tenant">Current storefront preferences.</param>
     /// <param name="netToman">Whole-toman payable amount after the actual capped discount.</param>
+    /// <param name="funding">Required exact-owner funding snapshot; null and owner restrictions fail closed.</param>
     /// <returns>True if at least one method is offered at this net amount.</returns>
-    private bool HasPurchaseDiscountPaymentMethod(BotInstance tenant, long netToman) =>
-        PurchaseDiscountPaymentMethods(tenant, netToman).Count != 0;
+    /// <remarks>Preview only; first payment admission requires another fresh funding evaluation.</remarks>
+    /// <example><code>HasPurchaseDiscountPaymentMethod(tenant, netToman, funding);</code></example>
+    private bool HasPurchaseDiscountPaymentMethod(BotInstance tenant, long netToman, TenantAccessEvaluation funding) =>
+        PurchaseDiscountPaymentMethods(tenant, netToman, funding).Count != 0;
 
     /// <summary>Renders the persisted quote and binds a newly delivered or Telegram-confirmed already-visible message.</summary>
     /// <param name="botClient">Required transport for the tenant bot that owns this quote and its Telegram message.</param>
@@ -260,6 +270,7 @@ public partial class TenantBotService
     /// foreground deadlines, transport cancellation without caller cancellation, 5xx and other uncertain failures
     /// tombstone the original message and expire the quote before propagating the original exception. No replacement
     /// is sent when Telegram may already have applied the edit, and neither DQ nor legacy PAY* buttons can admit it.
+    /// One fresh exact-owner funding snapshot drives all payment choices; debt mode overrides saved opt-outs and omits personal card.
     /// If delivery cannot be bound, the quote expires without admission. Explicit caller cancellation propagates unchanged.</remarks>
     /// <exception cref="OperationCanceledException">The caller cancels Telegram delivery or local quote binding, or transport cancellation has an uncertain edit outcome.</exception>
     /// <exception cref="TelegramForegroundDeliveryTimeoutException">The edit exceeded its foreground budget; the quote is retired without a replacement send.</exception>
@@ -293,7 +304,8 @@ public partial class TenantBotService
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🎟 ثبت کد تخفیف", CUSTOMERCALLBACKPREFIX + "DC:" + id36) });
         if (quote.CodeId.HasValue)
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("حذف کد تخفیف", CUSTOMERCALLBACKPREFIX + "DR:" + id36) });
-        foreach (var (provider, caption) in PurchaseDiscountPaymentMethods(tenant, quote.NetToman))
+        var funding = await GetTenantPaymentAccessAsync(tenant, token);
+        foreach (var (provider, caption) in PurchaseDiscountPaymentMethods(tenant, quote.NetToman, funding))
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData(caption, CUSTOMERCALLBACKPREFIX + "DQ:" + id36 + ":" + provider) });
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") });
         var keyboard = new InlineKeyboardMarkup(rows);

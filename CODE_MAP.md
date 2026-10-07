@@ -222,10 +222,10 @@
   than `GozargahSiteSyncRetentionDays` (30 default), retaining latest success/deletion state; unresolved rows never purge.
   No schema/index change; see `docs/gozargah-sync-retention.md` for audit and optional manual VACUUM guidance.
 
-- Owner access/debt: `TenantAccessService` gates every tenant message/callback before business actions, without stopping
-  receivers or changing manual Enabled. Owner IsBlocked takes priority; otherwise local balance >0 or readable usable
-  website balance at or above the configurable `tenantMinimumSiteWalletToman` (default 200000) allows access.
-  Website unavailability uses local balance alone.
+- Owner access/funding: `TenantAccessService` rejects missing/blocked owners; manual Enabled remains separate.
+  Bot balance >0 OR usable Gozargah wallet >= `tenantMinimumSiteWalletToman` (default 200000 toman) restores
+  saved payment preferences. `InsufficientFunding` still allows customer access, but new external payments use
+  the live owned-bot central gateway set and exclude the personal card. Website unavailability does not stop the bot.
   Negative local wallets trigger owner-wide partial/full website repayment through `TenantDebtTransfer` and existing
   website debit receipts; only confirmed debit authorizes unique local credit. One pending transfer per owner, no
   uncertain replay. `WalletOperationReconciliationService` recovers local credits after restart without remote calls.
@@ -505,16 +505,15 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
 - Data-only migration `20260802000000_RequeueUniquePayUserFeePayerFailures` requeues uncredited rows rejected before the live `feePayer=user` buyer alias/payable contract was supported; the worker still requires a fresh fully matching paid response before settlement.
 - Data-only migration `20260803180000_RequeueUniquePayVerifiedUnsettled` schedules provider-paid but uncredited rows for a fresh authenticated inquiry after the stale-context settlement fix. `UniquePaySettlementService` owns a factory-created users.db context per attempt so reconciliation's newly persisted `paid` state cannot be hidden by the legacy singleton change tracker; no migration directly credits a wallet.
 - UniquePay `feePayer` is controlled by the business-level `gatewayFee`/`feePayer` settings in the provider panel; the documented create-invoice form has no fee-payer field. Keep verification support for `user`/`buyer` and `owner` so existing invoices remain settleable; the provider currently reports `user` when the customer bears the configured 12% fee.
-- All five tenant platform gateways use `live global enabled && saved tenant preference` for new customer invoices.
-  `TenantBotService.SETTENANTSETTINGASYNC` saves an authenticated owner preference even while globally disabled,
-  then warns that management disabled customer visibility until management enables it. Owner panel text separates
-  saved preference from effective availability; keyboard checkmarks show preference only. Purchase, renewal and
-  customer-wallet top-up menus/stale callbacks retain the shared live gate; existing invoice settlement is unchanged.
-  `MultiStoreTests.Store_gateway_preference_saves_while_global_off_and_customer_admission_tracks_live_permission`
-  covers all five providers, exact-store authorization, replay/expiry and live off/on admission.
-  Tetraminator's invoice core also rechecks permission before allocating a new payment for an already-admitted quote;
-  existing linked invoices are reused independently of later disablement.
-- AtlasPay is a toman card-to-card provider (`Domain/AtlasPay.cs`) using `X-API-Key` over HTTPS with `POST /orders`, `GET /orders/{id}`, `POST /orders/{id}/verify`; the customer-visible reference is `trackingCode` and the charged amount is `totalAmountToman`, while settlement always credits/stores the immutable `BaseAmountToman`. Migration `20260910012628_AddAtlasPayGateway` adds `AtlasPayPaymentInfos`, `TenantBotOrders.AtlasPayPaymentInfoId`, and `BotInstances.TenantAtlasPayEnabled` (default true); no other table changes. The API key is restart-loaded only (never persisted or logged). When AtlasPay's optional direct-payment-details capability is enabled for the merchant, `POST /orders` may additionally return `cardNumber`, `cardHolderName`, and `bankName`; these are used only from the in-memory create response to render the customer's payment message and are never copied into `AtlasPayPaymentInfo`/users.db/logs. Persisted payment rows still store only `CardNumberMasked`. Invoice creation is single-attempt: the local payment row and order FK are persisted before `POST /orders`, and HTTP 400/401 are definitive while 5xx/timeout/transport/malformed-success are ambiguous and never auto-retried. Reconciliation/verify only inquire (`GET`/`verify`) and never re-create. Settlement is `IsVerifiedForAutomaticSettlement` fail-closed on identity (provider order id, merchant ref, tracking code, total amount), known status (`confirmed`/`settled` eligible), and `requiresManualDelivery` (never auto-settles; moves to `manual_review`). Owned wallet credits use operation key `payment:atlaspay:{id}:credit`; tenant fulfillment reuses the common purchase/renewal pipeline with an atomic `pending -> processing -> settled` claim and tenant/order linkage checks. Tenant AtlasPay availability is `global AtlasPay enabled && TenantAtlasPayEnabled`; owner preference is saved independently of global disablement, and both switches govern creation only (existing payments keep settling). Referral eligibility includes `atlaspay`.
+- `TenantPaymentGatewayPolicy` governs all five tenant central gateways. Funded mode requires
+  `live global enabled && saved tenant preference`; insufficient funding ignores saved opt-outs and excludes
+  new personal-card payments without mutating any setting. Purchase/discount/renewal/customer-wallet menus
+  share a read-only exact-owner snapshot; stale callbacks and first provider POST recheck fresh funding.
+  Disabled, missing, blocked, or reassigned storefront owners fail closed. Issued invoices and actual submitted
+  card receipts retain inquiry/settlement recovery; only new courtesy-account creation is funding-gated.
+  Owner panels/alerts explain temporary central-payment mode and automatic restoration of saved preferences.
+  Behavioral coverage: `MultiStoreTests`, `TenantAccessThresholdTests`, `TenantCustomerWalletTopUpTests`.
+- AtlasPay is a toman card-to-card provider (`Domain/AtlasPay.cs`) using `X-API-Key` over HTTPS with `POST /orders`, `GET /orders/{id}`, `POST /orders/{id}/verify`; the customer-visible reference is `trackingCode` and the charged amount is `totalAmountToman`, while settlement always credits/stores the immutable `BaseAmountToman`. Migration `20260910012628_AddAtlasPayGateway` adds `AtlasPayPaymentInfos`, `TenantBotOrders.AtlasPayPaymentInfoId`, and `BotInstances.TenantAtlasPayEnabled` (default true); no other table changes. The API key is restart-loaded only (never persisted or logged). When AtlasPay's optional direct-payment-details capability is enabled for the merchant, `POST /orders` may additionally return `cardNumber`, `cardHolderName`, and `bankName`; these are used only from the in-memory create response to render the customer's payment message and are never copied into `AtlasPayPaymentInfo`/users.db/logs. Persisted payment rows still store only `CardNumberMasked`. Invoice creation is single-attempt: the local payment row and order FK are persisted before `POST /orders`, and HTTP 400/401 are definitive while 5xx/timeout/transport/malformed-success are ambiguous and never auto-retried. Reconciliation/verify only inquire (`GET`/`verify`) and never re-create. Settlement is `IsVerifiedForAutomaticSettlement` fail-closed on identity (provider order id, merchant ref, tracking code, total amount), known status (`confirmed`/`settled` eligible), and `requiresManualDelivery` (never auto-settles; moves to `manual_review`). Owned wallet credits use operation key `payment:atlaspay:{id}:credit`; tenant fulfillment reuses the common purchase/renewal pipeline with an atomic `pending -> processing -> settled` claim and tenant/order linkage checks. New tenant AtlasPay admission uses `TenantPaymentGatewayPolicy`: live global permission is mandatory, and `TenantAtlasPayEnabled` applies only in funded mode. Owner preference is saved independently; existing payments keep settling after funding or preference changes. Referral eligibility includes `atlaspay`.
 - AtlasPay supports the optional signed webhook documented in section 3.8 of `api_docs/atlaspay-sdk مستندات.md`. The public
   endpoint is `POST /atlaspay-webhook`; `atlasPayWebhookSecret` is the one-time secret returned when the merchant webhook
   is registered and must stay outside source control/logs/Telegram. `PaymentController.ReceiveAtlasPayWebhook` verifies
@@ -593,16 +592,15 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   (default `active`) and `ReconciliationExhaustedAtUtc`, plus an index on the pair. It performs no backfill and changes no
   balance, so existing AtlasPay rows keep polling after the upgrade.
 - Super-admin `⚙️ مدیریت درگاه‌ها` displays all four live gateway states, root key names, and configuration readiness without exposing secrets. Enabling a gateway with missing token/URL is rejected. Target-state callbacks carry a revision and short expiry, and are restricted to configured super-admin ids.
-- New HooshPay invoices require the live global `hooshPayEnabled` switch and, for tenant storefronts, the
-  per-tenant `TenantHooshPayEnabled` preference. Disabling either switch hides and blocks only new invoices, including
-  stale Telegram callbacks; existing rows remain eligible for status checks, IPN processing, and settlement. A missing
-  global key is disabled, while the tracked operational configuration explicitly keeps the gateway enabled.
+- New HooshPay invoices require live global `hooshPayEnabled`; funded tenants also require
+  `TenantHooshPayEnabled`, while underfunded tenants use the central set. Disabled global permission blocks new
+  invoices, including stale callbacks, but existing rows retain inquiry/IPN/settlement. A missing global key is disabled.
 - Provider invoice amount limits are enforced both at owned/tenant UI boundaries and inside the provider clients before
   request construction. HooshPay accepts inclusive 50,000 through 1,000,000 toman. UniquePay requires strictly more
   than 50,000 toman, so 50,000 is rejected and 50,001 is valid. Invalid tenant purchase callbacks create no order or
   payment row; invalid tenant renewal callbacks preserve the existing pending order but create no provider/payment row.
-- NOWPayments creation uses the same live global snapshot and, for tenant storefronts, `TenantNowPaymentsEnabled`;
-  IPN validation and settlement of existing crypto invoices continue when new creation is disabled.
+- NOWPayments creation uses the same live global snapshot and tenant funding policy: saved
+  `TenantNowPaymentsEnabled` applies only in funded mode. Existing crypto inquiry/IPN/settlement remains independent.
 - `Utils/DollarPriceHelper.cs` is the single market-unit normalization boundary for NOWPayments: every accepted quote is
   **IRT/Toman per 1 USDT**. The active Nobitex priority is `v3/orderbook/USDTIRT`, then API v2 IRT stats, then API IRT
   stats; ambiguous RLS-labelled markets are excluded. Multiple live IRT sources use scale consensus so a factor-of-ten
@@ -653,7 +651,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   selected plan's exact traffic to `TotalGB` and adds the exact plan days while preserving positive absolute-expiry or
   negative first-connection-expiry mode. When expired, it replaces `TotalGB`, resets counters, and writes only the
   selected plan duration as a negative first-connection expiry. Owned, tenant, and super-admin flows share this rule.
-- Tenant platform-gateway sales credit owner profit; tenant card-to-card fulfillment debits owner base cost and can allow negative owner balances if configured by business rules.
+- Tenant central-gateway sales credit immutable `ProfitToman` once to the shared owner bot wallet, including negative balances, reducing debt. Personal-card fulfillment debits owner base cost and can leave that balance negative.
 - Tenant card-to-card base cost settlement tries the owner's bot wallet first, then the owner's Gozargah website wallet when connected and sufficient, then allows the bot wallet to go negative with an owner warning. This does not auto-disable the customer account in the current phase.
 - Tenant platform-gateway sales credit profit to the owner's bot wallet; the Gozargah website wallet is not mutated for gateway profit. Fulfillment persists owner bot-wallet before/after and now records read-only website-wallet before/after observations on `TenantBotOrder` (nullable when unavailable). The separate AtlasPay/UniquePay payment audit displays these persisted values; delayed AtlasPay audit replay labels pre-migration website balances as unrecorded instead of substituting current balances. `20260929140000_RecordTenantOwnerSiteWalletSnapshots` adds only these audit columns, with no historical backfill or wallet effects.
 - Every wallet movement should have a matching `WalletLedgerEntry`.
@@ -1058,6 +1056,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   recycled to Pending (send never started, retryable); an expired lease with a set phase becomes DeliveryUncertain
   (remote outcome ambiguous, never replayed).
 - Tenant storefront funding alerts (users.db `TenantStorefrontFundingAlerts`/`...States`) are edge-triggered on `TenantAccessDecision.InsufficientFunding` only; `underfunded_transition` fires once per underfunded episode, `customer_attempt` obeys `tenantUnderfundedCustomerAttemptNotificationCooldownMinutes` (default 15). Owner delivery always goes through the owned/default bot, never the tenant bot transport; the customer lane only persists/queues rows.
+  Both alert kinds explain that the storefront stays active on central gateways, personal card is temporarily
+  unavailable, and central-sale profit repays shared bot-wallet debt; the existing OR recovery rule is unchanged.
 - Funding-alert worker two-phase delivery mirrors the notification outbox: claim sets Processing + `SendStartedAtUtc=null`, the phase is persisted immediately before Telegram transport via a conditional update (Id + Processing + ClaimToken + null phase; 0 rows updated => no send). Expired lease + null phase => recycled to Pending/retryable; expired lease + set phase => DeliveryUncertain, never replayed. `Cancelled` is terminal.
 - On funding recovery (`Allowed`) the same transaction clears the state episode and cancels Pending rows plus Processing rows whose send never started; Processing rows with `SendStartedAtUtc != null` stay conservative. Pre-send, the worker re-validates the storefront state: must exist, `IsUnderfunded`, and `EpisodeNumber` must match the alert (0 = legacy row, accepted while underfunded); otherwise the alert is cancelled without any Telegram call. Migration `20260910001835_HardenTenantStorefrontFundingAlertDelivery` adds `SendStartedAtUtc`, `EpisodeNumber`, and the (Status, DeliveredAtUtc) index.
 - Delivered funding-alert retention is configurable via `tenantStorefrontFundingAlertRetentionDays` (positive, default 30); the worker deletes at most 100 Delivered rows per scan that are older than the cutoff and carry no claim/lease. Pending/Processing/DeliveryUncertain/ManualReview/Cancelled rows are never auto-deleted.
@@ -1569,7 +1569,7 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   (`SHOWCUSTOMERCONFIRMASYNC`, `BuildTenantRenewPaymentProviderKeyboard`), the tenant personal card-to-card rows
   (`PAYCARD:` / `RNCARD:`), and the named-rial invoice payment links (`WithUrl`). NOWPayments/crypto (`CryptoGatewayAction`,
   `PAYNP:` / `RNNP:`) is deliberately unmarked because it settles in cryptocurrency. The marker is display-only and never
-  enters callback data; `Adminbot.Tests/PaymentGatewayLabelTests.cs` asserts captions and byte-exact payloads.
+  enters callback data.
 - `TelegramBotService.IsGatewayAction` takes the current caption plus a `params` list of previously shipped captions.
   Telegram reply keyboards are one-time and already delivered, so every caption that gained the rial marker also passes
   its pre-marker wording (and older descriptive aliases) or a stale-button press would fall through. Ordering is

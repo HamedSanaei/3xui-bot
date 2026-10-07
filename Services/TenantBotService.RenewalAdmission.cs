@@ -17,9 +17,17 @@ public partial class TenantBotService
     /// <param name="order">Unsaved, target-authorized renewal order with pending payment provider.</param>
     /// <param name="grossToman">Fresh undiscounted tenant sale amount in whole toman.</param>
     /// <param name="baseCostToman">Fresh colleague cost used only for discount validation.</param>
-    /// <param name="token">Cancellation of the users.db transaction and Telegram delivery.</param>
+    /// <param name="token">Cancellation of fresh owner funding reads, the users.db transaction and Telegram delivery.</param>
     /// <returns><c>false</c> only if no code was selected; otherwise <c>true</c> after admission or an actionable failure.</returns>
-    /// <remarks>Admission rechecks the global renewal permission and reserves capacity with the pending order in one users.db commit. This method never invokes a provider, wallet, or XUI; any invalid selected code fails closed instead of charging the gross amount.</remarks>
+    /// <remarks>
+    /// Admission rechecks global renewal permission and reserves discount capacity with the pending order in one users.db
+    /// commit. Fresh exact-owner funding selects the live global gateway set during insufficient funding; personal-card
+    /// payment remains unavailable until funding recovers. Saved store preferences are never overwritten.
+    /// This method never invokes a provider, debits a wallet, or calls XUI; an invalid selected code fails closed instead
+    /// of charging the gross amount. The funding observation is read-only and runs outside the discount transaction.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">The caller cancels funding, discount admission, state persistence or delivery.</exception>
+    /// <example><code>await AdmitDiscountedRenewalFromStateAsync(client, chatId, tenant, customer, user, order, grossToman, baseCostToman, token);</code></example>
     private async Task<bool> AdmitDiscountedRenewalFromStateAsync(
         ITelegramBotClient client, ChatId chatId, BotInstance tenant, CredUser customer, User user,
         TenantBotOrder order, long grossToman, long baseCostToman, CancellationToken token)
@@ -49,7 +57,7 @@ public partial class TenantBotService
             return true;
         }
 
-        if (PurchaseDiscountPaymentMethods(tenant, saved.Value.Displayed.NetToman).Count == 0)
+        if (PurchaseDiscountPaymentMethods(tenant, saved.Value.Displayed.NetToman, await GetTenantPaymentAccessAsync(tenant, token)).Count == 0)
         {
             await SendDiscountedRenewalAdmissionFailureAsync(client, chatId, user, order, grossToman,
                 "هیچ روش پرداخت فعالی مبلغ نهایی این کد را نمی‌پذیرد؛ کد دیگری وارد کنید یا «ادامه بدون کد تخفیف» را بزنید.", token);
@@ -70,7 +78,7 @@ public partial class TenantBotService
         await _state.ClearUserStatus(user);
         await client.SendMessage(chatId, BuildTenantRenewOrderPaymentChoiceText(admitted.Value),
             parseMode: ParseMode.Html,
-            replyMarkup: BuildTenantRenewPaymentProviderKeyboard(admitted.Value, tenant),
+            replyMarkup: BuildTenantRenewPaymentProviderKeyboard(admitted.Value, tenant, await GetTenantPaymentAccessAsync(tenant, token)),
             cancellationToken: token);
         return true;
     }

@@ -26,14 +26,19 @@ never cancels committed payment evidence, paid invoice settlement, or durable de
 
 Only the final active state shows `💰 کیف پول` and `📒 تراکنش‌های من` to customers. History always queries the
 authenticated sender's global ledger, not an id supplied by a callback. Store owners receive order amount/profit/source
-only, never the customer's whole balance. Existing tenant owner suspension/debt checks still guard new interactions.
+only, never the customer's whole balance. Missing/blocked owners and manual store disablement still restrict access;
+insufficient owner funding changes new payment choices, not customer access.
 
 ## Top-up and settlement
 
 `WalletChargeApplicationService` shares amount policies, live gateway admission and invoice transport with the
-owned flow. Tenant amounts are entered in toman; gateway selection also requires the store's switch. Supported
-central providers: HooshPay, Tetraminator, UniquePay, AtlasPay and NOWPayments. Platform gateway credentials remain
-central; the existing personal-storefront-card approval path credits only the customer, without a central owner mirror.
+owned flow. Tenant amounts are entered in toman. Funded owners use global permission plus saved store switches;
+underfunded owners temporarily use exactly the live owned-bot central gateways, ignoring store opt-outs.
+Supported central providers: HooshPay, Tetraminator, UniquePay, AtlasPay and NOWPayments; credentials remain central.
+Personal-storefront-card top-ups are unavailable while underfunded and return automatically when the existing OR
+funding rule recovers, provided the saved card preference/configuration still permits them. No preferences are changed.
+First creation and provider POST recheck fresh exact-owner funding; old card callbacks cannot create a new receipt order.
+Approval of actual previously submitted card receipts remains valid and credits only the customer, without an owner mirror.
 
 The bot/user confirmation state is consumed before provider creation. A `wallet_charge` payment row, including
 tenant BotId, username, customer/chat and immutable `WalletOriginBotType`, commits **before** external I/O.

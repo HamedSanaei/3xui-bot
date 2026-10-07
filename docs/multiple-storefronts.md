@@ -1,15 +1,24 @@
 # Multiple storefronts with shared owner accounts
 
-## Owner suspension and automatic debt repayment
+## Funding fallback, owner restrictions and automatic debt repayment
 
 All messages and callbacks are gated by the fresh shared owner profile. A blocked owner takes priority and produces
 `ربات به علت تخلف مسدود است. به پشتیبانی پیام دهید.` without a support id/link. Receivers stay alive to answer;
 manual store Enabled remains unchanged and therefore still applies after the owner is unblocked.
 
-For an unblocked owner, positive local wallet balance allows access. Otherwise a readable usable website wallet of
-at least 1,000,000 toman is required (exactly 1,000,000 qualifies). No connection or a failed read means local wallet
-balance alone decides. Restricted customers receive `ربات به علت بدهی غیرفعال است. به پشتیبانی پیام دهید.`
-Owned payment/charge flows and already-paid webhook/recovery work are not gated.
+For an unblocked owner, funding eligibility remains **positive bot-wallet balance OR a readable usable Gozargah
+wallet at least `tenantMinimumSiteWalletToman`** (default **200,000 toman**, inclusive). Both wallets do not need
+to be positive. When neither condition holds, the storefront stays accessible instead of refusing customers.
+New external payments use exactly the currently enabled global gateways offered by owned bots, even when the
+tenant's saved provider switches are off; normal provider amount limits still apply. No gateway is hard-coded.
+New personal-storefront-card payments and courtesy-account creation are unavailable until funding recovers.
+Saved settings and manual Enabled are never overwritten; recovery automatically restores ordinary preferences.
+Existing approved customer-wallet purchases, issued invoices and actual submitted receipts retain their original
+settlement/recovery rules. Owner blocking and missing-owner restrictions are not bypassed.
+
+Central-gateway purchase/renewal settlement credits the order's immutable `ProfitToman` exactly once to the owner's
+shared bot wallet, including a negative balance. This reduces debt without introducing a new balance mutation or
+repayment mechanism. Existing customer-wallet top-up approval and central mirror rules remain unchanged.
 
 On customer interaction, negative local balance triggers repayment of min(local debt, usable website funds), including
 partial repayment. The immutable owner-wide transfer is reserved before website I/O. Website admission rechecks funds
@@ -26,13 +35,6 @@ Before deployment, stop the single polling process, take a coordinated backup of
 the procedure below, and apply migrations before receivers start. `20260907120000_TenantDebtTransfers` creates empty
 storage and does not replay historical debt. Its downgrade refuses to erase any transfer history. Monitor pending
 transfers, credit recovery warnings, and website contention. No automatic deployment is part of this change.
-
-Owned and tenant menus now display `🌟اکانت تست`; old free-account buttons remain input aliases only. Trial eligibility,
-volumes, duration and bot/user cooldown remain unchanged. This increment is reviewed statically and with one Release
-build only: no tests added/run, no executable migration validation, no publish, commit, push or deployment.
-This increment's `dotnet build Adminbot.csproj -c Release --no-restore -v q` passed: zero warnings and errors.
-Static diff/UTF-8 checks passed with no corruption markers. These checks do not establish runtime financial or
-migration behavior; the earlier test/publish results below predate the owner-access/debt-transfer change.
 
 `TenantMaxStoresPerOwner` is positive and defaults to 5. Every allocated row counts, even when disabled or reset.
 Lowering the limit never disables an existing store. Reuse a disabled store instead of deleting its history.
@@ -167,12 +169,13 @@ never restore only one database or replay historical financial effects to force 
 
 ## Verification coverage
 
-Owner gateway recovery verification passed 1,125 existing-suite cases, including the 25 new exact-store, fresh-proof
-and rejected-attempt/idempotency cases in `TenantOwnerGatewayRecoveryTests.cs`. A separate temporary executable
-drove the real update dispatcher and Telegram SDK through 15 purchase/renewal/ambiguous-creation scenarios across
-all five gateways, with controlled HTTP transports and real private SQLite databases. No live Telegram/provider/
-production-panel request was made. Production-only Linux publish passed without auxiliary test dependencies;
-temporary verification tooling is not part of the application or server publish.
+Funding-mode regression coverage uses the existing `Adminbot.Tests` project: `TenantAccessThresholdTests`,
+`MultiStoreTests`, `TenantCustomerWalletTopUpTests` and funding-alert tests cover threshold boundaries, live global
+gateway selection, stale-card rejection, preference restoration and first-provider-POST admission.
+A temporary executable also exercised real storefront handlers and SQLite settlement: accessible `/start`,
+purchase/renewal/top-up choices, partial/full debt repayment through profit, duplicate-credit prevention and owner
+blocking. Telegram delivery was recorded locally; no live gateway, panel or production database was contacted.
+Temporary verification tooling and auxiliary test assemblies are excluded from production Linux publish.
 
 Tenant purchase and renewal audit messages display a fixed readable label from `PaymentProvider`, separately
 from owner settlement funding. Unknown provider values are never echoed. Storefronts expose `🌟اکانت تست`
@@ -180,13 +183,6 @@ through the shared owned v3 trial handler: non-colleagues, verified sender-owned
 or normal 1 GiB, three days, thirty days per trial type and bot/user. `TelegramPhoneVerification` is shared;
 rejection support and menus belong to the receiving store. Trials retain recipient, store and owner metadata
 through the existing durable XUI creation boundary, with no financial order, owner debit or profit.
-
-Before this incremental gateway/trial change, 146 tests, Release build, Linux publish, both model-drift checks
-and migration preflight passed. Those results do not validate the incremental change. Its requested verification
-is limited to source/diff and UTF-8 review plus one Release build; no new tests or repeated suite are requested.
-The incremental `dotnet build Adminbot.csproj -c Release --no-restore -v q` passed with zero warnings/errors.
-Diff whitespace checks and strict UTF-8/visible Persian review passed; no mojibake markers were found.
-No incremental test run, publish, migration preflight, commit, push or deployment was performed.
 
 `MultiStoreTests.cs` uses real temporary SQLite databases and the production handler/service graph. It covers
 concurrent cap enforcement, add redelivery, lower limits, upgrade identity/balance preservation, input restart,

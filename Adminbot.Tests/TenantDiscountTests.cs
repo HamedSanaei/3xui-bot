@@ -368,7 +368,11 @@ public sealed partial class ConcurrencyTests
     /// <summary>Purchase code entry preserves the message-bound net, including repeated application of the same code.</summary>
     /// <param name="repeatCode">Whether the customer reopens code entry and submits the same valid code again.</param>
     /// <returns>A task after preview invariants and exactly-once discounted payment admission are verified.</returns>
-    /// <remarks>Regression: Telegram confirms an identical edit with status 400/message-not-modified; that must not expire or rebind the customer's still-valid quote.</remarks>
+    /// <remarks>
+    /// A persisted positive owner wallet makes personal-card admission eligible, independently of quote delivery.
+    /// Regression: Telegram confirms an identical edit with status 400/message-not-modified; that must not expire or
+    /// rebind the customer's still-valid quote.
+    /// </remarks>
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -388,6 +392,12 @@ public sealed partial class ConcurrencyTests
         {
             db.BotInstances.Add(tenant);
             await db.SaveChangesAsync();
+        }
+        // This scenario exercises valid personal-card admission, not the owner's debt-mode restriction.
+        await using (var credentials = databases.Credentials.CreateDbContext())
+        {
+            credentials.Users.Add(new CredUser { TelegramUserId = 711, AccountBalance = 1_000_000 });
+            await credentials.SaveChangesAsync();
         }
         var discounts = provider.GetRequiredService<TenantDiscountService>();
         Assert.True((await discounts.SaveCodeAsync(tenant.Id, 711,
@@ -636,6 +646,8 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(1, (await discounts.GetUsageAsync(tenant.Id, 711, cardDefinition.Value.Id)).Value.Remaining);
     }
     /// <summary>The real renewal confirmation admits only the displayed net and a disabled code never becomes a gross order.</summary>
+    /// <returns>A task after persisted discount reservations and rejection of a disabled code are verified.</returns>
+    /// <remarks>The stored owner is financially eligible; a payment-method denial must not hide a discount-admission failure.</remarks>
     [Fact]
     public async Task TenantDiscount_Renewal_confirmation_reserves_once_and_fails_closed_after_code_disable()
     {
@@ -650,6 +662,11 @@ public sealed partial class ConcurrencyTests
         {
             db.BotInstances.Add(tenant);
             await db.SaveChangesAsync();
+        }
+        await using (var credentials = databases.Credentials.CreateDbContext())
+        {
+            credentials.Users.Add(new CredUser { TelegramUserId = 711, AccountBalance = 1_000_000 });
+            await credentials.SaveChangesAsync();
         }
         var discounts = provider.GetRequiredService<TenantDiscountService>();
         var code = await discounts.SaveCodeAsync(tenant.Id, 711,

@@ -450,7 +450,7 @@ public partial class TelegramBotService
         _credentialsDbContext = credentialsDb;
         _configuration = configuration;
         _appConfig = _configuration.Get<AppConfig>();
-        _walletCharges = new WalletChargeApplicationService(dbContext, _appConfig, gatewayAvailability, null,
+        _walletCharges = new WalletChargeApplicationService(dbContext, _appConfig, gatewayAvailability, null, null,
             hooshPay, tetraminator, uniquePay, atlasPay, nowPayments);
         _logger = logger;
         _broadcastManager = broadcastManager;

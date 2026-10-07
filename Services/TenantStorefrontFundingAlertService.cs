@@ -6,6 +6,11 @@ using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types.Enums;
 
+/// <summary>Persists owner-scoped underfunding episodes and durable notifications while storefront customer access remains available.</summary>
+/// <remarks>
+/// Classifies episodes by Decision, not IsAllowed: InsufficientFunding is accessible but still requires central
+/// payments and owner funding alerts. Cooldowns, recovery cancellation, and delivery idempotency are unchanged.
+/// </remarks>
 public sealed class TenantStorefrontFundingAlertService
 {
     private static readonly AsyncKeyedGate Storefronts = new();
@@ -21,6 +26,22 @@ public sealed class TenantStorefrontFundingAlertService
         _logger = logger;
     }
 
+    /// <summary>Observes the storefront's financial mode and queues an owner alert without blocking customer navigation.</summary>
+    /// <param name="tenant">Resolved tenant storefront; its internal id scopes episodes and its stored owner id addresses notifications.</param>
+    /// <param name="evaluation">Snapshot for this exact stored owner; null is ignored and must never be borrowed from another owner.</param>
+    /// <param name="customerAttempt">Whether an accessible customer interaction should trigger the persisted attempt cooldown.</param>
+    /// <param name="allowUnderfundedAlerts">Whether this enabled, usable storefront may queue financial alerts; false suppresses new alerts.</param>
+    /// <param name="cancellationToken">Cancellation for storefront admission and durable database writes.</param>
+    /// <returns>A task completing after state and any notification intent are committed; no Telegram send occurs inline.</returns>
+    /// <remarks>
+    /// Allowed ends an underfunded episode; InsufficientFunding tracks central-payment fallback even though IsAllowed
+    /// is true. Blocked or missing owners do not queue funding alerts. Customer cooldowns and transition business keys
+    /// remain durable; recovery cancels only superseded alerts whose send has not started. No wallet, order, or payment
+    /// changes are made, and the owner's notification transport does not hold the customer handler lane.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">Storefront admission or database work is cancelled.</exception>
+    /// <exception cref="DbUpdateException">Funding state or notification intent cannot be persisted.</exception>
+    /// <example><code>await alerts.ObserveAsync(tenant, evaluation, customerAttempt: true, allowUnderfundedAlerts: true, token);</code></example>
     public async Task ObserveAsync(BotInstance tenant, TenantAccessEvaluation evaluation, bool customerAttempt,
         bool allowUnderfundedAlerts, CancellationToken cancellationToken)
     {
@@ -121,6 +142,16 @@ public sealed class TenantStorefrontFundingAlertService
         if (queued.Item1 || queued.Item2) TenantStorefrontFundingAlertWorker.Wake();
     }
 
+    /// <summary>Observes post-settlement funding recovery or entry into central-payment fallback independently of monitoring.</summary>
+    /// <param name="tenant">Settled tenant storefront whose internal id and exact stored owner scope notification state.</param>
+    /// <param name="before">Optional pre-settlement evaluation for this same owner.</param>
+    /// <param name="after">Optional post-settlement evaluation for this same owner; null produces no post-settlement observation.</param>
+    /// <param name="cancellationToken">Cancellation for durable episode and alert writes.</param>
+    /// <returns>A task completing the existing financial transition observations, without inline Telegram delivery.</returns>
+    /// <remarks>Both funding decisions permit access; their distinction still drives durable alert episodes and recovery cancellation. No repayment or wallet mutation occurs here.</remarks>
+    /// <exception cref="OperationCanceledException">The financial observation is cancelled.</exception>
+    /// <exception cref="DbUpdateException">The financial observation cannot be persisted.</exception>
+    /// <example><code>await alerts.ObserveSettlementAsync(tenant, before, after, token);</code></example>
     public async Task ObserveSettlementAsync(BotInstance tenant, TenantAccessEvaluation before,
         TenantAccessEvaluation after, CancellationToken cancellationToken)
     {
@@ -235,6 +266,17 @@ public sealed class TenantStorefrontFundingAlertDeliveryService
             parseMode: ParseMode.Html, cancellationToken: cancellationToken)).MessageId;
     }
 
+    /// <summary>Builds the owner-facing explanation of active storefront central-payment fallback and funding recovery.</summary>
+    /// <param name="alert">Required durable financial alert with tenant username and owner-wallet snapshots in toman.</param>
+    /// <returns>Persian Telegram HTML with escaped storefront identifiers and configured threshold, never a suspension or lost-sale claim.</returns>
+    /// <remarks>
+    /// Both alert kinds explain the same financial mode: only live central owned-bot gateways admit new payments,
+    /// saved provider opt-outs are ignored, and personal-card admission pauses. Central gateway owner profit credits
+    /// the shared bot wallet and reduces negative debt; the unchanged OR funding rule restores saved preferences.
+    /// Formatting has no financial or durable-delivery side effects.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">The persisted alert kind is not a supported financial notification.</exception>
+    /// <example><code>var text = TenantStorefrontFundingAlertDeliveryService.BuildMessage(alert);</code></example>
     internal static string BuildMessage(TenantStorefrontFundingAlert alert)
     {
         var username = (alert.TenantBotUsername ?? alert.TenantBotId).Trim().TrimStart('@');
@@ -243,24 +285,25 @@ public sealed class TenantStorefrontFundingAlertDeliveryService
         var siteBalance = alert.SiteWalletToman.HasValue
             ? alert.SiteWalletToman.Value.FormatCurrency()
             : "نامشخص / در دسترس نیست";
-        if (alert.Kind == TenantStorefrontFundingAlertKinds.CustomerAttempt)
-            return "🛒 <b>یک مشتری در حال تلاش برای استفاده از ربات فروشگاهی شماست.</b>\n\n" +
-                   $"🤖 فروشگاه: <code>@{Html(username)}</code>\n\n" +
-                   "در حال حاضر به دلیل موجودی ناکافی، فروشگاه امکان ارائه سرویس ندارد.\n\n" +
-                   "برای فعال شدن مجدد:\n" +
-                   "• موجودی حساب ربات خود را افزایش دهید\n" +
-                   $"• یا کیف پول گذرگاه را حداقل به <code>{Html(minimum)}</code> برسانید.\n\n" +
-                   "لطفاً برای جلوگیری از از دست رفتن فروش، موجودی را شارژ کنید.";
-        if (alert.Kind != TenantStorefrontFundingAlertKinds.UnderfundedTransition)
-            throw new InvalidOperationException("unknown_storefront_funding_alert_kind");
-        return "⚠️ <b>ربات فروشگاهی شما به دلیل موجودی ناکافی غیرفعال شده است.</b>\n\n" +
+        var heading = alert.Kind switch
+        {
+            TenantStorefrontFundingAlertKinds.CustomerAttempt =>
+                "🛒 <b>یک مشتری در حال استفاده از ربات فروشگاهی شماست.</b>\n\n",
+            TenantStorefrontFundingAlertKinds.UnderfundedTransition =>
+                "⚠️ <b>ربات فروشگاهی شما با درگاه‌های مرکزی فعال می‌ماند.</b>\n\n",
+            _ => throw new InvalidOperationException("unknown_storefront_funding_alert_kind")
+        };
+        return heading +
                $"🤖 فروشگاه: <code>@{Html(username)}</code>\n\n" +
-               "برای فعال شدن مجدد ربات، یکی از شرایط زیر را فراهم کنید:\n\n" +
-               "• موجودی حساب شما در ربات را افزایش دهید.\n" +
-               $"• یا موجودی کیف پول سایت گذرگاه را به حداقل <code>{Html(minimum)}</code> برسانید.\n\n" +
+               "به دلیل موجودی ناکافی، ربات همچنان فعال است و پرداخت‌های جدید فقط از درگاه‌های مرکزی فعال ربات‌های اصلی انجام می‌شوند؛ تنظیمات خاموش‌کردن این درگاه‌ها در فروشگاه موقتاً اعمال نمی‌شوند.\n" +
+               "کارت‌به‌کارت شخصی تا زمان تأمین موجودی موقتاً در دسترس نیست.\n\n" +
+               "سود مالک از فروش‌های درگاه مرکزی به کیف پول مشترک شما در ربات اضافه می‌شود و بدهی منفی را کاهش می‌دهد.\n\n" +
+               "برای بازگشت خودکار به روش‌های پرداخت ذخیره‌شده، یکی از شرایط زیر کافی است:\n" +
+               "• موجودی کیف پول شما در ربات بیشتر از صفر باشد.\n" +
+               $"• یا موجودی قابل‌استفاده کیف پول سایت گذرگاه حداقل <code>{Html(minimum)}</code> باشد.\n\n" +
                $"💳 موجودی فعلی ربات: <code>{Html(botBalance)}</code>\n" +
                $"🌐 موجودی فعلی گذرگاه: <code>{Html(siteBalance)}</code>\n\n" +
-               "پس از تأمین موجودی، دسترسی فروشگاه به‌صورت خودکار طبق قوانین فعلی سیستم برقرار خواهد شد.";
+               "پس از تأمین موجودی، تنظیمات ذخیره‌شده درگاه‌ها و کارت‌به‌کارت شخصی، در صورت فعال بودن، به‌صورت خودکار دوباره اعمال می‌شوند.";
     }
 
     private static string Html(string value) => WebUtility.HtmlEncode(value ?? string.Empty);

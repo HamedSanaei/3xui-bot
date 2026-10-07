@@ -388,6 +388,9 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(3, delivered.EpisodeNumber);
     }
 
+    /// <summary>External owner-wallet changes drive durable financial episodes independently of customer accessibility.</summary>
+    /// <returns>A task completing read-only monitor cycles for two storefronts sharing the same exact owner.</returns>
+    /// <remarks>Both financial modes permit access; only classification changes alert recovery and central-payment requirements, without repayment or wallet mutation.</remarks>
     [Fact]
     public async Task Monitor_detects_external_wallet_drop_recovery_and_new_episode_without_mutating_finance()
     {
@@ -435,6 +438,11 @@ public sealed partial class ConcurrencyTests
 
         // External drop below the threshold: one transition alert per storefront of the same episode.
         wallet = 100_000;
+        var fallback = access.ClassifyFundingSnapshot(0, true, wallet);
+        Assert.Equal(TenantAccessDecision.InsufficientFunding, fallback.Decision);
+        Assert.True(fallback.IsAllowed);
+        Assert.True(fallback.RequiresPlatformPayments);
+        Assert.Null(fallback.RestrictionMessage);
         Assert.Equal(2, await monitor.RunCycleAsync(databases.Users, access, alerts));
         await using (var db = databases.Users.CreateDbContext())
         {
@@ -445,6 +453,11 @@ public sealed partial class ConcurrencyTests
 
         // External recovery: states healthy and pending alerts cancelled.
         wallet = 300_000;
+        var recovered = access.ClassifyFundingSnapshot(0, true, wallet);
+        Assert.Equal(TenantAccessDecision.Allowed, recovered.Decision);
+        Assert.True(recovered.IsAllowed);
+        Assert.False(recovered.RequiresPlatformPayments);
+        Assert.Null(recovered.RestrictionMessage);
         Assert.Equal(2, await monitor.RunCycleAsync(databases.Users, access, alerts));
         await using (var db = databases.Users.CreateDbContext())
         {
@@ -528,9 +541,6 @@ public sealed partial class ConcurrencyTests
     [Fact]
     public void Funding_alert_retention_and_monitor_interval_are_validated()
     {
-        Assert.Equal(30, new AppConfig().TenantStorefrontFundingAlertRetentionDays);
-        Assert.True(new AppConfig().TenantStorefrontFundingMonitorEnabled);
-        Assert.Equal(5, new AppConfig().TenantStorefrontFundingMonitorIntervalMinutes);
         var validator = typeof(Program).GetMethod("ValidateTenantStorefrontConfiguration", BindingFlags.Static | BindingFlags.NonPublic)!;
         var thrown = Assert.Throws<TargetInvocationException>(() => validator.Invoke(null,
             new object[] { new AppConfig { TenantStorefrontFundingAlertRetentionDays = 0 } }));

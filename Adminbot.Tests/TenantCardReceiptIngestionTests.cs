@@ -468,11 +468,17 @@ public sealed partial class ConcurrencyTests
         Assert.DoesNotContain(create, "tenant-create:", StringComparison.Ordinal);
     }
 
-    /// <summary>Seeds one enabled tenant storefront plus one live card order for it.</summary>
+    /// <summary>Seeds an enabled, financially eligible personal-card storefront and one live receipt order.</summary>
     /// <param name="databases">Temporary database fixture.</param>
     /// <param name="orderId">Public order id to create.</param>
     /// <param name="orderKind">Purchase or renewal; renewals must be excluded from provisional delivery.</param>
     /// <returns>The persisted tenant row.</returns>
+    /// <remarks>
+    /// The exact stored owner has a positive bot wallet and configured personal card, allowing receipt-upload prompts.
+    /// This is fixture initialization without wallet-operation receipts; image ingestion and target isolation, not debt
+    /// admission, are the scenarios under test. Existing receipt evidence remains processable if funding later falls.
+    /// </remarks>
+    /// <example><code>var tenant = await SeedReceiptTenantAsync(databases, "receipt-order", TenantBotOrderKinds.Purchase);</code></example>
     private static async Task<BotInstance> SeedReceiptTenantAsync(Databases databases, string orderId, string orderKind)
     {
         var tenant = new BotInstance
@@ -481,12 +487,20 @@ public sealed partial class ConcurrencyTests
             Type = BotInstanceTypes.Tenant,
             Enabled = true,
             OwnerTelegramUserId = ReceiptOwnerId,
+            TenantCardPaymentEnabled = true,
+            TenantCardNumber = "6037990000000000",
+            TenantCardHolderName = "Receipt Owner",
             CreatedAtUtc = DateTime.UtcNow
         };
         await using var db = databases.Users.CreateDbContext();
         db.BotInstances.Add(tenant);
         db.TenantBotOrders.Add(ReceiptOrder(tenant, orderId, orderKind));
         await db.SaveChangesAsync();
+        await using (var credentials = databases.Credentials.CreateDbContext())
+        {
+            credentials.Users.Add(new CredUser { TelegramUserId = ReceiptOwnerId, AccountBalance = 1_000_000 });
+            await credentials.SaveChangesAsync();
+        }
         return tenant;
     }
 

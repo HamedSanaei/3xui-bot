@@ -8,18 +8,17 @@ using Microsoft.Extensions.Logging.Abstractions;
 using System.Reflection;
 using Xunit;
 
-/// <summary>Covers the configurable tenant storefront site-wallet threshold and its startup validation.</summary>
+/// <summary>Covers financial-mode boundaries and startup validation without treating insufficient funding as suspension.</summary>
 /// <remarks>
-/// The threshold key is <c>tenantMinimumSiteWalletToman</c>; the historical hard-coded one-million-toman gate is
-/// replaced by this value. These tests drive the real <see cref="TenantAccessService"/> through a real website API
-/// fake so the full eligibility pipeline (config, HTTP lookup, wallet parse) is exercised.
+/// The threshold key is <c>tenantMinimumSiteWalletToman</c>. These tests drive the real
+/// <see cref="TenantAccessService"/> through a website API fake so configuration, lookup, and wallet parsing
+/// exercise the unchanged OR eligibility rule independently of customer access.
 /// </remarks>
 public sealed partial class ConcurrencyTests
 {
-    /// <summary>Site wallet at the configured boundary: below denies, at and above the threshold allow.</summary>
-    /// <returns>A task completing after the three eligibility evaluations against the real fake server.</returns>
-    /// <remarks>Regression guard: the gate must follow <c>tenantMinimumSiteWalletToman</c> (200000 here), not the
-    /// historical hard-coded 1,000,000 toman. 199999 must be denied while 200000 must be allowed.</remarks>
+    /// <summary>Below the configured site boundary requires central payments; at and above it restore saved preferences.</summary>
+    /// <returns>A task completing three financial evaluations against the website API fake.</returns>
+    /// <remarks>All three modes allow customer access. The 200000-toman threshold does not require a positive bot wallet.</remarks>
     [Fact]
     public async Task Tenant_site_wallet_threshold_uses_configured_minimum()
     {
@@ -55,17 +54,30 @@ public sealed partial class ConcurrencyTests
         var access = new TenantAccessService(databases.Users, credentials, sync, configuration, NullLogger<TenantAccessService>.Instance);
 
         wallet = 199_999;
-        Assert.Equal(TenantAccessService.DebtMessage, await access.EvaluateAsync(711, default));
+        var below = await access.EvaluateDecisionAsync(711, default);
+        Assert.Equal(TenantAccessDecision.InsufficientFunding, below.Decision);
+        Assert.True(below.IsAllowed);
+        Assert.True(below.RequiresPlatformPayments);
+        Assert.Null(below.RestrictionMessage);
+        Assert.Null(await access.EvaluateAsync(711, default));
         wallet = 200_000;
-        Assert.Null(await access.EvaluateAsync(711, default));
+        var at = await access.EvaluateDecisionAsync(711, default);
+        Assert.Equal(TenantAccessDecision.Allowed, at.Decision);
+        Assert.True(at.IsAllowed);
+        Assert.False(at.RequiresPlatformPayments);
+        Assert.Null(at.RestrictionMessage);
         wallet = 500_000;
-        Assert.Null(await access.EvaluateAsync(711, default));
+        var above = await access.EvaluateDecisionAsync(711, default);
+        Assert.Equal(TenantAccessDecision.Allowed, above.Decision);
+        Assert.True(above.IsAllowed);
+        Assert.False(above.RequiresPlatformPayments);
+        Assert.Null(above.RestrictionMessage);
         await app.StopAsync();
     }
 
-    /// <summary>A positive local bot wallet allows access without any website threshold involvement.</summary>
-    /// <returns>A task completing after the owner is credited and the access gate opens.</returns>
-    /// <remarks>The website client is left unconfigured, so website funding is unavailable; only the local balance can open the gate.</remarks>
+    /// <summary>A positive local bot wallet retains saved payment preferences without website funding.</summary>
+    /// <returns>A task completing after owner credit and the financial-mode snapshot.</returns>
+    /// <remarks>The website client is unconfigured; the positive shared bot wallet alone satisfies the OR funding rule.</remarks>
     [Fact]
     public async Task Positive_local_wallet_allows_access_independently_of_website_threshold()
     {
@@ -84,17 +96,19 @@ public sealed partial class ConcurrencyTests
             new GozargahSiteApiClient(configuration, NullLogger<GozargahSiteApiClient>.Instance),
             configuration, NullLogger<GozargahSiteSyncService>.Instance);
         var access = new TenantAccessService(databases.Users, credentials, sync, configuration, NullLogger<TenantAccessService>.Instance);
-        Assert.Null(await access.EvaluateAsync(711, default));
+        var evaluation = await access.EvaluateFundingSnapshotAsync(711, default);
+        Assert.Equal(TenantAccessDecision.Allowed, evaluation.Decision);
+        Assert.True(evaluation.IsAllowed);
+        Assert.False(evaluation.RequiresPlatformPayments);
+        Assert.Null(evaluation.RestrictionMessage);
     }
 
     /// <summary>A negative configured site-wallet threshold fails startup validation instead of being clamped.</summary>
-    /// <returns>A task completing after invoking the real startup validator.</returns>
     /// <remarks>The validator is the exact private method <c>Program.Main</c> calls before migration; a negative value
-    /// would make every storefront pass the website gate and must never be silently converted to zero.</remarks>
+    /// would make every usable website wallet financially eligible and must not be silently converted to zero.</remarks>
     [Fact]
     public void Negative_tenant_site_wallet_threshold_is_rejected_by_startup_validation()
     {
-        Assert.Equal(200_000L, new AppConfig().TenantMinimumSiteWalletToman);
         var validator = typeof(Program).GetMethod("ValidateTenantStorefrontConfiguration", BindingFlags.Static | BindingFlags.NonPublic)
             ?? throw new InvalidOperationException("Startup validator not found.");
         var negative = new AppConfig { TenantMinimumSiteWalletToman = -1 };

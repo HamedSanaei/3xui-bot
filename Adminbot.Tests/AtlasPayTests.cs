@@ -2142,25 +2142,30 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>
-    /// Global + tenant creation switch matrix: both the global AtlasPay switch and the tenant-scoped
-    /// TenantAtlasPayEnabled must be on before a new tenant AtlasPay order can be created; either switch off
-    /// rejects creation before any payment row or provider POST exists.
+    /// A funded tenant requires both the live global AtlasPay switch and its saved TenantAtlasPayEnabled
+    /// preference before a new order can be created. Either switch off rejects creation before a payment row
+    /// or provider POST exists.
     /// </summary>
     /// <returns>A task completing after both rejection combinations leave no payment row and no HTTP traffic.</returns>
     /// <remarks>
-    /// The switches govern creation only; this test proves no new Atlas tenant order or payment is persisted when
-    /// either switch is off.
+    /// The exact persisted owner has a positive shared bot-wallet balance, so debt-mode preference overrides do not
+    /// apply. The switches govern new creation only; previously issued invoices retain their settlement path.
     /// </remarks>
     [Fact]
-    public async Task AtlasPay_tenant_creation_requires_global_and_tenant_switches()
+    public async Task AtlasPay_funded_tenant_creation_requires_global_and_tenant_switches()
     {
         using var databases = new Databases(initialize: false);
         await using (var users = databases.Users.CreateDbContext()) await users.Database.MigrateAsync();
         await using (var credentials = databases.Credentials.CreateDbContext()) await credentials.Database.MigrateAsync();
+        await using (var credentials = databases.Credentials.CreateDbContext())
+        {
+            credentials.Users.Add(new CredUser { TelegramUserId = 711, AccountBalance = 1_000_000 });
+            await credentials.SaveChangesAsync();
+        }
         var scenarios = new[]
         {
-            new { Name="global-off", AtlasEnabled=false, TenantEnabled=true, Expected="سراسری" },
-            new { Name="tenant-off", AtlasEnabled=true, TenantEnabled=false, Expected="فروشگاه" }
+            new { Name="global-off", AtlasEnabled=false, TenantEnabled=true },
+            new { Name="tenant-off", AtlasEnabled=true, TenantEnabled=false }
         };
         var tenantNumber = 10;
         foreach (var scenario in scenarios)
@@ -2199,7 +2204,6 @@ public sealed partial class ConcurrencyTests
                 Message=new Message { Id =1, Chat=new Chat { Id=722 } } };
             var selection = new XuiV3PurchaseSelection { ServiceKey="normal", TrafficGb=10, DurationKey="m1", AccountCount=1 };
             await (Task)method.Invoke(service, new object[] { client, callback, tenant, customer!, selection, CancellationToken.None })!;
-            Assert.Contains(client.Answers, x => x.Contains(scenario.Expected, StringComparison.Ordinal));
             await using (var db = databases.Users.CreateDbContext())
             {
                 Assert.Empty(await db.AtlasPayPaymentInfos.ToListAsync());
