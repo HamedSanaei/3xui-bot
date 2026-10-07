@@ -109,21 +109,28 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     /// Converts expired processing leases into a terminal delivery-uncertain state without resending them.
     /// </summary>
     /// <param name="cancellationToken">Host token for the users.db read and update.</param>
-    /// <returns>A task that completes after every currently expired claim is quarantined.</returns>
+    /// <returns>A task that completes after currently eligible expired claims are quarantined, or a read-only idle check.</returns>
     /// <remarks>
     /// A process may stop after Telegram accepts a message but before the message id is saved. Automatically retrying
     /// that row would risk customer spam, so lease expiry is permanently fail-closed until an administrator explicitly
     /// changes the row.
+    /// The same lease predicate guards the read-only admission check and update. Rows becoming eligible after an
+    /// empty check wait for the next scan; no transaction or writer lock is acquired by an idle scan.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The scan cancellation token is cancelled.</exception>
+    /// <example>An idle WAL scan can complete while another connection holds the database writer.</example>
     private async Task MarkExpiredClaimsUncertainAsync(CancellationToken cancellationToken)
     {
         var now = DateTime.UtcNow;
         await using var context = _contextFactory.CreateDbContext();
-        var expiredCount = await context.PaymentSettlementNotifications
+        var expiredClaims = context.PaymentSettlementNotifications
             .Where(row => row.Status == PaymentSettlementNotificationStatuses.Processing &&
                           row.LeaseUntilUtc.HasValue &&
-                          row.LeaseUntilUtc.Value <= now)
-            .ExecuteUpdateAsync(
+                          row.LeaseUntilUtc.Value <= now);
+        if (!await expiredClaims.AnyAsync(cancellationToken))
+            return;
+
+        var expiredCount = await expiredClaims.ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(row => row.Status, PaymentSettlementNotificationStatuses.DeliveryUncertain)
                     .SetProperty(row => row.LastError, "processing_lease_expired_after_possible_delivery")

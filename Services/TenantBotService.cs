@@ -54,6 +54,9 @@ public partial class TenantBotService
     private static readonly AsyncKeyedGate TenantUniquePayInvoiceCreationGate = new();
     private static readonly AsyncKeyedGate TenantAtlasPayInvoiceCreationGate = new();
     private static readonly AsyncKeyedGate TenantAtlasPayPurchaseGate = new();
+    /// <summary>Serializes one AtlasPay audit in this process without holding the users.db writer while the separate logger outbox commits.</summary>
+    /// <remarks>The persisted success marker prevents normal replay after restart; users.db and the logger outbox are not one atomic database.</remarks>
+    private static readonly AsyncKeyedGate TenantAtlasPayAuditGate = new();
     public const string OwnerMenuButton = "🛒 فعالسازی ربات فروشگاهی";
 
     private const string OWNERCALLBACKPREFIX = "TBM:";
@@ -9282,43 +9285,44 @@ public partial class TenantBotService
     /// <summary>
     /// Emits the missing AtlasPay customer-payment receipt for an already settled, fulfilled tenant order.
     /// </summary>
-    /// <param name="paymentId">Positive users.db AtlasPay payment primary key, not a provider order id.</param>
-    /// <param name="cancellationToken">Cancellation of the short users.db audit transaction.</param>
+    /// <param name="paymentId">Positive global users.db AtlasPay payment primary key, not a provider order id; nonpositive values are ineligible.</param>
+    /// <param name="cancellationToken">Cancellation of the per-payment wait, detached eligibility reads, and short local marker write.</param>
     /// <returns>
-    /// <c>true</c> when the payment log was submitted to the central logger and the UTC marker committed;
-    /// <c>false</c> when already marked or not eligible. The logger controls whether it can durably accept delivery.
+    /// <c>true</c> when this call submitted the payment log and wrote its UTC marker;
+    /// <c>false</c> when already marked, ineligible, removed, or another writer already marked the row.
+    /// The logger controls whether it can durably accept delivery; this result is not a Telegram delivery acknowledgement.
     /// </returns>
     /// <remarks>
     /// Called after first settlement and by audit recovery after false historical markers have been cleared.
-    /// A conditional write takes the users.db SQLite write lock before reading and checking the payment/order,
-    /// preventing parallel callers from enqueueing the same unmarked row under deferred transactions.
-    /// After verifying official success, reciprocal identities/amounts, and fulfilled state, this method submits
-    /// the payment log with stored plan, account, customer charge, provider fee, owner cost, profit, and the owner
-    /// wallet balances captured at fulfillment, then commits the marker. Historical orders without a website-wallet
-    /// observation explicitly show that it was not recorded; the current website balance is never substituted.
-    /// The logger outbox and users.db are separate databases: a crash or
-    /// ambiguous commit between these operations cannot provide cross-database exactly-once delivery.
+    /// A per-payment in-process gate serializes callers in the single application instance. Eligibility reads are
+    /// fully materialized and their context disposed before calling the synchronous logger: its separate outbox
+    /// must never retain the users.db writer or run inside a retryable database delegate.
+    /// After verifying official success, reciprocal tenant/customer identities and amounts, and fulfilled state,
+    /// this method submits the stored plan, account, customer charge, provider fee, owner cost, profit, and the owner
+    /// wallet observations captured at fulfillment, then conditionally writes the marker in a short local operation.
+    /// Only that idempotent marker write can retry SQLite contention; the payment log is never replayed by those retries.
+    /// Historical orders without a website-wallet observation explicitly show that it was not recorded.
+    /// The logger outbox and users.db remain separate databases: a crash or exhausted marker-write failure after
+    /// log admission can cause audit replay during recovery; cross-database exactly-once delivery is not guaranteed.
     /// Logger failures may also be contained internally and are not an acknowledgement of outbox acceptance.
-    /// It never invokes XUI, credits a wallet, appends a ledger entry, changes an order, or resends a notification.
+    /// It never invokes XUI, credits a wallet, appends a ledger entry, changes an order, or resends a customer notification.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The wait or local database work is cancelled; cancellation after log admission may leave its marker unset.</exception>
+    /// <exception cref="Microsoft.Data.Sqlite.SqliteException">A local read fails or the bounded marker-write contention attempts are exhausted.</exception>
     /// <example><code>var logged = await tenantBotService.EnsureAtlasPayTenantPaymentAuditAsync(paymentId, cancellationToken);</code></example>
-    public Task<bool> EnsureAtlasPayTenantPaymentAuditAsync(int paymentId, CancellationToken cancellationToken)
+    public async Task<bool> EnsureAtlasPayTenantPaymentAuditAsync(int paymentId, CancellationToken cancellationToken)
     {
         if (paymentId <= 0)
-            return Task.FromResult(false);
+            return false;
 
-        return _workflow.WriteAsync(async db =>
+        using var lease = await TenantAtlasPayAuditGate.EnterAsync(
+            paymentId.ToString(CultureInfo.InvariantCulture), cancellationToken);
+        AtlasPayPaymentInfo payment;
+        TenantBotOrder order;
+        await using (var db = _serviceProvider.GetRequiredService<UserDbContextFactory>().CreateDbContext())
         {
-            await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-            // Claim the SQLite writer slot before any read: a deferred read transaction alone allows two log enqueues.
-            // The self-assignment changes no stored values; only the later audit marker commit records the event.
-            var claimed = await db.AtlasPayPaymentInfos
-                .Where(x => x.Id == paymentId && x.SuccessLoggedAtUtc == null)
-                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.UpdatedAtUtc, x => x.UpdatedAtUtc),
-                    cancellationToken);
-            if (claimed != 1)
-                return false;
-            var payment = await db.AtlasPayPaymentInfos.FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
+            payment = await db.AtlasPayPaymentInfos.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == paymentId, cancellationToken);
             if (payment == null || payment.SuccessLoggedAtUtc.HasValue ||
                 !string.Equals(payment.PaymentPurpose, TenantBotPaymentPurposes.TenantOrder, StringComparison.OrdinalIgnoreCase) ||
                 !AtlasPayStatuses.IsSuccess(payment.ProviderStatus) || payment.RequiresManualDelivery ||
@@ -9330,7 +9334,7 @@ public partial class TenantBotService
                 !payment.TenantBotOrderId.HasValue)
                 return false;
 
-            var order = await db.TenantBotOrders.FirstOrDefaultAsync(
+            order = await db.TenantBotOrders.AsNoTracking().FirstOrDefaultAsync(
                 x => x.Id == payment.TenantBotOrderId.Value, cancellationToken);
             if (order == null || order.AtlasPayPaymentInfoId != payment.Id ||
                 !string.Equals(order.PaymentProvider, "atlaspay", StringComparison.OrdinalIgnoreCase) ||
@@ -9343,35 +9347,39 @@ public partial class TenantBotService
                 !order.IsFulfilled || order.PaymentStatus != TenantBotOrderStatuses.Fulfilled ||
                 !order.PaidAtUtc.HasValue || !order.FulfilledAtUtc.HasValue)
                 return false;
+        }
 
-            var fee = payment.TotalAmountToman.Value - payment.BaseAmountToman;
-            _logger.LogPayment(
-                "✅ <b>پرداخت رسمی AtlasPay مشتری فروشگاه تأیید شد</b>\n\n" +
-                "🏪 <b>فروشگاه و سفارش</b>\n" +
-                $"🤖 ربات: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
-                $"🧾 سفارش: <code>{Html(order.OrderId)}</code>\n" +
-                $"📦 نوع: <code>{Html(order.OrderKind)}</code> | سرویس: <code>{Html(order.ServiceKey)}</code>\n" +
-                $"📋 پلن: <code>{Html(order.UnlimitedPlanKey ?? order.DurationKey)}</code> | تعداد: <code>{order.AccountCount}</code>\n" +
-                $"👤 مشتری: <code>{order.CustomerTelegramUserId}</code> | مالک: <code>{order.OwnerTelegramUserId}</code>\n\n" +
-                "💳 <b>پرداخت و سهم فروشگاه</b>\n" +
-                $"🔖 Payment ID: <code>AP:{payment.Id}</code> | Provider Order ID: <code>{payment.ProviderOrderId}</code>\n" +
-                $"💰 مبلغ فروش: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
-                $"💵 مبلغ فاکتور: <code>{Html(payment.TotalAmountToman.Value.FormatCurrency())}</code>\n" +
-                $"📉 هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
-                $"📈 سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
-                $"🧮 کارمزد/اختلاف فاکتور: <code>{Html(fee.FormatCurrency())}</code>\n" +
-                BuildTenantOwnerWalletAuditSection(order) +
-                "\n📌 <b>نتیجه</b>\n" +
-                $"🔎 وضعیت درگاه: <code>{Html(payment.ProviderStatus)}</code>\n" +
-                $"🌐 اکانت: <code>{Html(order.CreatedAccountEmail)}</code>\n" +
-                $"📡 منبع تأیید: <code>{Html(order.FulfillmentSource ?? "-")}</code>");
+        // The logger commits to another SQLite file and can wait on its own gate.
+        // Keep that wait outside users.db transactions and database-only retry delegates.
+        var fee = payment.TotalAmountToman.Value - payment.BaseAmountToman;
+        _logger.LogPayment(
+            "✅ <b>پرداخت رسمی AtlasPay مشتری فروشگاه تأیید شد</b>\n\n" +
+            "🏪 <b>فروشگاه و سفارش</b>\n" +
+            $"🤖 ربات: <code>{Html(order.TenantBotId)}</code> @{Html(order.TenantBotUsername)}\n" +
+            $"🧾 سفارش: <code>{Html(order.OrderId)}</code>\n" +
+            $"📦 نوع: <code>{Html(order.OrderKind)}</code> | سرویس: <code>{Html(order.ServiceKey)}</code>\n" +
+            $"📋 پلن: <code>{Html(order.UnlimitedPlanKey ?? order.DurationKey)}</code> | تعداد: <code>{order.AccountCount}</code>\n" +
+            $"👤 مشتری: <code>{order.CustomerTelegramUserId}</code> | مالک: <code>{order.OwnerTelegramUserId}</code>\n\n" +
+            "💳 <b>پرداخت و سهم فروشگاه</b>\n" +
+            $"🔖 Payment ID: <code>AP:{payment.Id}</code> | Provider Order ID: <code>{payment.ProviderOrderId}</code>\n" +
+            $"💰 مبلغ فروش: <code>{Html(payment.BaseAmountToman.FormatCurrency())}</code>\n" +
+            $"💵 مبلغ فاکتور: <code>{Html(payment.TotalAmountToman.Value.FormatCurrency())}</code>\n" +
+            $"📉 هزینه پایه همکار: <code>{Html(order.BaseCostToman.FormatCurrency())}</code>\n" +
+            $"📈 سود همکار: <code>{Html(order.ProfitToman.FormatCurrency())}</code>\n" +
+            $"🧮 کارمزد/اختلاف فاکتور: <code>{Html(fee.FormatCurrency())}</code>\n" +
+            BuildTenantOwnerWalletAuditSection(order) +
+            "\n📌 <b>نتیجه</b>\n" +
+            $"🔎 وضعیت درگاه: <code>{Html(payment.ProviderStatus)}</code>\n" +
+            $"🌐 اکانت: <code>{Html(order.CreatedAccountEmail)}</code>\n" +
+            $"📡 منبع تأیید: <code>{Html(order.FulfillmentSource ?? "-")}</code>");
 
-            payment.SuccessLoggedAtUtc = DateTime.UtcNow;
-            payment.UpdatedAtUtc = DateTime.UtcNow;
-            await db.SaveChangesAsync(cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
-            return true;
-        }, cancellationToken);
+        var loggedAt = DateTime.UtcNow;
+        var marked = await _workflow.WriteAsync(db => db.AtlasPayPaymentInfos
+            .Where(x => x.Id == paymentId && x.SuccessLoggedAtUtc == null)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.SuccessLoggedAtUtc, loggedAt)
+                .SetProperty(x => x.UpdatedAtUtc, loggedAt), cancellationToken), cancellationToken);
+        return marked == 1;
     }
 
     /// <summary>

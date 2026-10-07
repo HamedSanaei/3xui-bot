@@ -508,6 +508,121 @@ public sealed partial class ConcurrencyTests
         }
     }
 
+    /// <summary>A stalled AtlasPay audit logger must not retain the application writer or admit a concurrent duplicate audit.</summary>
+    /// <returns>A task completing after an independent WAL write, concurrent replay, and persisted marker are verified.</returns>
+    /// <remarks>Regression for logger outbox admission inside a users.db transaction. The logger attempts a real independent write
+    /// and then pauses; a second scoped caller must wait on the payment gate, not the database writer.</remarks>
+    [Fact]
+    public async Task AtlasPay_audit_logger_does_not_hold_users_writer_and_serializes_replay()
+    {
+        using var databases = new Databases();
+        var (provider, _, _) = IncidentProvider(databases);
+        await using (provider)
+        {
+            int paymentId;
+            await using (var db = databases.Users.CreateDbContext())
+            {
+                var now = DateTime.UtcNow;
+                var order = new TenantBotOrder
+                {
+                    OrderId = "audit-contention", TenantBotId = "tenant-audit-contention",
+                    OwnerTelegramUserId = 711, CustomerTelegramUserId = 812, CustomerChatId = 812,
+                    SalePriceToman = 100_000, BaseCostToman = 60_000, ProfitToman = 40_000,
+                    OwnerWalletDelta = 40_000, OwnerBalanceBefore = -70_000, OwnerBalanceAfter = -30_000,
+                    PaymentProvider = "atlaspay", IsFulfilled = true,
+                    PaymentStatus = TenantBotOrderStatuses.Fulfilled, PaidAtUtc = now, FulfilledAtUtc = now
+                };
+                db.TenantBotOrders.Add(order);
+                await db.SaveChangesAsync();
+                var payment = VerifiedAtlasPayment();
+                payment.PaymentPurpose = TenantBotPaymentPurposes.TenantOrder;
+                payment.BotId = order.TenantBotId;
+                payment.TelegramUserId = order.CustomerTelegramUserId;
+                payment.TenantOwnerTelegramUserId = order.OwnerTelegramUserId;
+                payment.TenantBotOrderId = order.Id;
+                payment.BaseAmountToman = order.SalePriceToman;
+                payment.TotalAmountToman = 112_000;
+                payment.ProviderStatus = "settled";
+                payment.PaidAtUtc = now; payment.SettledAtUtc = now;
+                payment.SettlementState = AtlasPaySettlementStates.Settled;
+                payment.IsAddedToBalance = true;
+                db.AtlasPayPaymentInfos.Add(payment);
+                await db.SaveChangesAsync();
+                order.AtlasPayPaymentInfoId = payment.Id;
+                await db.SaveChangesAsync();
+                paymentId = payment.Id;
+            }
+
+            using var logger = new AtlasAuditContentionLogger(databases.Users);
+            await using var firstScope = provider.CreateAsyncScope();
+            await using var secondScope = provider.CreateAsyncScope();
+            var first = ActivatorUtilities.CreateInstance<TenantBotService>(firstScope.ServiceProvider, logger);
+            var second = ActivatorUtilities.CreateInstance<TenantBotService>(secondScope.ServiceProvider, logger);
+            var initial = Task.Run(() => first.EnsureAtlasPayTenantPaymentAuditAsync(paymentId, default));
+            Task<bool>? replay = null;
+            try
+            {
+                await logger.Entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                replay = second.EnsureAtlasPayTenantPaymentAuditAsync(paymentId, default);
+                Assert.False(replay.IsCompleted);
+            }
+            finally
+            {
+                logger.Release.Set();
+                await initial;
+                if (replay != null) await replay;
+            }
+            Assert.True(await initial);
+            Assert.False(await replay!);
+            Assert.Null(logger.WriterError);
+            Assert.Equal(1, logger.Calls);
+            await using var verify = databases.Users.CreateDbContext();
+            var saved = await verify.AtlasPayPaymentInfos.AsNoTracking().SingleAsync(x => x.Id == paymentId);
+            Assert.NotNull(saved.SuccessLoggedAtUtc);
+        }
+    }
+
+    /// <summary>Probes the users.db writer from synchronous audit logging and pauses admission until the test releases it.</summary>
+    /// <param name="factory">Factory owning only the isolated regression database, never production data.</param>
+    private sealed class AtlasAuditContentionLogger(UserDbContextFactory factory) : ILogger<TenantBotService>, IDisposable
+    {
+        /// <summary>Signals after the real independent write attempt has completed.</summary>
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>Allows the blocked logger call to return before fixture disposal.</summary>
+        public ManualResetEventSlim Release { get; } = new();
+        /// <summary>Number of payment audit submissions, including any duplicate caller.</summary>
+        public int Calls;
+        /// <summary>SQLite writer contention observed during logging; null means the writer was available.</summary>
+        public Exception? WriterError;
+        /// <inheritdoc />
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        /// <inheritdoc />
+        public bool IsEnabled(LogLevel level) => true;
+        /// <inheritdoc />
+        public void Log<TState>(LogLevel level, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (eventId.Id != 1000) return;
+            Interlocked.Increment(ref Calls);
+            using var seed = factory.CreateDbContext();
+            var connection = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(
+                seed.Database.GetDbConnection().ConnectionString) { DefaultTimeout = 1 };
+            using var probe = new UserDbContext(new DbContextOptionsBuilder<UserDbContext>()
+                .UseSqlite(connection.ToString()).Options);
+            try
+            {
+                // Even a zero-row UPDATE needs SQLite's writer slot. No financial row is changed by this probe.
+                probe.Database.ExecuteSqlRaw("UPDATE AtlasPayPaymentInfos SET UpdatedAtUtc = UpdatedAtUtc WHERE Id = 0;");
+            }
+            catch (Exception error) { WriterError = error; }
+            Entered.TrySetResult();
+            if (!Release.Wait(TimeSpan.FromSeconds(10)))
+                throw new TimeoutException("The audit regression did not release logger admission.");
+        }
+        /// <summary>Disposes the test barrier after all audit calls have completed.</summary>
+        public void Dispose() => Release.Dispose();
+    }
+
     [Fact]
     public async Task AtlasPay_owned_settlement_credits_base_amount_exactly_once_with_ledger_and_notification()
     {

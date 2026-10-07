@@ -13,10 +13,438 @@ using Xunit;
 using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.DependencyInjection;
+using System.Data.Common;
+using System.Reflection;
 
 /// <summary>Extends the regression suite with recovery, migration, and real HTTP failure boundaries.</summary>
 public sealed partial class ConcurrencyTests
 {
+    /// <summary>Idle production maintenance remains read-only even while an independent WAL writer is held.</summary>
+    /// <param name="workerKind">Production payment, funding, or discount scan to exercise.</param>
+    /// <param name="withRows">Whether to include rows that narrowly fail each maintenance predicate.</param>
+    /// <returns>A task completing only after the scan finishes before the writer is released.</returns>
+    /// <remarks>One-second SQLite timeouts fail accidental writes directly; the cancellation watchdog is not an elapsed-time assertion.</remarks>
+    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Idle_maintenance_scans_finish_while_WAL_writer_is_held"</code></example>
+    [Theory]
+    [InlineData("payment", false)]
+    [InlineData("payment", true)]
+    [InlineData("funding", false)]
+    [InlineData("funding", true)]
+    [InlineData("discount", false)]
+    [InlineData("discount", true)]
+    public async Task Idle_maintenance_scans_finish_while_WAL_writer_is_held(string workerKind, bool withRows)
+    {
+        using var databases = new Databases();
+        if (withRows)
+        {
+            var future = DateTime.UtcNow.AddDays(1);
+            var past = DateTime.UtcNow.AddDays(-60);
+            await using var seed = databases.Users.CreateDbContext();
+            seed.PaymentSettlementNotifications.AddRange(
+                MaintenancePayment("payment-null-lease", PaymentSettlementNotificationStatuses.Processing, null),
+                MaintenancePayment("payment-live-lease", PaymentSettlementNotificationStatuses.Processing, future),
+                MaintenancePayment("payment-terminal", PaymentSettlementNotificationStatuses.Delivered, past),
+                MaintenancePayment("payment-not-due", PaymentSettlementNotificationStatuses.Pending, null, future));
+            seed.TenantStorefrontFundingAlerts.AddRange(
+                MaintenanceFunding("funding-null-lease", TenantStorefrontFundingAlertStatuses.Processing),
+                MaintenanceFunding("funding-live-before-send", TenantStorefrontFundingAlertStatuses.Processing, lease: future),
+                MaintenanceFunding("funding-live-after-send", TenantStorefrontFundingAlertStatuses.Processing, lease: future, sendStarted: past),
+                MaintenanceFunding("funding-not-due", TenantStorefrontFundingAlertStatuses.Pending, nextAttempt: future),
+                MaintenanceFunding("funding-recent", TenantStorefrontFundingAlertStatuses.Delivered, delivered: DateTime.UtcNow),
+                MaintenanceFunding("funding-no-delivery-date", TenantStorefrontFundingAlertStatuses.Delivered),
+                MaintenanceFunding("funding-old-claimed", TenantStorefrontFundingAlertStatuses.Delivered, delivered: past, claimToken: "retained"),
+                MaintenanceFunding("funding-old-leased", TenantStorefrontFundingAlertStatuses.Delivered, delivered: past, lease: past));
+            seed.TenantDiscountQuotes.AddRange(
+                MaintenanceQuote("quote-future", TenantDiscountQuoteStates.Open, future),
+                MaintenanceQuote("quote-admitted", TenantDiscountQuoteStates.Admitted, past),
+                MaintenanceQuote("quote-expired", TenantDiscountQuoteStates.Expired, past));
+            await seed.SaveChangesAsync();
+        }
+        var commands = new MaintenanceCommandInterceptor();
+        var factory = MaintenanceFactory(databases, commands);
+        await using var writer = new SqliteConnection(MaintenanceConnectionString(databases));
+        await writer.OpenAsync();
+        await using (var journal = writer.CreateCommand())
+        {
+            journal.CommandText = "PRAGMA journal_mode;";
+            Assert.Equal("wal", await journal.ExecuteScalarAsync());
+        }
+        using var transaction = writer.BeginTransaction(deferred: false);
+        using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var sends = 0;
+        Assert.Equal(0, await ScanMaintenanceWorkerAsync(workerKind, factory, watchdog.Token, () => sends++));
+        Assert.Equal(0, sends);
+        Assert.Equal(0, commands.Mutations);
+        transaction.Rollback();
+    }
+
+    /// <summary>Eligible payment leases and open quotes still transition, while null/future leases and admitted quotes survive.</summary>
+    /// <returns>A task completing after the stored transition and ownership fields have been checked.</returns>
+    /// <remarks>Funding send-phase recovery and the 100-row retention cap also retain their existing hardening regressions.</remarks>
+    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Maintenance_admission_preserves_eligible_payment_and_quote_transitions"</code></example>
+    [Fact]
+    public async Task Maintenance_admission_preserves_eligible_payment_and_quote_transitions()
+    {
+        using var databases = new Databases();
+        var past = DateTime.UtcNow.AddMinutes(-1);
+        var future = DateTime.UtcNow.AddDays(1);
+        await using (var seed = databases.Users.CreateDbContext())
+        {
+            seed.PaymentSettlementNotifications.AddRange(
+                MaintenancePayment("expired", PaymentSettlementNotificationStatuses.Processing, past),
+                MaintenancePayment("null", PaymentSettlementNotificationStatuses.Processing, null),
+                MaintenancePayment("future", PaymentSettlementNotificationStatuses.Processing, future));
+            seed.TenantDiscountQuotes.AddRange(
+                MaintenanceQuote("open-expired", TenantDiscountQuoteStates.Open, past),
+                MaintenanceQuote("open-future", TenantDiscountQuoteStates.Open, future),
+                MaintenanceQuote("admitted-expired", TenantDiscountQuoteStates.Admitted, past));
+            await seed.SaveChangesAsync();
+        }
+        var factory = MaintenanceFactory(databases);
+        using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, await ScanMaintenanceWorkerAsync("payment", factory, watchdog.Token, () => Assert.Fail("Unexpected payment send")));
+        Assert.Equal(0, await ScanMaintenanceWorkerAsync("discount", factory, watchdog.Token, () => Assert.Fail("Unexpected discount send")));
+        await using var verify = databases.Users.CreateDbContext();
+        var payment = await verify.PaymentSettlementNotifications.SingleAsync(x => x.NotificationKey == "expired");
+        Assert.Equal(PaymentSettlementNotificationStatuses.DeliveryUncertain, payment.Status);
+        Assert.Equal("processing_lease_expired_after_possible_delivery", payment.LastError);
+        Assert.Null(payment.ClaimToken);
+        Assert.Null(payment.LeaseUntilUtc);
+        Assert.Null(payment.NextAttemptAtUtc);
+        Assert.Equal(1, payment.AttemptCount);
+        Assert.Equal(2, await verify.PaymentSettlementNotifications.CountAsync(x => x.Status == PaymentSettlementNotificationStatuses.Processing));
+        Assert.Equal(TenantDiscountQuoteStates.Expired, (await verify.TenantDiscountQuotes.SingleAsync(x => x.SelectionKey == "open-expired")).State);
+        Assert.Equal(TenantDiscountQuoteStates.Open, (await verify.TenantDiscountQuotes.SingleAsync(x => x.SelectionKey == "open-future")).State);
+        Assert.Equal(TenantDiscountQuoteStates.Admitted, (await verify.TenantDiscountQuotes.SingleAsync(x => x.SelectionKey == "admitted-expired")).State);
+    }
+
+    /// <summary>A concurrent state change after a successful maintenance preflight cannot be overwritten or deleted by stale eligibility.</summary>
+    /// <param name="operation">Lease phase, retention, or quote expiry to exercise.</param>
+    /// <returns>A task completing after the deterministic read/write race and persisted state assertions.</returns>
+    /// <remarks>The read interceptor performs a real second-connection WAL commit before allowing the conditional mutation to run.</remarks>
+    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Maintenance_mutations_recheck_predicates_after_preflight_race"</code></example>
+    [Theory]
+    [InlineData("payment")]
+    [InlineData("funding-before-send")]
+    [InlineData("funding-possible-send")]
+    [InlineData("funding-retention")]
+    [InlineData("discount")]
+    public async Task Maintenance_mutations_recheck_predicates_after_preflight_race(string operation)
+    {
+        using var databases = new Databases();
+        var past = DateTime.UtcNow.AddDays(-60);
+        var table = operation == "payment" ? "PaymentSettlementNotifications"
+            : operation == "discount" ? "TenantDiscountQuotes" : "TenantStorefrontFundingAlerts";
+        await using (var seed = databases.Users.CreateDbContext())
+        {
+            if (operation == "payment")
+                seed.PaymentSettlementNotifications.Add(MaintenancePayment("race", PaymentSettlementNotificationStatuses.Processing, past));
+            else if (operation == "discount")
+                seed.TenantDiscountQuotes.Add(MaintenanceQuote("race", TenantDiscountQuoteStates.Open, past));
+            else
+                seed.TenantStorefrontFundingAlerts.Add(MaintenanceFunding("race",
+                    operation == "funding-retention" ? TenantStorefrontFundingAlertStatuses.Delivered : TenantStorefrontFundingAlertStatuses.Processing,
+                    delivered: past, lease: operation == "funding-retention" ? null : past,
+                    sendStarted: operation == "funding-possible-send" ? past : null));
+            await seed.SaveChangesAsync();
+        }
+        var interceptor = new MaintenanceCommandInterceptor(table, async () =>
+        {
+            await using var concurrent = databases.Users.CreateDbContext();
+            if (operation == "payment")
+                await concurrent.PaymentSettlementNotifications.ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Status, PaymentSettlementNotificationStatuses.Delivered));
+            else if (operation == "discount")
+                await concurrent.TenantDiscountQuotes.ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.State, TenantDiscountQuoteStates.Admitted));
+            else if (operation == "funding-retention")
+                await concurrent.TenantStorefrontFundingAlerts.ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.ClaimToken, "new-claim"));
+            else
+                await concurrent.TenantStorefrontFundingAlerts.ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.Cancelled));
+        }, operation == "funding-possible-send" ? "IS NOT NULL" : null);
+        var factory = MaintenanceFactory(databases, interceptor);
+        using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        if (operation.StartsWith("funding-", StringComparison.Ordinal))
+        {
+            using var worker = new TenantStorefrontFundingAlertWorker(factory, new MaintenanceNoSendSender(() => Assert.Fail("Unexpected send")),
+                NullLogger<TenantStorefrontFundingAlertWorker>.Instance);
+            if (operation == "funding-retention")
+                Assert.Equal(0, await worker.CompactDeliveredAsync(watchdog.Token));
+            else
+                await worker.RecoverExpiredClaimsAsync(watchdog.Token);
+        }
+        else
+            Assert.Equal(0, await ScanMaintenanceWorkerAsync(operation, factory, watchdog.Token, () => Assert.Fail("Unexpected send")));
+        Assert.True(interceptor.RaceApplied);
+        await using var verify = databases.Users.CreateDbContext();
+        if (operation == "payment")
+            Assert.Equal(PaymentSettlementNotificationStatuses.Delivered, (await verify.PaymentSettlementNotifications.SingleAsync()).Status);
+        else if (operation == "discount")
+            Assert.Equal(TenantDiscountQuoteStates.Admitted, (await verify.TenantDiscountQuotes.SingleAsync()).State);
+        else
+        {
+            var row = await verify.TenantStorefrontFundingAlerts.SingleAsync();
+            Assert.Equal(operation == "funding-retention" ? TenantStorefrontFundingAlertStatuses.Delivered : TenantStorefrontFundingAlertStatuses.Cancelled, row.Status);
+            if (operation == "funding-retention") Assert.Equal("new-claim", row.ClaimToken);
+        }
+    }
+
+    /// <summary>Rows becoming eligible after an empty preflight wait for the next maintenance cycle.</summary>
+    /// <param name="operation">Maintenance predicate whose empty-read race is exercised.</param>
+    /// <returns>A task completing after the newly eligible row survives the current maintenance call.</returns>
+    /// <remarks>The row is committed on a separate WAL connection after SQLite has executed the empty EXISTS query.</remarks>
+    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Empty_maintenance_preflight_defers_newly_eligible_rows"</code></example>
+    [Theory]
+    [InlineData("payment")]
+    [InlineData("funding-before-send")]
+    [InlineData("funding-possible-send")]
+    [InlineData("funding-retention")]
+    [InlineData("discount")]
+    public async Task Empty_maintenance_preflight_defers_newly_eligible_rows(string operation)
+    {
+        using var databases = new Databases();
+        var past = DateTime.UtcNow.AddDays(-60);
+        var table = operation == "payment" ? "PaymentSettlementNotifications"
+            : operation == "discount" ? "TenantDiscountQuotes" : "TenantStorefrontFundingAlerts";
+        var interceptor = new MaintenanceCommandInterceptor(table, async () =>
+        {
+            await using var concurrent = databases.Users.CreateDbContext();
+            if (operation == "payment")
+                concurrent.PaymentSettlementNotifications.Add(MaintenancePayment("newly-eligible", PaymentSettlementNotificationStatuses.Processing, past));
+            else if (operation == "discount")
+                concurrent.TenantDiscountQuotes.Add(MaintenanceQuote("newly-eligible", TenantDiscountQuoteStates.Open, past));
+            else
+                concurrent.TenantStorefrontFundingAlerts.Add(MaintenanceFunding("newly-eligible",
+                    operation == "funding-retention" ? TenantStorefrontFundingAlertStatuses.Delivered : TenantStorefrontFundingAlertStatuses.Processing,
+                    delivered: past, lease: operation == "funding-retention" ? null : past,
+                    sendStarted: operation == "funding-possible-send" ? past : null));
+            await concurrent.SaveChangesAsync();
+        }, operation == "funding-possible-send" ? "IS NOT NULL" : null);
+        var factory = MaintenanceFactory(databases, interceptor);
+        using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        if (operation.StartsWith("funding-", StringComparison.Ordinal))
+        {
+            using var worker = new TenantStorefrontFundingAlertWorker(factory, new MaintenanceNoSendSender(() => Assert.Fail("Unexpected send")),
+                NullLogger<TenantStorefrontFundingAlertWorker>.Instance);
+            if (operation == "funding-retention")
+                Assert.Equal(0, await worker.CompactDeliveredAsync(watchdog.Token));
+            else
+                await worker.RecoverExpiredClaimsAsync(watchdog.Token);
+        }
+        else
+            Assert.Equal(0, await ScanMaintenanceWorkerAsync(operation, factory, watchdog.Token, () => Assert.Fail("Unexpected send")));
+        Assert.True(interceptor.RaceApplied);
+        Assert.Equal(0, interceptor.Mutations);
+        await using var verify = databases.Users.CreateDbContext();
+        if (operation == "payment")
+            Assert.Equal(PaymentSettlementNotificationStatuses.Processing, (await verify.PaymentSettlementNotifications.SingleAsync()).Status);
+        else if (operation == "discount")
+            Assert.Equal(TenantDiscountQuoteStates.Open, (await verify.TenantDiscountQuotes.SingleAsync()).State);
+        else
+            Assert.Equal(operation == "funding-retention" ? TenantStorefrontFundingAlertStatuses.Delivered : TenantStorefrontFundingAlertStatuses.Processing,
+                (await verify.TenantStorefrontFundingAlerts.SingleAsync()).Status);
+    }
+
+    /// <summary>A BUSY reported after an applied retention DELETE must not replay and remove a second batch.</summary>
+    /// <returns>A task completing after exactly 100 committed deletions and propagation of the injected cleanup failure.</returns>
+    /// <remarks>The first DELETE executes on the real WAL file before interception injects the cleanup-time exception.</remarks>
+    /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Funding_retention_does_not_replay_after_applied_delete_reports_busy"</code></example>
+    [Fact]
+    public async Task Funding_retention_does_not_replay_after_applied_delete_reports_busy()
+    {
+        using var databases = new Databases();
+        await using (var seed = databases.Users.CreateDbContext())
+        {
+            for (var i = 0; i < 150; i++)
+                seed.TenantStorefrontFundingAlerts.Add(MaintenanceFunding($"cleanup:{i}", TenantStorefrontFundingAlertStatuses.Delivered,
+                    delivered: DateTime.UtcNow.AddDays(-60)));
+            await seed.SaveChangesAsync();
+        }
+        var failure = new AppliedRetentionBusyInterceptor();
+        using var worker = new TenantStorefrontFundingAlertWorker(MaintenanceFactory(databases, failure),
+            new MaintenanceNoSendSender(() => Assert.Fail("Unexpected send")), NullLogger<TenantStorefrontFundingAlertWorker>.Instance);
+        using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var exception = await Assert.ThrowsAsync<SqliteException>(() => worker.CompactDeliveredAsync(watchdog.Token));
+        Assert.Equal(5, exception.SqliteErrorCode);
+        Assert.Equal(1, failure.ExecutedDeletes);
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Equal(50, await verify.TenantStorefrontFundingAlerts.CountAsync());
+    }
+
+    /// <summary>Injects a one-shot SQLite cleanup failure after a real retention statement has already completed.</summary>
+    private sealed class AppliedRetentionBusyInterceptor : DbCommandInterceptor
+    {
+        /// <summary>Number of real DELETE statements completed before interception.</summary>
+        public int ExecutedDeletes { get; private set; }
+
+        /// <summary>Returns normal command results except for the first completed retention DELETE.</summary>
+        /// <param name="command">Completed production command.</param>
+        /// <param name="eventData">Execution diagnostics.</param>
+        /// <param name="result">Actual number of affected rows.</param>
+        /// <param name="cancellationToken">Test watchdog.</param>
+        /// <returns>The original affected-row count on later or unrelated statements.</returns>
+        /// <exception cref="SqliteException">The first DELETE has already applied when the injected BUSY is reported.</exception>
+        public override ValueTask<int> NonQueryExecutedAsync(DbCommand command, CommandExecutedEventData eventData,
+            int result, CancellationToken cancellationToken = default)
+        {
+            if (command.CommandText.TrimStart().StartsWith("DELETE", StringComparison.OrdinalIgnoreCase) && ++ExecutedDeletes == 1)
+                throw new SqliteException("Injected cleanup BUSY after applied retention delete", 5);
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>Builds a nonpooled one-second-timeout connection string scoped to the temporary users.db file.</summary>
+    /// <param name="databases">Fixture owning the file and its cleanup.</param>
+    /// <returns>A test-only connection string; production options are unchanged.</returns>
+    private static string MaintenanceConnectionString(Databases databases) =>
+        new SqliteConnectionStringBuilder(SqliteOperation.ConnectionString(Path.Combine(databases.DirectoryPath, "users.db")))
+        { Pooling = false, DefaultTimeout = 1 }.ToString();
+
+    /// <summary>Creates production contexts with optional command interception against the same real WAL file.</summary>
+    /// <param name="databases">Temporary database owner.</param>
+    /// <param name="interceptors">Observers or deterministic preflight race hooks.</param>
+    /// <returns>An independent users.db factory with one-second accidental-write failure bounds.</returns>
+    private static UserDbContextFactory MaintenanceFactory(Databases databases, params IInterceptor[] interceptors) =>
+        new(new DbContextOptionsBuilder<UserDbContext>()
+            .UseSqlite(MaintenanceConnectionString(databases), sqlite => sqlite.CommandTimeout(1))
+            .AddInterceptors(interceptors).Options);
+
+    /// <summary>Builds a valid payment row without enqueuing a financial operation.</summary>
+    /// <param name="key">Unique local notification key.</param>
+    /// <param name="status">Delivery state under test.</param>
+    /// <param name="lease">Lease eligibility timestamp.</param>
+    /// <param name="nextAttempt">Optional pending delivery timestamp.</param>
+    /// <returns>A detached notification ready for fixture persistence.</returns>
+    private static PaymentSettlementNotification MaintenancePayment(string key, string status, DateTime? lease, DateTime? nextAttempt = null) =>
+        new() { NotificationKey = key, Provider = "test", MessageText = "maintenance", BotId = "maintenance",
+            Status = status, LeaseUntilUtc = lease, ClaimToken = "original-claim", AttemptCount = 1,
+            NextAttemptAtUtc = nextAttempt, CreatedAtUtc = DateTime.UtcNow, UpdatedAtUtc = DateTime.UtcNow };
+
+    /// <summary>Builds a valid funding outbox row with independently controlled maintenance fields.</summary>
+    /// <param name="key">Unique outbox business key.</param>
+    /// <param name="status">Outbox delivery state.</param>
+    /// <param name="delivered">Delivery time for retention eligibility.</param>
+    /// <param name="lease">Lease time for recovery or retention protection.</param>
+    /// <param name="sendStarted">Durable possible-send phase.</param>
+    /// <param name="claimToken">Optional retention-protecting owner token.</param>
+    /// <param name="nextAttempt">Optional future pending delivery time.</param>
+    /// <returns>A detached row ready for fixture persistence.</returns>
+    private static TenantStorefrontFundingAlert MaintenanceFunding(string key, string status, DateTime? delivered = null,
+        DateTime? lease = null, DateTime? sendStarted = null, string? claimToken = null, DateTime? nextAttempt = null) =>
+        new() { BusinessKey = key, TenantBotId = "maintenance", Kind = TenantStorefrontFundingAlertKinds.UnderfundedTransition,
+            Status = status, DeliveredAtUtc = delivered, LeaseUntilUtc = lease, SendStartedAtUtc = sendStarted,
+            ClaimToken = claimToken, NextAttemptAtUtc = nextAttempt };
+
+    /// <summary>Builds a quote with explicit lifecycle and expiry, without admitting an order.</summary>
+    /// <param name="selection">Distinct local quote selection.</param>
+    /// <param name="state">Quote lifecycle state.</param>
+    /// <param name="expiry">Eligibility timestamp.</param>
+    /// <returns>A detached quote ready for persistence.</returns>
+    private static TenantDiscountQuote MaintenanceQuote(string selection, string state, DateTime expiry) =>
+        new() { TenantBotId = "maintenance", SelectionKey = selection, State = state, ExpiresAtUtc = expiry };
+
+    /// <summary>Exercises one real production cycle, using established reflection seams only for the payment worker.</summary>
+    /// <param name="kind">Worker kind under test.</param>
+    /// <param name="factory">Real WAL context factory.</param>
+    /// <param name="token">Cancellation watchdog.</param>
+    /// <param name="sending">Records any unexpected transport invocation.</param>
+    /// <returns>Claimed-row count, or the discount worker's next cursor.</returns>
+    /// <exception cref="OperationCanceledException">The watchdog expires.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The worker kind is unknown.</exception>
+    private static async Task<int> ScanMaintenanceWorkerAsync(string kind, UserDbContextFactory factory, CancellationToken token, Action sending)
+    {
+        using var scopes = new ServiceCollection().BuildServiceProvider();
+        if (kind == "discount")
+        {
+            using var worker = new TenantDiscountReservationWorker(factory, scopes.GetRequiredService<IServiceScopeFactory>(),
+                NullLogger<TenantDiscountReservationWorker>.Instance);
+            return await worker.ProcessOnceAsync(cancellationToken: token);
+        }
+        if (kind == "funding")
+        {
+            using var worker = new TenantStorefrontFundingAlertWorker(factory, new MaintenanceNoSendSender(sending),
+                NullLogger<TenantStorefrontFundingAlertWorker>.Instance);
+            return await worker.ProcessOnceAsync(token);
+        }
+        if (kind != "payment") throw new ArgumentOutOfRangeException(nameof(kind));
+        var clients = new BotClientProvider(new BotRegistry(new ConfigurationBuilder().Build()), _ =>
+        { sending(); throw new InvalidOperationException("Unexpected payment transport"); });
+        using var payment = new PaymentSettlementNotificationWorker(factory, clients, NullLogger<PaymentSettlementNotificationWorker>.Instance);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        await (Task)typeof(PaymentSettlementNotificationWorker).GetMethod("MarkExpiredClaimsUncertainAsync", flags)!
+            .Invoke(payment, new object[] { token })!;
+        var rows = await (Task<IReadOnlyList<PaymentSettlementNotification>>)typeof(PaymentSettlementNotificationWorker)
+            .GetMethod("ClaimDueBatchAsync", flags)!.Invoke(payment, new object[] { token })!;
+        foreach (var row in rows)
+            await (Task)typeof(PaymentSettlementNotificationWorker).GetMethod("DeliverClaimAsync", flags)!
+                .Invoke(payment, new object[] { row, token })!;
+        return rows.Count;
+    }
+
+    /// <summary>Observes maintenance SQL and optionally commits a one-shot competing state transition after preflight.</summary>
+    /// <param name="table">Table whose EXISTS preflight should trigger the race, or null for observation only.</param>
+    /// <param name="race">Real independent-connection state transition.</param>
+    /// <param name="requiredSql">Optional phase-specific SQL fragment distinguishing the second recovery predicate.</param>
+    private sealed class MaintenanceCommandInterceptor(string? table = null, Func<Task>? race = null, string? requiredSql = null) : DbCommandInterceptor
+    {
+        /// <summary>Number of UPDATE or DELETE commands admitted by the scan.</summary>
+        public int Mutations { get; private set; }
+        /// <summary>Whether the deterministic competing commit ran.</summary>
+        public bool RaceApplied { get; private set; }
+
+        /// <summary>Commits the competing transition before the caller resumes its preflight.</summary>
+        /// <param name="command">Executed production query.</param>
+        /// <param name="eventData">Execution diagnostics.</param>
+        /// <param name="result">Actual SQLite result reader.</param>
+        /// <param name="cancellationToken">Test watchdog.</param>
+        /// <returns>The unchanged real result reader.</returns>
+        public override async ValueTask<DbDataReader> ReaderExecutedAsync(DbCommand command, CommandExecutedEventData eventData,
+            DbDataReader result, CancellationToken cancellationToken = default)
+        {
+            if (!RaceApplied && table != null && race != null && command.CommandText.Contains("EXISTS", StringComparison.OrdinalIgnoreCase)
+                && command.CommandText.Contains(table, StringComparison.Ordinal)
+                && (requiredSql == null || command.CommandText.Contains(requiredSql, StringComparison.Ordinal)))
+            {
+                RaceApplied = true;
+                await race();
+            }
+            return result;
+        }
+
+        /// <summary>Counts mutation attempts without suppressing, retrying, or replacing the real SQLite command.</summary>
+        /// <param name="command">Production command about to execute.</param>
+        /// <param name="eventData">Execution diagnostics.</param>
+        /// <param name="result">Original interception result.</param>
+        /// <param name="cancellationToken">Test watchdog.</param>
+        /// <returns>The original interception result.</returns>
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(DbCommand command, CommandEventData eventData,
+            InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            var sql = command.CommandText.TrimStart();
+            if (sql.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase) || sql.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase))
+                Mutations++;
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>Records transport admission; idle scan assertions require this sender never to be invoked.</summary>
+    /// <param name="sending">Transport invocation recorder.</param>
+    private sealed class MaintenanceNoSendSender(Action sending) : ITenantStorefrontFundingAlertSender
+    {
+        /// <summary>Records a send and returns a deterministic message id without external I/O.</summary>
+        /// <param name="alert">Claimed row passed by the production delivery path.</param>
+        /// <param name="cancellationToken">Scan cancellation.</param>
+        /// <returns>A deterministic Telegram acknowledgement id.</returns>
+        public Task<int?> SendAsync(TenantStorefrontFundingAlert alert, CancellationToken cancellationToken)
+        {
+            sending();
+            return Task.FromResult<int?>(123);
+        }
+    }
+
     /// <summary>An immediate website send and recovery of its same saved event issue only one successful order request.</summary>
     /// <returns>A task completing after both callers finish and the outbox is marked succeeded.</returns>
     /// <remarks>The real HTTP barrier also proves an unrelated users.db writer can commit during website I/O.</remarks>

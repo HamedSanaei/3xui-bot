@@ -309,6 +309,12 @@ public sealed class TenantStorefrontFundingAlertDeliveryService
     private static string Html(string value) => WebUtility.HtmlEncode(value ?? string.Empty);
 }
 
+/// <summary>Delivers tenant owner funding alerts with bounded conditional maintenance outside customer update lanes.</summary>
+/// <remarks>
+/// Stored tenant identity and funding episode remain authoritative; claim tokens serialize attempts, and a durable
+/// send-start phase distinguishes retryable pre-send expiry from uncertain delivery. Idle scans remain read-only.
+/// This worker changes only alert delivery state, never owner/customer balances, payments or ledger entries.
+/// </remarks>
 public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
 {
     private const int MaximumAttempts = 6;
@@ -351,6 +357,12 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
         }
     }
 
+    /// <summary>Runs one recovery, retention, and delivery cycle without waiting for the polling interval.</summary>
+    /// <param name="cancellationToken">Cancellation propagated to database commands and delivery.</param>
+    /// <returns>The number of notification rows claimed during this cycle.</returns>
+    /// <remarks>Idle maintenance uses read-only admission checks; claims and Telegram sends are never replayed by this method.</remarks>
+    /// <exception cref="OperationCanceledException">The scan cancellation token is cancelled.</exception>
+    /// <example>An empty cycle returns zero even while a different WAL connection holds a writer transaction.</example>
     internal async Task<int> ProcessOnceAsync(CancellationToken cancellationToken = default)
     {
         await RecoverExpiredClaimsAsync(cancellationToken);
@@ -365,30 +377,36 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
     /// becoming DeliveryUncertain.
     /// </summary>
     /// <param name="cancellationToken">Scan cancellation token.</param>
-    /// <returns>A task completing after both recovery updates are applied.</returns>
+    /// <returns>A task completing after eligible recovery updates, or read-only checks when neither phase is due.</returns>
     /// <remarks>
     /// An expired claim whose <see cref="TenantStorefrontFundingAlert.SendStartedAtUtc"/> is null proves no Telegram
     /// request was started, so the row returns to Pending with an immediate retry. An expired claim whose send phase
     /// is set may have invoked Telegram, so it is conservatively marked DeliveryUncertain and never replayed.
+    /// Each send-phase predicate is reused for its admission read and conditional update. Claims becoming eligible
+    /// after an empty check wait for the next cycle; a concurrent state change is still protected by the update predicate.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The scan cancellation token is cancelled.</exception>
+    /// <example>An expired pre-send claim returns to Pending; an expired possible-send claim becomes DeliveryUncertain.</example>
     internal async Task RecoverExpiredClaimsAsync(CancellationToken cancellationToken = default)
     {
         var now = DateTime.UtcNow;
         await using var db = _factory.CreateDbContext();
-        await db.TenantStorefrontFundingAlerts
+        var beforeSend = db.TenantStorefrontFundingAlerts
             .Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Processing && x.LeaseUntilUtc <= now
-                        && x.SendStartedAtUtc == null)
-            .ExecuteUpdateAsync(s => s
+                        && x.SendStartedAtUtc == null);
+        if (await beforeSend.AnyAsync(cancellationToken))
+            await beforeSend.ExecuteUpdateAsync(s => s
                 .SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.Pending)
                 .SetProperty(x => x.NextAttemptAtUtc, now)
                 .SetProperty(x => x.LastError, "processing_lease_expired_before_send")
                 .SetProperty(x => x.ClaimToken, (string)null)
                 .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
                 .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
-        await db.TenantStorefrontFundingAlerts
+        var possibleSend = db.TenantStorefrontFundingAlerts
             .Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Processing && x.LeaseUntilUtc <= now
-                        && x.SendStartedAtUtc != null)
-            .ExecuteUpdateAsync(s => s
+                        && x.SendStartedAtUtc != null);
+        if (await possibleSend.AnyAsync(cancellationToken))
+            await possibleSend.ExecuteUpdateAsync(s => s
                 .SetProperty(x => x.Status, TenantStorefrontFundingAlertStatuses.DeliveryUncertain)
                 .SetProperty(x => x.LastError, "processing_lease_expired_after_possible_delivery")
                 .SetProperty(x => x.ClaimToken, (string)null)
@@ -405,22 +423,28 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
     /// <remarks>
     /// Only rows that are Delivered, delivered before the cutoff, and free of any claim or lease are candidates.
     /// Pending, Processing, DeliveryUncertain, ManualReview, and Cancelled rows are never deleted automatically.
+    /// An empty eligibility check never issues DELETE. The bounded candidate query is evaluated again by DELETE,
+    /// not materialized into stale ids, so concurrent state changes remain protected by the full retention predicate.
+    /// Deletion is issued only once: a SQLite failure after execution must not replay another retention batch.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The scan cancellation token is cancelled.</exception>
+    /// <example>With 150 eligible Delivered rows, one call deletes at most 100; a later call may delete the remainder.</example>
     internal async Task<int> CompactDeliveredAsync(CancellationToken cancellationToken = default)
     {
         if (_retentionDays <= 0)
             return 0;
         var cutoff = DateTime.UtcNow.AddDays(-Math.Min(_retentionDays, 36500));
-        return await SqliteOperation.RunAsync(async ct =>
-        {
-            await using var db = _factory.CreateDbContext();
-            var candidates = db.TenantStorefrontFundingAlerts
-                .Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Delivered &&
-                            x.DeliveredAtUtc != null && x.DeliveredAtUtc < cutoff &&
-                            x.ClaimToken == null && x.LeaseUntilUtc == null)
-                .OrderBy(x => x.Id).Select(x => x.Id).Take(MaximumCleanupBatch);
-            return await db.TenantStorefrontFundingAlerts.Where(x => candidates.Contains(x.Id)).ExecuteDeleteAsync(ct);
-        }, cancellationToken);
+        await using var db = _factory.CreateDbContext();
+        var eligible = db.TenantStorefrontFundingAlerts
+            .Where(x => x.Status == TenantStorefrontFundingAlertStatuses.Delivered &&
+                        x.DeliveredAtUtc != null && x.DeliveredAtUtc < cutoff &&
+                        x.ClaimToken == null && x.LeaseUntilUtc == null);
+        if (!await eligible.AnyAsync(cancellationToken))
+            return 0;
+
+        var candidates = eligible.OrderBy(x => x.Id).Select(x => x.Id).Take(MaximumCleanupBatch);
+        return await db.TenantStorefrontFundingAlerts
+            .Where(x => candidates.Contains(x.Id)).ExecuteDeleteAsync(cancellationToken);
     }
 
     private async Task<List<TenantStorefrontFundingAlert>> ClaimDueBatchAsync(CancellationToken cancellationToken)

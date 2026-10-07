@@ -547,9 +547,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   one-time storefront fulfillment path, then `EnsureAtlasPayTenantPaymentAuditAsync` emits a separate protected
   `LogPayment` receipt with local `AP:` id, provider order id, buyer/owner, tenant/order, service/plan/account,
   customer base and charged total, invoice fee, owner base cost/profit, and provider status. It verifies reciprocal
-  payment/order links and settled fulfillment, and uses the
-  `SuccessLoggedAtUtc` marker to avoid repeat audits. The users.db marker and Telegram logger outbox are separate
-  databases: delivery/admission failure is not crash-atomic with the marker; check the logger destination/outbox
+  payment/order links and settled fulfillment. A per-payment in-process gate serializes audits; detached reads
+  finish before logger admission, with no users.db writer retained across the separate logger outbox commit.
+  Only the conditional `SuccessLoggedAtUtc` marker write can retry contention, never `LogPayment`.
+  The databases are not crash-atomic; exhausted marker persistence after admission may replay an audit on recovery.
+  Check the logger destination/outbox
   when a report is missing. Data-only migration `20260929120000_RequeueAtlasPayTenantPaymentAudits` clears historical
   false markers for linked, already-fulfilled AtlasPay orders; `AtlasPayReconciliationHostedService` scans bounded
   missing audits without re-inquiring the provider or re-running XUI/wallet/ledger/customer delivery. The original
@@ -752,6 +754,14 @@ and the main menu.
 - `Data/SqliteOperation.cs`: retries ONLY SQLite BUSY/LOCKED (5/6), at most 3 attempts, fresh context per attempt,
   bounded 50/150ms + 0-50ms jitter backoff, never network inside the delegate. Both databases run WAL with a 5s busy
   timeout and private cache; connections are per-operation and short.
+- SQLite scan contention (2026-10-07): payment/tenant-receipt/funding lease recovery, funding retention and discount
+  quote expiry preflight their exact predicates with read-only EXISTS; idle cycles never issue UPDATE/DELETE.
+  Mutations recheck the predicates; newly eligible rows after an empty read wait for the next cycle. Funding cleanup
+  remains <=100 rows and never retries an applied deletion batch. Native SQLite async commands still run synchronously.
+  A receipt accepted by Telegram never returns to Pending after ACK persistence failure: owned-token quarantine
+  preserves applied Delivered/replacement claims, or retains Processing until expiry to DeliveryUncertain.
+  Regressions: `ReliabilityTests.cs`, `ReliabilityIncidentRegressionTests.cs`, `AtlasPayTests.cs`; operating notes
+  in `docs/deployment.md`. No schema, funding-policy, timeout, pooling or financial mutation change.
 
 ### Foreground I/O bounds and lane-blocker diagnostics
 

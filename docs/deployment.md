@@ -76,6 +76,41 @@ service; a failing gate exits before the protected `Data` directory or systemd i
 preflight all precede synchronization, and synchronization precedes the restart) so the gate cannot be dropped or moved
 by a later edit on a machine without rsync or systemd.
 
+## SQLite scan contention and receipt acknowledgement recovery
+
+The 2026-10-07 incident reported simultaneous receipt, funding-alert, discount and payment-notification scan failures
+with SQLite error 5 (`database is locked`) and a Kestrel thread-pool starvation warning. Read-only server inspection
+found WAL already enabled, one application process and mostly terminal notification queues. The exact long-held
+writer at the incident time is not identified by the available stack; a cleanup-time exception does not prove the
+preceding statement was unapplied.
+
+Two code paths amplified contention. Even a zero-row UPDATE/DELETE acquires SQLite's single writer, and the provider's
+async command API performs synchronous native work. Idle lease/expiry/retention writes therefore blocked otherwise
+empty scans. AtlasPay tenant audit submission also waited for the separate durable logger outbox while retaining the
+users.db writer inside a retryable transaction.
+
+The corrected payment, tenant-receipt, funding-alert and discount scans first perform a read-only eligibility check
+and retain the full predicate on the eventual mutation. Work becoming eligible after an empty read waits for the
+next cycle. Funding retention deletes at most one 100-row batch without replaying an ambiguously applied DELETE.
+Eligible writes can still report genuine contention; worker error reporting, WAL, pooling and native timeouts are
+unchanged. Increasing Telegram concurrency or retrying entire scans is not a substitute for short write boundaries.
+
+AtlasPay audits now materialize eligible payment/order snapshots, dispose the read context, and admit the log without
+a users.db transaction. A per-payment gate serializes callers in the single application process. Only the idempotent
+marker update can retry; logger admission cannot repeat inside a database retry. The logger outbox and users.db are
+not crash-atomic: a process crash or exhausted marker write after admission can still produce an audit replay during
+recovery. No account, balance, owner profit or ledger operation is repeated by audit recovery.
+
+If Telegram accepts a tenant receipt but its message-id acknowledgement fails to persist, the worker quarantines
+only its original Processing/claim-token pair as DeliveryUncertain. If that write also fails, it retains the lease;
+expiry also becomes DeliveryUncertain, never Pending. An acknowledgement already applied before provider cleanup
+failed remains Delivered. Verify the Sales Assistant's actual message before any manual retry; do not bulk-reset
+Processing or DeliveryUncertain rows, because doing so can resend accepted receipts.
+
+No new schema migration, database repair, pool change or manual WAL switch is required by this fix. The tenant
+underfunding central-gateway fallback and personal-card funding admission rules remain unchanged. Use the normal
+production deployment gates above; do not copy standalone smoke tooling or test assemblies into the server publish.
+
 ## Shared owned and tenant installation tutorial assets
 
 `Assets/tutorials/{android_v2rayng,windows_v2rayn,ios_android_v2box}/` is application content, not persistent

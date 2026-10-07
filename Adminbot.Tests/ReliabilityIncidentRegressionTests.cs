@@ -1,8 +1,11 @@
 ﻿using System.Collections.Concurrent;
+using System.Data.Common;
 using System.Reflection;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -196,6 +199,193 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(TenantManualReceiptNotificationStatuses.Delivered, row.Status);
         Assert.Equal(4242, row.TelegramMessageId);
         Assert.NotNull(row.DeliveredAtUtc);
+    }
+
+    /// <summary>An idle receipt scan reads terminal, future and unexpired rows without contending with a real WAL writer.</summary>
+    /// <returns>A task verifying zero sends and zero claimed rows while another connection owns the writer lock.</returns>
+    [Fact]
+    public async Task Idle_receipt_scan_completes_while_sqlite_writer_is_held()
+    {
+        using var databases = new Databases();
+        await SeedReceiptAcknowledgementAsync(databases);
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            await db.TenantManualReceiptNotifications.ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, TenantManualReceiptNotificationStatuses.Delivered));
+            db.TenantManualReceiptNotifications.AddRange(
+                new TenantManualReceiptNotification
+                {
+                    ReceiptId = 91002, Status = TenantManualReceiptNotificationStatuses.Pending,
+                    NextAttemptAtUtc = DateTime.UtcNow.AddHours(1)
+                },
+                new TenantManualReceiptNotification
+                {
+                    ReceiptId = 91003, Status = TenantManualReceiptNotificationStatuses.Processing,
+                    ClaimToken = "unexpired-claim", LeaseUntilUtc = DateTime.UtcNow.AddHours(1)
+                });
+            await db.SaveChangesAsync();
+        }
+
+        var factory = ReceiptContentionFactory(databases);
+        var sender = new CountingReceiptSender();
+        using var worker = new TenantManualReceiptNotificationWorker(
+            factory, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        await using var writer = new SqliteConnection(ReceiptConnectionString(databases));
+        await writer.OpenAsync();
+        using var transaction = writer.BeginTransaction(deferred: false);
+        Assert.Equal(0, await Task.Run(() => worker.ProcessOnceAsync()).WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, sender.SuccessCount);
+        transaction.Rollback();
+    }
+
+    /// <summary>A real accepted receipt never returns to pending when SQLite blocks acknowledgement, even across lease expiry and restart.</summary>
+    /// <param name="releaseBeforeQuarantine">Whether the writer is released after the actual BUSY failure or remains held through quarantine.</param>
+    /// <returns>A task verifying the sender is invoked exactly once and persistence remains non-retryable.</returns>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Receipt_acknowledgement_busy_never_authorizes_another_send(bool releaseBeforeQuarantine)
+    {
+        using var databases = new Databases();
+        await SeedReceiptAcknowledgementAsync(databases);
+        var busy = new ReceiptAcknowledgementBusyBarrier();
+        var factory = ReceiptContentionFactory(databases, busy);
+        var sender = new BlockingReceiptSender();
+        using var worker = new TenantManualReceiptNotificationWorker(
+            factory, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        var scan = Task.Run(() => worker.ProcessOnceAsync());
+        try
+        {
+            await sender.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await using var writer = new SqliteConnection(ReceiptConnectionString(databases));
+            await writer.OpenAsync();
+            using var transaction = writer.BeginTransaction(deferred: false);
+            sender.Release.TrySetResult();
+            await busy.Observed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            if (releaseBeforeQuarantine)
+                transaction.Commit();
+            busy.Continue.TrySetResult();
+            Assert.Equal(1, await scan.WaitAsync(TimeSpan.FromSeconds(10)));
+            if (!releaseBeforeQuarantine)
+                transaction.Rollback();
+        }
+        finally
+        {
+            sender.Release.TrySetResult();
+            busy.Continue.TrySetResult();
+            await scan.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var row = await db.TenantManualReceiptNotifications.SingleAsync();
+            Assert.Equal(releaseBeforeQuarantine
+                ? TenantManualReceiptNotificationStatuses.DeliveryUncertain
+                : TenantManualReceiptNotificationStatuses.Processing, row.Status);
+            Assert.Null(row.NextAttemptAtUtc);
+            if (!releaseBeforeQuarantine)
+            {
+                Assert.NotNull(row.ClaimToken);
+                Assert.NotNull(row.LeaseUntilUtc);
+                await db.TenantManualReceiptNotifications.ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.LeaseUntilUtc, DateTime.UtcNow.AddMinutes(-1)));
+            }
+        }
+
+        using var restarted = new TenantManualReceiptNotificationWorker(
+            factory, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        Assert.Equal(0, await restarted.ProcessOnceAsync());
+        Assert.Equal(0, await restarted.ProcessOnceAsync());
+        Assert.Equal(1, sender.SuccessCount);
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Equal(TenantManualReceiptNotificationStatuses.DeliveryUncertain,
+            (await verify.TenantManualReceiptNotifications.SingleAsync()).Status);
+    }
+
+    /// <summary>A provider failure after the real acknowledgement UPDATE cannot downgrade its already committed delivered row.</summary>
+    /// <returns>A task verifying the applied acknowledgement survives quarantine and restart without a second send.</returns>
+    [Fact]
+    public async Task Applied_receipt_acknowledgement_failure_preserves_delivered_status()
+    {
+        using var databases = new Databases();
+        await SeedReceiptAcknowledgementAsync(databases);
+        var cleanupFailure = new ReceiptAppliedAcknowledgementFailure();
+        var factory = ReceiptContentionFactory(databases, cleanupFailure);
+        var sender = new CountingReceiptSender();
+        using var worker = new TenantManualReceiptNotificationWorker(
+            factory, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        Assert.Equal(1, await worker.ProcessOnceAsync());
+        Assert.Equal(1, cleanupFailure.Failures);
+        using var restarted = new TenantManualReceiptNotificationWorker(
+            factory, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        Assert.Equal(0, await restarted.ProcessOnceAsync());
+        Assert.Equal(1, sender.SuccessCount);
+        await using var verify = databases.Users.CreateDbContext();
+        var row = await verify.TenantManualReceiptNotifications.SingleAsync();
+        Assert.Equal(TenantManualReceiptNotificationStatuses.Delivered, row.Status);
+        Assert.Equal(4242, row.TelegramMessageId);
+        Assert.NotNull(row.DeliveredAtUtc);
+        Assert.Null(row.LastError);
+    }
+
+    /// <summary>An accepted receipt cannot quarantine a processing claim that no longer belongs to its send attempt.</summary>
+    /// <returns>A task verifying an acknowledgement mismatch preserves the replacement token and never releases pending.</returns>
+    [Fact]
+    public async Task Receipt_acknowledgement_mismatch_preserves_another_claim()
+    {
+        using var databases = new Databases();
+        await SeedReceiptAcknowledgementAsync(databases);
+        var sender = new BlockingReceiptSender();
+        using var worker = new TenantManualReceiptNotificationWorker(
+            databases.Users, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        var scan = worker.ProcessOnceAsync();
+        try
+        {
+            await sender.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await using var db = databases.Users.CreateDbContext();
+            await db.TenantManualReceiptNotifications.ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.ClaimToken, "replacement-claim")
+                .SetProperty(x => x.LastError, "replacement_claim_owned_elsewhere")
+                .SetProperty(x => x.LeaseUntilUtc, DateTime.UtcNow.AddHours(1)));
+            sender.Release.TrySetResult();
+            Assert.Equal(1, await scan.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+        finally
+        {
+            sender.Release.TrySetResult();
+            await scan.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        using var restarted = new TenantManualReceiptNotificationWorker(
+            databases.Users, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        Assert.Equal(0, await restarted.ProcessOnceAsync());
+        Assert.Equal(1, sender.SuccessCount);
+        await using var verify = databases.Users.CreateDbContext();
+        var row = await verify.TenantManualReceiptNotifications.SingleAsync();
+        Assert.Equal(TenantManualReceiptNotificationStatuses.Processing, row.Status);
+        Assert.Equal("replacement-claim", row.ClaimToken);
+        Assert.Equal("replacement_claim_owned_elsewhere", row.LastError);
+    }
+
+    /// <summary>Shutdown after the sender returns an accepted message does not release the receipt for another attempt.</summary>
+    /// <returns>A task verifying post-acceptance cancellation is quarantined independently of the host token.</returns>
+    [Fact]
+    public async Task Receipt_cancellation_after_acceptance_does_not_authorize_retry()
+    {
+        using var databases = new Databases();
+        await SeedReceiptAcknowledgementAsync(databases);
+        using var cancellation = new CancellationTokenSource();
+        var sender = new AcceptedThenCancelledReceiptSender(cancellation);
+        using var worker = new TenantManualReceiptNotificationWorker(
+            databases.Users, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        Assert.Equal(1, await worker.ProcessOnceAsync(cancellation.Token));
+        using var restarted = new TenantManualReceiptNotificationWorker(
+            databases.Users, sender, NullLogger<TenantManualReceiptNotificationWorker>.Instance);
+        Assert.Equal(0, await restarted.ProcessOnceAsync());
+        Assert.Equal(1, sender.SuccessCount);
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Equal(TenantManualReceiptNotificationStatuses.DeliveryUncertain,
+            (await verify.TenantManualReceiptNotifications.SingleAsync()).Status);
     }
 
     [Fact]
@@ -394,6 +584,124 @@ public sealed partial class ConcurrencyTests
         return (services.BuildServiceProvider(), registry, clients);
     }
 
+    /// <summary>Persists a receipt and its real pending notification in the fixture's isolated WAL database.</summary>
+    /// <param name="databases">Fixture owning the database files.</param>
+    /// <returns>A task that completes after both rows are durable.</returns>
+    /// <remarks>Creates only isolated test receipt/outbox records; no wallet, provider, panel or Telegram side effect occurs.</remarks>
+    private static async Task SeedReceiptAcknowledgementAsync(Databases databases)
+    {
+        await using var db = databases.Users.CreateDbContext();
+        var receipt = new TenantManualPaymentReceipt
+        {
+            TenantBotOrderId = 91001, OrderId = "acknowledgement-order", TenantBotId = "tenant-reset",
+            OwnerTelegramUserId = 711, CustomerTelegramUserId = 7468859738,
+            CustomerChatId = 7468859738, PhotoFileId = "accepted-receipt", AmountToman = 1000
+        };
+        db.TenantManualPaymentReceipts.Add(receipt);
+        await db.SaveChangesAsync();
+        db.TenantManualReceiptNotifications.Add(new TenantManualReceiptNotification { ReceiptId = receipt.Id });
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>Uses the existing WAL fixture with a one-second native SQLite timeout and no shared pool.</summary>
+    /// <param name="databases">Fixture whose users.db connection string is reused.</param>
+    /// <returns>A connection string scoped exclusively to the fixture's temporary file.</returns>
+    private static string ReceiptConnectionString(Databases databases)
+    {
+        using var db = databases.Users.CreateDbContext();
+        return new SqliteConnectionStringBuilder(db.Database.GetConnectionString())
+        {
+            DefaultTimeout = 1, Pooling = false
+        }.ToString();
+    }
+
+    /// <summary>Creates independent production contexts with a bounded native lock wait and optional provider-boundary interception.</summary>
+    /// <param name="databases">Fixture containing the already-created WAL schema.</param>
+    /// <param name="interceptors">Interceptors observing or faulting actual executed commands, never replacing their result.</param>
+    /// <returns>A factory using the real Microsoft SQLite provider against the isolated file.</returns>
+    private static UserDbContextFactory ReceiptContentionFactory(Databases databases, params IInterceptor[] interceptors) =>
+        new(new DbContextOptionsBuilder<UserDbContext>()
+            .UseSqlite(ReceiptConnectionString(databases), sqlite => sqlite.CommandTimeout(1))
+            .AddInterceptors(interceptors).Options);
+
+    /// <summary>Identifies the acknowledgement command by its real table and delivered-timestamp assignment.</summary>
+    /// <param name="command">SQL command emitted by the receipt worker.</param>
+    /// <returns>True only for the receipt acknowledgement UPDATE, excluding claims and quarantine.</returns>
+    private static bool IsReceiptAcknowledgement(DbCommand command) =>
+        command.CommandText.StartsWith("UPDATE \"TenantManualReceiptNotifications\"", StringComparison.Ordinal) &&
+        command.CommandText.Contains("\"DeliveredAtUtc\"", StringComparison.Ordinal);
+
+    /// <summary>Pauses propagation of an actual native BUSY acknowledgement so the test controls quarantine lock availability.</summary>
+    private sealed class ReceiptAcknowledgementBusyBarrier : DbCommandInterceptor
+    {
+        /// <summary>Completes only after the real provider reports SQLITE_BUSY for the acknowledgement.</summary>
+        public TaskCompletionSource Observed { get; } = Signal();
+        /// <summary>Allows the failed command to unwind after the test chooses whether to release its writer.</summary>
+        public TaskCompletionSource Continue { get; } = Signal();
+
+        /// <summary>Observes native acknowledgement failure without suppressing or replacing it.</summary>
+        /// <param name="command">Real failed SQL command.</param>
+        /// <param name="eventData">Provider exception and execution metadata.</param>
+        /// <param name="cancellationToken">Original command token.</param>
+        /// <returns>A task completing once the test permits failure propagation.</returns>
+        public override async Task CommandFailedAsync(
+            DbCommand command, CommandErrorEventData eventData, CancellationToken cancellationToken = default)
+        {
+            if (IsReceiptAcknowledgement(command) &&
+                eventData.Exception is SqliteException { SqliteErrorCode: 5 })
+            {
+                Observed.TrySetResult();
+                await Continue.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            await base.CommandFailedAsync(command, eventData, cancellationToken);
+        }
+    }
+
+    /// <summary>Raises a deterministic provider-boundary failure only after the real acknowledgement UPDATE has applied.</summary>
+    private sealed class ReceiptAppliedAcknowledgementFailure : DbCommandInterceptor
+    {
+        private int _failures;
+        /// <summary>Number of successfully applied acknowledgements followed by an injected failure.</summary>
+        public int Failures => Volatile.Read(ref _failures);
+
+        /// <summary>Models an applied-command cleanup ambiguity while preserving the actual SQLite mutation.</summary>
+        /// <param name="command">Command that has already completed against SQLite.</param>
+        /// <param name="eventData">Real command execution metadata.</param>
+        /// <param name="result">Affected-row count from the real database.</param>
+        /// <param name="cancellationToken">Original command token.</param>
+        /// <returns>The unchanged result for all commands other than the first applied acknowledgement.</returns>
+        /// <exception cref="SqliteException">The acknowledgement applied, but its provider completion is ambiguous to the caller.</exception>
+        public override ValueTask<int> NonQueryExecutedAsync(
+            DbCommand command, CommandExecutedEventData eventData, int result,
+            CancellationToken cancellationToken = default)
+        {
+            if (result == 1 && IsReceiptAcknowledgement(command) &&
+                Interlocked.CompareExchange(ref _failures, 1, 0) == 0)
+                throw new SqliteException("Injected failure after receipt acknowledgement applied.", 5);
+            return base.NonQueryExecutedAsync(command, eventData, result, cancellationToken);
+        }
+    }
+
+    /// <summary>Returns one accepted message while requesting host shutdown before acknowledgement persistence.</summary>
+    /// <param name="cancellation">Test-owned host lifetime source cancelled immediately after the local sender accepts the receipt.</param>
+    private sealed class AcceptedThenCancelledReceiptSender(CancellationTokenSource cancellation) : ITenantManualReceiptNotificationSender
+    {
+        private int _successCount;
+        /// <summary>Number of accepted receipt sends.</summary>
+        public int SuccessCount => Volatile.Read(ref _successCount);
+
+        /// <summary>Accepts the receipt, then cancels the host without throwing a transport failure.</summary>
+        /// <param name="receipt">Real receipt loaded by the worker.</param>
+        /// <param name="cancellationToken">Host token cancelled immediately after acceptance.</param>
+        /// <returns>The acknowledged message id.</returns>
+        public Task<int?> SendAsync(TenantManualPaymentReceipt receipt, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _successCount);
+            cancellation.Cancel();
+            return Task.FromResult<int?>(5151);
+        }
+    }
+
     private static async Task<bool> IsInboxCompletedAsync(Databases databases, int updateId)
     {
         await using var db = databases.Users.CreateDbContext();
@@ -410,15 +718,24 @@ public sealed partial class ConcurrencyTests
 
     private static string Token(int botId) => botId + ":" + new string('a', 35);
 
+    /// <summary>Waits at the external-send boundary so a test can acquire a writer after claim persistence.</summary>
     private sealed class BlockingReceiptSender : ITenantManualReceiptNotificationSender
     {
+        private int _successCount;
+        /// <summary>Number of receipt messages accepted after the send barrier.</summary>
+        public int SuccessCount => Volatile.Read(ref _successCount);
         public TaskCompletionSource Entered { get; } = Signal();
         public TaskCompletionSource Release { get; } = Signal();
 
+        /// <summary>Accepts a receipt only after the test releases its send barrier.</summary>
+        /// <param name="receipt">Real receipt loaded by the worker.</param>
+        /// <param name="cancellationToken">Token for the pre-acceptance wait.</param>
+        /// <returns>The accepted message id.</returns>
         public async Task<int?> SendAsync(TenantManualPaymentReceipt receipt, CancellationToken cancellationToken)
         {
             Entered.TrySetResult();
             await Release.Task.WaitAsync(cancellationToken);
+            Interlocked.Increment(ref _successCount);
             return 3131;
         }
     }
