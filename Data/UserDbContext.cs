@@ -1,12 +1,14 @@
 using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
 using System.Threading;
+using Adminbot.Services.TelegramEndpoints;
 
 /// <summary>
 /// Entity Framework context for <c>users.db</c>.
 /// It stores bot-scoped conversation state, payment metadata, tenant storefront definitions,
 /// tenant orders, tenant ledger rows, durable settlement-notification delivery, global owned-colleague daily trial grants,
-/// XUI volume-reminder cycles, cookies, and other runtime data that must not live in <c>credentials.db</c>.
+/// XUI volume-reminder cycles, identity-scoped Telegram endpoint routing and independent operator alerts,
+/// cookies, and other runtime data that must not live in <c>credentials.db</c>.
 /// </summary>
 /// <remarks>
 /// Multi-instance support is implemented here by routing the legacy <see cref="User"/> state API
@@ -45,6 +47,14 @@ public class UserDbContext : DbContext
     public DbSet<User> Users { get; set; }
     /// <summary>Private durable Telegram inputs and terminal deduplication receipts, isolated by runtime bot id.</summary>
     public DbSet<TelegramUpdateInboxEntry> TelegramUpdateInbox { get; set; }
+    /// <summary>Secret-free bot-identity-scoped Cloud/Local state and CAS control revisions.</summary>
+    public DbSet<TelegramEndpointState> TelegramEndpointStates { get; set; }
+    /// <summary>Append-only endpoint migration receipts without cascading bot deletion.</summary>
+    public DbSet<TelegramEndpointHistory> TelegramEndpointHistory { get; set; }
+    /// <summary>Independent per-global-superadmin Cloud notification intents retained across restarts.</summary>
+    public DbSet<TelegramEndpointAlert> TelegramEndpointAlerts { get; set; }
+    /// <summary>Compact permanent incident/recipient deduplication keys surviving delivered outbox retention.</summary>
+    public DbSet<TelegramEndpointAlertReceipt> TelegramEndpointAlertReceipts { get; set; }
     /// <summary>Private durable XUI creation identities that prevent a second addClient after a restart.</summary>
     public DbSet<XuiV3CreationOperation> XuiV3CreationOperations { get; set; }
     /// <summary>Global owned-colleague trial receipts retained across all bots, services and conversation resets.</summary>
@@ -165,9 +175,12 @@ public class UserDbContext : DbContext
     /// free quota; paid creation uses the deterministic colleague-paid-trial:{Id} logical operation link.
     /// Public-channel participation is independent per BotInstances.Id and defaults true for existing/new Tenant rows.
     /// Explicit false is an owner opt-out, preserved by runtime mapping and storefront reset; no customer/financial schema changes.
+    /// Endpoint routing uses exact BotId plus BotFather identity, CAS Revision and separate operator ControlRevision.
+    /// Endpoint history has no cascading foreign keys; independent alert intents deduplicate per incident and global superadmin.
     /// </remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        TelegramEndpointModelConfiguration.Configure(modelBuilder);
         // Exact inbox links complement the existing bot/user fallback for historical recovery records.
         modelBuilder.Entity<XuiV3RenewalOperation>().HasIndex(x => x.InboxSequence);
         modelBuilder.Entity<XuiV3LinkChangeOperation>().HasIndex(x => x.InboxSequence);

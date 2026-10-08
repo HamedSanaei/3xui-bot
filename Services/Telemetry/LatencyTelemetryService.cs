@@ -27,7 +27,8 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
         "sqlite_transaction_completed", "telegram_poll_completed", "telegram_poll_failed", "telegram_poll_recovered",
         "telegram_poll_backoff", "telegram_receiver_started", "telegram_receiver_stopped", "telegram_receiver_health",
         "telegram_receiver_startup", "process_health", "telemetry_loss", "telemetry_writer_failure", "telemetry_started",
-        "telemetry_stopped", "telemetry_incident", "telegram_timeline_metadata_lost"
+        "telemetry_stopped", "telemetry_incident", "telegram_timeline_metadata_lost",
+        "telegram_endpoint_health", "telegram_endpoint_migration", "telegram_endpoint_outage", "telegram_endpoint_recovered"
     };
     /// <summary>Private validated configuration snapshot.</summary>
     private readonly LatencyTelemetryOptions _options;
@@ -447,7 +448,7 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
     /// <summary>Checks schema family and bounded safe dimensions before any serialization or persistence.</summary>
     /// <param name="observation">Channel observation supplied by trusted internal instrumentation.</param>
     /// <returns>True for version-one, payload-free, bounded dimensions and finite stage values.</returns>
-    /// <remarks>ASCII tokens admit tenant-prefixed and underscore bot ids while excluding URLs, message text, SQL and control characters. Arbitrary customer or chat ids must never be supplied by callers.</remarks>
+    /// <remarks>ASCII tokens admit tenant-prefixed and underscore bot ids while excluding URLs, message text, SQL and control characters. Endpoint/state/trigger dimensions use stricter closed vocabularies; generations are positive and endpoint success timestamps require UTC. Arbitrary customer or chat ids must never be supplied by callers.</remarks>
     private static bool IsSafe(LatencyTelemetryEvent observation)
         => observation.SchemaVersion == 1 && observation.EventType != null && EventTypes.Contains(observation.EventType)
             && IsToken(observation.TraceId) && IsToken(observation.BotId) && IsToken(observation.UpdateType)
@@ -456,6 +457,13 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
             && IsToken(observation.TimeoutCategory) && IsToken(observation.FailureClassification) && IsToken(observation.Outcome)
             && IsToken(observation.TimingQuality) && IsToken(observation.PersistenceOutcome) && IsToken(observation.GapBeforeStage)
             && IsToken(observation.GapAfterStage) && IsToken(observation.SlowestStage)
+            && TelegramEndpointTelemetryContext.IsEndpointType(observation.EndpointType)
+            && TelegramEndpointTelemetryContext.IsMigrationState(observation.MigrationState)
+            && TelegramEndpointTelemetryContext.IsFailoverTrigger(observation.FailoverTrigger)
+            && (observation.EndpointGeneration == null || observation.EndpointGeneration > 0)
+            && (observation.LastSuccessUtc == null || observation.LastSuccessUtc.Value.Kind == DateTimeKind.Utc)
+            && IsFinite(observation.HealthCheckDurationMs) && IsFinite(observation.FailoverDurationMs)
+            && IsFinite(observation.CloudReuseRemainingMs)
             && IsStageMap(observation.StageMs) && IsStageMap(observation.InclusiveStageMs)
             && (observation.GcCollections == null || observation.GcCollections.Length == 3)
             && IsFinite(observation.DurationMs) && IsFinite(observation.ReceiverToAdmissionMs) && IsFinite(observation.AdmissionMs)

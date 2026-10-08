@@ -610,6 +610,12 @@ public sealed partial class ConcurrencyTests
         }
     }
 
+    /// <summary>Builds an isolated renewal graph with synthetic Telegram delivery and identity probes.</summary>
+    /// <param name="databases">Temporary SQLite fixture owning the user and credential databases.</param>
+    /// <param name="renewalStore">Controlled production-derived operation store used to inject post-commit settlement failure.</param>
+    /// <returns>A provider the caller must asynchronously dispose; no hosted receiver or live Telegram request starts.</returns>
+    /// <remarks>The fake provider requires an explicit fake identity transport. Real financial stores and transactions remain unchanged so exactly-once settlement behavior is exercised.</remarks>
+    /// <example><code>await using var provider = RenewalProvider(databases, failingStore);</code></example>
     private static ServiceProvider RenewalProvider(Databases databases, XuiV3RenewalOperationStore renewalStore)
     {
         var configuration = new ConfigurationBuilder()
@@ -640,6 +646,8 @@ public sealed partial class ConcurrencyTests
         var botClientProvider = new BotClientProvider(registry, bot => clients.GetOrAdd(bot.Id, _ => new StorefrontClient()));
         services.AddSingleton(registry);
         services.AddSingleton(botClientProvider);
+        services.AddSingleton<ITelegramTokenProbe>(new OwnerIdentityProbe((token, _) => Task.FromResult(
+            new Telegram.Bot.Types.User { Id = long.Parse(token.Split(':')[0]), IsBot = true, FirstName = "fixture" })));
         services.AddSingleton(renewalStore);
         return services.BuildServiceProvider();
     }

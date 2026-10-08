@@ -485,6 +485,13 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
         }
         return claimed;
     }
+    /// <summary>Delivers one owned order-notification claim and persists its conservative transport outcome.</summary>
+    /// <param name="notification">Detached processing row with the active claim token.</param>
+    /// <param name="cancellationToken">Host token for order loading, send-phase persistence and Telegram delivery.</param>
+    /// <returns>A task completing after durable delivery, deferral or quarantine.</returns>
+    /// <remarks>The send marker prevents replay after ambiguous dispatch. Only exact endpoint admission refusals
+    /// prove no HTTP request occurred and can clear that marker while refunding the provisional claim attempt.</remarks>
+    /// <exception cref="OperationCanceledException">Host shutdown interrupts processing; the claim remains retained.</exception>
     private async Task DeliverAsync(TenantOrderNotification notification, CancellationToken cancellationToken)
     {
         TenantBotOrder order;
@@ -563,6 +570,11 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
             await MarkDeliveryUncertainAsync(notification, TelegramDeliveryFailureClassifier.Classify(ex), cancellationToken);
             LogDuration(order, notification.Kind, started, "delivery_uncertain");
         }
+        catch (BotTransportUnavailableException ex) when (ex.ReasonCode is "endpoint_migration_pending" or "obsolete_endpoint_generation")
+        {
+            await DeferEndpointFenceAsync(notification, ex.ReasonCode, cancellationToken);
+            LogDuration(order, notification.Kind, started, "endpoint_fenced_before_dispatch");
+        }
         catch (BotTransportUnavailableException)
         {
             await RetryOrExhaustAsync(notification, "bot_transport_unavailable", cancellationToken);
@@ -630,6 +642,33 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
                 .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
         if (updated != 1)
             await MarkDeliveryUncertainAsync(notification, "telegram_ack_persistence_uncertain", cancellationToken, requireClaim: false);
+    }
+
+    /// <summary>Releases a known pre-dispatch endpoint fence without exhausting actual delivery attempts.</summary>
+    /// <param name="notification">Processing row carrying the original claim token.</param>
+    /// <param name="safeError">Exact sanitized endpoint admission refusal.</param>
+    /// <param name="cancellationToken">Token for the conditional durable lease release.</param>
+    /// <returns>A task completing after the owned row returns to pending.</returns>
+    /// <remarks>The endpoint facade proves no HTTP dispatch even though the conservative send marker was saved.
+    /// Only this refusal clears that marker and refunds the claim increment; ambiguous sends remain non-replayable.
+    /// An indefinitely paused endpoint retains intent instead of spending the network retry budget.</remarks>
+    private async Task DeferEndpointFenceAsync(
+        TenantOrderNotification notification, string safeError, CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        await using var db = _contextFactory.CreateDbContext();
+        await db.TenantOrderNotifications
+            .Where(x => x.Id == notification.Id && x.Status == TenantOrderNotificationStatuses.Processing &&
+                        x.ClaimToken == notification.ClaimToken)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, TenantOrderNotificationStatuses.Pending)
+                .SetProperty(x => x.AttemptCount, x => x.AttemptCount > 0 ? x.AttemptCount - 1 : 0)
+                .SetProperty(x => x.NextAttemptAtUtc, now.Add(ScanInterval))
+                .SetProperty(x => x.LastError, safeError)
+                .SetProperty(x => x.SendStartedAtUtc, (DateTime?)null)
+                .SetProperty(x => x.ClaimToken, (string)null)
+                .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
     }
 
     private async Task RetryOrExhaustAsync(TenantOrderNotification notification, string safeError, CancellationToken cancellationToken)

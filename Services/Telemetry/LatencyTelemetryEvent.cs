@@ -33,6 +33,22 @@ public sealed record LatencyTelemetryEvent
     public string Operation { get; init; }
     /// <summary>Allowed Telegram method identifier, without its request payload or URL.</summary>
     public string Method { get; init; }
+    /// <summary>Closed cloud/local route label captured for the actual request; null identifies legacy or unrouted observations.</summary>
+    public string EndpointType { get; init; }
+    /// <summary>Positive identity-scoped route generation captured at admission; never a Telegram identifier.</summary>
+    public long? EndpointGeneration { get; init; }
+    /// <summary>Closed endpoint migration-state enum name, never the raw persisted state.</summary>
+    public string MigrationState { get; init; }
+    /// <summary>Monotonic endpoint health probe milliseconds; null when not measured.</summary>
+    public double? HealthCheckDurationMs { get; init; }
+    /// <summary>Closed manual/automatic/startup migration trigger, without actor identifiers or explanations.</summary>
+    public string FailoverTrigger { get; init; }
+    /// <summary>Monotonic migration or outage-to-recovery milliseconds, when measured by its lifecycle owner.</summary>
+    public double? FailoverDurationMs { get; init; }
+    /// <summary>Nonnegative milliseconds remaining before acknowledged logout permits Cloud reuse.</summary>
+    public double? CloudReuseRemainingMs { get; init; }
+    /// <summary>UTC instant of the last successful endpoint health observation; null when unavailable.</summary>
+    public DateTime? LastSuccessUtc { get; init; }
     /// <summary>Closed diagnostic category, including the incident family for summary records.</summary>
     public string Category { get; init; }
     /// <summary>Monotonic elapsed milliseconds for this observation.</summary>

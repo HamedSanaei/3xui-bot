@@ -50,7 +50,7 @@ internal sealed class TelegramTelemetryBotClient : TelegramBotClient
     /// <param name="request">SDK request; only a whitelisted MethodName is retained.</param>
     /// <param name="cancellationToken">Original caller token whose cancellation must remain distinct from HTTP timeout.</param>
     /// <returns>The original SDK-validated response, including an empty updates array; no payload is copied.</returns>
-    /// <remarks>HTTP header-only observations are a separate record family and must not be summed with this duration. Long polling is classified separately and never a slow foreground operation.</remarks>
+    /// <remarks>HTTP header-only observations are a separate record family and must not be summed with this duration. Long polling is classified separately and never a slow foreground operation. Endpoint metadata is captured once per actual request, not held across receiver callbacks.</remarks>
     /// <exception cref="Exception">Original SDK/API/transport exceptions are rethrown unchanged.</exception>
     /// <example><code>var result = await client.SendRequest(request, cancellationToken);</code></example>
     public override Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
@@ -72,6 +72,7 @@ internal sealed class TelegramTelemetryBotClient : TelegramBotClient
     {
         var method = TelegramTransportDiagnostics.Method(request == null ? default : request.MethodName.AsSpan());
         using var context = TelegramApiRequestContext.Push(method, cancellationToken);
+        var endpoint = context.Endpoint;
         var scope = TelegramUpdateLatencyScope.Current;
         var receiver = UpdateTelemetryTracker.Current;
         var adminRequest = default(TelegramUpdateLatencyScope.TelegramRequestTimer);
@@ -111,7 +112,9 @@ internal sealed class TelegramTelemetryBotClient : TelegramBotClient
                 Sequence = scope != null ? (scope.Sequence > 0 ? scope.Sequence : null) : receiver?.Sequence,
                 Method = method, Category = TelegramTransportDiagnostics.Category(method),
                 Stage = method == "getUpdates" ? "telegram_polling" : "telegram_api", Operation = "sdk_validated_request",
-                DurationMs = elapsedMs, Attempt = 1
+                DurationMs = elapsedMs, Attempt = 1,
+                EndpointType = endpoint?.EndpointType, EndpointGeneration = endpoint?.EndpointGeneration,
+                MigrationState = endpoint?.MigrationState
             });
             if (method == "getUpdates")
             {
@@ -167,6 +170,7 @@ internal sealed class TelegramTelemetryHttpHandler : DelegatingHandler
     private async Task<HttpResponseMessage> SendMeasuredAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         var context = TelegramApiRequestContext.Current;
+        var endpoint = context?.Endpoint ?? TelegramEndpointTelemetryContext.Current;
         var method = context?.Method ?? "unknown";
         var scope = TelegramUpdateLatencyScope.Current;
         var receiver = UpdateTelemetryTracker.Current;
@@ -193,7 +197,9 @@ internal sealed class TelegramTelemetryHttpHandler : DelegatingHandler
                 UpdateId = scope?.UpdateId ?? receiver?.UpdateId,
                 Sequence = scope != null ? (scope.Sequence > 0 ? scope.Sequence : null) : receiver?.Sequence,
                 Method = method, Category = TelegramTransportDiagnostics.Category(method), Stage = "telegram_http",
-                Operation = "http_response_headers", DurationMs = _timeProvider.GetElapsedTime(started).TotalMilliseconds, Attempt = 1
+                Operation = "http_response_headers", DurationMs = _timeProvider.GetElapsedTime(started).TotalMilliseconds, Attempt = 1,
+                EndpointType = endpoint?.EndpointType, EndpointGeneration = endpoint?.EndpointGeneration,
+                MigrationState = endpoint?.MigrationState
             });
         }
     }
@@ -215,6 +221,8 @@ internal sealed class TelegramApiRequestContext : IDisposable
     internal CancellationToken Caller { get; }
     /// <summary>Actual numeric response-header status, or null before headers arrive.</summary>
     internal int? HttpStatusCode { get; set; }
+    /// <summary>Immutable actual-request route shared by HTTP and SDK completion even if the enclosing route later changes.</summary>
+    internal TelegramEndpointTelemetryContext Endpoint { get; }
 
     /// <summary>Installs fixed-size request metadata for the SDK await.</summary>
     /// <param name="method">Whitelisted method constant.</param>
@@ -225,6 +233,7 @@ internal sealed class TelegramApiRequestContext : IDisposable
         _previous = Ambient.Value;
         Method = method;
         Caller = caller;
+        Endpoint = TelegramEndpointTelemetryContext.Current;
         Ambient.Value = this;
     }
 

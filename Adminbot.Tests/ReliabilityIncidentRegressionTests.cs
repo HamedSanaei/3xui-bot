@@ -541,6 +541,8 @@ public sealed partial class ConcurrencyTests
     /// A provider exposing the registered production services, the configured <see cref="BotRegistry"/>, and the
     /// per-bot fake Telegram clients keyed by bot id. The caller owns and must dispose the provider.
     /// </returns>
+    /// <remarks>Replaces both delivery and identity transports with synthetic clients; endpoint-authority behavior is covered separately by routed SDK fixtures. No hosted receiver is started.</remarks>
+    /// <example><code>var (provider, registry, clients) = IncidentProvider(databases);</code></example>
     private static (ServiceProvider Provider, BotRegistry Registry, ConcurrentDictionary<string, StorefrontClient> Clients)
         IncidentProvider(
             Databases databases,
@@ -581,6 +583,9 @@ public sealed partial class ConcurrencyTests
             bot => clients.GetOrAdd(bot.Id, _ => new StorefrontClient()));
         services.AddSingleton(registry);
         services.AddSingleton(botClientProvider);
+        // This fixture replaces the SDK provider, so identity probes must also stay on an explicit fake transport.
+        services.AddSingleton<ITelegramTokenProbe>(new OwnerIdentityProbe((token, _) => Task.FromResult(
+            new Telegram.Bot.Types.User { Id = long.Parse(token.Split(':')[0]), IsBot = true, FirstName = "fixture" })));
         return (services.BuildServiceProvider(), registry, clients);
     }
 

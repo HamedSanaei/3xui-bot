@@ -1677,3 +1677,45 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   to the exact storefront, and is deliberately not wired into every customer send yet; ambiguous failures never disable
   anything. Owned-bot rejections are runtime-only so a restart retries after the owner fixes Premium or the catalog, and
   no failure ever edits `configuration.json`.
+
+## Per-bot Telegram Cloud / Local routing
+
+- `Services/TelegramEndpoints/` owns validated startup options, exact-identity users.db state/history/alert stores,
+  durable coordinator/health worker, runtime admission gate, routed SDK facade, private Super Admin panel and independent
+  Cloud-only notification worker. Existing bots default Cloud; no install/deployment migration changes their endpoint.
+- Migration `20261009120000_AddTelegramEndpointRouting` adds four endpoint-only users.db tables (state, append-only
+  history, alert outbox, permanent compact alert receipts), no financial/schema cutover. Key is internal BotId + numeric
+  BotFather id; CAS `Revision` differs from operator `ControlRevision`; token/identity replacement cannot reuse old routing.
+- `Program` hydrates current identities after registry loading and before any hosted sender/receiver. `BotClientProvider`
+  preserves the shared HTTP pool and caches endpoint SDK epochs; reusable worker facades resolve at operation admission,
+  pinned receiver epochs fail stale getUpdates with cancellation. Exact identity is mandatory for privileged control clients.
+- `TelegramUpdateScheduler` acquires an endpoint lease before durable claim; paused FIFO heads stay queued while other
+  bots run. `MultiBotHostedService` exposes its existing per-bot lifecycle semaphore for stop/join/strict destination readiness.
+  Admitted handlers drain their original epoch; started sends are never rerouted/replayed. Existing budgets/concurrency stay fixed.
+- Cloud→Local commits intent/logout marker, tokenless Local preflight, source drain, Cloud logout once, exact Local identity
+  and zero-offset/non-dropping receiving readiness. Ambiguous/interrupted logout is manual intervention, never blindly repeated.
+  Local→Cloud requires proven Local cleanup and persisted Cloud eligibility; conservative fresh ten-minute Local-logout wait.
+  Unreachable Local cannot produce false Cloud success. Default automatic failback is off; desired and effective stay separate.
+- Official Local GetFile gives server filesystem paths, not Cloud /file HTTP downloads. `localFileServerRoot` and existing
+  readable nonsymlink `localFileHostRoot` mapping are required before migration. `TGFile` provenance/epoch + capped string
+  bindings protect transfers; copy only read-only files below the trusted existing downloader volume, never touch its container.
+- **🌐 مدیریت Telegram API** / `/telegram_api`: global live Super Admin allowlist only, private enabled owned host,
+  actor/chat/message/host/BotFather-bound ten-minute single-use callbacks, confirmation + control revision. Another healthy
+  owned bot provides recovery control; tenant owners/customers/assistant hosts have no authority.
+- Explicit `notificationBotId` + `notificationTelegramBotId` reserve an enabled owned Cloud-only identity, including aliases.
+  Durable incident/recipient deduplication survives delivered-detail retention. Post-send uncertainty is visible, not replayed;
+  absent notification transport retains bounded pending/manual-review alerts. Never assume the affected token can alert via Cloud.
+- JSONL v1 adds nullable endpoint type/generation/state and four closed endpoint event families. Report series separate
+  bot/endpoint/method/HTTP-SDK-foreground boundary and retain bounded newest-100 endpoint history; private actor audit stays in DB.
+- `docs/telegram-api-endpoints.md` covers official restrictions, file/notifier prerequisites, safe disable, staged dedicated-bot
+  rollout and rollback. Older Cloud-only binaries are unsafe until every Local/uncertain identity is safely resolved to Cloud.
+
+- Dynamic registry/token probes hydrate exact saved routes before admission; A→B→A cannot forget Local/uncertain epochs.
+  Fresh internal aliases with unsafe same-BotFather history fail closed; current token-bearing duplicates cannot migrate, even disabled.
+  Owner token registration/panel reads share pooled read-only routed probes, bounded historical-alias authority and
+  endpoint/token-generation cache validation. New identity admission never bypasses saved cleanup/cooldown via raw Cloud getMe.
+  Numeric-identity fences/drains include aliases, leased retired identities and unregistered probes; A→B→A cannot forget outstanding sends.
+  Cloud→Local/manual or opt-in failback must retain another enabled non-assistant owned Cloud control identity; recheck before logout.
+- Durable settlement/order/receipt/weekly senders defer proven pre-HTTP endpoint fences, refund provisional claim attempts
+  and preserve budgets during Cloud waits. Identity replacement stays manual review; ambiguous payment/receipt dispatch
+  outcomes are DeliveryUncertain without replay or speculative receipt fallback after a possibly delivered photo.

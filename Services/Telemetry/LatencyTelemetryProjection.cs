@@ -55,6 +55,8 @@ internal static class LatencyTelemetryProjection
     private const ulong InboxCompleted = 1UL << 22;
     /// <summary>Bounded timeline-origin loss metadata.</summary>
     private const ulong TimelineLost = 1UL << 23;
+    /// <summary>Identity-free endpoint health, migration and outage measurements.</summary>
+    private const ulong Endpoint = 1UL << 24;
 
     /// <summary>Determines the fixed relevant-field mask for one closed event family.</summary>
     /// <param name="eventType">Internal closed schema-one record family, never arbitrary customer input.</param>
@@ -76,6 +78,7 @@ internal static class LatencyTelemetryProjection
         "telegram_update_completed" => AllTimeline | StageSummary | RequestSummary | Errors,
         "telegram_timeline_metadata_lost" => TimelineLost | Errors,
         "telegram_request_completed" or "telegram_api_request_completed" or "telegram_foreground_request_completed" => Request | Errors,
+        "telegram_endpoint_health" or "telegram_endpoint_migration" or "telegram_endpoint_outage" or "telegram_endpoint_recovered" => Endpoint | Errors,
         "latency_stage_completed" => Stage | Errors,
         "unattributed_handler_time" => StageSummary,
         "sqlite_operation_completed" or "sqlite_busy_retry" or "sqlite_transaction_completed" => Database | Errors,
@@ -107,10 +110,12 @@ internal static class LatencyTelemetryProjection
     {
         "schemaVersion" or "sessionId" or "timestampUtc" or "eventType" or "traceId" or "botId" or "updateId"
             or "sequence" or "updateType" or "operation" or "category" or "outcome" or "timingQuality" => Core,
+        "endpointType" or "endpointGeneration" or "migrationState" => Request | Endpoint,
+        "healthCheckDurationMs" or "failoverTrigger" or "failoverDurationMs" or "cloudReuseRemainingMs" or "lastSuccessUtc" => Endpoint,
         "stage" => Request | Database | Polling | Stage | StageSummary | AllTimeline | HandlerStarted | FirstAttempt | FirstCompleted | FirstAcknowledged,
         "method" => Request | FirstAttempt | FirstCompleted | FirstAcknowledged,
-        "durationMs" => Request | Database | Polling | Stage | StageSummary | AllTimeline | HandlerCompleted | TimelineLost,
-        "httpStatusCode" or "apiErrorCode" => Request | Polling | AllTimeline | HandlerCompleted | FirstCompleted | FirstAcknowledged,
+        "durationMs" => Request | Endpoint | Database | Polling | Stage | StageSummary | AllTimeline | HandlerCompleted | TimelineLost,
+        "httpStatusCode" or "apiErrorCode" => Request | Endpoint | Polling | AllTimeline | HandlerCompleted | FirstCompleted | FirstAcknowledged,
         "exceptionCategory" or "cancellationSource" or "timeoutCategory" or "failureClassification" => Errors,
         "attempt" => Request | Database | Polling,
         "receivedAtUtc" => AllTimeline | Received,
@@ -141,7 +146,8 @@ internal static class LatencyTelemetryProjection
         "callbackAckMs" or "callbackAckAttemptMs" or "callbackAckAcknowledgedMs" or "totalTelegramMs"
             or "telegramRequestCount" or "foregroundTimeoutCount" => RequestSummary,
         "busyRetryCount" or "busyWaitMs" or "sqliteErrorCode" => Database | AllTimeline | HandlerCompleted,
-        "lastSuccessfulPollAtUtc" or "lastReceivedUpdateAtUtc" or "degradedSinceUtc" or "consecutiveFailures"
+        "consecutiveFailures" => Polling | Endpoint,
+        "lastSuccessfulPollAtUtc" or "lastReceivedUpdateAtUtc" or "degradedSinceUtc"
             or "recoveryMs" or "backoffMs" or "receiverRunning" => Polling,
         "cpuPercent" or "managedHeapBytes" or "availableMemoryBytes" or "workingSetBytes" or "threadPoolPendingWorkItems"
             or "threadPoolThreads" or "gcCollections" or "gcPauseMs" => Health,

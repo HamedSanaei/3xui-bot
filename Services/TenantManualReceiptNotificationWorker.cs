@@ -158,8 +158,10 @@ public sealed class TenantManualReceiptNotificationWorker : BackgroundService
     /// <param name="notification">Detached receipt notification carrying this attempt's claim token.</param>
     /// <param name="cancellationToken">Host token for receipt loading, transport and acknowledgement.</param>
     /// <returns>A task that completes after delivery or a conservative non-retryable persistence outcome.</returns>
-    /// <remarks>Only transport failures can release a retryable claim. Once the sender returns a message id,
-    /// acknowledgement persistence, cancellation, or logger failure cannot return it to pending.</remarks>
+    /// <remarks>A proven endpoint fence refunds the provisional claim attempt and retains pending intent indefinitely
+    /// without an HTTP notification dispatch. Ambiguous sender failures become delivery-uncertain instead of retries;
+    /// only a definite unavailable/no-send result keeps the existing bounded retry. Once the sender returns a message
+    /// id, acknowledgement persistence, cancellation, or logger failure cannot return it to pending.</remarks>
     /// <exception cref="OperationCanceledException">The receipt read or pre-acknowledgement transport wait is cancelled.</exception>
     /// <example>A returned message id followed by an ACK database failure leaves delivery uncertain, not retryable.</example>
     private async Task DeliverAsync(TenantManualReceiptNotification notification, CancellationToken cancellationToken)
@@ -188,11 +190,17 @@ public sealed class TenantManualReceiptNotificationWorker : BackgroundService
             // Cancellation can race with Telegram acceptance; keep the lease intact rather than authorizing another send.
             throw;
         }
+        catch (BotTransportUnavailableException ex) when (ex.ReasonCode is "endpoint_migration_pending" or "obsolete_endpoint_generation")
+        {
+            await DeferEndpointFenceAsync(notification, ex.ReasonCode, cancellationToken);
+            return;
+        }
         catch (Exception ex)
         {
             _logger.LogWarning("Tenant receipt notification attempt failed. NotificationId={NotificationId} ErrorType={ErrorType}",
                 notification.Id, ex.GetType().Name);
-            await RetryOrExhaustAsync(notification, "assistant_delivery_failed", cancellationToken);
+            await MarkTerminalAsync(notification, TenantManualReceiptNotificationStatuses.DeliveryUncertain,
+                "assistant_send_outcome_uncertain", cancellationToken);
             return;
         }
 
@@ -241,6 +249,31 @@ public sealed class TenantManualReceiptNotificationWorker : BackgroundService
                 .SetProperty(x => x.NextAttemptAtUtc, (DateTime?)null), cancellationToken);
         if (updated != 1)
             throw new InvalidOperationException("The tenant receipt notification delivery claim no longer matches.");
+    }
+
+    /// <summary>Defers a known pre-dispatch endpoint fence without consuming delivery attempts.</summary>
+    /// <param name="notification">Detached receipt row carrying the active processing claim.</param>
+    /// <param name="safeError">Exact sanitized endpoint admission refusal.</param>
+    /// <param name="cancellationToken">Token for the conditional durable lease release.</param>
+    /// <returns>A task completing after the owned claim is pending or no longer matches.</returns>
+    /// <remarks>Only a proven no-dispatch refusal refunds the provisional claim increment. An indefinitely paused
+    /// endpoint retains operator notification intent; the normal scan delay avoids a busy retry loop.</remarks>
+    private async Task DeferEndpointFenceAsync(
+        TenantManualReceiptNotification notification, string safeError, CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        await using var db = _contextFactory.CreateDbContext();
+        await db.TenantManualReceiptNotifications
+            .Where(x => x.Id == notification.Id && x.Status == TenantManualReceiptNotificationStatuses.Processing &&
+                        x.ClaimToken == notification.ClaimToken)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, TenantManualReceiptNotificationStatuses.Pending)
+                .SetProperty(x => x.AttemptCount, x => x.AttemptCount > 0 ? x.AttemptCount - 1 : 0)
+                .SetProperty(x => x.NextAttemptAtUtc, now.Add(ScanInterval))
+                .SetProperty(x => x.LastError, safeError)
+                .SetProperty(x => x.ClaimToken, (string)null)
+                .SetProperty(x => x.LeaseUntilUtc, (DateTime?)null)
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
     }
 
     private async Task RetryOrExhaustAsync(TenantManualReceiptNotification notification, string safeError, CancellationToken cancellationToken)

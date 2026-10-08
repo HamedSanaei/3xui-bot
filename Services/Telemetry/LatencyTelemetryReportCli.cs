@@ -35,7 +35,7 @@ public static class LatencyTelemetryReportCli
         "sendVoice", "sendSticker", "sendPoll", "copyMessage", "forwardMessage", "setMyCommands", "setWebhook",
         "editMessageMedia", "getChatMemberCount", "copyMessages", "setChatMenuButton", "setMyDescription",
         "setMyShortDescription", "getUserProfilePhotos",
-        "deleteWebhook", "getWebhookInfo", "pinChatMessage", "unpinChatMessage", "sendChatAction", "other", "unknown"
+        "deleteWebhook", "getWebhookInfo", "pinChatMessage", "unpinChatMessage", "sendChatAction", "logOut", "close", "other", "unknown"
     };
     /// <summary>Closed outcome and failure labels shared by report sections.</summary>
     private static readonly HashSet<string> Labels = new(StringComparer.Ordinal)
@@ -74,7 +74,8 @@ public static class LatencyTelemetryReportCli
         "telegram_receiver_started", "telegram_receiver_stopped", "telegram_receiver_health", "process_health", "telemetry_loss",
         "telemetry_writer_failure", "telemetry_started", "telemetry_stopped", "telemetry_incident",
         "telegram_api_request_completed", "telegram_receiver_startup", "telegram_update_first_response_acknowledged",
-        "telegram_timeline_metadata_lost"
+        "telegram_timeline_metadata_lost", "telegram_endpoint_health", "telegram_endpoint_migration",
+        "telegram_endpoint_outage", "telegram_endpoint_recovered"
     };
     /// <summary>Closed SQLite boundary categories; logical caller names not on this list remain other.</summary>
     private static readonly HashSet<string> DatabaseOperations = new(StringComparer.Ordinal)
@@ -297,6 +298,29 @@ public static class LatencyTelemetryReportCli
     /// <summary>Formats UTC timestamps without culture-dependent or input-controlled text.</summary>
     /// <param name="value">UTC instant, optionally unavailable.</param><returns>An ISO UTC label.</returns>
     private static string Time(DateTime? value) => value?.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture) ?? "unavailable";
+    /// <summary>Projects an archive endpoint to a closed label, explicitly retaining legacy missing metadata as unknown.</summary>
+    /// <param name="record">Untrusted parsed archive record.</param><returns>Cloud/local label or unknown; never an address or arbitrary text.</returns>
+    private static string EndpointLabel(JsonElement record)
+    {
+        var endpoint = Text(record, "endpointType");
+        return endpoint is "cloud" or "local" ? endpoint : "unknown";
+    }
+
+    /// <summary>Projects an archive migration state to the closed schema vocabulary.</summary>
+    /// <param name="record">Untrusted parsed archive record.</param><returns>Validated enum name or unknown.</returns>
+    private static string MigrationLabel(JsonElement record)
+    {
+        var state = Text(record, "migrationState");
+        return state != null && TelegramEndpointTelemetryContext.IsMigrationState(state) ? state : "unknown";
+    }
+
+    /// <summary>Projects an archive migration trigger without exposing actors or free-form explanations.</summary>
+    /// <param name="record">Untrusted parsed archive record.</param><returns>Validated trigger or unknown.</returns>
+    private static string TriggerLabel(JsonElement record)
+    {
+        var trigger = Text(record, "failoverTrigger");
+        return trigger != null && TelegramEndpointTelemetryContext.IsFailoverTrigger(trigger) ? trigger : "unknown";
+    }
 
     /// <summary>Fixed logarithmic histogram; bucket upper bounds approximate quantiles within 5% above 0.1 ms.</summary>
     private sealed class Histogram
@@ -355,6 +379,33 @@ public static class LatencyTelemetryReportCli
         /// <summary>Exact counts keyed only by the closed outcome vocabulary.</summary>
         public readonly Dictionary<string, long> Outcomes = new(StringComparer.Ordinal);
     }
+
+    /// <summary>Fixed per-bot/endpoint health and migration aggregates independent of request latency series.</summary>
+    private sealed class EndpointStats
+    {
+        /// <summary>Bounded health-probe and failover duration histograms; missing values remain unavailable.</summary>
+        public readonly Histogram Health = new(), Failover = new();
+        /// <summary>Exact accepted event-family counts; polling incidents are kept separate.</summary>
+        public long HealthEvents, Migrations, Outages, Recoveries;
+        /// <summary>Most recent safe state observation and successful-health time in event time, not scan order.</summary>
+        public DateTime? LatestUtc, LastSuccessUtc;
+        /// <summary>Closed most-recent state and trigger labels.</summary>
+        public string State = "unknown", Trigger = "unknown";
+        /// <summary>Most-recent positive generation and measured remaining Cloud wait.</summary>
+        public long? Generation;
+        /// <summary>Remaining Cloud reuse wait at the most recent observation, not a countdown recalculated by this report.</summary>
+        public double? CloudReuseRemainingMs;
+    }
+
+    /// <summary>Safe bounded transition history; no actor, identity payload, URL or raw persisted state is retained.</summary>
+    /// <param name="Utc">Observation UTC time.</param><param name="Bot">Safe pseudonymous or known bot label.</param>
+    /// <param name="Endpoint">Closed endpoint or unknown.</param><param name="Generation">Positive route generation or unavailable.</param>
+    /// <param name="Event">Closed endpoint event family.</param><param name="State">Closed migration state or unknown.</param>
+    /// <param name="Trigger">Closed migration trigger or unknown.</param><param name="Outcome">Closed outcome label.</param>
+    /// <param name="FailoverMs">Measured migration/outage recovery milliseconds or unavailable.</param>
+    /// <param name="CloudWaitMs">Measured Cloud reuse remaining milliseconds or unavailable.</param>
+    private sealed record EndpointHistory(DateTime Utc, string Bot, string Endpoint, long? Generation,
+        string Event, string State, string Trigger, string Outcome, double? FailoverMs, double? CloudWaitMs);
     /// <summary>Bounded rolling polling episode with a capped failure classification sequence.</summary>
     private sealed class Episode
     {
@@ -420,10 +471,16 @@ public static class LatencyTelemetryReportCli
         private readonly string filter;
         /// <summary>At most 128 owning-bot aggregate rows.</summary>
         private readonly Dictionary<string, BotStats> bots = new(StringComparer.OrdinalIgnoreCase);
-        /// <summary>At most 512 Telegram bot/method/boundary latency series.</summary>
+        /// <summary>At most 512 Telegram bot/endpoint/method/boundary latency series; legacy routes are explicitly unknown.</summary>
         private readonly Dictionary<string, Group> telegram = new(StringComparer.Ordinal);
         /// <summary>At most 512 SQLite bot/category/event latency series.</summary>
         private readonly Dictionary<string, Group> database = new(StringComparer.Ordinal);
+        /// <summary>At most 512 bot/endpoint health and incident aggregates.</summary>
+        private readonly Dictionary<string, EndpointStats> endpoints = new(StringComparer.Ordinal);
+        /// <summary>Most recent 100 migration/outage/recovery observations, projected to closed labels only.</summary>
+        private readonly List<EndpointHistory> endpointHistory = new();
+        /// <summary>Exact transition rows omitted from the bounded history sample.</summary>
+        private long endpointHistoryOmitted;
         /// <summary>At most 20000 safe trace keys and compact milestone/final-summary flags.</summary>
         private readonly Dictionary<string, byte> traces = new(StringComparer.Ordinal);
         /// <summary>At most 512 validated process-session ids and cumulative loss-counter maxima.</summary>
@@ -485,6 +542,7 @@ public static class LatencyTelemetryReportCli
                         || outcome is "timeout" or "timed_out" or "foreground_timeout" or "foreground_budget_expired" or "callback_policy_timeout")) stats.Timeouts++;
                 }
                 else if (type is "telegram_request_completed" or "telegram_api_request_completed") AddTelegram(r, bot, type);
+                else if (type.StartsWith("telegram_endpoint_", StringComparison.Ordinal)) AddEndpoint(r, bot, type, utc.Value);
                 else if (type.StartsWith("telegram_poll_", StringComparison.Ordinal) || type == "telegram_receiver_health") AddPoll(r, type, bot, stats, utc.Value);
                 else if (type.StartsWith("sqlite_", StringComparison.Ordinal)) AddDatabase(r, type, bot);
             }
@@ -640,15 +698,62 @@ public static class LatencyTelemetryReportCli
             if (groups.Count >= MaxGroups) { Quality.GroupLimit++; return null; }
             groups.Add(key, group = new Group()); return group;
         }
-        /// <summary>Aggregates headers-only and SDK-validated request records in separate series, never summing them.</summary>
+        /// <summary>Aggregates headers-only and SDK-validated requests per bot/actual endpoint/method in separate series, never summing them.</summary>
         /// <param name="r">Request record.</param><param name="bot">Safe owning bot label.</param><param name="type">Known headers or SDK record family.</param>
-        /// <remarks>Healthy long polling retains its measured duration but never counts as a slow interactive request.</remarks>
+        /// <remarks>Healthy long polling retains its measured duration but never counts as a slow interactive request. Legacy absent endpoint metadata is unknown, never assumed Cloud.</remarks>
         private void AddTelegram(JsonElement r, string bot, string type)
         {
             var method = Label(Text(r, "method"), Methods);
-            var group = GetGroup(telegram, bot + "/" + method + "/" + (type == "telegram_request_completed" ? "headers" : "sdk_validated"));
+            var group = GetGroup(telegram, bot + "/" + EndpointLabel(r) + "/" + method + "/" + (type == "telegram_request_completed" ? "headers" : "sdk_validated"));
             if (group == null) return;
             AddDuration(group, r, method == "getUpdates" ? double.PositiveInfinity : 2000);
+        }
+
+        /// <summary>Aggregates endpoint incidents and retains a bounded newest transition history without free-form labels.</summary>
+        /// <param name="r">Endpoint observation from an untrusted archive.</param><param name="bot">Safe owning bot label.</param>
+        /// <param name="type">Allowlisted endpoint event family.</param><param name="utc">Validated observation UTC time.</param>
+        /// <remarks>Health records contribute only to aggregates, avoiding a history dominated by periodic probes. Latest state follows event time, even across out-of-order files. No state-machine duration is inferred from missing measurements.</remarks>
+        private void AddEndpoint(JsonElement r, string bot, string type, DateTime utc)
+        {
+            var endpoint = EndpointLabel(r);
+            var key = bot + "/" + endpoint;
+            if (!endpoints.TryGetValue(key, out var stats))
+            {
+                if (endpoints.Count >= MaxGroups) { Quality.GroupLimit++; return; }
+                endpoints.Add(key, stats = new EndpointStats());
+            }
+            switch (type)
+            {
+                case "telegram_endpoint_health": stats.HealthEvents++; break;
+                case "telegram_endpoint_migration": stats.Migrations++; break;
+                case "telegram_endpoint_outage": stats.Outages++; break;
+                case "telegram_endpoint_recovered": stats.Recoveries++; break;
+            }
+            if (Number(r, "healthCheckDurationMs") is double health) stats.Health.Add(health);
+            if (Number(r, "failoverDurationMs") is double failover) stats.Failover.Add(failover);
+            var lastSuccess = Utc(r, "lastSuccessUtc");
+            if (lastSuccess.HasValue && (!stats.LastSuccessUtc.HasValue || lastSuccess > stats.LastSuccessUtc))
+                stats.LastSuccessUtc = lastSuccess;
+            var state = MigrationLabel(r);
+            var trigger = TriggerLabel(r);
+            var generation = Count(r, "endpointGeneration");
+            long? knownGeneration = generation > 0 ? generation : null;
+            if (!stats.LatestUtc.HasValue || utc >= stats.LatestUtc)
+            {
+                stats.LatestUtc = utc; stats.State = state; stats.Trigger = trigger;
+                stats.Generation = knownGeneration; stats.CloudReuseRemainingMs = Number(r, "cloudReuseRemainingMs");
+            }
+            if (type == "telegram_endpoint_health") return;
+            var row = new EndpointHistory(utc, bot, endpoint, knownGeneration, type, state, trigger,
+                Label(Text(r, "outcome"), Labels), Number(r, "failoverDurationMs"), Number(r, "cloudReuseRemainingMs"));
+            if (endpointHistory.Count == MaxEpisodes)
+            {
+                endpointHistoryOmitted++;
+                if (utc <= endpointHistory[^1].Utc) return;
+                endpointHistory.RemoveAt(endpointHistory.Count - 1);
+            }
+            var insert = endpointHistory.FindIndex(item => item.Utc < utc);
+            endpointHistory.Insert(insert < 0 ? endpointHistory.Count : insert, row);
         }
         /// <summary>Adds exact event/outcome counts and histogram latency for one group.</summary>
         /// <param name="group">Bounded group.</param><param name="r">Parsed record.</param><param name="slowMs">Explicit slow threshold in milliseconds.</param>
@@ -728,7 +833,7 @@ public static class LatencyTelemetryReportCli
             if (episodes.Count < MaxEpisodes) episodes.Add(episode); else Quality.EpisodeLimit++;
         }
 
-        /// <summary>Writes the six required report groups from allowlisted fields and explicitly labels all approximations and caps.</summary>
+        /// <summary>Writes the six existing report groups plus bounded endpoint incidents/history from allowlisted fields.</summary>
         /// <param name="output">Operator output writer.</param><param name="token">Cancellation before each output section/row.</param>
         /// <returns>A task completing after the safe report is written.</returns>
         public async Task WriteAsync(TextWriter output, CancellationToken token)
@@ -751,11 +856,11 @@ public static class LatencyTelemetryReportCli
                 token.ThrowIfCancellationRequested();
                 await output.WriteLineAsync($"bot={update.Bot} trace={update.Trace} utc={Time(update.Timestamp)} application={Ms(update.Application)} outcome={update.Outcome} rankingBasis={update.RankingBasis} rankingMs={Ms(update.Duration)} {update.Breakdown}");
             }
-            await output.WriteLineAsync("3. Telegram requests per bot/method/boundary (headers-only and fully SDK-validated await are separate series, NEVER summed; neither proves customer delivery)");
+            await output.WriteLineAsync("3. Telegram requests per bot/endpoint/method/boundary (legacy endpoint=unknown; headers-only and fully SDK-validated await are separate series, NEVER summed; neither proves customer delivery)");
             foreach (var pair in telegram.OrderBy(p => p.Key, StringComparer.Ordinal))
             {
                 token.ThrowIfCancellationRequested();
-                await output.WriteLineAsync($"bot/method={pair.Key} events={pair.Value.Events} {pair.Value.Duration.Summary()} failed={pair.Value.Failed} slow={pair.Value.Slow} outcomes={string.Join(',', pair.Value.Outcomes.OrderBy(p => p.Key).Select(p => p.Key + ':' + p.Value.ToString(CultureInfo.InvariantCulture)))}");
+                await output.WriteLineAsync($"bot/endpoint/method={pair.Key} events={pair.Value.Events} {pair.Value.Duration.Summary()} failed={pair.Value.Failed} slow={pair.Value.Slow} outcomes={string.Join(',', pair.Value.Outcomes.OrderBy(p => p.Key).Select(p => p.Key + ':' + p.Value.ToString(CultureInfo.InvariantCulture)))}");
             }
             await output.WriteLineAsync("4. Polling episodes / failure sequence / recovery / degraded periods (bounded first-episode sample; a poll success closes a failure episode)");
             foreach (var episode in episodes)
@@ -780,6 +885,19 @@ public static class LatencyTelemetryReportCli
             await output.WriteLineAsync($"legacyMissingSessionLossReasonMaxGauges: fullChannel={Quality.FullChannelDropped} write={Quality.WriteDropped} rejected={Quality.Rejected} shutdown={Quality.ShutdownDropped}");
             await output.WriteLineAsync($"limitOmissions: files={Quality.FileLimit} botRecords={Quality.BotLimit} groupRecords={Quality.GroupLimit} traceRecords={Quality.TraceLimit} episodes={Quality.EpisodeLimit} sessionCounterRecords={Quality.SessionLimit} outOfOrderPollRecords={Quality.OutOfOrder}");
             await output.WriteLineAsync($"Quality caveats: process counters are summed maxima per validated session (cap={MaxSessions}), not per snapshot; these cumulative values can include loss before the lookback window. Legacy missing-session counters remain separate maxima with unknown restart provenance, never added to session totals. Incomplete traces may cross window/retention boundaries. Trace coverage is capped (not extrapolated). Missing fields stay unavailable; unknown labels become other; identities outside the fixed known-bot vocabulary are pseudonymized even when filtered. No customer contents, tokens, URLs, SQL, passwords, or arbitrary exception text are projected.");
+            await output.WriteLineAsync("7. Endpoint health / migration / outage / recovery (bounded bot/endpoint aggregates; latest state follows event UTC; missing route=unknown; health and failover durations are separate measurements)");
+            foreach (var pair in endpoints.OrderBy(p => p.Key, StringComparer.Ordinal))
+            {
+                token.ThrowIfCancellationRequested();
+                var s = pair.Value;
+                await output.WriteLineAsync($"bot/endpoint={pair.Key} healthEvents={s.HealthEvents} migrations={s.Migrations} outages={s.Outages} recoveries={s.Recoveries} healthCheck: {s.Health.Summary()} failover: {s.Failover.Summary()} latestUtc={Time(s.LatestUtc)} generation={s.Generation?.ToString(CultureInfo.InvariantCulture) ?? "unavailable"} state={s.State} trigger={s.Trigger} cloudReuseRemainingMs={Ms(s.CloudReuseRemainingMs)} lastSuccessUtc={Time(s.LastSuccessUtc)}");
+            }
+            await output.WriteLineAsync($"Endpoint transition history: newest-first limit={MaxEpisodes} omitted={endpointHistoryOmitted}; no health-probe rows, actor identifiers or raw state.");
+            foreach (var row in endpointHistory)
+            {
+                token.ThrowIfCancellationRequested();
+                await output.WriteLineAsync($"endpointEvent={row.Event} bot={row.Bot} endpoint={row.Endpoint} generation={row.Generation?.ToString(CultureInfo.InvariantCulture) ?? "unavailable"} utc={Time(row.Utc)} state={row.State} trigger={row.Trigger} outcome={row.Outcome} failoverMs={Ms(row.FailoverMs)} cloudReuseRemainingMs={Ms(row.CloudWaitMs)}");
+            }
         }
     }
 }

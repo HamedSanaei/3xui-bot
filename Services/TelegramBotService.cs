@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Adminbot.Domain;
 using Adminbot.Domain.TelegramUi;
 using Adminbot.Services.AppleMobileConfig;
+using Adminbot.Services.TelegramEndpoints;
 using Adminbot.Utils;
 
 using Newtonsoft.Json;
@@ -140,6 +141,7 @@ public partial class TelegramBotService
         TenantBotService.TenantWalletAdminMenuAction,
         AdminClientDownloadAction,
         AdminTrialAccountLoggingAction,
+        TelegramEndpointAdminService.Action,
         "🤖 وضعیت ربات‌ها",
         AdminManualReviewAction,
         "📑 Menu"
@@ -237,6 +239,8 @@ public partial class TelegramBotService
     private readonly IClientDownloadAvailability _clientDownloadAvailability;
     /// <summary>Shared persisted preference for Telegram-only trial acquisition audits across all bots.</summary>
     private readonly TrialAccountLoggingSettings _trialAccountLogging;
+    /// <summary>Optional identity-bound global endpoint control plane; tenant/customer flows never gain endpoint authority.</summary>
+    private readonly TelegramEndpointAdminService _endpointAdmin;
     private readonly IClientReleaseService _clientReleaseService;
     private readonly AppleMobileConfigTelegramFlow _appleMobileConfigFlow;
     private readonly XuiV3PurchaseService _xuiV3PurchaseService;
@@ -390,6 +394,7 @@ public partial class TelegramBotService
     /// </param>
     /// <param name="mandatoryJoinMembershipCache">Optional owned-bot membership cache; null creates the standard cache without changing join requirements.</param>
     /// <param name="appleMobileConfigFlow">Optional Apple APN profile flow; null leaves that integration unavailable.</param>
+    /// <param name="endpointAdmin">Optional singleton global-super-admin endpoint panel with private-owned-host authorization and durable queued migrations.</param>
     /// <remarks>
     /// The service belongs to one execution/request scope. Conversation and financial stores create independent
     /// users.db contexts through their factories. Runtime bot identity always comes from <see cref="BotContextAccessor"/>
@@ -442,7 +447,8 @@ public partial class TelegramBotService
         TrialAccountLoggingSettings trialAccountLogging,
         TelegramInteractionTimeouts interactionTimeouts = null,
         ITelegramMandatoryJoinMembershipCache mandatoryJoinMembershipCache = null,
-        AppleMobileConfigTelegramFlow appleMobileConfigFlow = null)
+        AppleMobileConfigTelegramFlow appleMobileConfigFlow = null,
+        TelegramEndpointAdminService endpointAdmin = null)
     {
         _botClient = botClient;
         _workflow = dbContext;
@@ -468,6 +474,7 @@ public partial class TelegramBotService
         _clientDownloadAvailability = clientDownloadAvailability;
         _clientReleaseService = clientReleaseService;
         _appleMobileConfigFlow = appleMobileConfigFlow;
+        _endpointAdmin = endpointAdmin;
         _xuiV3PurchaseService = xuiV3PurchaseService;
         _xuiV3BotFlowService = xuiV3BotFlowService;
         _xuiV3PurchaseSessionStore = xuiV3PurchaseSessionStore;
@@ -929,6 +936,10 @@ public partial class TelegramBotService
     /// <exception cref="OperationCanceledException">The current update is cancelled during Telegram, state or external-service work.</exception>
     private async Task HandleUpdateCoreAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
+        // This control plane precedes all stateful flows; its own exact host/global-admin checks reject forged tenant callbacks.
+        if (_endpointAdmin != null && await _endpointAdmin.TryHandleAsync(
+            CurrentBot?.Id ?? BotContextAccessor.CurrentBotId, botClient, update, cancellationToken)) return;
+
         if (_salesAssistantService.IsAssistantBot)
         {
             await _salesAssistantService.TryHandleUpdateAsync(botClient, update, cancellationToken);

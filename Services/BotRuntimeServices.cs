@@ -1,6 +1,7 @@
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Adminbot.Services.Telemetry;
+using Adminbot.Services.TelegramEndpoints;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
@@ -10,6 +11,8 @@ using Newtonsoft.Json;
 using System.Globalization;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
@@ -326,10 +329,24 @@ public class BotClientProvider : IDisposable
     private readonly BotRegistry _registry;
     /// <summary>Creates a fresh client after first use or explicit invalidation without changing cache semantics.</summary>
     private readonly Func<BotInstanceConfig, ITelegramBotClient> _clientFactory;
-    /// <summary>Provider-owned socket pool preserving the SDK's three-minute pooled connection lifetime.</summary>
-    private readonly SocketsHttpHandler _transport = new() { PooledConnectionLifetime = TimeSpan.FromMinutes(3) };
+    /// <summary>Provider-owned three-minute socket pool; redirects cannot forward token-bearing paths to an untrusted origin.</summary>
+    private readonly SocketsHttpHandler _transport = new() { PooledConnectionLifetime = TimeSpan.FromMinutes(3), AllowAutoRedirect = false };
     /// <summary>Optional shared writer; transport observations never perform I/O on the caller.</summary>
     private readonly LatencyTelemetryService _telemetry;
+    /// <summary>Optional endpoint admission authority; direct legacy test constructors retain their original factory behavior.</summary>
+    private readonly TelegramEndpointRuntimeGate _endpointGate;
+    /// <summary>Validated trusted Cloud/loopback Local origins and read-only host file mapping.</summary>
+    private readonly TelegramEndpointRoutingOptions _endpointOptions;
+    /// <summary>At most one cached SDK epoch per configured bot and endpoint; obsolete SDKs retain in-flight send ownership until collection.</summary>
+    private readonly Dictionary<(string BotId, TelegramEndpointType Endpoint), EndpointSdk> _endpointSdks = new();
+    /// <summary>Bounded reusable read-only token-probe SDKs, keyed by secret fingerprint rather than raw token.</summary>
+    private readonly Dictionary<(string BotId, TelegramEndpointType Endpoint, long Generation, string Fingerprint), ITelegramBotClient> _probeSdks = new();
+    /// <summary>Optional deterministic SDK factory for production-routing verification without real bot tokens or network calls.</summary>
+    private readonly Func<BotInstanceConfig, TelegramEndpointRoute, ITelegramBotClient> _endpointFactory;
+    /// <summary>Caller-owned deterministic HTTP handler substituting only the socket layer for real SDK routing verification.</summary>
+    private readonly HttpMessageHandler _endpointTestTransport;
+    /// <summary>Exact production gate used by this provider; token probes must share this instance instead of bypassing saved state.</summary>
+    internal TelegramEndpointRuntimeGate EndpointGate => _endpointGate;
     /// <summary>Gets metadata-only health for this provider's active receivers across every bot family.</summary>
     public TelegramPollingTelemetryTracker PollingTelemetry { get; }
     /// <summary>Gets whether runtime provenance should be allocated for the shared enabled writer.</summary>
@@ -342,6 +359,8 @@ public class BotClientProvider : IDisposable
     /// </summary>
     /// <param name="registry">Shared registry of canonical internal bot ids and current bot tokens.</param>
     /// <param name="telemetry">Optional shared nonblocking telemetry writer; null preserves existing direct-constructor callers.</param>
+    /// <param name="endpointGate">Optional shared identity-bound routing gate; production publishes saved states before hosted work starts.</param>
+    /// <param name="endpointOptions">Validated configured origins/file mapping; missing configuration preserves Cloud defaults.</param>
     /// <remarks>
     /// Disables v22 automatic rate-limit retries so existing application policy remains authoritative.
     /// HttpClient is created once per cached bot, never per request. The shared socket pool has the SDK's
@@ -349,12 +368,43 @@ public class BotClientProvider : IDisposable
     /// </remarks>
     /// <exception cref="ArgumentNullException">The registry is null.</exception>
     /// <example><code>var provider = new BotClientProvider(registry, telemetry);</code></example>
-    public BotClientProvider(BotRegistry registry, LatencyTelemetryService telemetry = null)
+    public BotClientProvider(BotRegistry registry, LatencyTelemetryService telemetry = null,
+        TelegramEndpointRuntimeGate endpointGate = null, TelegramEndpointRoutingOptions endpointOptions = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _telemetry = telemetry;
+        _endpointGate = endpointGate;
+        _endpointOptions = (endpointOptions ?? new TelegramEndpointRoutingOptions()).ValidateAndSnapshot();
         PollingTelemetry = new TelegramPollingTelemetryTracker(telemetry);
-        _clientFactory = CreateClient;
+        _clientFactory = endpointGate == null ? CreateClient : CreateRoutingClient;
+    }
+
+    /// <summary>Creates the real routing facade over deterministic SDK transports for isolated integration verification.</summary>
+    /// <param name="registry">Exact current bot identity authority.</param>
+    /// <param name="endpointGate">Real shared pre-claim/request fence.</param>
+    /// <param name="endpointOptions">Validated trusted endpoint/mapping configuration.</param>
+    /// <param name="endpointFactory">Per-generation SDK factory using fake HTTP, never production tokens or sessions.</param>
+    /// <param name="telemetry">Optional real JSONL writer used by endpoint correlation tests.</param>
+    /// <remarks>The alternate factory preserves real facade, generation cache, admission and file provenance behavior.</remarks>
+    internal BotClientProvider(BotRegistry registry, TelegramEndpointRuntimeGate endpointGate,
+        TelegramEndpointRoutingOptions endpointOptions, Func<BotInstanceConfig, TelegramEndpointRoute, ITelegramBotClient> endpointFactory,
+        LatencyTelemetryService telemetry = null) : this(registry, telemetry, endpointGate, endpointOptions)
+    {
+        _endpointFactory = endpointFactory ?? throw new ArgumentNullException(nameof(endpointFactory));
+    }
+
+    /// <summary>Exercises production SDK construction and trusted baseUrl selection over an isolated fake HTTP transport.</summary>
+    /// <param name="registry">Exact current identity authority.</param>
+    /// <param name="endpointGate">Real handler/request admission fence.</param>
+    /// <param name="endpointOptions">Validated fixed Cloud/loopback Local origins.</param>
+    /// <param name="transport">Caller-owned fake transport; no live URL is contacted.</param>
+    /// <param name="telemetry">Optional real JSONL writer for request correlation.</param>
+    /// <remarks>No SDK or request is mocked: the provider constructs the pinned v22 client normally, retaining RetryCount=0 and its pooled generation cache.</remarks>
+    internal BotClientProvider(BotRegistry registry, TelegramEndpointRuntimeGate endpointGate,
+        TelegramEndpointRoutingOptions endpointOptions, HttpMessageHandler transport, LatencyTelemetryService telemetry = null)
+        : this(registry, telemetry, endpointGate, endpointOptions)
+    {
+        _endpointTestTransport = transport ?? throw new ArgumentNullException(nameof(transport));
     }
 
     /// <summary>
@@ -392,6 +442,177 @@ public class BotClientProvider : IDisposable
         var httpClient = new HttpClient(new TelegramTelemetryHttpHandler(bot.Id, _telemetry, _transport), disposeHandler: false);
         return new TelegramTelemetryBotClient(new TelegramBotClientOptions(bot.Token) { RetryCount = 0 },
             httpClient, bot.Id, _telemetry, PollingTelemetry);
+    }
+
+    /// <summary>Creates an ordinary reusable facade whose next operation resolves the active exact endpoint generation.</summary>
+    /// <param name="bot">Exact registry configuration with a valid BotFather token.</param>
+    /// <returns>A shared facade safe for existing background workers to retain across endpoint migrations.</returns>
+    /// <remarks>Endpoint selection is leased atomically per operation; ambiguous requests are never replayed.</remarks>
+    /// <example><code>var client = CreateRoutingClient(bot);</code></example>
+    private ITelegramBotClient CreateRoutingClient(BotInstanceConfig bot)
+    {
+        var identity = TelegramBotTokenIdentity.ExtractBotId(bot.Token)
+            ?? throw new BotTransportUnavailableException("invalid_bot_identity");
+        return new EndpointRoutedTelegramBotClient(bot.Id, identity, _endpointGate,
+            route => GetEndpointSdk(bot.Id, route), _endpointOptions, _telemetry);
+    }
+
+    /// <summary>Resolves a pooled SDK epoch after the caller has admitted an ordinary or explicit control operation.</summary>
+    /// <param name="botId">Exact configured canonical internal bot id.</param>
+    /// <param name="route">Admitted positive BotFather identity and endpoint generation.</param>
+    /// <returns>A cached SDK over the shared socket pool; no HttpClient is constructed per request.</returns>
+    /// <exception cref="BotTransportUnavailableException">The registry identity changed before transport resolution.</exception>
+    /// <remarks>At most two SDK entries exist per bot. Replacing an entry never cancels an admitted send; the old SDK remains owned by its caller until completion.</remarks>
+    /// <example><code>var sdk = GetEndpointSdk(bot.Id, admittedRoute);</code></example>
+    private ITelegramBotClient GetEndpointSdk(string botId, TelegramEndpointRoute route)
+    {
+        var bot = _registry.GetById(botId);
+        if (bot == null || !string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) ||
+            TelegramBotTokenIdentity.ExtractBotId(bot.Token) != route.TelegramBotId)
+            throw new BotTransportUnavailableException("bot_identity_changed");
+        lock (_syncRoot)
+        {
+            var key = (bot.Id, route.Endpoint);
+            if (_endpointSdks.TryGetValue(key, out var existing) && existing.Generation == route.Generation &&
+                string.Equals(existing.Token, bot.Token, StringComparison.Ordinal)) return existing.Client;
+            var client = CreateEndpointSdk(bot, route);
+            _endpointSdks[key] = new(route.Generation, bot.Token, client);
+            return client;
+        }
+    }
+
+    /// <summary>Constructs one cached SDK using the existing shared socket pool and unchanged retry/timeout policy.</summary>
+    /// <param name="bot">Exact configured or authority-verified probe identity; token remains private and must never be logged.</param>
+    /// <param name="route">Trusted endpoint and generation admitted by the caller, never a user URL.</param>
+    /// <returns>The real SDK or isolated fake transport factory result; caller retains it while an operation is outstanding.</returns>
+    /// <remarks>Cloud passes null baseUrl to preserve LocalBotServer=false. Local alone supplies the validated loopback origin.</remarks>
+    private ITelegramBotClient CreateEndpointSdk(BotInstanceConfig bot, TelegramEndpointRoute route)
+    {
+        if (_endpointFactory != null) return _endpointFactory(bot, route);
+        var http = new HttpClient(new TelegramTelemetryHttpHandler(bot.Id, _telemetry, _endpointTestTransport ?? _transport), disposeHandler: false);
+        var options = new TelegramBotClientOptions(bot.Token, route.Endpoint == TelegramEndpointType.Local ? _endpointOptions.LocalBaseUrl : null)
+        { RetryCount = 0 };
+        return new TelegramTelemetryBotClient(options, http, bot.Id, _telemetry, PollingTelemetry);
+    }
+
+    /// <summary>Resolves a bounded pooled SDK for a same-identity replacement token or a proven-safe fresh Cloud probe.</summary>
+    /// <param name="botId">Canonical registered id, or fixed token_probe label for an unregistered identity.</param>
+    /// <param name="token">Required unlogged BotFather secret, at most 512 characters, whose identity was verified by the caller.</param>
+    /// <param name="route">Authority-admitted endpoint/generation; registered identities are rechecked before construction.</param>
+    /// <param name="registered">True for a current registry identity; false only under counted same-gate identity admission after historical cleanup/cooldown authority was checked.</param>
+    /// <returns>A shared read-only probe SDK; eviction never cancels an admitted request.</returns>
+    /// <remarks>At most 128 secret-fingerprint entries are retained across bots, tokens and generations, using the same socket transport as ordinary clients.</remarks>
+    /// <exception cref="BotTransportUnavailableException">Registered or supplied numeric identity no longer matches.</exception>
+    private ITelegramBotClient GetProbeSdk(string botId, string token, TelegramEndpointRoute route, bool registered)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+        if (token.Length > 512 || TelegramBotTokenIdentity.ExtractBotId(token) != route.TelegramBotId)
+            throw new BotTransportUnavailableException("invalid_bot_identity");
+        var current = registered ? _registry.GetById(botId) : null;
+        if (registered && (current == null || !string.Equals(current.Id, botId, StringComparison.OrdinalIgnoreCase) ||
+            TelegramBotTokenIdentity.ExtractBotId(current.Token) != route.TelegramBotId))
+            throw new BotTransportUnavailableException("bot_identity_changed");
+        if (registered && string.Equals(current.Token, token, StringComparison.Ordinal))
+            return _endpointGate == null ? GetClientForCapabilityProbe(botId) : GetEndpointSdk(botId, route);
+        Span<byte> bytes = stackalloc byte[Encoding.UTF8.GetMaxByteCount(token.Length)];
+        var count = Encoding.UTF8.GetBytes(token, bytes);
+        Span<byte> digest = stackalloc byte[32];
+        SHA256.HashData(bytes[..count], digest);
+        var key = (botId, route.Endpoint, route.Generation, Convert.ToHexString(digest));
+        lock (_syncRoot)
+        {
+            if (_probeSdks.TryGetValue(key, out var cached)) return cached;
+            var template = new BotInstanceConfig
+            {
+                Id = botId, Token = token, Type = current?.Type ?? BotInstanceTypes.Tenant,
+                Enabled = current?.Enabled ?? false, Username = current?.Username
+            };
+            var client = _endpointGate == null ? _clientFactory(template) : CreateEndpointSdk(template, route);
+            if (_probeSdks.Count >= 128)
+            {
+                using var oldest = _probeSdks.GetEnumerator();
+                oldest.MoveNext();
+                _probeSdks.Remove(oldest.Current.Key);
+            }
+            _probeSdks.Add(key, client);
+            return client;
+        }
+    }
+
+    /// <summary>Reads an authority-approved unregistered token through the shared Cloud pool under counted numeric-identity admission.</summary>
+    /// <param name="token">Required BotFather secret, never persisted or logged; caller must prove no Local, uncertain, or cooldown alias exists.</param>
+    /// <param name="admission">Active lease from this provider's exact runtime gate, acquired before durable and current-registration authority reads.</param>
+    /// <param name="cancellationToken">Existing registration/owner probe budget, forwarded unchanged.</param>
+    /// <returns>The SDK-authenticated identity for internal registration; never permission to bypass subsequent saved routing.</returns>
+    /// <remarks>Only TelegramTokenProbe invokes this read-only seam after historical-state checks. The caller retains admission through the complete SDK await and final authority check, so concurrent registration cannot log out this identity mid-probe. No polling, logout, unrestricted client, or retry is introduced.</remarks>
+    /// <exception cref="BotTransportUnavailableException">The supplied identity or its active shared-gate admission is invalid.</exception>
+    /// <example><code>var identity = await clients.ProbeUnregisteredTokenAsync(token, admission, cancellationToken);</code></example>
+    internal async Task<Telegram.Bot.Types.User> ProbeUnregisteredTokenAsync(string token,
+        TelegramEndpointRuntimeGate.IdentityProbeLease admission, CancellationToken cancellationToken)
+    {
+        var identity = TelegramBotTokenIdentity.ExtractBotId(token) ?? throw new BotTransportUnavailableException("invalid_bot_identity");
+        if (_endpointGate == null || admission == null || !admission.IsActiveFor(_endpointGate, identity))
+            throw new BotTransportUnavailableException("endpoint_identity_authority_unavailable");
+        var route = new TelegramEndpointRoute("token_probe", identity, TelegramEndpointType.Cloud, 1, true, TelegramEndpointMigrationState.Cloud);
+        using var context = IsTelemetryEnabled ? TelegramEndpointTelemetryContext.Push(route.Endpoint, route.Generation, route.MigrationState) : null;
+        return await GetProbeSdk(route.BotId, token, route, registered: false).GetMe(cancellationToken);
+    }
+
+    /// <summary>Creates a narrowly scoped endpoint transport for migration probes/logout or the reserved independent notifier.</summary>
+    /// <param name="botId">Exact configured bot id; default-bot fallback is forbidden.</param>
+    /// <param name="endpoint">Trusted explicit Cloud or Local destination enum.</param>
+    /// <param name="generation">Positive operation epoch used to correlate the control request.</param>
+    /// <param name="expectedTelegramBotId">Required positive exact BotFather identity from durable migration/notifier state; a replaced registry token is rejected before dispatch.</param>
+    /// <returns>A pooled identity-bound control view; never pass it to customer handlers or general background workers.</returns>
+    /// <exception cref="BotTransportUnavailableException">The exact bot is absent, disabled, or token identity is invalid.</exception>
+    /// <remarks>This bypass is necessary only while ordinary admissions are fenced. The coordinator persists intent before logOut and never repeats an ambiguous irreversible call.</remarks>
+    /// <example><code>var control = provider.CreateEndpointControlClient(bot.Id, TelegramEndpointType.Cloud, state.Generation, state.TelegramBotId);</code></example>
+    public ITelegramBotClient CreateEndpointControlClient(string botId, TelegramEndpointType endpoint, long generation, long expectedTelegramBotId)
+    {
+        var bot = _registry.GetById(botId);
+        var identity = TelegramBotTokenIdentity.ExtractBotId(bot?.Token);
+        if (bot == null || !string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) || !bot.Enabled ||
+            !identity.HasValue || identity.Value != expectedTelegramBotId || generation < 1)
+            throw new BotTransportUnavailableException("control_bot_unavailable");
+        // Existing deterministic factories remain valid for control protocol tests.
+        if (_endpointGate == null) return GetClient(bot.Id, identity.Value);
+        var state = _endpointGate.GetRoute(bot.Id, identity.Value).MigrationState;
+        var route = new TelegramEndpointRoute(bot.Id, identity.Value, endpoint, generation, false, state);
+        return new EndpointRoutedTelegramBotClient(bot.Id, identity.Value, null,
+            selected => GetEndpointSdk(bot.Id, selected), _endpointOptions, _telemetry, control: route);
+    }
+
+    /// <summary>Creates a pinned current-generation receiver view, rejecting requests from an obsolete polling generation.</summary>
+    /// <param name="botId">Exact configured internal bot id.</param>
+    /// <returns>A receiver-only view permitted during strict staged startup, or the original client when routing is not installed.</returns>
+    /// <remarks>Only the runtime owns this view; ordinary callbacks use the reusable normal facade so receiver privileges cannot escape into business execution.</remarks>
+    /// <exception cref="BotTransportUnavailableException">The exact identity or generation is unavailable.</exception>
+    public ITelegramBotClient GetEndpointReceiverClient(string botId)
+    {
+        if (_endpointGate == null) return GetClient(botId);
+        var bot = _registry.GetById(botId);
+        var identity = TelegramBotTokenIdentity.ExtractBotId(bot?.Token);
+        if (bot == null || !string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) || !identity.HasValue)
+            throw new BotTransportUnavailableException("receiver_bot_unavailable");
+        var route = _endpointGate.GetRoute(bot.Id, identity.Value);
+        return new EndpointRoutedTelegramBotClient(bot.Id, identity.Value, _endpointGate,
+            selected => GetEndpointSdk(bot.Id, selected), _endpointOptions, _telemetry,
+            generation: route.Generation, receiver: true);
+    }
+
+    /// <summary>Fixed-size cached SDK ownership for one bot/endpoint; the token is private and never serialized.</summary>
+    private sealed class EndpointSdk
+    {
+        /// <summary>Positive cached endpoint epoch.</summary>
+        internal long Generation { get; }
+        /// <summary>Current secret used only for ordinal invalidation; never serialized or formatted by a record ToString.</summary>
+        internal string Token { get; }
+        /// <summary>SDK owned by callers through completion of already admitted operations.</summary>
+        internal ITelegramBotClient Client { get; }
+        /// <summary>Retains one SDK epoch without record-generated secret formatting.</summary>
+        /// <param name="generation">Positive endpoint generation.</param><param name="token">Required private BotFather secret; never log it.</param>
+        /// <param name="client">Real cached SDK or deterministic fixture transport.</param>
+        internal EndpointSdk(long generation, string token, ITelegramBotClient client) { Generation = generation; Token = token; Client = client; }
     }
 
     /// <summary>
@@ -434,7 +655,7 @@ public class BotClientProvider : IDisposable
     /// Required persisted internal bot id selected by an authorized owner workflow, not a Telegram bot, user or chat id.
     /// Empty ids are rejected rather than falling back to the default owned bot.
     /// </param>
-    /// <returns>The shared client for that bot's configured token; the caller must not dispose it or use it for delivery.</returns>
+    /// <returns>A read-only view for that bot's current active endpoint/token; the caller must not dispose it or use it for delivery.</returns>
     /// <remarks>
     /// Use only for bounded identity and channel-capability lookups after ownership has been checked. Disabled tenants
     /// are allowed solely for this pre-activation path; ordinary and historical delivery still requires an enabled
@@ -450,12 +671,35 @@ public class BotClientProvider : IDisposable
         return GetClientCore(botId, expectedTelegramBotId: null, allowDisabledTenant: true);
     }
 
+    /// <summary>Probes a replacement secret for the same current BotFather identity through its admitted endpoint, without enabling delivery.</summary>
+    /// <param name="botId">Required exact current registry id, not a customer supplied username.</param>
+    /// <param name="token">Required trimmed replacement/current BotFather secret; never logged, and its numeric identity must match the registry.</param>
+    /// <param name="expectedTelegramBotId">Required positive currently registered BotFather numeric identity.</param>
+    /// <returns>A read-only routed facade permitting getMe/chat/admin capability reads only; normal fences remain authoritative.</returns>
+    /// <remarks>The supplied token is held in a bounded pooled SDK probe cache. This is not a migration/control bypass or a delivery capability.</remarks>
+    /// <exception cref="BotTransportUnavailableException">Current or supplied identity changed, is unknown or lacks a token.</exception>
+    internal ITelegramBotClient GetClientForCapabilityProbe(string botId, string token, long expectedTelegramBotId)
+    {
+        var bot = _registry.GetById(botId);
+        if (bot == null || !string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) || expectedTelegramBotId <= 0 ||
+            TelegramBotTokenIdentity.ExtractBotId(bot.Token) != expectedTelegramBotId ||
+            TelegramBotTokenIdentity.ExtractBotId(token) != expectedTelegramBotId)
+            throw new BotTransportUnavailableException("bot_identity_changed");
+        if (_endpointGate == null)
+        {
+            var route = new TelegramEndpointRoute(bot.Id, expectedTelegramBotId, TelegramEndpointType.Cloud, 1, true, TelegramEndpointMigrationState.Cloud);
+            return GetProbeSdk(bot.Id, token, route, registered: true);
+        }
+        return new EndpointRoutedTelegramBotClient(bot.Id, expectedTelegramBotId, _endpointGate,
+            route => GetProbeSdk(bot.Id, token, route, registered: true), _endpointOptions, _telemetry, probe: true);
+    }
+
     /// <summary>Resolves one exact cached transport while preserving runtime availability and historical identity guards.</summary>
     /// <param name="botId">Internal registry bot id; only ordinary default-bot callers may omit it.</param>
     /// <param name="expectedTelegramBotId">Optional immutable BotFather numeric id captured by historical work.</param>
     /// <param name="allowDisabledTenant">True only for an authorized pre-activation capability probe, never for delivery.</param>
     /// <returns>The cached or newly created client belonging to the resolved registry bot; its lifetime remains shared.</returns>
-    /// <remarks>Availability and identity are checked before reading the cache, so a prior probe cannot unlock delivery.</remarks>
+    /// <remarks>Availability and identity are checked before reading the cache, so a prior probe cannot unlock delivery. Disabled-tenant probes return a separate read-only facade, not the delivery cache entry.</remarks>
     /// <exception cref="BotTransportUnavailableException">The bot, token, enabled state or required identity is unavailable.</exception>
     /// <exception cref="InvalidOperationException">The configured client factory returned no transport.</exception>
     /// <example><code>var client = GetClientCore(botId, expectedTelegramBotId);</code></example>
@@ -482,9 +726,18 @@ public class BotClientProvider : IDisposable
             throw new BotTransportUnavailableException("bot_identity_changed");
         }
 
+        if (allowDisabledTenant && _endpointGate != null)
+        {
+            var identity = TelegramBotTokenIdentity.ExtractBotId(bot.Token)
+                ?? throw new BotTransportUnavailableException("invalid_bot_identity");
+            return new EndpointRoutedTelegramBotClient(bot.Id, identity, _endpointGate,
+                route => GetEndpointSdk(bot.Id, route), _endpointOptions, _telemetry, probe: true);
+        }
+
         lock (_syncRoot)
         {
-            if (_clients.TryGetValue(bot.Id, out var existing))
+            if (_clients.TryGetValue(bot.Id, out var existing) &&
+                (_endpointGate == null || existing.BotId == TelegramBotTokenIdentity.ExtractBotId(bot.Token)))
                 return existing;
 
             var created = _clientFactory(bot);
@@ -798,7 +1051,7 @@ public sealed class BotRuntimeStatusStore
 /// Hosted service that starts one Telegram receiver per enabled bot.
 /// All receivers dispatch updates into the shared TelegramBotService with a bot-specific runtime context.
 /// </summary>
-public class MultiBotHostedService : IHostedService
+public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLifecycle
 {
     private readonly BotRegistry _registry;
     private readonly BotClientProvider _clientProvider;
@@ -811,6 +1064,12 @@ public class MultiBotHostedService : IHostedService
     private readonly UpdateTelemetryTracker _updateTelemetry;
     /// <summary>Optional writer used for an unpersisted admin-control handler measurement scope.</summary>
     private readonly LatencyTelemetryService _telemetry;
+    /// <summary>Shared endpoint admission gate; null preserves original direct-constructor lifecycle tests.</summary>
+    private readonly TelegramEndpointRuntimeGate _endpointGate;
+    /// <summary>Authorized operator control path available from every healthy owned bot.</summary>
+    private readonly TelegramEndpointAdminService _endpointAdmin;
+    /// <summary>Coalesces route availability changes into the existing single tracked receiver-recovery lifetime.</summary>
+    private readonly SemaphoreSlim _endpointRecoveryWake = new(0, 1);
     private readonly TimeSpan _startupProbeTimeout;
     private CancellationTokenSource _receivingCts;
     private readonly Dictionary<string, CancellationTokenSource> _botReceivers = new(StringComparer.OrdinalIgnoreCase);
@@ -867,6 +1126,8 @@ public class MultiBotHostedService : IHostedService
     /// <param name="logger">Logger for receiver lifecycle events.</param>
     /// <param name="telemetry">Optional shared writer for unpersisted admin-control scopes; transport clients use the provider's same writer.</param>
     /// <param name="updateTelemetry">Optional per-update receiver tracker; null preserves existing direct-constructor callers.</param>
+    /// <param name="endpointGate">Optional shared routing fence; saved pending migrations never start an ordinary receiver.</param>
+    /// <param name="endpointAdmin">Optional global-super-admin endpoint panel; customer/tenant callbacks cannot use it.</param>
     /// <remarks>The host tracks receiver, initialization, and recovery lifetimes; each replacement waits for the previous receiver generation to terminate.</remarks>
     public MultiBotHostedService(
         BotRegistry registry,
@@ -878,7 +1139,9 @@ public class MultiBotHostedService : IHostedService
         IConfiguration configuration,
         ILogger<MultiBotHostedService> logger,
         LatencyTelemetryService telemetry = null,
-        UpdateTelemetryTracker updateTelemetry = null)
+        UpdateTelemetryTracker updateTelemetry = null,
+        TelegramEndpointRuntimeGate endpointGate = null,
+        TelegramEndpointAdminService endpointAdmin = null)
     {
         _registry = registry;
         _clientProvider = clientProvider;
@@ -888,6 +1151,9 @@ public class MultiBotHostedService : IHostedService
         _runtimeStatusStore = runtimeStatusStore;
         _updateTelemetry = updateTelemetry;
         _telemetry = telemetry;
+        _endpointGate = endpointGate;
+        _endpointAdmin = endpointAdmin;
+        if (_endpointGate != null) _endpointGate.AvailabilityChanged += SignalEndpointRecovery;
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         _startupProbeTimeout = TimeSpan.FromSeconds(Math.Clamp(appConfig.TelegramBotStartupProbeTimeoutSeconds, 5, 60));
         _logger = logger;
@@ -913,7 +1179,7 @@ public class MultiBotHostedService : IHostedService
         foreach (var bot in _registry.Bots)
         {
             var result = await StartBotAttemptSerializedAsync(bot.Id, cancellationToken);
-            if (IsNonRetryableStartupResult(result))
+            if (IsNonRetryableStartupResult(result) && !(result == BotStartupResult.Skipped && _endpointGate != null && !_endpointGate.CanReceive(bot.Id)))
                 nonRetryableBotIds.Add(bot.Id);
         }
 
@@ -1012,6 +1278,7 @@ public class MultiBotHostedService : IHostedService
     /// <param name="cancellationToken">
     /// Token used for Telegram validation calls and database cleanup when startup is cancelled by the host.
     /// </param>
+    /// <param name="strictEndpointValidation">True only for a staged migration destination: identity and short polling must validate without optimistic startup.</param>
     /// <returns>
     /// A <see cref="BotStartupResult" /> value describing whether a receiver started, was already running, should
     /// be skipped permanently, or failed in a way that can be retried by the persistent startup recovery loop.
@@ -1020,13 +1287,14 @@ public class MultiBotHostedService : IHostedService
     /// This method is the single startup path for owned, tenant, and assistant bots and must be called while holding
     /// the corresponding lifecycle gate. It mutates tenant rows only when Telegram proves the token is invalid or
     /// duplicate-token protection chooses another bot. Webhook preflight must succeed before registration; only a
-    /// transient <c>getMe</c> failure may use optimistic registration. Command setup and identity refresh continue in
-    /// the background.
+    /// transient <c>getMe</c> failure may use optimistic registration outside migration. Staged migration requires exact
+    /// BotFather identity and a zero-timeout, non-dropping getUpdates proof before registration. Command setup and identity refresh continue in the background.
     /// Startup/receiver health and update reception emit only nonblocking metadata. Each update opens its
     /// receiver timeline before the bounded admin control path or durable admission; control-path completion
     /// is explicit and never creates a durable inbox receipt. SDK-validated polls own health recovery.
     /// </remarks>
-    private async Task<BotStartupResult> StartBotCoreAsync(string botId, CancellationToken cancellationToken = default)
+    private async Task<BotStartupResult> StartBotCoreAsync(string botId, CancellationToken cancellationToken = default,
+        bool strictEndpointValidation = false)
     {
         var bot = _registry.GetById(botId);
         if (bot == null || !string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase))
@@ -1038,6 +1306,14 @@ public class MultiBotHostedService : IHostedService
             _runtimeStatusStore.MarkSkipped(bot, bot.Enabled ? "missing token" : "disabled by configuration");
             return BotStartupResult.Skipped;
         }
+        if (_endpointGate != null && TelegramBotTokenIdentity.ExtractBotId(bot.Token) is long currentIdentity)
+            await _endpointGate.HydrateAsync(bot.Id, currentIdentity, cancellationToken);
+        if (!strictEndpointValidation && _endpointGate != null && !_endpointGate.CanReceive(bot.Id))
+        {
+            _runtimeStatusStore.MarkSkipped(bot, "endpoint migration pending");
+            return BotStartupResult.Skipped;
+        }
+
 
         lock (_syncRoot)
         {
@@ -1079,7 +1355,11 @@ public class MultiBotHostedService : IHostedService
             // Each bot receives with its own token but dispatches through the shared TelegramBotService.
             var parentToken = _receivingCts?.Token ?? cancellationToken;
             botCts = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
-            var client = _clientProvider.GetClient(bot.Id);
+            var receiverToken = botCts.Token;
+            var client = _clientProvider.GetEndpointReceiverClient(bot.Id);
+            var expectedBotIdentity = TelegramBotTokenIdentity.ExtractBotId(bot.Token);
+            var endpointGeneration = _endpointGate != null && expectedBotIdentity.HasValue ?
+                _endpointGate.GetRoute(bot.Id, expectedBotIdentity.Value).Generation : (long?)null;
             Telegram.Bot.Types.User me = null;
             Exception transientProbeError = null;
 
@@ -1091,19 +1371,22 @@ public class MultiBotHostedService : IHostedService
                 using var probeMetadata = _clientProvider.IsTelemetryEnabled ?
                     TelegramRequestCancellationScope.PushStartupProbe(cancellationToken, probeCts.Token) : null;
                 me = await client.GetMe(probeCts.Token);
+                if (strictEndpointValidation)
+                {
+                    if (!expectedBotIdentity.HasValue || me.Id != expectedBotIdentity.Value)
+                        throw new BotTransportUnavailableException("destination_identity_mismatch");
+                    // Offset zero does not confirm/remove this batch. The real receiver admits it durably before its next poll.
+                    await client.GetUpdates(offset: 0, limit: 1, timeout: 0,
+                        allowedUpdates: Array.Empty<UpdateType>(), cancellationToken: probeCts.Token);
+                }
             }
-            catch (Exception ex) when (IsTelegramTransientStartupError(ex))
+            catch (Exception ex) when (!strictEndpointValidation && IsTelegramTransientStartupError(ex))
             {
                 // A transient getMe failure does not prove the token is invalid. Register the receiver exactly once
                 // and let polling plus background initialization establish connectivity without taking the bot offline.
                 transientProbeError = ex;
             }
 
-            var context = new BotRuntimeContext
-            {
-                Config = bot,
-                Client = client
-            };
 
             Task previousReceiver;
             lock (_syncRoot) _receiverTasks.TryGetValue(bot.Id, out previousReceiver);
@@ -1123,9 +1406,20 @@ public class MultiBotHostedService : IHostedService
                     bool handled;
                     try
                     {
-                        using var admin = _scopeFactory.CreateScope();
-                        handled = await admin.ServiceProvider.GetRequiredService<TelegramInboxAdminService>()
-                            .TryHandleAsync(bot.Id, client, update, token);
+                        handled = false;
+                        if (_endpointGate == null || _endpointGate.CanReceive(bot.Id))
+                        {
+                            // Receiver privileges must never escape into operator/customer requests.
+                            var updateClient = expectedBotIdentity.HasValue ?
+                                _clientProvider.GetClient(bot.Id, expectedBotIdentity.Value) : _clientProvider.GetClient(bot.Id);
+                            handled = _endpointAdmin != null && await _endpointAdmin.TryHandleAsync(bot.Id, updateClient, update, token);
+                            if (!handled)
+                            {
+                                using var admin = _scopeFactory.CreateScope();
+                                handled = await admin.ServiceProvider.GetRequiredService<TelegramInboxAdminService>()
+                                    .TryHandleAsync(bot.Id, updateClient, update, token);
+                            }
+                        }
                     }
                     finally
                     {
@@ -1138,20 +1432,24 @@ public class MultiBotHostedService : IHostedService
                     }
                     await _scheduler.EnqueueAsync(bot.Id, update, token);
                 },
-                errorHandler: (_, exception, token) => HandleBotPollingErrorAsync(bot.Id, exception, token),
+                errorHandler: (_, exception, token) => token.IsCancellationRequested ||
+                    !IsCurrentEndpointGeneration(bot.Id, expectedBotIdentity, endpointGeneration) ? Task.CompletedTask :
+                    HandleBotPollingErrorAsync(bot.Id, exception, token),
                 receiverOptions: new ReceiverOptions
                 {
                     AllowedUpdates = Array.Empty<UpdateType>()
                 },
                 cancellationToken: botCts.Token);
 
-            lock (_syncRoot) _receiverTasks[bot.Id] = receiverTask;
+            lock (_syncRoot)
+            {
+                _receiverTasks[bot.Id] = receiverTask;
+                _botReceivers[bot.Id] = botCts;
+            }
             TrackBackgroundTask(receiverTask);
-            receiverTask.GetAwaiter().OnCompleted(() => _clientProvider.PollingTelemetry.Stopped(bot.Id, receiverGeneration));
+            receiverTask.GetAwaiter().OnCompleted(() => CompleteReceiverGeneration(bot.Id, botCts, receiverTask, receiverGeneration));
             _clientProvider.PollingTelemetry.Startup(bot.Id, "completed");
 
-            lock (_syncRoot)
-                _botReceivers[bot.Id] = botCts;
 
             if (transientProbeError == null)
             {
@@ -1181,7 +1479,8 @@ public class MultiBotHostedService : IHostedService
                 () => CompleteBotInitializationAsync(
                     bot.Id,
                     TelegramBotTokenIdentity.ExtractBotId(bot.Token),
-                    parentToken),
+                    endpointGeneration,
+                    receiverToken),
                 CancellationToken.None));
 
             return BotStartupResult.Started;
@@ -1201,9 +1500,17 @@ public class MultiBotHostedService : IHostedService
                 }
             }
 
-            botCts?.Cancel();
+            try { botCts?.Cancel(); } catch (ObjectDisposedException) { }
             botCts?.Dispose();
             _clientProvider.Invalidate(bot.Id);
+
+            if (strictEndpointValidation)
+            {
+                // A destination-specific rejection is migration evidence, not authority to revoke a tenant's token.
+                _runtimeStatusStore.MarkFailed(bot, "endpoint_receiver_not_ready", "destination receiver validation failed");
+                _logger.LogWarning("Telegram endpoint receiver validation failed. Category={Category}", "receiver_not_ready");
+                return BotStartupResult.TransientFailure;
+            }
 
             if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
                 return BotStartupResult.TransientFailure;
@@ -1312,6 +1619,7 @@ public class MultiBotHostedService : IHostedService
     /// Numeric bot id extracted from the token used to create the receiver. A changed token cancels this background
     /// worker so it cannot validate or disable a newer receiver generation.
     /// </param>
+    /// <param name="expectedEndpointGeneration">Captured positive route epoch, or null when endpoint routing is not installed; obsolete workers cannot initialize a replacement receiver.</param>
     /// <param name="cancellationToken">Host/receiver lifetime token that cancels background retries during shutdown.</param>
     /// <returns>A task that completes after success, a definitive token rejection, receiver stop, or retry exhaustion.</returns>
     /// <remarks>
@@ -1324,6 +1632,7 @@ public class MultiBotHostedService : IHostedService
     private async Task CompleteBotInitializationAsync(
         string botId,
         long? expectedTelegramBotId,
+        long? expectedEndpointGeneration,
         CancellationToken cancellationToken)
     {
         const int maxAttempts = 5;
@@ -1337,21 +1646,22 @@ public class MultiBotHostedService : IHostedService
             if (bot == null ||
                 !bot.Enabled ||
                 string.IsNullOrWhiteSpace(bot.Token) ||
-                TelegramBotTokenIdentity.ExtractBotId(bot.Token) != expectedTelegramBotId)
+                TelegramBotTokenIdentity.ExtractBotId(bot.Token) != expectedTelegramBotId ||
+                !IsCurrentEndpointGeneration(botId, expectedTelegramBotId, expectedEndpointGeneration))
             {
                 return;
             }
 
             try
             {
-                var client = _clientProvider.GetClient(bot.Id);
+                var client = _clientProvider.GetEndpointReceiverClient(bot.Id);
                 using var probeCts = CreateStartupProbeCancellation(cancellationToken);
                 using var probeMetadata = _clientProvider.IsTelemetryEnabled ?
                     TelegramRequestCancellationScope.PushStartupProbe(cancellationToken, probeCts.Token) : null;
                 var me = await client.GetMe(probeCts.Token);
                 await ConfigureBotCommandsAsync(client, bot, probeCts.Token);
 
-                if (!IsReceiverRunning(botId))
+                if (!IsReceiverRunning(botId) || !IsCurrentEndpointGeneration(botId, expectedTelegramBotId, expectedEndpointGeneration))
                     return;
 
                 _runtimeStatusStore.MarkStarted(bot, me.Username);
@@ -1384,7 +1694,7 @@ public class MultiBotHostedService : IHostedService
                 }
                 else
                 {
-                    await StopBotAsync(bot.Id);
+                    await StopBotAsync(bot.Id, cancellationToken);
                     _logger.LogCritical(
                         ex,
                         "Configured Telegram bot receiver stopped after background validation rejected its token. botId={BotId}",
@@ -1405,6 +1715,109 @@ public class MultiBotHostedService : IHostedService
                     bot.Id);
                 return;
             }
+        }
+    }
+
+    /// <summary>Removes only the completed receiver's exact registration and wakes existing recovery after a fence exits polling.</summary>
+    /// <param name="botId">Canonical runtime bot id captured when this receiver started.</param>
+    /// <param name="receiver">Exact owned CTS; a predecessor must never remove/cancel a replacement.</param>
+    /// <param name="task">Completed receiving task retained for lifecycle join.</param>
+    /// <param name="pollingGeneration">Existing polling telemetry generation, distinct from endpoint generation.</param>
+    /// <remarks>A prelogout failure can reopen the source after its fenced poll exited; leaving its CTS registered would suppress recovery forever.</remarks>
+    private void CompleteReceiverGeneration(string botId, CancellationTokenSource receiver, Task task, long pollingGeneration)
+    {
+        _clientProvider.PollingTelemetry.Stopped(botId, pollingGeneration);
+        bool removed;
+        lock (_syncRoot)
+        {
+            removed = _botReceivers.TryGetValue(botId, out var current) && ReferenceEquals(current, receiver) &&
+                _receiverTasks.TryGetValue(botId, out var registeredTask) && ReferenceEquals(registeredTask, task);
+            if (removed)
+            {
+                _botReceivers.Remove(botId);
+                _runtimeStatusStore.MarkStopped(botId, "receiver generation completed");
+            }
+        }
+        if (!removed) return;
+        _transientPollingBackoff.Remove(botId);
+        try { receiver.Cancel(); } catch (ObjectDisposedException) { } catch (AggregateException) { }
+        receiver.Dispose();
+        SignalEndpointRecovery();
+    }
+
+    /// <summary>Prevents completed probes or errors from an obsolete endpoint generation mutating a replacement receiver.</summary>
+    /// <param name="botId">Exact canonical runtime bot id captured at receiver startup.</param>
+    /// <param name="identity">Captured positive BotFather identity, or null for legacy deterministic runtime factories.</param>
+    /// <param name="generation">Captured endpoint epoch, or null when routing is not installed.</param>
+    /// <returns>True only for the current configured identity/epoch; legacy no-routing receivers retain original behavior.</returns>
+    /// <remarks>This performs only a short metadata read. Receiver cancellation remains the primary shutdown signal.</remarks>
+    private bool IsCurrentEndpointGeneration(string botId, long? identity, long? generation)
+    {
+        if (_endpointGate == null || !generation.HasValue) return true;
+        if (!identity.HasValue) return false;
+        try { return _endpointGate.GetRoute(botId, identity.Value).Generation == generation.Value; }
+        catch (BotTransportUnavailableException) { return false; }
+    }
+
+    /// <summary>Acquires the existing per-bot lifecycle semaphore for a fenced endpoint migration.</summary>
+    /// <param name="botId">Required exact configured runtime bot id, never a username or default-bot alias.</param>
+    /// <param name="token">Host/migration cancellation while waiting; callback foreground tokens must not own migration work.</param>
+    /// <returns>An asynchronous lease serializing stop, join, strict destination startup and committed route publication.</returns>
+    /// <exception cref="BotTransportUnavailableException">The exact configured bot is absent.</exception>
+    /// <exception cref="OperationCanceledException">Lifecycle ownership waiting is cancelled.</exception>
+    /// <remarks>No shared Local process/container is controlled. The coordinator owns request fencing and durable intent.</remarks>
+    /// <example><code>await using var lifecycle = await runtime.AcquireAsync(botId, token); await lifecycle.StopAndWaitAsync(token);</code></example>
+    public async Task<ITelegramEndpointReceiverLease> AcquireAsync(string botId, CancellationToken token)
+    {
+        var bot = _registry.GetById(botId);
+        if (string.IsNullOrWhiteSpace(botId) || bot == null || !string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase))
+            throw new BotTransportUnavailableException("migration_bot_unavailable");
+        var gate = GetLifecycleGate(bot.Id);
+        await gate.WaitAsync(token);
+        return new EndpointReceiverLease(this, bot.Id, gate);
+    }
+
+    /// <summary>Bot-specific receiver ownership backed by the runtime's existing start/stop/recovery semaphore.</summary>
+    private sealed class EndpointReceiverLease : ITelegramEndpointReceiverLease
+    {
+        /// <summary>Runtime owner released exactly once; no client or shared API server ownership is transferred.</summary>
+        private MultiBotHostedService _owner;
+        /// <summary>Canonical internal bot id isolated by this lease.</summary>
+        private readonly string _botId;
+        /// <summary>Already-acquired runtime lifecycle semaphore.</summary>
+        private readonly SemaphoreSlim _gate;
+        /// <summary>Wraps an already-acquired per-bot runtime lifecycle gate.</summary>
+        /// <param name="owner">Runtime that owns the receiver dictionaries and host cancellation.</param>
+        /// <param name="botId">Exact configured canonical bot id.</param>
+        /// <param name="gate">Existing acquired lifecycle semaphore.</param>
+        internal EndpointReceiverLease(MultiBotHostedService owner, string botId, SemaphoreSlim gate)
+        { _owner = owner; _botId = botId; _gate = gate; }
+
+        /// <inheritdoc />
+        public async Task StopAndWaitAsync(CancellationToken token)
+        {
+            var owner = _owner ?? throw new ObjectDisposedException(nameof(EndpointReceiverLease));
+            owner.StopBotCore(_botId, "endpoint migration");
+            Task previous;
+            lock (owner._syncRoot) owner._receiverTasks.TryGetValue(_botId, out previous);
+            await TelegramReceiverLifetime.ObservePreviousAsync(previous, token);
+        }
+
+        /// <inheritdoc />
+        public async Task<bool> StartValidatedAsync(CancellationToken token)
+        {
+            var owner = _owner ?? throw new ObjectDisposedException(nameof(EndpointReceiverLease));
+            if (owner._receivingCts == null || owner._receivingCts.IsCancellationRequested) return false;
+            return await owner.StartBotCoreAsync(_botId, token, strictEndpointValidation: true) == BotStartupResult.Started;
+        }
+
+        /// <summary>Releases lifecycle ownership once; it does not start/stop a receiver or alter committed routing state.</summary>
+        /// <returns>A completed value task after releasing the semaphore.</returns>
+        /// <remarks>Failures remain durable coordinator states. Another bot's receiver is never affected.</remarks>
+        public ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _owner, null) != null) _gate.Release();
+            return ValueTask.CompletedTask;
         }
     }
 
@@ -1435,34 +1848,47 @@ public class MultiBotHostedService : IHostedService
     /// Linked host shutdown token. Cancelling it stops the recovery loop without throwing into the hosted service.
     /// </param>
     /// <returns>
-    /// A task that completes after every missing receiver starts, all remaining bots become definitively
-    /// non-retryable, or host cancellation is requested.
+    /// A task completing after initial recovery in no-routing direct construction, or after host cancellation when
+    /// endpoint routing keeps the bounded lifetime waiting for newly available persisted routes.
     /// </returns>
     /// <remarks>
     /// This is a process-local safety net for transient Telegram startup failures. It does not replace the normal
     /// tenant owner start button; it only repairs the common Ubuntu restart race where one or more configured owned
     /// bots fail <c>GetMe</c> or <c>SetMyCommands</c> once and would otherwise remain offline until another service
-    /// restart. Recovery is persistent but its delay is exponentially backed off and capped, so a longer Telegram
-    /// outage cannot leave an enabled tenant permanently offline or create a tight retry loop.
+    /// restart. Recovery is persistent but its delay is exponentially backed off and capped. With endpoint routing,
+    /// a coalesced availability wake restores a safely reactivated source after restart without polling or spawning a task per health event.
     /// </remarks>
     private async Task RecoverMissingStartupReceiversAsync(
         HashSet<string> nonRetryableBotIds,
         CancellationToken cancellationToken)
     {
         var attempt = 0;
+        var routingWake = false;
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
                 var missingBots = GetRetryableMissingBots(nonRetryableBotIds);
                 if (missingBots.Count == 0)
-                    return;
+                {
+                    if (_endpointGate == null) return;
+                    attempt = 0;
+                    await _endpointRecoveryWake.WaitAsync(cancellationToken);
+                    routingWake = true;
+                    continue;
+                }
 
                 attempt++;
                 var delay = CalculateStartupRecoveryDelay(attempt);
-                foreach (var bot in missingBots)
-                    _clientProvider.PollingTelemetry.Backoff(bot.Id, delay, "startup_recovery");
-                await Task.Delay(delay, cancellationToken);
+                if (!routingWake)
+                {
+                    foreach (var bot in missingBots)
+                        _clientProvider.PollingTelemetry.Backoff(bot.Id, delay, "startup_recovery");
+                    if (_endpointGate == null) await Task.Delay(delay, cancellationToken);
+                    else await _endpointRecoveryWake.WaitAsync(delay, cancellationToken);
+                }
+                // A committed availability wake repairs the source immediately; real startup failures still use existing backoff.
+                routingWake = false;
 
                 foreach (var bot in missingBots)
                 {
@@ -1473,7 +1899,7 @@ public class MultiBotHostedService : IHostedService
                         delay.TotalSeconds);
 
                     var result = await StartBotAttemptSerializedAsync(bot.Id, cancellationToken);
-                    if (IsNonRetryableStartupResult(result))
+                    if (IsNonRetryableStartupResult(result) && !(result == BotStartupResult.Skipped && _endpointGate != null && !_endpointGate.CanReceive(bot.Id)))
                         nonRetryableBotIds.Add(bot.Id);
                 }
             }
@@ -1528,8 +1954,16 @@ public class MultiBotHostedService : IHostedService
             .Where(bot => bot.Enabled)
             .Where(bot => !string.IsNullOrWhiteSpace(bot.Token))
             .Where(bot => !nonRetryableBotIds.Contains(bot.Id))
+            .Where(bot => _endpointGate == null || _endpointGate.CanReceive(bot.Id))
             .Where(bot => !IsReceiverRunning(bot.Id))
             .ToList();
+    }
+
+    /// <summary>Wakes the existing receiver recovery lifetime after a meaningful endpoint availability change.</summary>
+    /// <remarks>One semaphore token coalesces changes across bots; health-only revisions do not spawn work.</remarks>
+    private void SignalEndpointRecovery()
+    {
+        try { _endpointRecoveryWake.Release(); } catch (SemaphoreFullException) { }
     }
 
     /// <summary>
@@ -1721,7 +2155,7 @@ public class MultiBotHostedService : IHostedService
             string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) &&
             IsTelegramGetUpdatesConflict(exception))
         {
-            await StopBotAsync(botId);
+            await StopBotAsync(botId, cancellationToken);
             _logger.LogCritical(
                 "Telegram receiver stopped because another getUpdates poller is using the same token. botId={BotId}, username=@{Username}, telegramError={TelegramError}",
                 bot.Id,
@@ -2097,7 +2531,7 @@ public class MultiBotHostedService : IHostedService
         if (lifecycleGateHeld)
             StopBotCore(bot.Id, "tenant token cleanup");
         else
-            await StopBotAsync(bot.Id);
+            await StopBotAsync(bot.Id, cancellationToken);
 
         await using var scope = _scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
@@ -2452,18 +2886,20 @@ public class MultiBotHostedService : IHostedService
     /// Stops one bot receiver under its lifecycle gate without stopping the whole application.
     /// </summary>
     /// <param name="botId">Internal runtime bot id whose receiver must be cancelled.</param>
+    /// <param name="cancellationToken">Optional caller cancellation while waiting for lifecycle ownership; receiver callbacks pass their own token to avoid self-join deadlocks during migration.</param>
     /// <returns>A task that completes after any concurrent startup finishes and the registered receiver is cancelled.</returns>
+    /// <exception cref="OperationCanceledException">Lifecycle ownership waiting is cancelled before this call stops a receiver.</exception>
     /// <remarks>
     /// Waiting on the same per-bot gate used by startup makes the final state deterministic. The method is idempotent:
     /// stopping an already stopped bot does not create or cancel another receiver.
     /// </remarks>
-    public async Task StopBotAsync(string botId)
+    public async Task StopBotAsync(string botId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(botId))
             return;
 
         var lifecycleGate = GetLifecycleGate(botId);
-        await lifecycleGate.WaitAsync();
+        await lifecycleGate.WaitAsync(cancellationToken);
         try
         {
             StopBotCore(botId, "receiver stopped");
@@ -2518,6 +2954,7 @@ public class MultiBotHostedService : IHostedService
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _scheduler.StopAdmission();
+        if (_endpointGate != null) _endpointGate.AvailabilityChanged -= SignalEndpointRecovery;
         lock (_syncRoot)
         {
             foreach (var receiver in _botReceivers.ToList())

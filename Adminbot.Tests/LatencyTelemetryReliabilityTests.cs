@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using Adminbot.Services.Telemetry;
+using Adminbot.Services.TelegramEndpoints;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Telegram.Bot;
@@ -621,6 +622,129 @@ public sealed class LatencyTelemetryReliabilityTests
         foreach (var forbidden in new[] { "private.invalid", "TEST_TOKEN", "customer-body", "https://" })
             Assert.DoesNotContain(forbidden, json, StringComparison.Ordinal);
     }
+    /// <summary>Actual concurrent SDK and HTTP requests retain the exact admitted endpoint generation and correlation without cross-request ambient leakage.</summary>
+    /// <returns>A task verifying both transport boundaries and context restoration using only in-process HTTP.</returns>
+    [Fact]
+    public async Task Concurrent_endpoint_requests_share_http_sdk_generation_and_isolate_context()
+    {
+        using var files = new TemporaryFiles();
+        using var service = files.Service();
+        var entered = 0;
+        var bothEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var handler = new ScriptedHandler(async (_, token) =>
+        {
+            if (Interlocked.Increment(ref entered) == 2) bothEntered.TrySetResult();
+            await bothEntered.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
+            return Response(MessageJson);
+        });
+        using var http = Http(service, "owned", handler);
+        var sdk = Sdk(service, "owned", http);
+        var cloud = Task.Run(async () =>
+        {
+            using var route = TelegramEndpointTelemetryContext.Push(TelegramEndpointType.Cloud, 1, TelegramEndpointMigrationState.Cloud);
+            using var scope = Push(service, TimeProvider.System, "owned");
+            await sdk.SendMessage(7, "private-cloud-text");
+            Assert.Equal("cloud", TelegramEndpointTelemetryContext.Current.EndpointType);
+            return scope.TraceId;
+        });
+        var local = Task.Run(async () =>
+        {
+            using var route = TelegramEndpointTelemetryContext.Push(TelegramEndpointType.Local, 2, TelegramEndpointMigrationState.Local);
+            using var scope = Push(service, TimeProvider.System, "owned");
+            await sdk.SendMessage(7, "private-local-text");
+            Assert.Equal("local", TelegramEndpointTelemetryContext.Current.EndpointType);
+            return scope.TraceId;
+        });
+        var traces = await Task.WhenAll(cloud, local);
+        Assert.Null(TelegramEndpointTelemetryContext.Current);
+        await service.StartAsync(default);
+        await service.StopAsync(default);
+        var events = ReadEvents(files.TelemetryDirectory);
+        foreach (var endpoint in new[] { "cloud", "local" })
+        {
+            var requests = events.Where(item => item.EndpointType == endpoint).ToArray();
+            Assert.Equal(2, requests.Length);
+            var headers = Assert.Single(requests, item => item.EventType == "telegram_request_completed");
+            var validated = Assert.Single(requests, item => item.EventType == "telegram_api_request_completed");
+            Assert.Equal(endpoint == "cloud" ? 1L : 2L, headers.EndpointGeneration);
+            Assert.Equal(headers.EndpointGeneration, validated.EndpointGeneration);
+            Assert.Equal(headers.MigrationState, validated.MigrationState);
+            Assert.Equal(headers.TraceId, validated.TraceId);
+            Assert.Equal(traces[endpoint == "cloud" ? 0 : 1], validated.TraceId);
+            Assert.Equal(headers.UpdateId, validated.UpdateId);
+            Assert.Equal(headers.Sequence, validated.Sequence);
+            Assert.Equal("sendMessage", validated.Method);
+        }
+    }
+
+    /// <summary>Nested request route scopes restore their enclosing route and do not leave polling metadata on subsequent callbacks.</summary>
+    [Fact]
+    public void Endpoint_context_restores_nested_routes_before_receiver_callbacks()
+    {
+        Assert.Null(TelegramEndpointTelemetryContext.Current);
+        using (var cloud = TelegramEndpointTelemetryContext.Push(TelegramEndpointType.Cloud, 1, TelegramEndpointMigrationState.Cloud))
+        {
+            using (TelegramEndpointTelemetryContext.Push(TelegramEndpointType.Local, 2, TelegramEndpointMigrationState.Local))
+                Assert.Equal("local", TelegramEndpointTelemetryContext.Current!.EndpointType);
+            Assert.Same(cloud, TelegramEndpointTelemetryContext.Current);
+        }
+        Assert.Null(TelegramEndpointTelemetryContext.Current);
+        Assert.Throws<ArgumentOutOfRangeException>(() => TelegramEndpointTelemetryContext.Push(TelegramEndpointType.Cloud, 0, TelegramEndpointMigrationState.Cloud));
+        Assert.Throws<ArgumentOutOfRangeException>(() => TelegramEndpointTelemetryContext.Push((TelegramEndpointType)99, 1, TelegramEndpointMigrationState.Cloud));
+        Assert.Throws<ArgumentOutOfRangeException>(() => TelegramEndpointTelemetryContext.Push(TelegramEndpointType.Cloud, 1, (TelegramEndpointMigrationState)99));
+        Assert.Null(TelegramEndpointTelemetryContext.Current);
+    }
+
+    /// <summary>Endpoint schema projection persists every supported measurement while rejecting arbitrary labels, invalid numbers and non-UTC success timestamps.</summary>
+    /// <returns>A task verifying the real version-one writer rejects leakage without recursion or writer failures.</returns>
+    [Fact]
+    public async Task Endpoint_schema_projects_measurements_and_rejects_uncontrolled_state_or_secrets()
+    {
+        using var files = new TemporaryFiles();
+        using var service = files.Service();
+        var now = DateTime.UtcNow;
+        var safe = new LatencyTelemetryEvent
+        {
+            EventType = "telegram_endpoint_migration", BotId = "owned", EndpointType = "local",
+            EndpointGeneration = 2, MigrationState = "CloudWait", HealthCheckDurationMs = 12.5,
+            FailoverTrigger = "automatic_outage", FailoverDurationMs = 100, CloudReuseRemainingMs = 600000,
+            LastSuccessUtc = now, Outcome = "uncertain", ConsecutiveFailures = 3
+        };
+        foreach (var family in new[] { "telegram_endpoint_health", "telegram_endpoint_migration", "telegram_endpoint_outage", "telegram_endpoint_recovered" })
+            Assert.True(service.TryRecord(safe with { EventType = family }));
+        var unsafeRecords = new[]
+        {
+            safe with { EndpointType = "private-token" }, safe with { MigrationState = "raw_state_private" },
+            safe with { FailoverTrigger = "987654321" }, safe with { EndpointGeneration = 0 },
+            safe with { HealthCheckDurationMs = double.NaN }, safe with { FailoverDurationMs = double.PositiveInfinity },
+            safe with { CloudReuseRemainingMs = -1 }, safe with { LastSuccessUtc = DateTime.SpecifyKind(now, DateTimeKind.Unspecified) },
+            safe with { EndpointType = "http://127.0.0.1:8081/bot123:SECRET" }
+        };
+        foreach (var row in unsafeRecords) Assert.True(service.TryRecord(row));
+        await service.StartAsync(default);
+        await service.StopAsync(default);
+        Assert.Equal(unsafeRecords.Length, service.DroppedEvents);
+        Assert.Equal(0, service.WriterFailures);
+        var persisted = ReadEvents(files.TelemetryDirectory).Where(row => row.EventType.StartsWith("telegram_endpoint_", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(4, persisted.Length);
+        Assert.All(persisted, row =>
+        {
+            Assert.Equal(1, row.SchemaVersion);
+            Assert.Equal(safe.EndpointType, row.EndpointType);
+            Assert.Equal(safe.EndpointGeneration, row.EndpointGeneration);
+            Assert.Equal(safe.MigrationState, row.MigrationState);
+            Assert.Equal(safe.HealthCheckDurationMs, row.HealthCheckDurationMs);
+            Assert.Equal(safe.FailoverTrigger, row.FailoverTrigger);
+            Assert.Equal(safe.FailoverDurationMs, row.FailoverDurationMs);
+            Assert.Equal(safe.CloudReuseRemainingMs, row.CloudReuseRemainingMs);
+            Assert.Equal(safe.LastSuccessUtc, row.LastSuccessUtc);
+            Assert.Equal(safe.ConsecutiveFailures, row.ConsecutiveFailures);
+        });
+        var json = string.Join("\n", Directory.GetFiles(files.TelemetryDirectory, "latency-*.jsonl").Select(File.ReadAllText));
+        foreach (var forbidden in new[] { "private-token", "raw_state", "987654321", "127.0.0.1", "SECRET", "actorTelegramUserId", "telegramBotId", "token", "url" })
+            Assert.DoesNotContain(forbidden, json, StringComparison.Ordinal);
+    }
+
 
     /// <summary>Creates the accepted safe event used for storage-only tests.</summary>
     /// <returns>A new payload-free summary with a canonical bot and opaque trace.</returns>

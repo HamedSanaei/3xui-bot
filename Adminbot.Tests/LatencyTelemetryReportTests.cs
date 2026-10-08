@@ -46,8 +46,8 @@ public sealed class LatencyTelemetryReportTests
         Assert.Contains("trace=" + trace, text);
         Assert.Contains("telegram_send=2000", text);
         Assert.Contains("firstAcknowledged=2500", text);
-        Assert.Contains("bot/method=GozargahNetwork_Bot/sendMessage/headers events=1", text);
-        Assert.Contains("bot/method=GozargahNetwork_Bot/sendMessage/sdk_validated events=1", text);
+        Assert.Contains("bot/endpoint/method=GozargahNetwork_Bot/unknown/sendMessage/headers events=1", text);
+        Assert.Contains("bot/endpoint/method=GozargahNetwork_Bot/unknown/sendMessage/sdk_validated events=1", text);
         Assert.Contains("failures=2 recoveryMs=3000", text);
         Assert.Contains("sequence=http_5xx:HTTP502>dns", text);
         Assert.Contains("busyIncidents=1", text);
@@ -88,13 +88,15 @@ public sealed class LatencyTelemetryReportTests
             botId = secret, traceId = secret, method = secret, category = secret, operation = secret,
             outcome = secret, failureClassification = secret, timingQuality = secret,
             body = secret, password = secret, sql = secret, exceptionMessage = secret,
+            endpointType = secret, migrationState = secret, failoverTrigger = secret,
+            rawState = secret, actorTelegramUserId = secret, telegramUserId = secret, endpointUrl = secret,
             applicationMs = 6000, durationMs = 1, stageMs = new Dictionary<string, double> { [secret] = 6000 }
         });
         await File.WriteAllTextAsync(archive.PathFor("001.jsonl"), string.Join('\n', new[]
         {
             Malicious("telegram_update_completed"), Malicious("telegram_request_completed"),
             Malicious("telegram_poll_failed"), Malicious("sqlite_operation_completed"),
-            Malicious(secret)
+            Malicious("telegram_endpoint_migration"), Malicious("telegram_endpoint_outage"), Malicious(secret)
         }) + "\n", new UTF8Encoding(false));
         var (code, text) = await archive.ReportAsync();
         Assert.Equal(0, code);
@@ -151,7 +153,7 @@ public sealed class LatencyTelemetryReportTests
         var (code, text) = await archive.ReportAsync();
         Assert.Equal(0, code);
         Assert.Contains("foregroundTimeouts=2 pollFailures=0", text);
-        var pollingApi = Assert.Single(text.Split('\n'), line => line.StartsWith("bot/method=GozargahNetwork_Bot/getUpdates/", StringComparison.Ordinal));
+        var pollingApi = Assert.Single(text.Split('\n'), line => line.StartsWith("bot/endpoint/method=GozargahNetwork_Bot/unknown/getUpdates/", StringComparison.Ordinal));
         Assert.Contains("max=50000 ms", pollingApi);
         Assert.Contains("slow=0", pollingApi);
     }
@@ -402,6 +404,65 @@ public sealed class LatencyTelemetryReportTests
         var code = await LatencyTelemetryReportCli.RunAsync(new[] { "telemetry-report", "--directory", archive.Directory }, output, source.Token);
         Assert.Equal(130, code);
         Assert.Equal("Telemetry report: CANCELLED" + Environment.NewLine, output.ToString());
+    }
+
+    /// <summary>Cloud/Local latency quantiles must stay independent by method and boundary, with legacy routes explicitly unknown.</summary>
+    /// <returns>A task verifying endpoint comparisons and closed incident labels from the real analyzer.</returns>
+    [Fact]
+    public async Task Endpoint_quantiles_and_incidents_preserve_closed_dimensions_and_legacy_unknown()
+    {
+        using var archive = new Archive();
+        var now = DateTime.UtcNow.AddMinutes(-1);
+        var bot = "GozargahNetwork_Bot";
+        await archive.WriteAsync(
+            Row("telegram_api_request_completed", now, bot) with { EndpointType = "cloud", EndpointGeneration = 1, Method = "sendMessage", DurationMs = 100 },
+            Row("telegram_api_request_completed", now, bot) with { EndpointType = "cloud", EndpointGeneration = 1, Method = "sendMessage", DurationMs = 200 },
+            Row("telegram_api_request_completed", now, bot) with { EndpointType = "local", EndpointGeneration = 2, Method = "sendMessage", DurationMs = 10 },
+            Row("telegram_request_completed", now, bot) with { EndpointType = "local", EndpointGeneration = 2, Method = "sendMessage", DurationMs = 5 },
+            Row("telegram_api_request_completed", now, bot) with { Method = "sendMessage", DurationMs = 900 },
+            Row("telegram_endpoint_health", now, bot) with { EndpointType = "local", EndpointGeneration = 2, MigrationState = "Local", HealthCheckDurationMs = 3, LastSuccessUtc = now },
+            Row("telegram_endpoint_outage", now.AddSeconds(1), bot) with { EndpointType = "local", EndpointGeneration = 2, MigrationState = "LocalUnavailable", FailoverTrigger = "automatic_outage" },
+            Row("telegram_endpoint_recovered", now.AddSeconds(2), bot) with { EndpointType = "cloud", EndpointGeneration = 3, MigrationState = "CloudRecovered", FailoverTrigger = "automatic_outage", FailoverDurationMs = 600000, CloudReuseRemainingMs = 0 },
+            Row("telegram_endpoint_migration", now, bot) with { EndpointType = "SECRET_URL", MigrationState = "SECRET_STATE", FailoverTrigger = "SECRET_ACTOR" });
+        var (code, text) = await archive.ReportAsync();
+        Assert.Equal(0, code);
+        var cloud = Assert.Single(text.Split('\n'), line => line.StartsWith("bot/endpoint/method=" + bot + "/cloud/sendMessage/sdk_validated", StringComparison.Ordinal));
+        Assert.Contains("events=2 count=2", cloud);
+        foreach (var percentile in new[] { "P50~=", "P95~=", "P99~=" })
+        {
+            var value = double.Parse(cloud.Split(percentile, StringSplitOptions.None)[1].Split(' ')[0], CultureInfo.InvariantCulture);
+            var expected = percentile == "P50~=" ? 100d : 200d;
+            Assert.InRange(value, expected, expected * 1.05);
+        }
+        Assert.Contains("max=200 ms", cloud);
+        Assert.Contains("bot/endpoint/method=" + bot + "/local/sendMessage/sdk_validated events=1 count=1 P50~=10", text);
+        Assert.Contains("bot/endpoint/method=" + bot + "/local/sendMessage/headers events=1 count=1 P50~=5", text);
+        Assert.Contains("bot/endpoint/method=" + bot + "/unknown/sendMessage/sdk_validated events=1 count=1", text);
+        Assert.Contains("6. Data quality", text);
+        Assert.Contains("7. Endpoint health", text);
+        Assert.Contains("healthEvents=1 migrations=0 outages=1 recoveries=0", text);
+        Assert.Contains("state=CloudRecovered trigger=automatic_outage", text);
+        Assert.Contains("endpointEvent=telegram_endpoint_recovered", text);
+        Assert.DoesNotContain("SECRET", text);
+        Assert.Contains("endpoint=unknown", text);
+        Assert.Contains("state=unknown trigger=unknown", text);
+    }
+
+    /// <summary>Endpoint history remains capped under many transitions and hostile optional fields are never projected.</summary>
+    /// <returns>A task verifying exact omission accounting and newest-event state independent of scan order.</returns>
+    [Fact]
+    public async Task Endpoint_history_is_bounded_and_latest_state_uses_event_time()
+    {
+        using var archive = new Archive();
+        var now = DateTime.UtcNow.AddMinutes(-10);
+        var rows = Enumerable.Range(0, 102).Reverse().Select(i => Row("telegram_endpoint_migration", now.AddSeconds(i), "sales-assistant") with
+        { EndpointType = "local", EndpointGeneration = i + 1, MigrationState = i == 101 ? "Local" : "SwitchingToLocal", FailoverTrigger = "manual" }).ToArray();
+        await archive.WriteAsync(rows);
+        var (code, text) = await archive.ReportAsync();
+        Assert.Equal(0, code);
+        Assert.Contains("generation=102 state=Local", text);
+        Assert.Contains("limit=100 omitted=2", text);
+        Assert.Equal(100, text.Split('\n').Count(line => line.StartsWith("endpointEvent=", StringComparison.Ordinal)));
     }
 
     /// <summary>Creates a minimal real schema record with a known successful outcome.</summary>

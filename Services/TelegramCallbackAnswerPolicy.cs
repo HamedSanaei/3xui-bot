@@ -82,9 +82,9 @@ public static class TelegramCallbackAnswerPolicy
     /// shutdown and is intentionally propagated.
     /// </exception>
     /// <remarks>
-    /// Publishes only cancellation-token provenance for the existing best-effort deadline. Nested SDK and
-    /// foreground telemetry can distinguish this policy timeout from actual caller shutdown without changing
-    /// the deadline, swallow/rethrow behavior, payloads or retry policy.
+    /// Publishes only cancellation-token provenance for the existing best-effort deadline. Nested SDK, routed
+    /// endpoint facades and foreground telemetry can distinguish this policy timeout from actual caller shutdown
+    /// without changing the deadline, swallow/rethrow behavior, payloads or retry policy.
     /// </remarks>
     /// <example>
     /// <code>
@@ -124,6 +124,7 @@ public static class TelegramCallbackAnswerPolicy
         using var cancellationMetadata = !LatencyTelemetrySuppression.IsActive &&
             (TelegramUpdateLatencyScope.Current != null ||
              client is TelegramTelemetryBotClient { IsTelemetryEnabled: true } ||
+             client is Adminbot.Services.TelegramEndpoints.EndpointRoutedTelegramBotClient { IsTelemetryEnabled: true } ||
              client is ForegroundBoundedTelegramBotClient { IsTelemetryEnabled: true })
             ? TelegramRequestCancellationScope.PushCallbackPolicy(cancellationToken, bounded.Token) : null;
         try

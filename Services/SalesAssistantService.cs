@@ -249,8 +249,12 @@ public class SalesAssistantService
     /// final confirmation DELEGATES to <see cref="TenantBotService.APPROVEMANUALRECEIPTASYNC" />.
     /// the receipt photo is first DOWNLOADED through the tenant Bot that received it and then UPLOADED Again
     /// through the sales assistant Bot because Telegram file IDENTIFIERS are not safely REUSABLE across bots.
+    /// Known pre-dispatch endpoint fences propagate to the durable receipt worker instead of sending fallback text.
+    /// Photo dispatch with an ambiguous result never falls back to a second message; the durable caller quarantines it.
     /// </remarks>
     /// <returns>A task completing after the owner receipt notification attempt; the receipt approval state is unchanged.</returns>
+    /// <exception cref="BotTransportUnavailableException">An endpoint migration or obsolete generation refuses dispatch before HTTP.</exception>
+    /// <exception cref="HttpRequestException">A photo request may have been accepted before its response failed.</exception>
     public async Task<int?> NOTIFYMANUALRECEIPTASYNC(TenantManualPaymentReceipt receipt, CancellationToken CancellationToken)
     {
         var _workflow = new UserWorkflowStore(_userDbContextFactory);
@@ -292,6 +296,7 @@ public class SalesAssistantService
             }
         });
 
+        var photoSendInvoked = false;
         try
         {
             var TENANTCLIENT = _botClientProvider.GetClient(receipt.TenantBotId);
@@ -302,7 +307,9 @@ public class SalesAssistantService
             await TENANTCLIENT.DownloadFile(TELEGRAMFILE.FilePath, PHOTOSTREAM, CancellationToken);
             PHOTOSTREAM.Position = 0;
 
-            var sent = await _botClientProvider.GetClient(assistant.Id).SendPhoto(
+            var assistantClient = _botClientProvider.GetClient(assistant.Id);
+            photoSendInvoked = true;
+            var sent = await assistantClient.SendPhoto(
                 chatId: receipt.OwnerTelegramUserId,
                 photo: InputFile.FromStream(PHOTOSTREAM, $"tenant-receipt-{receipt.Id}.JPG"),
                 caption: Text,
@@ -310,6 +317,14 @@ public class SalesAssistantService
                 replyMarkup: keyboard,
                 cancellationToken: CancellationToken);
             return sent.MessageId;
+        }
+        catch (BotTransportUnavailableException ex) when (ex.ReasonCode is "endpoint_migration_pending" or "obsolete_endpoint_generation")
+        {
+            throw;
+        }
+        catch (Exception ex) when (photoSendInvoked && ex is not ApiRequestException { ErrorCode: 400 or 403 or 429 })
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -338,9 +353,11 @@ public class SalesAssistantService
     /// <returns>A task that completes after the fallback message is sent or skipped because the assistant bot is unavailable.</returns>
     /// <remarks>
     /// This method preserves the manual-payment approval path when a tenant bot file id cannot be downloaded or
-    /// re-uploaded by the Sales Assistant bot. It is intentionally best-effort: failure to send the fallback is
-    /// logged but never thrown back into tenant order processing.
+    /// re-uploaded by the Sales Assistant bot. Definite API rejection or ordinary unavailable transport is skipped;
+    /// other outcomes propagate to the durable caller because Telegram acceptance cannot be ruled out.
+    /// Known pre-dispatch endpoint fences propagate so durable pending intent survives without spending attempts.
     /// </remarks>
+    /// <exception cref="BotTransportUnavailableException">An endpoint migration or obsolete generation refuses dispatch before HTTP.</exception>
     private async Task<int?> SENDMANUALRECEIPTFALLBACKTEXTASYNC(
         TenantManualPaymentReceipt receipt,
         string baseText,
@@ -370,7 +387,15 @@ public class SalesAssistantService
                 cancellationToken: CancellationToken);
             return sent.MessageId;
         }
-        catch (Exception ex)
+        catch (BotTransportUnavailableException ex) when (ex.ReasonCode is "endpoint_migration_pending" or "obsolete_endpoint_generation")
+        {
+            throw;
+        }
+        catch (BotTransportUnavailableException)
+        {
+            return null;
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode is 400 or 403 or 429)
         {
             _logger.LogWarning(ex, "sales assistant receipt fallback text failed. RECEIPTID={RECEIPTID}", receipt.Id);
             return null;

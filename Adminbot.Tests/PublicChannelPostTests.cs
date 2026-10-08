@@ -831,6 +831,7 @@ public sealed partial class ConcurrencyTests
         public PublicChannelPostKey Key { get; } = new("main", 711, 711);
         /// <summary>Creates a production registration isolated from all live paths and starts only the manager.</summary>
         /// <returns>A fixture whose owner must asynchronously dispose it.</returns>
+        /// <remarks>Only the publication worker starts. Synthetic store-free endpoint admission and an explicit fake identity probe replace receiver startup/hydration; no real Telegram network is used.</remarks>
         public static async Task<PublicPostFixture> CreateAsync()
         {
             var f = new PublicPostFixture();
@@ -849,6 +850,8 @@ public sealed partial class ConcurrencyTests
             services.TryAddSingleton<PublicChannelPostManager>();
             f.Registry = new BotRegistry(config);
             services.AddSingleton(f.Registry);
+            // This worker-only fixture has no receiver startup/hydration; explicit store-free admission keeps it network-free.
+            services.AddSingleton(new Adminbot.Services.TelegramEndpoints.TelegramEndpointRuntimeGate(f.Registry));
             services.AddSingleton(new BotClientProvider(f.Registry, bot => new TelegramBotClient(new TelegramBotClientOptions(bot.Token) { RetryCount = 0 }, new HttpClient(f.Http, disposeHandler: false))));
             services.AddSingleton<ITelegramTokenProbe>(new OwnerIdentityProbe((token, _) => Task.FromResult(new TelegramUser { Id = long.Parse(token.Split(':')[0]), IsBot = true, FirstName = "fixture", Username = "fixture_bot" })));
             services.AddSingleton(new TelegramForegroundDeliveryPolicy { OverallBudget = TimeSpan.FromSeconds(2), MediaGroupBudget = TimeSpan.FromSeconds(2) });

@@ -6,6 +6,7 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Exceptions;
 using Adminbot.Services.Telemetry;
+using Adminbot.Services.TelegramEndpoints;
 
 /// <summary>Accepts durable bounded updates independently of handler execution.</summary>
 public interface ITelegramUpdateScheduler
@@ -54,6 +55,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     private readonly LatencyTelemetryService _telemetry;
     /// <summary>Bounded reception clocks transferred at durable claim; never owns scheduler state.</summary>
     private readonly UpdateTelemetryTracker _timelineTracker;
+    /// <summary>Optional atomic endpoint admission fence; a paused bot's lane heads remain durably queued.</summary>
+    private readonly TelegramEndpointRuntimeGate _endpointGate;
     /// <summary>Coalesced readiness optimization; the durable ready query remains authoritative.</summary>
     private readonly SemaphoreSlim _wake = new(0, 1);
     private static readonly Counter<long> Wakeups = Meter.CreateCounter<long>("telegram.update.scheduler.wakeups");
@@ -142,15 +145,19 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <param name="logger">Structured logger; update payloads and exception messages are excluded.</param>
     /// <param name="telemetry">Optional persistent JSONL writer; failure or a full buffer cannot affect scheduling.</param>
     /// <param name="timelineTracker">Optional bounded metadata tracker connecting receiver admission with claims.</param>
+    /// <param name="endpointGate">Optional shared endpoint gate; handler admission is acquired before durable claim without changing FIFO/concurrency.</param>
     /// <remarks>The host owns scheduler lifetime. FIFO, capacity and concurrency are unchanged. Metadata clocks measure admission,
     /// ready-snapshot dispatch and actual handler boundaries; no telemetry write occurs in users.db.</remarks>
     public TelegramUpdateScheduler(TelegramUpdateInboxStore store, ITelegramUpdateExecutor executor, AppConfig config,
-        ILogger<TelegramUpdateScheduler> logger, LatencyTelemetryService telemetry = null, UpdateTelemetryTracker timelineTracker = null)
+        ILogger<TelegramUpdateScheduler> logger, LatencyTelemetryService telemetry = null, UpdateTelemetryTracker timelineTracker = null,
+        TelegramEndpointRuntimeGate endpointGate = null)
     {
         ValidateConfiguration(config);
         _store = store; _executor = executor; _logger = logger;
         _telemetry = telemetry;
         _timelineTracker = timelineTracker;
+        _endpointGate = endpointGate;
+        if (_endpointGate != null) _endpointGate.AvailabilityChanged += Wake;
         _store.ReadyChanged += Wake;
         _concurrency = config.TelegramUpdateMaxConcurrency;
         _capacity = config.TelegramUpdateQueueCapacity;
@@ -275,7 +282,10 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                         userCursors[bot] = head.TelegramUserId;
                         eligible.Remove(head);
                         _lastBot = bot;
-                        var execution = ProcessAsync(head.Sequence, _handlers.Token, readyObservedTimestamp);
+                        TelegramEndpointRuntimeGate.TelegramEndpointExecutionLease endpointLease = null;
+                        // The claim and migration fence cannot race: rejected heads stay queued with their FIFO receipt intact.
+                        if (_endpointGate != null && !_endpointGate.TryAcquireExecution(head.BotId, out endpointLease)) continue;
+                        var execution = ProcessAsync(head.Sequence, _handlers.Token, readyObservedTimestamp, endpointLease);
                         active.Add(head.Sequence, execution);
                         // Notify after task completion, not merely after its final DB write, so slot reaping cannot miss a wake.
                         execution.GetAwaiter().OnCompleted(Wake);
@@ -305,12 +315,17 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <param name="sequence">Internal inbox sequence; no secret data.</param>
     /// <param name="token">Cancellation propagated to the handler after drain expiry.</param>
     /// <param name="readyObservedTimestamp">Stopwatch timestamp after the ready query; zero denotes unavailable dispatch timing.</param>
+    /// <param name="endpointLease">Optional already-admitted endpoint epoch; held through final persistence and released even when claim fails.</param>
     /// <returns>A tracked task that observes handler failures and attempts independent final persistence.</returns>
     /// <remarks>The host owns scheduler lifetime and FIFO/concurrency are unchanged. Correlated summaries distinguish claim,
     /// queue, actual ExecuteAsync, post-handler review and final persistence. Foreground API observations and watchdogs
-    /// retain their original routing and budgets; private payloads and exception bodies never enter JSONL.</remarks>
-    private async Task ProcessAsync(long sequence, CancellationToken token, long readyObservedTimestamp = 0)
+    /// retain their original budgets; private payloads and exception bodies never enter JSONL. Endpoint migration pauses new
+    /// claims atomically while admitted handlers finish their original epoch; no terminal receipt is created for a merely paused head.</remarks>
+    private async Task ProcessAsync(long sequence, CancellationToken token, long readyObservedTimestamp = 0,
+        TelegramEndpointRuntimeGate.TelegramEndpointExecutionLease endpointLease = null)
     {
+        using var endpointAdmission = endpointLease;
+        using var endpointFlow = endpointLease?.Enter();
         _store.Executing.TryAdd(sequence, 0);
         TelegramUpdateWorkItem item = null;
         var started = Stopwatch.GetTimestamp();
@@ -686,6 +701,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _store.ReadyChanged -= Wake;
+        if (_endpointGate != null) _endpointGate.AvailabilityChanged -= Wake;
         _admission.Dispose(); _handlers.Dispose(); _coordinator.Dispose();
     }
 }

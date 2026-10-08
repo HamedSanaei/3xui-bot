@@ -1,6 +1,7 @@
 using System;
 using Adminbot.Services.Telemetry;
 using Adminbot.Domain;
+using Adminbot.Services.TelegramEndpoints;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
@@ -55,7 +56,7 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     private readonly LatencyTelemetryService _telemetry;
     /// <summary>Gets whether this request path requires cancellation provenance for enabled transport telemetry.</summary>
     internal bool IsTelemetryEnabled => _telemetry?.Enabled == true ||
-        _inner is TelegramTelemetryBotClient { IsTelemetryEnabled: true };
+        _inner is TelegramTelemetryBotClient { IsTelemetryEnabled: true } or EndpointRoutedTelegramBotClient { IsTelemetryEnabled: true };
 
     /// <summary>
     /// Creates a foreground-bounded view over an existing bot client.
@@ -122,9 +123,14 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     public Task<bool> TestApi(CancellationToken cancellationToken = default)
         => _inner.TestApi(cancellationToken);
 
-    /// <inheritdoc />
+    /// <summary>Downloads the actual looked-up file while preserving endpoint-generation provenance on routed clients.</summary>
+    /// <param name="file">Required TGFile returned by this bot's GetFile; an obsolete lookup epoch must not silently switch endpoint.</param>
+    /// <param name="destination">Caller-owned writable stream; the decorator never disposes it.</param>
+    /// <param name="cancellationToken">Existing file-transfer cancellation, never replaced with a foreground deadline.</param>
+    /// <returns>A task completing after the inner client's real file copy.</returns>
+    /// <remarks>Local files use the validated existing read-only host mapping. No automatic retry or reroute occurs for stale generation or ambiguous transfer failure.</remarks>
     public Task DownloadFile(Telegram.Bot.Types.TGFile file, Stream destination, CancellationToken cancellationToken = default)
-        => DownloadFile(file.FilePath, destination, cancellationToken);
+        => _inner.DownloadFile(file, destination, cancellationToken);
 
     /// <summary>
     /// Downloads a Telegram file through the inner client without any foreground budget.
@@ -187,6 +193,7 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
         int? apiErrorCode = null;
         var recordDirect = latencyScope == null && _telemetry?.Enabled == true && !LatencyTelemetrySuppression.IsActive;
         var directStarted = recordDirect ? Stopwatch.GetTimestamp() : 0;
+        using var endpointObservation = recordDirect ? new TelegramEndpointRequestObservation() : null;
         Exception failure = null;
 
         try
@@ -233,10 +240,17 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
                 _telemetry.TryRecord(TelegramTransportDiagnostics.Classify(failure, null, cancellationToken) with
                 {
                     EventType = "telegram_foreground_request_completed",
-                    BotId = (_inner as TelegramTelemetryBotClient)?.CanonicalBotId ?? BotContextAccessor.CurrentBotId,
+                    BotId = _inner switch
+                    {
+                        TelegramTelemetryBotClient sdk => sdk.CanonicalBotId,
+                        EndpointRoutedTelegramBotClient routed => routed.CanonicalBotId,
+                        _ => BotContextAccessor.CurrentBotId
+                    },
                     TraceId = receiver?.TraceId, UpdateId = receiver?.UpdateId, Sequence = receiver?.Sequence,
                     Method = method, Category = TelegramTransportDiagnostics.Category(method),
                     Stage = TelegramUpdateLatencyScope.StageName(stage), Operation = DescribeRequestKind(request),
+                    EndpointType = endpointObservation?.Route is { } actual ? (actual.Endpoint == TelegramEndpointType.Cloud ? "cloud" : "local") : null,
+                    EndpointGeneration = endpointObservation?.Route?.Generation, MigrationState = endpointObservation?.MigrationState,
                     DurationMs = Stopwatch.GetElapsedTime(directStarted).TotalMilliseconds, Attempt = 1
                 });
             }

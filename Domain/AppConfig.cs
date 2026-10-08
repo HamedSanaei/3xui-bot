@@ -19,6 +19,9 @@ namespace Adminbot.Domain
         /// <summary>Startup-bound, payload-free latency telemetry settings shared by all bot families; missing configuration enables bounded collection.</summary>
         /// <remarks>Files live beneath the application's persistent Data/Telemetry directory, never in SQLite. Invalid resource bounds are rejected explicitly; filesystem outages fail soft and recover in the writer.</remarks>
         public Adminbot.Services.Telemetry.LatencyTelemetryOptions LatencyTelemetry { get; set; } = new();
+        /// <summary>Startup-bound trusted Telegram endpoint routing policy; existing identities remain Cloud unless explicitly migrated.</summary>
+        /// <remarks>Per-bot desired/effective endpoints, generations and migration intent live durably in users.db. Disabling management does not erase Local session state or force an unsafe Cloud login. No API credentials belong in this settings object.</remarks>
+        public Adminbot.Services.TelegramEndpoints.TelegramEndpointRoutingOptions TelegramEndpointRouting { get; set; } = new();
         /// <summary>Maximum storefront rows per colleague, including disabled and reset stores. Must be positive.</summary>
         /// <remarks>Lowering this limit prevents new allocation but never disables or deletes existing stores.</remarks>
         public int TenantMaxStoresPerOwner { get; set; } = 5;

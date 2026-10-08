@@ -12,11 +12,11 @@ using Adminbot.Services.Telemetry;
 /// Telegram. It intentionally has no <c>CredentialsDbContext</c>, wallet ledger, provider settlement service, tenant
 /// fulfillment service, or XUI dependency, so retries cannot credit a wallet or fulfill an order again.
 ///
-/// Pending rows are polled every fifteen seconds and claimed with a two-minute users.db lease. Transient delivery
-/// failures retry at most six times with bounded exponential backoff. An expired processing lease is permanently
-/// moved to delivery-uncertain instead of being resent because Telegram may have accepted the original message before
-/// the process crashed. Routine successful/retry events stay at Debug; permanent or ambiguous outcomes are warnings
-/// or errors suitable for operator attention.
+/// Pending rows are polled every fifteen seconds and claimed with a two-minute users.db lease. Definite transient
+/// rejections retry at most six times with bounded exponential backoff. Known endpoint fences retain pending intent
+/// without spending that budget. Ambiguous HTTP failures and expired processing leases become delivery-uncertain
+/// instead of being resent because Telegram may have accepted the original message. Routine successful/retry events
+/// stay at Debug; permanent or ambiguous outcomes are warnings or errors suitable for operator attention.
 /// </remarks>
 public sealed class PaymentSettlementNotificationWorker : BackgroundService
 {
@@ -220,6 +220,8 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     /// one fresh-context attempt to mark delivery-uncertain and never deliberately resends the same message.
     /// Explicit owner-report keys route to Sales Assistant and the captured owner chat; customer keys retain exact
     /// originating tenant identity checks. Neither route re-enters settlement or resolves a replacement owner.
+    /// Known endpoint admission refusals release the lease and undo its provisional attempt increment because no
+    /// HTTP request was dispatched. Pauses can defer indefinitely without consuming the network retry budget.
     /// </remarks>
     private async Task DeliverClaimAsync(
         PaymentSettlementNotification notification,
@@ -307,6 +309,10 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
             // cancellation may have raced with Telegram accepting the request.
             throw;
         }
+        catch (BotTransportUnavailableException ex) when (ex.ReasonCode is "endpoint_migration_pending" or "obsolete_endpoint_generation")
+        {
+            await DeferEndpointFenceAsync(notification, ex.ReasonCode, cancellationToken);
+        }
         catch (BotTransportUnavailableException ex) when (ex.ReasonCode == "bot_identity_changed")
         {
             await MarkTerminalAsync(
@@ -357,12 +363,14 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     }
 
     /// <summary>
-    /// Classifies one Telegram/network failure and applies bounded retry or a terminal delivery state.
+    /// Classifies definite rejection for bounded retry and quarantines ambiguous Telegram/network failures.
     /// </summary>
     /// <param name="notification">Detached processing row whose attempt failed.</param>
     /// <param name="exception">Telegram or transport exception; its raw message is never persisted.</param>
     /// <param name="cancellationToken">Host token for the state transition.</param>
     /// <returns>A task that completes after the claim is released or quarantined.</returns>
+    /// <remarks>Known no-dispatch endpoint fences are handled separately. Network failures and Telegram server
+    /// errors may follow acceptance and cannot authorize an automatic resend.</remarks>
     private async Task HandleDeliveryFailureAsync(
         PaymentSettlementNotification notification,
         Exception exception,
@@ -392,10 +400,10 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
 
             if (apiException.ErrorCode >= 500)
             {
-                await RetryOrExhaustAsync(
+                await MarkTerminalAsync(
                     notification,
-                    CalculateRetryDelay(notification.AttemptCount),
-                    $"telegram_transient_{apiException.ErrorCode}",
+                    PaymentSettlementNotificationStatuses.DeliveryUncertain,
+                    $"telegram_send_outcome_uncertain_{apiException.ErrorCode}",
                     cancellationToken);
                 return;
             }
@@ -403,10 +411,10 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
 
         if (exception is TaskCanceledException or TimeoutException or HttpRequestException or RequestException)
         {
-            await RetryOrExhaustAsync(
+            await MarkTerminalAsync(
                 notification,
-                CalculateRetryDelay(notification.AttemptCount),
-                "telegram_transport_transient",
+                PaymentSettlementNotificationStatuses.DeliveryUncertain,
+                "telegram_send_outcome_uncertain",
                 cancellationToken);
             return;
         }
@@ -416,6 +424,32 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
             PaymentSettlementNotificationStatuses.ManualReview,
             "telegram_delivery_unknown",
             cancellationToken);
+    }
+
+    /// <summary>Defers a proven pre-dispatch endpoint refusal without spending the network delivery budget.</summary>
+    /// <param name="notification">Detached row whose processing claim owns the provisional attempt.</param>
+    /// <param name="reasonCode">Exact credential-free pre-dispatch endpoint fence reason.</param>
+    /// <param name="cancellationToken">Token for the conditional users.db lease release.</param>
+    /// <returns>A task completing after the matching claim is pending or a stale claim matches no row.</returns>
+    /// <remarks>Unlike ambiguous sends, a fence guarantees no HTTP dispatch. Indefinite endpoint pauses retain
+    /// the intent, and the scan interval prevents a busy retry loop. Only this known refusal refunds the claim.</remarks>
+    private async Task DeferEndpointFenceAsync(
+        PaymentSettlementNotification notification, string reasonCode, CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        await using var context = _contextFactory.CreateDbContext();
+        await context.PaymentSettlementNotifications
+            .Where(row => row.Id == notification.Id &&
+                          row.Status == PaymentSettlementNotificationStatuses.Processing &&
+                          row.ClaimToken == notification.ClaimToken)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(row => row.Status, PaymentSettlementNotificationStatuses.Pending)
+                .SetProperty(row => row.AttemptCount, row => row.AttemptCount > 0 ? row.AttemptCount - 1 : 0)
+                .SetProperty(row => row.NextAttemptAtUtc, now.Add(ScanInterval))
+                .SetProperty(row => row.LastError, reasonCode)
+                .SetProperty(row => row.ClaimToken, (string)null)
+                .SetProperty(row => row.LeaseUntilUtc, (DateTime?)null)
+                .SetProperty(row => row.UpdatedAtUtc, now), cancellationToken);
     }
 
     /// <summary>

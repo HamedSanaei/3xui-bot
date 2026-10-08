@@ -3,19 +3,21 @@ using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Microsoft.EntityFrameworkCore.Migrations;
 
 #nullable disable
 
 namespace Adminbot.Migrations
 {
-    /// <summary>Current users.db migration model, including identity-scoped Telegram endpoint control and durable independent operator alerts.</summary>
+    /// <summary>Frozen users.db target model for the additive Telegram endpoint routing migration.</summary>
     [DbContext(typeof(UserDbContext))]
-    partial class UserDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261009120000_AddTelegramEndpointRouting")]
+    partial class AddTelegramEndpointRouting
     {
-        /// <summary>Describes the latest users.db schema for additive migration comparisons.</summary>
+        /// <summary>Describes the frozen additive endpoint schema without changing financial models.</summary>
         /// <param name="modelBuilder">The EF Core migration model builder.</param>
-        /// <remarks>Endpoint states isolate BotId plus BotFather identity. Append-only history and compact permanent incident/recipient receipts have no financial or cascading foreign-key effects.</remarks>
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <remarks>Endpoint states isolate BotId plus BotFather identity; history and compact incident/recipient dedupe receipts survive registry changes. Existing financial schema remains frozen unchanged.</remarks>
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.8");

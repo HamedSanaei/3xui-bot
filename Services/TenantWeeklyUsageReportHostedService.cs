@@ -80,7 +80,8 @@ public sealed class TenantWeeklyUsageReportHostedService : BackgroundService
     /// <remarks>
     /// Queries consumed keys once before a single batched 14-day scan. Generates each chart and verifies ownership
     /// before the atomic send barrier. The scoped assistant repeats ownership validation before its one HTTP call.
-    /// Known 429/no-route outcomes may retry next cycle; permanent rejection and ambiguous outcomes cannot.
+    /// Known 429/no-route outcomes and proven pre-dispatch endpoint fences may retry next cycle; permanent rejection
+    /// and ambiguous outcomes cannot. A fence resets the dispatch barrier only because no HTTP send occurred.
     /// </remarks>
     /// <exception cref="OperationCanceledException">Host shutdown interrupted the cycle.</exception>
     /// <example><code>await worker.ProcessOnceAsync(new DateTime(2026, 10, 10, 0, 0, 0), token);</code></example>
@@ -160,6 +161,11 @@ public sealed class TenantWeeklyUsageReportHostedService : BackgroundService
                     await RecordKnownDeliveryAsync(target.Key, messageId.Value, "host_cancelled_after_delivery");
                 // If HTTP may have started, retain SendStarted: cancellation cannot prove that nothing was sent.
                 throw;
+            }
+            catch (BotTransportUnavailableException ex) when (ex.ReasonCode is "endpoint_migration_pending" or "obsolete_endpoint_generation")
+            {
+                if (started && !messageId.HasValue)
+                    await RecordOutcomeAsync(target.Key, UsageReportDispatchStatuses.Failed, ex.ReasonCode);
             }
             catch (Exception ex)
             {

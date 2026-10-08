@@ -4,6 +4,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using Adminbot.Domain;
+using Adminbot.Services.TelegramEndpoints;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -235,6 +236,32 @@ public sealed class TenantWeeklyDeliveryTests
         Assert.Single(fixture.Http.Sends);
     }
 
+    /// <summary>A proven assistant endpoint fence leaves the durable weekly dispatch retryable, not uncertain.</summary>
+    /// <returns>A task completing after no fenced HTTP and exactly one resumed report delivery.</returns>
+    [Fact]
+    public async Task Endpoint_fence_defers_durable_weekly_report_then_resumes_once()
+    {
+        using var fixture = new Fixture(routed: true);
+        await fixture.SeedAsync(Store("store-a", 711, 20001));
+        fixture.Gate!.Fence("assistant", 90001);
+        var end = new DateTime(2026, 10, 10);
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end));
+        Assert.Empty(fixture.Http.Sends);
+        await using (var db = fixture.Users.CreateDbContext())
+        {
+            var row = await db.UsageReportDispatches.SingleAsync();
+            Assert.Equal(UsageReportDispatchStatuses.Failed, row.Status);
+        }
+        fixture.Gate.Publish(new TelegramEndpointState { BotId = "assistant", TelegramBotId = 90001,
+            Generation = 2, Revision = 2, DesiredEndpoint = TelegramEndpointType.Local,
+            EffectiveEndpoint = TelegramEndpointType.Local, MigrationState = TelegramEndpointMigrationState.Local });
+        Assert.Equal(1, await fixture.Worker().ProcessOnceAsync(end.AddMinutes(1)));
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end.AddMinutes(2)));
+        Assert.Single(fixture.Http.Sends);
+        await using var verify = fixture.Users.CreateDbContext();
+        Assert.Equal(UsageReportDispatchStatuses.Sent, (await verify.UsageReportDispatches.SingleAsync()).Status);
+    }
+
     /// <summary>Removing or disabling Sales Assistant must never substitute an available owned or tenant transport.</summary>
     /// <returns>A task after the exact-route API and worker have made no Telegram requests.</returns>
     [Fact]
@@ -340,6 +367,8 @@ public sealed class TenantWeeklyDeliveryTests
         public UsageReportDispatchStore Store { get; }
         /// <summary>Runtime identity registry containing assistant and owned transports.</summary>
         public BotRegistry Registry { get; }
+        /// <summary>Optional real route admission gate for the endpoint-fence regression.</summary>
+        public TelegramEndpointRuntimeGate? Gate { get; }
         /// <summary>HTTP capture boundary shared by all clients in this fixture.</summary>
         public CaptureHandler Http { get; } = new();
         /// <summary>Scope provider resolving real SalesAssistantService instances.</summary>
@@ -347,7 +376,8 @@ public sealed class TenantWeeklyDeliveryTests
         /// <summary>Optional inventory-to-send mutation invoked while resolving the real assistant service.</summary>
         public Action? BeforeAssistantResolve { get; set; }
         /// <summary>Creates isolated persisted state and real SDK transports without a credentials database.</summary>
-        public Fixture()
+        /// <param name="routed">Whether actual SDK requests use the endpoint admission facade.</param>
+        public Fixture(bool routed = false)
         {
             Directory.CreateDirectory(_directory);
             var connection = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = Path.Combine(_directory, "users.db"), Pooling = false }.ToString();
@@ -359,8 +389,11 @@ public sealed class TenantWeeklyDeliveryTests
                 ["SalesAssistantBot:Id"] = "assistant", ["SalesAssistantBot:Token"] = Token(90001), ["SalesAssistantBot:Enabled"] = "true"
             }).Build();
             Registry = new BotRegistry(configuration);
-            var clients = new BotClientProvider(Registry, bot => new TelegramBotClient(
-                new TelegramBotClientOptions(bot.Token) { RetryCount = 0 }, new HttpClient(Http, disposeHandler: false)));
+            Gate = routed ? new TelegramEndpointRuntimeGate(Registry) : null;
+            var clients = routed
+                ? new BotClientProvider(Registry, Gate!, new TelegramEndpointRoutingOptions(), Http)
+                : new BotClientProvider(Registry, bot => new TelegramBotClient(
+                    new TelegramBotClientOptions(bot.Token) { RetryCount = 0 }, new HttpClient(Http, disposeHandler: false)));
             Analytics = new UsageAnalyticsService(configuration, Users, NullLogger<UsageAnalyticsService>.Instance);
             Store = new UsageReportDispatchStore(Users);
             var services = new ServiceCollection();

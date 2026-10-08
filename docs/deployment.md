@@ -375,3 +375,21 @@ orders matching both store and current owner. See [report semantics](multiple-st
 rows just to replay a cycle. `Rejected` means a definitive permanent Telegram rejection; `Failed` permits
 retry only for a definite no-send condition or 429. Structured warnings retain sanitized codes/types, not
 bot tokens or raw API messages. No report operation changes balances, profit, ledger entries or orders.
+
+## Per-bot Telegram Cloud / Local routing
+
+Existing bots remain Cloud after deployment; no automatic production migration runs. The additive users.db migration
+`20261009120000_AddTelegramEndpointRouting` stores exact BotFather-bound endpoint state, history and durable independent
+operator-alert receipts. Existing deployment preserves these rows/configuration with the application databases.
+Run the normal published `--migration-check` on isolated backup copies before activation.
+
+Global Super Admins use **🗽 Admin → 🌐 مدیریت Telegram API** or `/telegram_api` in another healthy owned bot.
+Before any explicit Local migration, configure the reserved independent Cloud-only notifier and a validated read-only
+mapping from the existing downloader container's Local file directory to its existing host volume. Keep port 8081 loopback;
+do not install, restart, stop or reconfigure the downloader container. A missing mapping blocks migration before Cloud logout.
+
+Cloud logout has a ten-minute Cloud reuse restriction; acknowledged Local logout also receives the conservative recorded
+rollback wait. Unreachable/uncertain Local cleanup is pending/intervention, never a successful Cloud failover.
+Default failback is manual. Disabling management retains saved effective routes rather than logging Local bots into Cloud.
+Do not roll back to an unaware Cloud-only binary until every Local bot has safely returned to validated Cloud operation.
+See [protocol, independent alerts, staged rollout and safe rollback](telegram-api-endpoints.md).

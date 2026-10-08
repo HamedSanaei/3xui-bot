@@ -189,7 +189,7 @@ public sealed partial class ConcurrencyTests
     /// <param name="transport">Required HTTP transport supplying official inquiry-shaped responses, never mocked settlement.</param>
     /// <param name="panelUrl">Optional real loopback XUI fixture URL; null leaves account mutation unavailable.</param>
     /// <returns>A production service provider owned and asynchronously disposed by the caller.</returns>
-    /// <remarks>Closed new-admission flags are intentional. Existing issued-payment recovery must remain independent of them.</remarks>
+    /// <remarks>Closed new-admission flags are intentional. Existing issued-payment recovery must remain independent of them. Delivery and identity probes both use explicit synthetic transports; the fake provider never resolves mismatched production endpoint authority.</remarks>
     /// <example><code>await using var provider = OwnerGatewayProvider(databases, transport, panel.Urls.Single());</code></example>
     private static ServiceProvider OwnerGatewayProvider(Databases databases, OwnerGatewayTransport transport, string? panelUrl = null)
     {
@@ -217,6 +217,8 @@ public sealed partial class ConcurrencyTests
         var registry = new BotRegistry(configuration);
         services.AddSingleton(registry);
         services.AddSingleton(new BotClientProvider(registry, _ => new StorefrontClient()));
+        services.AddSingleton<ITelegramTokenProbe>(new OwnerIdentityProbe((token, _) => Task.FromResult(
+            new Telegram.Bot.Types.User { Id = long.Parse(token.Split(':')[0]), IsBot = true, FirstName = "fixture" })));
         return services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
     }
 

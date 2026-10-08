@@ -1,6 +1,8 @@
 using System.Buffers;
 using System.Security.Cryptography;
 using System.Text;
+using Adminbot.Domain;
+using Adminbot.Services.TelegramEndpoints;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 
@@ -12,20 +14,163 @@ public interface ITelegramTokenProbe
     /// <param name="token">Required trimmed BotFather secret; never use it as a diagnostic or cache key.</param>
     /// <param name="cancellationToken">Caller-owned cancellation including the budget for this particular probe.</param>
     /// <returns>The Telegram bot identity, for internal synchronization only.</returns>
-    /// <remarks>Does not change a storefront or retry failed Telegram requests.</remarks>
+    /// <remarks>Does not change a storefront or retry failed Telegram requests. Production counts a numeric-identity lease before reading durable authority and retains it through the complete SDK await and final authority check, so registration cannot bypass migration draining. Registered routes include disabled pre-enable tenants; historical aliases must permit any unregistered Cloud login.</remarks>
     /// <exception cref="OperationCanceledException">The caller's probe scope was canceled.</exception>
     /// <exception cref="ApiRequestException">Telegram rejects getMe; callers must distinguish authoritative token rejection from transient API failures.</exception>
-    /// <exception cref="ArgumentException">The SDK rejects the supplied token's format before contacting Telegram.</exception>
+    /// <exception cref="ArgumentException">The token has no valid positive BotFather identity, or the SDK rejects its format before contacting Telegram.</exception>
+    /// <exception cref="BotTransportUnavailableException">Identity authority is incomplete, migration is fenced, or saved Local/session history prevents safe Cloud reuse.</exception>
     /// <example><code>var identity = await probe.GetMeAsync(savedToken, probeCancellation.Token);</code></example>
     Task<Telegram.Bot.Types.User> GetMeAsync(string token, CancellationToken cancellationToken);
 }
 
-/// <summary>Non-retrying Telegram getMe transport shared by foreground owner validation and token registration.</summary>
-public sealed class TelegramTokenProbe : ITelegramTokenProbe
+/// <summary>Allows cached identity results to revalidate endpoint authority without an identity-bearing Telegram request.</summary>
+public interface ITelegramTokenProbeAuthority
 {
+    /// <summary>Checks durable identity aliases and current endpoint admission, returning a secret-free cache epoch.</summary>
+    /// <param name="token">Supplied secret, used privately for exact identity and rotation checks.</param>
+    /// <param name="cancellationToken">Caller-owned complete foreground or registration budget.</param>
+    /// <returns>A secret-free fingerprint of current registry token and endpoint generation.</returns>
+    /// <remarks>A short counted numeric-identity lease precedes durable reads, including unregistered tokens. A cached success is usable only while this authority epoch remains equal; a pre-existing migration fence rejects authority before any Telegram request.</remarks>
+    /// <exception cref="BotTransportUnavailableException">Durable authority is missing, incomplete, suspect, or fenced.</exception>
+    /// <example><code>var epoch = await authority.GetAuthorityAsync(savedToken, cancellationToken);</code></example>
+    Task<string> GetAuthorityAsync(string token, CancellationToken cancellationToken);
+}
+
+/// <summary>Non-retrying identity transport that preserves exact registered routes and rejects unsafe historical Cloud login.</summary>
+/// <remarks>No probe logs or persists a secret; cache keys use fingerprints. Numeric-identity admission precedes durable authority reads and remains counted through SDK completion. Cloud reads require complete durable alias authority, and every SDK transport shares the provider socket pool.</remarks>
+public sealed class TelegramTokenProbe : ITelegramTokenProbe, ITelegramTokenProbeAuthority
+{
+    /// <summary>Current exact registered identity authority, including disabled pre-enable tenants.</summary>
+    private readonly BotRegistry _registry;
+    /// <summary>Read-only routed transport provider; control clients are never used here.</summary>
+    private readonly BotClientProvider _clients;
+    /// <summary>Durable cross-alias session authority, including removed registry identities.</summary>
+    private readonly ITelegramEndpointStateStore _store;
+    /// <summary>Current per-identity migration admission and generation authority.</summary>
+    private readonly TelegramEndpointRuntimeGate _gate;
+
+    /// <summary>Creates a fail-closed directly constructed probe when durable endpoint authority is unavailable.</summary>
+    /// <remarks>Legacy direct construction is safe: it cannot assume an unknown token has never used Local.</remarks>
+    public TelegramTokenProbe() { }
+
+    /// <summary>Creates the production singleton with complete registry, persistence, and routed transport authority.</summary>
+    /// <param name="registry">Current exact bot identities, including disabled tenants.</param>
+    /// <param name="clients">Provider of pooled read-only capability transports.</param>
+    /// <param name="store">Durable identity routes across all internal aliases.</param>
+    /// <param name="gate">Shared migration fences and hydrated route generations.</param>
+    /// <remarks>No network operation runs during construction; caller-owned budgets cover all durable authority reads and HTTP. Every SDK probe reuses the provider socket pool.</remarks>
+    /// <exception cref="ArgumentNullException">An authority dependency is missing.</exception>
+    /// <exception cref="BotTransportUnavailableException">The provider is not bound to the same migration gate, so it cannot guarantee the selected route.</exception>
+    /// <example><code>var probe = new TelegramTokenProbe(registry, clients, store, gate);</code></example>
+    public TelegramTokenProbe(BotRegistry registry, BotClientProvider clients, ITelegramEndpointStateStore store,
+        TelegramEndpointRuntimeGate gate)
+    {
+        _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+        _clients = clients ?? throw new ArgumentNullException(nameof(clients));
+        _store = store ?? throw new ArgumentNullException(nameof(store));
+        _gate = gate ?? throw new ArgumentNullException(nameof(gate));
+        if (!ReferenceEquals(_clients.EndpointGate, _gate))
+            throw new BotTransportUnavailableException("endpoint_identity_authority_unavailable");
+    }
+
     /// <inheritdoc />
-    public Task<Telegram.Bot.Types.User> GetMeAsync(string token, CancellationToken cancellationToken) =>
-        new TelegramBotClient(new TelegramBotClientOptions(token) { RetryCount = 0 }).GetMe(cancellationToken);
+    public async Task<Telegram.Bot.Types.User> GetMeAsync(string token, CancellationToken cancellationToken)
+    {
+        using var admission = AcquireIdentityProbe(token, cancellationToken, out var expectedIdentity);
+        var before = await ResolveAsync(token, expectedIdentity, cancellationToken);
+        var identity = before.BotId == null
+            ? await _clients.ProbeUnregisteredTokenAsync(token, admission, cancellationToken)
+            : await _clients.GetClientForCapabilityProbe(before.BotId, token, before.Identity).GetMe(cancellationToken);
+        if (identity.Id != before.Identity)
+            throw new BotTransportUnavailableException("telegram_identity_changed");
+        var after = await ResolveAsync(token, expectedIdentity, cancellationToken);
+        if (!string.Equals(before.Epoch, after.Epoch, StringComparison.Ordinal))
+            throw new BotTransportUnavailableException("endpoint_migration_pending");
+        return identity;
+    }
+
+    /// <inheritdoc />
+    public async Task<string> GetAuthorityAsync(string token, CancellationToken cancellationToken)
+    {
+        using var admission = AcquireIdentityProbe(token, cancellationToken, out var identity);
+        return (await ResolveAsync(token, identity, cancellationToken)).Epoch;
+    }
+
+    /// <summary>Counts a probe before asynchronous authority reads, even when its BotFather identity has no registered alias yet.</summary>
+    /// <param name="token">Required privately supplied BotFather secret; only its positive numeric identity enters the gate.</param>
+    /// <param name="cancellationToken">Complete caller-owned probe budget, checked before admission.</param>
+    /// <param name="identity">The validated numeric BotFather identity, never an internal tenant, chat, or customer id.</param>
+    /// <returns>An owned identity-only lease; dispose after all authority checks and the complete SDK operation.</returns>
+    /// <remarks>Missing durable authority fails closed. A concurrent registration shares this count, so its migration cannot log out until this lease ends.</remarks>
+    /// <exception cref="ArgumentException">The supplied secret does not contain a valid positive BotFather identity.</exception>
+    /// <exception cref="OperationCanceledException">The caller's probe scope is already canceled.</exception>
+    /// <exception cref="BotTransportUnavailableException">Durable authority is unavailable or migration has already fenced the numeric identity.</exception>
+    /// <example><code>using var admission = AcquireIdentityProbe(token, cancellationToken, out var identity);</code></example>
+    private TelegramEndpointRuntimeGate.IdentityProbeLease AcquireIdentityProbe(
+        string token, CancellationToken cancellationToken, out long identity)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        identity = TelegramBotTokenIdentity.ExtractBotId(token)
+            ?? throw new ArgumentException("Invalid bot token format.", nameof(token));
+        if (_store == null || _gate == null)
+            throw new BotTransportUnavailableException("endpoint_identity_authority_unavailable");
+        return _gate.AcquireIdentityProbe(identity);
+    }
+
+    /// <summary>Resolves complete bounded durable identity authority before either Cloud login or a cached result is admitted.</summary>
+    /// <param name="token">Supplied BotFather secret; replacement secrets must retain the registered numeric identity.</param>
+    /// <param name="identity">Positive numeric BotFather identity extracted from the supplied secret before acquiring its identity-only lease.</param>
+    /// <param name="cancellationToken">Complete caller probe budget, unchanged across durable authority and SDK operations.</param>
+    /// <returns>Exact canonical registry route or an eligible unregistered Cloud route, plus a secret-free epoch.</returns>
+    /// <remarks>The caller holds numeric-identity admission across this read and any SDK operation. Local/session uncertainty under any alias denies Cloud even after internal rename or removal; a final read rejects results whose registration, token, or endpoint epoch changed.</remarks>
+    /// <exception cref="BotTransportUnavailableException">Authority is unavailable, Cloud reuse is unsafe, or migration is fenced.</exception>
+    /// <example><code>var authority = await ResolveAsync(savedToken, admittedIdentity, cancellationToken);</code></example>
+    private async Task<(string BotId, long Identity, string Epoch)> ResolveAsync(
+        string token, long identity, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var aliases = await _store.ReadIdentityStatesAsync(identity, cancellationToken);
+        if (aliases.Count > 128)
+            throw new BotTransportUnavailableException("endpoint_identity_authority_overflow");
+        BotInstanceConfig bot = null;
+        var registered = _registry.Bots;
+        for (var index = 0; index < registered.Count; index++)
+        {
+            var candidate = registered[index];
+            if (TelegramBotTokenIdentity.ExtractBotId(candidate.Token) != identity) continue;
+            bot ??= candidate;
+            if (string.Equals(candidate.Token, token, StringComparison.Ordinal))
+            {
+                bot = candidate;
+                break;
+            }
+        }
+        TelegramEndpointRoute? route = null;
+        if (bot != null)
+        {
+            await _gate.HydrateAsync(bot.Id, identity, cancellationToken);
+            route = _gate.GetRoute(bot.Id, identity);
+            if (!route.Value.Available)
+                throw new BotTransportUnavailableException("endpoint_migration_pending");
+        }
+        var endpoint = route?.Endpoint ?? TelegramEndpointType.Cloud;
+        foreach (var state in aliases)
+        {
+            var active = state.MigrationState is TelegramEndpointMigrationState.Cloud or TelegramEndpointMigrationState.CloudRecovered
+                or TelegramEndpointMigrationState.Local or TelegramEndpointMigrationState.LocalDegraded;
+            if (!active || state.TelegramBotId != identity || state.LogoutAttemptedAtUtc.HasValue &&
+                (!state.LogoutAcknowledgedAtUtc.HasValue || state.LogoutAcknowledgedAtUtc < state.LogoutAttemptedAtUtc))
+                throw new BotTransportUnavailableException("endpoint_migration_pending");
+            if (endpoint == TelegramEndpointType.Cloud &&
+                (state.EffectiveEndpoint != TelegramEndpointType.Cloud ||
+                 state.MigrationState is not (TelegramEndpointMigrationState.Cloud or TelegramEndpointMigrationState.CloudRecovered) ||
+                 state.CloudReuseEligibleAtUtc > DateTime.UtcNow))
+                throw new BotTransportUnavailableException("endpoint_cloud_reuse_restricted");
+        }
+        var epoch = bot == null ? $"unregistered:{identity}" :
+            $"{bot.Id}:{identity}:{endpoint}:{route.Value.Generation}:{TenantOwnerTokenProbeCache.Fingerprint(bot.Token)}";
+        return (bot?.Id, identity, epoch);
+    }
 }
 
 /// <summary>Closed, secret-free outcomes of an owner-panel identity probe.</summary>
@@ -49,8 +194,8 @@ public sealed record TenantOwnerTokenProbeResult(TenantOwnerTokenProbeStatus Sta
 
 /// <summary>Instance-owned bounded single-flight cache for short foreground owner-panel getMe probes.</summary>
 /// <remarks>
-/// Production registers one singleton across scoped handlers. Keys combine the internal storefront id with SHA-256
-/// token fingerprints, never raw secrets. Success lives three minutes and non-authoritative failures twenty seconds.
+/// Production registers one singleton across scoped handlers. Keys combine the internal storefront id, SHA-256
+/// token fingerprint, and revalidated endpoint/token authority epoch, never raw secrets. Success lives three minutes and non-authoritative failures twenty seconds.
 /// Invalid results are not retained. Eviction and explicit invalidation detach old flights, preventing late completion
 /// from repopulating a replaced identity. Callers must still guard persisted identity/revision before applying results.
 /// Canceling the final waiter removes and cancels its flight rather than caching handler shutdown as a transient failure.
@@ -59,8 +204,8 @@ public sealed class TenantOwnerTokenProbeCache
 {
     /// <summary>Protects the bounded entry map and waiter ownership; never held across an await.</summary>
     private readonly object _sync = new();
-    /// <summary>Retained results and shared flights keyed solely by internal id and cryptographic fingerprint.</summary>
-    private readonly Dictionary<(string TenantId, string Fingerprint), Entry> _entries = new();
+    /// <summary>Bounded results and flights keyed by internal id, token fingerprint, and revalidated endpoint authority epoch.</summary>
+    private readonly Dictionary<(string TenantId, string Fingerprint, string Authority), Entry> _entries = new();
     /// <summary>Non-retrying injectable getMe transport.</summary>
     private readonly ITelegramTokenProbe _probe;
     /// <summary>Dedicated foreground timeout, independent of the twelve-second startup configuration.</summary>
@@ -106,7 +251,8 @@ public sealed class TenantOwnerTokenProbeCache
     /// <param name="token">Required saved BotFather secret; hashed before dictionary lookup and never logged.</param>
     /// <param name="cancellationToken">This handler's cancellation; checked on cache hits and independently while waiting.</param>
     /// <returns>Verified Telegram identity or a non-authoritative/invalid classification; no persistent state is changed.</returns>
-    /// <remarks>One canceled waiter cannot cancel another handler. If all waiters leave, the flight is discarded and canceled.</remarks>
+    /// <remarks>One canceled waiter cannot cancel another handler. Final-waiter departure cancels the flight.
+    /// Production authority checks share the two-second foreground budget, including cache hits, and prevent a fenced or rotated endpoint from authorizing a retained success.</remarks>
     /// <exception cref="OperationCanceledException">The calling handler was canceled, including on a cache hit.</exception>
     /// <example><code>var result = await cache.ProbeAsync(store.Id, store.Token, updateCancellation);</code></example>
     public async Task<TenantOwnerTokenProbeResult> ProbeAsync(string tenantBotId, string token, CancellationToken cancellationToken)
@@ -114,7 +260,22 @@ public sealed class TenantOwnerTokenProbeCache
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(tenantBotId);
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-        var key = (tenantBotId, Fingerprint(token));
+        var authority = _probe as ITelegramTokenProbeAuthority;
+        using var deadline = authority == null ? null : new CancellationTokenSource(_probeTimeout, _timeProvider);
+        using var budget = deadline == null ? null : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
+        var waitToken = budget?.Token ?? cancellationToken;
+        string epoch;
+        try
+        {
+            epoch = authority == null ? string.Empty : await authority.GetAuthorityAsync(token, waitToken).WaitAsync(waitToken);
+        }
+        catch (Exception exception)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return new(IsInvalid(exception) ? TenantOwnerTokenProbeStatus.Invalid :
+                IsTransient(exception) ? TenantOwnerTokenProbeStatus.Transient : TenantOwnerTokenProbeStatus.Unavailable);
+        }
+        var key = (tenantBotId, Fingerprint(token), epoch);
         Entry entry;
         var start = false;
         lock (_sync)
@@ -142,9 +303,20 @@ public sealed class TenantOwnerTokenProbeCache
             _ = RunProbeAsync(key, token, entry);
         try
         {
-            var result = await entry.Completion.Task.WaitAsync(cancellationToken);
+            var result = await entry.Completion.Task.WaitAsync(waitToken);
             cancellationToken.ThrowIfCancellationRequested();
+            if (authority != null && result.Status is TenantOwnerTokenProbeStatus.Valid or TenantOwnerTokenProbeStatus.Invalid)
+            {
+                var current = await authority.GetAuthorityAsync(token, waitToken).WaitAsync(waitToken);
+                if (!string.Equals(epoch, current, StringComparison.Ordinal))
+                    return new(TenantOwnerTokenProbeStatus.Unavailable);
+            }
             return result;
+        }
+        catch (Exception exception)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return new(IsTransient(exception) ? TenantOwnerTokenProbeStatus.Transient : TenantOwnerTokenProbeStatus.Unavailable);
         }
         finally
         {
@@ -174,12 +346,12 @@ public sealed class TenantOwnerTokenProbeCache
     }
 
     /// <summary>Completes one independently budgeted flight and retains only a still-owned result.</summary>
-    /// <param name="key">Internal tenant id and SHA-256 token fingerprint.</param>
+    /// <param name="key">Internal tenant id, SHA-256 token fingerprint, and checked endpoint authority epoch.</param>
     /// <param name="token">Raw secret retained only for the outstanding transport call.</param>
     /// <param name="entry">Shared flight whose waiter count controls shutdown cancellation.</param>
     /// <returns>A task completing after the secret-free result is published to waiting handlers.</returns>
     /// <remarks>Every exception is classified internally; no exception message or raw token enters logs or cached keys.</remarks>
-    private async Task RunProbeAsync((string TenantId, string Fingerprint) key, string token, Entry entry)
+    private async Task RunProbeAsync((string TenantId, string Fingerprint, string Authority) key, string token, Entry entry)
     {
         TenantOwnerTokenProbeResult result;
         try
@@ -213,7 +385,7 @@ public sealed class TenantOwnerTokenProbeCache
     /// <returns>A SHA-256 hexadecimal fingerprint safe for an internal tenant-scoped cache key, not for public diagnostics.</returns>
     /// <remarks>Only the fingerprint string is allocated on ordinary repeated panel taps.</remarks>
     /// <example><code>var key = (store.Id, Fingerprint(savedToken));</code></example>
-    private static string Fingerprint(string token)
+    internal static string Fingerprint(string token)
     {
         var byteCount = Encoding.UTF8.GetByteCount(token);
         byte[] rented = null;

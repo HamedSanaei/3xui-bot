@@ -1272,6 +1272,15 @@ public sealed partial class ConcurrencyTests
                 ["GozargahSiteSyncEnabled"]="false", ["GozargahSiteWalletPaymentsEnabled"]="false"
             }).Build();
 
+    /// <summary>Builds isolated financial services with fake delivery and identity transports, never live Telegram sessions.</summary>
+    /// <param name="databases">Temporary SQLite fixture owning the user and credential databases.</param>
+    /// <param name="configuration">Required synthetic configuration with paths confined to the fixture and loopback external APIs.</param>
+    /// <param name="atlas">Controlled payment provider whose financial behavior is exercised without production credentials.</param>
+    /// <param name="registry">Exact synthetic bot inventory used by delivery assertions.</param>
+    /// <param name="clients">Per-bot fake clients recording delivery, not endpoint migration authority.</param>
+    /// <returns>A complete service provider that the test must asynchronously dispose; no hosted worker starts.</returns>
+    /// <remarks>The fake provider requires a matching explicit fake identity probe. Endpoint protocol tests use the routed provider separately; financial transaction semantics remain production implementations.</remarks>
+    /// <example><code>await using var provider = AtlasTenantProvider(databases, configuration, atlas, out var registry, out var clients);</code></example>
     private static ServiceProvider AtlasTenantProvider(Databases databases, IConfiguration configuration, AtlasPay atlas,
         out BotRegistry registry, out System.Collections.Concurrent.ConcurrentDictionary<string, StorefrontClient> clients)
     {
@@ -1288,6 +1297,9 @@ public sealed partial class ConcurrencyTests
         clients = localClients;
         var clientProvider = new BotClientProvider(registry, bot => localClients.GetOrAdd(bot.Id, _ => new StorefrontClient()));
         services.AddSingleton(registry); services.AddSingleton(clientProvider);
+        // Financial scenarios replace the SDK provider and must not resolve a mismatched production probe authority.
+        services.AddSingleton<ITelegramTokenProbe>(new OwnerIdentityProbe((token, _) => Task.FromResult(
+            new Telegram.Bot.Types.User { Id = long.Parse(token.Split(':')[0]), IsBot = true, FirstName = "fixture" })));
         return services.BuildServiceProvider();
     }
 }

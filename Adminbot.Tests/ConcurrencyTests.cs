@@ -21,6 +21,7 @@ public sealed partial class ConcurrencyTests
 
     /// <summary>The actual production registrations must reject captive contexts and provide isolated execution graphs.</summary>
     /// <returns>A task completing after the documented regression invariant has been verified.</returns>
+    /// <remarks>New registry identities remain unavailable until exact durable route hydration, matching production's before-receiver startup ordering.</remarks>
     /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Production_service_graph_has_no_singleton_capturing_a_scoped_context"</code></example>
     [Fact]
     public async Task Production_service_graph_has_no_singleton_capturing_a_scoped_context()
@@ -48,6 +49,9 @@ public sealed partial class ConcurrencyTests
         Assert.False(executor.IsAvailable("test-bot"));
         provider.GetRequiredService<BotRegistry>().Upsert(new BotInstance
         { Id = "active", Enabled = true, Token = "12345:" + new string('a', 35) });
+        Assert.False(executor.IsAvailable("active"));
+        await provider.GetRequiredService<Adminbot.Services.TelegramEndpoints.TelegramEndpointRuntimeGate>()
+            .HydrateAsync("active", 12345, CancellationToken.None);
         Assert.True(executor.IsAvailable("active"));
         Assert.False(executor.IsAvailable("absent-bot"));
     }

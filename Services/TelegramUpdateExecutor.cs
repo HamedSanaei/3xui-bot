@@ -1,6 +1,7 @@
 using Adminbot.Domain;
 using Telegram.Bot.Types;
 using Adminbot.Services.Telemetry;
+using Adminbot.Services.TelegramEndpoints;
 
 /// <summary>Restores bot identity and owns the disposable service graph of one scheduled execution.</summary>
 /// <remarks>Per-operation stores own short database contexts; legacy coordinated workflows share only this execution's unit of work.</remarks>
@@ -13,6 +14,8 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
     private readonly TelegramForegroundDeliveryPolicy _foregroundDelivery;
     /// <summary>Optional payload-free sink for foreground requests; never owns the shared Telegram transport.</summary>
     private readonly LatencyTelemetryService _telemetry;
+    /// <summary>Optional advisory endpoint availability; the scheduler owns the atomic pre-claim lease.</summary>
+    private readonly TelegramEndpointRuntimeGate _endpointGate;
     /// <summary>Creates an executor without capturing a mutable handler or database context.</summary>
     /// <param name="scopes">Application scope factory for one logical Telegram execution.</param>
     /// <param name="registry">Current owned, tenant, and assistant bot definitions.</param>
@@ -23,6 +26,7 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
     /// production eight-second budget, so production wiring stays unchanged and tests can inject millisecond windows.
     /// </param>
     /// <param name="telemetry">Optional nonblocking writer passed to the execution-only decorator; no deadlines or retries change.</param>
+    /// <param name="endpointGate">Optional shared routing authority; unavailable migration states defer queued work without changing delivery deadlines.</param>
     /// <remarks>The executor is a singleton holding factories and runtime registries; each invocation owns its context scope and restores ambient bot identity on exit.</remarks>
     public TelegramUpdateExecutor(
         IServiceScopeFactory scopes,
@@ -30,7 +34,7 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
         BotClientProvider clients,
         BotContextAccessor context,
         TelegramForegroundDeliveryPolicy foregroundDelivery = null,
-        LatencyTelemetryService telemetry = null)
+        LatencyTelemetryService telemetry = null, TelegramEndpointRuntimeGate endpointGate = null)
     {
         _scopes = scopes;
         _registry = registry;
@@ -38,14 +42,19 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
         _context = context;
         _foregroundDelivery = foregroundDelivery ?? TelegramForegroundDeliveryPolicy.Production;
         _telemetry = telemetry;
+        _endpointGate = endpointGate;
     }
 
-    /// <inheritdoc />
+    /// <summary>Checks configured identity, enabled state and advisory endpoint readiness before scheduling.</summary>
+    /// <param name="botId">Exact canonical durable inbox bot id; no default-bot fallback is accepted.</param>
+    /// <returns>False while a bot is disabled or its endpoint is fenced; its update remains queued.</returns>
+    /// <remarks>The scheduler acquires a separate atomic lease before claim. An already-admitted handler may finish after fencing.</remarks>
     public bool IsAvailable(string botId)
     {
         var bot = _registry.GetById(botId);
         return bot != null && string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase)
-            && bot.Enabled && !string.IsNullOrWhiteSpace(bot.Token);
+            && bot.Enabled && !string.IsNullOrWhiteSpace(bot.Token)
+            && (_endpointGate == null || (TelegramBotTokenIdentity.ExtractBotId(bot.Token) is { } identity && _endpointGate.IsAvailable(bot.Id, identity)));
     }
 
     /// <summary>Executes the exact persisted bot's update using isolated handler services and the shared instrumented transport.</summary>
@@ -53,7 +62,8 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
     /// <param name="cancellationToken">Existing handler token cancelled only after the scheduler drain deadline.</param>
     /// <returns>The unchanged handler completion; telemetry cannot retry or convert ambiguous sends.</returns>
     /// <remarks>The scheduler supplies the ambient correlated latency scope. Foreground decoration is execution-only;
-    /// raw receivers and durable background delivery retain their existing transport and budgets.</remarks>
+    /// receivers and durable background delivery retain their existing budgets. The shared routed facade pins admitted
+    /// handler operations to their original generation during a migration drain; it never transparently replays a send.</remarks>
     /// <exception cref="InvalidOperationException">The exact bot became unavailable after claim.</exception>
     public async Task ExecuteAsync(TelegramUpdateWorkItem item, CancellationToken cancellationToken)
     {

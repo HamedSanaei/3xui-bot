@@ -13,6 +13,7 @@ using Adminbot.Domain.TelegramUi;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Adminbot.Services.Telemetry;
+using Adminbot.Services.TelegramEndpoints;
 using Microsoft.Extensions.Logging.Abstractions;
 
 
@@ -38,7 +39,8 @@ public class Program
     /// and queues (or, in its default dry run, only reports) receipt re-upload reminders for tenant card orders whose
     /// receipt image was dropped before the image-document fix; it starts no listener, receiver, or worker. Normal
     /// startup prints the embedded commit/configuration before loading private configuration, then preserves the
-    /// existing migrate-before-receiver ordering.
+    /// existing migrate-before-receiver ordering. Durable identity-bound endpoint routes are hydrated before any hosted
+    /// sender/receiver starts; pending migration states never fall back to Cloud merely because the process restarted.
     /// Read-only <c>telemetry-report</c> and isolated <c>telemetry-benchmark</c> exit before host construction,
     /// configuration loading, migrations, Telegram receivers and financial workers.
     ///
@@ -128,6 +130,7 @@ public class Program
             // Sync configured brand bots first, then hydrate runtime-created tenant bots from users.db.
             await SyncBotInstancesAsync(userDb, botRegistry);
             await botRegistry.LoadTenantBotsFromDatabaseAsync(userDb);
+            await app.Services.GetRequiredService<TelegramEndpointCoordinator>().InitializeAsync(CancellationToken.None);
             // Report degraded (but usable) configuration once, before any receiver starts. This is sanitized and never
             // a hard failure: the process must keep settling payments, running XUI work, and answering customers even
             // when the log destinations or the panel URL are missing. It never prints a chat id, bot id, token, or URL.
@@ -169,13 +172,16 @@ public class Program
     /// jobs without retaining scoped handlers, database contexts or foreground clients.
     /// Latency telemetry owns one bounded JSONL writer and is registered first so it stops after receivers, inbox drain
     /// and workers. Its directory is adjacent to the resolved users.db in persistent Data, never the shell working directory.
-    /// EF interceptors measure commands and transactions without SQL values; telemetry adds no database model or migration.</remarks>
+    /// EF interceptors measure commands and transactions without SQL values; telemetry adds no database model or migration.
+    /// Endpoint routing adds separate identity-bound state/history/operator-alert tables only in users.db, shares the
+    /// pooled transport and existing lifecycle gate, and hydrates committed routes before hosted work starts.</remarks>
     /// <example><code>RegisterApplicationServices(services, configuration, validatedOptions, contentRootPath);</code></example>
     public static void RegisterApplicationServices(IServiceCollection services, IConfiguration configuration, AppConfig appConfig, string contentRootPath)
     {
         var telegramOutboxDatabasePath = Path.Combine(contentRootPath, "Data", "telegram-log-outbox.db");
         services.AddSingleton<IConfiguration>(configuration);
         services.AddSingleton(appConfig);
+        services.AddSingleton((appConfig.TelegramEndpointRouting ?? new TelegramEndpointRoutingOptions()).ValidateAndSnapshot());
         var usersPath = string.IsNullOrWhiteSpace(appConfig.UserDatabasePath) ? "Data/users.db" : appConfig.UserDatabasePath;
         var persistentDataDirectory = Path.GetDirectoryName(Path.GetFullPath(usersPath, contentRootPath));
         services.AddSingleton(sp => new LatencyTelemetryService(appConfig.LatencyTelemetry, persistentDataDirectory,
@@ -225,7 +231,13 @@ public class Program
         services.AddScoped<AtlasPaySettlementService>();
         services.AddSingleton<BotContextAccessor>();
         services.AddSingleton<BotRegistry>();
+        services.AddSingleton<TelegramEndpointRuntimeGate>();
         services.AddSingleton<BotClientProvider>();
+        services.AddSingleton<TelegramEndpointStore>();
+        services.AddSingleton<ITelegramEndpointStateStore>(sp => sp.GetRequiredService<TelegramEndpointStore>());
+        services.AddSingleton<TelegramEndpointCoordinator>();
+        services.AddSingleton<ITelegramEndpointAdministration>(sp => sp.GetRequiredService<TelegramEndpointCoordinator>());
+        services.AddSingleton<TelegramEndpointAdminService>();
         // Owner-panel getMe uses its own short budget and bounded singleton cache across sequential handler scopes.
         // Token registration reuses only the injectable transport, retaining the existing startup-sized budget.
         services.AddSingleton<ITelegramTokenProbe, TelegramTokenProbe>();
@@ -369,6 +381,10 @@ public class Program
         services.AddHostedService(sp => sp.GetRequiredService<TelegramUpdateScheduler>());
         services.AddSingleton<MultiBotHostedService>();
         services.AddHostedService(sp => sp.GetRequiredService<MultiBotHostedService>());
+        services.AddSingleton<ITelegramEndpointReceiverLifecycle>(sp => sp.GetRequiredService<MultiBotHostedService>());
+        // Migration work starts after receiver host initialization and stops before receivers: no detached migration survives shutdown.
+        services.AddHostedService<TelegramEndpointCoordinatorWorker>();
+        services.AddHostedService<TelegramEndpointNotificationWorker>();
 
         //services.AddHostedService<ZibalPaymentCheckerService>();
 

@@ -19,6 +19,7 @@ internal static class TelegramTransportDiagnostics
     internal static string Method(ReadOnlySpan<char> method) => method switch
     {
         "getUpdates" => "getUpdates", "getMe" => "getMe", "getWebhookInfo" => "getWebhookInfo",
+        "logOut" => "logOut", "close" => "close",
         "deleteWebhook" => "deleteWebhook", "setWebhook" => "setWebhook", "setMyCommands" => "setMyCommands",
         "sendMessage" => "sendMessage", "sendPhoto" => "sendPhoto", "sendDocument" => "sendDocument",
         "sendMediaGroup" => "sendMediaGroup", "sendVideo" => "sendVideo", "sendAnimation" => "sendAnimation",
@@ -49,7 +50,7 @@ internal static class TelegramTransportDiagnostics
         "editMessageText" or "editMessageCaption" or "editMessageReplyMarkup" or "editMessageMedia" => "edit",
         "sendPhoto" or "sendDocument" or "sendMediaGroup" or "sendVideo" or "sendAnimation" or "sendAudio" or "sendVoice" => "upload",
         "sendMessage" or "sendSticker" or "forwardMessage" or "copyMessage" or "copyMessages" => "send",
-        "getMe" or "getWebhookInfo" or "deleteWebhook" or "setWebhook" or "setMyCommands" => "runtime",
+        "getMe" or "getWebhookInfo" or "deleteWebhook" or "setWebhook" or "setMyCommands" or "logOut" or "close" => "runtime",
         "getFile" => "file_lookup",
         _ => "other"
     };

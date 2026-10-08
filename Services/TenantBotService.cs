@@ -290,7 +290,7 @@ public partial class TenantBotService
     /// tenant pricing, wallet debit, order fulfillment, or XUI exactly-once semantics.
     /// </param>
     /// <param name="MandatoryJoinMembershipCache">Optional singleton positive forced-join cache; direct constructions without it use a private cache.</param>
-    /// <param name="TokenProbe">Optional injectable non-retrying getMe transport; null uses TelegramTokenProbe and raw tokens are never logged.</param>
+    /// <param name="TokenProbe">Optional injectable non-retrying routed getMe transport; null resolves the shared service or safely refuses probes without durable endpoint authority. Raw tokens are never logged.</param>
     /// <param name="OwnerTokenProbeCache">Optional bounded two-second owner-panel cache. Production injects its singleton; null creates a private per-service cache.</param>
     /// <remarks>One handler scope owns one tenant selection and must not be reused concurrently. Order wallet receipt keys derive from durable order identity.
     /// Production shares the foreground token cache across scopes; direct construction without cache injection does not share verification results.</remarks>
@@ -368,7 +368,7 @@ public partial class TenantBotService
         _premiumUiCapabilityProbe = PremiumUiCapabilityProbe;
         _interactionTimeouts = InteractionTimeouts ?? TelegramInteractionTimeouts.Production;
         _mandatoryJoinMembershipCache = MandatoryJoinMembershipCache ?? new TelegramMandatoryJoinMembershipCache();
-        _tokenProbe = TokenProbe ?? new TelegramTokenProbe();
+        _tokenProbe = TokenProbe ?? ServiceProvider?.GetService<ITelegramTokenProbe>() ?? new TelegramTokenProbe();
         _ownerTokenProbeCache = OwnerTokenProbeCache ?? new TenantOwnerTokenProbeCache(_tokenProbe);
     }
 
@@ -1913,6 +1913,7 @@ public partial class TenantBotService
     /// A clearly revoked token is cleaned only while the saved token, owner, numeric identity and panel revision
     /// still match the probed snapshot. Transient failures preserve every setting and are never persisted.
     /// Workflow concurrency checks also prevent an old result from mutating a replacement made during a local write.
+    /// Cached success must retain the current endpoint generation and token authority; migration fences preserve settings instead of permitting a Cloud identity login.
     /// </remarks>
     /// <exception cref="OperationCanceledException">The owner update was canceled, even if the cache has a result.</exception>
     /// <example><code>var notice = await VALIDATETENANTTOKENFORPANELASYNC(selectedStore, updateCancellation);</code></example>
@@ -2189,7 +2190,8 @@ public partial class TenantBotService
     /// <remarks>The returned numeric identity must match the token and be unique across tenant, owned and assistant bots.
     /// Stops only the selected receiver before replacement. The unique database identity closes concurrent registration races.
     /// A changed numeric bot or owner identity revokes all customer-wallet approval evidence before persistence.
-    /// Token registration retains its existing configured startup-sized budget, using the injectable transport.
+    /// Token registration retains its existing configured startup-sized budget, using the read-only routed transport.
+    /// Registered and replacement secrets of the same numeric identity retain their authoritative endpoint; historical Local aliases or uncertain cleanup prohibit an unregistered Cloud login.
     /// Every successful save removes cached foreground checks, including checks for a replaced secret with the same bot id.
     /// Raw tokens and probe exception text are never sent to logs or replies. All financial history is preserved.</remarks>
     /// <exception cref="OperationCanceledException">The owner update was canceled during validation or persistence.</exception>
