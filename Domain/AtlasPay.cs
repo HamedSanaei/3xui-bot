@@ -585,9 +585,20 @@ public sealed class AtlasPay
         return ParseStatusResponse(json, "verify", requirePaidField: true);
     }
 
+    /// <summary>Sends one logical AtlasPay operation with the existing inquiry-only retry policy.</summary>
+    /// <param name="method">Existing provider HTTP verb, unchanged by measurement.</param>
+    /// <param name="relativePath">Provider-relative path; order ids and paths are never telemetry metadata.</param>
+    /// <param name="body">Optional existing request body, never retained by diagnostics.</param>
+    /// <param name="retryReadOnly">Existing authorization for read-only inquiry retries; creation and verification remain non-replayed.</param>
+    /// <param name="cancellationToken">Caller cancellation for provider requests and existing retry delays.</param>
+    /// <returns>Original successful provider response for the caller's existing payment proof validation.</returns>
+    /// <remarks>Only logical awaited wall time is attributed to payment_gateway. Existing timeouts/backoff are included; no balances, ledger, settlement, idempotency, or financial authorization changes.</remarks>
+    /// <exception cref="AtlasPayApiException">Original rejection or exhausted read-only transport failure.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels the existing provider operation.</exception>
     private async Task<string> SendAsync(HttpMethod method, string relativePath, object body, bool retryReadOnly,
         CancellationToken cancellationToken)
     {
+        using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
         var retryCount = retryReadOnly ? Math.Clamp(_configuration.AtlasPayInquiryRetryCount, 0, 10) : 0;
         for (var attempt = 0; ; attempt++)
         {

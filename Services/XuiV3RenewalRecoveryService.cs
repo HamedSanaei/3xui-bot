@@ -1,6 +1,7 @@
 using Adminbot.Domain;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Adminbot.Services.Telemetry;
 
 /// <summary>
 /// Durably reconciles ambiguous XUI v3 renewals and completes settlement after delayed panel commits or restarts.
@@ -57,9 +58,12 @@ public sealed class XuiV3RenewalRecoveryService : BackgroundService
     /// <remarks>
     /// Recovery leases make concurrent service instances safe. A process crash leaves the account locked and another
     /// instance may resume after lease expiry without replaying the panel mutation.
+    /// Fixed SQLite telemetry labels identify this recovery worker without account ids or financial values.
+    /// Instrumentation does not add panel retries, change leases/transactions or alter settlement idempotency.
     /// </remarks>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var sqliteDiagnostics = LatencySqliteOperationScope.Push(LatencySqliteOperationCategory.XuiRenewalRecovery);
         while (!stoppingToken.IsCancellationRequested)
         {
             try

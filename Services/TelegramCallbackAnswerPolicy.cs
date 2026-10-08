@@ -1,3 +1,4 @@
+using Adminbot.Services.Telemetry;
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot;
@@ -80,6 +81,11 @@ public static class TelegramCallbackAnswerPolicy
     /// Thrown when <paramref name="cancellationToken"/> was cancelled by the caller. This indicates outer lane
     /// shutdown and is intentionally propagated.
     /// </exception>
+    /// <remarks>
+    /// Publishes only cancellation-token provenance for the existing best-effort deadline. Nested SDK and
+    /// foreground telemetry can distinguish this policy timeout from actual caller shutdown without changing
+    /// the deadline, swallow/rethrow behavior, payloads or retry policy.
+    /// </remarks>
     /// <example>
     /// <code>
     /// // Production: bounded by the configured two-second budget.
@@ -115,6 +121,11 @@ public static class TelegramCallbackAnswerPolicy
         // budget guarantees this UX-only request cannot outlive its deadline and stall the user lane.
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         bounded.CancelAfter(timeout ?? Timeout);
+        using var cancellationMetadata = !LatencyTelemetrySuppression.IsActive &&
+            (TelegramUpdateLatencyScope.Current != null ||
+             client is TelegramTelemetryBotClient { IsTelemetryEnabled: true } ||
+             client is ForegroundBoundedTelegramBotClient { IsTelemetryEnabled: true })
+            ? TelegramRequestCancellationScope.PushCallbackPolicy(cancellationToken, bounded.Token) : null;
         try
         {
             await client.AnswerCallbackQuery(

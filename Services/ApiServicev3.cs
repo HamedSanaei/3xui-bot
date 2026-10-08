@@ -2596,8 +2596,10 @@ public class ApiServicev3
     /// Retry attempts stay out of the private Telegram logger channel, but are written with full exception details to
     /// the daily diagnostic file so transient panel problems remain reviewable without channel noise.
     /// When an <see cref="XuiOperationTiming"/> scope is active, the complete logical request—including retry attempts
-    /// and configured backoff—is accumulated as panel API time. Calls made outside an operation scope remain unmeasured
-    /// and retain their previous behavior.
+    /// and configured backoff—is accumulated as panel API time. Calls outside an operation scope retain their
+    /// previous behavior. All logical reads and writes also contribute to the update latency scope when one exists,
+    /// regardless of foreground/background execution policy. Only a closed read/write category is recorded,
+    /// never the URI or body.
     ///
     /// Foreground budget shape:
     /// The budget is NOT per attempt. The whole logical request (attempt + backoff + response read) must finish inside
@@ -2614,12 +2616,10 @@ public class ApiServicev3
         XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.ReadOnly,
         XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
-        // Attribute the complete logical request to the closed-vocabulary foreground stage when this is an interactive
-        // read. Background workers execute without a latency scope, so the measurement is a no-op for them and their
-        // behavior is unchanged.
-        using var stageMeasurement = executionPolicy == XuiV3RequestExecutionPolicy.ForegroundRead
-            ? (TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default)
-            : default;
+        // The complete awaited logical operation includes existing attempts, response reading, and backoff. HTTP
+        // verb plus a compile-time read-route allowlist classify POST lookups without changing retry authorization.
+        var latencyScope = TelegramUpdateLatencyScope.Current;
+        using var stageMeasurement = latencyScope?.Measure(ClassifyLatencyStage(method, uri)) ?? default;
 
         // One measurement covers the complete logical request, including every retry and retry delay. The ambient
         // operation scope is bot-update-local, so concurrent customer operations cannot mix their API durations.
@@ -2688,6 +2688,34 @@ public class ApiServicev3
             // outcome so the handler stops retrying and releases the Telegram lane with a user-safe retry message.
             throw new XuiV3ForegroundReadTimeoutException(ResolveForegroundReadOverallBudget(appConfig));
         }
+    }
+
+    /// <summary>Classifies XUI requests without exposing endpoint, subscription, email, or request data.</summary>
+    /// <param name="method">Existing HTTP verb; GET and HEAD are reads.</param>
+    /// <param name="uri">Existing request URI inspected only for compile-time read endpoint patterns, never retained or emitted.</param>
+    /// <returns>A closed XUI read/write category; unrecognized POST routes are conservatively writes.</returns>
+    /// <remarks>Classification is diagnostics only and must never determine retries or authorize financial mutation.</remarks>
+    private static TelegramUpdateStage ClassifyLatencyStage(HttpMethod method, Uri uri)
+    {
+        if (method == HttpMethod.Get || method == HttpMethod.Head) return TelegramUpdateStage.XuiRead;
+        var path = uri.AbsolutePath.AsSpan().TrimEnd('/');
+        if (path.EndsWith("/getTwoFactorEnable", StringComparison.Ordinal)
+            || path.Contains("/panel/api/clients/ips/", StringComparison.Ordinal)
+            || path.EndsWith("/panel/api/clients/onlines", StringComparison.Ordinal)
+            || path.EndsWith("/panel/api/clients/onlinesByNode", StringComparison.Ordinal)
+            || path.EndsWith("/panel/api/clients/lastOnline", StringComparison.Ordinal)
+            || path.EndsWith("/panel/api/clients/activeInbounds", StringComparison.Ordinal)
+            || path.Contains("/panel/api/server/logs/", StringComparison.Ordinal)
+            || path.Contains("/panel/api/server/xraylogs/", StringComparison.Ordinal)
+            || path.EndsWith("/panel/setting/all", StringComparison.Ordinal)
+            || path.EndsWith("/panel/setting/defaultSettings", StringComparison.Ordinal)
+            || path.EndsWith("/panel/xray", StringComparison.Ordinal)
+            || path.EndsWith("/panel/xray/warp/data", StringComparison.Ordinal)
+            || path.EndsWith("/panel/xray/nord/data", StringComparison.Ordinal)
+            || path.EndsWith("/panel/xray/nord/countries", StringComparison.Ordinal)
+            || path.EndsWith("/panel/xray/nord/servers", StringComparison.Ordinal))
+            return TelegramUpdateStage.XuiRead;
+        return TelegramUpdateStage.XuiMutation;
     }
 
     /// <summary>
@@ -2808,6 +2836,8 @@ public class ApiServicev3
     /// The complete request is measured only when a surrounding <see cref="XuiOperationTiming"/> scope exists. This
     /// method does not create an operation scope by itself, so read-only subscription requests outside audited account
     /// activities do not produce timing logs.
+    /// When an update latency scope exists, the complete awaited subscription read is also attributed to xui_read,
+    /// without retaining its subscription identifier or endpoint.
     /// </remarks>
     /// <exception cref="ArgumentException">Thrown when the configured base URL or path cannot form a valid URI.</exception>
     /// <exception cref="HttpRequestException">Thrown when the subscription endpoint returns an unsuccessful response.</exception>
@@ -2819,6 +2849,7 @@ public class ApiServicev3
         CancellationToken cancellationToken)
     {
         using var panelMeasurement = XuiOperationTiming.BeginCurrentPanelCall();
+        using var latencyMeasurement = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
         var baseUrl = string.IsNullOrWhiteSpace(serverInfo.SubLinkUrl)
             ? serverInfo.Url
             : serverInfo.SubLinkUrl;

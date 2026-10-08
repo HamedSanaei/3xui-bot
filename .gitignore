@@ -182,6 +182,9 @@ Data/servers*.json
 # Bot/user activity logs and generated build artifacts
 Logs/
 Data/Logs/
+
+# Sensitive append-only operational telemetry is persistent runtime state, never source.
+Data/Telemetry/
 artifacts/
 published/
 

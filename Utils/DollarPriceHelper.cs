@@ -54,10 +54,17 @@ namespace Adminbot.Utils
             return client;
         }
 
+        /// <summary>Awaits one existing public market quote and preserves its existing source-unit normalization.</summary>
+        /// <param name="endpoint">Compile-time provider descriptor; its URL and returned prices are never latency telemetry.</param>
+        /// <param name="cancellationToken">Existing caller cancellation for the provider request.</param>
+        /// <returns>The original normalized IRT/toman-per-USDT quote, or Empty for an existing handled provider failure.</returns>
+        /// <remarks>Each overlapping awaited HTTP/response parse uses external_http. Consensus, three-source concurrency, ten-second timeout, retry behavior, and financial conversion are unchanged.</remarks>
+        /// <exception cref="OperationCanceledException">The caller cancels the existing provider request.</exception>
         private async Task<DollarPriceQuote> TryReadQuoteAsync(QuoteEndpoint endpoint, CancellationToken cancellationToken)
         {
             try
             {
+                using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ExternalHttp) ?? default;
                 using var response = await _client.GetAsync(endpoint.Url, cancellationToken);
                 response.EnsureSuccessStatusCode();
                 var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);

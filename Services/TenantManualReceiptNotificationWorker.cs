@@ -1,5 +1,6 @@
 using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
+using Adminbot.Services.Telemetry;
 
 internal interface ITenantManualReceiptNotificationSender
 {
@@ -51,8 +52,15 @@ public sealed class TenantManualReceiptNotificationWorker : BackgroundService
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
+    /// <summary>Scans and relays durable tenant receipt notifications under the existing lease/retry policy.</summary>
+    /// <param name="stoppingToken">Host lifetime cancellation for local scans and existing background delivery.</param>
+    /// <returns>The worker lifetime task; individual notification failures retain the existing handling.</returns>
+    /// <remarks>A fixed payload-free SQLite category identifies this worker's reads/writes and contention.
+    /// Tenant ownership remains in the existing receipt queries; no tenant/customer id or payment details enter telemetry.
+    /// The category creates no database write, Telegram request, balance effect or additional retry.</remarks>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var sqliteDiagnostics = LatencySqliteOperationScope.Push(LatencySqliteOperationCategory.TenantManualReceiptNotification);
         while (!stoppingToken.IsCancellationRequested)
         {
             try

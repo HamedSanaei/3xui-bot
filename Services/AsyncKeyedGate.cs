@@ -29,7 +29,7 @@ public sealed class AsyncKeyedGate
     /// <param name="key">Required non-secret stable resource id, such as provider/payment or tenant/order id.</param>
     /// <param name="token">Cancellation while waiting for another operation on the same resource.</param>
     /// <returns>An exclusive lease that must be disposed after the operation, including exceptional exits.</returns>
-    /// <remarks>Different keys proceed independently; no ordering claim is made beyond mutual exclusion.</remarks>
+    /// <remarks>Different keys proceed independently; no ordering claim is made beyond mutual exclusion. Only semaphore wait wall time is attributed to lock_wait; keys and acquired lease lifetime are never diagnostic metadata.</remarks>
     /// <example><code>using var lease = await gate.EnterAsync(orderId, token);</code></example>
     public async Task<IDisposable> EnterAsync(string key, CancellationToken token = default)
     {
@@ -40,7 +40,11 @@ public sealed class AsyncKeyedGate
             if (!_entries.TryGetValue(key, out entry)) _entries.Add(key, entry = new());
             entry.References++;
         }
-        try { await entry.Gate.WaitAsync(token); }
+        try
+        {
+            using var waiting = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.LockWait) ?? default;
+            await entry.Gate.WaitAsync(token);
+        }
         catch { Release(key, entry, acquired: false); throw; }
         return new Lease(this, key, entry);
     }

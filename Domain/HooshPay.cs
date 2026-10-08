@@ -308,12 +308,14 @@ namespace Adminbot.Domain
         /// <returns>Deserialized HooshPay response.</returns>
         /// <exception cref="InvalidOperationException">Thrown when the API key is missing.</exception>
         /// <exception cref="HooshPayApiException">Thrown when HooshPay returns an error or empty response.</exception>
+        /// <remarks>The logical awaited provider request and parsing are attributed to payment_gateway. Existing financial proof, invoice settlement, request body, timeout, and retry behavior remain unchanged; diagnostics never retain URL, credentials, or response content.</remarks>
         private async Task<T> SendAsync<T>(
             HttpMethod method,
             string relativeUrl,
             object body,
             CancellationToken cancellationToken)
         {
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
             if (string.IsNullOrWhiteSpace(_appConfig.HooshPayApiKey))
                 throw new InvalidOperationException("HooshPay API key is not configured.");
 

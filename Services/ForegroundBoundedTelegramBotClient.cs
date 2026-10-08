@@ -1,4 +1,7 @@
 using System;
+using Adminbot.Services.Telemetry;
+using Adminbot.Domain;
+using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Threading;
@@ -48,6 +51,11 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
 
     /// <summary>Immutable budgets for ordinary sends and multipart media-group uploads.</summary>
     private readonly TelegramForegroundDeliveryPolicy _policy;
+    /// <summary>Optional shared writer used only to enable cancellation provenance outside an update scope.</summary>
+    private readonly LatencyTelemetryService _telemetry;
+    /// <summary>Gets whether this request path requires cancellation provenance for enabled transport telemetry.</summary>
+    internal bool IsTelemetryEnabled => _telemetry?.Enabled == true ||
+        _inner is TelegramTelemetryBotClient { IsTelemetryEnabled: true };
 
     /// <summary>
     /// Creates a foreground-bounded view over an existing bot client.
@@ -60,11 +68,15 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// Immutable interactive delivery budget. Production passes <see cref="TelegramForegroundDeliveryPolicy.Production"/>;
     /// tests pass millisecond budgets.
     /// </param>
+    /// <param name="telemetry">Optional nonblocking telemetry writer; null preserves existing direct-constructor callers.</param>
+    /// <remarks>Cancellation provenance distinguishes a nested callback policy's existing deadline from caller shutdown; no budgets or retries change.</remarks>
     /// <exception cref="ArgumentNullException">The inner client or the policy is null.</exception>
-    public ForegroundBoundedTelegramBotClient(ITelegramBotClient inner, TelegramForegroundDeliveryPolicy policy)
+    public ForegroundBoundedTelegramBotClient(ITelegramBotClient inner, TelegramForegroundDeliveryPolicy policy,
+        LatencyTelemetryService telemetry = null)
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
+        _telemetry = telemetry;
     }
 
     /// <inheritdoc />
@@ -141,10 +153,14 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// keep the ordinary deadline. The ambient <see cref="TelegramUpdateLatencyScope"/> measures the same awaited
     /// inner request and records a metadata-only completion even for healthy calls. The recorder is local telemetry,
     /// not an operator incident; recorder failures cannot alter the response or exception.
+    /// Direct calls with an enabled writer but no handler scope emit one foreground completion themselves;
+    /// scoped calls rely solely on the scope's foreground event so durations and timeout counts are not duplicated.
     /// When only that deadline expires — the caller's own token is still live — the typed
     /// <see cref="TelegramForegroundDeliveryTimeoutException"/> is raised without retrying. Caller cancellation,
     /// transport errors, and Telegram API errors keep their original exception identity. Cancellation is recorded as
     /// caller-owned, deadline-owned, or independent transport cancellation according to the actual token states.
+    /// The existing callback policy deadline is retained as callback-policy cancellation metadata rather than
+    /// mislabeled as caller shutdown; the original exception and best-effort policy behavior remain unchanged.
     /// </remarks>
     /// <exception cref="TelegramForegroundDeliveryTimeoutException">
     /// The overall interactive delivery budget expired before Telegram answered.
@@ -162,29 +178,38 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(overallBudget);
         var latencyScope = TelegramUpdateLatencyScope.Current;
+        using var cancellationMetadata = !LatencyTelemetrySuppression.IsActive &&
+            (IsTelemetryEnabled || latencyScope != null || TelegramRequestCancellationScope.Current != null)
+            ? TelegramRequestCancellationScope.PushForeground(cancellationToken, budget.Token) : null;
         using var measurement = latencyScope?.Measure(stage) ?? default;
         var requestMeasurement = latencyScope?.MeasureTelegramRequest(kind) ?? default;
         var outcome = TelegramForegroundRequestOutcome.Completed;
         int? apiErrorCode = null;
+        var recordDirect = latencyScope == null && _telemetry?.Enabled == true && !LatencyTelemetrySuppression.IsActive;
+        var directStarted = recordDirect ? Stopwatch.GetTimestamp() : 0;
+        Exception failure = null;
 
         try
         {
             return await _inner.SendRequest(request, budget.Token);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && budget.IsCancellationRequested)
+        catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested && budget.IsCancellationRequested)
         {
             outcome = TelegramForegroundRequestOutcome.ForegroundBudgetExpired;
+            failure = exception;
             // An upload may have reached Telegram before its response was lost; never retry an ambiguous send.
             throw new TelegramForegroundDeliveryTimeoutException(DescribeRequestKind(request), overallBudget);
         }
         catch (ApiRequestException exception)
         {
             outcome = TelegramForegroundRequestOutcome.TelegramApiError;
+            failure = exception;
             apiErrorCode = exception.ErrorCode;
             throw;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException exception)
         {
+            failure = exception;
             outcome = cancellationToken.IsCancellationRequested
                 ? TelegramForegroundRequestOutcome.CallerCancellation
                 : TelegramForegroundRequestOutcome.TransportError;
@@ -192,6 +217,7 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
         }
         catch (Exception exception)
         {
+            failure = exception;
             outcome = exception is HttpRequestException or IOException or RequestException or TimeoutException
                 ? TelegramForegroundRequestOutcome.TransportError
                 : TelegramForegroundRequestOutcome.UnexpectedError;
@@ -200,6 +226,20 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
         finally
         {
             requestMeasurement.Complete(outcome, apiErrorCode);
+            if (recordDirect)
+            {
+                var receiver = UpdateTelemetryTracker.Current;
+                var method = TelegramTransportDiagnostics.Method(request.MethodName.AsSpan());
+                _telemetry.TryRecord(TelegramTransportDiagnostics.Classify(failure, null, cancellationToken) with
+                {
+                    EventType = "telegram_foreground_request_completed",
+                    BotId = (_inner as TelegramTelemetryBotClient)?.CanonicalBotId ?? BotContextAccessor.CurrentBotId,
+                    TraceId = receiver?.TraceId, UpdateId = receiver?.UpdateId, Sequence = receiver?.Sequence,
+                    Method = method, Category = TelegramTransportDiagnostics.Category(method),
+                    Stage = TelegramUpdateLatencyScope.StageName(stage), Operation = DescribeRequestKind(request),
+                    DurationMs = Stopwatch.GetElapsedTime(directStarted).TotalMilliseconds, Attempt = 1
+                });
+            }
         }
     }
 
@@ -217,9 +257,11 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
     /// <remarks>
     /// The mapping is a fixed compile-time list. Unknown request kinds — including receiver long polling, webhook
     /// management, and file transfer — are never bounded, so this decorator cannot alter runtime or durable behavior.
+    /// The SDK telemetry subclass reuses this classification only for the unpersisted admin-control scope;
+    /// that measurement never applies the interactive deadline to the admin service's existing transport.
     /// </remarks>
     /// <example><code>var isForeground = TryClassifyForegroundRequest(request, out var stage, out var kind);</code></example>
-    private static bool TryClassifyForegroundRequest<TResponse>(
+    internal static bool TryClassifyForegroundRequest<TResponse>(
         IRequest<TResponse> request, out TelegramUpdateStage stage, out TelegramForegroundRequestKind kind)
     {
         stage = TelegramUpdateStage.TelegramSend;
@@ -238,6 +280,7 @@ public sealed class ForegroundBoundedTelegramBotClient : ITelegramBotClient
                 kind = TelegramForegroundRequestKind.DocumentUpload;
                 return true;
             case AnswerCallbackQueryRequest:
+                stage = TelegramUpdateStage.TelegramCallbackAck;
                 kind = TelegramForegroundRequestKind.CallbackAcknowledgement;
                 return true;
             case DeleteMessageRequest:

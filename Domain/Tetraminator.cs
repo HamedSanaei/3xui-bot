@@ -327,6 +327,7 @@ public sealed class Tetraminator
     /// <returns>Deserialized provider response.</returns>
     /// <exception cref="InvalidOperationException">Thrown when API credentials or the provider base URL are unavailable.</exception>
     /// <exception cref="TetraminatorApiException">Thrown for provider rejection, malformed JSON, or exhausted inquiry retries.</exception>
+    /// <remarks>The logical awaited provider operation is attributed to payment_gateway, including existing inquiry retry delays. No provider ids, bodies, keys, financial settlement, or retry/timeout behavior is changed or recorded.</remarks>
     private async Task<T> SendAsync<T>(
         HttpMethod method,
         string relativePath,
@@ -334,6 +335,7 @@ public sealed class Tetraminator
         bool retryInquiry,
         CancellationToken cancellationToken)
     {
+        using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
         if (string.IsNullOrWhiteSpace(_appConfig.TetraminatorApiKey))
             throw new InvalidOperationException("Tetraminator API key is not configured.");
         if (_httpClient.BaseAddress == null)

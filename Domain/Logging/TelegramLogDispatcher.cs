@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using Adminbot.Services.Telemetry;
 
 namespace Adminbot.Domain.Logging
 {
@@ -686,8 +687,14 @@ namespace Adminbot.Domain.Logging
             }
         }
 
+        /// <summary>Sends one existing logger item under unchanged pacing without recursively observing alert delivery.</summary>
+        /// <param name="send">Required existing logger send operation; its message and destination never enter latency telemetry.</param>
+        /// <returns>A task completing after the paced send, preserving the original delivery result.</returns>
+        /// <remarks>Async-local suppression applies only to this operational logger path, not customer sends or receivers.</remarks>
+        /// <exception cref="OperationCanceledException">Dispatcher shutdown cancels pacing or delivery.</exception>
         private async Task PacedSendAsync(Func<Task> send)
         {
+            using var telemetrySuppression = LatencyTelemetrySuppression.Enter();
             var wait = _options.MinimumSendInterval - (_options.UtcNow() - _lastSendAt);
             if (wait > TimeSpan.Zero)
                 await Task.Delay(wait, _shutdown.Token);

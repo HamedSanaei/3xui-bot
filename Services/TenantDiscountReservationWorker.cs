@@ -1,6 +1,7 @@
 using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Adminbot.Services.Telemetry;
 
 /// <summary>Reconciles reserved claims and refunded-wallet claims after callbacks, restarts or delivery failures.</summary>
 /// <param name="users">Factory for the authoritative users.db claim and quote index.</param>
@@ -13,10 +14,13 @@ public sealed class TenantDiscountReservationWorker(UserDbContextFactory users, 
     /// <summary>Scans claim ids in bounded pages and expires unadmitted quotes without touching payment rows.</summary>
     /// <param name="stoppingToken">Host lifetime cancellation, propagated to each local read and claim reconciliation.</param>
     /// <returns>The worker lifetime task; individual claim failures do not stop later claims.</returns>
-    /// <remarks>Each cycle advances past unresolved claims, wrapping to the first id only after a complete pass. Refunded wallet claims remain scanned even if previously consumed; an exact committed refund receipt must be verified before release. Exactly-once transitions occur inside users.db write transactions.</remarks>
+    /// <remarks>Each cycle advances past unresolved claims, wrapping to the first id only after a complete pass. Refunded wallet claims remain scanned even if previously consumed; an exact committed refund receipt must be verified before release. Exactly-once transitions occur inside users.db write transactions.
+    /// Fixed payload-free SQLite telemetry identifies this worker's contention; tenant/customer ids, refund amounts
+    /// and provider data remain private. No claim, transaction, retry or financial rule is changed.</remarks>
     /// <example>After scanning ids 1 through 50, the next cycle starts after 50; an empty page resets the cursor to zero.</example>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var sqliteDiagnostics = LatencySqliteOperationScope.Push(LatencySqliteOperationCategory.TenantDiscountReservation);
         var after = 0;
         while (!stoppingToken.IsCancellationRequested)
         {

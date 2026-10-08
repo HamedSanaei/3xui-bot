@@ -1,5 +1,25 @@
 # CODE_MAP.md
 
+- Persistent Telegram latency telemetry: `Services/Telemetry/` owns a bounded single JSONL writer, UTC/monotonic
+  version-one metadata, receiver/inbox timeline correlation, runtime health, cooldown incidents, read-only reporting
+  and a controlled benchmark. Enabled defaults: 8192 events, daily/25 MiB files, 14-day/500 MiB retention; storage is
+  `Telemetry` beside the resolved users database (production persistent publish `Data/Telemetry`), never shell CWD.
+  `UpdateTelemetryTracker` adds no schema; `TelegramUpdateLatencyScope` now partitions exclusive nested stages,
+  ACK versus visible responses and measured unattributed gaps. Shared pooled Telegram HTTP records headers and full
+  SDK validation separately; healthy empty long polls are not slow foreground requests. DI-owned EF interceptors,
+  existing SQLite BUSY retry hooks, transaction lifetimes, fixed incident-worker categories, keyed gates and shared
+  XUI/site/payment/external awaits expose contention/waits without SQL values, tokens, customer payloads or altered
+  financial/FIFO/retry/budget semantics. Live shutdown/recovery emits at most one terminal summary; late commit
+  publication preserves receiver origin and marks unknown queue timing explicitly.
+  `Program` handles `telemetry-report --hours 24 --bot GozargahNetwork_Bot --directory <absolute path>` and
+  `telemetry-benchmark --iterations 10000` before configuration/migrations/hosting. Counts exclude deduplicated
+  admissions; restart clocks remain null, recovered handler-only rankings are labelled; loss counters use process
+  sessions. Unknown report bot labels are pseudonymous even when filtered; global SQLite diagnostics stay visible.
+  Linux files/directories are 0600/0700, Data survives both deployment layouts, and telemetry is excluded
+  from source/publish synchronization. Existing-project `LatencyTelemetry*Tests` and transaction diagnostics cover
+  lifecycle/FIFO, SDK/polling, fault/loss/retention/restart/shutdown and safe reporting. No new project/migration;
+  operational schema, commands, limits and read-only production procedure: `docs/telegram-latency-telemetry.md`.
+
 - Foreground latency gaps (October 5 evidence): owned account-id/renewal/snapshot lookups now use the existing
   12 s read budget; email direct/fallback share one lifetime, and my-accounts renders its one fresh response.
   Trial creation opts into `XuiV3CreateAccountOptions.ForegroundNetworkBudget` (12 s default, 15 s cap) for

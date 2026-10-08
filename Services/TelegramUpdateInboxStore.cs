@@ -2,12 +2,15 @@ using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 using Telegram.Bot.Types;
+using Adminbot.Services.Telemetry;
 
 /// <summary>Persists bounded Telegram admission, claims, and payload-free terminal receipts in users.db.</summary>
 /// <remarks>All transactions are local and short. No receiver or handler executes while a write transaction is held.</remarks>
 public sealed partial class TelegramUpdateInboxStore
 {
     private readonly UserDbContextFactory _factory;
+    /// <summary>Optional payload-free receiver timing published immediately after admission commit.</summary>
+    private readonly UpdateTelemetryTracker _telemetryTracker;
     /// <summary>Post-commit readiness notification; subscribers must never throw or treat signals as durable work.</summary>
     public event Action ReadyChanged;
     /// <summary>Notifies the coordinator that persisted work or runtime availability may now permit execution.</summary>
@@ -16,9 +19,11 @@ public sealed partial class TelegramUpdateInboxStore
     /// <summary>Creates an inbox sharing only immutable database options.</summary>
     /// <param name="factory">Required users.db context factory.</param>
     /// <param name="credentials">Global wallet receipt factory; missing configuration refuses reviewed resolution.</param>
+    /// <param name="telemetryTracker">Optional bounded receiver metadata tracker; never participates in durable admission or FIFO.</param>
     /// <remarks>Queries return detached metadata without loading payloads. Business recovery records never consume Telegram admission capacity.</remarks>
-    public TelegramUpdateInboxStore(UserDbContextFactory factory, CredentialsDbContextFactory credentials = null)
-    { _factory = factory; _credentials = credentials; }
+    public TelegramUpdateInboxStore(UserDbContextFactory factory, CredentialsDbContextFactory credentials = null,
+        UpdateTelemetryTracker telemetryTracker = null)
+    { _factory = factory; _credentials = credentials; _telemetryTracker = telemetryTracker; }
 
     /// <summary>Attempts durable admission without exceeding the configured unfinished-work limit.</summary>
     /// <param name="botId">Required canonical runtime bot id; never a token.</param>
@@ -27,22 +32,29 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="token">Receiver cancellation before acceptance.</param>
     /// <returns>True when committed or already accepted; false when admission must wait for capacity.</returns>
     /// <remarks>Duplicate delivery succeeds even when full. The count stops at capacity inside the admission transaction. Cancellation after commit is resolved by durable deduplication.
-    /// Telegram's native serializer retains the Bot API wire format now that v22 uses System.Text.Json attributes.</remarks>
+    /// Telegram's native serializer retains the Bot API wire format now that v22 uses System.Text.Json attributes.
+    /// Payload-free timing is published after commit and before NotifyReady; it introduces no database writes.</remarks>
     /// <example><code>while (!await store.TryAcceptAsync(botId, update, capacity, token)) await Task.Delay(100, token);</code></example>
     public Task<bool> TryAcceptAsync(string botId, Update update, int capacity, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        if (await db.TelegramUpdateInbox.AnyAsync(x => x.BotId == botId && x.UpdateId == update.Id, ct)) return true;
+        if (await db.TelegramUpdateInbox.AnyAsync(x => x.BotId == botId && x.UpdateId == update.Id, ct))
+        {
+            UpdateTelemetryTracker.Current?.CompleteDuplicate();
+            return true;
+        }
         if (await db.TelegramUpdateInbox.Where(x => x.Status == "queued" || x.Status == "running")
             .Select(x => x.Sequence).Take(capacity).CountAsync(ct) >= capacity) return false;
-        db.TelegramUpdateInbox.Add(new TelegramUpdateInboxEntry
+        var entry = new TelegramUpdateInboxEntry
         {
             BotId = botId, UpdateId = update.Id, TelegramUserId = TelegramUpdateIdentity.ResolveUserId(update),
             UpdateType = update.Type.ToString(), Payload = System.Text.Json.JsonSerializer.Serialize(update, Telegram.Bot.JsonBotAPI.Options), AcceptedAtUtc = DateTime.UtcNow
-        });
+        };
+        db.TelegramUpdateInbox.Add(entry);
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
+        _telemetryTracker?.Persisted(entry.Sequence, entry.AcceptedAtUtc);
         NotifyReady();
         return true;
     }, token);
@@ -91,11 +103,13 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="sequence">Internal claimed inbox sequence.</param>
     /// <param name="failureCode">Null for success; otherwise a coarse non-secret failure code.</param>
     /// <param name="token">Independent persistence cancellation token, normally not the cancelled handler token.</param>
-    /// <returns>A task completing after the claim becomes terminal for Telegram scheduling.</returns>
-    /// <remarks>Every outcome erases the private payload. A failure requiring business reconciliation becomes <c>completed_with_review</c>; other failures become <c>completed_with_error</c>. Neither state blocks later updates.</remarks>
-    public async Task FinishAsync(long sequence, string failureCode, CancellationToken token)
+    /// <returns>True when a running claim was transitioned; false when no running claim remained and no row changed.</returns>
+    /// <remarks>Every changed receipt erases the private payload. A failure requiring business reconciliation becomes
+    /// <c>completed_with_review</c>; other failures become <c>completed_with_error</c>. A false result can follow live
+    /// shutdown recovery and is not proof of a new final commit. Neither terminal state blocks later updates.</remarks>
+    public async Task<bool> FinishAsync(long sequence, string failureCode, CancellationToken token)
     {
-        await SqliteOperation.RunAsync(async ct =>
+        var changed = await SqliteOperation.RunAsync(async ct =>
         {
             await using var db = _factory.CreateDbContext();
             var terminalStatus = failureCode == null ? "completed"
@@ -107,13 +121,18 @@ public sealed partial class TelegramUpdateInboxStore
                     .SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow), ct);
         }, token);
         NotifyReady();
+        return changed > 0;
     }
 
     /// <summary>Converts interrupted and legacy nonterminal claims to terminal review receipts and expires old deduplication receipts.</summary>
-    /// <param name="token">Host startup cancellation; must finish before receiver admission begins.</param>
+    /// <param name="token">Existing startup or independent shutdown-recovery cancellation.</param>
+    /// <param name="preRestartTelemetry">True for previous-process startup receipts; false reconciles only known live timelines during shutdown.</param>
     /// <returns>The number of interrupted or legacy uncertain receipts converted without replaying their handlers.</returns>
-    /// <remarks>Requires the deployment's single polling process. Queued updates remain runnable; business operations preserve any side-effect ambiguity independently. Private payloads are erased from every converted receipt.</remarks>
-    public Task<int> RecoverAsync(CancellationToken token) => SqliteOperation.RunAsync(async ct =>
+    /// <remarks>Requires the deployment's single polling process. Queued updates remain runnable; business operations preserve any side-effect ambiguity independently.
+    /// Private payloads are erased from every converted receipt. Startup emits bounded recovered summaries with
+    /// pre-restart clocks null; shutdown uses each live timeline's exact-once terminal guard, avoiding duplicate summaries.
+    /// No handler is replayed and no telemetry schema is added.</remarks>
+    public Task<int> RecoverAsync(CancellationToken token, bool preRestartTelemetry = true) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
         var now = DateTime.UtcNow;
@@ -121,10 +140,44 @@ public sealed partial class TelegramUpdateInboxStore
             .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "completed_with_review")
                 .SetProperty(x => x.Payload, (string)null).SetProperty(x => x.CompletedAtUtc, now)
                 .SetProperty(x => x.FailureCode, x => x.Status == "running" ? "process_interrupted" : x.FailureCode), ct);
+        if (count > 0 && _telemetryTracker != null)
+            await RecordRecoveryTelemetryAsync(db, now, preRestartTelemetry, ct);
         var cutoff = DateTime.UtcNow.AddDays(-7);
         await db.TelegramUpdateInbox.Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff).ExecuteDeleteAsync(ct);
         return count;
     }, token);
+
+    /// <summary>Records already-terminal interrupted receipts in bounded metadata pages without reloading payloads.</summary>
+    /// <param name="db">Existing short-lived recovery context after its terminal update, not an execution context.</param>
+    /// <param name="completedAtUtc">Exact UTC completion timestamp assigned by this recovery attempt.</param>
+    /// <param name="preRestartTelemetry">True reconstructs previous-process summaries; false only reconciles live shutdown execution metadata.</param>
+    /// <param name="token">Existing recovery cancellation; diagnostic read failures do not alter recovery results.</param>
+    /// <returns>A task completing after available metadata is observed; no records are mutated.</returns>
+    /// <remarks>Only rows updated by this recovery timestamp are inspected. Retention and business recovery remain unchanged.</remarks>
+    private async Task RecordRecoveryTelemetryAsync(UserDbContext db, DateTime completedAtUtc, bool preRestartTelemetry, CancellationToken token)
+    {
+        try
+        {
+            long after = 0;
+            while (true)
+            {
+                var rows = await db.TelegramUpdateInbox.AsNoTracking()
+                    .Where(x => x.Sequence > after && x.Status == "completed_with_review" && x.CompletedAtUtc == completedAtUtc)
+                    .OrderBy(x => x.Sequence).Take(128)
+                    .Select(x => new TelegramUpdateInboxEntry { Sequence = x.Sequence, BotId = x.BotId, UpdateId = x.UpdateId,
+                        UpdateType = x.UpdateType, AcceptedAtUtc = x.AcceptedAtUtc, StartedAtUtc = x.StartedAtUtc }).ToListAsync(token);
+                if (rows.Count == 0) break;
+                foreach (var row in rows)
+                    _telemetryTracker.RecordRecovered(row.Sequence, row.BotId, row.UpdateId, row.UpdateType,
+                        row.AcceptedAtUtc, row.StartedAtUtc, completedAtUtc, preRestartTelemetry);
+                after = rows[^1].Sequence;
+            }
+        }
+        catch
+        {
+            // Optional metadata cannot turn a successful terminal recovery into a failed retry or delay startup further.
+        }
+    }
 
     /// <summary>Finds the earlier same-lane execution contributing the largest positive overlap to the victim's wait.</summary>
     /// <param name="sequence">Internal inbox sequence of the currently starting (victim) update.</param>

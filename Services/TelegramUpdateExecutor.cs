@@ -1,5 +1,6 @@
 using Adminbot.Domain;
 using Telegram.Bot.Types;
+using Adminbot.Services.Telemetry;
 
 /// <summary>Restores bot identity and owns the disposable service graph of one scheduled execution.</summary>
 /// <remarks>Per-operation stores own short database contexts; legacy coordinated workflows share only this execution's unit of work.</remarks>
@@ -10,6 +11,8 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
     private readonly BotClientProvider _clients;
     private readonly BotContextAccessor _context;
     private readonly TelegramForegroundDeliveryPolicy _foregroundDelivery;
+    /// <summary>Optional payload-free sink for foreground requests; never owns the shared Telegram transport.</summary>
+    private readonly LatencyTelemetryService _telemetry;
     /// <summary>Creates an executor without capturing a mutable handler or database context.</summary>
     /// <param name="scopes">Application scope factory for one logical Telegram execution.</param>
     /// <param name="registry">Current owned, tenant, and assistant bot definitions.</param>
@@ -19,19 +22,22 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
     /// Immutable interactive Telegram delivery budget applied to this execution's UX calls. A missing value keeps the
     /// production eight-second budget, so production wiring stays unchanged and tests can inject millisecond windows.
     /// </param>
+    /// <param name="telemetry">Optional nonblocking writer passed to the execution-only decorator; no deadlines or retries change.</param>
     /// <remarks>The executor is a singleton holding factories and runtime registries; each invocation owns its context scope and restores ambient bot identity on exit.</remarks>
     public TelegramUpdateExecutor(
         IServiceScopeFactory scopes,
         BotRegistry registry,
         BotClientProvider clients,
         BotContextAccessor context,
-        TelegramForegroundDeliveryPolicy foregroundDelivery = null)
+        TelegramForegroundDeliveryPolicy foregroundDelivery = null,
+        LatencyTelemetryService telemetry = null)
     {
         _scopes = scopes;
         _registry = registry;
         _clients = clients;
         _context = context;
         _foregroundDelivery = foregroundDelivery ?? TelegramForegroundDeliveryPolicy.Production;
+        _telemetry = telemetry;
     }
 
     /// <inheritdoc />
@@ -42,7 +48,13 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
             && bot.Enabled && !string.IsNullOrWhiteSpace(bot.Token);
     }
 
-    /// <inheritdoc />
+    /// <summary>Executes the exact persisted bot's update using isolated handler services and the shared instrumented transport.</summary>
+    /// <param name="item">Required claimed durable update; its payload remains private to the handler.</param>
+    /// <param name="cancellationToken">Existing handler token cancelled only after the scheduler drain deadline.</param>
+    /// <returns>The unchanged handler completion; telemetry cannot retry or convert ambiguous sends.</returns>
+    /// <remarks>The scheduler supplies the ambient correlated latency scope. Foreground decoration is execution-only;
+    /// raw receivers and durable background delivery retain their existing transport and budgets.</remarks>
+    /// <exception cref="InvalidOperationException">The exact bot became unavailable after claim.</exception>
     public async Task ExecuteAsync(TelegramUpdateWorkItem item, CancellationToken cancellationToken)
     {
         var bot = _registry.GetById(item.Key.BotId);
@@ -51,7 +63,7 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
         // Only this update execution receives the bounded client view. The receiver and every background worker keep
         // the raw client, so long polling, durable outbox delivery, and file relay are unaffected by the interactive
         // budget. The decorator wraps the shared instance and never disposes it.
-        var client = new ForegroundBoundedTelegramBotClient(_clients.GetClient(bot.Id), _foregroundDelivery);
+        var client = new ForegroundBoundedTelegramBotClient(_clients.GetClient(bot.Id), _foregroundDelivery, _telemetry);
         var runtime = new BotRuntimeContext { Config = RuntimeSnapshot.Copy(bot), Client = client };
         using (_context.Push(runtime))
         // The interaction actor is resolved once from the durable update and published for the whole execution, so

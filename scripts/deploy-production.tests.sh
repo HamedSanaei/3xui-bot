@@ -28,6 +28,14 @@ printf 'new-app\n' > "$stage_publish/app.dll"
 printf 'new-library\n' > "$stage_publish/new-library.dll"
 printf 'must-never-enter-live-data\n' > "$stage_publish/Data/injected.txt"
 
+# JSONL telemetry is sensitive persistent Data, including deployments whose source checkout also contains Data.
+# Exercise actual rsync behavior rather than pinning filter wording.
+mkdir -p "$live_publish/Data/Telemetry" "$live_root/Data/Telemetry" "$stage_publish/Data/Telemetry" "$stage_source/Data/Telemetry"
+printf 'live-runtime-telemetry\n' > "$live_publish/Data/Telemetry/latency-live.jsonl"
+printf 'live-checkout-telemetry\n' > "$live_root/Data/Telemetry/latency-live.jsonl"
+printf 'staged-sensitive-telemetry\n' > "$stage_publish/Data/Telemetry/latency-staged.jsonl"
+printf 'staged-sensitive-telemetry\n' > "$stage_source/Data/Telemetry/latency-staged.jsonl"
+
 sync_publish "$stage_publish" "$live_publish"
 
 [[ "$(cat "$live_publish/Data/preserve.txt")" == "persistent-production-state" ]]
@@ -63,6 +71,10 @@ sync_source "$stage_source" "$live_root"
 [[ ! -e "$live_root/stale-source.txt" ]]
 [[ "$(cat "$live_publish/Data/preserve.txt")" == "persistent-production-state" ]]
 [[ "$(cat "$outside_marker")" == "outside-test-sentinel" ]]
+[[ "$(cat "$live_publish/Data/Telemetry/latency-live.jsonl")" == "live-runtime-telemetry" ]]
+[[ "$(cat "$live_root/Data/Telemetry/latency-live.jsonl")" == "live-checkout-telemetry" ]]
+[[ ! -e "$live_publish/Data/Telemetry/latency-staged.jsonl" ]]
+[[ ! -e "$live_root/Data/Telemetry/latency-staged.jsonl" ]]
 
 printf 'Production Data preservation test: PASS\n'
 printf '  preserved Data/preserve.txt content\n'

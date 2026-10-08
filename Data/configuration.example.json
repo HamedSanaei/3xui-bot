@@ -56,6 +56,18 @@
   "telegramUpdateMaxConcurrency": 16,
   "telegramUpdateQueueCapacity": 1000,
   "telegramUpdateShutdownDrainSeconds": 90,
+  "latencyTelemetry": {
+    "enabled": true,
+    "retentionDays": 14,
+    "maxFileBytes": 26214400,
+    "maxTotalBytes": 524288000,
+    "channelCapacity": 8192,
+    "sampleIntervalSeconds": 30,
+    "flushIntervalSeconds": 2,
+    "shutdownFlushSeconds": 5,
+    "slowOperationMs": 2000,
+    "slowUpdateMs": 5000
+  },
   "userActivityLogEnabled": true,
   "userActivityLogLevel": "Information",
   "userActivityLogMaxExceptionDepth": 1,

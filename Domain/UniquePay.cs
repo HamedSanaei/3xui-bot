@@ -800,6 +800,7 @@ public sealed class UniquePay
     /// <returns>Deserialized response with its raw JSON attached for protected diagnostics.</returns>
     /// <exception cref="InvalidOperationException">Thrown when token or base URL is absent.</exception>
     /// <exception cref="UniquePayApiException">Thrown after a provider rejection, malformed response, or exhausted retry.</exception>
+    /// <remarks>The complete existing awaited provider operation, including inquiry retries/backoff, is attributed to payment_gateway. No invoice body, bearer token, hash, financial settlement, balance, or retry policy is changed or recorded.</remarks>
     private async Task<T> SendFormAsync<T>(
         string relativePath,
         IReadOnlyDictionary<string, string> fields,
@@ -807,6 +808,7 @@ public sealed class UniquePay
         CancellationToken cancellationToken)
         where T : UniquePayResponseBase
     {
+        using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
         if (string.IsNullOrWhiteSpace(_configuration.UniquePayBusinessToken))
             throw new InvalidOperationException("UniquePay business token is not configured.");
         if (_httpClient.BaseAddress == null)

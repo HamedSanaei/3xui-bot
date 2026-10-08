@@ -50,12 +50,14 @@ sync_source() {
   local live_root="$2"
   rsync -a --delete --checksum \
     --filter='P bin/Release/net10.0/linux-x64/publish/Data/***' \
+    --filter='P Data/Telemetry/***' \
     --exclude='.git/' \
     --exclude='bin/' \
     --exclude='obj/' \
     --exclude='Adminbot.Tests/bin/' \
     --exclude='Adminbot.Tests/obj/' \
     --exclude='Data/configuration.json' \
+    --exclude='Data/Telemetry/' \
     --exclude='*.db' --exclude='*.db-*' \
     "$source_dir/" "$live_root/"
 }

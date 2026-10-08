@@ -227,6 +227,9 @@ public class UserActivityLogService
     /// <param name="isSuperAdmin">Whether the related user is a super admin.</param>
     /// <param name="details">Optional structured details that are compacted before writing.</param>
     /// <param name="cancellationToken">Cancellation token for file writing.</param>
+    /// <returns>A task completing after the unchanged best-effort append or configured filtering.</returns>
+    /// <remarks>The existing activity-file mutex and append are separately timed as lock_wait and business_processing.
+    /// Only durations and fixed stage names enter latency telemetry, never this audit entry or its customer details.</remarks>
     private async Task WriteAsync(
         UserActivityLogLevel level,
         string eventName,
@@ -264,8 +267,10 @@ public class UserActivityLogService
 
         try
         {
-            await _writeLock.WaitAsync(cancellationToken);
+            using (TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.LockWait) ?? default)
+                await _writeLock.WaitAsync(cancellationToken);
             lockTaken = true;
+            using var appendTiming = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.BusinessProcessing) ?? default;
             Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
 
             var encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);

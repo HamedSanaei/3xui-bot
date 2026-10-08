@@ -105,6 +105,8 @@ public class ApiService
     /// are logged and converted to <c>null</c> so Telegram update handlers do not crash.
     /// TLS negotiation is delegated to <see cref="HttpClient" /> and the operating system so obsolete global
     /// <see cref="ServicePointManager" /> settings cannot weaken or misrepresent the connection policy.
+    /// Only the actual awaited login HTTP boundary is attributed to xui_read; local cookie persistence is excluded.
+    /// Telemetry never retains server URLs, cookies, credentials, or provider response data.
     /// </remarks>
     public static async Task<string> LoginAndGetSessionCookie(ServerInfo serverInfo)
 
@@ -146,7 +148,9 @@ public class ApiService
                 // valid nist 
                 // Set the base address of your API
                 httpClient.BaseAddress = baseUri;
+                using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
                 HttpResponseMessage response = await httpClient.PostAsJsonAsync(BuildPanelRoute(rootPath, "login"), loginData);
+                latency.Dispose();
 
                 if (response.IsSuccessStatusCode)
                 {
@@ -218,6 +222,7 @@ public class ApiService
     /// <returns><c>true</c> when the panel accepts the cookie; otherwise <c>false</c>.</returns>
     /// <remarks>
     /// Any malformed URL, empty cookie, HTTP failure, or exception is treated as an invalid cache entry.
+    /// Only the awaited panel probe is attributed to xui_read; no cookies or endpoint metadata are recorded.
     /// </remarks>
     private static async Task<bool> IsCookieValid(ServerInfo serverInfo, string cookie)
     {
@@ -248,7 +253,9 @@ public class ApiService
         try
         {
             var route = new Uri(baseUri, BuildPanelRoute(serverInfo.RootPath, "panel/api/inbounds/list"));
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
             HttpResponseMessage response = await httpClient.GetAsync(route);
+            latency.Dispose();
             if (response.IsSuccessStatusCode)
             {
                 return true;
@@ -301,7 +308,8 @@ public class ApiService
     /// <param name="accountDto">Required private panel request and global Telegram owner; never log its authentication cookie.</param>
     /// <returns>True for proven creation and saved state; false for a handled panel/HTTP failure.</returns>
     /// <remarks>Panel I/O is outside SQLite writes. VMess templates are copied before customer-specific mutation.
-    /// Legacy HTTP uses its request timeout; interrupted scheduler executions must be reviewed, never replayed wholesale.</remarks>
+    /// Legacy HTTP uses its request timeout; interrupted scheduler executions must be reviewed, never replayed wholesale.
+    /// Only the actual awaited HTTP/response parsing boundary is attributed to xui_write; subsequent state persistence is excluded and credentials are never telemetry.</remarks>
     public static async Task<bool> CreateUserAccount(AccountDto accountDto)
     {
         string sessionCookie = accountDto.SessionCookie;
@@ -356,9 +364,11 @@ public class ApiService
         try
         {
             // Send the POST request with the JSON body
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiMutation) ?? default;
             HttpResponseMessage response = await httpClient.PostAsJsonAsync(apiUrl, requestBody);
             string responseBody = await response.Content.ReadAsStringAsync();
             AddClientResult result = JsonConvert.DeserializeObject<AddClientResult>(responseBody);
+            latency.Dispose();
 
 
             // Check if the request was successful
@@ -410,7 +420,7 @@ public class ApiService
     /// <summary>Updates a legacy v2 account and stores the resulting delivery state for the active bot.</summary>
     /// <param name="accountDto">Required private panel request, current client, and Telegram owner; do not log cookies or links.</param>
     /// <returns>True when the panel update and state persistence succeed; false for handled transport failures.</returns>
-    /// <remarks>Uses a private VMess template copy and short factory-backed state writes after HTTP completes.</remarks>
+    /// <remarks>Uses a private VMess template copy and short factory-backed state writes after HTTP completes. Only awaited HTTP/response parsing is attributed to xui_write, not the subsequent state writes; no account or credential metadata is recorded.</remarks>
     public static async Task<bool> UpdateUserAccount(AccountDtoUpdate accountDto)
     {
         string sessionCookie = accountDto.SessionCookie;
@@ -451,9 +461,11 @@ public class ApiService
         try
         {
             // Send the POST request with the JSON body
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiMutation) ?? default;
             HttpResponseMessage response = await httpClient.PostAsJsonAsync(apiUrl, requestBody);
             string responseBody = await response.Content.ReadAsStringAsync();
             AddClientResult result = JsonConvert.DeserializeObject<AddClientResult>(responseBody);
+            latency.Dispose();
 
 
             // Check if the request was successful
@@ -587,7 +599,7 @@ public class ApiService
     /// <param name="email">Required exact private panel account email; do not expose another customer's configuration.</param>
     /// <param name="tgUserId">Global Telegram owner id whose bot-scoped conversation receives the result.</param>
     /// <returns>The matching client and configured country tag; the client may be null when no panel contains it.</returns>
-    /// <remarks>Each panel request completes before state persistence. Mutable protocol templates are copied per result.</remarks>
+    /// <remarks>Each panel request completes before state persistence. Mutable protocol templates are copied per result. Only each awaited HTTP/response parsing boundary is attributed to xui_read; client emails, identifiers, endpoints, and delivery snapshots are never telemetry.</remarks>
     public static async Task<(ClientExtend ClientExtend, string SelectedCountry)> FetchClientByEmail(string email, long tgUserId)
     {
 
@@ -634,6 +646,7 @@ public class ApiService
                     try
                     {
                         // Send the Get request 
+                        using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
                         HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
                         string responseBody = await response.Content.ReadAsStringAsync();
                         result = JsonConvert.DeserializeObject<InboundState>(responseBody);
@@ -665,6 +678,7 @@ public class ApiService
                     try
                     {
                         // Send the Get request 
+                        using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
                         HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
                         string responseBody = await response.Content.ReadAsStringAsync();
                         clientState = JsonConvert.DeserializeObject<ClientState>(responseBody);
@@ -716,6 +730,13 @@ public class ApiService
         return (ClientExtend: null, SelectedCountry: null);
     }
 
+    /// <summary>Reads one legacy panel account and its traffic snapshot by exact private client id.</summary>
+    /// <param name="id">Private panel client UUID; never diagnostic metadata.</param>
+    /// <param name="serverInfo">Existing panel descriptor with private credentials and endpoint.</param>
+    /// <param name="inboundId">Panel-local inbound id from the existing account selection.</param>
+    /// <returns>The detached existing client snapshot, or null if an existing panel read fails or does not find it.</returns>
+    /// <remarks>Only individual awaited HTTP/response parsing boundaries use xui_read. Ownership checks, login handling, timeouts, and retries remain unchanged; account data is never telemetry.</remarks>
+    /// <exception cref="Exception">The existing panel login fails.</exception>
     public static async Task<ClientExtend> FetchClientFromServer(Guid id, ServerInfo serverInfo, int inboundId)
     {
         Client findedClient = null;
@@ -747,6 +768,7 @@ public class ApiService
         try
         {
             // Send the Get request 
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
             HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
             string responseBody = await response.Content.ReadAsStringAsync();
             result = JsonConvert.DeserializeObject<InboundState>(responseBody);
@@ -777,6 +799,7 @@ public class ApiService
         try
         {
             // Send the Get request 
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
             HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
             string responseBody = await response.Content.ReadAsStringAsync();
             clientState = JsonConvert.DeserializeObject<ClientState>(responseBody);
@@ -808,6 +831,13 @@ public class ApiService
 
     }
 
+    /// <summary>Reads the existing owner's legacy accounts and their panel traffic snapshots.</summary>
+    /// <param name="telegramUserId">Existing global Telegram account owner used only by the unchanged ownership filter, never telemetry.</param>
+    /// <param name="serverInfo">Existing private panel configuration and login descriptor.</param>
+    /// <param name="inboundId">Existing panel-local inbound id to inspect.</param>
+    /// <returns>The original detached account list, possibly empty or null on an existing handled read failure.</returns>
+    /// <remarks>Each actual awaited HTTP/response parsing boundary uses xui_read; login, ownership, timeout, and retry behavior stay unchanged.</remarks>
+    /// <exception cref="Exception">The existing panel login fails.</exception>
     public static async Task<List<ClientExtend>> FetchAllClientFromServer(long telegramUserId, ServerInfo serverInfo, int inboundId)
     {
 
@@ -842,6 +872,7 @@ public class ApiService
         try
         {
             // Send the Get request 
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
             HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
             string responseBody = await response.Content.ReadAsStringAsync();
             result = JsonConvert.DeserializeObject<InboundState>(responseBody);
@@ -879,6 +910,7 @@ public class ApiService
             try
             {
                 // Send the Get request 
+                using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiRead) ?? default;
                 HttpResponseMessage response = await httpClient.GetAsync(inboundstateUrl);
                 string responseBody = await response.Content.ReadAsStringAsync();
                 clientState = JsonConvert.DeserializeObject<ClientState>(responseBody);
@@ -952,6 +984,12 @@ public class ApiService
         }
     }
 
+    /// <summary>Applies the existing activation change to a legacy account after its unchanged owner check.</summary>
+    /// <param name="email">Existing private panel account email, never diagnostic metadata.</param>
+    /// <param name="telegramUserId">Existing global account owner checked before the panel mutation.</param>
+    /// <param name="enable">Existing requested activation state, passed unchanged.</param>
+    /// <returns>True for the original proven panel success; false for existing lookup, ownership, or handled transport failure.</returns>
+    /// <remarks>Only awaited mutation HTTP/response parsing is attributed to xui_write. No ownership, financial, activation, retry, or timeout behavior changes.</remarks>
     internal static async Task<bool> AccountActivating(string email, long telegramUserId, bool enable)
     {
         var res = await FetchClientByEmail(email, telegramUserId);
@@ -1010,9 +1048,11 @@ public class ApiService
         try
         {
             // Send the POST request with the JSON body
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiMutation) ?? default;
             HttpResponseMessage response = await httpClient.PostAsJsonAsync(apiUrl, requestBody);
             string responseBody = await response.Content.ReadAsStringAsync();
             AddClientResult result = JsonConvert.DeserializeObject<AddClientResult>(responseBody);
+            latency.Dispose();
 
 
             // Check if the request was successful

@@ -1,5 +1,6 @@
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
+using Adminbot.Services.Telemetry;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
@@ -8,6 +9,7 @@ using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 using System.Globalization;
 using System.Net;
+using System.Net.Http;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
@@ -319,22 +321,40 @@ public sealed class BotTransportUnavailableException : InvalidOperationException
 /// Runtime delivery refuses disabled tenants. An explicitly owner-authorized activation capability probe can resolve
 /// the exact disabled tenant's transport without enabling its storefront or registering a receiver.
 /// </remarks>
-public class BotClientProvider
+public class BotClientProvider : IDisposable
 {
     private readonly BotRegistry _registry;
     /// <summary>Creates a fresh client after first use or explicit invalidation without changing cache semantics.</summary>
     private readonly Func<BotInstanceConfig, ITelegramBotClient> _clientFactory;
+    /// <summary>Provider-owned socket pool preserving the SDK's three-minute pooled connection lifetime.</summary>
+    private readonly SocketsHttpHandler _transport = new() { PooledConnectionLifetime = TimeSpan.FromMinutes(3) };
+    /// <summary>Optional shared writer; transport observations never perform I/O on the caller.</summary>
+    private readonly LatencyTelemetryService _telemetry;
+    /// <summary>Gets metadata-only health for this provider's active receivers across every bot family.</summary>
+    public TelegramPollingTelemetryTracker PollingTelemetry { get; }
+    /// <summary>Gets whether runtime provenance should be allocated for the shared enabled writer.</summary>
+    internal bool IsTelemetryEnabled => _telemetry?.Enabled == true && !LatencyTelemetrySuppression.IsActive;
     private readonly Dictionary<string, ITelegramBotClient> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _syncRoot = new();
 
     /// <summary>
-    /// Creates a provider bound to the shared BotRegistry.
+    /// Creates a provider bound to the shared BotRegistry and a single pooled socket transport.
     /// </summary>
-    /// <param name="registry">Runtime bot registry.</param>
-    /// <remarks>Disables v22 automatic rate-limit retries so the application's existing delivery/recovery policy remains authoritative.</remarks>
-    public BotClientProvider(BotRegistry registry)
-        : this(registry, bot => new TelegramBotClient(new TelegramBotClientOptions(bot.Token) { RetryCount = 0 }))
+    /// <param name="registry">Shared registry of canonical internal bot ids and current bot tokens.</param>
+    /// <param name="telemetry">Optional shared nonblocking telemetry writer; null preserves existing direct-constructor callers.</param>
+    /// <remarks>
+    /// Disables v22 automatic rate-limit retries so existing application policy remains authoritative.
+    /// HttpClient is created once per cached bot, never per request. The shared socket pool has the SDK's
+    /// three-minute connection lifetime; no timeout, TLS, DNS, proxy or retry policy is changed.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">The registry is null.</exception>
+    /// <example><code>var provider = new BotClientProvider(registry, telemetry);</code></example>
+    public BotClientProvider(BotRegistry registry, LatencyTelemetryService telemetry = null)
     {
+        _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+        _telemetry = telemetry;
+        PollingTelemetry = new TelegramPollingTelemetryTracker(telemetry);
+        _clientFactory = CreateClient;
     }
 
     /// <summary>
@@ -356,6 +376,22 @@ public class BotClientProvider
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _clientFactory = clientFactory ?? throw new ArgumentNullException(nameof(clientFactory));
+        PollingTelemetry = new TelegramPollingTelemetryTracker();
+    }
+
+    /// <summary>Creates one cached v22 SDK client over the provider-owned shared socket pool.</summary>
+    /// <param name="bot">Resolved canonical bot configuration; its token is used only by the SDK.</param>
+    /// <returns>A client whose lifetime remains shared with receivers and background delivery.</returns>
+    /// <remarks>
+    /// The lightweight handler is not disposed on invalidation: doing so could cancel already admitted
+    /// background sends. It owns no socket resources; the provider disposes the shared pool at host shutdown.
+    /// </remarks>
+    /// <example><code>var client = CreateClient(bot);</code></example>
+    private ITelegramBotClient CreateClient(BotInstanceConfig bot)
+    {
+        var httpClient = new HttpClient(new TelegramTelemetryHttpHandler(bot.Id, _telemetry, _transport), disposeHandler: false);
+        return new TelegramTelemetryBotClient(new TelegramBotClientOptions(bot.Token) { RetryCount = 0 },
+            httpClient, bot.Id, _telemetry, PollingTelemetry);
     }
 
     /// <summary>
@@ -463,6 +499,7 @@ public class BotClientProvider
     /// Removes a cached client so a changed token will be used on the next request.
     /// </summary>
     /// <param name="botId">BotId whose client should be recreated.</param>
+    /// <remarks>Active receiver telemetry is removed. Existing in-flight sends keep their original transport; only the next lookup recreates the cached SDK client.</remarks>
     public void Invalidate(string botId)
     {
         if (string.IsNullOrWhiteSpace(botId))
@@ -470,7 +507,12 @@ public class BotClientProvider
 
         lock (_syncRoot)
             _clients.Remove(botId);
+        PollingTelemetry.Stopped(botId);
     }
+
+    /// <summary>Releases the shared socket pool when the application service provider is disposed.</summary>
+    /// <remarks>Client invalidation never calls this method, so rotating one bot cannot cancel another bot's admitted sends.</remarks>
+    public void Dispose() => _transport.Dispose();
 }
 
 /// <summary>
@@ -765,6 +807,10 @@ public class MultiBotHostedService : IHostedService
     private readonly BotContextAccessor _botContextAccessor;
     private readonly BotRuntimeStatusStore _runtimeStatusStore;
     private readonly ILogger<MultiBotHostedService> _logger;
+    /// <summary>Optional per-update receiver timeline tracker, shared with scheduler admission.</summary>
+    private readonly UpdateTelemetryTracker _updateTelemetry;
+    /// <summary>Optional writer used for an unpersisted admin-control handler measurement scope.</summary>
+    private readonly LatencyTelemetryService _telemetry;
     private readonly TimeSpan _startupProbeTimeout;
     private CancellationTokenSource _receivingCts;
     private readonly Dictionary<string, CancellationTokenSource> _botReceivers = new(StringComparer.OrdinalIgnoreCase);
@@ -819,6 +865,8 @@ public class MultiBotHostedService : IHostedService
     /// through <paramref name="registry" /> and are never read or logged by this constructor.
     /// </param>
     /// <param name="logger">Logger for receiver lifecycle events.</param>
+    /// <param name="telemetry">Optional shared writer for unpersisted admin-control scopes; transport clients use the provider's same writer.</param>
+    /// <param name="updateTelemetry">Optional per-update receiver tracker; null preserves existing direct-constructor callers.</param>
     /// <remarks>The host tracks receiver, initialization, and recovery lifetimes; each replacement waits for the previous receiver generation to terminate.</remarks>
     public MultiBotHostedService(
         BotRegistry registry,
@@ -828,7 +876,9 @@ public class MultiBotHostedService : IHostedService
         BotContextAccessor botContextAccessor,
         BotRuntimeStatusStore runtimeStatusStore,
         IConfiguration configuration,
-        ILogger<MultiBotHostedService> logger)
+        ILogger<MultiBotHostedService> logger,
+        LatencyTelemetryService telemetry = null,
+        UpdateTelemetryTracker updateTelemetry = null)
     {
         _registry = registry;
         _clientProvider = clientProvider;
@@ -836,6 +886,8 @@ public class MultiBotHostedService : IHostedService
         _scopeFactory = scopeFactory;
         _botContextAccessor = botContextAccessor;
         _runtimeStatusStore = runtimeStatusStore;
+        _updateTelemetry = updateTelemetry;
+        _telemetry = telemetry;
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         _startupProbeTimeout = TimeSpan.FromSeconds(Math.Clamp(appConfig.TelegramBotStartupProbeTimeoutSeconds, 5, 60));
         _logger = logger;
@@ -970,6 +1022,9 @@ public class MultiBotHostedService : IHostedService
     /// duplicate-token protection chooses another bot. Webhook preflight must succeed before registration; only a
     /// transient <c>getMe</c> failure may use optimistic registration. Command setup and identity refresh continue in
     /// the background.
+    /// Startup/receiver health and update reception emit only nonblocking metadata. Each update opens its
+    /// receiver timeline before the bounded admin control path or durable admission; control-path completion
+    /// is explicit and never creates a durable inbox receipt. SDK-validated polls own health recovery.
     /// </remarks>
     private async Task<BotStartupResult> StartBotCoreAsync(string botId, CancellationToken cancellationToken = default)
     {
@@ -1020,6 +1075,7 @@ public class MultiBotHostedService : IHostedService
         CancellationTokenSource botCts = null;
         try
         {
+            _clientProvider.PollingTelemetry.Startup(bot.Id, "starting");
             // Each bot receives with its own token but dispatches through the shared TelegramBotService.
             var parentToken = _receivingCts?.Token ?? cancellationToken;
             botCts = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
@@ -1032,6 +1088,8 @@ public class MultiBotHostedService : IHostedService
             try
             {
                 using var probeCts = CreateStartupProbeCancellation(cancellationToken);
+                using var probeMetadata = _clientProvider.IsTelemetryEnabled ?
+                    TelegramRequestCancellationScope.PushStartupProbe(cancellationToken, probeCts.Token) : null;
                 me = await client.GetMe(probeCts.Token);
             }
             catch (Exception ex) when (IsTelegramTransientStartupError(ex))
@@ -1051,15 +1109,33 @@ public class MultiBotHostedService : IHostedService
             lock (_syncRoot) _receiverTasks.TryGetValue(bot.Id, out previousReceiver);
             await TelegramReceiverLifetime.ObservePreviousAsync(previousReceiver, cancellationToken);
 
+            var receiverGeneration = _clientProvider.PollingTelemetry.Started(bot.Id);
             var receiverTask = client.ReceiveAsync(
                 updateHandler: async (_, update, token) =>
                 {
+                    using var received = _updateTelemetry?.Receive(bot.Id, update.Id, update.Type.ToString());
+                    _clientProvider.PollingTelemetry.ReceivedUpdate(bot.Id);
                     // The tracked receiver owns this bounded super-admin control path, which must remain usable
                     // when durable customer capacity is full. It never replays a terminal handler receipt.
-                    var admin = _scopeFactory.CreateScope();
-                    using (admin)
-                        if (await admin.ServiceProvider.GetRequiredService<TelegramInboxAdminService>()
-                            .TryHandleAsync(bot.Id, client, update, token)) return;
+                    var adminLatency = _telemetry?.Enabled == true ? TelegramUpdateLatencyScope.Push(
+                        0, bot.Id, update.Id, TimeSpan.FromSeconds(2), null,
+                        telemetry: _telemetry, traceId: received?.TraceId) : null;
+                    bool handled;
+                    try
+                    {
+                        using var admin = _scopeFactory.CreateScope();
+                        handled = await admin.ServiceProvider.GetRequiredService<TelegramInboxAdminService>()
+                            .TryHandleAsync(bot.Id, client, update, token);
+                    }
+                    finally
+                    {
+                        adminLatency?.Dispose();
+                    }
+                    if (handled)
+                    {
+                        received?.CompleteControlPath(adminLatency?.CaptureTelemetry());
+                        return;
+                    }
                     await _scheduler.EnqueueAsync(bot.Id, update, token);
                 },
                 errorHandler: (_, exception, token) => HandleBotPollingErrorAsync(bot.Id, exception, token),
@@ -1071,6 +1147,8 @@ public class MultiBotHostedService : IHostedService
 
             lock (_syncRoot) _receiverTasks[bot.Id] = receiverTask;
             TrackBackgroundTask(receiverTask);
+            receiverTask.GetAwaiter().OnCompleted(() => _clientProvider.PollingTelemetry.Stopped(bot.Id, receiverGeneration));
+            _clientProvider.PollingTelemetry.Startup(bot.Id, "completed");
 
             lock (_syncRoot)
                 _botReceivers[bot.Id] = botCts;
@@ -1110,6 +1188,7 @@ public class MultiBotHostedService : IHostedService
         }
         catch (Exception ex)
         {
+            _clientProvider.PollingTelemetry.Startup(bot.Id, "failed", ex);
             // If a post-registration log/status action throws, remove only this exact CTS. A newer receiver
             // generation must never be removed by cleanup from an older failed start attempt.
             lock (_syncRoot)
@@ -1188,6 +1267,7 @@ public class MultiBotHostedService : IHostedService
     /// active webhook, it calls <c>deleteWebhook</c> with <c>dropPendingUpdates=false</c> and performs a second read-only
     /// probe. Any probe, delete, or verification failure prevents <c>StartReceiving</c>; the existing serialized
     /// startup recovery can then retry without creating two receivers for the same bot.
+    /// Probe deadlines publish cancellation provenance only; diagnostic code never inspects or retains the webhook URL.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// Thrown when Telegram still reports an active webhook after the delete operation completes.
@@ -1198,6 +1278,8 @@ public class MultiBotHostedService : IHostedService
         CancellationToken cancellationToken)
     {
         using var initialProbeCts = CreateStartupProbeCancellation(cancellationToken);
+        using var initialMetadata = _clientProvider.IsTelemetryEnabled ?
+            TelegramRequestCancellationScope.PushStartupProbe(cancellationToken, initialProbeCts.Token) : null;
         var webhookInfo = await client.GetWebhookInfo(initialProbeCts.Token);
         if (string.IsNullOrWhiteSpace(webhookInfo?.Url))
             return;
@@ -1208,11 +1290,15 @@ public class MultiBotHostedService : IHostedService
             bot.Type);
 
         using var deleteCts = CreateStartupProbeCancellation(cancellationToken);
+        using var deleteMetadata = _clientProvider.IsTelemetryEnabled ?
+            TelegramRequestCancellationScope.PushStartupProbe(cancellationToken, deleteCts.Token) : null;
         await client.DeleteWebhook(
             dropPendingUpdates: false,
             cancellationToken: deleteCts.Token);
 
         using var verificationCts = CreateStartupProbeCancellation(cancellationToken);
+        using var verificationMetadata = _clientProvider.IsTelemetryEnabled ?
+            TelegramRequestCancellationScope.PushStartupProbe(cancellationToken, verificationCts.Token) : null;
         var verified = await client.GetWebhookInfo(verificationCts.Token);
         if (!string.IsNullOrWhiteSpace(verified?.Url))
             throw new InvalidOperationException("Telegram still reports an active webhook after deletion.");
@@ -1232,6 +1318,8 @@ public class MultiBotHostedService : IHostedService
     /// This operation never creates a receiver. Transient failures preserve the existing receiver and mark it
     /// degraded; a definitive invalid tenant token is routed through the serialized cleanup path. No token or API
     /// secret is written to logs.
+    /// Existing bounded probes publish startup-deadline provenance, so telemetry does not label a local
+    /// initialization deadline as host cancellation. The configured budgets and retry sequence are unchanged.
     /// </remarks>
     private async Task CompleteBotInitializationAsync(
         string botId,
@@ -1258,6 +1346,8 @@ public class MultiBotHostedService : IHostedService
             {
                 var client = _clientProvider.GetClient(bot.Id);
                 using var probeCts = CreateStartupProbeCancellation(cancellationToken);
+                using var probeMetadata = _clientProvider.IsTelemetryEnabled ?
+                    TelegramRequestCancellationScope.PushStartupProbe(cancellationToken, probeCts.Token) : null;
                 var me = await client.GetMe(probeCts.Token);
                 await ConfigureBotCommandsAsync(client, bot, probeCts.Token);
 
@@ -1370,6 +1460,8 @@ public class MultiBotHostedService : IHostedService
 
                 attempt++;
                 var delay = CalculateStartupRecoveryDelay(attempt);
+                foreach (var bot in missingBots)
+                    _clientProvider.PollingTelemetry.Backoff(bot.Id, delay, "startup_recovery");
                 await Task.Delay(delay, cancellationToken);
 
                 foreach (var bot in missingBots)
@@ -1534,6 +1626,8 @@ public class MultiBotHostedService : IHostedService
     /// getUpdates conflict means another process or receiver is already polling the same token; this receiver is
     /// stopped to prevent noisy conflict loops. Telegram's distinct "webhook is active" conflict schedules one
     /// bot-scoped recovery generation, which clears the webhook through the startup guard before polling resumes.
+    /// Telemetry reports the policy-selected backoff without changing it; telemetry's degraded window resets
+    /// only after a fully validated successful poll, independently of the existing operational backoff counter.
     /// </remarks>
     private async Task HandleBotPollingErrorAsync(string botId, Exception exception, CancellationToken cancellationToken)
     {
@@ -1548,6 +1642,7 @@ public class MultiBotHostedService : IHostedService
             _transientPollingBackoff.RecordHealthyPolling(botId);
 
             var retryDelay = TelegramRateLimitPolicy.GetRetryDelay(exception);
+            _clientProvider.PollingTelemetry.Backoff(botId, retryDelay, "rate_limit");
             _logger.LogDebug(
                 "Telegram polling rate limited; pausing this receiver before the next getUpdates call. botId={BotId}, retryAfterSeconds={RetryAfterSeconds}",
                 botId,
@@ -1584,6 +1679,7 @@ public class MultiBotHostedService : IHostedService
             // storm. The decision is computed quickly under the tracker's short per-bot lock and the delay is awaited
             // afterwards with no registry, lifecycle, or database lock held.
             var decision = _transientPollingBackoff.RegisterTransientFailure(botId);
+            _clientProvider.PollingTelemetry.Backoff(botId, decision.Delay, "transient_gateway");
 
             if (decision.ShouldLogOperational)
             {
@@ -1767,6 +1863,7 @@ public class MultiBotHostedService : IHostedService
             }
 
             var delay = CalculateStartupRecoveryDelay(attempt);
+            _clientProvider.PollingTelemetry.Backoff(botId, delay, "webhook_recovery");
             _logger.LogInformation(
                 "Telegram webhook-conflict receiver remains offline after a transient preflight failure; retry is scheduled. botId={BotId}, botType={BotType}, attempt={Attempt}, delaySeconds={DelaySeconds}",
                 botId,
@@ -2386,6 +2483,7 @@ public class MultiBotHostedService : IHostedService
     /// <remarks>
     /// Callers must hold the bot lifecycle gate, except host shutdown after the shared parent token has already been
     /// cancelled. This helper never touches another bot's CTS.
+    /// Receiver health metadata is emitted once and removed so stopped historical bot ids do not accumulate.
     /// </remarks>
     private bool StopBotCore(string botId, string reason)
     {
@@ -2402,6 +2500,7 @@ public class MultiBotHostedService : IHostedService
         // Receiver lifecycle ended: drop this bot's transient backoff state so a later, unrelated incident starts again
         // at the first step and so historical tenant bot ids cannot accumulate unbounded in-memory state.
         _transientPollingBackoff.Remove(botId);
+        _clientProvider.PollingTelemetry.Stopped(botId);
 
         cts.Cancel();
         cts.Dispose();
@@ -2426,6 +2525,8 @@ public class MultiBotHostedService : IHostedService
                 receiver.Value.Cancel();
                 receiver.Value.Dispose();
                 _runtimeStatusStore.MarkStopped(receiver.Key, "host shutdown");
+                _clientProvider.PollingTelemetry.Stopped(receiver.Key);
+                _transientPollingBackoff.Remove(receiver.Key);
             }
             _botReceivers.Clear();
         }

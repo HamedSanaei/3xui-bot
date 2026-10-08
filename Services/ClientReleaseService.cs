@@ -213,11 +213,13 @@ public sealed class ClientReleaseService : IClientReleaseService
     /// <returns>A successful resolution, or a failure carrying a stable reason code.</returns>
     /// <exception cref="JsonException">The response body is not a JSON object and could not be parsed.</exception>
     /// <exception cref="HttpRequestException">The provider request failed at the transport level.</exception>
+    /// <remarks>The logical awaited fetch is attributed to external_http when an update scope exists; repository URLs and response data are not telemetry. Cache and timeout behavior remain unchanged.</remarks>
     private async Task<ClientReleaseResolution> FetchLatestAsync(
         string repository,
         ClientDownloadPlatform platform,
         CancellationToken cancellationToken)
     {
+        using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ExternalHttp) ?? default;
         using var request = new HttpRequestMessage(
             HttpMethod.Get,
             $"https://api.github.com/repos/{repository}/releases/latest");

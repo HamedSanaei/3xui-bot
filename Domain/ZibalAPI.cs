@@ -18,7 +18,14 @@ namespace Adminbot.Domain
             _appConfig = configuration.Get<AppConfig>();
         }
 
-        //post
+        /// <summary>Creates the existing Zibal payment request without changing amount or invoice admission.</summary>
+        /// <param name="amount">Existing provider invoice amount in Iranian rial; passed unchanged.</param>
+        /// <param name="callbackUrl">Existing callback URL sent only to Zibal, never telemetry metadata.</param>
+        /// <param name="merchantId">Existing merchant credential, never diagnostic metadata.</param>
+        /// <param name="description">Existing provider description, never diagnostic metadata.</param>
+        /// <returns>Original provider creation response; callers retain existing validation and settlement responsibility.</returns>
+        /// <remarks>Only the awaited HTTP/response parsing boundary uses payment_gateway; no balance, ledger, retry, or financial authorization changes.</remarks>
+        /// <example><code>var invoice = await ZibalAPI.SendPaymentRequest(1000000, "https://example.invalid/payment/callback", "example-merchant");</code></example>
         public static async Task<PaymentRequestResponse> SendPaymentRequest(long amount, string callbackUrl, string merchantId = "zibal", string description = "توضیحات")
         {
             var paymentRequest = new PaymentRequest
@@ -34,6 +41,7 @@ namespace Adminbot.Domain
 
             using (var client = new HttpClient())
             {
+                using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
                 var response = await client.PostAsync("https://gateway.zibal.ir/v1/request", data);
                 string result = await response.Content.ReadAsStringAsync();
                 var paymentResponse = JsonConvert.DeserializeObject<PaymentRequestResponse>(result);
@@ -45,6 +53,12 @@ namespace Adminbot.Domain
             return $"https://gateway.zibal.ir/start/{payment.TrackId}";
         }
 
+        /// <summary>Performs the existing Zibal verification for the supplied provider track id.</summary>
+        /// <param name="trId">Existing provider track id, never retained by latency diagnostics.</param>
+        /// <param name="merchantId">Existing merchant credential sent only to the provider.</param>
+        /// <returns>Original verification response; callers retain existing idempotent settlement rules.</returns>
+        /// <remarks>Only awaited provider wall time is attributed to payment_gateway. No payment amount, proof validation, balance, timeout, or retry behavior changes.</remarks>
+        /// <example><code>var proof = await ZibalAPI.Verify(123456, "example-merchant"); // Validate proof before existing idempotent settlement.</code></example>
         public static async Task<PaymentVerificationResponse> Verify(long trId, string merchantId = "zibal")
         {
             var paymentVerify = new
@@ -58,6 +72,7 @@ namespace Adminbot.Domain
 
             using (var client = new HttpClient())
             {
+                using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
                 var response = await client.PostAsync("https://gateway.zibal.ir/v1/verify", data);
                 string result = await response.Content.ReadAsStringAsync();
                 var paymentverificationResponse = JsonConvert.DeserializeObject<PaymentVerificationResponse>(result);
@@ -133,7 +148,12 @@ namespace Adminbot.Domain
             return msg;
         }
 
-        //estelam pardakht
+        /// <summary>Reads the existing Zibal payment status without introducing payment retries or settlement.</summary>
+        /// <param name="trId">Existing provider track id, never retained by telemetry.</param>
+        /// <param name="merchantId">Existing provider merchant credential, never diagnostic metadata.</param>
+        /// <returns>Original inquiry response for the caller's unchanged proof and settlement handling.</returns>
+        /// <remarks>Awaited HTTP and response parsing use payment_gateway; no amount, balance, ledger, cancellation, or transport policy changes.</remarks>
+        /// <example><code>var status = await ZibalAPI.Inquiry(123456, "example-merchant"); // Inquiry never settles a payment itself.</code></example>
         public static async Task<InquiryResponse> Inquiry(long trId, string merchantId = "zibal")
         {
 
@@ -148,6 +168,7 @@ namespace Adminbot.Domain
 
             using (var client = new HttpClient())
             {
+                using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
                 var response = await client.PostAsync("https://gateway.zibal.ir/v1/inquiry", data);
                 string result = await response.Content.ReadAsStringAsync();
                 var inquiryResponse = JsonConvert.DeserializeObject<InquiryResponse>(result);

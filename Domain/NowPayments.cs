@@ -510,6 +510,17 @@ namespace Adminbot.Domain
             };
         }
 
+        /// <summary>Sends the existing authenticated NOWPayments operation and parses its response.</summary>
+        /// <typeparam name="T">Existing provider response DTO type.</typeparam>
+        /// <param name="method">Existing provider HTTP verb.</param>
+        /// <param name="relativeUrl">Provider-relative route; ids, queries, and URLs are never telemetry metadata.</param>
+        /// <param name="body">Optional existing request body, never retained by diagnostics.</param>
+        /// <param name="cancellationToken">Original provider cancellation token.</param>
+        /// <param name="useBearerToken">Existing requirement for configured or acquired JWT authentication.</param>
+        /// <returns>Original parsed provider response, subject to the caller's unchanged payment proof rules.</returns>
+        /// <remarks>Logical awaited wall time, including existing JWT acquisition, uses payment_gateway. No invoice amount, settlement, balance, timeout, retry, credential, or financial behavior changes.</remarks>
+        /// <exception cref="NowPaymentsApiException">Original provider rejection or malformed response.</exception>
+        /// <exception cref="OperationCanceledException">The caller cancels the existing provider request.</exception>
         private async Task<T> SendAsync<T>(
             HttpMethod method,
             string relativeUrl,
@@ -517,6 +528,7 @@ namespace Adminbot.Domain
             CancellationToken cancellationToken,
             bool useBearerToken = false)
         {
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
             if (string.IsNullOrWhiteSpace(_appConfig.NowPaymentApiKey))
                 throw new InvalidOperationException("NOWPayments API key is not configured.");
 
@@ -569,6 +581,12 @@ namespace Adminbot.Domain
             return result;
         }
 
+        /// <summary>Resolves the existing configured/cached JWT or awaits the existing authentication request.</summary>
+        /// <param name="cancellationToken">Original authentication cancellation token.</param>
+        /// <returns>The existing bearer token; callers must never expose it in diagnostics.</returns>
+        /// <remarks>Only an actual authentication HTTP wait is attributed to payment_gateway. Credential selection, caching, timeout, and financial behavior are unchanged.</remarks>
+        /// <exception cref="InvalidOperationException">Existing authentication credentials are absent.</exception>
+        /// <exception cref="NowPaymentsApiException">Original authentication rejection or malformed response.</exception>
         private async Task<string> GetJwtTokenAsync(CancellationToken cancellationToken)
         {
             var configuredToken = NormalizeBearerToken(_appConfig.NowPaymentJwtToken);
@@ -600,6 +618,7 @@ namespace Adminbot.Domain
             using var request = new HttpRequestMessage(HttpMethod.Post, "auth");
             request.Content = new StringContent(requestJson, Encoding.UTF8, "application/json");
 
+            using var latency = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.ProviderRead) ?? default;
             using var response = await _httpClient.SendAsync(request, cancellationToken);
             var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
 

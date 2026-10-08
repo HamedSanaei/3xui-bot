@@ -61,6 +61,10 @@
     <!-- Production Data is shared state and must never be copied into an immutable release artifact. -->
     <Content Update="Data\**" CopyToPublishDirectory="Never" />
     <None Update="Data\**" CopyToPublishDirectory="Never" />
+    <!-- Sensitive operational telemetry must not enter either build output or published application content. -->
+    <Content Remove="Data\Telemetry\**" />
+    <None Remove="Data\Telemetry\**" />
+    <EmbeddedResource Remove="Data\Telemetry\**" />
   </ItemGroup>
 
 </Project>

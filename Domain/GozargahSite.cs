@@ -608,7 +608,9 @@ namespace Adminbot.Domain
         /// Logging rule:
         /// A missing website user during wallet-button eligibility checks is a normal business outcome, not an
         /// operational API failure. Other HTTP and response-shape failures still emit warnings so sync, wallet debit,
-        /// and order lifecycle problems remain visible to operators.
+        /// and order lifecycle problems remain visible to operators. Logical site reads use site_lookup; site
+        /// mutations use external_http. Timings include the existing awaited response and validation, without
+        /// changing wallet debits, mirroring, retries, or transport ceilings.
         /// </remarks>
         private async Task<GozargahSiteApiResponse<T>> SendAsync<T>(object body, CancellationToken cancellationToken)
         {
@@ -618,10 +620,9 @@ namespace Adminbot.Domain
                 throw new InvalidOperationException("GozargahSiteApiKey is not configured.");
 
             var action = GetActionName(body);
-            // Attribute this outbound site lookup to the closed-vocabulary site_lookup stage when it happens inside a
-            // Telegram update lane. Background sync callers run without a latency scope, so the measurement is a no-op
-            // for them. The site base URL and API key are never part of the stage name.
-            using var stageMeasurement = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.SiteLookup) ?? default;
+            // The logical awaited site operation retains only a closed category; action payloads are never metadata.
+            using var stageMeasurement = TelegramUpdateLatencyScope.Current?.Measure(
+                action == "get_user" ? TelegramUpdateStage.SiteLookup : TelegramUpdateStage.ExternalHttp) ?? default;
             using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
             using var request = new HttpRequestMessage(HttpMethod.Post, _appConfig.GozargahSiteApiBaseUrl);
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _appConfig.GozargahSiteApiKey);

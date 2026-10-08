@@ -2,6 +2,7 @@ using System.Net;
 using Adminbot.Domain;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
+using Adminbot.Services.Telemetry;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types.Enums;
@@ -345,8 +346,14 @@ public sealed class TenantStorefrontFundingAlertWorker : BackgroundService
         try { WakeSignal.Release(); } catch (SemaphoreFullException) { }
     }
 
+    /// <summary>Scans existing storefront funding alerts without moving delivery into foreground update lanes.</summary>
+    /// <param name="stoppingToken">Host lifetime cancellation for the existing local scan and background send policy.</param>
+    /// <returns>The worker lifetime task under unchanged lease/retry rules.</returns>
+    /// <remarks>Fixed SQLite telemetry labels identify this worker's contention without tenant ids, wallet values or secrets.
+    /// Existing alert ownership and financial state are unchanged; the label introduces no persistence or network call.</remarks>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var sqliteDiagnostics = LatencySqliteOperationScope.Push(LatencySqliteOperationCategory.TenantStorefrontFundingAlert);
         while (!stoppingToken.IsCancellationRequested)
         {
             try { await ProcessOnceAsync(stoppingToken); }

@@ -2,6 +2,7 @@ using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
+using Adminbot.Services.Telemetry;
 
 /// <summary>
 /// Delivers durable owned-wallet settlement notifications independently of financial settlement.
@@ -73,9 +74,12 @@ public sealed class PaymentSettlementNotificationWorker : BackgroundService
     /// Startup performs no historical backfill and no financial work. It only changes stale outbox processing claims
     /// to delivery-uncertain. A loop-level database failure is logged and retried on the next scan without touching
     /// provider payment or wallet state.
+    /// Fixed payload-free SQLite metadata identifies this worker's read/write contention. No customer, amount or provider
+    /// payload is emitted, and settlement/debit/credit/duplicate-delivery semantics remain unchanged.
     /// </remarks>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var sqliteDiagnostics = LatencySqliteOperationScope.Push(LatencySqliteOperationCategory.PaymentSettlementNotification);
         while (!stoppingToken.IsCancellationRequested)
         {
             try

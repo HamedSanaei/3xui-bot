@@ -16,6 +16,9 @@ namespace Adminbot.Domain
         }
         public List<long> AdminsUserIds { get; set; }
         public List<BotInstanceConfig> Bots { get; set; } = new();
+        /// <summary>Startup-bound, payload-free latency telemetry settings shared by all bot families; missing configuration enables bounded collection.</summary>
+        /// <remarks>Files live beneath the application's persistent Data/Telemetry directory, never in SQLite. Invalid resource bounds are rejected explicitly; filesystem outages fail soft and recover in the writer.</remarks>
+        public Adminbot.Services.Telemetry.LatencyTelemetryOptions LatencyTelemetry { get; set; } = new();
         /// <summary>Maximum storefront rows per colleague, including disabled and reset stores. Must be positive.</summary>
         /// <remarks>Lowering this limit prevents new allocation but never disables or deletes existing stores.</remarks>
         public int TenantMaxStoresPerOwner { get; set; } = 5;

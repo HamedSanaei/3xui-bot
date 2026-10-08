@@ -5,6 +5,7 @@ using System.Diagnostics.Metrics;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Exceptions;
+using Adminbot.Services.Telemetry;
 
 /// <summary>Accepts durable bounded updates independently of handler execution.</summary>
 public interface ITelegramUpdateScheduler
@@ -49,6 +50,10 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     private static readonly Histogram<double> Duration = Meter.CreateHistogram<double>("telegram.update.handler.duration", "ms");
     private static readonly Histogram<int> QueueDepth = Meter.CreateHistogram<int>("telegram.update.queue.depth", "updates");
     private readonly TelegramUpdateInboxStore _store;
+    /// <summary>Nonblocking payload-free event writer, shared by all bot families.</summary>
+    private readonly LatencyTelemetryService _telemetry;
+    /// <summary>Bounded reception clocks transferred at durable claim; never owns scheduler state.</summary>
+    private readonly UpdateTelemetryTracker _timelineTracker;
     /// <summary>Coalesced readiness optimization; the durable ready query remains authoritative.</summary>
     private readonly SemaphoreSlim _wake = new(0, 1);
     private static readonly Counter<long> Wakeups = Meter.CreateCounter<long>("telegram.update.scheduler.wakeups");
@@ -135,11 +140,17 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <param name="executor">Runtime resolution and handler execution boundary.</param>
     /// <param name="config">Application settings: positive concurrency, capacity, and drain duration in seconds.</param>
     /// <param name="logger">Structured logger; update payloads and exception messages are excluded.</param>
-    /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
-    public TelegramUpdateScheduler(TelegramUpdateInboxStore store, ITelegramUpdateExecutor executor, AppConfig config, ILogger<TelegramUpdateScheduler> logger)
+    /// <param name="telemetry">Optional persistent JSONL writer; failure or a full buffer cannot affect scheduling.</param>
+    /// <param name="timelineTracker">Optional bounded metadata tracker connecting receiver admission with claims.</param>
+    /// <remarks>The host owns scheduler lifetime. FIFO, capacity and concurrency are unchanged. Metadata clocks measure admission,
+    /// ready-snapshot dispatch and actual handler boundaries; no telemetry write occurs in users.db.</remarks>
+    public TelegramUpdateScheduler(TelegramUpdateInboxStore store, ITelegramUpdateExecutor executor, AppConfig config,
+        ILogger<TelegramUpdateScheduler> logger, LatencyTelemetryService telemetry = null, UpdateTelemetryTracker timelineTracker = null)
     {
         ValidateConfiguration(config);
         _store = store; _executor = executor; _logger = logger;
+        _telemetry = telemetry;
+        _timelineTracker = timelineTracker;
         _store.ReadyChanged += Wake;
         _concurrency = config.TelegramUpdateMaxConcurrency;
         _capacity = config.TelegramUpdateQueueCapacity;
@@ -176,16 +187,31 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         _loop = RunAsync(_coordinator.Token);
     }
 
-    /// <inheritdoc />
+    /// <summary>Persists one receiver update under existing capacity backpressure while recording admission clocks.</summary>
+    /// <param name="botId">Canonical configured runtime bot id, not a token or user identity.</param>
+    /// <param name="update">Required private SDK update; only its id and enum category reach telemetry.</param>
+    /// <param name="cancellationToken">Existing receiver cancellation before acceptance.</param>
+    /// <returns>The original durable-admission completion, including deduplicated delivery.</returns>
+    /// <remarks>Direct scheduler callers receive a reception clock at method entry. Production receivers start it earlier,
+    /// before receiver control-path checks. Capacity sleeps are admission latency, never scheduler queue latency.</remarks>
+    /// <exception cref="OperationCanceledException">Admission or the receiver was stopped before durable acceptance.</exception>
+    /// <example><code>await scheduler.EnqueueAsync(bot.Id, update, receiverToken);</code></example>
     public async Task EnqueueAsync(string botId, Update update, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(botId);
         ArgumentNullException.ThrowIfNull(update);
+        using var reception = UpdateTelemetryTracker.Current == null
+            ? _timelineTracker?.Receive(botId, update.Id, update.Type.ToString()) : null;
+        var timeline = UpdateTelemetryTracker.Current;
+        timeline?.BeginAdmission();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _admission.Token);
         var token = linked.Token;
         token.ThrowIfCancellationRequested();
-        while (!await _store.TryAcceptAsync(botId, update, _capacity, token))
+        while (true)
         {
+            timeline?.BeginAdmissionAttempt();
+            if (await _store.TryAcceptAsync(botId, update, _capacity, token)) break;
+            timeline?.AdmissionRefused();
             var now = Environment.TickCount64;
             var previous = Interlocked.Read(ref _lastPressureWarning);
             if (now - previous > 10000 && Interlocked.CompareExchange(ref _lastPressureWarning, now, previous) == previous)
@@ -219,6 +245,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     Interlocked.Increment(ref _readyQueryCount);
                     ReadyQueries.Add(1);
                     var ready = await _store.ReadReadyAsync(_capacity, token);
+                    var readyObservedTimestamp = Stopwatch.GetTimestamp();
                     foreach (var idleBot in userCursors.Keys.Where(bot => !ready.Any(x => x.BotId == bot)).ToArray())
                         userCursors.Remove(idleBot);
                     if (DateTime.UtcNow >= nextMaintenance)
@@ -230,6 +257,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     {
                         var depth = await _store.CountPendingAsync(token);
                         QueueDepth.Record(depth);
+                        _telemetry?.UpdateSchedulerHealth(ActiveHandlerCount, depth);
                         await RecordRecoveryMetricsAsync(token);
                         if (depth >= _capacity * 0.8)
                             _logger.LogWarning("Telegram queue pressure. QueueDepth={QueueDepth} Capacity={Capacity} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}", depth, _capacity, ActiveHandlerCount, _concurrency);
@@ -247,7 +275,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                         userCursors[bot] = head.TelegramUserId;
                         eligible.Remove(head);
                         _lastBot = bot;
-                        var execution = ProcessAsync(head.Sequence, _handlers.Token);
+                        var execution = ProcessAsync(head.Sequence, _handlers.Token, readyObservedTimestamp);
                         active.Add(head.Sequence, execution);
                         // Notify after task completion, not merely after its final DB write, so slot reaping cannot miss a wake.
                         execution.GetAwaiter().OnCompleted(Wake);
@@ -276,9 +304,12 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <summary>Claims and executes one update, isolating exceptions and recording a durable terminal outcome.</summary>
     /// <param name="sequence">Internal inbox sequence; no secret data.</param>
     /// <param name="token">Cancellation propagated to the handler after drain expiry.</param>
+    /// <param name="readyObservedTimestamp">Stopwatch timestamp after the ready query; zero denotes unavailable dispatch timing.</param>
     /// <returns>A tracked task that observes handler failures and attempts independent final persistence.</returns>
-    /// <remarks>The host owns scheduler lifetime and FIFO/concurrency are unchanged. Foreground requests produce closed, local-only kind/outcome/timing observations; the watchdog distinguishes current-request age from handler age, and completion retains request count/aggregate duration. Telegram API failures keep numeric status/closed reason metadata, never exception bodies, and retain their durable terminal outcome.</remarks>
-    private async Task ProcessAsync(long sequence, CancellationToken token)
+    /// <remarks>The host owns scheduler lifetime and FIFO/concurrency are unchanged. Correlated summaries distinguish claim,
+    /// queue, actual ExecuteAsync, post-handler review and final persistence. Foreground API observations and watchdogs
+    /// retain their original routing and budgets; private payloads and exception bodies never enter JSONL.</remarks>
+    private async Task ProcessAsync(long sequence, CancellationToken token, long readyObservedTimestamp = 0)
     {
         _store.Executing.TryAdd(sequence, 0);
         TelegramUpdateWorkItem item = null;
@@ -286,6 +317,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         string failure = null;
         var counted = false;
         TelegramUpdateLatencyScope latencyScope = null;
+        UpdateTelemetryTracker.UpdateTelemetryTimeline timeline = null;
         // Live long-handler diagnostics: one timer per execution and one flag that proves the handler was still
         // running when it fired. A StrongBox gives the timer callback a reference it can read atomically.
         var handlerFinished = new System.Runtime.CompilerServices.StrongBox<int>(0);
@@ -296,36 +328,29 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         {
             item = await _store.ClaimAsync(sequence, token);
             if (item == null) return;
+            timeline = _timelineTracker?.Claimed(item, started, readyObservedTimestamp);
             var wait = Math.Max(0, (item.StartedAtUtc - item.AcceptedAtUtc).TotalMilliseconds);
             QueueWait.Record(wait);
             var active = Interlocked.Increment(ref _activeCount);
             counted = true;
+            _telemetry?.UpdateActiveHandlers(ActiveHandlerCount);
             _logger.LogDebug("Telegram update started. BotId={BotId} TelegramUserId={TelegramUserId} UpdateId={UpdateId} UpdateType={UpdateType} QueueWaitMs={QueueWaitMs} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}",
                 item.Key.BotId, item.Key.TelegramUserId, item.Update.Id, item.Update.Type, wait, active, _concurrency);
             if (wait > LongQueueWaitThreshold.TotalMilliseconds)
                 await ReportLongQueueWaitAsync(item, sequence, wait, token);
 
-            // The latency scope is pushed before the watchdog so the live warning can name the closed-vocabulary stage
-            // that is actually blocking the lane. The scope is captured explicitly because the watchdog callback runs on
-            // a timer thread whose ambient scope is not the handler's.
             using (TelegramUpdateExecutionScope.Push(sequence))
-            using (latencyScope = TelegramUpdateLatencyScope.Push(
-                sequence,
-                item.Key.BotId,
-                item.Update.Id,
-                SlowStageThreshold,
-                (stage, elapsedMs) => ReportSlowStage(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, stage, elapsedMs),
-                observation => ReportTelegramRequest(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, observation)))
             {
                 // The watchdog fires once at the threshold. It reports the root blocker instead of the victims that
                 // merely waited behind it, and it never runs when the handler already finished.
-                handlerWarningTimer = new CancellationTokenSource(LongHandlerWarningThreshold);
+                handlerWarningTimer = new CancellationTokenSource();
                 var claimedItem = item;
-                var observedScope = latencyScope;
                 handlerWarningRegistration = handlerWarningTimer.Token.Register(() =>
                 {
                     if (System.Threading.Volatile.Read(ref handlerFinished.Value) != 0)
                         return;
+                    var observedScope = latencyScope;
+                    if (observedScope == null) return; // No handler scope exists during pre-invocation setup.
                     System.Threading.Volatile.Write(ref handlerWarningEmitted.Value, 1);
                     try
                     {
@@ -335,7 +360,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                         _logger.LogWarning(
                             "Telegram update handler running unusually long. BotId={BotId} Sequence={Sequence} UpdateId={UpdateId} UpdateType={UpdateType} HandlerElapsedMs={HandlerElapsedMs} Stage={Stage} RequestKind={RequestKind} RequestOutcome={RequestOutcome} RequestElapsedMs={RequestElapsedMs} TelegramRequestCount={TelegramRequestCount} TotalTelegramElapsedMs={TotalTelegramElapsedMs} ActiveHandlers={ActiveHandlers} MaxConcurrency={MaxConcurrency}",
                             claimedItem.Key.BotId, sequence, claimedItem.Update.Id, claimedItem.Update.Type,
-                            request?.HandlerElapsedMs ?? observedScope.Elapsed.TotalMilliseconds, observedScope.CurrentStage?.ToString() ?? "none",
+                            request?.HandlerElapsedMs ?? observedScope.Elapsed.TotalMilliseconds, observedScope.CurrentStageName,
                             request?.Kind.ToString() ?? "none", request?.Outcome.ToString() ?? "none", request?.RequestElapsedMs ?? 0,
                             request?.RequestCount ?? observedScope.RequestCount, request?.TotalTelegramElapsedMs ?? observedScope.TotalTelegramElapsedMs,
                             ActiveHandlerCount, _concurrency);
@@ -346,7 +371,27 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     }
                 });
 
-                await _executor.ExecuteAsync(item, token);
+                using (latencyScope = TelegramUpdateLatencyScope.Push(
+                    sequence,
+                    item.Key.BotId,
+                    item.Update.Id,
+                    SlowStageThreshold,
+                    (stage, elapsedMs) => ReportSlowStage(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, stage, elapsedMs),
+                    observation => ReportTelegramRequest(item.Key.BotId, sequence, item.Update.Id, item.Update.Type, observation),
+                    telemetry: _telemetry, traceId: timeline?.TraceId))
+                {
+                    // Scope and lifecycle use one clock origin/end; watchdog setup cannot be charged to handler work.
+                    handlerWarningTimer.CancelAfter(LongHandlerWarningThreshold);
+                    timeline?.HandlerStarted(latencyScope.HandlerStartedAtUtc);
+                    try { await _executor.ExecuteAsync(item, token); }
+                    finally
+                    {
+                        var handlerCompletedTimestamp = Stopwatch.GetTimestamp();
+                        // Freeze the authoritative handler clock before constructing diagnostic dictionaries.
+                        latencyScope.Dispose();
+                        timeline?.HandlerCompleted(latencyScope.CaptureTelemetry(), handlerCompletedTimestamp);
+                    }
+                }
             }
             token.ThrowIfCancellationRequested();
             if (await _store.HasUnresolvedCreationAsync(sequence, token))
@@ -384,7 +429,11 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             System.Threading.Volatile.Write(ref handlerFinished.Value, 1);
             handlerWarningRegistration.Dispose();
             handlerWarningTimer?.Dispose();
-            if (counted) Interlocked.Decrement(ref _activeCount);
+            if (counted)
+            {
+                Interlocked.Decrement(ref _activeCount);
+                _telemetry?.UpdateActiveHandlers(ActiveHandlerCount);
+            }
             var duration = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             Duration.Record(duration);
             RecordHandlerDurationDiagnostic(
@@ -397,8 +446,15 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                 latencyScope?.TotalTelegramElapsedMs ?? 0);
             // Also resolves a committed claim whose payload could not be deserialized before ClaimAsync returned.
             using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-            try { if (item != null || failure != null) await _store.FinishAsync(sequence, failure, persistence.Token); }
+            var persistenceStarted = Stopwatch.GetTimestamp();
+            bool? persisted = false;
+            try
+            {
+                if (item != null || failure != null)
+                    persisted = await _store.FinishAsync(sequence, failure, persistence.Token) ? true : null;
+            }
             catch (Exception ex) { _logger.LogError("Telegram completion persistence failed; claim remains recoverable. Sequence={Sequence} ErrorType={ErrorType}", sequence, ex.GetType().Name); }
+            timeline?.Completed(failure, persistenceStarted, persisted);
             _store.Executing.TryRemove(sequence, out _);
             Wake(); // Completion also releases an active-task slot even when final persistence failed.
             _logger.LogDebug("Telegram update finished. Sequence={Sequence} HandlerDurationMs={HandlerDurationMs} Outcome={Outcome}", sequence, duration, failure ?? "completed");
@@ -613,7 +669,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             _handlers.Cancel();
             _coordinator.Cancel();
             using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-            try { await _store.RecoverAsync(persistence.Token); }
+            try { await _store.RecoverAsync(persistence.Token, preRestartTelemetry: false); }
             catch (Exception failure) { _logger.LogError("Shutdown recovery persistence failed; running claims will be finalized on restart. ErrorType={ErrorType}", failure.GetType().Name); }
             try { await _loop.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken); }
             catch (Exception failure) when (failure is TimeoutException or OperationCanceledException)

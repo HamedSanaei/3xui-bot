@@ -12,6 +12,8 @@ using Adminbot.Domain;
 using Adminbot.Domain.TelegramUi;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using Adminbot.Services.Telemetry;
+using Microsoft.Extensions.Logging.Abstractions;
 
 
 /// <summary>
@@ -37,6 +39,8 @@ public class Program
     /// receipt image was dropped before the image-document fix; it starts no listener, receiver, or worker. Normal
     /// startup prints the embedded commit/configuration before loading private configuration, then preserves the
     /// existing migrate-before-receiver ordering.
+    /// Read-only <c>telemetry-report</c> and isolated <c>telemetry-benchmark</c> exit before host construction,
+    /// configuration loading, migrations, Telegram receivers and financial workers.
     ///
     /// In addition to the Telegram operational logger, startup registers a fail-soft daily diagnostic file logger for
     /// warning/error/critical entries. This keeps full exception chains on disk even when channel-noise suppression
@@ -60,6 +64,17 @@ public class Program
         if (TenantCardReceiptRecoveryCli.IsRequested(args))
         {
             Environment.ExitCode = await TenantCardReceiptRecoveryCli.RunAsync(args, Console.Out, CancellationToken.None);
+            return;
+        }
+
+        if (LatencyTelemetryReportCli.IsRequested(args))
+        {
+            Environment.ExitCode = await LatencyTelemetryReportCli.RunAsync(args, Console.Out, CancellationToken.None);
+            return;
+        }
+        if (LatencyTelemetryBenchmarkCli.IsRequested(args))
+        {
+            Environment.ExitCode = await LatencyTelemetryBenchmarkCli.RunAsync(args, Console.Out, CancellationToken.None);
             return;
         }
 
@@ -99,6 +114,12 @@ public class Program
 
         builder.Host.UseDefaultServiceProvider(options => { options.ValidateScopes = true; options.ValidateOnBuild = true; });
         var app = builder.Build();
+        var latencyTelemetry = app.Services.GetRequiredService<LatencyTelemetryService>();
+        // Bind logging only after the service graph exists. A writer-constructor ILogger would recursively resolve
+        // the Telegram provider, its dispatcher, the instrumented bot clients and this same telemetry singleton.
+        latencyTelemetry.SetIncidentLogger(app.Services.GetRequiredService<ILogger<LatencyTelemetryService>>());
+        SqliteOperation.ConfigureTelemetry(latencyTelemetry);
+        Console.WriteLine($"[LatencyTelemetry] enabled={latencyTelemetry.Enabled} path: {latencyTelemetry.StorageDirectory}");
         using (var scope = app.Services.CreateScope())
         {
             var userDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
@@ -145,13 +166,25 @@ public class Program
     /// TenantWeeklyUsageReportHostedService batches storefront-only analytics after Friday midnight Tehran and
     /// delivers owner charts exclusively through scoped Sales Assistant services, independently of the global report flag.
     /// PublicChannelPostManager is one shared singleton/hosted instance; it owns process-local preview/publication
-    /// jobs without retaining scoped handlers, database contexts or foreground clients.</remarks>
+    /// jobs without retaining scoped handlers, database contexts or foreground clients.
+    /// Latency telemetry owns one bounded JSONL writer and is registered first so it stops after receivers, inbox drain
+    /// and workers. Its directory is adjacent to the resolved users.db in persistent Data, never the shell working directory.
+    /// EF interceptors measure commands and transactions without SQL values; telemetry adds no database model or migration.</remarks>
     /// <example><code>RegisterApplicationServices(services, configuration, validatedOptions, contentRootPath);</code></example>
     public static void RegisterApplicationServices(IServiceCollection services, IConfiguration configuration, AppConfig appConfig, string contentRootPath)
     {
         var telegramOutboxDatabasePath = Path.Combine(contentRootPath, "Data", "telegram-log-outbox.db");
         services.AddSingleton<IConfiguration>(configuration);
         services.AddSingleton(appConfig);
+        var usersPath = string.IsNullOrWhiteSpace(appConfig.UserDatabasePath) ? "Data/users.db" : appConfig.UserDatabasePath;
+        var persistentDataDirectory = Path.GetDirectoryName(Path.GetFullPath(usersPath, contentRootPath));
+        services.AddSingleton(sp => new LatencyTelemetryService(appConfig.LatencyTelemetry, persistentDataDirectory,
+            NullLogger<LatencyTelemetryService>.Instance));
+        services.AddHostedService(sp => sp.GetRequiredService<LatencyTelemetryService>());
+        services.AddSingleton(sp => new UpdateTelemetryTracker(sp.GetRequiredService<LatencyTelemetryService>(),
+            appConfig.TelegramUpdateQueueCapacity));
+        services.AddSingleton<LatencySqliteCommandInterceptor>();
+        services.AddSingleton<LatencySqliteTransactionInterceptor>();
         services.AddSingleton<IPaymentGatewayAvailability>(sp =>
             new PaymentGatewayAvailabilityService(
                 appConfig,
@@ -323,7 +356,8 @@ public class Program
             TimeSpan.FromSeconds(appConfig.TelegramUpdateShutdownDrainSeconds + 30));
         services.AddSingleton<TelegramUpdateInboxStore>(sp =>
         {
-            var store = new TelegramUpdateInboxStore(sp.GetRequiredService<UserDbContextFactory>(), sp.GetRequiredService<CredentialsDbContextFactory>());
+            var store = new TelegramUpdateInboxStore(sp.GetRequiredService<UserDbContextFactory>(),
+                sp.GetRequiredService<CredentialsDbContextFactory>(), sp.GetRequiredService<UpdateTelemetryTracker>());
             sp.GetRequiredService<BotRegistry>().AvailabilityChanged += store.NotifyReady;
             return store;
         });
@@ -339,17 +373,28 @@ public class Program
         //services.AddHostedService<ZibalPaymentCheckerService>();
 
         services.AddScoped<UserDbContext>(sp => sp.GetRequiredService<UserDbContextFactory>().CreateDbContext());
-        var userContextOptions = new DbContextOptionsBuilder<UserDbContext>()
-            .UseSqlite(BuildSqliteConnectionString(appConfig.UserDatabasePath, readWriteCreate: true))
-            .Options;
-        services.AddSingleton(new UserDbContextFactory(userContextOptions));
+        services.AddSingleton(sp =>
+        {
+            var transactions = sp.GetRequiredService<LatencySqliteTransactionInterceptor>();
+            var options = new DbContextOptionsBuilder<UserDbContext>()
+                .UseSqlite(BuildSqliteConnectionString(appConfig.UserDatabasePath, readWriteCreate: true))
+                .AddInterceptors(sp.GetRequiredService<LatencySqliteCommandInterceptor>(), transactions, transactions.ConnectionCleanupInterceptor)
+                .Options;
+            return new UserDbContextFactory(options);
+        });
         services.AddSingleton<UserStateStore>();
         services.AddScoped<UserWorkflowStore>();
 
 
-        var optionsBuilder = new DbContextOptionsBuilder<CredentialsDbContext>();
-        optionsBuilder.UseSqlite(BuildSqliteConnectionString(appConfig.CredentialsDatabasePath, readWriteCreate: true));
-        services.AddSingleton(new CredentialsDbContextFactory(optionsBuilder.Options));
+        services.AddSingleton(sp =>
+        {
+            var transactions = sp.GetRequiredService<LatencySqliteTransactionInterceptor>();
+            var options = new DbContextOptionsBuilder<CredentialsDbContext>()
+                .UseSqlite(BuildSqliteConnectionString(appConfig.CredentialsDatabasePath, readWriteCreate: true))
+                .AddInterceptors(sp.GetRequiredService<LatencySqliteCommandInterceptor>(), transactions, transactions.ConnectionCleanupInterceptor)
+                .Options;
+            return new CredentialsDbContextFactory(options);
+        });
         services.AddSingleton<CredentialsStore>();
         services.AddSingleton<BroadcastManager>();
         services.AddHostedService(sp => sp.GetRequiredService<BroadcastManager>());
