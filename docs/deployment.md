@@ -141,6 +141,8 @@ Historical 66–84 second queue waits can include multiple predecessor execution
 Attribution reports clipped overlap, lane occupancy (claim through terminal receipt, **not handler-only time**) and
 the wait outside the selected predecessor separately. It does not blame all waiting time on one handler or fabricate
 a blocker when overlap is absent. Keep the detailed correlated telemetry when diagnosing any remaining long wait.
+Live handler watchdogs stop at the business-handler boundary before post-handler review. Completed-handler metrics
+use that frozen duration, so a slow SQLite review cannot falsely report an already-completed handler as running.
 
 No new schema migration, database repair, pool change or manual WAL switch is required by this fix. The tenant
 underfunding central-gateway fallback and personal-card funding admission rules remain unchanged. Use the normal

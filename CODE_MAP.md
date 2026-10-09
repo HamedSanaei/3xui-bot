@@ -955,7 +955,9 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   (`TelegramLogSuppression.LongHandlerOperatorThresholdMilliseconds`) that `TelegramUpdateScheduler` uses to initialize
   `LongHandlerWarningThreshold`, so the watchdog and the channel policy cannot drift. Instrumentation thresholds
   (`SlowStageThreshold` 2 s, `InteractiveHandlerThreshold` 5 s, `LongHandlerWarningThreshold` 10 s,
-  `LongQueueWaitThreshold` 5 s) are intentionally unchanged: the fix is channel routing, not measurement.
+  `LongQueueWaitThreshold` 5 s) are intentionally unchanged: routing and accurate timing boundaries address the noise.
+  The watchdog ends at actual `ExecuteAsync` completion, before any post-handler SQLite review. Completed-handler
+  diagnostics and duration metrics use the frozen handler scope, never claim/review/lane-occupancy time.
 - **UX telemetry attribution** (`Services/TelegramInteractionActor.cs`): `TelegramUpdateExecutor` publishes the update
   sender once per execution (callback, message, edited message, inline query, chosen inline result, checkout and
   shipping queries, poll answer, chat-member updates) through an `AsyncLocal<long?>` scope, so

@@ -85,6 +85,10 @@ Every terminal scheduled execution, including fast successful handlers, attempts
 
 Receiver control commands use `outcome=receiver_control_path` and `timingQuality=receiver_control_path_no_inbox`; their real handler/response clocks remain available but inbox milestones are null. Duplicate deliveries use `outcome=duplicate`; they close correlation records but do not count as another execution in reports. Aborted reception is explicit. Restart recovery retains `completed_with_review`, never replays external effects, and records pre-restart durations as null. In-process forced shutdown shares the live terminal-summary guard: recovery and a still-unwinding handler cannot count the same execution twice. Its partial summary can have incomplete handler timing (`live_handler_interrupted_timing_incomplete`), not fabricated completion. Claim/publication synchronization retains receiver origin even when a periodic scan claims before the post-commit continuation; that case has null queue time and `commit_observation_after_claim`. Capacity loss remains visible through `telegram_timeline_metadata_lost`.
 
+The live long-handler watchdog and completed-handler duration metrics use this same actual handler boundary.
+They stop/freeze before post-handler review; delayed review stays visible in `postHandlerMs` and lane occupancy,
+not as a false live-handler alert or inflated handler-only duration.
+
 ### Handler stages and gaps
 
 `stageMs` partitions covered handler wall time into exclusive stages; `inclusiveStageMs` separately records nested/overlapping operation duration and **must not be summed**. Concurrent operations cannot double-count exclusive wall time: each interval belongs to the newest still-active stage timer. Metadata is bounded to 1024 overlapping handles; overflow is quality-visible.
