@@ -304,7 +304,9 @@ public sealed class TelegramEndpointAdminService
     /// <param name="token">Cancels UI metadata and bounded Telegram work.</param>
     /// <param name="notice">Optional fixed Persian outcome/progress label without raw error data.</param>
     /// <returns>A task completing after the new control keyboard is published.</returns>
-    /// <remarks>Main screens contain only connection, migration outcome and fixed Persian action; inventory includes whole-inventory live Cloud/Local counts, with paused/disabled and unknown routes separate. Technical screens are read-only fresh snapshots, paginated without dropping diagnostic content. Registration receipts expire independently and remain identity/control-revision bound.</remarks>
+    /// <remarks>Main screens contain only connection, migration outcome and fixed Persian action; inventory includes whole-inventory live Cloud/Local counts, with paused/disabled and unknown routes separate.
+    /// Bulk confirmation explicitly states that active destinations are skipped without receiver interruption or preference changes.
+    /// Technical screens are read-only fresh snapshots, paginated without dropping diagnostic content. Registration receipts expire independently and remain identity/control-revision bound.</remarks>
     private async Task RenderAsync(string host, ITelegramBotClient client, long actor, long chat, int messageId,
         PanelCommand view, CancellationToken token, string notice = null)
     {
@@ -320,6 +322,7 @@ public sealed class TelegramEndpointAdminService
             var targets = inventory.Select(x => new TelegramEndpointBulkTarget(x.BotId, x.TelegramBotId, x.ControlRevision)).ToArray();
             text.AppendLine($"⚠️ انتقال دسته‌ای {targets.Length} ربات به {EndpointLabel(view.Target)} را تأیید می‌کنید؟");
             text.AppendLine("تمام فهرست (همه صفحه‌ها)، هویت و نسخه کنترل اکنون ثابت شده‌اند؛ ربات جدید/جایگزین وارد این درخواست نمی‌شود.");
+            text.AppendLine("ربات‌هایی که از قبل روی مقصد فعال‌اند رد می‌شوند (skip)؛ تنظیم مسیرشان تغییر نمی‌کند و قطع‌و‌وصل نمی‌شوند. فقط ربات‌های مسیر مقابل منتقل می‌شوند.");
             text.AppendLine(view.Target == TelegramEndpointType.Local
                 ? "🏠 یک ربات Owned فعال و مستقل روی Cloud برای مسیر مدیریت باقی می‌ماند (ترجیحاً همین میزبان). قانون آخرین مسیر مستقل Cloud دور زده نمی‌شود؛ بعضی درخواست‌ها ممکن است رد شوند."
                 : "☁️ همه ربات‌های این فهرست، از جمله میزبان، بررسی می‌شوند. پاک‌سازی و مهلت رسمی Cloud می‌تواند تکمیل را به تأخیر بیندازد.");

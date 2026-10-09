@@ -1726,6 +1726,9 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - Bulk Cloud/Local controls freeze all pages/identities/control revisions, require the same private single-use confirmation,
   and call `TelegramEndpointCoordinator.Bulk` for sequential individual intent admission (no network/drain inside callbacks).
   One nonwaiting batch lock plus existing per-bot CAS/guards; exact committed operation receipts, truthful partial/cancelled outcomes.
+  Active effective destinations (including CloudRecovered/LocalDegraded) skip as `unchanged` under the bot lock, even if
+  desired intent differs; preserve preference/operation/revisions/receiver epoch without a write, fence, logout or restart.
+  Only opposite-route bots get new bulk intents; individual confirmations retain preference-only updates without reconnecting.
   Local explicitly retains one eligible owned Cloud control, preferring host then ordinal id; never bypasses last-control safety.
   Read-only per-actor paginated reports last one hour (max 512; latest three linked), reopenable from another healthy owned host;
   controls still expire after ten minutes. Aggregate reports vanish on restart/expiry, individual operation/history remain durable.

@@ -501,30 +501,58 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.Equal(1, f.Protocol.LogoutCalls);
     }
 
-    /// <summary>Desired-only Cloud intent and exact unchanged state both provide their own committed operation ids without any migration transport.</summary>
-    /// <returns>A task after the two existing individual admission branches provide exact metadata.</returns>
-    [Fact]
-    public async Task Bulk_reports_exact_desired_only_and_unchanged_operation_ids()
+    /// <summary>Mixed-route batches migrate only the opposite route and leave the destination's admitted request and saved preference untouched.</summary>
+    /// <param name="target">Explicit Cloud or Local bulk destination; both must skip their already-active receiver epoch.</param>
+    /// <returns>A task after the real worker completes the one necessary migration without writing or fencing the skipped identity.</returns>
+    /// <remarks>Regression: recovered Cloud and degraded Local remain valid skip destinations even when desired intent differs. A pinned request on the skipped bot must not delay another identity's migration.</remarks>
+    [Theory]
+    [InlineData(TelegramEndpointType.Cloud)]
+    [InlineData(TelegramEndpointType.Local)]
+    public async Task Bulk_mixed_routes_skip_active_destination_without_changing_or_draining_it(TelegramEndpointType target)
     {
-        using var f = new BulkFixture();
+        using var f = new BulkFixture(target);
+        var opposite = target == TelegramEndpointType.Cloud ? TelegramEndpointType.Local : TelegramEndpointType.Cloud;
+        f.AddBot("needs-migration", 456, BotInstanceTypes.Tenant, endpoint: opposite);
+        var priorOperation = new string('a', 32);
         f.Source.Store.Mutate(state =>
         {
-            state.DesiredEndpoint = TelegramEndpointType.Local;
-            state.MigrationState = TelegramEndpointMigrationState.CloudRecovered;
-            state.OperationId = new string('a', 32);
+            state.DesiredEndpoint = opposite;
+            state.MigrationState = target == TelegramEndpointType.Cloud
+                ? TelegramEndpointMigrationState.CloudRecovered : TelegramEndpointMigrationState.LocalDegraded;
+            state.OperationId = priorOperation;
         });
-        var priorOperation = new string('b', 32);
-        f.Source.Store.Seed(new TelegramEndpointState { BotId = "operator-control", TelegramBotId = 345, OperationId = priorOperation });
-        var results = await f.RequestAsync(TelegramEndpointType.Cloud, await f.FreezeAsync());
-        var host = results.Single(x => x.BotId == "owned-a");
-        var control = results.Single(x => x.BotId == "operator-control");
-        Assert.Equal("accepted", host.ResultCode);
-        Assert.Equal((await f.Coordinator.GetStatusAsync("owned-a", default)).OperationId, host.OperationId);
-        Assert.NotEqual(new string('a', 32), host.OperationId);
-        Assert.Equal("unchanged", control.ResultCode);
-        Assert.Equal(priorOperation, control.OperationId);
-        Assert.Empty(f.Protocol.Events);
-        Assert.Equal(0, f.Lifecycle.Acquisitions);
+        var frozen = await f.FreezeAsync();
+        var before = await f.Coordinator.GetStatusAsync("owned-a", default);
+        var route = f.Gate.GetRoute("owned-a", 123);
+        using var pinnedRequest = f.Gate.AcquireRequest("owned-a", 123, route.Generation);
+
+        var results = await f.RequestAsync(target, frozen);
+
+        var skipped = results.Single(x => x.BotId == "owned-a");
+        Assert.Equal("unchanged", skipped.ResultCode);
+        Assert.Equal(priorOperation, skipped.OperationId);
+        Assert.Equal("accepted", results.Single(x => x.BotId == "needs-migration").ResultCode);
+        Assert.Equal(new[] { "needs-migration" }, f.Store.Intents.ToArray());
+        Assert.Equal(route, f.Gate.GetRoute("owned-a", 123));
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        // Cloud activation respects the official cooldown; advancing only the isolated clock avoids a real wait.
+        f.Clock.Advance(TimeSpan.FromMinutes(11));
+        await f.Coordinator.RunPendingOperationsAsync(default);
+
+        var after = await f.Coordinator.GetStatusAsync("owned-a", default);
+        Assert.Equal(before.DesiredEndpoint, after.DesiredEndpoint);
+        Assert.Equal(before.EffectiveEndpoint, after.EffectiveEndpoint);
+        Assert.Equal(before.MigrationState, after.MigrationState);
+        Assert.Equal(before.OperationId, after.OperationId);
+        Assert.Equal(before.Revision, after.Revision);
+        Assert.Equal(before.ControlRevision, after.ControlRevision);
+        Assert.Equal(route, f.Gate.GetRoute("owned-a", 123));
+        Assert.Empty(await f.Coordinator.GetHistoryAsync("owned-a", default));
+        var moved = await f.Coordinator.GetStatusAsync("needs-migration", default);
+        Assert.Equal(target, moved.EffectiveEndpoint);
+        Assert.True(f.Gate.IsAvailable("needs-migration", 456));
+        Assert.Equal(1, f.Protocol.LogoutCalls);
+        Assert.Equal(1, f.Lifecycle.Starts);
     }
 
     /// <summary>All admitted Local intents survive process-local state loss and resume individually while the explicitly retained Cloud control remains admitted.</summary>

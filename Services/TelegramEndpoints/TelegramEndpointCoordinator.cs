@@ -225,6 +225,9 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
     /// <returns>A closed accepted/unchanged result or precise admission refusal, including mapping failures and migration_in_progress distinct from the nonwaiting busy lock.</returns>
     /// <remarks>Bot-specific nonwaiting locks prevent concurrent intents. Uncertain logout cannot be manually overridden.
     /// Cloud-to-Local intent retains another enabled owned Cloud identity for independent private administration.
+    /// Bulk admission treats an active effective destination as unchanged, even when saved desired intent differs;
+    /// it preserves that bot's preference, operation receipt, revisions and receiver epoch without publishing state.
+    /// Individual confirmation may still update a differing preference without draining or restarting the receiver.
     /// The hosted worker owns lifecycle drain; this method never waits for the callback's own handler to finish.</remarks>
     /// <example><code>var outcome = await coordinator.RequestMigrationAsync(botId, TelegramEndpointType.Local, adminId, revision, identity, token);</code></example>
     public async Task<string> RequestMigrationAsync(string botId, TelegramEndpointType target, long actor,
@@ -253,7 +256,9 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
             if (!IsActive(state) && state.EffectiveEndpoint == target) return AdmissionFailure(state, "unsafe");
             if (state.EffectiveEndpoint == target && IsActive(state))
             {
-                if (state.DesiredEndpoint == target)
+                // Bulk transfers move only opposite-route bots; a recovered/degraded destination is not a new intent.
+                // Keep the skip under this bot's lock so stale confirmations cannot overwrite newer state.
+                if (_bulkAdmission.Value?.Active == true || state.DesiredEndpoint == target)
                 {
                     CaptureBulkAdmission(state);
                     return "unchanged";
