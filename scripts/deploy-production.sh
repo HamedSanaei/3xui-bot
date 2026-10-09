@@ -189,12 +189,14 @@ main() {
     # otherwise an interrupted deploy can leave the production lock pinned indefinitely.
     exec 9>&-
     cd "$stage_source"
-    dotnet tool restore
-    dotnet restore Adminbot.sln
-    dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=$actual_sha"
-    dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
-    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context UserDbContext --configuration Release
-    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context CredentialsDbContext --configuration Release
+    # The enclosing ( ... ) || fail disables inherited errexit within this subshell.
+    # Check every release gate explicitly: a later successful EF check must never hide a failed test.
+    dotnet tool restore || exit $?
+    dotnet restore Adminbot.sln || exit $?
+    dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=$actual_sha" || exit $?
+    dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build || exit $?
+    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context UserDbContext --configuration Release || exit $?
+    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context CredentialsDbContext --configuration Release || exit $?
   ) || fail "release gates failed for commit $actual_sha; production was not synchronized or restarted."
   printf 'Release gates passed for commit %s.\n' "$actual_sha"
 

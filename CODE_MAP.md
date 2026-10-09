@@ -312,7 +312,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `dotnet ef migrations has-pending-model-changes` contexts, then publish with `SourceRevisionId`, then the published
   executable's `--migration-check` against fresh databases AND online-backup copies of the live
   `Data/users.db` + `Data/credentials.db`. `dotnet publish` alone was previously the only check on that path and is
-  explicitly not sufficient. `scripts/deploy-production.tests.sh` asserts this ordering structurally.
+  explicitly not sufficient. Each release-gate command explicitly propagates a nonzero exit status inside the
+  `( ... ) || fail` subshell; relying on Bash `set -e` there is unsafe because later successful EF checks can hide failed tests.
+  `scripts/deploy-production.tests.sh` asserts the ordering structurally.
   See `docs/deployment.md`. A dirty or SHA-mismatched checkout is rejected before build, and systemd is untouched until
   every build/test/EF/artifact check succeeds. Release assemblies log their embedded commit and build configuration.
 - Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
