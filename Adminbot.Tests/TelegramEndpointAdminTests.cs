@@ -236,6 +236,62 @@ public sealed class TelegramEndpointAdminTests
         Assert.Contains("جزئیات «disabled_bot»", observed);
     }
 
+    /// <summary>Initial inventory totals cover all pages and actual routes across bot types, then change on a read-only refresh.</summary>
+    /// <returns>A task after the first sent message, next page and fresh runtime observations are checked.</returns>
+    /// <remarks>Saved Local preferences do not count a fenced source as active; disabled and unobserved routes occupy separate buckets.</remarks>
+    [Fact]
+    public async Task Inventory_totals_cover_all_pages_and_refresh_actual_routes()
+    {
+        var fixture = new Fixture(extraBots: 13);
+        foreach (var id in new[] { "tenant", "assistant", "owned-assistant" })
+            fixture.Backend.States[id].RuntimeEndpoint = TelegramEndpointType.Local;
+        var paused = fixture.Backend.States["extra0"];
+        paused.DesiredEndpoint = paused.EffectiveEndpoint = TelegramEndpointType.Local;
+        paused.RuntimeEndpoint = TelegramEndpointType.Local;
+        paused.RuntimeAvailable = false;
+        paused.MigrationState = TelegramEndpointMigrationState.CloudWait;
+        var unknown = fixture.Backend.States["extra12"];
+        unknown.RuntimeAvailable = null;
+        unknown.RuntimeEndpoint = null;
+        unknown.RuntimeGeneration = null;
+
+        await fixture.OpenAsync();
+        var initial = Assert.Single(fixture.Client.Sends).Text!;
+        Assert.Contains("📊 مجموع ربات‌ها: 19", initial);
+        Assert.Contains("☁️ CLOUD: 13 | 🏠 LOCAL: 3", initial);
+        Assert.Contains("⛔ متوقف/غیرفعال: 2 | ❔ نامشخص: 1", initial);
+        Assert.True(initial.IndexOf("☁️ CLOUD: 13", StringComparison.Ordinal) <
+            initial.IndexOf("فهرست ربات‌ها — صفحه", StringComparison.Ordinal));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "صفحه بعد ▶️"));
+        Assert.Contains("☁️ CLOUD: 13 | 🏠 LOCAL: 3", fixture.Control.Text);
+
+        fixture.Backend.States["tenant"].RuntimeEndpoint = TelegramEndpointType.Cloud;
+        unknown.RuntimeAvailable = true;
+        unknown.RuntimeEndpoint = TelegramEndpointType.Cloud;
+        unknown.RuntimeGeneration = 2;
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی فهرست"));
+        Assert.Contains("☁️ CLOUD: 15 | 🏠 LOCAL: 2", fixture.Control.Text);
+        Assert.Contains("⛔ متوقف/غیرفعال: 2 | ❔ نامشخص: 0", fixture.Control.Text);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Empty(fixture.Backend.Batches);
+    }
+
+    /// <summary>An incomplete observed generation cannot enter active Local counts even when durable preferences and endpoint say Local.</summary>
+    /// <returns>A task after the first inventory message reports unknown rather than fabricated active routing.</returns>
+    [Fact]
+    public async Task Inventory_totals_do_not_fill_missing_generation_from_saved_endpoint()
+    {
+        var fixture = new Fixture();
+        var state = fixture.Backend.States["tenant"];
+        state.DesiredEndpoint = state.EffectiveEndpoint = TelegramEndpointType.Local;
+        state.RuntimeEndpoint = TelegramEndpointType.Local;
+        state.RuntimeGeneration = null;
+        await fixture.OpenAsync();
+        var initial = Assert.Single(fixture.Client.Sends).Text!;
+        Assert.Contains("☁️ CLOUD: 4 | 🏠 LOCAL: 0", initial);
+        Assert.Contains("⛔ متوقف/غیرفعال: 1 | ❔ نامشخص: 1", initial);
+    }
+
     /// <summary>Keeps operational safety readable in the main screen while moving timestamps, mapping and safe history to complete technical pages.</summary>
     /// <returns>A task completing after actual SDK output proves the separation and secret-free technical navigation.</returns>
     [Fact]

@@ -1712,6 +1712,11 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   generation/gate/UTC/state/history/config source+startup/live roots/error code/phase/action without probes or mutations.
   Startup/live mapping differences require deliberate restart, never hot remap. Success requires exact-current-operation
   destination activation receipts/timestamps; newer durable admission refusal cannot masquerade as prior success.
+  Initial inventory text includes full-inventory active Cloud/Local totals, separate paused/disabled and unknown counts,
+  refreshed on every page/control refresh via the same `TelegramEndpointPresentation.AdmittedEndpoint` badge classifier.
+- Existing receiver-start messages and tenant durable HTML lifecycle events include the captured receiving epoch's
+  `☁️ CLOUD` / `🏠 LOCAL` on every startup/restart; desired failback never overrides actual origin. Staged starts remain
+  explicitly not final activation. No added API/DB operation, notification path or delivery/financial/FIFO policy change.
 - `TelegramEndpointDiagnosticCatalog` owns finite Persian guidance and stage-qualified failures (mapping, root health,
   identity, stop/drain, logout, receiving readiness). Admission missing mapping persists without intent/logout; failure
   history retains its closed category even after health clears current error. No schema, FIFO, financial or failover cutover.

@@ -46,6 +46,10 @@ Durable settlement, order, receipt and weekly notifications defer exact pre-HTTP
 
 Inventory and bot detail screens begin with the **actual request-admission endpoint** in plain text. The simple screen shows connection, the latest migration result and fixed Persian corrective actions; machine metadata is not mixed into normal status.
 
+The **initial inventory message** includes total bots, `☁️ CLOUD` / `🏠 LOCAL` active counts, paused/disabled count and unknown count. These cover the complete owned/tenant/assistant inventory across all pages, not just visible rows, and refresh from the same runtime-admission observations as individual badges. A missing identity/generation/endpoint never fills from saved preferences; a fenced migration source is counted as paused, not active.
+
+On every service startup, the existing `Started Telegram bot receiver` message includes `Telegram API: ☁️ CLOUD` or `Telegram API: 🏠 LOCAL` for each receiver, captured from its endpoint generation before startup probes. Existing tenant durable-HTML lifecycle messages include the same origin. Saved Local routes survive restart; a desired Local preference after Cloud recovery does not falsely label Cloud traffic Local. A staged migration receiver explicitly says final activation is not yet confirmed. No extra notification, health request, retry, recipient or database write is introduced; existing delivery reliability remains unchanged.
+
 | Panel headline | Exact meaning |
 |---|---|
 | `☁️ CLOUD` | The enabled exact identity currently admits ordinary requests through Cloud |
@@ -259,12 +263,15 @@ Observed verification (initial routing smoke rows are explicitly labeled):
 
 | Check | Observed result |
 |---|---|
-| Current simplified-panel/config/mapping focused Release regressions | 254 passed; zero failed/skipped; actual SDK screens, file/source validation, phase-qualified errors, cooldown/restart, authority/replay and JSONL diagnostics covered |
-| Current complete Release regression suite | 1,622 passed; zero failed/skipped; pre-existing warnings remain in unrelated test files, no new warning in changed tests |
-| Current real panel/coordinator/gate smoke on Windows and isolated Linux | CLOUD → validated LOCAL → truthful CloudWait/paused connection → validated CLOUD; maximum one receiver; one fake logout per direction; missing mapping and unreachable root perform zero logout |
-| Current Linux effective-access smoke | Accessible directory accepted; actual mode-000 directory denied under uid 1000; real symlink rejected; missing directory classified. Temporary self-contained launcher only; invariant globalization because this isolated WSL image lacks ICU, not a production configuration change |
-| Current configuration-source before/after smoke | Original loader selected conflicting assembly `/stale`; fixed explicit content-root provider selected `/data` on Windows/Linux |
-| Current smoke JSONL | 22 observations across round-trip and refusal scenarios; zero dropped events/writer failures; exact stage/code retained |
+| Inventory/startup focused Release regressions | 227 passed; zero failed/skipped; complete-inventory pagination/refresh, unknown/paused exclusion, two fresh starts for each owned/tenant/assistant Cloud/Local route, staged-start truthfulness and existing durable-audit/backup invariants covered |
+| Inventory/startup complete Release regression suite | 1,630 passed; zero failed/skipped; includes existing tenant/financial, routing, FIFO and durable notification regressions |
+| Inventory/startup actual runtime smoke | First SDK message shows all-inventory counts; refresh changes actual Cloud/Local totals; actual v22 receiver startup labels match observed Cloud/Local poll origins and generation 7; zero logout calls, fake transport only |
+| Previous simplified-panel/config/mapping focused Release regressions | 254 passed; zero failed/skipped; actual SDK screens, file/source validation, phase-qualified errors, cooldown/restart, authority/replay and JSONL diagnostics covered |
+| Previous complete Release regression suite | 1,622 passed; zero failed/skipped; pre-existing warnings remain in unrelated test files, no new warning in changed tests |
+| Previous real panel/coordinator/gate smoke on Windows and isolated Linux | CLOUD → validated LOCAL → truthful CloudWait/paused connection → validated CLOUD; maximum one receiver; one fake logout per direction; missing mapping and unreachable root perform zero logout |
+| Previous Linux effective-access smoke | Accessible directory accepted; actual mode-000 directory denied under uid 1000; real symlink rejected; missing directory classified. Temporary self-contained launcher only; invariant globalization because this isolated WSL image lacks ICU, not a production configuration change |
+| Previous configuration-source before/after smoke | Original loader selected conflicting assembly `/stale`; fixed explicit content-root provider selected `/data` on Windows/Linux |
+| Previous smoke JSONL | 22 observations across round-trip and refusal scenarios; zero dropped events/writer failures; exact stage/code retained |
 | Logger-channel cutover verification retained from the previous change | 202 focused regressions and 1,496 complete Release regressions passed; missing/configured logger labels and actual channel worker were exercised through fake HTTP without private delivery |
 | Endpoint status/bulk focused Release regressions | 265 passed; zero failed/skipped; actual gate observations, operation evidence, full-inventory admission, authorization/replay/concurrency, cooldown/restart and ambiguous persistence covered |
 | Complete Release regression suite after status/bulk enhancement | 1,561 passed; zero failed/skipped; includes existing tenant/financial, FIFO, endpoint protocol and durable logger-outbox regressions |

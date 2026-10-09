@@ -1,4 +1,5 @@
 using Adminbot.Domain.Logging;
+using Adminbot.Services.TelegramEndpoints;
 using Microsoft.Data.Sqlite;
 using Telegram.Bot.Types.Enums;
 using Xunit;
@@ -144,10 +145,10 @@ public sealed class BackupRecoveryTests
             new TypedLogger(logger));
         var method = typeof(MultiBotHostedService).GetMethod("LogTenantRuntimeEvent",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic, null,
-            [typeof(string), typeof(string), typeof(long?), typeof(IEnumerable<string>), typeof(string), typeof(string), typeof(string)], null)!;
+            [typeof(string), typeof(string), typeof(long?), typeof(IEnumerable<string>), typeof(string), typeof(string), typeof(string), typeof(TelegramEndpointType?)], null)!;
         try
         {
-            for (var i = 0; i < 20; i++) method.Invoke(service, ["tenant-" + i, "store", (long?)123, new[] { "channel" }, "support", "روشن شد", "error <test>"]);
+            for (var i = 0; i < 20; i++) method.Invoke(service, ["tenant-" + i, "store", (long?)123, new[] { "channel" }, "support", "روشن شد", "error <test>", null]);
             await using var outbox = new TelegramLogOutbox(fixture.Options.OutboxDatabasePath);
             Assert.Equal(0, (await outbox.ReadBackupAsync()).Requested);
             using var db = new SqliteConnection("Data Source=" + fixture.Options.OutboxDatabasePath);

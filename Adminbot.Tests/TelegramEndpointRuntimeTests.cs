@@ -7,6 +7,7 @@ using Adminbot.Services.TelegramEndpoints;
 using Adminbot.Services.Telemetry;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Telegram.Bot;
 using Telegram.Bot.Requests;
@@ -202,6 +203,77 @@ public sealed partial class ConcurrencyTests
         finally { Directory.Delete(root, recursive: true); }
     }
 
+    /// <summary>Every process startup reports the real restored receiver origin for owned, tenant and assistant bots, not configuration defaults or desired failback.</summary>
+    /// <param name="endpoint">Durably effective Cloud or Local endpoint; all transports are synthetic.</param>
+    /// <param name="type">Configured bot type whose ordinary service-start path is exercised.</param>
+    /// <returns>A task after two fresh runtime/gate instances agree with real v22 HTTP origins and preserve the saved generation.</returns>
+    /// <remarks>The Cloud case keeps a desired Local preference, reproducing recovered failover state. No production tokens, external requests, logout or downloader process are used.</remarks>
+    [Theory]
+    [InlineData(TelegramEndpointType.Cloud, BotInstanceTypes.Owned)]
+    [InlineData(TelegramEndpointType.Local, BotInstanceTypes.Owned)]
+    [InlineData(TelegramEndpointType.Cloud, BotInstanceTypes.Tenant)]
+    [InlineData(TelegramEndpointType.Local, BotInstanceTypes.Tenant)]
+    [InlineData(TelegramEndpointType.Cloud, BotInstanceTypes.SalesAssistant)]
+    [InlineData(TelegramEndpointType.Local, BotInstanceTypes.SalesAssistant)]
+    public async Task Endpoint_startup_message_matches_restored_origin_on_every_restart(TelegramEndpointType endpoint, string type)
+    {
+        using var databases = new Databases();
+        var store = new TelegramEndpointStore(databases.Users, new AppConfig());
+        var saved = await store.GetOrCreateAsync("endpoint-a", 123456, default);
+        saved.DesiredEndpoint = TelegramEndpointType.Local;
+        saved.EffectiveEndpoint = endpoint;
+        saved.MigrationState = endpoint == TelegramEndpointType.Cloud
+            ? TelegramEndpointMigrationState.CloudRecovered : TelegramEndpointMigrationState.Local;
+        saved.Generation = 7;
+        Assert.True(await store.TrySaveAsync(saved, saved.Revision));
+        var expectedOrigin = endpoint == TelegramEndpointType.Cloud ? "cloud" : "local";
+        var expectedBadge = endpoint == TelegramEndpointType.Cloud ? "☁️ CLOUD" : "🏠 LOCAL";
+        for (var boot = 0; boot < 2; boot++)
+        {
+            var registry = EndpointRuntimeRegistry();
+            registry.Upsert(new BotInstance { Id = "endpoint-a", Token = EndpointRuntimeToken(123456),
+                Type = type, Enabled = true });
+            var gate = new TelegramEndpointRuntimeGate(registry, store);
+            using var http = new EndpointRuntimeHttp();
+            using var clients = new BotClientProvider(registry, gate, new TelegramEndpointRoutingOptions(), http);
+            using var services = new ServiceCollection()
+                .AddScoped<UserDbContext>(_ => databases.Users.CreateDbContext()).BuildServiceProvider();
+            var logger = new EndpointStartupLogger();
+            var runtime = new MultiBotHostedService(registry, clients, new EndpointRuntimeNoopScheduler(),
+                services.GetRequiredService<IServiceScopeFactory>(), new BotContextAccessor(), new BotRuntimeStatusStore(),
+                new ConfigurationBuilder().Build(), logger, endpointGate: gate);
+            try
+            {
+                await runtime.StartAsync(default);
+                await (endpoint == TelegramEndpointType.Cloud ? http.CloudPollStarted.Task : http.LocalPollStarted.Task)
+                    .WaitAsync(TimeSpan.FromSeconds(3));
+                var message = Assert.Single(logger.Entries, entry =>
+                    entry.Message.StartsWith("Started Telegram bot receiver. botId=endpoint-a,", StringComparison.Ordinal)).Message;
+                Assert.Contains("Telegram API: " + expectedBadge, message);
+                Assert.DoesNotContain(EndpointRuntimeToken(123456), message);
+                Assert.Contains(http.Calls, call => call.Identity == 123456 && call.Endpoint == expectedOrigin &&
+                    call.Method == "getUpdates" && !call.ShortPoll);
+                Assert.DoesNotContain(http.Calls, call => call.Identity == 123456 && call.Endpoint != expectedOrigin);
+                Assert.DoesNotContain(http.Calls, call => call.Method == "logOut");
+                Assert.Equal(7, gate.GetRoute("endpoint-a", 123456).Generation);
+                Assert.Equal(1, http.MaximumPollers[123456]);
+                if (type == BotInstanceTypes.Tenant)
+                {
+                    var tenantMessage = Assert.Single(logger.Entries, entry => entry.EventId == 1001 &&
+                        entry.Message.Contains("وضعیت ربات فروشگاهی tenant", StringComparison.Ordinal)).Message;
+                    // Compare rendered Telegram HTML text, not the encoder's numeric representation of emoji.
+                    Assert.Contains("Telegram API: " + expectedBadge, WebUtility.HtmlDecode(tenantMessage));
+                    Assert.DoesNotContain(EndpointRuntimeToken(123456), tenantMessage);
+                }
+            }
+            finally
+            {
+                using var stopping = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await runtime.StopAsync(stopping.Token);
+            }
+        }
+    }
+
     /// <summary>The actual runtime lifecycle joins old polling, validates destination getUpdates, and starts exactly one Local receiver without changing another bot.</summary>
     /// <returns>A task completing after real SDK polling epochs and strict identity failure behavior are observed.</returns>
     [Fact]
@@ -212,9 +284,10 @@ public sealed partial class ConcurrencyTests
         using var http = new EndpointRuntimeHttp();
         using var clients = new BotClientProvider(registry, gate, new TelegramEndpointRoutingOptions(), http);
         using var services = new ServiceCollection().BuildServiceProvider();
+        var logger = new EndpointStartupLogger();
         var runtime = new MultiBotHostedService(registry, clients, new EndpointRuntimeNoopScheduler(),
             services.GetRequiredService<IServiceScopeFactory>(), new BotContextAccessor(), new BotRuntimeStatusStore(),
-            new ConfigurationBuilder().Build(), NullLogger<MultiBotHostedService>.Instance, endpointGate: gate);
+            new ConfigurationBuilder().Build(), logger, endpointGate: gate);
         await runtime.StartAsync(default);
         try
         {
@@ -229,6 +302,11 @@ public sealed partial class ConcurrencyTests
                 gate.Publish(staged);
                 gate.PrepareActivation("endpoint-a", 123456, TelegramEndpointType.Local, 2);
                 Assert.True(await lifecycle.StartValidatedAsync(default));
+                var stagedStart = logger.Entries.Last(entry =>
+                    entry.Message.StartsWith("Started Telegram bot receiver. botId=endpoint-a,", StringComparison.Ordinal)).Message;
+                Assert.Contains("Telegram API: 🏠 LOCAL", stagedStart);
+                Assert.Contains("فعال‌سازی نهایی انتقال هنوز تأیید نشده است", stagedStart);
+                Assert.False(gate.IsAvailable("endpoint-a", 123456));
                 gate.Publish(EndpointRuntimeState("endpoint-a", 123456, TelegramEndpointType.Local, 2));
             }
             await http.LocalPollStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
@@ -675,6 +753,21 @@ public sealed partial class ConcurrencyTests
         public void StopAdmission() { }
         /// <inheritdoc />
         public Task EnqueueAsync(string botId, Update update, CancellationToken cancellationToken) => throw new InvalidOperationException("Unexpected fixture update.");
+    }
+
+    /// <summary>Captures real startup/lifecycle logger output while leaving delivery and operational state untouched.</summary>
+    /// <remarks>Only synthetic fixture messages enter this queue; no production logger provider, recipient or credential is involved.</remarks>
+    private sealed class EndpointStartupLogger : ILogger<MultiBotHostedService>
+    {
+        /// <summary>Actual event identity and formatted message, enabling the origin and durable-HTML surfaces to be distinguished.</summary>
+        public ConcurrentQueue<(int EventId, string Message)> Entries { get; } = new();
+        /// <inheritdoc />
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        /// <inheritdoc />
+        public bool IsEnabled(LogLevel logLevel) => true;
+        /// <inheritdoc />
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) => Entries.Enqueue((eventId.Id, formatter(state, exception)));
     }
     /// <summary>Controlled business execution boundary using the real scheduler/inbox rather than mocking claim order.</summary>
     /// <param name="execute">Consumer-visible handler invoked exactly once per successful durable claim.</param>

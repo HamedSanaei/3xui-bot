@@ -14,10 +14,31 @@ internal static class TelegramEndpointPresentation
         if (state.TelegramBotId <= 0) return "❔ اتصال نامشخص؛ هویت ربات موجود نیست";
         if (!enabled) return "⛔ اتصال غیرفعال؛ ربات غیرفعال است";
         if (state.RuntimeAvailable == false) return "⛔ اتصال متوقف؛ پذیرش درخواست بسته است";
-        if (state.RuntimeAvailable != true || !state.RuntimeEndpoint.HasValue || !Enum.IsDefined(state.RuntimeEndpoint.Value) || !state.RuntimeGeneration.HasValue)
-            return "❔ اتصال نامشخص؛ مسیر فعلی مشاهده نشده است";
-        return state.RuntimeEndpoint == TelegramEndpointType.Cloud ? "☁️ CLOUD" : "🏠 LOCAL";
+        var endpoint = AdmittedEndpoint(state, enabled);
+        return endpoint.HasValue ? EndpointBadge(endpoint.Value) : "❔ اتصال نامشخص؛ مسیر فعلی مشاهده نشده است";
     }
+
+    /// <summary>Identifies only a currently observed ordinary-request endpoint for both the inventory totals and individual badges.</summary>
+    /// <param name="state">Required detached current BotFather identity with the coordinator's gate snapshot; disabled bots have RuntimeAvailable=false.</param>
+    /// <param name="enabled">Current registry enablement, not the saved endpoint preference or receiver health.</param>
+    /// <returns>Cloud or Local only for an enabled, identified, admitted and observed generation; null for paused, disabled or unknown routing.</returns>
+    /// <remarks>This is read-only classification, not a health probe. Desired and last-effective endpoints never fill missing runtime observations.</remarks>
+    /// <example><code>var endpoint = TelegramEndpointPresentation.AdmittedEndpoint(state, enabled: true);</code></example>
+    internal static TelegramEndpointType? AdmittedEndpoint(TelegramEndpointState state, bool enabled)
+        => enabled && state.TelegramBotId > 0 && state.RuntimeAvailable == true && state.RuntimeEndpoint.HasValue &&
+            Enum.IsDefined(state.RuntimeEndpoint.Value) && state.RuntimeGeneration.HasValue ? state.RuntimeEndpoint : null;
+
+    /// <summary>Formats a verified endpoint origin without claiming network health or completed migration.</summary>
+    /// <param name="endpoint">Closed endpoint selected by a current route or the legacy Cloud-only client; never a URL or credential.</param>
+    /// <returns>The fixed CLOUD or LOCAL badge; an invalid enum remains explicitly unknown rather than defaulting to Cloud.</returns>
+    /// <remarks>Receiver-start events use their captured generation's origin, which may still be a staged destination with ordinary admission closed.</remarks>
+    /// <example><code>var label = TelegramEndpointPresentation.EndpointBadge(receiverRoute.Endpoint);</code></example>
+    internal static string EndpointBadge(TelegramEndpointType endpoint) => endpoint switch
+    {
+        TelegramEndpointType.Cloud => "☁️ CLOUD",
+        TelegramEndpointType.Local => "🏠 LOCAL",
+        _ => "❔ Endpoint نامشخص"
+    };
 
     /// <summary>Gets the destination of the current operation, separately from automatic fallback's preserved desired Local route.</summary>
     /// <param name="state">Detached durable operation metadata.</param>

@@ -1331,7 +1331,9 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     /// BotFather identity and a zero-timeout, non-dropping getUpdates proof before registration. Command setup and identity refresh continue in the background.
     /// Startup/receiver health and update reception emit only nonblocking metadata. Each update opens its
     /// receiver timeline before the bounded admin control path or durable admission; control-path completion
-    /// is explicit and never creates a durable inbox receipt. SDK-validated polls own health recovery.
+    /// is explicit and never creates a durable inbox receipt. SDK-validated polls own health recovery. The existing
+    /// receiver-start log and tenant lifecycle message include the captured receiver generation's Cloud/Local origin;
+    /// a staged migration start is explicitly not proof of final destination activation.
     /// </remarks>
     private async Task<BotStartupResult> StartBotCoreAsync(string botId, CancellationToken cancellationToken = default,
         bool strictEndpointValidation = false)
@@ -1398,8 +1400,10 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
             var receiverToken = botCts.Token;
             var client = _clientProvider.GetEndpointReceiverClient(bot.Id);
             var expectedBotIdentity = TelegramBotTokenIdentity.ExtractBotId(bot.Token);
-            var endpointGeneration = _endpointGate != null && expectedBotIdentity.HasValue ?
-                _endpointGate.GetRoute(bot.Id, expectedBotIdentity.Value).Generation : (long?)null;
+            var receiverRoute = _endpointGate != null && expectedBotIdentity.HasValue ?
+                _endpointGate.GetRoute(bot.Id, expectedBotIdentity.Value) : (TelegramEndpointRoute?)null;
+            var endpointGeneration = receiverRoute?.Generation;
+            var receiverEndpoint = receiverRoute?.Endpoint ?? TelegramEndpointType.Cloud;
             Telegram.Bot.Types.User me = null;
             Exception transientProbeError = null;
 
@@ -1505,15 +1509,19 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
             }
 
             _logger.LogInformation(
-                "Started Telegram bot receiver. botId={BotId}, username=@{Username}",
+                "Started Telegram bot receiver. botId={BotId}, username=@{Username}\nTelegram API: {Endpoint}{MigrationNotice}",
                 bot.Id,
-                me?.Username ?? bot.Username);
+                me?.Username ?? bot.Username,
+                TelegramEndpointPresentation.EndpointBadge(receiverEndpoint),
+                strictEndpointValidation ? "\n⏳ مقصد در حال آماده‌سازی است؛ فعال‌سازی نهایی انتقال هنوز تأیید نشده است." : string.Empty);
             if (IsTenant(bot))
                 LogTenantRuntimeEvent(
                     bot,
                     me?.Username ?? bot.Username,
-                    transientProbeError == null ? "روشن شد" : "روشن شد؛ در حال تکمیل اتصال",
-                    null);
+                    strictEndpointValidation ? "گیرندهٔ مقصد شروع شد؛ انتقال هنوز نهایی نشده است" :
+                        transientProbeError == null ? "روشن شد" : "روشن شد؛ در حال تکمیل اتصال",
+                    null,
+                    receiverEndpoint);
 
             TrackBackgroundTask(Task.Run(
                 () => CompleteBotInitializationAsync(
@@ -1588,7 +1596,7 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
             if (IsTenant(bot))
             {
                 _logger.LogError(ex, "Tenant Telegram bot receiver failed to start. botId={BotId}", bot.Id);
-                LogTenantRuntimeEvent(bot, bot.Username, "خطا در روشن شدن", ex.Message);
+                LogTenantRuntimeEvent(bot, bot.Username, "خطا در روشن شدن", ex.Message, null);
             }
             else
             {
@@ -2604,7 +2612,8 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
             DeserializeRuntimeStringList(tenant.TenantChannelIdsJson),
             tenant.SupportAccount,
             "خاموش شد",
-            reason);
+            reason,
+            null);
 
         if (notifyOwner && tenant.OwnerTelegramUserId.HasValue)
             await NotifyTenantOwnerTokenClearedAsync(tenant.OwnerTelegramUserId.Value, tenant.Username, cleanupToken);
@@ -2683,11 +2692,14 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     /// <summary>
     /// Writes the tenant runtime lifecycle event to the private operational Telegram log.
     /// </summary>
-    /// <param name="bot">Runtime tenant bot configuration.</param>
-    /// <param name="telegramUsername">Username returned by Telegram <c>GetMe</c>, when available.</param>
-    /// <param name="status">Human-readable lifecycle status such as started, stopped, or failed.</param>
-    /// <param name="error">Optional non-secret error text.</param>
-    private void LogTenantRuntimeEvent(BotInstanceConfig bot, string telegramUsername, string status, string error)
+    /// <param name="bot">Required current tenant configuration from the exact runtime registry; owns the internal bot identity and tenant settings, never a default owned-bot substitute.</param>
+    /// <param name="telegramUsername">Optional public bot username returned by GetMe; null/empty falls back only to this tenant's configured username.</param>
+    /// <param name="status">Required internal lifecycle description for the private operator channel; not customer payload or migration-success evidence.</param>
+    /// <param name="error">Optional non-secret error text; never pass a token-bearing URL, customer message or payment credential.</param>
+    /// <param name="receiverEndpoint">Captured receiver origin for a successful start; null for failure/stop events without a proven receiver origin.</param>
+    /// <remarks>Retains the existing durable HTML event and central logger channel. Endpoint metadata is not proof of network health or migration completion, and creates no financial backup intent.</remarks>
+    /// <example><code>LogTenantRuntimeEvent(bot, username, "روشن شد", null, receiverRoute.Endpoint);</code></example>
+    private void LogTenantRuntimeEvent(BotInstanceConfig bot, string telegramUsername, string status, string error, TelegramEndpointType? receiverEndpoint)
     {
         LogTenantRuntimeEvent(
             bot.Id,
@@ -2696,20 +2708,23 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
             bot.TenantChannelIds ?? new List<string>(),
             bot.SupportAccount,
             status,
-            error);
+            error,
+            receiverEndpoint);
     }
 
     /// <summary>
     /// Writes a tenant runtime lifecycle event as durable operational HTML using extracted tenant settings.
     /// </summary>
-    /// <param name="tenantId">Internal tenant bot id.</param>
-    /// <param name="tenantUsername">Last known public tenant bot username.</param>
-    /// <param name="ownerTelegramUserId">Telegram user id of the tenant owner, when known.</param>
-    /// <param name="channels">Tenant forced-join channels configured by the owner.</param>
-    /// <param name="supportAccount">Tenant support username or contact text.</param>
-    /// <param name="status">Lifecycle status shown in the private log channel.</param>
-    /// <param name="error">Optional non-secret error text shown in the private log channel.</param>
-    /// <remarks>Preserves the current bot context and central logger routing. This operational event never creates financial backup intent.</remarks>
+    /// <param name="tenantId">Required exact internal tenant BotId owning this lifecycle event, not a Telegram user/chat id.</param>
+    /// <param name="tenantUsername">Optional last-known public bot username; missing identity is shown explicitly rather than guessed.</param>
+    /// <param name="ownerTelegramUserId">Optional numeric Telegram user id of this storefront owner; retained only in the existing private operational audit.</param>
+    /// <param name="channels">Optional tenant-owned forced-join channel references; existing private HTML formatting handles empty values.</param>
+    /// <param name="supportAccount">Optional tenant-configured public support reference, not a credential.</param>
+    /// <param name="status">Required internal lifecycle description for the private logger channel; ordinary receiver start is not final migration activation.</param>
+    /// <param name="error">Optional secret-free error explanation; customer payload and token-bearing request URLs are forbidden.</param>
+    /// <param name="receiverEndpoint">Optional proven receiver-start Cloud/Local origin; null omits it instead of guessing a route for a stopped or rejected identity.</param>
+    /// <remarks>Preserves the current bot context and central logger routing. A receiver origin alone never claims final migration activation. This operational event never creates financial backup intent.</remarks>
+    /// <example><code>LogTenantRuntimeEvent("tenant-123456-1", "sample_store_bot", 123456L, [], "@sample_support", "روشن شد", null, TelegramEndpointType.Cloud);</code></example>
     private void LogTenantRuntimeEvent(
         string tenantId,
         string tenantUsername,
@@ -2717,7 +2732,8 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
         IEnumerable<string> channels,
         string supportAccount,
         string status,
-        string error)
+        string error,
+        TelegramEndpointType? receiverEndpoint)
     {
         var owner = ownerTelegramUserId.HasValue
             ? $"<a href=\"tg://user?id={ownerTelegramUserId.Value}\">{ownerTelegramUserId.Value}</a>"
@@ -2730,6 +2746,7 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
         var message =
             "🤖 <b>وضعیت ربات فروشگاهی tenant</b>\n\n" +
             $"وضعیت: <b>{Html(status)}</b>\n" +
+            (receiverEndpoint.HasValue ? $"Telegram API: {Html(TelegramEndpointPresentation.EndpointBadge(receiverEndpoint.Value))}\n" : string.Empty) +
             $"ربات: <code>{Html(username)}</code>\n" +
             $"شناسه داخلی: <code>{Html(tenantId)}</code>\n" +
             $"مالک: {owner}\n" +

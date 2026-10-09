@@ -304,7 +304,7 @@ public sealed class TelegramEndpointAdminService
     /// <param name="token">Cancels UI metadata and bounded Telegram work.</param>
     /// <param name="notice">Optional fixed Persian outcome/progress label without raw error data.</param>
     /// <returns>A task completing after the new control keyboard is published.</returns>
-    /// <remarks>Main screens contain only connection, migration outcome and fixed Persian action. Technical screens are read-only fresh snapshots, paginated without dropping diagnostic content. Registration receipts expire independently and remain identity/control-revision bound.</remarks>
+    /// <remarks>Main screens contain only connection, migration outcome and fixed Persian action; inventory includes whole-inventory live Cloud/Local counts, with paused/disabled and unknown routes separate. Technical screens are read-only fresh snapshots, paginated without dropping diagnostic content. Registration receipts expire independently and remain identity/control-revision bound.</remarks>
     private async Task RenderAsync(string host, ITelegramBotClient client, long actor, long chat, int messageId,
         PanelCommand view, CancellationToken token, string notice = null)
     {
@@ -334,6 +334,7 @@ public sealed class TelegramEndpointAdminService
         {
             var inventory = await _coordinator.GetInventoryAsync(token);
             var page = Math.Clamp(view.Page, 0, Math.Max(0, (inventory.Count - 1) / PageSize));
+            AppendInventorySummary(text, inventory);
             text.AppendLine($"فهرست ربات‌ها — صفحه {page + 1}/{Math.Max(1, (inventory.Count + PageSize - 1) / PageSize)}");
             text.Insert(0, ActiveBadge(hostState) + "\n" + Action + "\n");
             foreach (var state in inventory.Skip(page * PageSize).Take(PageSize))
@@ -441,6 +442,30 @@ public sealed class TelegramEndpointAdminService
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
         deadline.CancelAfter(TimeSpan.FromSeconds(5));
         await client.EditMessageText(chat, messageId, body, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: deadline.Token);
+    }
+
+    /// <summary>Adds whole-inventory routing totals to the first control message and every inventory refresh/page.</summary>
+    /// <param name="text">Required operator-only message builder; receives only aggregate counts, not customer or token data.</param>
+    /// <param name="inventory">Required complete detached coordinator snapshot across owned, tenant and assistant bots; disabled identities already have RuntimeAvailable=false.</param>
+    /// <remarks>Counts ordinary-request admission, not saved preference, polling health or just the displayed page. This performs one in-memory pass without extra database or Telegram calls; fenced migration sources cannot inflate active counts.</remarks>
+    /// <example><code>AppendInventorySummary(text, await _coordinator.GetInventoryAsync(token));</code></example>
+    private static void AppendInventorySummary(StringBuilder text, IReadOnlyList<TelegramEndpointState> inventory)
+    {
+        var cloud = 0;
+        var local = 0;
+        var paused = 0;
+        var unknown = 0;
+        foreach (var state in inventory)
+        {
+            var endpoint = TelegramEndpointPresentation.AdmittedEndpoint(state, enabled: true);
+            if (endpoint == TelegramEndpointType.Cloud) cloud++;
+            else if (endpoint == TelegramEndpointType.Local) local++;
+            else if (state.TelegramBotId > 0 && state.RuntimeAvailable == false) paused++;
+            else unknown++;
+        }
+        text.AppendLine($"📊 مجموع ربات‌ها: {inventory.Count}");
+        text.AppendLine($"☁️ CLOUD: {cloud} | 🏠 LOCAL: {local}");
+        text.AppendLine($"⛔ متوقف/غیرفعال: {paused} | ❔ نامشخص: {unknown}");
     }
 
     /// <summary>Adds progress with historical source separated from current admission.</summary>
