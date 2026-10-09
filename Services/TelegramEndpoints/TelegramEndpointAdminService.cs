@@ -70,7 +70,8 @@ public sealed class TelegramEndpointAdminService
     /// <summary>The exact owned administration-menu entry; /telegram_api provides an alternate healthy owned-host path.</summary>
     public const string Action = "🌐 مدیریت Telegram API";
     private const string Prefix = "tep:";
-    private const int PageSize = 6;
+    /// <summary>Three complete operational summaries per page keep fixed Persian diagnostics below Telegram's text limit without truncation.</summary>
+    private const int PageSize = 3;
     private const int MaxSessions = 512;
     /// <summary>Absolute bounded report lifetime, longer than the official ten-minute Cloud cooldown; callback confirmations still expire after ten minutes.</summary>
     private static readonly TimeSpan BulkReportLifetime = TimeSpan.FromHours(1);
@@ -80,6 +81,8 @@ public sealed class TelegramEndpointAdminService
     private readonly Microsoft.Extensions.Configuration.IConfiguration _liveConfiguration;
     private readonly BotRegistry _registry;
     private readonly TelegramEndpointRoutingOptions _options;
+    /// <summary>Authoritative startup configuration location for read-only operator diagnostics; never reads the private JSON file.</summary>
+    private readonly ApplicationConfigurationSource _configurationSource;
     private readonly ILogger<TelegramEndpointAdminService> _logger;
     private readonly TelegramInteractionTimeouts _timeouts;
     private readonly TimeProvider _time;
@@ -98,11 +101,13 @@ public sealed class TelegramEndpointAdminService
     /// <param name="timeouts">Optional immutable callback budget; defaults to the existing production deadline.</param>
     /// <param name="timeProvider">Optional deterministic UTC clock for session expiry and cooldown presentation.</param>
     /// <param name="liveConfiguration">Optional live application configuration; production supplies it so a removed global admin cannot use stale startup authority.</param>
+    /// <param name="configurationSource">Optional authoritative content-root configuration source; absent test constructions report an unavailable source rather than guessing a path.</param>
+    /// <remarks>Construction retains trusted configuration metadata only; technical views never load JSON or hot-change startup routing/file mappings.</remarks>
     /// <example><code>await panel.TryHandleAsync(hostingBotId, client, update, cancellationToken);</code></example>
     public TelegramEndpointAdminService(ITelegramEndpointAdministration coordinator, AppConfig configuration,
         BotRegistry registry, TelegramEndpointRoutingOptions options, ILogger<TelegramEndpointAdminService> logger,
         TelegramInteractionTimeouts timeouts = null, TimeProvider timeProvider = null,
-        Microsoft.Extensions.Configuration.IConfiguration liveConfiguration = null)
+        Microsoft.Extensions.Configuration.IConfiguration liveConfiguration = null, ApplicationConfigurationSource configurationSource = null)
     {
         _coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
@@ -112,6 +117,7 @@ public sealed class TelegramEndpointAdminService
         _timeouts = timeouts ?? TelegramInteractionTimeouts.Production;
         _time = timeProvider ?? TimeProvider.System;
         _liveConfiguration = liveConfiguration;
+        _configurationSource = configurationSource;
     }
 
     /// <summary>Consumes endpoint-panel entries or callbacks before stale business flows on a healthy owned host.</summary>
@@ -183,7 +189,7 @@ public sealed class TelegramEndpointAdminService
                 await AckAsync(client, callback, hostingBotId, "وضعیت یا هویت ربات تغییر کرده است؛ پنل تازه نمایش داده می‌شود.", token);
                 var freshView = command.BotId != null && host.TelegramBotId == session.HostIdentity &&
                     current.TelegramBotId == command.Identity
-                    ? command with { Kind = CommandKind.Detail, Revision = current.ControlRevision }
+                    ? command with { Kind = command.Kind == CommandKind.Technical ? CommandKind.Technical : CommandKind.Detail, Revision = current.ControlRevision, Receipt = null }
                     : new PanelCommand(CommandKind.Inventory);
                 await RenderAsync(hostingBotId, client, actor, message.Chat.Id, message.Id, freshView, token);
                 return true;
@@ -223,14 +229,25 @@ public sealed class TelegramEndpointAdminService
             }
             if (command.Kind == CommandKind.Migrate)
             {
-                // Publish refresh controls before the queued operation can fence this very receiver.
-                await RenderAsync(hostingBotId, client, actor, message.Chat.Id, message.Id,
-                    command with { Kind = CommandKind.Detail }, token,
-                    "در حال ثبت درخواست انتقال؛ نتیجه نهایی را با «تازه‌سازی» یا /telegram_api در ربات اصلی سالم دیگری ببینید.");
-                var result = await _coordinator.RequestMigrationAsync(command.BotId, command.Target, actor, command.Revision, command.Identity, token);
-                if (result != "accepted")
-                    await RenderAsync(hostingBotId, client, actor, message.Chat.Id, message.Id,
-                        command with { Kind = CommandKind.Detail }, token, ResultLabel(result));
+                // The mutable bounded receipt is already bound to refresh/technical controls before possible host fencing.
+                var receipt = new ControlReceipt(command.Identity, command.Revision, _time.GetUtcNow().AddMinutes(10));
+                var progress = command with { Kind = CommandKind.Detail, Receipt = receipt };
+                await RenderAsync(hostingBotId, client, actor, message.Chat.Id, message.Id, progress, token,
+                    "⏳ در حال ثبت درخواست انتقال؛ هنوز پذیرش یا تکمیل اثبات نشده است. نتیجه را با تازه‌سازی یا در ربات اصلی سالم دیگری ببینید.");
+                string result;
+                try
+                {
+                    result = await _coordinator.RequestMigrationAsync(command.BotId, command.Target, actor, command.Revision, command.Identity, token);
+                    lock (_sync) receipt.Category = result;
+                }
+                catch
+                {
+                    lock (_sync) receipt.Category = "registration_uncertain";
+                    throw;
+                }
+                if (result is not ("accepted" or "registration_uncertain"))
+                    await RenderAsync(hostingBotId, client, actor, message.Chat.Id, message.Id, progress, token,
+                        result == "stale" ? ResultLabel(result) : null);
                 return true;
             }
             string notice = null;
@@ -287,7 +304,7 @@ public sealed class TelegramEndpointAdminService
     /// <param name="token">Cancels UI metadata and bounded Telegram work.</param>
     /// <param name="notice">Optional fixed Persian outcome/progress label without raw error data.</param>
     /// <returns>A task completing after the new control keyboard is published.</returns>
-    /// <remarks>Actual admission appears before desired/last-activated routes. Migration success requires exact current-operation activation history and timestamp; trailing telemetry/history lines alone may be omitted when the fixed message bound is reached.</remarks>
+    /// <remarks>Main screens contain only connection, migration outcome and fixed Persian action. Technical screens are read-only fresh snapshots, paginated without dropping diagnostic content. Registration receipts expire independently and remain identity/control-revision bound.</remarks>
     private async Task RenderAsync(string host, ITelegramBotClient client, long actor, long chat, int messageId,
         PanelCommand view, CancellationToken token, string notice = null)
     {
@@ -319,13 +336,13 @@ public sealed class TelegramEndpointAdminService
             var page = Math.Clamp(view.Page, 0, Math.Max(0, (inventory.Count - 1) / PageSize));
             text.AppendLine($"فهرست ربات‌ها — صفحه {page + 1}/{Math.Max(1, (inventory.Count + PageSize - 1) / PageSize)}");
             text.Insert(0, ActiveBadge(hostState) + "\n" + Action + "\n");
-            text.AppendLine("نشان مسیر فعال فقط پذیرش عادی در gate است؛ تضمین سلامت شبکه/دریافت پیام نیست.");
             foreach (var state in inventory.Skip(page * PageSize).Take(PageSize))
             {
                 text.AppendLine($"{ActiveBadge(state)} | {BotLabel(state.BotId)}");
-                text.AppendLine($"انتخاب: {(state.TelegramBotId > 0 ? EndpointLabel(state.DesiredEndpoint) : "نامشخص")} | آخرین مسیر فعال‌شده: {(state.TelegramBotId > 0 ? EndpointLabel(state.EffectiveEndpoint) : "نامشخص")}");
                 var outcomeHistory = state.TelegramBotId > 0 ? await _coordinator.GetHistoryAsync(state.BotId, token) : Array.Empty<TelegramEndpointHistory>();
-                text.AppendLine(TelegramEndpointPresentation.OutcomeLabel(state, outcomeHistory));
+                AppendConnection(text, state, outcomeHistory);
+                text.AppendLine(TelegramEndpointPresentation.MainOutcomeLabel(state, outcomeHistory));
+                AppendDiagnostic(text, state.LastFailureCategory, state, technical: false);
                 AddButton(rows, commands, nonce, "جزئیات «" + BotLabel(state.BotId) + "»", new PanelCommand(CommandKind.Detail, state.BotId, state.TelegramBotId, state.ControlRevision, page));
             }
             if (page > 0) AddButton(rows, commands, nonce, "◀️ صفحه قبل", new PanelCommand(CommandKind.Inventory, Identity: hostState.TelegramBotId, Revision: hostState.ControlRevision, Page: page - 1));
@@ -343,65 +360,75 @@ public sealed class TelegramEndpointAdminService
         {
             var state = await _coordinator.GetStatusAsync(view.BotId, token);
             var detail = view with { Kind = CommandKind.Detail, Identity = state.TelegramBotId, Revision = state.ControlRevision };
-            text.Insert(0, ActiveBadge(state) + "\n" + Action + "\n");
-            text.AppendLine($"ربات: {BotLabel(state.BotId)} — شناسه Telegram: {state.TelegramBotId}");
             var history = state.TelegramBotId > 0 ? await _coordinator.GetHistoryAsync(state.BotId, token) : Array.Empty<TelegramEndpointHistory>();
-            text.AppendLine(TelegramEndpointPresentation.OutcomeLabel(state, history));
-            var requested = history.FirstOrDefault(x => !string.IsNullOrEmpty(state.OperationId) && x.OperationId == state.OperationId && x.Reason == "migration_requested");
-            var source = requested?.FromEffectiveEndpoint ?? state.LogoutEndpoint;
-            text.AppendLine(state.TelegramBotId <= 0 || string.IsNullOrEmpty(state.OperationId)
-                ? "انتقال جاری: برای هویت جاری ثبت نشده/نامشخص"
-                : $"انتقال جاری: مبدأ {(source.HasValue ? EndpointLabel(source.Value) : "نامشخص")} ← مقصد {EndpointLabel(TelegramEndpointPresentation.Target(state))}");
-            text.AppendLine($"شروع UTC: {Utc(state.MigrationStartedAtUtc)} | فعال‌سازی مقصد UTC: {(TelegramEndpointPresentation.Outcome(state, history) == "succeeded" ? Utc(state.LastMigrationAtUtc) : "هنوز اثبات نشده")}");
-            text.AppendLine($"انتخاب مدیر: {(state.TelegramBotId > 0 ? EndpointLabel(state.DesiredEndpoint) : "نامشخص؛ هویت موجود نیست")} | آخرین مسیر فعال‌شده: {(state.TelegramBotId > 0 ? EndpointLabel(state.EffectiveEndpoint) : "نامشخص؛ مسیر منتشر نشده")}");
-            text.AppendLine($"وضعیت پایدار پروتکل: {StateLabel(state.MigrationState)} | نسل مسیر فعلی: {state.RuntimeGeneration?.ToString(CultureInfo.InvariantCulture) ?? "نامشخص"}");
-            text.AppendLine("مسیر فعال یعنی پذیرش عادی در gate؛ تضمین سلامت شبکه یا زنده‌بودن دریافت‌کننده نیست.");
-            if (view.Kind == CommandKind.Confirm)
-                text.AppendLine($"⚠️ انتقال به {EndpointLabel(view.Target)} را تأیید می‌کنید؟ دریافت پیام این ربات موقتاً متوقف می‌شود؛ خروج bot-specific و مهلت رسمی Cloud لازم است.");
-            var configured = _registry.Bots.FirstOrDefault(x => x.Id == state.BotId);
-            text.AppendLine($"پیکربندی ربات: {(configured?.Enabled == true ? "فعال" : "غیرفعال")} | هویت معتبر: {(state.TelegramBotId > 0 ? "بله" : "خیر؛ توکن/هویت پیکربندی نشده")}");
-            var health = _coordinator.SharedLocalHealth;
-            text.AppendLine($"سرور محلی: {(health.Reachable ? "در دسترس؛ احراز هویت ربات نیست" : "در دسترس نیست/هنوز بررسی نشده")}");
-            text.AppendLine($"بررسی سرور UTC: {Utc(health.LastCheckedAtUtc)} | آخرین موفقیت سرور UTC: {Utc(health.LastSuccessAtUtc)}");
-            text.AppendLine($"آخرین بررسی ربات UTC: {Utc(state.LastHealthCheckAtUtc)}");
-            text.AppendLine($"آخرین موفقیت ربات UTC: {Utc(state.LastSuccessfulHealthAtUtc)}");
-            text.AppendLine($"آخرین انتقال UTC: {Utc(state.LastMigrationAtUtc)} | تلاش ایمن بعدی UTC: {Utc(state.NextAttemptAtUtc)}");
-            text.AppendLine($"آخرین خطا: {FailureLabel(state.LastFailureCategory)} | زمان UTC: {Utc(state.LastFailureAtUtc)}");
-            var remaining = state.CloudReuseEligibleAtUtc.HasValue ? Math.Max(0, (state.CloudReuseEligibleAtUtc.Value - _time.GetUtcNow().UtcDateTime).TotalSeconds) : 0;
-            text.AppendLine(state.TelegramBotId > 0
-                ? $"انتظار مجاز Cloud: {Math.Ceiling(remaining)} ثانیه | موعد UTC: {Utc(state.CloudReuseEligibleAtUtc)}"
-                : "انتظار مجاز Cloud: نامشخص؛ هویت معتبر موجود نیست");
-            text.AppendLine($"بازگشت اضطراری خودکار: {(state.TelegramBotId <= 0 ? "نامشخص؛ هویت موجود نیست" : state.AutoFailoverEnabled ? "روشن" : "خاموش")} | بازگشت خودکار به Local: {(_options.AutomaticFailback ? "روشن" : "خاموش")}");
-            text.AppendLine($"مدیریت مسیر: {(_options.Enabled ? "فعال" : "غیرفعال در پیکربندی")}");
-            text.AppendLine($"پیش‌نیاز فایل Local: {(!string.IsNullOrWhiteSpace(_options.LocalFileServerRoot) && !string.IsNullOrWhiteSpace(_options.LocalFileHostRoot) ? "نگاشت مسیر تنظیم شده" : "نگاشت مطمئن مسیر سرور/میزبان تنظیم نشده؛ انتقال Local مجاز نیست")}");
-            if (state.LogoutAttemptedAtUtc.HasValue && !state.LogoutAcknowledgedAtUtc.HasValue)
-                text.AppendLine("⚠️ خروج نامطمئن/در انتظار: تکرار logOut یا فعال‌سازی اجباری Cloud مجاز نیست؛ بررسی دستی لازم است.");
-            if (state.TelegramBotId <= 0)
+            var receiptCategory = ReceiptCategory(view.Receipt, state);
+            if (view.Kind == CommandKind.Technical)
             {
-                text.AppendLine("⚠️ بدون هویت معتبر، مسیر Cloud فرض نمی‌شود و انتقال/بازگشت اضطراری مجاز نیست. ابتدا پیکربندی ربات را اصلاح کنید.");
-                AddButton(rows, commands, nonce, "🔄 تازه‌سازی وضعیت", detail);
-                text.AppendLine("تاریخچه هویت جاری در دسترس نیست؛ هیچ هویتی از سوابق قدیمی حدس زده نمی‌شود.");
-            }
-            else if (view.Kind == CommandKind.Confirm)
-            {
-                AddButton(rows, commands, nonce, "✅ تأیید انتقال به " + EndpointLabel(view.Target), detail with { Kind = CommandKind.Migrate, Target = view.Target });
-                AddButton(rows, commands, nonce, "❌ انصراف", detail);
+                text.AppendLine("🔍 جزئیات فنی — فقط خواندنی");
+                text.AppendLine($"ربات: {BotLabel(state.BotId)} — شناسه Telegram: {state.TelegramBotId}");
+                if (view.BatchId != null)
+                {
+                    lock (_sync)
+                    {
+                        if (_reports.TryGetValue(view.BatchId, out var report) && report.Actor == actor)
+                        {
+                            var frozen = report.Targets.FirstOrDefault(x => x.BotId == state.BotId);
+                            text.AppendLine($"گزارش دسته‌ای — هویت ثابت: {frozen?.Identity} | مقصد: {RouteName(report.Target)} | انقضا UTC: {report.Expires:yyyy-MM-dd HH:mm:ss 'UTC'}");
+                        }
+                    }
+                }
+                text.AppendLine(ActiveBadge(state));
+                text.AppendLine(TelegramEndpointPresentation.OutcomeLabel(state, history));
+                if (receiptCategory != null) text.AppendLine("نتیجه ثبت همین درخواست: " + ResultLabel(receiptCategory));
+                AppendDiagnostic(text, receiptCategory, state, technical: true);
+                if (!string.IsNullOrEmpty(state.LastFailureCategory)) text.AppendLine("خطای وضعیت فعلی:");
+                AppendDiagnostic(text, state.LastFailureCategory, state, technical: true);
+                if (state.MigrationState == TelegramEndpointMigrationState.CloudWait)
+                    AppendDiagnostic(text, "cloud_cooldown", state, technical: true);
+                await AppendTechnicalAsync(text, state, history, token);
+                var pages = TechnicalPages(text.ToString());
+                var technicalPage = Math.Clamp(view.TechnicalPage, 0, pages.Count - 1);
+                text.Clear().AppendLine($"🔍 جزئیات فنی — صفحه {technicalPage + 1}/{pages.Count}").Append(pages[technicalPage]);
+                var technical = detail with { Kind = CommandKind.Technical, TechnicalPage = technicalPage };
+                AddButton(rows, commands, nonce, "🔄 تازه‌سازی جزئیات فنی", technical);
+                if (technicalPage > 0) AddButton(rows, commands, nonce, "◀️ بخش فنی قبل", technical with { TechnicalPage = technicalPage - 1 });
+                if (technicalPage + 1 < pages.Count) AddButton(rows, commands, nonce, "بخش فنی بعد ▶️", technical with { TechnicalPage = technicalPage + 1 });
+                AddButton(rows, commands, nonce, "↩️ بازگشت به وضعیت ربات", detail);
+                if (view.BatchId != null) AddButton(rows, commands, nonce, "📊 بازگشت به گزارش", new PanelCommand(CommandKind.BulkReport, Identity: hostState.TelegramBotId, BatchId: view.BatchId, Page: view.Page));
             }
             else
             {
-                AddButton(rows, commands, nonce, "🔄 تازه‌سازی وضعیت و سلامت", detail with { Kind = CommandKind.Refresh });
-                AddButton(rows, commands, nonce, "انتقال به Cloud…", detail with { Kind = CommandKind.Confirm, Target = TelegramEndpointType.Cloud });
-                AddButton(rows, commands, nonce, "انتقال به Local…", detail with { Kind = CommandKind.Confirm, Target = TelegramEndpointType.Local });
-                AddButton(rows, commands, nonce, state.AutoFailoverEnabled ? "خاموش‌کردن بازگشت اضطراری" : "روشن‌کردن بازگشت اضطراری", detail with { Kind = CommandKind.Failover, Enabled = !state.AutoFailoverEnabled });
-                text.AppendLine("تاریخچه اخیر:");
-                foreach (var item in history.Take(6)) AppendOptional(text, HistoryLabel(item));
-                if (history.Count == 0) text.AppendLine("رویدادی ثبت نشده است.");
+                text.Insert(0, ActiveBadge(state) + "\n" + Action + "\n");
+                text.AppendLine($"ربات: {BotLabel(state.BotId)}");
+                AppendConnection(text, state, history);
+                // A pre-registration screen must not reuse a previous operation's success as the new request's result.
+                text.AppendLine(view.Receipt != null && notice != null
+                    ? "⏳ نتیجه انتقال: درخواست جدید هنوز پذیرفته نشده؛ نتیجه را تازه‌سازی کنید."
+                    : TelegramEndpointPresentation.MainOutcomeLabel(state, history));
+                if (receiptCategory != null) text.AppendLine("ثبت درخواست: " + ResultLabel(receiptCategory));
+                AppendDiagnostic(text, receiptCategory, state, technical: false);
+                AppendDiagnostic(text, state.LastFailureCategory, state, technical: false);
+                if (view.Kind == CommandKind.Confirm)
+                    text.AppendLine($"⚠️ انتقال به {EndpointLabel(view.Target)} را تأیید می‌کنید؟ دریافت پیام این ربات موقتاً متوقف می‌شود؛ خروج اختصاصی ربات و مهلت رسمی CLOUD لازم است.");
+                if (state.TelegramBotId <= 0)
+                    AddButton(rows, commands, nonce, "🔄 تازه‌سازی وضعیت", detail);
+                else if (view.Kind == CommandKind.Confirm)
+                {
+                    AddButton(rows, commands, nonce, "✅ تأیید انتقال به " + EndpointLabel(view.Target), detail with { Kind = CommandKind.Migrate, Target = view.Target });
+                    AddButton(rows, commands, nonce, "❌ انصراف", detail);
+                }
+                else
+                {
+                    AddButton(rows, commands, nonce, "🔄 تازه‌سازی وضعیت و سلامت", detail with { Kind = CommandKind.Refresh });
+                    AddButton(rows, commands, nonce, "انتقال به Cloud…", detail with { Kind = CommandKind.Confirm, Target = TelegramEndpointType.Cloud, Receipt = null });
+                    AddButton(rows, commands, nonce, "انتقال به Local…", detail with { Kind = CommandKind.Confirm, Target = TelegramEndpointType.Local, Receipt = null });
+                    AddButton(rows, commands, nonce, state.AutoFailoverEnabled ? "خاموش‌کردن بازگشت اضطراری" : "روشن‌کردن بازگشت اضطراری", detail with { Kind = CommandKind.Failover, Enabled = !state.AutoFailoverEnabled });
+                }
+                AddButton(rows, commands, nonce, "🔍 جزئیات فنی", detail with { Kind = CommandKind.Technical, TechnicalPage = 0 });
             }
             AddButton(rows, commands, nonce, "📋 بازگشت به فهرست", new PanelCommand(CommandKind.Inventory, Identity: hostState.TelegramBotId, Revision: hostState.ControlRevision, Page: view.Page));
         }
-        var pending = await _coordinator.GetPendingAlertCountAsync(token);
-        AppendOptional(text, $"اعلان‌های تحویل‌نشده/نامطمئن: {pending}");
-        AppendOptional(text, await NotificationLabelAsync(token));
+        // Logger/configuration/history belong exclusively to the authenticated technical view.
         var body = text.ToString();
         if (messageId == 0) messageId = (await SendTextAsync(client, chat, body, token)).Id;
         lock (_sync)
@@ -416,20 +443,139 @@ public sealed class TelegramEndpointAdminService
         await client.EditMessageText(chat, messageId, body, replyMarkup: new InlineKeyboardMarkup(rows), cancellationToken: deadline.Token);
     }
 
+    /// <summary>Adds progress with historical source separated from current admission.</summary>
+    /// <param name="text">Operational output body.</param>
+    /// <param name="state">Fresh current identity and route.</param>
+    /// <param name="history">Current identity operation receipts.</param>
+    /// <remarks>A historical source is never described as active when admission is paused.</remarks>
+    private void AppendConnection(StringBuilder text, TelegramEndpointState state, IReadOnlyList<TelegramEndpointHistory> history)
+    {
+        if (TelegramEndpointPresentation.Outcome(state, history) != "pending") return;
+        text.AppendLine("⏳ در حال انتقال");
+        var source = history.FirstOrDefault(x => x.OperationId == state.OperationId && x.Reason == "migration_requested")?.FromEffectiveEndpoint ?? state.LogoutEndpoint;
+        text.AppendLine($"مبدأ انتقال: {(source.HasValue ? RouteName(source.Value) : "نامشخص")} → مقصد: {RouteName(TelegramEndpointPresentation.Target(state))}");
+        text.AppendLine("اتصال فعلی: " + ActiveBadge(state));
+    }
+
+    /// <summary>Reads a receipt only while its original identity, revision and expiry match.</summary>
+    /// <param name="receipt">Optional session-held closed result receipt.</param>
+    /// <param name="state">Fresh configured identity and revision.</param>
+    /// <returns>Retained category, or null after expiry/replacement.</returns>
+    /// <remarks>Locking publishes the result written after pre-fence UI delivery; no request is registered by this read.</remarks>
+    private string ReceiptCategory(ControlReceipt receipt, TelegramEndpointState state)
+    {
+        lock (_sync)
+            return receipt != null && receipt.Identity == state.TelegramBotId && receipt.Revision == state.ControlRevision &&
+                receipt.Expires > _time.GetUtcNow() ? receipt.Category : null;
+    }
+
+    /// <summary>Renders fixed catalog messages/actions; codes and stages appear only on technical screens.</summary>
+    /// <param name="text">Output body.</param>
+    /// <param name="category">Closed backend category, never exception text.</param>
+    /// <param name="state">Fresh identity snapshot for stage-aware interpretation.</param>
+    /// <param name="technical">True includes code, stage and checked prerequisite.</param>
+    /// <remarks>Unrecognized values use the catalog fallback and are never echoed.</remarks>
+    private static void AppendDiagnostic(StringBuilder text, string category, TelegramEndpointState state, bool technical)
+    {
+        if (category is null or "" or "none") return;
+        var diagnostic = TelegramEndpointDiagnosticCatalog.Describe(category, state);
+        if (diagnostic == null) return;
+        text.AppendLine("⚠️ " + diagnostic.Message);
+        text.AppendLine("اقدام: " + diagnostic.Action);
+        if (!technical) return;
+        text.AppendLine("کد: " + diagnostic.Code + " | مرحله: " + diagnostic.Stage);
+        text.AppendLine("بررسی‌شده: " + diagnostic.Checked);
+    }
+
+    /// <summary>Collects secret-free technical state, mapping provenance and history without probes or mutations.</summary>
+    /// <param name="text">Technical body, paginated without truncation.</param>
+    /// <param name="state">Current bot's detached snapshot.</param>
+    /// <param name="history">Current identity's bounded audit history.</param>
+    /// <param name="token">Cancels local metadata reads.</param>
+    /// <returns>A task completing after read-only diagnostics are collected.</returns>
+    /// <remarks>Mapping remains startup-bound to preserve file epochs; live changes require restart. Closed history failures retain their own diagnostics after later health clears the current failure.</remarks>
+    private async Task AppendTechnicalAsync(StringBuilder text, TelegramEndpointState state, IReadOnlyList<TelegramEndpointHistory> history, CancellationToken token)
+    {
+        text.AppendLine($"Generation: {state.RuntimeGeneration?.ToString(CultureInfo.InvariantCulture) ?? "نامشخص"} | Gate: {state.RuntimeAvailable?.ToString() ?? "نامشخص"} | Runtime endpoint: {(state.RuntimeEndpoint.HasValue ? RouteName(state.RuntimeEndpoint.Value) : "نامشخص")}");
+        text.AppendLine($"Migration State: {StateLabel(state.MigrationState)} | ControlRevision: {state.ControlRevision}");
+        text.AppendLine($"انتخاب ذخیره‌شده: {RouteName(state.DesiredEndpoint)} | آخرین فعال‌سازی: {RouteName(state.EffectiveEndpoint)}");
+        text.AppendLine($"شروع UTC: {Utc(state.MigrationStartedAtUtc)} | فعال‌سازی همین عملیات UTC: {(TelegramEndpointPresentation.Outcome(state, history) == "succeeded" ? Utc(state.LastMigrationAtUtc) : "اثبات نشده")}");
+        text.AppendLine($"بررسی ربات UTC: {Utc(state.LastHealthCheckAtUtc)} | سلامت موفق UTC: {Utc(state.LastSuccessfulHealthAtUtc)}");
+        text.AppendLine($"آخرین خطا UTC: {Utc(state.LastFailureAtUtc)} | تلاش ایمن بعدی UTC: {Utc(state.NextAttemptAtUtc)}");
+        text.AppendLine($"خروج آغازشده UTC: {Utc(state.LogoutAttemptedAtUtc)} | خروج تأییدشده UTC: {Utc(state.LogoutAcknowledgedAtUtc)}");
+        var remaining = state.CloudReuseEligibleAtUtc.HasValue ? Math.Max(0, (state.CloudReuseEligibleAtUtc.Value - _time.GetUtcNow().UtcDateTime).TotalSeconds) : 0;
+        text.AppendLine($"انتظار مجاز CLOUD: {Math.Ceiling(remaining)} ثانیه | موعد UTC: {Utc(state.CloudReuseEligibleAtUtc)}");
+        text.AppendLine($"بازگشت اضطراری: {(state.AutoFailoverEnabled ? "روشن" : "خاموش")} | بازگشت خودکار LOCAL: {(_options.AutomaticFailback ? "روشن" : "خاموش")}");
+        text.AppendLine($"مدیریت مسیر: {(_options.Enabled ? "فعال" : "غیرفعال")}");
+        text.AppendLine("منبع پیکربندی: " + (_configurationSource?.FilePath ?? "منبع در دسترس نیست"));
+        text.AppendLine("نگاشت آغاز اجرا — localFileServerRoot: " + (string.IsNullOrWhiteSpace(_options.LocalFileServerRoot) ? "تنظیم نشده" : _options.LocalFileServerRoot));
+        text.AppendLine("نگاشت آغاز اجرا — localFileHostRoot: " + (string.IsNullOrWhiteSpace(_options.LocalFileHostRoot) ? "تنظیم نشده" : _options.LocalFileHostRoot));
+        if (_liveConfiguration != null)
+        {
+            var liveServer = _liveConfiguration["telegramEndpointRouting:localFileServerRoot"];
+            var liveHost = _liveConfiguration["telegramEndpointRouting:localFileHostRoot"];
+            text.AppendLine("نگاشت پیکربندی فعلی — localFileServerRoot: " + (string.IsNullOrWhiteSpace(liveServer) ? "تنظیم نشده" : liveServer));
+            text.AppendLine("نگاشت پیکربندی فعلی — localFileHostRoot: " + (string.IsNullOrWhiteSpace(liveHost) ? "تنظیم نشده" : liveHost));
+            if (!string.Equals(liveServer ?? "", _options.LocalFileServerRoot ?? "", StringComparison.Ordinal) ||
+                !string.Equals(liveHost ?? "", _options.LocalFileHostRoot ?? "", StringComparison.Ordinal))
+                text.AppendLine("⚠️ نگاشت فعلی با آغاز اجرا متفاوت است؛ پس از اصلاح، راه‌اندازی مجدد لازم است. مسیرهای فایل زنده تغییر نمی‌کنند.");
+        }
+        text.AppendLine(_options.HasLocalFileMapping ? "پیش‌نیاز فایل LOCAL: ریشه‌ها تنظیم شده‌اند؛ خوانایی و مجوز از این نمایش اثبات نمی‌شود." : "پیش‌نیاز فایل LOCAL: نگاشت مطمئن تنظیم نشده است.");
+        var health = _coordinator.SharedLocalHealth;
+        text.AppendLine($"سرور محلی: {(health.Reachable ? "در دسترس؛ احراز هویت ربات نیست" : "در دسترس نیست/بررسی نشده")} | بررسی UTC: {Utc(health.LastCheckedAtUtc)} | موفق UTC: {Utc(health.LastSuccessAtUtc)}");
+        text.AppendLine($"اعلان‌های تحویل‌نشده/نامطمئن: {await _coordinator.GetPendingAlertCountAsync(token)}");
+        text.AppendLine(await NotificationLabelAsync(token));
+        text.AppendLine("تاریخچه اخیر:");
+        foreach (var item in history.Take(6))
+        {
+            text.AppendLine(HistoryLabel(item));
+            if (item.Reason is ("migration_failed" or "migration_admission_failed" or "logout_refused" or "logout_uncertain" or
+                "manual_intervention" or "safe_retry_scheduled" or "startup_reconciled") &&
+                (!Enum.TryParse<TelegramEndpointMigrationState>(item.Outcome, out var oldState) || !Enum.IsDefined(oldState)))
+                AppendDiagnostic(text, item.Outcome, null, technical: true);
+        }
+        if (history.Count == 0) text.AppendLine("رویدادی ثبت نشده است.");
+        if (state.TelegramBotId <= 0) text.AppendLine("هیچ هویتی از سوابق قدیمی حدس زده نمی‌شود.");
+    }
+
+    /// <summary>Splits complete technical output into bounded Unicode-safe pages without dropping any diagnostic or path.</summary>
+    /// <param name="body">Secret-free technical text, including trusted filesystem paths.</param>
+    /// <returns>Nonempty pages at most 3000 UTF-16 code units each.</returns>
+    /// <remarks>Splitting preserves surrogate pairs; navigation exposes every part instead of silently omitting history/actions.</remarks>
+    private static IReadOnlyList<string> TechnicalPages(string body)
+    {
+        var pages = new List<string>();
+        for (var offset = 0; offset < body.Length;)
+        {
+            var count = Math.Min(3000, body.Length - offset);
+            if (offset + count < body.Length)
+            {
+                var newline = body.LastIndexOf('\n', offset + count - 1, count);
+                if (newline >= offset) count = newline - offset + 1;
+                else if (char.IsHighSurrogate(body[offset + count - 1])) count--;
+            }
+            pages.Add(body.Substring(offset, count));
+            offset += count;
+        }
+        if (pages.Count == 0) pages.Add("");
+        return pages;
+    }
+
+    /// <summary>Names endpoint kinds without suggesting that a durable endpoint admits requests.</summary>
+    /// <param name="endpoint">Closed durable or observed endpoint enum.</param>
+    /// <returns>Uppercase CLOUD/LOCAL or a fixed unknown label.</returns>
+    private static string RouteName(TelegramEndpointType endpoint) => endpoint switch
+    {
+        TelegramEndpointType.Cloud => "CLOUD",
+        TelegramEndpointType.Local => "LOCAL",
+        _ => "نامشخص"
+    };
     /// <summary>Formats a bot's runtime admission badge using its current enabled configuration.</summary>
     /// <param name="state">Detached identity-bound observation from the coordinator.</param>
     /// <returns>A badge that never promotes a disabled, missing or fenced route to active.</returns>
     private string ActiveBadge(TelegramEndpointState state)
         => TelegramEndpointPresentation.ActiveBadge(state, _registry.Bots.Any(x => x.Id == state.BotId && x.Enabled));
 
-    /// <summary>Adds an optional telemetry/history line only when it fits, preserving all earlier safety and action headlines.</summary>
-    /// <param name="text">Required already rendered headline and safety body.</param>
-    /// <param name="line">Sanitized optional telemetry/history text.</param>
-    /// <remarks>No existing body or Unicode character is truncated. Core content is bounded by pagination and fixed labels.</remarks>
-    private static void AppendOptional(StringBuilder text, string line)
-    {
-        if (text.Length + line.Length + 2 <= 3900) text.AppendLine(line);
-    }
 
     /// <summary>Reads a session-local batch report and current execution state without registering any intent again.</summary>
     /// <param name="text">Required bounded output body.</param>
@@ -441,7 +587,8 @@ public sealed class TelegramEndpointAdminService
     /// <param name="view">Report identity and zero-based page selected by a bound callback.</param>
     /// <param name="token">Cancels metadata reads only.</param>
     /// <returns>A task completing with paginated registration and current-operation outcomes plus refresh controls.</returns>
-    /// <remarks>Reports expire absolutely after one hour and are lost on restart; callback controls still expire after ten minutes and must be reopened from inventory. Per-bot durable state/history remain accessible after either expiry. Identity/operation replacements are never credited to this batch.</remarks>
+    /// <remarks>Reports expire absolutely after one hour and are lost on restart; callback controls still expire after ten minutes and must be reopened from inventory. Per-bot durable state/history remain accessible after either expiry. Identity/operation replacements are never credited to this batch.
+    /// Technical buttons expose each bot's complete diagnostics behind the same one-use, actor/message/host/identity/revision-bound callback security.</remarks>
     private async Task AppendBulkReportAsync(StringBuilder text, List<InlineKeyboardButton[]> rows,
         List<PanelCommand> commands, string nonce, long actor, TelegramEndpointState host, PanelCommand view, CancellationToken token)
     {
@@ -458,7 +605,7 @@ public sealed class TelegramEndpointAdminService
         var inventory = new PanelCommand(CommandKind.Inventory, Identity: host.TelegramBotId, Revision: host.ControlRevision);
         if (report == null)
         {
-            text.AppendLine("گزارش دسته‌ای منقضی/ناموجود است؛ انتقال را تکرار نکنید. وضعیت و تاریخچه پایدار هر ربات را از فهرست بخوانید.");
+            text.AppendLine("گزارش دسته‌ای منقضی/ناموجود است؛ انتقال را تکرار نکنید. وضعیت پایدار هر ربات را از فهرست بخوانید.");
             AddButton(rows, commands, nonce, "📋 بازگشت به فهرست", inventory);
             return;
         }
@@ -487,7 +634,6 @@ public sealed class TelegramEndpointAdminService
         text.AppendLine($"از قبل روی مقصد: {observations.Count(x => x.Outcome == "already_active")}؛ برای این ربات‌ها انتقال جدیدی انجام نشد.");
         text.AppendLine(registering ? "⏳ ثبت درخواست‌ها در جریان است؛ نتیجه هر ربات هنوز قطعی نیست." : "ثبت درخواست‌ها پایان یافته؛ پذیرش به معنی تکمیل نیست. فقط تازه‌سازی، بدون ثبت مجدد.");
         text.AppendLine("اگر میزبان بسته شود، ارسال به‌روزرسانی نهایی تضمین نمی‌شود؛ /telegram_api را در ربات Owned سالم دیگری باز کنید.");
-        text.AppendLine($"گزارش موقت تا {report.Expires.ToString("HH:mm:ss 'UTC'", CultureInfo.InvariantCulture)}؛ پس از راه‌اندازی مجدد، وضعیت/تاریخچه هر ربات پایدار می‌ماند.");
         if (report.Target == TelegramEndpointType.Local)
             text.AppendLine(observations.Any(x => x.Result?.ResultCode == "retained_cloud_control")
                 ? "🏠 مسیر مستقل مدیریت Cloud حفظ شد؛ ربات مشخص‌شده روی Cloud نگه داشته شده و انتقال Local برای آن ثبت نشد."
@@ -497,7 +643,7 @@ public sealed class TelegramEndpointAdminService
         text.AppendLine($"صفحه گزارش {page + 1}/{Math.Max(1, (observations.Length + reportPageSize - 1) / reportPageSize)}");
         foreach (var item in observations.Skip(page * reportPageSize).Take(reportPageSize))
         {
-            text.AppendLine($"ربات: {BotLabel(item.Target.BotId)} | هویت ثابت: {item.Target.Identity}");
+            text.AppendLine($"ربات: {BotLabel(item.Target.BotId)}");
             text.AppendLine("ثبت: " + (registering && item.Result == null ? "در جریان؛ هنوز نتیجه ثبت دریافت نشده" : ResultLabel(item.Result?.ResultCode ?? "not_submitted")));
             text.AppendLine("اجرای همین درخواست: " + (item.Outcome switch
             {
@@ -509,11 +655,10 @@ public sealed class TelegramEndpointAdminService
             if (item.State != null)
             {
                 text.AppendLine(ActiveBadge(item.State));
-                var source = item.History.FirstOrDefault(x => x.OperationId == item.Result?.OperationId && x.Reason == "migration_requested")?.FromEffectiveEndpoint
-                    ?? item.State.LogoutEndpoint;
-                text.AppendLine($"مبدأ: {(source.HasValue ? EndpointLabel(source.Value) : "نامشخص")} ← مقصد درخواست: {EndpointLabel(report.Target)}");
-                text.AppendLine($"شروع UTC: {Utc(item.State.MigrationStartedAtUtc)} | فعال‌سازی همین درخواست UTC: {(item.Outcome == "succeeded" ? Utc(item.State.LastMigrationAtUtc) : "اثبات نشده")}");
-                text.AppendLine($"موعد Cloud UTC: {Utc(item.State.CloudReuseEligibleAtUtc)}");
+                AppendConnection(text, item.State, item.History);
+                var receipt = new ControlReceipt(item.Target.Identity, item.State.ControlRevision, report.Expires) { Category = item.Result?.ResultCode };
+                AddButton(rows, commands, nonce, "🔍 جزئیات فنی «" + BotLabel(item.Target.BotId) + "»",
+                    new PanelCommand(CommandKind.Technical, item.State.BotId, item.State.TelegramBotId, item.State.ControlRevision, page, BatchId: view.BatchId, Receipt: receipt));
             }
         }
         var refresh = view with { Identity = host.TelegramBotId, Revision = host.ControlRevision, Page = page };
@@ -650,6 +795,7 @@ public sealed class TelegramEndpointAdminService
     /// <summary>Maps closed command outcomes to safe Persian without echoing unknown error strings.</summary>
     /// <param name="result">Coordinator's closed outcome code.</param>
     /// <returns>A fixed safe operational explanation.</returns>
+    /// <remarks>New validation refusal categories use the shared fixed catalog; no raw backend strings appear in either single or bulk summaries.</remarks>
     private static string ResultLabel(string result) => result switch
     {
         "accepted" => "درخواست ثبت شد؛ وضعیت تازه‌سازی و هشدارهای پایدار را بررسی کنید.",
@@ -666,6 +812,9 @@ public sealed class TelegramEndpointAdminService
         "not_submitted" => "ثبت نشد؛ ادامه دسته پس از توقف/لغو ثبت نشده است.",
         "registration_uncertain" => "ثبت نامطمئن؛ ممکن است درخواست پایدار شده باشد. تکرار نکنید؛ وضعیت هر ربات را بررسی کنید.",
         "batch_busy" => "دسته دیگری در حال ثبت است؛ این درخواست ثبت نشد.",
+        "local_file_mapping_missing" or "local_file_mapping_invalid" or "local_file_host_missing" or "local_file_access_denied" or "local_file_path_linked" or "local_file_probe_failed"
+            => "اعتبارسنجی رد شد؛ هیچ درخواست انتقالی ثبت نشد. " + TelegramEndpointDiagnosticCatalog.Describe(result).Message,
+        "migration_in_progress" => "انتقال دیگری در جریان است؛ درخواست جدید ثبت نشد. تازه‌سازی کنید.",
         _ => "درخواست پذیرفته نشد؛ پیش‌نیازها و وضعیت ثبت‌شده را بررسی کنید. خروج نامطمئن را تکرار نکنید."
     };
 
@@ -681,6 +830,7 @@ public sealed class TelegramEndpointAdminService
     private static string ReasonLabel(string reason) => reason switch
     {
         "migration_requested" => "درخواست انتقال مدیر کل",
+        "migration_admission_failed" => "اعتبارسنجی رد شد؛ درخواست جدید ثبت نشد",
         "auto_failover_changed" => "تغییر بازگشت اضطراری",
         "startup_reconciled" => "بازیابی پس از راه‌اندازی",
         "cloud_logout_intent" => "ثبت قصد خروج Cloud",
@@ -703,33 +853,13 @@ public sealed class TelegramEndpointAdminService
     };
 
     /// <summary>Labels closed persisted migration outcomes without echoing arbitrary history content.</summary>
-    /// <param name="outcome">Persisted enum-name outcome, not raw provider text.</param>
-    /// <returns>The Persian protocol-state label, or a fixed unknown-outcome label.</returns>
+    /// <param name="outcome">Persisted protocol enum name or closed failure category, never raw provider text.</param>
+    /// <returns>The fixed protocol or catalog failure explanation; unknown content is not echoed.</returns>
+    /// <remarks>Historical failure stage is rendered from that receipt separately, never inferred from the latest bot state.</remarks>
     private static string HistoryOutcomeLabel(string outcome)
         => Enum.TryParse<TelegramEndpointMigrationState>(outcome, out var state) && Enum.IsDefined(state)
-            ? StateLabel(state) : "نتیجه ثبت‌شده نامشخص؛ وضعیت فعلی را بررسی کنید";
+            ? StateLabel(state) : TelegramEndpointDiagnosticCatalog.Describe(outcome)?.Message ?? "نتیجه ثبت‌شده نامشخص؛ وضعیت فعلی را بررسی کنید";
 
-    /// <summary>Labels safe health failure categories without echoing unrecognized provider/error values.</summary>
-    /// <param name="category">Persisted closed health error category, possibly null.</param>
-    /// <returns>A fixed Persian failure label.</returns>
-    private static string FailureLabel(string category) => category switch
-    {
-        null or "" or "none" => "ثبت نشده",
-        "timeout" => "مهلت بررسی پایان یافت",
-        "connection_refused" or "network" => "سرور در دسترس نیست",
-        "invalid_response" => "پاسخ سرور محلی معتبر نیست",
-        "identity_mismatch" => "هویت ربات مطابقت ندارد",
-        "identity_alias_conflict" => "شناسه BotFather بین چند تنظیم ربات مشترک است؛ انتقال تا اصلاح پیکربندی تکراری مجاز نیست",
-        "operator_control_missing" => "مسیر مستقل مدیریت از یک ربات Owned فعال روی Cloud وجود ندارد",
-        "token_rejected" => "احراز هویت رد شد",
-        "rate_limited" => "محدودیت نرخ Telegram؛ اثبات قطعی سرور نیست",
-        "telegram_upstream" => "خطای Telegram؛ اثبات قطعی سرور نیست",
-        "logout_refused" => "خروج رد شد",
-        "logout_uncertain" => "خروج نامطمئن؛ بدون تکرار",
-        "receiver_not_ready" => "دریافت پیام مقصد آماده نیست",
-        "configuration_missing" => "پیش‌نیاز پیکربندی موجود نیست",
-        _ => "خطای بررسی ثبت‌شده؛ اطلاعات حساس نمایش داده نمی‌شود"
-    };
 
     /// <summary>Server-side control kinds; users submit only a nonce and an index, never operation parameters.</summary>
     private enum CommandKind
@@ -738,6 +868,8 @@ public sealed class TelegramEndpointAdminService
         Inventory,
         /// <summary>Reads one current configured identity and its durable history.</summary>
         Detail,
+        /// <summary>Reads complete diagnostics without probes, preference changes or migration admission.</summary>
+        Technical,
         /// <summary>Displays a single-bot confirmation without mutation.</summary>
         Confirm,
         /// <summary>Consumes one confirmation and queues one durable individual intent.</summary>
@@ -763,9 +895,22 @@ public sealed class TelegramEndpointAdminService
     /// <param name="Enabled">Explicit automatic-fallback target preference.</param>
     /// <param name="Targets">Full frozen inventory snapshot used only by single-use bulk confirmation.</param>
     /// <param name="BatchId">Opaque process-local report identity; never a durable migration operation id.</param>
+    /// <param name="Receipt">Optional bounded exact-identity/revision registration result retained across read-only navigation.</param>
+    /// <param name="TechnicalPage">Zero-based complete diagnostic page, independent of the inventory/report return page.</param>
     private sealed record PanelCommand(CommandKind Kind, string BotId = null, long Identity = 0, long Revision = 0,
         int Page = 0, TelegramEndpointType Target = TelegramEndpointType.Cloud, bool Enabled = false,
-        IReadOnlyList<TelegramEndpointBulkTarget> Targets = null, string BatchId = null);
+        IReadOnlyList<TelegramEndpointBulkTarget> Targets = null, string BatchId = null, ControlReceipt Receipt = null, int TechnicalPage = 0);
+
+    /// <summary>Contains one secret-free registration result bound to the original identity, control revision and absolute expiry.</summary>
+    /// <param name="Identity">Exact numeric BotFather identity of the attempted registration.</param>
+    /// <param name="Revision">Control revision checked for that registration.</param>
+    /// <param name="Expires">Absolute expiry; refreshing the UI never extends retention.</param>
+    /// <remarks>Owned by existing bounded sessions; Category is published/read under the panel session lock.</remarks>
+    private sealed record ControlReceipt(long Identity, long Revision, DateTimeOffset Expires)
+    {
+        /// <summary>Closed backend result only; no credentials, external text or exception payloads are retained.</summary>
+        public string Category { get; set; }
+    }
     /// <summary>One message-bound one-use control session with a strict ten-minute absolute expiry.</summary>
     /// <param name="Host">Exact internal owned hosting bot id.</param>
     /// <param name="HostIdentity">Current numeric hosting bot identity; token replacement invalidates controls.</param>

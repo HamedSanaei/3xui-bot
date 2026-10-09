@@ -332,6 +332,9 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   receipt table (balance mutation + receipt commit atomically in one credentials.db transaction; see the Wallet
   Operations section). Referral must not add tables, columns, or models to this database.
 - `Data/configuration.json`: app-level settings and owned bot configs. Secrets live here locally and must not be copied into docs.
+- `Domain/ApplicationConfigurationSource.cs` loads only the explicit host content-root `Data/configuration.json`, shared with
+  existing editors/database paths; startup prints the absolute source and endpoint technical views show it. Unbased JSON
+  loading previously selected an assembly-directory shadow in an isolated reproduction. No fallback/example/private rewrite.
 - `Data/configuration.example.json`: sanitized configuration template including referral, four-gateway enable/readiness, panel, and bot logger/backup channel settings; all gateway switches and secrets default to off/empty placeholders. Its first key is a `_readme` array that states it is an illustrative template and NOT a schema or key whitelist, and that it must never be used to prune a real configuration. Eight test files load it as configuration, so every value added to it is deliberately equal to the documented `AppConfig` default (zero behavior change) and deployment-specific sections (pricing tables, Gozargah site sync, TLS paths, `DatabaseCleanup`/`Performance`, legacy single-bot fallback keys) stay intentionally omitted. See `docs/deployment.md` → “Configuration change safety”.
 - Startup configuration validation (`Domain/ConfigurationPreflight.cs`) is the single cross-cutting configuration gate. `ValidateEnabledFeatures` is **fatal** and runs in `Program.Main` beside the per-feature `Validate*` methods, before DI and before any migration: it rejects an explicitly enabled feature whose required panel URL is missing/unusable (`volumeExpirationReminderEnabled` + no `xuiV3ApiBaseUrl`), a non-blank `xuiV3ApiBaseUrl` that is not an absolute HTTP/HTTPS URL, and `userDatabasePath`/`credentialsDatabasePath` resolving to the same file. `AccountExpiryReminderEnabled` is deliberately **not** a fatal gate because it defaults to `true`, which would make an intentionally panel-less deployment unbootable. `DescribeStartupReport` is **warn-only**, runs after bot hydration, and reports a missing Telegram logger channel, a missing backup channel, and a missing panel URL. The validator never reads/rewrites/prunes/backfills a configuration file, never rejects an unknown key (the binder ignores them, so older and newer configurations stay mutually usable), and never echoes a configured value, chat id, token, or secret. Tests: `Adminbot.Tests/ConfigurationPreflightTests.cs`.
 - `Data/xui-v3-service-plans.json`: XUI v3 service catalog, inbounds, metered per-GB/per-day/lifetime pricing,
@@ -1697,14 +1700,24 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   Local→Cloud requires proven Local cleanup and persisted Cloud eligibility; conservative fresh ten-minute Local-logout wait.
   Unreachable Local cannot produce false Cloud success. Default automatic failback is off; desired and effective stay separate.
 - Official Local GetFile gives server filesystem paths, not Cloud /file HTTP downloads. `localFileServerRoot` and existing
-  readable nonsymlink `localFileHostRoot` mapping are required before migration. `TGFile` provenance/epoch + capped string
-  bindings protect transfers; copy only read-only files below the trusted existing downloader volume, never touch its container.
+  searchable/listable nonsymlink `localFileHostRoot` mapping are required before migration. Linux uses effective ACL/privilege
+  `faccessat` plus bounded listing, never customer contents/probe writes. Root syntax validation occurs at named Local-use
+  boundaries (admission, both prelogout checks, resolution), not fatal Cloud startup; origins/resource bounds stay fatal.
+  `TGFile` provenance/epoch + capped bindings protect read-only transfers; never touch the shared downloader container.
 - **🌐 مدیریت Telegram API** / `/telegram_api`: global live Super Admin allowlist only, private enabled owned host,
   actor/chat/message/host/BotFather-bound ten-minute single-use callbacks, confirmation + control revision. Another healthy
   owned bot provides recovery control; tenant owners/customers/assistant hosts have no authority.
-- Endpoint panel leads with actual enabled gate admission (`RuntimeEndpoint`, `RuntimeAvailable`, `RuntimeGeneration`, nullable `[NotMapped]`)
-  rather than desired/last-activated state; reads never reopen fences. `TelegramEndpointPresentation` requires exact-current-
-  operation activation history/timestamps for success; refusal/restored source, cooldown, uncertainty and later health stay distinct.
+- Endpoint main views lead with exact `☁️ CLOUD` / `🏠 LOCAL` from nullable `[NotMapped]` actual admission; fenced/unknown
+  routes stay explicit. Pending source/destination is separated from live connection. `🔍 جزئیات فنی` paginates complete
+  generation/gate/UTC/state/history/config source+startup/live roots/error code/phase/action without probes or mutations.
+  Startup/live mapping differences require deliberate restart, never hot remap. Success requires exact-current-operation
+  destination activation receipts/timestamps; newer durable admission refusal cannot masquerade as prior success.
+- `TelegramEndpointDiagnosticCatalog` owns finite Persian guidance and stage-qualified failures (mapping, root health,
+  identity, stop/drain, logout, receiving readiness). Admission missing mapping persists without intent/logout; failure
+  history retains its closed category even after health clears current error. No schema, FIFO, financial or failover cutover.
+  Read-only 2026-10-09 Gozargah evidence: active Publish/Data configuration lacks routing section/roots, Cloud generation 1,
+  no migration history/logout; expected `/data` → `/opt/telegram-media-downloader-bot/data` host is accessible and tokenless
+  Local root responds. Production config/identity authentication/session remain operator-owned; details in endpoint docs.
 - Bulk Cloud/Local controls freeze all pages/identities/control revisions, require the same private single-use confirmation,
   and call `TelegramEndpointCoordinator.Bulk` for sequential individual intent admission (no network/drain inside callbacks).
   One nonwaiting batch lock plus existing per-bot CAS/guards; exact committed operation receipts, truthful partial/cancelled outcomes.
@@ -1720,6 +1733,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   prior ACK/pruned/started receipts prohibit replay, private recipient ids removed. Down deliberately refuses unsafe reconstruction.
 - JSONL v1 adds nullable endpoint type/generation/state and four closed endpoint event families. Report series separate
   bot/endpoint/method/HTTP-SDK-foreground boundary and retain bounded newest-100 endpoint history; private actor audit stays in DB.
+  Migration events also retain controlled `stage`/`operation` and uppercase `failureClassification`; intermediate transitions
+  are `in_progress`, not success. Closed historical failure categories replace state-name Outcome only on failure receipts.
 - `docs/telegram-api-endpoints.md` covers official restrictions, file/logger prerequisites, safe disable, staged dedicated-bot
   rollout and rollback. Older Cloud-only binaries are unsafe until every Local/uncertain identity is safely resolved to Cloud.
 

@@ -38,8 +38,8 @@ public sealed class TelegramEndpointRoutingOptions
 
     /// <summary>Validates trusted origins and resource bounds, then returns an independently mutable startup snapshot.</summary>
     /// <returns>A detached validated settings copy; URLs contain only trusted endpoint origins.</returns>
-    /// <exception cref="ArgumentException">An origin, identifier, mapping pair, or bound is unsafe.</exception>
-    /// <remarks>Missing mapping roots are allowed at startup, but <see cref="HasLocalFileMapping"/> must gate first Local migration. Tests substitute HTTP transports, never relax origin validation.</remarks>
+    /// <exception cref="ArgumentException">An origin or resource bound is unsafe.</exception>
+    /// <remarks>Root values are preserved, not repaired or rejected at Cloud startup. ValidateLocalFileMapping and the read-only mapper gate every Local admission, irreversible recheck and file resolution; malformed mappings cannot prevent independent Cloud administration.</remarks>
     /// <example><code>var routing = configured.ValidateAndSnapshot();</code></example>
     public TelegramEndpointRoutingOptions ValidateAndSnapshot()
     {
@@ -61,9 +61,6 @@ public sealed class TelegramEndpointRoutingOptions
         Bound(NotificationMaxAttempts, 1, 100, nameof(NotificationMaxAttempts));
         var server = LocalFileServerRoot ?? "";
         var host = LocalFileHostRoot ?? "";
-        if ((server.Length == 0) != (host.Length == 0) ||
-            (server.Length > 0 && (!AbsoluteServerRoot(server) || !Path.IsPathFullyQualified(host) || host.Any(char.IsControl))))
-            throw new ArgumentException("Local file mapping requires two trusted absolute roots.");
         var copy = (TelegramEndpointRoutingOptions)MemberwiseClone();
         copy.CloudBaseUrl = cloud.GetLeftPart(UriPartial.Authority);
         copy.LocalBaseUrl = local.GetLeftPart(UriPartial.Authority);
@@ -74,6 +71,26 @@ public sealed class TelegramEndpointRoutingOptions
 
     /// <summary>Whether both trusted file roots are explicitly configured; file existence is checked by the host mapper.</summary>
     public bool HasLocalFileMapping => !string.IsNullOrEmpty(LocalFileServerRoot) && !string.IsNullOrEmpty(LocalFileHostRoot);
+
+    /// <summary>Validates the complete root pair only at a Local-use boundary, without touching storage.</summary>
+    /// <returns>Null for a syntactically safe absolute pair, otherwise mapping_missing or mapping_invalid in the closed Local diagnostic vocabulary.</returns>
+    /// <remarks>Callers must additionally prove actual directory access and reject links. Startup preserves malformed values so Cloud remains available; this boundary never normalizes away traversal or control characters.</remarks>
+    /// <example><code>var refusal = options.ValidateLocalFileMapping();</code></example>
+    internal string ValidateLocalFileMapping()
+    {
+        var server = LocalFileServerRoot;
+        var host = LocalFileHostRoot;
+        if (string.IsNullOrWhiteSpace(server) || string.IsNullOrWhiteSpace(host)) return "local_file_mapping_missing";
+        if (server != server.Trim() || host != host.Trim() || !AbsoluteServerRoot(server) ||
+            !Path.IsPathFullyQualified(host) || host.Any(char.IsControl) ||
+            server.Replace('\\', '/').Split('/').Any(x => x is "." or "..") ||
+            host.Replace('\\', '/').Split('/').Any(x => x is "." or ".."))
+            return "local_file_mapping_invalid";
+        try { _ = Path.GetFullPath(host); }
+        catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
+        { return "local_file_mapping_invalid"; }
+        return null;
+    }
 
 
     /// <summary>Rejects path, credential, query, and fragment components in an origin.</summary>

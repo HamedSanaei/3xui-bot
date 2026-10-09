@@ -38,8 +38,9 @@ public class Program
     /// isolated temporary databases. <c>--recover-missed-tenant-card-receipts</c> also exits before host construction
     /// and queues (or, in its default dry run, only reports) receipt re-upload reminders for tenant card orders whose
     /// receipt image was dropped before the image-document fix; it starts no listener, receiver, or worker. Normal
-    /// startup prints the embedded commit/configuration before loading private configuration, then preserves the
-    /// existing migrate-before-receiver ordering. Durable identity-bound endpoint routes are hydrated before any hosted
+    /// startup prints the embedded commit and exact content-root Data/configuration.json source before loading private
+    /// configuration, then preserves migrate-before-receiver ordering. No assembly-directory fallback can shadow the source.
+    /// Durable identity-bound endpoint routes are hydrated before any hosted
     /// sender/receiver starts; pending migration states never fall back to Cloud merely because the process restarted.
     /// Read-only <c>telemetry-report</c> and isolated <c>telemetry-benchmark</c> exit before host construction,
     /// configuration loading, migrations, Telegram receivers and financial workers.
@@ -85,10 +86,11 @@ public class Program
 
         var builder = WebApplication.CreateBuilder(args);
         builder.Services.AddControllers();
-        // Build configuration manually
-        var configuration = new ConfigurationBuilder()
-            .AddJsonFile("./Data/configuration.json", optional: false, reloadOnChange: true)
-            .Build();
+        // Configuration readers and existing editors must share the host content root, not a stale assembly-directory Data copy.
+        var configurationSource = new Adminbot.Domain.ApplicationConfigurationSource(builder.Environment.ContentRootPath);
+        Console.WriteLine($"[Configuration] path: {configurationSource.FilePath}");
+        var configuration = configurationSource.Load();
+        using var configurationLifetime = configuration as IDisposable;
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         ReferralConfigurationValidator.ValidateConfigurationAndThrow(configuration);
         ValidateXuiV3LinkChangeConfiguration(appConfig);
@@ -112,6 +114,7 @@ public class Program
         Console.WriteLine($"[TelegramOutbox] path: {telegramOutboxDatabasePath}");
         ConfigureWebServer(builder, appConfig);
 
+        builder.Services.AddSingleton(configurationSource);
         RegisterApplicationServices(builder.Services, configuration, appConfig, builder.Environment.ContentRootPath);
 
         builder.Host.UseDefaultServiceProvider(options => { options.ValidateScopes = true; options.ValidateOnBuild = true; });

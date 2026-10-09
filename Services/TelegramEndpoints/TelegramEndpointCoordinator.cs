@@ -121,7 +121,7 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
                     state.MigrationState = state.LogoutEndpoint == TelegramEndpointType.Local
                         ? TelegramEndpointMigrationState.LocalLogoutUncertain
                         : TelegramEndpointMigrationState.CloudLogoutUncertain;
-                    state.LastFailureCategory = "logout_uncertain";
+                    state.LastFailureCategory = state.LogoutEndpoint == TelegramEndpointType.Local ? "local_logout_uncertain" : "cloud_logout_uncertain";
                     state.LastFailureAtUtc = UtcNow;
                     state.NextAttemptAtUtc = null;
                     if (!await SaveAsync(state, "startup_reconciled", "manual_intervention", cancellationToken))
@@ -134,7 +134,7 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
                     state.MigrationState = state.LogoutEndpoint == TelegramEndpointType.Local
                         ? TelegramEndpointMigrationState.LocalLogoutUncertain
                         : TelegramEndpointMigrationState.CloudLogoutUncertain;
-                    state.LastFailureCategory = "logout_uncertain";
+                    state.LastFailureCategory = state.LogoutEndpoint == TelegramEndpointType.Local ? "local_logout_uncertain" : "cloud_logout_uncertain";
                     state.NextAttemptAtUtc = null;
                     if (!await SaveAsync(state, "startup_reconciled", "manual_intervention", cancellationToken))
                         throw new InvalidOperationException("Endpoint startup reconciliation conflicted.");
@@ -222,7 +222,7 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
     /// <param name="expectedControlRevision">Nonnegative control revision shown in the one-use confirmation.</param>
     /// <param name="expectedTelegramBotId">Positive BotFather identity frozen by the displayed confirmation; replacement identities are stale.</param>
     /// <param name="cancellationToken">Callback token used only for authorization/persistence, not background migration.</param>
-    /// <returns>A fixed status code: accepted, unchanged, stale, busy, denied, aliased, unavailable, disabled, unsafe or control_path_missing.</returns>
+    /// <returns>A closed accepted/unchanged result or precise admission refusal, including mapping failures and migration_in_progress distinct from the nonwaiting busy lock.</returns>
     /// <remarks>Bot-specific nonwaiting locks prevent concurrent intents. Uncertain logout cannot be manually overridden.
     /// Cloud-to-Local intent retains another enabled owned Cloud identity for independent private administration.
     /// The hosted worker owns lifecycle drain; this method never waits for the callback's own handler to finish.</remarks>
@@ -232,26 +232,25 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
     {
         await InitializeAsync(cancellationToken);
         var status = ValidateCommand(botId, actor, out var bot, out var identity);
-        if (status != null) return status;
-        if (!Enum.IsDefined(target) || expectedControlRevision < 0) return "denied";
-        if (target == TelegramEndpointType.Local && !HasLocalFileMapping) return "unavailable";
+        if (status != null) return AdmissionFailure(bot, status);
+        if (!Enum.IsDefined(target) || expectedControlRevision < 0) return AdmissionFailure(bot, "denied");
         var mutex = GetLock(bot.Id);
-        if (!await mutex.WaitAsync(0, cancellationToken)) return "busy";
+        if (!await mutex.WaitAsync(0, cancellationToken)) return AdmissionFailure(bot, "busy");
         try
         {
             status = ValidateCommand(botId, actor, out bot, out identity);
-            if (status != null) return status;
-            if (identity != expectedTelegramBotId || expectedTelegramBotId <= 0) return "stale";
+            if (status != null) return AdmissionFailure(bot, status);
+            if (identity != expectedTelegramBotId || expectedTelegramBotId <= 0) return AdmissionFailure(bot, "stale");
             var state = await _store.GetOrCreateAsync(bot.Id, identity, cancellationToken);
             status = ValidateCommand(botId, actor, out bot, out identity);
-            if (status != null) return status;
-            if (identity != expectedTelegramBotId || state.TelegramBotId != identity) return "stale";
-            if (state.ControlRevision != expectedControlRevision) return "stale";
-            if (state.LastFailureCategory == "identity_alias_conflict") return "aliased";
-            if (IsUncertain(state)) return "unsafe";
-            if (IsPending(state)) return "busy";
-            if (!IsActive(state) && state.LogoutAcknowledgedAtUtc.HasValue) return "unsafe";
-            if (!IsActive(state) && state.EffectiveEndpoint == target) return "unsafe";
+            if (status != null) return AdmissionFailure(state, status);
+            if (identity != expectedTelegramBotId || state.TelegramBotId != identity) return AdmissionFailure(state, "stale");
+            if (state.ControlRevision != expectedControlRevision) return AdmissionFailure(state, "stale");
+            if (state.LastFailureCategory == "identity_alias_conflict") return AdmissionFailure(state, "aliased");
+            if (IsUncertain(state)) return AdmissionFailure(state, "unsafe");
+            if (IsPending(state)) return AdmissionFailure(state, "migration_in_progress");
+            if (!IsActive(state) && state.LogoutAcknowledgedAtUtc.HasValue) return AdmissionFailure(state, "unsafe");
+            if (!IsActive(state) && state.EffectiveEndpoint == target) return AdmissionFailure(state, "unsafe");
             if (state.EffectiveEndpoint == target && IsActive(state))
             {
                 if (state.DesiredEndpoint == target)
@@ -264,13 +263,24 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
                 state.OperationId = Guid.NewGuid().ToString("N");
                 state.ActorTelegramUserId = actor;
                 state.Trigger = "manual";
-                if (!await SaveAsync(state, "migration_requested", null, cancellationToken)) return "stale";
+                if (!await SaveAsync(state, "migration_requested", null, cancellationToken)) return AdmissionFailure(state, "stale");
                 CaptureBulkAdmission(state);
                 return "accepted";
             }
-            if (target == TelegramEndpointType.Local && !HasIndependentCloudControl(identity)) return "control_path_missing";
+            if (target == TelegramEndpointType.Local)
+            {
+                var mappingFailure = TelegramLocalFileMapper.ProbeReadiness(_options);
+                if (mappingFailure != null)
+                {
+                    state.LastFailureCategory = mappingFailure;
+                    state.LastFailureAtUtc = UtcNow;
+                    if (!await SaveAsync(state, "migration_admission_failed", null, cancellationToken)) return AdmissionFailure(state, "stale");
+                    return mappingFailure;
+                }
+            }
+            if (target == TelegramEndpointType.Local && !HasIndependentCloudControl(identity)) return AdmissionFailure(state, "control_path_missing");
             BeginIntent(state, target, actor, "manual", preserveDesired: false);
-            if (!await SaveAsync(state, "migration_requested", "migration_started", cancellationToken)) return "stale";
+            if (!await SaveAsync(state, "migration_requested", "migration_started", cancellationToken)) return AdmissionFailure(state, "stale");
             CaptureBulkAdmission(state);
             SignalWork();
             return "accepted";
@@ -306,7 +316,7 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
             if (identity != expectedTelegramBotId || state.TelegramBotId != identity) return "stale";
             if (state.ControlRevision != expectedControlRevision) return "stale";
             if (state.LastFailureCategory == "identity_alias_conflict") return "aliased";
-            if (IsPending(state)) return "busy";
+            if (IsPending(state)) return AdmissionFailure(state, "migration_in_progress");
             if (state.AutoFailoverEnabled == enabled) return "unchanged";
             state.AutoFailoverEnabled = enabled;
             state.ControlRevision++;
@@ -433,6 +443,7 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
     /// <param name="alert">Closed durable incident category, or null when no alert is needed.</param>
     /// <param name="token">Persistence cancellation token; mutation acknowledgement callers use an independent token.</param>
     /// <returns>True only after the transition and any alert committed. A conflict never authorizes external replay.</returns>
+    /// <remarks>Committed admission failures emit failure telemetry without claiming acceptance or activating any route. Intermediate successful protocol boundaries are progress, not completed migration.</remarks>
     private async Task<bool> SaveAsync(TelegramEndpointState state, string reason, string alert, CancellationToken token)
     {
         if (!await _store.TrySaveAsync(state, state.Revision, reason, alert, token)) return false;
@@ -442,12 +453,29 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
         if (reason != null)
         {
             var terminal = reason is "migration_succeeded" or "cloud_recovered" or "local_recovered" or
-                "migration_failed" or "manual_intervention" or "logout_uncertain" or "logout_refused";
+                "migration_failed" or "migration_admission_failed" or "manual_intervention" or "logout_uncertain" or "logout_refused";
             Record(state, reason is "cloud_recovered" or "local_recovered" ? "telegram_endpoint_recovered" : "telegram_endpoint_migration",
-                state.LastFailureCategory == null ? "success" : "failure", terminal: terminal);
+                state.LastFailureCategory != null ? "failure" : terminal ? "success" : "in_progress", terminal: terminal);
         }
         return true;
     }
+
+    /// <summary>Records a rejected command without changing the active protocol or persisting a false operation.</summary>
+    /// <param name="state">Detached exact current identity snapshot.</param>
+    /// <param name="category">Closed admission result, never raw callback or error text.</param>
+    /// <returns>The same closed refusal for single and bulk callers.</returns>
+    private string AdmissionFailure(TelegramEndpointState state, string category)
+    {
+        Record(state, "telegram_endpoint_migration", "failure", failureCategory: category);
+        return category;
+    }
+
+    /// <summary>Records validation refusal before a durable operation snapshot exists.</summary>
+    /// <param name="bot">Trusted resolved registry bot, or null when absent; untrusted requested ids are never logged.</param>
+    /// <param name="category">Closed command refusal.</param>
+    /// <returns>The same refusal without persistence, network, drain or logout.</returns>
+    private string AdmissionFailure(BotInstanceConfig bot, string category) =>
+        AdmissionFailure(new TelegramEndpointState { BotId = bot?.Id ?? "unresolved" }, category);
 
     /// <summary>Wakes hosted work without allocating a task or dropping durable operation intent.</summary>
     private void SignalWork()
@@ -468,8 +496,14 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
     /// <param name="outcome">Closed operation outcome.</param>
     /// <param name="durationMs">Optional monotonic health duration in milliseconds.</param>
     /// <param name="terminal">True only for the committed operation terminal event; its monotonic clock is consumed once.</param>
-    private void Record(TelegramEndpointState state, string family, string outcome, double? durationMs = null, bool terminal = false)
+    /// <param name="failureCategory">Optional closed admission refusal for observation only; the durable snapshot is never copied or changed.</param>
+    private void Record(TelegramEndpointState state, string family, string outcome, double? durationMs = null, bool terminal = false, string failureCategory = null)
     {
+        var category = failureCategory ?? state.LastFailureCategory;
+        var diagnostic = TelegramEndpointDiagnosticCatalog.Describe(category, state);
+        if (family == "telegram_endpoint_migration" && outcome == "failure" && diagnostic != null)
+            _logger.LogWarning("Telegram endpoint migration rejected or deferred. ErrorCode={ErrorCode} Phase={Phase} Checked={Checked}",
+                diagnostic.Code, diagnostic.Stage, diagnostic.Checked);
         if (_telemetry?.Enabled != true) return;
         double? operationDuration = null;
         if (terminal && _operationClocks.TryRemove(state.BotId, out var clock) && clock.OperationId == state.OperationId)
@@ -479,7 +513,8 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
             TimestampUtc = UtcNow, EventType = family, BotId = state.BotId,
             EndpointType = state.EffectiveEndpoint == TelegramEndpointType.Local ? "local" : "cloud",
             EndpointGeneration = state.Generation, MigrationState = state.MigrationState.ToString(),
-            Outcome = outcome, Category = state.LastFailureCategory,
+            Outcome = outcome, Category = category,
+            FailureClassification = diagnostic?.Code, Stage = diagnostic?.Stage, Operation = diagnostic?.Stage,
             ConsecutiveFailures = state.ConsecutiveFailures,
             HealthCheckDurationMs = durationMs, FailoverTrigger = state.Trigger,
             FailoverDurationMs = operationDuration,

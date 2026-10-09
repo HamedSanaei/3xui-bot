@@ -206,8 +206,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.Equal(frozen.Length, results.Count);
         Assert.Equal("aliased", results.Single(x => x.BotId == "operator-control").ResultCode);
         Assert.Equal("unavailable", results.Single(x => x.BotId == "alias").ResultCode);
-        Assert.Equal("busy", results.Single(x => x.BotId == "pending").ResultCode);
-        Assert.Equal("busy", results.Single(x => x.BotId == "cooldown").ResultCode);
+        Assert.Equal("migration_in_progress", results.Single(x => x.BotId == "pending").ResultCode);
+        Assert.Equal("migration_in_progress", results.Single(x => x.BotId == "cooldown").ResultCode);
         Assert.Equal("unsafe", results.Single(x => x.BotId == "uncertain").ResultCode);
         Assert.Equal(deadline, (await f.Coordinator.GetStatusAsync("cooldown", default)).CloudReuseEligibleAtUtc);
         Assert.Equal(new string('b', 32), (await f.Coordinator.GetStatusAsync("uncertain", default)).OperationId);
@@ -579,7 +579,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         f.Restart();
         await f.Coordinator.InitializeAsync(default);
         var retry = await f.RequestAsync(TelegramEndpointType.Cloud, await f.FreezeAsync());
-        Assert.Equal("busy", retry.Single(x => x.BotId == "owned-a").ResultCode);
+        Assert.Equal("migration_in_progress", retry.Single(x => x.BotId == "owned-a").ResultCode);
         Assert.Equal("unsafe", retry.Single(x => x.BotId == "uncertain").ResultCode);
         await f.Coordinator.RunPendingOperationsAsync(default);
         Assert.Equal(1, f.Protocol.LogoutCalls);

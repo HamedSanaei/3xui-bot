@@ -47,7 +47,8 @@ public sealed partial class TelegramEndpointCoordinator
     /// <returns>A task completing after one bounded phase; no cooldown sleep occurs under a bot lock.</returns>
     /// <remarks>The marker commits before mutation. Failure after that boundary stays fenced and uncertain.
     /// Cloud-to-Local also retains independent owned Cloud control before intent execution, before marker commit
-    /// and immediately before dispatch. Losing control before HTTP restores the verified source without logout.</remarks>
+    /// and immediately before dispatch. Losing control before HTTP restores the verified source without logout.
+    /// Failures persist the exact closed mapping, probe, stop/drain, cleanup or receiving boundary; raw exception text never becomes an operator diagnostic.</remarks>
     private async Task ExecuteOperationAsync(TelegramEndpointState state, CancellationToken shutdownToken)
     {
         if (CanRecoverLocal(state))
@@ -79,6 +80,7 @@ public sealed partial class TelegramEndpointCoordinator
         using var scope = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken, budget.Token);
         ITelegramEndpointReceiverLease lease = null;
         var stopped = false;
+        var phase = "source_lifecycle";
         try
         {
             if (!state.LogoutAttemptedAtUtc.HasValue && HasIdentityAlias(state.BotId, state.TelegramBotId))
@@ -107,22 +109,25 @@ public sealed partial class TelegramEndpointCoordinator
                     await FailBeforeLogoutAsync(state, "operator_control_missing", shutdownToken);
                     return;
                 }
-                if (!HasLocalFileMapping)
+                var mappingFailure = TelegramLocalFileMapper.ProbeReadiness(_options);
+                if (mappingFailure != null)
                 {
-                    await FailBeforeLogoutAsync(state, "configuration_missing", shutdownToken);
+                    await FailBeforeLogoutAsync(state, mappingFailure, shutdownToken);
                     return;
                 }
+                phase = "local_root";
                 var root = await ProbeSharedAsync(scope.Token);
                 if (!root.Success)
                 {
-                    await FailBeforeLogoutAsync(state, TelegramEndpointHealthPolicy.Code(root.Failure), shutdownToken);
+                    await FailBeforeLogoutAsync(state, TelegramEndpointDiagnosticCatalog.ProbeCategory(phase, root.Failure), shutdownToken);
                     return;
                 }
                 // Never call Local getMe here: even getMe can create a Local session before Cloud logout.
+                phase = "cloud_source_identity";
                 var source = await ProbeIdentityAsync(state, TelegramEndpointType.Cloud, scope.Token);
                 if (!source.Success)
                 {
-                    await FailBeforeLogoutAsync(state, TelegramEndpointHealthPolicy.Code(source.Failure), shutdownToken);
+                    await FailBeforeLogoutAsync(state, TelegramEndpointDiagnosticCatalog.ProbeCategory(phase, source.Failure), shutdownToken);
                     return;
                 }
             }
@@ -135,11 +140,14 @@ public sealed partial class TelegramEndpointCoordinator
                 }
             }
 
+            phase = "source_lifecycle";
             var lifecycle = _services.GetRequiredService<ITelegramEndpointReceiverLifecycle>();
             lease = await lifecycle.AcquireAsync(state.BotId, scope.Token).WaitAsync(scope.Token);
             _gate.Fence(state.BotId, state.TelegramBotId);
+            phase = "source_stop";
             await lease.StopAndWaitAsync(scope.Token).WaitAsync(scope.Token);
             stopped = true;
+            phase = "source_drain";
             await _gate.DrainAsync(state.BotId, state.TelegramBotId,
                 TimeSpan.FromSeconds(_options.MigrationDrainSeconds), scope.Token);
             if (state.MigrationState == TelegramEndpointMigrationState.LocalUnavailable)
@@ -150,11 +158,13 @@ public sealed partial class TelegramEndpointCoordinator
             }
             if (state.MigrationState == TelegramEndpointMigrationState.FallbackPending)
             {
+                phase = "local_root";
                 var root = await ProbeSharedAsync(scope.Token);
+                if (root.Success) phase = "local_source_identity";
                 var source = root.Success ? await ProbeIdentityAsync(state, TelegramEndpointType.Local, scope.Token) : root;
                 if (!source.Success)
                 {
-                    await ScheduleSafeRetryAsync(state, source.Failure, shutdownToken);
+                    await ScheduleSafeRetryAsync(state, source.Failure, shutdownToken, TelegramEndpointDiagnosticCatalog.ProbeCategory(phase, source.Failure));
                     return;
                 }
             }
@@ -177,9 +187,16 @@ public sealed partial class TelegramEndpointCoordinator
                     await RestoreSourceAsync(state, lease, scope.Token, "migration_failed");
                     return;
                 }
+                var mappingFailure = endpoint == TelegramEndpointType.Cloud ? TelegramLocalFileMapper.ProbeReadiness(_options) : null;
+                if (mappingFailure != null)
+                {
+                    state.LastFailureCategory = mappingFailure;
+                    state.LastFailureAtUtc = UtcNow;
+                    await RestoreSourceAsync(state, lease, scope.Token, "migration_failed");
+                    return;
+                }
                 var bot = FindBot(state.BotId);
                 if (bot == null || !bot.Enabled || TelegramBotTokenIdentity.ExtractBotId(bot.Token) != state.TelegramBotId ||
-                    (endpoint == TelegramEndpointType.Cloud && !HasLocalFileMapping) ||
                     (state.Trigger == "manual" && _configuration.GetSection(nameof(AppConfig.AdminsUserIds))
                         .Get<List<long>>()?.Contains(state.ActorTelegramUserId ?? 0) != true))
                 {
@@ -198,12 +215,13 @@ public sealed partial class TelegramEndpointCoordinator
                 if (!await SaveAsync(state, endpoint == TelegramEndpointType.Cloud ? "cloud_logout_intent" : "local_logout_intent",
                     null, scope.Token)) return;
                 var controlMissing = endpoint == TelegramEndpointType.Cloud && !HasIndependentCloudControl(state.TelegramBotId);
-                if (HasIdentityAlias(state.BotId, state.TelegramBotId) || controlMissing)
+                mappingFailure = endpoint == TelegramEndpointType.Cloud ? TelegramLocalFileMapper.ProbeReadiness(_options) : null;
+                if (HasIdentityAlias(state.BotId, state.TelegramBotId) || controlMissing || mappingFailure != null)
                 {
                     // The marker committed, but no transport was dispatched: this live path can safely clear it.
                     state.LogoutAttemptedAtUtc = null;
                     state.LogoutEndpoint = null;
-                    state.LastFailureCategory = controlMissing ? "operator_control_missing" : "identity_alias_conflict";
+                    state.LastFailureCategory = mappingFailure ?? (controlMissing ? "operator_control_missing" : "identity_alias_conflict");
                     await RestoreSourceAsync(state, lease, scope.Token, "migration_failed");
                     return;
                 }
@@ -223,7 +241,7 @@ public sealed partial class TelegramEndpointCoordinator
                 }
                 if (!result.Acknowledged)
                 {
-                    state.LastFailureCategory = "logout_refused";
+                    state.LastFailureCategory = endpoint == TelegramEndpointType.Local ? "local_logout_refused" : "cloud_logout_refused";
                     state.LastFailureAtUtc = UtcNow;
                     state.LogoutAttemptedAtUtc = null;
                     state.LogoutEndpoint = null;
@@ -250,7 +268,8 @@ public sealed partial class TelegramEndpointCoordinator
                     await MarkUncertainAsync(state);
                     return;
                 }
-                await ActivateAsync(state, TelegramEndpointType.Local, lease, scope.Token);
+                phase = "local_destination_receiver";
+                await ActivateAsync(state, TelegramEndpointType.Local, lease, scope.Token, shutdownToken);
             }
             else if (state.MigrationState is TelegramEndpointMigrationState.CloudWait or TelegramEndpointMigrationState.SwitchingToCloud)
             {
@@ -270,7 +289,8 @@ public sealed partial class TelegramEndpointCoordinator
                     await SaveAsync(state, "cloud_wait", null, CancellationToken.None);
                     return;
                 }
-                await ActivateAsync(state, TelegramEndpointType.Cloud, lease, scope.Token);
+                phase = "cloud_destination_receiver";
+                await ActivateAsync(state, TelegramEndpointType.Cloud, lease, scope.Token, shutdownToken);
             }
         }
         catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested)
@@ -283,11 +303,15 @@ public sealed partial class TelegramEndpointCoordinator
         {
             if (lease != null) await StopReceiverBoundedAsync(state, lease);
             var failure = TelegramEndpointHealthPolicy.Classify(exception);
+            var category = phase is "local_root" or "cloud_source_identity" or "local_source_identity"
+                ? TelegramEndpointDiagnosticCatalog.ProbeCategory(phase, failure)
+                : phase == "source_lifecycle" ? "source_lifecycle_unavailable"
+                : phase + (failure == TelegramEndpointFailure.Timeout ? "_timeout" : "_failed");
             if (state.LogoutAttemptedAtUtc.HasValue && !state.LogoutAcknowledgedAtUtc.HasValue)
                 await MarkUncertainAsync(state);
             else if (state.MigrationState == TelegramEndpointMigrationState.LocalUnavailable)
             {
-                state.LastFailureCategory = "drain_timeout";
+                state.LastFailureCategory = category;
                 state.MigrationState = TelegramEndpointMigrationState.ManualInterventionRequired;
                 state.NextAttemptAtUtc = null;
                 await SaveAsync(state, "manual_intervention", "manual_intervention", CancellationToken.None);
@@ -298,20 +322,20 @@ public sealed partial class TelegramEndpointCoordinator
                     state = await _store.GetOrCreateAsync(state.BotId, state.TelegramBotId, CancellationToken.None);
                 state.MigrationState = state.LogoutEndpoint == TelegramEndpointType.Cloud
                     ? TelegramEndpointMigrationState.SwitchingToLocal : TelegramEndpointMigrationState.SwitchingToCloud;
-                await ScheduleSafeRetryAsync(state, failure, CancellationToken.None);
+                await ScheduleSafeRetryAsync(state, failure, CancellationToken.None, category);
             }
             else if (state.MigrationState == TelegramEndpointMigrationState.FallbackPending)
-                await ScheduleSafeRetryAsync(state, failure, CancellationToken.None);
+                await ScheduleSafeRetryAsync(state, failure, CancellationToken.None, category);
             else if (stopped && lease != null)
             {
-                state.LastFailureCategory = failure == TelegramEndpointFailure.Timeout ? "drain_timeout" : "lifecycle_unavailable";
+                state.LastFailureCategory = category;
                 // A failed drain cannot replace the old generation; leave an explicit fenced state.
                 state.MigrationState = TelegramEndpointMigrationState.ManualInterventionRequired;
                 state.NextAttemptAtUtc = null;
                 await SaveAsync(state, "manual_intervention", "manual_intervention", CancellationToken.None);
             }
             else
-                await FailBeforeLogoutAsync(state, "lifecycle_unavailable", CancellationToken.None);
+                await FailBeforeLogoutAsync(state, category, CancellationToken.None);
             _logger.LogWarning("Telegram endpoint operation deferred. Category={Category}", state.LastFailureCategory);
         }
         finally
@@ -330,15 +354,20 @@ public sealed partial class TelegramEndpointCoordinator
     /// <param name="endpoint">Explicit destination permitted by logout proof and cooldown.</param>
     /// <param name="lease">Exclusive stopped receiver lifecycle lease.</param>
     /// <param name="token">Whole operation budget, separate from the admin callback.</param>
+    /// <param name="shutdownToken">Host lifetime used to distinguish shutdown from destination budget expiry.</param>
     /// <returns>A task completing with an active committed route or a fenced bounded safe retry.</returns>
-    /// <remarks>The parent lifecycle additionally checks webhook absence and nondropping short getUpdates.</remarks>
+    /// <remarks>The parent lifecycle checks webhook absence and nondropping short getUpdates. Identity and readiness failures retain their exact destination boundary across restart without altering retry policy.</remarks>
     private async Task ActivateAsync(TelegramEndpointState state, TelegramEndpointType endpoint,
-        ITelegramEndpointReceiverLease lease, CancellationToken token)
+        ITelegramEndpointReceiverLease lease, CancellationToken token, CancellationToken shutdownToken)
     {
-        var identity = await ProbeIdentityAsync(state, endpoint, token);
+        TelegramEndpointProbeResult identity;
+        try { identity = await ProbeIdentityAsync(state, endpoint, token); }
+        catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested) { throw; }
+        catch (Exception exception) { identity = new(TelegramEndpointHealthPolicy.Classify(exception)); }
         if (!identity.Success)
         {
-            await ScheduleSafeRetryAsync(state, identity.Failure, CancellationToken.None);
+            await ScheduleSafeRetryAsync(state, identity.Failure, CancellationToken.None,
+                TelegramEndpointDiagnosticCatalog.ProbeCategory(endpoint == TelegramEndpointType.Local ? "local_destination_identity" : "cloud_destination_identity", identity.Failure));
             return;
         }
         state.Generation++;
@@ -346,10 +375,24 @@ public sealed partial class TelegramEndpointCoordinator
             ? TelegramEndpointMigrationState.SwitchingToLocal : TelegramEndpointMigrationState.SwitchingToCloud;
         if (!await SaveAsync(state, "destination_starting", null, token)) return;
         _gate.PrepareActivation(state.BotId, state.TelegramBotId, endpoint, state.Generation);
-        if (!await lease.StartValidatedAsync(token).WaitAsync(token))
+        try
         {
+            if (!await lease.StartValidatedAsync(token).WaitAsync(token))
+            {
+                await StopReceiverBoundedAsync(state, lease);
+                await ScheduleSafeRetryAsync(state, TelegramEndpointFailure.ReceiverNotReady, CancellationToken.None,
+                    endpoint == TelegramEndpointType.Local ? "local_destination_receiver_not_ready" : "cloud_destination_receiver_not_ready");
+                return;
+            }
+        }
+        catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested) { throw; }
+        catch (Exception exception)
+        {
+            var failure = TelegramEndpointHealthPolicy.Classify(exception);
             await StopReceiverBoundedAsync(state, lease);
-            await ScheduleSafeRetryAsync(state, TelegramEndpointFailure.ReceiverNotReady, CancellationToken.None);
+            await ScheduleSafeRetryAsync(state, failure, CancellationToken.None,
+                (endpoint == TelegramEndpointType.Local ? "local_destination_receiver" : "cloud_destination_receiver") +
+                (failure == TelegramEndpointFailure.Timeout ? "_timeout" : "_failed"));
             return;
         }
         state.EffectiveEndpoint = endpoint;
@@ -379,11 +422,24 @@ public sealed partial class TelegramEndpointCoordinator
     /// <param name="token">Remaining whole-operation budget.</param>
     /// <param name="reason">Closed logout_refused or migration_failed history reason for this safe source restoration.</param>
     /// <returns>A task completing with the verified original route or explicit intervention.</returns>
+    /// <remarks>Readiness refusal/timeout after safe restoration is persisted as a separate source_restore boundary; no destination activation or cleanup retry is authorized.</remarks>
     private async Task RestoreSourceAsync(TelegramEndpointState state, ITelegramEndpointReceiverLease lease, CancellationToken token,
         string reason = "logout_refused")
     {
         _gate.PrepareActivation(state.BotId, state.TelegramBotId, state.EffectiveEndpoint, state.Generation);
-        if (!await lease.StartValidatedAsync(token).WaitAsync(token))
+        bool ready;
+        try
+        {
+            ready = await lease.StartValidatedAsync(token).WaitAsync(token);
+            if (!ready) state.LastFailureCategory = "source_restore_receiver_not_ready";
+        }
+        catch (Exception exception)
+        {
+            ready = false;
+            state.LastFailureCategory = TelegramEndpointHealthPolicy.Classify(exception) == TelegramEndpointFailure.Timeout
+                ? "source_restore_receiver_timeout" : "source_restore_receiver_failed";
+        }
+        if (!ready)
         {
             state.MigrationState = TelegramEndpointMigrationState.ManualInterventionRequired;
             state.NextAttemptAtUtc = null;
@@ -420,16 +476,19 @@ public sealed partial class TelegramEndpointCoordinator
     /// <param name="failure">Typed safe-read or readiness failure.</param>
     /// <param name="token">Persistence cancellation.</param>
     /// <returns>A task completing after a durable due time or explicit manual-intervention state.</returns>
-    private async Task ScheduleSafeRetryAsync(TelegramEndpointState state, TelegramEndpointFailure failure, CancellationToken token)
+    /// <param name="category">Optional precise migration boundary/category; health recovery retains its original generic classification when omitted.</param>
+    /// <remarks>The optional category preserves boundary evidence across retry exhaustion; the typed failure alone still governs unchanged retry eligibility, limits and delay. No ambiguous cleanup is repeated.</remarks>
+    /// <example><code>await ScheduleSafeRetryAsync(state, probe.Failure, token, TelegramEndpointDiagnosticCatalog.ProbeCategory("local_root", probe.Failure));</code></example>
+    private async Task ScheduleSafeRetryAsync(TelegramEndpointState state, TelegramEndpointFailure failure, CancellationToken token, string category = null)
     {
         state.RecoveryAttempts++;
-        state.LastFailureCategory = TelegramEndpointHealthPolicy.Code(failure);
+        state.LastFailureCategory = category ?? TelegramEndpointHealthPolicy.Code(failure);
         state.LastFailureAtUtc = UtcNow;
         _gate.Fence(state.BotId, state.TelegramBotId);
         if (failure is TelegramEndpointFailure.IdentityMismatch or TelegramEndpointFailure.TokenRejected or TelegramEndpointFailure.ConfigurationMissing ||
             state.RecoveryAttempts >= _options.RecoveryMaxAttempts)
         {
-            if (state.RecoveryAttempts >= _options.RecoveryMaxAttempts) state.LastFailureCategory = "recovery_exhausted";
+            if (category == null && state.RecoveryAttempts >= _options.RecoveryMaxAttempts) state.LastFailureCategory = "recovery_exhausted";
             state.MigrationState = TelegramEndpointMigrationState.ManualInterventionRequired;
             state.NextAttemptAtUtc = null;
             await SaveAsync(state, "manual_intervention", "manual_intervention", token);
@@ -447,7 +506,7 @@ public sealed partial class TelegramEndpointCoordinator
         _gate.Fence(state.BotId, state.TelegramBotId);
         state.MigrationState = state.LogoutEndpoint == TelegramEndpointType.Local
             ? TelegramEndpointMigrationState.LocalLogoutUncertain : TelegramEndpointMigrationState.CloudLogoutUncertain;
-        state.LastFailureCategory = "logout_uncertain";
+        state.LastFailureCategory = state.LogoutEndpoint == TelegramEndpointType.Local ? "local_logout_uncertain" : "cloud_logout_uncertain";
         state.LastFailureAtUtc = UtcNow;
         state.NextAttemptAtUtc = null;
         await SaveAsync(state, "logout_uncertain", "manual_intervention", CancellationToken.None);

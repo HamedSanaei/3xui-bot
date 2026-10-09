@@ -72,8 +72,8 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
     private readonly Microsoft.Extensions.Configuration.IConfiguration _liveConfiguration;
     /// <summary>Validated startup resource bounds.</summary>
     private readonly TelegramEndpointRoutingOptions _options;
-    /// <summary>Finite safe failure vocabulary; never exception messages.</summary>
-    private static readonly HashSet<string> FailureCategories = new(StringComparer.Ordinal)
+    /// <summary>Finite safe failure vocabulary, including the shared catalog's closed migration boundary combinations; never exception messages.</summary>
+    private static readonly HashSet<string> FailureCategories = new(TelegramEndpointDiagnosticCatalog.MigrationFailureCategories, StringComparer.Ordinal)
     {
         "connection_refused", "timeout", "network", "invalid_response", "rate_limited", "telegram_upstream", "token_rejected",
         "identity_mismatch", "receiver_not_ready", "logout_refused", "logout_uncertain", "configuration_missing", "drain_timeout",
@@ -95,7 +95,7 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
     /// <summary>Finite internal migration history reasons; never arbitrary request or response payloads.</summary>
     private static readonly HashSet<string> HistoryReasons = new(StringComparer.Ordinal)
     {
-        "migration_requested", "auto_failover_changed", "startup_reconciled", "cloud_logout_intent", "local_logout_intent",
+        "migration_requested", "migration_admission_failed", "auto_failover_changed", "startup_reconciled", "cloud_logout_intent", "local_logout_intent",
         "logout_acknowledged", "logout_uncertain", "logout_refused", "destination_starting", "migration_succeeded",
         "migration_failed", "local_outage", "local_recovered", "fallback_pending", "cloud_wait", "cloud_recovered",
         "manual_intervention", "safe_retry_scheduled", "automatic_failback"
@@ -192,6 +192,7 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
     }
 
     /// <inheritdoc />
+    /// <remarks>Failure, uncertainty, refusal, startup reconciliation and safe-retry history preserve the already-validated closed failure category in Outcome. Successful/requested transitions retain migration-state names even if health metadata still has an older failure; no new persistence boundary or schema is introduced.</remarks>
     public async Task<bool> TrySaveAsync(TelegramEndpointState state, long expectedRevision, string historyReason = null, string alertCategory = null, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(state);
@@ -220,7 +221,11 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
                     BotId = next.BotId, TelegramBotId = next.TelegramBotId, OperationId = next.OperationId, ActorTelegramUserId = next.ActorTelegramUserId,
                     FromDesiredEndpoint = existing.DesiredEndpoint, ToDesiredEndpoint = next.DesiredEndpoint,
                     FromEffectiveEndpoint = existing.EffectiveEndpoint, ToEffectiveEndpoint = next.EffectiveEndpoint,
-                    MigrationState = next.MigrationState, Reason = historyReason, Outcome = next.MigrationState.ToString(), CreatedAtUtc = now, Revision = next.Revision
+                    MigrationState = next.MigrationState, Reason = historyReason,
+                    Outcome = next.LastFailureCategory != null &&
+                        historyReason is "migration_failed" or "migration_admission_failed" or "logout_refused" or "logout_uncertain" or "manual_intervention" or "safe_retry_scheduled" or "startup_reconciled"
+                        ? next.LastFailureCategory : next.MigrationState.ToString(),
+                    CreatedAtUtc = now, Revision = next.Revision
                 });
             db.Entry(existing).CurrentValues.SetValues(next);
             try { await db.SaveChangesAsync(ct); }

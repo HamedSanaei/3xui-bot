@@ -44,18 +44,21 @@ Durable settlement, order, receipt and weekly notifications defer exact pre-HTTP
 
 ## Reading status and using bulk migration
 
-The inventory and each bot's detail view lead with the **actual current request-admission route**, not its saved preference:
+Inventory and bot detail screens begin with the **actual request-admission endpoint** in plain text. The simple screen shows connection, the latest migration result and fixed Persian corrective actions; machine metadata is not mixed into normal status.
 
 | Panel headline | Exact meaning |
 |---|---|
-| `☁️ Cloud — مسیر فعال` | The enabled current identity admits ordinary requests through its hydrated Cloud generation |
-| `🏠 Local — مسیر فعال` | The enabled current identity admits ordinary requests through its hydrated Local generation |
-| `⛔ مسیر فعال: ندارد` | The bot is disabled or its admission gate is fenced; no ordinary new request may start |
-| `❔ مسیر فعال: نامشخص` | Identity or current runtime observation is unavailable; the panel does not guess Cloud |
+| `☁️ CLOUD` | The enabled exact identity currently admits ordinary requests through Cloud |
+| `🏠 LOCAL` | The enabled exact identity currently admits ordinary requests through Local |
+| `⛔ اتصال متوقف؛ پذیرش درخواست بسته است` | Admission is fenced; no ordinary new request may start, even if the saved effective endpoint is Cloud/Local |
+| `⛔ اتصال غیرفعال؛ ربات غیرفعال است` | The current registry disables this bot |
+| `❔ اتصال نامشخص؛ مسیر فعلی مشاهده نشده است` | Runtime observation is unavailable; no Cloud default is guessed |
 
-`انتخاب مدیر` is the desired endpoint; `آخرین مسیر فعال‌شده` is the last durably validated destination. Neither proves that ordinary traffic is currently admitted. The nullable `RuntimeEndpoint`, `RuntimeAvailable` and `RuntimeGeneration` observations are `[NotMapped]`: reading the panel neither writes them to SQLite nor reopens a temporary migration fence. An active badge is **not** a network-health or receiver-liveness guarantee; health/poll observations remain separate.
+During migration, **`⏳ در حال انتقال`** separates source → destination from the currently admitted/paused connection. A historical source is never labeled active after fencing. An admission badge is not a network-health or receiver-liveness guarantee.
 
-`نتیجه انتقال` now distinguishes successful destination activation, pending execution, Cloud cooldown, definitive refusal/failure, uncertain cleanup/manual intervention and unproven results. Success requires the exact current operation's committed activation history, matching destination and activation timestamp no earlier than that operation's start. An old timestamp, registration acknowledgment or restored source is not a successful new migration. A later endpoint health failure does not rewrite a proven historical success: the panel shows the successful operation and current degraded/closed admission separately. Details include source, requested destination, start/activation UTC times, current generation and the recorded Cloud eligibility time.
+**`🔍 جزئیات فنی`** contains generation/gate, desired/last-validated endpoints, BotFather identity, durable migration state, UTC timestamps, cooldown eligibility, failure code/phase/checked prerequisite/action, authoritative configuration source, startup/live mapping values, logger readiness and bounded recent history. Complete technical output is paginated without dropping long paths or diagnostics. Opening/refreshing technical pages is read-only: no health probe, config rewrite, migration admission or gate reopening. It inherits every authorization, identity, revision, expiry and replay check.
+
+Success requires the exact current operation's committed destination activation receipt, matching destination and an activation timestamp at/after its start. Registration, a previous success, restored source, cooldown and uncertain logout never prove a new successful migration. A newer persisted validation refusal is shown separately from the earlier committed migration. Its finite failure category survives subsequent health refresh in history; no extra schema is needed. Batch success remains attributed only to its exact accepted operation. Nullable runtime observations remain `[NotMapped]`.
 
 The full inventory offers **`🏠 انتقال همه ربات‌ها به Local…`** and **`☁️ انتقال همه ربات‌ها به Cloud…`**:
 
@@ -156,7 +159,58 @@ Only official HTTPS `api.telegram.org` and configured HTTP loopback origins are 
 
 Official `--local` GetFile returns absolute paths **inside the existing server/container**. Its HTTP request listener is not the Cloud `/file/bot…` download service. Adminbot copies through an explicitly configured read-only mapping from `localFileServerRoot` to `localFileHostRoot`. The downloader's published Compose binds `./data` to `/data`; inspect the actual existing mounts/directory read-only to select exact roots. Do not assume the illustrative downloader default is the production path. Do not change its container, ownership or configuration.
 
-The host directory must already exist, be readable by the Adminbot service account, and contain no symbolic-link/reparse components. Missing mapping blocks Local migration **before Cloud logout**. Returned paths must have successful same-facade GetFile provenance, lie beneath the trusted mapping, contain no traversal and belong to the lookup generation. Files are read only; paths, tokens, file contents and credentials are not logged. The TGFile overload retains weak object provenance; string-path compatibility bindings are capped at 512 per facade, so a stale/evicted Local path must be looked up again. Per-file permissions can still fail after root validation and remain an explicit delivery failure, not an HTTP fallback or resend.
+The host directory must already exist, be searchable/listable by the Adminbot process, and contain no symbolic-link/reparse components. Linux validation uses effective credentials/ACLs (`faccessat`) and a bounded directory listing, not guessed mode bits; it reads no customer file contents and writes no probe files. Missing/invalid roots, missing directory, denied access, links and filesystem failures have distinct closed diagnostic categories. Malformed mapping no longer takes down independent Cloud administration at startup: validation instead fails closed at Local admission, both irreversible prelogout rechecks and Local file resolution. Trusted origins/resource limits still fail startup. Returned paths require same-facade GetFile provenance, containment without traversal and the correct generation. Per-file permission failures remain explicit delivery errors, never HTTP fallback or resend.
+
+The TGFile overload retains weak object provenance; string-path compatibility bindings are capped at 512 per facade, so a stale/evicted Local path must be looked up again. File paths/content, tokens and credentials remain absent from request telemetry and logs; trusted root paths are shown only in the authenticated operator technical view.
+
+### Authoritative configuration and Gozargah blocker
+
+`ApplicationConfigurationSource` loads only `<IWebHostEnvironment.ContentRootPath>/Data/configuration.json`, prints its absolute path at startup, and supplies that path to technical details. The previous unbased `AddJsonFile` used the assembly-directory provider: an isolated reproduction with content-root `/data` and a conflicting assembly copy read `/stale`. The explicit provider now reads `/data`. This is a separately reproduced loader defect, **not evidence that production read the wrong file**.
+
+Read-only inspection on **2026-10-09** established the current production prerequisite failure:
+
+| Evidence | Observation |
+|---|---|
+| Active service working directory | `/root/vpnetiran/bin/Release/net10.0/linux-x64/publish` |
+| Actual private configuration | `/root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Data/configuration.json` |
+| Configuration before current process start | Entire `telegramEndpointRouting` section absent; neither mapping key exists at root either |
+| Expected host directory | `/opt/telegram-media-downloader-bot/data` exists, readable/searchable by the current root service account, with no linked ancestor |
+| Tokenless Local root | Official HTTP 404 Bot API envelope at loopback; reachability only, not bot authentication |
+| Gozargah exact configured/durable identity | Matches; desired/effective/state Cloud, generation 1 |
+| Gozargah durable migration evidence | Zero history rows; no migration/logout/acknowledgment/cooldown timestamps |
+
+Thus the observed blocker is **`LOCAL_FILE_MAPPING_MISSING` at `local_file_mapping`**, before intent or Cloud logout. The old generic `unavailable` result hid it. This check did not prove live token authentication, historical failure causes or destination readiness; no token-bearing production call, logout, config write, service action or Docker mutation occurred.
+
+An authorized operator must add only these required keys within the existing `telegramEndpointRouting` section of the **actual active private file**, preserving all unrelated settings/secrets:
+
+```json
+{
+  "telegramEndpointRouting": {
+    "localFileServerRoot": "/data",
+    "localFileHostRoot": "/opt/telegram-media-downloader-bot/data"
+  }
+}
+```
+
+These values describe the existing downloader mount; they do not install or modify it. Mapping is startup-bound to protect file/endpoint generations. If live configuration differs, technical details explicitly require a deliberate application restart after the separately approved config/deployment change; a panel refresh cannot hot-remap existing clients. No production configuration was changed by this patch.
+
+### Diagnosing admission versus execution
+
+| Technical category example | Boundary and operator action |
+|---|---|
+| `LOCAL_FILE_MAPPING_MISSING` / `LOCAL_FILE_MAPPING_INVALID` | Validation; complete/correct absolute roots in the authoritative source, then apply startup configuration deliberately |
+| `LOCAL_FILE_HOST_MISSING` / `LOCAL_FILE_ACCESS_DENIED` / `LOCAL_FILE_PATH_LINKED` | Validation; inspect the exact existing mount and actual service-account access, never bypass links/containment or change the downloader container |
+| `MIGRATION_IN_PROGRESS` / `BUSY` / `STALE` | No new intent admitted; observe current operation or obtain fresh controls rather than replaying an old callback |
+| `LOCAL_ROOT_CONNECTION_REFUSED` / `LOCAL_ROOT_TIMEOUT` | Tokenless Local preflight failed; inspect loopback process/network availability |
+| `CLOUD_SOURCE_IDENTITY_IDENTITY_MISMATCH` / `LOCAL_DESTINATION_IDENTITY_IDENTITY_MISMATCH` | Exact identity validation failed at the named source/destination boundary; destination is never reported successful |
+| `CLOUD_LOGOUT_REFUSED` / `CLOUD_LOGOUT_UNCERTAIN` | Definite refusal versus ambiguous mutation; the latter cannot safely be repeated |
+| `LOCAL_DESTINATION_RECEIVER_NOT_READY` | Destination identity alone is insufficient; receiving readiness must succeed |
+| `CLOUD_COOLDOWN` | Legitimate provider wait, not an admission error or completed Cloud migration |
+
+JSONL `telegram_endpoint_migration` retains lowercase closed `category`, uppercase `failureClassification`, controlled `stage`/`operation`, outcome and existing endpoint fields. Intermediate transitions use `in_progress`; only committed destination activation is success. Technical history retains the finite failure code in `Outcome` only on failure/refusal/uncertain/retry/reconciliation receipts, leaving successful/requested state receipts unchanged. No raw errors, URLs, payloads or credentials are introduced.
+
+After a separately approved deployment/config application, first verify technical details show the exact source and both **startup** roots. Keep another authorized active owned Cloud control. Explicitly confirm the dedicated test bot migration, then refresh from the independent control until **`🏠 LOCAL` + `✅ نتیجه انتقال: موفق`** appear together. Technical history must show the same operation's acknowledged Cloud logout and `migration_succeeded` after exact Local identity/receiver validation. Exercise a benign message and file download on the dedicated bot; only then explicitly migrate Gozargah. `accepted`, a desired Local value, root 404 or a logout acknowledgment alone is not success.
+
 
 ## Persistence and deployment
 
@@ -205,6 +259,12 @@ Observed verification (initial routing smoke rows are explicitly labeled):
 
 | Check | Observed result |
 |---|---|
+| Current simplified-panel/config/mapping focused Release regressions | 254 passed; zero failed/skipped; actual SDK screens, file/source validation, phase-qualified errors, cooldown/restart, authority/replay and JSONL diagnostics covered |
+| Current complete Release regression suite | 1,622 passed; zero failed/skipped; pre-existing warnings remain in unrelated test files, no new warning in changed tests |
+| Current real panel/coordinator/gate smoke on Windows and isolated Linux | CLOUD → validated LOCAL → truthful CloudWait/paused connection → validated CLOUD; maximum one receiver; one fake logout per direction; missing mapping and unreachable root perform zero logout |
+| Current Linux effective-access smoke | Accessible directory accepted; actual mode-000 directory denied under uid 1000; real symlink rejected; missing directory classified. Temporary self-contained launcher only; invariant globalization because this isolated WSL image lacks ICU, not a production configuration change |
+| Current configuration-source before/after smoke | Original loader selected conflicting assembly `/stale`; fixed explicit content-root provider selected `/data` on Windows/Linux |
+| Current smoke JSONL | 22 observations across round-trip and refusal scenarios; zero dropped events/writer failures; exact stage/code retained |
 | Logger-channel cutover verification retained from the previous change | 202 focused regressions and 1,496 complete Release regressions passed; missing/configured logger labels and actual channel worker were exercised through fake HTTP without private delivery |
 | Endpoint status/bulk focused Release regressions | 265 passed; zero failed/skipped; actual gate observations, operation evidence, full-inventory admission, authorization/replay/concurrency, cooldown/restart and ambiguous persistence covered |
 | Complete Release regression suite after status/bulk enhancement | 1,561 passed; zero failed/skipped; includes existing tenant/financial, FIFO, endpoint protocol and durable logger-outbox regressions |
@@ -220,4 +280,4 @@ Observed verification (initial routing smoke rows are explicitly labeled):
 
 The controlled benchmark and allocation caveats are recorded in [latency telemetry verification](telegram-latency-telemetry.md#controlled-overhead-benchmark-and-verification). Temporary smoke/report tooling lives outside the repository and is removed after verification.
 
-No local test proves production network quality, service-account file permissions, real notification audience, Telegram session restrictions in a live bot or historical Gozargah incidents. These require the staged dedicated test bot and read-only JSONL/state evidence. A healthy shared root is not a healthy bot, a completed API send is not proof a user read it, and ten minutes elapsed is not proof an unreachable Local session was cleaned up. Uncertain alert delivery and migration remain visible for human review.
+Automated fake transports do not prove production network quality, live token authentication, full service-account file-transfer permissions, notification audience or real Telegram session behavior. The read-only production check above proves only current root-directory access and tokenless Local reachability; per-file access, post-deployment settings and the actual receiving path still require the explicitly authorized dedicated test bot. API acknowledgment is not proof a user read the message, and elapsed cooldown is not proof an unreachable Local session was cleaned up. Uncertain alert delivery/migration remain visible for human review.

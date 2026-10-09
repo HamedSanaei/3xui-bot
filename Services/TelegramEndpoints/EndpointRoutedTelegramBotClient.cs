@@ -327,26 +327,55 @@ internal sealed class TelegramEndpointRequestObservation : IDisposable
 /// <remarks>Official Local API does not serve Cloud's /file endpoint. Container/server paths are never opened directly. No downloader configuration or filesystem is modified.</remarks>
 internal static class TelegramLocalFileMapper
 {
-    /// <summary>Validates an existing nonlinked host root before an irreversible Cloud logout.</summary>
-    /// <param name="options">Validated trusted server/host mapping from application configuration.</param>
-    /// <returns>True when the mapped host directory exists and no path component is a link/reparse point.</returns>
-    /// <remarks>Missing permission or inaccessible paths return false; actual per-file permissions are checked when transferring.</remarks>
-    internal static bool IsReady(TelegramEndpointRoutingOptions options)
+    /// <summary>Checks the trusted mapping using only directory metadata and a bounded read-only listing.</summary>
+    /// <param name="options">Trusted startup roots; absent or malformed values fail closed.</param>
+    /// <param name="directoryProbe">Optional internal deterministic listing-failure seam; production always performs its real listing first.</param>
+    /// <returns>Null only for an existing searchable, listable, nonlinked directory; otherwise a closed secret-free failure category.</returns>
+    /// <remarks>No file contents or entry names are consumed and no scratch files are created. Searchability and listing use the current process's actual ACLs and privileges. The test seam cannot bypass real validation.</remarks>
+    /// <example><code>var refusal = TelegramLocalFileMapper.ProbeReadiness(startupRoutingOptions); // Null permits the next safe preflight, not logout or migration success.</code></example>
+    internal static string ProbeReadiness(TelegramEndpointRoutingOptions options, Action<string> directoryProbe = null)
     {
-        if (!options.HasLocalFileMapping) return false;
-        try { CheckLinks(Path.GetFullPath(options.LocalFileHostRoot)); return Directory.Exists(options.LocalFileHostRoot); }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { return false; }
+        var validation = options.ValidateLocalFileMapping();
+        if (validation != null) return validation;
+        var host = options.LocalFileHostRoot;
+        try
+        {
+            var fullPath = Path.GetFullPath(host);
+            CheckLinks(fullPath);
+            if ((File.GetAttributes(fullPath) & FileAttributes.Directory) == 0) return "local_file_mapping_invalid";
+            CheckSearchAccess(fullPath);
+            // MoveNext forces lazy enumeration to actually open/list the directory, including an empty root.
+            using var entries = Directory.EnumerateFileSystemEntries(fullPath).GetEnumerator();
+            _ = entries.MoveNext();
+            directoryProbe?.Invoke(fullPath);
+            return null;
+        }
+        catch (UnauthorizedAccessException) { return "local_file_access_denied"; }
+        catch (System.Security.SecurityException) { return "local_file_access_denied"; }
+        catch (DirectoryNotFoundException) { return "local_file_host_missing"; }
+        catch (FileNotFoundException) { return "local_file_host_missing"; }
+        catch (ArgumentException) { return "local_file_mapping_invalid"; }
+        catch (NotSupportedException) { return "local_file_mapping_invalid"; }
+        catch (IOException error) when (error.Data.Contains("local_mapping_link")) { return "local_file_path_linked"; }
+        catch (IOException) { return "local_file_probe_failed"; }
     }
+
+    /// <summary>Preserves the health worker's boolean predicate while admission consumes the precise diagnostic.</summary>
+    /// <param name="options">Trusted startup root pair.</param>
+    /// <returns>True only when the real read-only mapping probe succeeds.</returns>
+    /// <remarks>Retains the existing health/failback predicate; a successful directory check is not bot authentication or Telegram readiness.</remarks>
+    /// <example><code>if (!TelegramLocalFileMapper.IsReady(startupRoutingOptions)) return; // Keep existing Cloud control.</code></example>
+    internal static bool IsReady(TelegramEndpointRoutingOptions options) => ProbeReadiness(options) == null;
 
     /// <summary>Resolves one observed server file beneath the trusted existing host mapping without traversal or links.</summary>
     /// <param name="options">Validated explicit roots; neither root may be supplied through an admin callback.</param>
     /// <param name="serverPath">Private actual GetFile path returned by the trusted Local API.</param>
     /// <returns>A full local host path suitable only for read-only copying; never expose it to users or logs.</returns>
     /// <exception cref="BotTransportUnavailableException">Mapping is absent, invalid, outside its root, or linked.</exception>
-    /// <remarks>URI decoding is deliberately absent: this is a filesystem path, not a URL. Every component rejects parent traversal and symbolic links.</remarks>
+    /// <remarks>The named Local-use boundary revalidates both roots even when Cloud startup preserved malformed settings. URI decoding is deliberately absent: this is a filesystem path, not a URL. Every component rejects parent traversal and symbolic links.</remarks>
     internal static string Resolve(TelegramEndpointRoutingOptions options, string serverPath)
     {
-        if (!options.HasLocalFileMapping || string.IsNullOrEmpty(serverPath) || serverPath.Length > 4096 || serverPath.Any(char.IsControl))
+        if (options.ValidateLocalFileMapping() != null || string.IsNullOrEmpty(serverPath) || serverPath.Length > 4096 || serverPath.Any(char.IsControl))
             throw new BotTransportUnavailableException("local_file_mapping_required");
         var serverRoot = options.LocalFileServerRoot.Replace('\\', '/').TrimEnd('/') + "/";
         var normalized = serverPath.Replace('\\', '/');
@@ -366,17 +395,52 @@ internal static class TelegramLocalFileMapper
 
     /// <summary>Checks each existing host path component without following symbolic links or Windows reparse points.</summary>
     /// <param name="fullPath">Required fully qualified root or file path.</param>
-    /// <exception cref="IOException">A linked component exists.</exception>
-    /// <remarks>The shared data volume is treated as trusted operator-owned storage; customer input never selects its root.</remarks>
+    /// <exception cref="IOException">A linked component exists or filesystem metadata cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">An ancestor cannot be searched.</exception>
+    /// <remarks>Metadata APIs throw rather than hiding access failures as nonexistence. Linux search uses effective-user ACL/privilege checks, not mode-bit guesses; trusted operator-owned storage must remain stable during use.</remarks>
     private static void CheckLinks(string fullPath)
     {
         var current = Path.GetPathRoot(fullPath);
         foreach (var part in fullPath[current.Length..].Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries))
         {
             current = Path.Combine(current, part);
-            FileSystemInfo info = Directory.Exists(current) ? new DirectoryInfo(current) : new FileInfo(current);
-            if (info.LinkTarget != null || (info.Exists && (info.Attributes & FileAttributes.ReparsePoint) != 0))
-                throw new IOException("A Local file mapping component is linked.");
+            var attributes = File.GetAttributes(current);
+            FileSystemInfo info = (attributes & FileAttributes.Directory) != 0 ? new DirectoryInfo(current) : new FileInfo(current);
+            if (info.LinkTarget != null || (attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                var error = new IOException("A Local file mapping component is linked.");
+                error.Data["local_mapping_link"] = true;
+                throw error;
+            }
+            if ((attributes & FileAttributes.Directory) != 0)
+                CheckSearchAccess(current);
         }
     }
+
+    /// <summary>Checks actual Linux directory-search access, including effective identity, ACLs and root privileges.</summary>
+    /// <param name="directory">Trusted existing absolute directory, already proven nonlinked.</param>
+    /// <remarks>faccessat performs no write or customer-file read. Windows uses metadata/list operations and its ordinary privilege-aware path traversal. Managed normalization of a trailing dot is not evidence of Unix search permission.</remarks>
+    /// <exception cref="UnauthorizedAccessException">The effective process cannot search the directory.</exception>
+    /// <exception cref="DirectoryNotFoundException">The directory disappeared during validation.</exception>
+    /// <exception cref="IOException">The filesystem could not prove search permission.</exception>
+    private static void CheckSearchAccess(string directory)
+    {
+        if (!OperatingSystem.IsLinux()) return;
+        // AT_FDCWD, X_OK, AT_EACCESS: check the running service's effective credentials, not the real user's mode bits.
+        if (DirectoryAccess(-100, directory, 1, 0x200) == 0) return;
+        var error = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+        if (error is 1 or 13) throw new UnauthorizedAccessException("Local directory search access denied.");
+        if (error is 2 or 20) throw new DirectoryNotFoundException("Local directory is unavailable.");
+        throw new IOException("Local directory search access could not be proven.");
+    }
+
+    /// <summary>Invokes Linux effective-credential access checking without opening or changing any file.</summary>
+    /// <param name="directoryFd">AT_FDCWD for the already absolute trusted path.</param>
+    /// <param name="path">Absolute nonlinked trusted directory, marshalled as UTF-8 and never logged.</param>
+    /// <param name="mode">X_OK directory-search permission bit.</param>
+    /// <param name="flags">AT_EACCESS selects effective service credentials including ACLs and privileges.</param>
+    /// <returns>Zero only when the kernel grants access; otherwise minus one with captured errno.</returns>
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "faccessat", SetLastError = true)]
+    private static extern int DirectoryAccess(int directoryFd,
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPUTF8Str)] string path, int mode, int flags);
 }

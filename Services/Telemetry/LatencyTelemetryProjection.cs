@@ -106,13 +106,14 @@ internal static class LatencyTelemetryProjection
     /// <summary>Maps one cached camel-case schema property to its relevant event-family masks.</summary>
     /// <param name="name">Serializer-owned property name, calculated once during metadata initialization.</param>
     /// <returns>Relevant mask; unknown newly added properties conservatively remain available in every family.</returns>
+    /// <remarks>Endpoint records retain controlled migration phase names in stage alongside their core operation and finite failure classification; no raw exceptions or endpoint URLs are introduced.</remarks>
     private static ulong FieldsForProperty(string name) => name switch
     {
         "schemaVersion" or "sessionId" or "timestampUtc" or "eventType" or "traceId" or "botId" or "updateId"
             or "sequence" or "updateType" or "operation" or "category" or "outcome" or "timingQuality" => Core,
         "endpointType" or "endpointGeneration" or "migrationState" => Request | Endpoint,
         "healthCheckDurationMs" or "failoverTrigger" or "failoverDurationMs" or "cloudReuseRemainingMs" or "lastSuccessUtc" => Endpoint,
-        "stage" => Request | Database | Polling | Stage | StageSummary | AllTimeline | HandlerStarted | FirstAttempt | FirstCompleted | FirstAcknowledged,
+        "stage" => Request | Endpoint | Database | Polling | Stage | StageSummary | AllTimeline | HandlerStarted | FirstAttempt | FirstCompleted | FirstAcknowledged,
         "method" => Request | FirstAttempt | FirstCompleted | FirstAcknowledged,
         "durationMs" => Request | Endpoint | Database | Polling | Stage | StageSummary | AllTimeline | HandlerCompleted | TimelineLost,
         "httpStatusCode" or "apiErrorCode" => Request | Endpoint | Polling | AllTimeline | HandlerCompleted | FirstCompleted | FirstAcknowledged,

@@ -150,7 +150,7 @@ public sealed class TelegramEndpointHistory
     public TelegramEndpointMigrationState MigrationState { get; set; }
     /// <summary>Closed internal transition reason; never an HTTP body or exception message.</summary>
     public string Reason { get; set; }
-    /// <summary>Closed migration-state name representing the transition outcome.</summary>
+    /// <summary>Closed migration-state name for successful/requested transitions, or the validated secret-free failure category for failed/refused/uncertain/admission/safe-retry receipts. Legacy state-only outcomes have no inferred precise failure stage.</summary>
     public string Outcome { get; set; }
     /// <summary>UTC commit observation time.</summary>
     public DateTime CreatedAtUtc { get; set; }

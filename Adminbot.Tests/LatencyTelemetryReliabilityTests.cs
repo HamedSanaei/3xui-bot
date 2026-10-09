@@ -697,6 +697,7 @@ public sealed class LatencyTelemetryReliabilityTests
 
     /// <summary>Endpoint schema projection persists every supported measurement while rejecting arbitrary labels, invalid numbers and non-UTC success timestamps.</summary>
     /// <returns>A task verifying the real version-one writer rejects leakage without recursion or writer failures.</returns>
+    /// <remarks>Migration diagnosis must survive file serialization: retaining only an error code while dropping its phase would hide whether admission or an irreversible operation failed.</remarks>
     [Fact]
     public async Task Endpoint_schema_projects_measurements_and_rejects_uncontrolled_state_or_secrets()
     {
@@ -708,7 +709,8 @@ public sealed class LatencyTelemetryReliabilityTests
             EventType = "telegram_endpoint_migration", BotId = "owned", EndpointType = "local",
             EndpointGeneration = 2, MigrationState = "CloudWait", HealthCheckDurationMs = 12.5,
             FailoverTrigger = "automatic_outage", FailoverDurationMs = 100, CloudReuseRemainingMs = 600000,
-            LastSuccessUtc = now, Outcome = "uncertain", ConsecutiveFailures = 3
+            LastSuccessUtc = now, Outcome = "uncertain", ConsecutiveFailures = 3,
+            Stage = "local_file_mapping", Operation = "migration_admission", FailureClassification = "LOCAL_FILE_MAPPING_MISSING"
         };
         foreach (var family in new[] { "telegram_endpoint_health", "telegram_endpoint_migration", "telegram_endpoint_outage", "telegram_endpoint_recovered" })
             Assert.True(service.TryRecord(safe with { EventType = family }));
@@ -733,6 +735,9 @@ public sealed class LatencyTelemetryReliabilityTests
             Assert.Equal(safe.EndpointType, row.EndpointType);
             Assert.Equal(safe.EndpointGeneration, row.EndpointGeneration);
             Assert.Equal(safe.MigrationState, row.MigrationState);
+            Assert.Equal(safe.Stage, row.Stage);
+            Assert.Equal(safe.Operation, row.Operation);
+            Assert.Equal(safe.FailureClassification, row.FailureClassification);
             Assert.Equal(safe.HealthCheckDurationMs, row.HealthCheckDurationMs);
             Assert.Equal(safe.FailoverTrigger, row.FailoverTrigger);
             Assert.Equal(safe.FailoverDurationMs, row.FailoverDurationMs);

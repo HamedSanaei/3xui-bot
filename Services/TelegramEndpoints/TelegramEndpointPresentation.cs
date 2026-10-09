@@ -1,23 +1,22 @@
-using System.Globalization;
-
 namespace Adminbot.Services.TelegramEndpoints;
 
 /// <summary>Formats secret-free route admission and current-operation outcomes without treating durable intent as a live route.</summary>
 /// <remarks>Gate admission is not a network probe or proof that a receiver is alive. Success requires a destination activation committed during the current operation.</remarks>
 internal static class TelegramEndpointPresentation
 {
-    /// <summary>Formats the actual admission badge before any desired or historical route.</summary>
+    /// <summary>Formats only the admitted endpoint or an explicit unavailable/unknown connection headline.</summary>
     /// <param name="state">Detached exact-identity state with nullable runtime observations.</param>
     /// <param name="enabled">Whether the current registry configuration enables this bot.</param>
-    /// <returns>A fixed Persian badge; absent observations never default to Cloud.</returns>
+    /// <returns>Exact uppercase CLOUD/LOCAL for an admitted route; never a historical source presented as active.</returns>
+    /// <remarks>The headline describes admission, not network reachability. Migration progress is added separately by the panel.</remarks>
     internal static string ActiveBadge(TelegramEndpointState state, bool enabled)
     {
-        if (state.TelegramBotId <= 0) return "❔ مسیر فعال: نامشخص؛ هویت موجود نیست";
-        if (!enabled) return "⛔ مسیر فعال: ندارد؛ ربات غیرفعال است";
-        if (state.RuntimeAvailable == false) return "⛔ مسیر فعال: ندارد؛ پذیرش درخواست بسته است";
+        if (state.TelegramBotId <= 0) return "❔ اتصال نامشخص؛ هویت ربات موجود نیست";
+        if (!enabled) return "⛔ اتصال غیرفعال؛ ربات غیرفعال است";
+        if (state.RuntimeAvailable == false) return "⛔ اتصال متوقف؛ پذیرش درخواست بسته است";
         if (state.RuntimeAvailable != true || !state.RuntimeEndpoint.HasValue || !Enum.IsDefined(state.RuntimeEndpoint.Value) || !state.RuntimeGeneration.HasValue)
-            return "❔ مسیر فعال: نامشخص؛ مشاهده مسیر موجود نیست";
-        return state.RuntimeEndpoint == TelegramEndpointType.Cloud ? "☁️ Cloud — مسیر فعال" : "🏠 Local — مسیر فعال";
+            return "❔ اتصال نامشخص؛ مسیر فعلی مشاهده نشده است";
+        return state.RuntimeEndpoint == TelegramEndpointType.Cloud ? "☁️ CLOUD" : "🏠 LOCAL";
     }
 
     /// <summary>Gets the destination of the current operation, separately from automatic fallback's preserved desired Local route.</summary>
@@ -53,23 +52,44 @@ internal static class TelegramEndpointPresentation
         return "pending";
     }
 
+    /// <summary>Separates the newest refused registration from the last committed operation after process-local controls are lost.</summary>
+    /// <param name="state">Fresh current configured identity.</param>
+    /// <param name="history">Current identity's bounded durable request/activation receipts.</param>
+    /// <returns>A fixed Persian main-screen summary; a newer refusal never becomes a successful new migration.</returns>
+    /// <remarks>Exact-operation Outcome remains unchanged for batch attribution; admission refusal cannot rewrite an older batch's committed success.</remarks>
+    internal static string MainOutcomeLabel(TelegramEndpointState state, IReadOnlyList<TelegramEndpointHistory> history)
+    {
+        TelegramEndpointHistory latest = null;
+        foreach (var item in history)
+        {
+            if (item.BotId != state.BotId || item.TelegramBotId != state.TelegramBotId ||
+                item.Reason is not ("migration_admission_failed" or "migration_requested")) continue;
+            if (latest == null || item.CreatedAtUtc > latest.CreatedAtUtc ||
+                (item.CreatedAtUtc == latest.CreatedAtUtc && item.Id > latest.Id)) latest = item;
+        }
+        return latest?.Reason == "migration_admission_failed"
+            ? "❌ آخرین درخواست انتقال: اعتبارسنجی رد شد؛ هیچ درخواست جدیدی ثبت نشد.\nآخرین انتقال ثبت‌شدهٔ پیشین:\n" + OutcomeLabel(state, history)
+            : OutcomeLabel(state, history);
+    }
+
     /// <summary>Formats the current migration outcome and next operator action before telemetry.</summary>
     /// <param name="history">Current identity's bounded durable operation receipts, not a batch registration result.</param>
     /// <param name="state">Detached current operation metadata.</param>
-    /// <returns>A fixed Persian operational label with UTC activation evidence only for proven current-operation activation.</returns>
+    /// <returns>A fixed Persian result/action without timestamps or technical protocol metadata.</returns>
+    /// <remarks>Admission, registration and execution are distinct. Dates and protocol metadata belong only to the authenticated technical view.</remarks>
     internal static string OutcomeLabel(TelegramEndpointState state, IReadOnlyList<TelegramEndpointHistory> history) => Outcome(state, history) switch
     {
         "unknown" => "نتیجه انتقال: نامشخص؛ ابتدا هویت ربات را اصلاح کنید.",
         "none" => "نتیجه انتقال: عملیات انتقالی برای هویت جاری ثبت نشده است.",
         "unproven" => "نتیجه انتقال: مسیر مقصد/انتخاب را بررسی کنید؛ فعال‌سازی جدید برای همین عملیات اثبات نشده است (ممکن است مقصد از قبل برقرار باشد).",
-        "succeeded" => $"✅ نتیجه انتقال: موفق؛ مقصد در {state.LastMigrationAtUtc.Value.ToString("yyyy-MM-dd HH:mm:ss 'UTC'", CultureInfo.InvariantCulture)} فعال شد." +
+        "succeeded" => "✅ نتیجه انتقال: موفق؛ مقصد برای همین درخواست فعال شد." +
             (state.RuntimeAvailable == false || state.MigrationState is TelegramEndpointMigrationState.LocalDegraded or TelegramEndpointMigrationState.LocalUnavailable
                 ? " ⚠️ افت سلامت/بسته‌شدن مسیر پس از انتقال موفق؛ وضعیت فعلی را جداگانه بررسی کنید." : ""),
-        "refused" => "❌ نتیجه انتقال: خروج رد شد؛ مقصد فعال نشد. مسیر مبدأ بازیابی‌شده را از نشان مسیر فعال بررسی کنید.",
+        "refused" => "❌ نتیجه انتقال: خروج رد شد؛ مقصد فعال نشد. اتصال فعلی مبدأ را جداگانه بررسی کنید.",
         "failed" => "❌ نتیجه انتقال: ناموفق؛ مقصد فعال نشد. مسیر مبدأ/خطا را بررسی کنید.",
-        "uncertain" => "⚠️ نتیجه انتقال: نامطمئن/نیازمند بررسی دستی؛ logOut یا درخواست انتقال را تکرار نکنید.",
+        "uncertain" => "⚠️ نتیجه انتقال: نامطمئن/نیازمند بررسی دستی؛ خروج یا درخواست انتقال را تکرار نکنید.",
         _ => state.MigrationState == TelegramEndpointMigrationState.CloudWait
-            ? "⏳ نتیجه انتقال: در انتظار مهلت رسمی Cloud؛ ثبت درخواست به معنی تکمیل نیست. تازه‌سازی کنید."
-            : "⏳ نتیجه انتقال: در حال اجرا/در انتظار؛ ثبت درخواست به معنی تکمیل نیست. تازه‌سازی کنید."
+            ? "⏳ نتیجه انتقال: در انتظار مهلت رسمی CLOUD؛ ثبت درخواست به معنی تکمیل نیست. تازه‌سازی کنید."
+            : "⏳ نتیجه انتقال: در حال انتقال؛ ثبت درخواست به معنی تکمیل نیست. تازه‌سازی کنید."
     };
 }

@@ -78,7 +78,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.True(f.Gate.IsAvailable("owned-a", 123));
     }
 
-    /// <summary>A mismatched Cloud identity never authorizes logout or destination session creation.</summary>
+    /// <summary>A mismatched Cloud source identity is persisted with its exact prelogout stage and never authorizes logout or destination creation.</summary>
+    /// <returns>A task after exact source-stage failure is saved with no irreversible call.</returns>
     [Fact]
     public async Task Wrong_source_identity_is_refused_before_logout()
     {
@@ -87,18 +88,19 @@ public sealed partial class TelegramEndpointCoordinatorTests
         f.Protocol.CloudFailure = TelegramEndpointFailure.IdentityMismatch;
         await f.RequestAsync(TelegramEndpointType.Local);
         await f.Coordinator.RunPendingOperationsAsync(default);
-        Assert.Equal("identity_mismatch", (await f.StatusAsync()).LastFailureCategory);
+        Assert.Equal("cloud_source_identity_identity_mismatch", (await f.StatusAsync()).LastFailureCategory);
         Assert.Equal(0, f.Protocol.LogoutCalls);
         Assert.DoesNotContain("identity:Local", f.Protocol.Events);
     }
 
     /// <summary>Missing trusted file mapping blocks Local intent before any probe or irreversible logout.</summary>
+    /// <returns>A task after precise mapping_missing admission refusal without any protocol request.</returns>
     [Fact]
     public async Task Missing_mapping_refuses_local_migration_without_transport_calls()
     {
         using var f = new Fixture(options: new TelegramEndpointRoutingOptions());
         await f.InitializeAsync();
-        Assert.Equal("unavailable", await f.RequestAsync(TelegramEndpointType.Local));
+        Assert.Equal("local_file_mapping_missing", await f.RequestAsync(TelegramEndpointType.Local));
         Assert.Empty(f.Protocol.Events);
     }
 
@@ -198,6 +200,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
     }
 
     /// <summary>The existing mapped directory must remain ready when the worker crosses the logout boundary.</summary>
+    /// <returns>A task after precise host_missing failure preserves source service without logout.</returns>
     [Fact]
     public async Task Removed_mapping_after_confirmation_never_authorizes_logout()
     {
@@ -207,7 +210,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Directory.Delete(f.HostRoot);
         await f.Coordinator.RunPendingOperationsAsync(default);
         Assert.Equal(0, f.Protocol.LogoutCalls);
-        Assert.Equal("configuration_missing", (await f.StatusAsync()).LastFailureCategory);
+        Assert.Equal("local_file_host_missing", (await f.StatusAsync()).LastFailureCategory);
     }
 
     /// <summary>Ambiguous mutation delivery stays fenced and never creates the destination session or replays logout.</summary>
@@ -305,7 +308,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.DoesNotContain("identity:Local", f.Protocol.Events);
     }
 
-    /// <summary>An explicit refusal may safely restart only the known source, never the destination.</summary>
+    /// <summary>An explicit Cloud logout refusal retains its endpoint boundary and may safely restart only the known source.</summary>
+    /// <returns>A task after source restoration without destination probing or replay of the same cleanup.</returns>
     [Fact]
     public async Task Definitive_logout_refusal_restores_cloud_and_does_not_retry_same_operation()
     {
@@ -317,14 +321,15 @@ public sealed partial class TelegramEndpointCoordinatorTests
         await f.Coordinator.RunPendingOperationsAsync(default);
         var state = await f.StatusAsync();
         Assert.Equal(TelegramEndpointMigrationState.Cloud, state.MigrationState);
-        Assert.Equal("logout_refused", state.LastFailureCategory);
+        Assert.Equal("cloud_logout_refused", state.LastFailureCategory);
         Assert.Null(state.LogoutAttemptedAtUtc);
         Assert.Equal(1, f.Protocol.LogoutCalls);
         Assert.DoesNotContain("identity:Local", f.Protocol.Events);
         Assert.True(f.Gate.IsAvailable("owned-a", 123));
     }
 
-    /// <summary>Destination getMe alone cannot activate a route when strict receiving readiness fails.</summary>
+    /// <summary>Destination getMe alone cannot activate a route when strict receiving readiness fails; precise Local readiness diagnostics remain fenced.</summary>
+    /// <returns>A task after safe receiver retry succeeds without a second logout.</returns>
     [Fact]
     public async Task Failed_receiving_readiness_stays_fenced_and_retries_reads_without_second_logout()
     {
@@ -336,7 +341,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         var state = await f.StatusAsync();
         Assert.Equal(TelegramEndpointMigrationState.SwitchingToLocal, state.MigrationState);
         Assert.False(f.Gate.IsAvailable("owned-a", 123));
-        Assert.Equal("receiver_not_ready", state.LastFailureCategory);
+        Assert.Equal("local_destination_receiver_not_ready", state.LastFailureCategory);
         f.Lifecycle.Ready = true;
         f.Clock.Advance(TimeSpan.FromSeconds(15));
         await f.Coordinator.RunPendingOperationsAsync(default);
@@ -405,7 +410,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.Equal(1, f.Lifecycle.MaximumReceivers);
     }
 
-    /// <summary>An unreachable Local session cannot be bypassed with Cloud getMe, even after its old cooldown elapsed.</summary>
+    /// <summary>An unreachable Local session cannot be bypassed with Cloud getMe; exhausting safe retries preserves its exact root failure stage.</summary>
+    /// <returns>A task after bounded reads end in explicit intervention with no logout or destination activation.</returns>
     [Fact]
     public async Task Unsafe_local_cleanup_has_bounded_safe_reads_and_visible_manual_review()
     {
@@ -425,7 +431,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
             }
         }
         Assert.Equal(TelegramEndpointMigrationState.ManualInterventionRequired, (await f.StatusAsync()).MigrationState);
-        Assert.Equal("recovery_exhausted", (await f.StatusAsync()).LastFailureCategory);
+        Assert.Equal("local_root_connection_refused", (await f.StatusAsync()).LastFailureCategory);
         Assert.Equal(0, f.Protocol.LogoutCalls);
         Assert.DoesNotContain("identity:Cloud", f.Protocol.Events);
         Assert.Contains("manual_intervention", f.Store.AlertCategories);
@@ -1089,7 +1095,14 @@ public sealed partial class TelegramEndpointCoordinatorTests
         {
             lock (_sync) return Task.FromResult<IReadOnlyList<TelegramEndpointState>>(_states.Values.Select(x => x.Copy()).ToArray());
         }
-        /// <inheritdoc />
+        /// <summary>Commits a detached fake CAS transition while preserving closed failure history for real panel/coordinator scenarios.</summary>
+        /// <param name="state">Synthetic identity-bound proposal; never production state or credentials.</param>
+        /// <param name="expectedRevision">Expected fake durable CAS revision.</param>
+        /// <param name="historyReason">Optional fixed transition reason that creates a failure or state receipt.</param>
+        /// <param name="alertCategory">Optional closed incident category recorded without message bodies.</param>
+        /// <param name="token">Caller cancellation context retained by the existing fake interface.</param>
+        /// <returns>True only when the fake revision commits; false for an injected or actual CAS conflict.</returns>
+        /// <remarks>History includes a closed error category on failed transitions, matching the real store so later health cannot erase panel diagnosis. No network or filesystem operation occurs.</remarks>
         public Task<bool> TrySaveAsync(TelegramEndpointState state, long expectedRevision, string? historyReason = null,
             string? alertCategory = null, CancellationToken token = default)
         {
@@ -1116,7 +1129,10 @@ public sealed partial class TelegramEndpointCoordinatorTests
                     MigrationState = state.MigrationState, ActorTelegramUserId = state.ActorTelegramUserId, OperationId = state.OperationId,
                     FromDesiredEndpoint = previous.DesiredEndpoint, ToDesiredEndpoint = state.DesiredEndpoint,
                     FromEffectiveEndpoint = previous.EffectiveEndpoint, ToEffectiveEndpoint = state.EffectiveEndpoint,
-                    Outcome = state.MigrationState.ToString(), Revision = state.Revision,
+                    Id = _history.Count + 1,
+                    Outcome = state.LastFailureCategory != null &&
+                        historyReason is "migration_failed" or "migration_admission_failed" or "logout_refused" or "logout_uncertain" or "manual_intervention" or "safe_retry_scheduled" or "startup_reconciled"
+                        ? state.LastFailureCategory : state.MigrationState.ToString(), Revision = state.Revision,
                     CreatedAtUtc = state.LastMigrationAtUtc ?? state.MigrationStartedAtUtc ?? DateTime.UtcNow
                 });
                 if (alertCategory != null)
