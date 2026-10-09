@@ -480,6 +480,32 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(2, (await db.TelegramUpdateInbox.SingleAsync()).UpdateId);
     }
 
+    /// <summary>Context-owned transaction disposal rolls back its changes and releases a queued durable admission.</summary>
+    /// <param name="asynchronous">True disposes the owning EF context asynchronously; false uses synchronous disposal.</param>
+    /// <returns>A task completing after the successor is persisted and the abandoned transaction's row is absent.</returns>
+    /// <remarks>EF marks the context disposed before cleaning up its transaction. Regression: querying Context.Database
+    /// from TransactionDisposed throws, interrupts provider cleanup and strands the writer. No explicit transaction
+    /// disposal is performed here; the context must own rollback and resource release in both disposal paths.</remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Sqlite_context_owned_transaction_disposal_rolls_back_and_releases_admission(bool asynchronous)
+    {
+        using var databases = new Databases();
+        await using var holder = databases.Users.CreateDbContext();
+        await holder.Database.BeginTransactionAsync();
+        holder.BotUserStates.Add(new BotUserState { BotId = "abandoned", TelegramUserId = 789 });
+        await holder.SaveChangesAsync();
+        var successor = databases.Inbox.TryAcceptAsync("a", Update(1, 123), 10, default);
+        Assert.False(successor.IsCompleted);
+        if (asynchronous) await holder.DisposeAsync();
+        else holder.Dispose();
+        Assert.True(await successor.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, await databases.Inbox.CountPendingAsync(default));
+        await using var check = databases.Users.CreateDbContext();
+        Assert.False(await check.BotUserStates.AnyAsync(x => x.BotId == "abandoned"));
+    }
+
     /// <summary>Foreground writer turns precede queued maintenance without starving the oldest background transaction.</summary>
     /// <returns>A task completing after all independent writer turns commit in priority/FIFO order.</returns>
     /// <remarks>The writer is held until every request is queued; completion order therefore cannot depend on sleeps or thread-pool scheduling.</remarks>

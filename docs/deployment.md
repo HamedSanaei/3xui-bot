@@ -127,6 +127,8 @@ waits. Reads remain concurrent; a bounded cancellable process-local queue gives 
 up to eight turns before a waiting background write. Explicit transaction ownership is reentrant and retained through
 reader/transaction cleanup. SQLite still enforces actual atomicity, constraints and cross-process isolation; this is
 not a replacement transaction manager or permission to replay financial/external effects.
+Transaction-disposal cleanup uses weak provider-transaction metadata instead of querying an already-disposed EF
+context; context-owned abandoned transactions still roll back and release successor writes.
 Queue-slot and writer-turn waits share the existing command/connection timeout, rather than waiting indefinitely.
 Expiry remains SQLite BUSY (5) under the existing three-attempt policy; caller cancellation is not relabelled as BUSY.
 An explicitly configured zero timeout preserves SQLite's unlimited-wait convention.

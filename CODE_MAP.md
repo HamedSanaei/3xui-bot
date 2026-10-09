@@ -788,6 +788,8 @@ and the main menu.
   Both EF contexts install command/transaction/cleanup interception; reads bypass it. Per-database cancellable
   queues cap metadata at 256 waiters, prefer inbox/active-handler persistence for at most eight turns, then serve
   background work. Owned transactions/readers retain their turn through cleanup; SQLite remains authoritative.
+  Transaction disposal uses weak provider-transaction ownership, never `Context.Database` after context disposal;
+  context-owned abandoned transactions roll back and release queued admission in both sync/async cleanup.
   Queue-slot/turn waits honor the existing command/connection timeout; expiry remains SQLite BUSY (5) for the
   unchanged three-attempt policy, while caller cancellation stays cancellation. Explicit timeout zero is unlimited.
   Inbox duplicate/full reads and payload serialization precede its short rechecked

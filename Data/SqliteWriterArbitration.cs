@@ -18,6 +18,8 @@ internal static class SqliteWriterArbitration
     private static readonly ConcurrentDictionary<string, WriterGate> Gates = new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
     /// <summary>Connection-local ownership permits commands inside the same immediate transaction to reenter.</summary>
     private static readonly ConditionalWeakTable<DbConnection, ConnectionOwnership> Connections = new();
+    /// <summary>Weak transaction ownership allows disposal cleanup without accessing an already-disposed EF context.</summary>
+    private static readonly ConditionalWeakTable<DbTransaction, ConnectionOwnership> TransactionOwners = new();
     /// <summary>Explicit foreground priority for receiver admission before a handler execution scope exists.</summary>
     private static readonly AsyncLocal<bool> Foreground = new();
     /// <summary>Shared command interceptor installed once on every users and credentials context.</summary>
@@ -345,7 +347,12 @@ internal static class SqliteWriterArbitration
             var owner = Ownership(connection);
             if (owner == null || result.HasResult) return result;
             owner.Enter(eventData.TransactionId);
-            try { return InterceptionResult<DbTransaction>.SuppressWithResult(connection.BeginTransaction(eventData.IsolationLevel)); }
+            try
+            {
+                var transaction = connection.BeginTransaction(eventData.IsolationLevel);
+                TransactionOwners.Add(transaction, owner);
+                return InterceptionResult<DbTransaction>.SuppressWithResult(transaction);
+            }
             catch { owner.Exit(eventData.TransactionId); throw; }
         }
         /// <inheritdoc />
@@ -358,8 +365,9 @@ internal static class SqliteWriterArbitration
             await owner.EnterAsync(eventData.TransactionId, cancellationToken);
             try
             {
-                return InterceptionResult<DbTransaction>.SuppressWithResult(
-                    await connection.BeginTransactionAsync(eventData.IsolationLevel, cancellationToken));
+                var transaction = await connection.BeginTransactionAsync(eventData.IsolationLevel, cancellationToken);
+                TransactionOwners.Add(transaction, owner);
+                return InterceptionResult<DbTransaction>.SuppressWithResult(transaction);
             }
             catch { owner.Exit(eventData.TransactionId); throw; }
         }
@@ -417,7 +425,9 @@ internal static class SqliteWriterArbitration
     }
 
     /// <summary>Releases abandoned transaction ownership after EF actually disposes its provider transaction.</summary>
-    /// <remarks>Only EF's TransactionDisposed event is enabled. Commit/rollback already release their turn; disposal is idempotent.</remarks>
+    /// <remarks>Only EF's TransactionDisposed event is enabled. EF can dispose its context before its transaction;
+    /// cleanup uses weak provider-transaction ownership, never the disposed context. Commit/rollback already release
+    /// their turn; disposal is idempotent and removes the transaction metadata.</remarks>
     private sealed class DisposalObserver : IObserver<DiagnosticListener>, IObserver<KeyValuePair<string, object>>
     {
         /// <summary>Registers process-lifetime listener discovery; the static observer outlives every application context.</summary>
@@ -428,8 +438,12 @@ internal static class SqliteWriterArbitration
         /// <inheritdoc />
         public void OnNext(KeyValuePair<string, object> value)
         {
-            if (value.Value is TransactionEventData { Context: not null } data
-                && Connections.TryGetValue(data.Context.Database.GetDbConnection(), out var owner)) owner.Exit(data.TransactionId);
+            if (value.Value is TransactionEventData data
+                && TransactionOwners.TryGetValue(data.Transaction, out var owner))
+            {
+                TransactionOwners.Remove(data.Transaction);
+                owner.Exit(data.TransactionId);
+            }
         }
         /// <inheritdoc />
         public void OnError(Exception error) { }
