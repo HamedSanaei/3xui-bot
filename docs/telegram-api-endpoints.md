@@ -23,7 +23,8 @@ Primary references:
 | `TelegramEndpointRuntimeGate` | Atomic pre-claim and complete-request/download leases; closes new admissions while admitted handlers drain |
 | `BotClientProvider` / `EndpointRoutedTelegramBotClient` | Shared HTTP pool, cached per-endpoint epochs, reusable worker facade, pinned receiver epochs and exact identity checks |
 | `MultiBotHostedService` | Existing per-bot lifecycle semaphore; stop/join old receiver and strict destination identity/webhook/poll readiness |
-| `TelegramEndpointAdminService` | Private owned-host global-admin panel, ten-minute message/actor/host/identity-bound single-use controls |
+| `TelegramEndpointAdminService` / `TelegramEndpointPresentation` | Private owned-host global-admin panel, actual admission badges, evidence-backed outcomes and confirmed frozen-inventory batch reports |
+| `TelegramEndpointCoordinator.Bulk` | Sequential per-bot intent admission through existing migration guards; explicit retained Cloud control and exact committed operation receipts |
 | `TelegramEndpointNotificationWorker` | One durable incident sent directly to the existing logger channel through a counted, authorized active Cloud bot |
 | Existing latency telemetry | Payload-free endpoint request/health/migration events and Cloud/Local reporting |
 
@@ -40,6 +41,37 @@ Cloud-to-Local requires another enabled non-assistant owned BotFather identity w
 The scheduler acquires an endpoint execution lease **before** durable claim. A paused lane head stays queued, preserving strict per-bot/user FIFO and deduplication. Admitted handlers may finish their original epoch; migrations wait for handlers, requests and file transfers before session cleanup. Other bots continue independently. Lifecycle ownership is the existing runtime semaphore, not a second competing receiver lock. Management callbacks persist/enqueue intent and return before their own receiver or handler is drained.
 
 Durable settlement, order, receipt and weekly notifications defer exact pre-HTTP endpoint fences; conditional claim release refunds provisional attempts rather than consuming network budgets during a long Cloud wait. Identity replacement remains manual review. Ambiguous payment HTTP/timeouts/5xx and receipt photo/fallback failures remain `DeliveryUncertain`, never endpoint-switch replay. Definite receipt photo rejections/file-read failures retain the existing fallback, but a potentially delivered photo never triggers a speculative second message.
+
+## Reading status and using bulk migration
+
+The inventory and each bot's detail view lead with the **actual current request-admission route**, not its saved preference:
+
+| Panel headline | Exact meaning |
+|---|---|
+| `☁️ Cloud — مسیر فعال` | The enabled current identity admits ordinary requests through its hydrated Cloud generation |
+| `🏠 Local — مسیر فعال` | The enabled current identity admits ordinary requests through its hydrated Local generation |
+| `⛔ مسیر فعال: ندارد` | The bot is disabled or its admission gate is fenced; no ordinary new request may start |
+| `❔ مسیر فعال: نامشخص` | Identity or current runtime observation is unavailable; the panel does not guess Cloud |
+
+`انتخاب مدیر` is the desired endpoint; `آخرین مسیر فعال‌شده` is the last durably validated destination. Neither proves that ordinary traffic is currently admitted. The nullable `RuntimeEndpoint`, `RuntimeAvailable` and `RuntimeGeneration` observations are `[NotMapped]`: reading the panel neither writes them to SQLite nor reopens a temporary migration fence. An active badge is **not** a network-health or receiver-liveness guarantee; health/poll observations remain separate.
+
+`نتیجه انتقال` now distinguishes successful destination activation, pending execution, Cloud cooldown, definitive refusal/failure, uncertain cleanup/manual intervention and unproven results. Success requires the exact current operation's committed activation history, matching destination and activation timestamp no earlier than that operation's start. An old timestamp, registration acknowledgment or restored source is not a successful new migration. A later endpoint health failure does not rewrite a proven historical success: the panel shows the successful operation and current degraded/closed admission separately. Details include source, requested destination, start/activation UTC times, current generation and the recorded Cloud eligibility time.
+
+The full inventory offers **`🏠 انتقال همه ربات‌ها به Local…`** and **`☁️ انتقال همه ربات‌ها به Cloud…`**:
+
+1. Open `/telegram_api` in a healthy enabled owned bot as a current global Super Admin; select the bulk destination.
+2. Review and explicitly confirm. The entire inventory across **all pages**, exact BotFather identities and control revisions is frozen at confirmation. Disabled, tokenless, tenant and assistant entries remain visible; newly added or replaced bots cannot silently join.
+3. The panel publishes progress and a read-only refresh control **before** admitting intents, because migration can fence the hosting bot. Each bot uses the existing individual migration API; registration is sequential and performs no receiver drain or Telegram protocol call. The existing worker executes accepted durable intents.
+4. Refresh the report to see accepted, pending, successful, rejected/failed, uncertain, not-submitted, changed/unproven and retained-control counts plus paginated per-bot results. Already-on-target entries have a separate count and never count as a new successful migration. Refresh never submits or replays a request.
+5. If the original host is unavailable, open `/telegram_api` in another healthy authorized owned host and select your recent batch report.
+
+**Bulk Local retains one eligible independent owned Cloud control**, preferably the hosting bot, otherwise by ordinal internal id within the frozen inventory. It explicitly reports which bot stayed Cloud rather than claiming every bot migrated. The last-independent-Cloud safety rule is unchanged: disabled, fenced, unhydrated, Local, tenant, assistant and duplicate-identity configurations cannot satisfy it. This prevents a shared Local outage from removing every administration path; route eligibility alone still does not prove Cloud network health. Bulk Cloud considers every frozen entry, including the host, but never bypasses session cleanup or the recorded cooldown.
+
+Bulk admission has a nonwaiting single-batch lock and uses the existing per-bot locks/CAS revisions. Concurrent individual changes produce visible busy/stale/refused outcomes. Global authority and exact host identity are rechecked between admissions. Cancellation or a persistence exception preserves the proven prefix, marks a possibly committed current admission uncertain and leaves the untouched tail unsubmitted; no automatic replay is added.
+
+Callback confirmations/navigation remain actor/chat/message/host-bound, single-use and ten-minute expiring. Read-only actor-scoped reports have a separate **absolute one-hour** lifetime, bounded to 512 reports, so the ten-minute Cloud wait does not erase them before normal completion. After ten minutes reopen inventory for fresh controls; refresh does not extend report lifetime. Only the latest three reports for that actor are linked from inventory. Aggregate reports are process-local and disappear on restart/expiry; each accepted bot's operation, phase and audit history remain durable and available through its details. Pending operations continue after restart without resubmitting the batch.
+
+This panel enhancement requires no new configuration, database migration, timeout change, receiver/FIFO change or notification transport. Bulk does not alter financial processing, retry ambiguous sends or control the downloader container. No bot changes endpoint until explicit confirmation.
 
 ## Durable phases and truthful availability
 
@@ -173,9 +205,10 @@ Observed verification (initial routing smoke rows are explicitly labeled):
 
 | Check | Observed result |
 |---|---|
-| Logger-channel endpoint, suppression and financial downgrade/upgrade regressions | 202 passed; zero failed/skipped |
-| Complete Release regression suite after logger-channel cutover | 1,496 passed; zero failed/skipped; includes tenant/financial invariants and downgrade-before-cutover/full-upgrade receipt preservation |
-| Actual private panel entry/callback smoke with isolated metadata and captured SDK edit requests | Missing/configured logger labels render readable Persian and show channel delivery plus Pending/uncertain semantics rather than private notifier setup; no live Telegram traffic |
+| Logger-channel cutover verification retained from the previous change | 202 focused regressions and 1,496 complete Release regressions passed; missing/configured logger labels and actual channel worker were exercised through fake HTTP without private delivery |
+| Endpoint status/bulk focused Release regressions | 265 passed; zero failed/skipped; actual gate observations, operation evidence, full-inventory admission, authorization/replay/concurrency, cooldown/restart and ambiguous persistence covered |
+| Complete Release regression suite after status/bulk enhancement | 1,561 passed; zero failed/skipped; includes existing tenant/financial, FIFO, endpoint protocol and durable logger-outbox regressions |
+| Actual status/bulk private-panel callback smoke with real coordinator/gate and fake protocol/lifecycle | Cloud inventory → confirmed bulk Local → validated Local success with retained Cloud control → bulk Cloud wait with no active route → validated Cloud success after controlled eleven-minute advance; current-operation success and already-on-target counts remain separate; no live Telegram traffic |
 | Release application build | Success; zero warnings/errors |
 | `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false` | Success; single production application, no auxiliary project dependency; clean external publish contains no tests, private databases/configuration or telemetry archives |
 | Both EF `has-pending-model-changes` checks | No pending model changes |

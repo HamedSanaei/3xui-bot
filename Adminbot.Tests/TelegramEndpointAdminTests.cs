@@ -271,15 +271,13 @@ public sealed class TelegramEndpointAdminTests
         state.MigrationState = TelegramEndpointMigrationState.ManualInterventionRequired;
         state.LastFailureCategory = "configuration_missing";
         await fixture.OpenAsync();
-        Assert.Contains("tenant_bot | انتخاب: نامشخص؛ هویت موجود نیست | مؤثر: نامشخص؛ مسیر منتشر نشده", fixture.Control.Text);
         await fixture.TapAsync(fixture.Control, Button(fixture.Control, "جزئیات «tenant_bot»"));
-        Assert.Contains("مسیر مؤثر: نامشخص؛ مسیر منتشر نشده", fixture.Control.Text);
-        Assert.Contains("نسل مسیر: نامشخص", fixture.Control.Text);
+        Assert.StartsWith("❔ مسیر فعال: نامشخص", fixture.Control.Text);
+        Assert.DoesNotContain("☁️ Cloud — مسیر فعال", fixture.Control.Text);
         Assert.Contains("هیچ هویتی از سوابق قدیمی حدس زده نمی‌شود", fixture.Control.Text);
         Assert.DoesNotContain(Buttons(fixture.Control), x => x.Text.StartsWith("انتقال به", StringComparison.Ordinal));
         Assert.DoesNotContain(Buttons(fixture.Control), x => x.Text.Contains("بازگشت اضطراری", StringComparison.Ordinal));
         await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی وضعیت"));
-        Assert.Contains("مسیر مؤثر: نامشخص؛ مسیر منتشر نشده", fixture.Control.Text);
         Assert.Empty(fixture.Backend.Migrations);
     }
 
@@ -297,10 +295,14 @@ public sealed class TelegramEndpointAdminTests
         state.DesiredEndpoint = TelegramEndpointType.Local;
         state.EffectiveEndpoint = TelegramEndpointType.Local;
         state.MigrationState = TelegramEndpointMigrationState.Local;
+        state.RuntimeEndpoint = TelegramEndpointType.Local;
+        state.RuntimeAvailable = true;
+        state.LastMigrationAtUtc = fixture.Clock.GetUtcNow().UtcDateTime.AddSeconds(1);
+        fixture.Backend.AddActivation("owned");
         await fixture.TapAsync(progress, Button(progress, "🔄 تازه‌سازی وضعیت و سلامت"));
         Assert.Single(fixture.Backend.Migrations);
-        Assert.Contains("مسیر مؤثر: Local (محلی)", fixture.Control.Text);
-        Assert.Contains("وضعیت: Local فعال", fixture.Control.Text);
+        Assert.StartsWith("🏠 Local — مسیر فعال", fixture.Control.Text);
+        Assert.Contains("نتیجه انتقال: موفق", fixture.Control.Text);
     }
 
     /// <summary>Bounds total process-local sessions while keeping newest controls usable.</summary>
@@ -357,6 +359,344 @@ public sealed class TelegramEndpointAdminTests
         await fixture.TapAsync(confirmation, Button(confirmation, "✅ تأیید انتقال به Local (محلی)"));
         Assert.Empty(fixture.Backend.Migrations);
         Assert.Contains("پنل قدیمی است", fixture.Control.Text);
+    }
+
+    /// <summary>Shows actual admission before durable intent and never invents an active stale Local route from a closed or missing gate.</summary>
+    /// <param name="available">Observed runtime admission, including unknown.</param>
+    /// <returns>A task completing after the consumer-visible active route badge is checked.</returns>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task Active_badge_uses_runtime_not_desired_or_last_activated(bool? available)
+    {
+        var fixture = new Fixture();
+        var state = fixture.Backend.States["owned"];
+        state.DesiredEndpoint = TelegramEndpointType.Local;
+        state.EffectiveEndpoint = TelegramEndpointType.Local;
+        state.RuntimeEndpoint = available.HasValue ? TelegramEndpointType.Cloud : null;
+        state.RuntimeAvailable = available;
+        state.RuntimeGeneration = available.HasValue ? 8 : null;
+        await fixture.OpenDetailAsync();
+        Assert.StartsWith(available == true ? "☁️ Cloud — مسیر فعال" :
+            available == false ? "⛔ مسیر فعال: ندارد" : "❔ مسیر فعال: نامشخص", fixture.Control.Text);
+        Assert.DoesNotContain("🏠 Local — مسیر فعال", fixture.Control.Text);
+        var text = Assert.IsType<string>(fixture.Control.Text);
+        Assert.True(text.IndexOf("مسیر فعال", StringComparison.Ordinal) <
+            text.IndexOf("انتخاب مدیر", StringComparison.Ordinal));
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "جزئیات «disabled_bot»"));
+        Assert.StartsWith("⛔ مسیر فعال: ندارد؛ ربات غیرفعال", fixture.Control.Text);
+    }
+
+    /// <summary>Old activation, restored source and ambiguous cleanup never count as successful destination activation.</summary>
+    /// <param name="scenario">Current operation phase or evidence boundary.</param>
+    /// <returns>A task completing after truthful outcome and required action are visible ahead of telemetry.</returns>
+    [Theory]
+    [InlineData("pending")]
+    [InlineData("cooldown")]
+    [InlineData("refused")]
+    [InlineData("failed")]
+    [InlineData("uncertain")]
+    [InlineData("preference")]
+    [InlineData("old_receipt")]
+    public async Task Latest_outcome_never_reuses_old_activation(string scenario)
+    {
+        var fixture = new Fixture();
+        var state = fixture.Backend.States["owned"];
+        state.OperationId = "current-operation";
+        state.MigrationStartedAtUtc = fixture.Clock.GetUtcNow().UtcDateTime;
+        state.LastMigrationAtUtc = state.MigrationStartedAtUtc.Value.AddMinutes(-1);
+        state.DesiredEndpoint = TelegramEndpointType.Local;
+        state.MigrationState = TelegramEndpointMigrationState.CheckingLocal;
+        if (scenario == "cooldown") state.MigrationState = TelegramEndpointMigrationState.CloudWait;
+        if (scenario == "refused")
+        {
+            state.MigrationState = TelegramEndpointMigrationState.Cloud;
+            state.LastFailureCategory = "logout_refused";
+            fixture.Backend.History.Add(new TelegramEndpointHistory { OperationId = state.OperationId, Reason = "logout_refused" });
+        }
+        if (scenario == "failed") state.MigrationState = TelegramEndpointMigrationState.MigrationFailed;
+        if (scenario == "uncertain") state.MigrationState = TelegramEndpointMigrationState.CloudLogoutUncertain;
+        if (scenario is "preference" or "old_receipt")
+        {
+            state.EffectiveEndpoint = TelegramEndpointType.Local;
+            state.MigrationState = TelegramEndpointMigrationState.Local;
+            state.LastMigrationAtUtc = state.MigrationStartedAtUtc;
+            fixture.Backend.History.Add(new TelegramEndpointHistory { OperationId = "earlier-operation",
+                Reason = "migration_succeeded", ToEffectiveEndpoint = TelegramEndpointType.Local });
+            state.LastFailureCategory = "network";
+        }
+        await fixture.OpenDetailAsync();
+        Assert.DoesNotContain("✅ نتیجه انتقال: موفق", fixture.Control.Text);
+        if (scenario is "preference" or "old_receipt") Assert.DoesNotContain("نتیجه انتقال: ناموفق", fixture.Control.Text);
+        Assert.Contains(scenario switch
+        {
+            "refused" => "خروج رد شد",
+            "failed" => "نتیجه انتقال: ناموفق",
+            "uncertain" => "نیازمند بررسی دستی",
+            "cooldown" => "مهلت رسمی Cloud",
+            "preference" or "old_receipt" => "برای همین عملیات اثبات نشده",
+            _ => "ثبت درخواست به معنی تکمیل نیست"
+        }, fixture.Control.Text);
+        var text = Assert.IsType<string>(fixture.Control.Text);
+        Assert.True(text.IndexOf("نتیجه انتقال", StringComparison.Ordinal) <
+            text.IndexOf("سرور محلی", StringComparison.Ordinal));
+    }
+
+    /// <summary>A committed destination remains a successful migration even if its later health degrades or admission closes.</summary>
+    /// <returns>A task completing after success evidence and separate current degradation are both visible.</returns>
+    [Fact]
+    public async Task Successful_migration_and_later_health_failure_are_separate()
+    {
+        var fixture = new Fixture();
+        var state = fixture.Backend.States["owned"];
+        state.OperationId = "current-operation";
+        state.MigrationStartedAtUtc = fixture.Clock.GetUtcNow().UtcDateTime;
+        state.LastMigrationAtUtc = state.MigrationStartedAtUtc.Value.AddSeconds(1);
+        state.DesiredEndpoint = state.EffectiveEndpoint = TelegramEndpointType.Local;
+        state.RuntimeEndpoint = TelegramEndpointType.Local;
+        state.RuntimeAvailable = false;
+        state.MigrationState = TelegramEndpointMigrationState.LocalUnavailable;
+        state.LastFailureCategory = "network";
+        fixture.Backend.AddActivation("owned");
+        await fixture.OpenDetailAsync();
+        Assert.StartsWith("⛔ مسیر فعال: ندارد", fixture.Control.Text);
+        Assert.Contains("✅ نتیجه انتقال: موفق", fixture.Control.Text);
+        Assert.Contains("پس از انتقال موفق", fixture.Control.Text);
+        Assert.DoesNotContain("🏠 Local — مسیر فعال", fixture.Control.Text);
+    }
+
+    /// <summary>Bulk confirmation freezes every inventory page, excludes later additions and lets CAS refuse replacements rather than silently retargeting them.</summary>
+    /// <returns>A task completing after one full frozen bulk API call, readable pagination and replay rejection.</returns>
+    [Fact]
+    public async Task Bulk_confirmation_freezes_full_inventory_and_never_replays()
+    {
+        var fixture = new Fixture(extraBots: 13);
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "صفحه بعد ▶️"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🏠 انتقال همه ربات‌ها به Local…"));
+        Assert.Empty(fixture.Backend.Batches);
+        var confirmation = fixture.Control;
+        Assert.Contains("19 ربات", confirmation.Text);
+        Assert.Contains("آخرین مسیر مستقل Cloud دور زده نمی‌شود", confirmation.Text);
+        var originals = fixture.Backend.States.Values.Select(x => (x.BotId, x.TelegramBotId, x.ControlRevision)).ToArray();
+        fixture.Backend.States["tenant"].TelegramBotId++;
+        fixture.Backend.States["extra12"].ControlRevision++;
+        fixture.Backend.States.Add("new", new TelegramEndpointState { BotId = "new", TelegramBotId = 5000 });
+        fixture.Backend.BulkCodes["owned"] = "retained_cloud_control";
+        fixture.Backend.BeforeBulk = () =>
+        {
+            Assert.Contains("ثبت درخواست‌ها در جریان", fixture.Control.Text);
+            Assert.Contains(Buttons(fixture.Control), x => x.Text == "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)");
+        };
+        var data = Button(confirmation, "✅ تأیید انتقال دسته‌ای به Local (محلی)");
+        var edits = fixture.Client.Edits.Count;
+        await fixture.TapAsync(confirmation, data);
+        Assert.Equal(edits + 1, fixture.Client.Edits.Count);
+        var batch = Assert.Single(fixture.Backend.Batches);
+        Assert.Equal(originals, batch.Targets.Select(x => (x.BotId, x.Identity, x.Revision)).ToArray());
+        Assert.Equal(("owned", 1000L, TelegramEndpointType.Local), (batch.Host, batch.Identity, batch.Target));
+        await fixture.TapAsync(confirmation, data);
+        Assert.Single(fixture.Backend.Batches);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("روی Cloud نگه داشته شد", fixture.Control.Text);
+        Assert.Contains("هویت/عملیات تغییر کرده", fixture.Control.Text);
+        var observed = new List<string>();
+        while (true)
+        {
+            var text = Assert.IsType<string>(fixture.Control.Text);
+            Assert.InRange(text.Length, 1, 3900);
+            observed.AddRange(text.Split('\n').Where(x => x.StartsWith("ربات:", StringComparison.Ordinal)));
+            var next = Buttons(fixture.Control).SingleOrDefault(x => x.Text == "صفحه بعد گزارش ▶️");
+            if (next == null) break;
+            await fixture.TapAsync(fixture.Control, next.CallbackData!);
+        }
+        Assert.Equal(19, observed.Count);
+        Assert.DoesNotContain(observed, x => x.Contains("ربات: new", StringComparison.Ordinal));
+        Assert.Single(fixture.Backend.Batches);
+    }
+
+    /// <summary>Per-bot API partial results survive refresh; acceptance and proven execution completion have separate aggregate counts.</summary>
+    /// <returns>A task completing after partial registration, execution, supersession and absolute report expiry without re-registration.</returns>
+    [Fact]
+    public async Task Partial_bulk_results_refresh_execution_without_re_registration()
+    {
+        var fixture = new Fixture();
+        fixture.Backend.BulkCodes["alternate"] = "retained_cloud_control";
+        fixture.Backend.BulkCodes["tenant"] = "not_submitted";
+        fixture.Backend.BulkCodes["assistant"] = "registration_uncertain";
+        fixture.Backend.BulkCodes["owned-assistant"] = "disabled";
+        fixture.Backend.BulkCodes["disabled"] = "disabled";
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🏠 انتقال همه ربات‌ها به Local…"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Local (محلی)"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("ثبت پذیرفته: 1 | در انتظار اجرا: 1 | انتقال موفق: 0 | رد/ناموفق: 2", fixture.Control.Text);
+        Assert.Contains("ثبت نامطمئن", fixture.Control.Text);
+        Assert.Contains("ادامه دسته پس از توقف/لغو", fixture.Control.Text);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "صفحه بعد گزارش ▶️"));
+        Assert.Contains("ممکن است درخواست پایدار شده باشد", fixture.Control.Text);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "◀️ صفحه قبل گزارش"));
+        var state = fixture.Backend.States["owned"];
+        state.EffectiveEndpoint = TelegramEndpointType.Local;
+        state.MigrationState = TelegramEndpointMigrationState.Local;
+        state.LastMigrationAtUtc = fixture.Clock.GetUtcNow().UtcDateTime.AddSeconds(1);
+        state.RuntimeEndpoint = TelegramEndpointType.Local;
+        fixture.Backend.AddActivation("owned");
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("در انتظار اجرا: 0 | انتقال موفق: 1", fixture.Control.Text);
+        state.OperationId = "superseded";
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("انتقال موفق: 0", fixture.Control.Text);
+        Assert.Contains("درخواست دیگری جایگزین", fixture.Control.Text);
+        fixture.Clock.Advance(TimeSpan.FromMinutes(59));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Buttons(fixture.Control).Single(x => x.Text.StartsWith("📊 گزارش دسته‌ای", StringComparison.Ordinal)).CallbackData!);
+        fixture.Clock.Advance(TimeSpan.FromMinutes(1));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("گزارش دسته‌ای منقضی", fixture.Control.Text);
+        Assert.Single(fixture.Backend.Batches);
+    }
+
+    /// <summary>Cloud cooldown outlives confirmation controls but must not erase read-only batch reporting before destination activation can finish.</summary>
+    /// <returns>A task completing after reopening the same actor-scoped report beyond ten minutes without another registration call.</returns>
+    [Fact]
+    public async Task Bulk_report_survives_cloud_cooldown_without_extending_confirmation_authority()
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)"));
+        var state = fixture.Backend.States["owned"];
+        state.MigrationState = TelegramEndpointMigrationState.CloudWait;
+        state.RuntimeAvailable = false;
+        fixture.Clock.Advance(TimeSpan.FromMinutes(11));
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Buttons(fixture.Control).Single(x => x.Text.StartsWith("📊 گزارش دسته‌ای", StringComparison.Ordinal)).CallbackData!);
+        Assert.Contains("در انتظار مهلت رسمی Cloud", fixture.Control.Text);
+        Assert.Contains("پذیرش درخواست بسته است", fixture.Control.Text);
+        Assert.Single(fixture.Backend.Batches);
+    }
+
+    /// <summary>Already-Cloud entries with old proven migrations are not counted as newly successful operations in a no-op Cloud batch.</summary>
+    /// <returns>A task completing after the real report distinguishes unchanged destinations from the new batch's successful migrations.</returns>
+    [Fact]
+    public async Task Bulk_unchanged_old_activation_is_not_new_batch_success()
+    {
+        var fixture = new Fixture();
+        foreach (var state in fixture.Backend.States.Values)
+        {
+            fixture.Backend.BulkCodes[state.BotId] = "unchanged";
+            state.OperationId = Guid.NewGuid().ToString("N");
+            state.MigrationStartedAtUtc = fixture.Clock.GetUtcNow().UtcDateTime.AddDays(-1);
+            state.LastMigrationAtUtc = state.MigrationStartedAtUtc.Value.AddMinutes(1);
+            fixture.Backend.AddActivation(state.BotId);
+        }
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("انتقال موفق: 0", fixture.Control.Text);
+        Assert.Contains("از قبل روی مقصد: 6", fixture.Control.Text);
+        Assert.Single(fixture.Backend.Batches);
+    }
+
+    /// <summary>The host may close immediately after Cloud batch registration; pre-existing progress is usable from another authorized owned entry.</summary>
+    /// <returns>A task completing after recovery-host report access with no promised post-fence edit or repeated API call.</returns>
+    [Fact]
+    public async Task Bulk_host_migration_pre_renders_progress_and_allows_other_owned_entry()
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
+        Assert.Contains("مهلت رسمی Cloud", fixture.Control.Text);
+        fixture.Backend.BeforeBulk = () => fixture.Backend.States["owned"].RuntimeAvailable = false;
+        var edits = fixture.Client.Edits.Count;
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)"));
+        Assert.Equal(edits + 1, fixture.Client.Edits.Count);
+        Assert.Contains("ارسال به‌روزرسانی نهایی تضمین نمی‌شود", fixture.Control.Text);
+        await fixture.Panel.TryHandleAsync("alternate", fixture.Client, Entry(Admin, "/telegram_api"), default);
+        var reportButton = Buttons(fixture.Control).Single(x => x.Text.StartsWith("📊 گزارش دسته‌ای", StringComparison.Ordinal));
+        await fixture.Panel.TryHandleAsync("alternate", fixture.Client, Callback(fixture.Control, reportButton.CallbackData!), default);
+        Assert.Contains("📊 گزارش انتقال دسته‌ای", fixture.Control.Text);
+        Assert.Single(fixture.Backend.Batches);
+    }
+
+    /// <summary>Bulk controls share exact actor/chat/message/host bindings, fresh authorization, strict expiry and malformed-payload rejection.</summary>
+    /// <param name="attack">The callback security boundary or stale host to exercise.</param>
+    /// <returns>A task completing with no bulk API request or single migration intent.</returns>
+    [Theory]
+    [InlineData("actor")]
+    [InlineData("host")]
+    [InlineData("tenant")]
+    [InlineData("chat")]
+    [InlineData("message")]
+    [InlineData("revoked")]
+    [InlineData("expired")]
+    [InlineData("malformed")]
+    [InlineData("identity")]
+    [InlineData("revision")]
+    public async Task Bulk_confirmation_rejects_forged_stale_or_expired_callbacks(string attack)
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🏠 انتقال همه ربات‌ها به Local…"));
+        var confirmation = fixture.Control;
+        var data = Button(confirmation, "✅ تأیید انتقال دسته‌ای به Local (محلی)");
+        if (attack == "revoked") fixture.Configuration.AdminsUserIds.Clear();
+        if (attack == "expired") fixture.Clock.Advance(TimeSpan.FromMinutes(10));
+        if (attack == "malformed") data += ":extra";
+        if (attack == "identity") fixture.Backend.States["owned"].TelegramBotId++;
+        if (attack == "revision") fixture.Backend.States["owned"].ControlRevision++;
+        await fixture.Panel.TryHandleAsync(attack == "host" ? "alternate" : attack == "tenant" ? "tenant" : "owned",
+            fixture.Client, Callback(confirmation, data, actor: attack == "actor" ? 202 : Admin,
+                chatId: attack == "chat" ? Admin + 1 : Admin,
+                messageId: attack == "message" ? confirmation.MessageId + 1 : null), default);
+        Assert.Empty(fixture.Backend.Batches);
+        Assert.Empty(fixture.Backend.Migrations);
+    }
+
+    /// <summary>Cancel never submits a batch; an interrupted API call is reported uncertain and refresh cannot repeat it.</summary>
+    /// <returns>A task completing after cancel and honest exception-boundary reporting.</returns>
+    [Fact]
+    public async Task Bulk_cancel_and_registration_exception_never_replay()
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🏠 انتقال همه ربات‌ها به Local…"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "❌ انصراف"));
+        Assert.Empty(fixture.Backend.Batches);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🏠 انتقال همه ربات‌ها به Local…"));
+        fixture.Backend.ThrowBulk = true;
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Local (محلی)"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("ممکن است درخواست پایدار شده باشد", fixture.Control.Text);
+        Assert.Contains("انتقال موفق: 0", fixture.Control.Text);
+        Assert.Single(fixture.Backend.Batches);
+    }
+
+    /// <summary>Preserves API-supplied committed and unsubmitted results when caller cancellation occurs after progress is already published.</summary>
+    /// <returns>A task completing after later read-only refresh exposes honest partial results without retrying cancellation.</returns>
+    [Fact]
+    public async Task Callback_cancellation_preserves_supplied_partial_registration_results()
+    {
+        var fixture = new Fixture();
+        foreach (var id in fixture.Backend.States.Keys.Where(x => x != "owned"))
+            fixture.Backend.BulkCodes[id] = "not_submitted";
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
+        var confirmation = fixture.Control;
+        using var cancellation = new CancellationTokenSource();
+        fixture.Backend.BeforeBulk = cancellation.Cancel;
+        await fixture.Panel.TryHandleAsync("owned", fixture.Client,
+            Callback(confirmation, Button(confirmation, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)")), cancellation.Token);
+        Assert.True(cancellation.IsCancellationRequested);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("ثبت پذیرفته: 1 | در انتظار اجرا: 1 | انتقال موفق: 0", fixture.Control.Text);
+        Assert.Contains("ادامه دسته پس از توقف/لغو", fixture.Control.Text);
+        Assert.Single(fixture.Backend.Batches);
     }
 
     /// <summary>Finds a rendered button by its exact Persian label.</summary>
@@ -432,7 +772,8 @@ public sealed class TelegramEndpointAdminTests
                 values[$"Bots:{i}:Type"] = id == "tenant" ? BotInstanceTypes.Tenant : id == "assistant" ? BotInstanceTypes.SalesAssistant : BotInstanceTypes.Owned;
                 values[$"Bots:{i}:Enabled"] = (id != "disabled").ToString();
                 values[$"Bots:{i}:IsSalesAssistant"] = (id is "assistant" or "owned-assistant").ToString();
-                Backend.States.Add(id, new TelegramEndpointState { BotId = id, TelegramBotId = 1000 + i });
+                Backend.States.Add(id, new TelegramEndpointState { BotId = id, TelegramBotId = 1000 + i,
+                    RuntimeEndpoint = TelegramEndpointType.Cloud, RuntimeAvailable = id != "disabled", RuntimeGeneration = 1 });
             }
             var registry = new BotRegistry(new ConfigurationBuilder().AddInMemoryCollection(values).Build());
             Panel = new TelegramEndpointAdminService(Backend, Configuration, registry, new TelegramEndpointRoutingOptions(),
@@ -473,6 +814,14 @@ public sealed class TelegramEndpointAdminTests
         public string? CommandOutcome { get; set; }
         /// <summary>Optional barrier keeping one request in flight while its duplicate is tested.</summary>
         public TaskCompletionSource? MigrationBarrier { get; set; }
+        /// <summary>Frozen calls observed by the fake bulk boundary, including hosting identity.</summary>
+        public List<(string Host, long Identity, TelegramEndpointType Target, IReadOnlyList<TelegramEndpointBulkTarget> Targets)> Batches { get; } = new();
+        /// <summary>Optional per-bot registration outcomes for partial, cancelled and safety-refusal scenarios.</summary>
+        public Dictionary<string, string> BulkCodes { get; } = new(StringComparer.Ordinal);
+        /// <summary>Assertion at the bulk boundary, before the hosting route may close.</summary>
+        public Action? BeforeBulk { get; set; }
+        /// <summary>Simulates an unreadable registration response; the UI must retain uncertainty and never retry the call.</summary>
+        public bool ThrowBulk { get; set; }
         /// <inheritdoc />
         public TelegramEndpointSharedHealth SharedLocalHealth => new(false, null, null, null);
         /// <inheritdoc />
@@ -500,6 +849,10 @@ public sealed class TelegramEndpointAdminTests
             Migrations.Enqueue((botId, target, actor, expectedControlRevision, expectedTelegramBotId));
             if (MigrationBarrier != null) await MigrationBarrier.Task;
             States[botId].ControlRevision++;
+            States[botId].OperationId = Guid.NewGuid().ToString("N");
+            States[botId].MigrationStartedAtUtc = new DateTime(2026, 10, 9, 0, 0, 0, DateTimeKind.Utc);
+            States[botId].DesiredEndpoint = target;
+            States[botId].MigrationState = target == TelegramEndpointType.Local ? TelegramEndpointMigrationState.CheckingLocal : TelegramEndpointMigrationState.FallbackPending;
             return "accepted";
         }
         /// <inheritdoc />
@@ -515,6 +868,41 @@ public sealed class TelegramEndpointAdminTests
         /// <inheritdoc />
         public Task<IReadOnlyList<TelegramEndpointHistory>> GetHistoryAsync(string botId, CancellationToken cancellationToken)
             => Task.FromResult<IReadOnlyList<TelegramEndpointHistory>>(History.ToArray());
+
+        /// <inheritdoc />
+        public Task<IReadOnlyList<TelegramEndpointBulkResult>> RequestBulkMigrationAsync(string hostingBotId, long hostingIdentity,
+            TelegramEndpointType target, long actor, IReadOnlyList<TelegramEndpointBulkTarget> targets, CancellationToken cancellationToken)
+        {
+            BeforeBulk?.Invoke();
+            Batches.Add((hostingBotId, hostingIdentity, target, targets.ToArray()));
+            if (ThrowBulk) throw new OperationCanceledException();
+            var results = targets.Select(snapshot =>
+            {
+                var state = States.GetValueOrDefault(snapshot.BotId);
+                var code = state == null || state.TelegramBotId != snapshot.Identity || state.ControlRevision != snapshot.Revision
+                    ? "stale" : BulkCodes.GetValueOrDefault(snapshot.BotId, "accepted");
+                if (code == "accepted")
+                {
+                    state!.ControlRevision++;
+                    state.OperationId = Guid.NewGuid().ToString("N");
+                    state.MigrationStartedAtUtc = new DateTime(2026, 10, 9, 0, 0, 0, DateTimeKind.Utc);
+                    state.DesiredEndpoint = target;
+                    state.MigrationState = target == TelegramEndpointType.Local ? TelegramEndpointMigrationState.CheckingLocal : TelegramEndpointMigrationState.FallbackPending;
+                }
+                return new TelegramEndpointBulkResult(snapshot.BotId, snapshot.Identity, code,
+                    code is "accepted" or "unchanged" ? state?.OperationId : null);
+            }).ToArray();
+            return Task.FromResult<IReadOnlyList<TelegramEndpointBulkResult>>(results);
+        }
+
+        /// <summary>Adds exact-operation committed activation evidence used by the real presentation path.</summary>
+        /// <param name="botId">Synthetic internal identity whose destination activation has been committed.</param>
+        public void AddActivation(string botId)
+        {
+            var state = States[botId];
+            History.Add(new TelegramEndpointHistory { BotId = botId, TelegramBotId = state.TelegramBotId, OperationId = state.OperationId,
+                Reason = "migration_succeeded", ToEffectiveEndpoint = state.EffectiveEndpoint, CreatedAtUtc = state.LastMigrationAtUtc!.Value });
+        }
     }
 
     /// <summary>Provides an independently advanceable UTC clock without sleeping or global time mutation.</summary>

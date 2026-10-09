@@ -148,8 +148,8 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
 
     /// <summary>Lists current registry identities, including disabled and token-missing panel entries.</summary>
     /// <param name="cancellationToken">Caller persistence-read cancellation token.</param>
-    /// <returns>Detached bot states ordered by canonical id; missing configuration is represented explicitly, never routed.</returns>
-    /// <remarks>Historical rows for a different BotFather identity do not become the current bot's endpoint.</remarks>
+    /// <returns>Detached bot states ordered by canonical id with unmapped runtime admission snapshots; missing configuration is represented explicitly, never guessed Cloud.</returns>
+    /// <remarks>Historical rows for a different BotFather identity do not become the current bot's endpoint. Gate metadata describes current routing admission, not a new network health check or receiver-liveness guarantee.</remarks>
     public async Task<IReadOnlyList<TelegramEndpointState>> GetInventoryAsync(CancellationToken cancellationToken)
     {
         await InitializeAsync(cancellationToken);
@@ -158,7 +158,13 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
         {
             var identity = TelegramBotTokenIdentity.ExtractBotId(bot.Token);
             if (identity is > 0)
-                result.Add(await _store.GetOrCreateAsync(bot.Id, identity.Value, cancellationToken));
+            {
+                var state = await _store.GetOrCreateAsync(bot.Id, identity.Value, cancellationToken);
+                if (TelegramBotTokenIdentity.ExtractBotId(FindBot(bot.Id)?.Token) == state.TelegramBotId)
+                    _gate.PublishIfUnhydrated(state);
+                PopulateRuntimeSnapshot(state);
+                result.Add(state);
+            }
             else
                 result.Add(new TelegramEndpointState
                 {
@@ -173,8 +179,8 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
     /// <summary>Reads the current exact bot's detached durable status without probing Telegram.</summary>
     /// <param name="botId">Required canonical internal registry id, not a numeric Telegram bot or user id.</param>
     /// <param name="cancellationToken">Caller persistence-read cancellation.</param>
-    /// <returns>The current identity's state, including disabled bots; no alternate default bot is substituted.</returns>
-    /// <remarks>A dynamically reintroduced identity hydrates from its saved row only once; status reads never reopen a temporary runtime fence.</remarks>
+    /// <returns>The current identity's state, including disabled bots and unmapped runtime admission observations; no alternate default bot is substituted.</returns>
+    /// <remarks>A dynamically reintroduced identity hydrates from its saved row only once; status reads never reopen a temporary runtime fence. RuntimeAvailable observes ordinary routing admission, not Telegram network health or receiver liveness.</remarks>
     /// <exception cref="ArgumentException">The requested bot is missing or has no valid configured identity.</exception>
     public async Task<TelegramEndpointState> GetStatusAsync(string botId, CancellationToken cancellationToken)
     {
@@ -185,7 +191,28 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
         var state = await _store.GetOrCreateAsync(bot.Id, identity.Value, cancellationToken);
         if (TelegramBotTokenIdentity.ExtractBotId(FindBot(bot.Id)?.Token) == state.TelegramBotId)
             _gate.PublishIfUnhydrated(state);
+        PopulateRuntimeSnapshot(state);
         return state;
+    }
+
+    /// <summary>Attaches exact current process route metadata to a detached administrative snapshot without probing or changing a route.</summary>
+    /// <param name="state">Detached current-identity users.db state; only unmapped observation fields are modified.</param>
+    /// <remarks>Disabled identities are never described as active. Token replacement between database read and inspection leaves all observations null. A temporary gate fence remains visible even while durable state still describes an activated Cloud or Local route.</remarks>
+    private void PopulateRuntimeSnapshot(TelegramEndpointState state)
+    {
+        state.RuntimeEndpoint = null;
+        state.RuntimeAvailable = null;
+        state.RuntimeGeneration = null;
+        var bot = FindBot(state.BotId);
+        if (bot == null || TelegramBotTokenIdentity.ExtractBotId(bot.Token) != state.TelegramBotId) return;
+        try
+        {
+            var route = _gate.GetRoute(state.BotId, state.TelegramBotId);
+            state.RuntimeEndpoint = route.Endpoint;
+            state.RuntimeAvailable = bot.Enabled && route.Available;
+            state.RuntimeGeneration = route.Generation;
+        }
+        catch (BotTransportUnavailableException) { }
     }
 
     /// <summary>Commits an authorized operator's explicit migration intent and returns before any receiver drain.</summary>
@@ -227,17 +254,24 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
             if (!IsActive(state) && state.EffectiveEndpoint == target) return "unsafe";
             if (state.EffectiveEndpoint == target && IsActive(state))
             {
-                if (state.DesiredEndpoint == target) return "unchanged";
+                if (state.DesiredEndpoint == target)
+                {
+                    CaptureBulkAdmission(state);
+                    return "unchanged";
+                }
                 state.DesiredEndpoint = target;
                 state.ControlRevision++;
                 state.OperationId = Guid.NewGuid().ToString("N");
                 state.ActorTelegramUserId = actor;
                 state.Trigger = "manual";
-                return await SaveAsync(state, "migration_requested", null, cancellationToken) ? "accepted" : "stale";
+                if (!await SaveAsync(state, "migration_requested", null, cancellationToken)) return "stale";
+                CaptureBulkAdmission(state);
+                return "accepted";
             }
             if (target == TelegramEndpointType.Local && !HasIndependentCloudControl(identity)) return "control_path_missing";
             BeginIntent(state, target, actor, "manual", preserveDesired: false);
             if (!await SaveAsync(state, "migration_requested", "migration_started", cancellationToken)) return "stale";
+            CaptureBulkAdmission(state);
             SignalWork();
             return "accepted";
         }

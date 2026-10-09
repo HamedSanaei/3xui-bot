@@ -1702,6 +1702,16 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - **🌐 مدیریت Telegram API** / `/telegram_api`: global live Super Admin allowlist only, private enabled owned host,
   actor/chat/message/host/BotFather-bound ten-minute single-use callbacks, confirmation + control revision. Another healthy
   owned bot provides recovery control; tenant owners/customers/assistant hosts have no authority.
+- Endpoint panel leads with actual enabled gate admission (`RuntimeEndpoint`, `RuntimeAvailable`, `RuntimeGeneration`, nullable `[NotMapped]`)
+  rather than desired/last-activated state; reads never reopen fences. `TelegramEndpointPresentation` requires exact-current-
+  operation activation history/timestamps for success; refusal/restored source, cooldown, uncertainty and later health stay distinct.
+- Bulk Cloud/Local controls freeze all pages/identities/control revisions, require the same private single-use confirmation,
+  and call `TelegramEndpointCoordinator.Bulk` for sequential individual intent admission (no network/drain inside callbacks).
+  One nonwaiting batch lock plus existing per-bot CAS/guards; exact committed operation receipts, truthful partial/cancelled outcomes.
+  Local explicitly retains one eligible owned Cloud control, preferring host then ordinal id; never bypasses last-control safety.
+  Read-only per-actor paginated reports last one hour (max 512; latest three linked), reopenable from another healthy owned host;
+  controls still expire after ten minutes. Aggregate reports vanish on restart/expiry, individual operation/history remain durable.
+  No schema/configuration/FIFO/financial/protocol change; disabled/missing/tenant/assistant entries remain visible, no uncertain replay.
 - Endpoint incidents: one permanent incident receipt/outbox row, sent directly to live root `loggerChannel` (current default
   logger fallback) using an existing enabled owned nonassistant Cloud/CloudRecovered bot; verify getMe/channel/post permission.
   Counted normal lease spans checks/marker/send; Local/migrating/unhydrated/fenced tokens never probe Cloud. No notifier ids/private sends.

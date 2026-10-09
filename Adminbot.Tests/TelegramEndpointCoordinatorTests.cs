@@ -15,7 +15,7 @@ using Xunit;
 /// <summary>Deterministic durability, session-ordering and health tests using only fake bot transports.</summary>
 /// <remarks>No production token, Bot API network request, container command or database is used. The real runtime
 /// gate and coordinator are exercised with a CAS store, controlled clock and serialized receiver lifecycle.</remarks>
-public sealed class TelegramEndpointCoordinatorTests
+public sealed partial class TelegramEndpointCoordinatorTests
 {
     /// <summary>Cloud logout must commit its marker and be acknowledged before the first real Local identity request.</summary>
     [Fact]
@@ -957,14 +957,14 @@ public sealed class TelegramEndpointCoordinatorTests
             Configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["AdminsUserIds:0"] = "7", ["Bots:0:Id"] = "owned-a", ["Bots:0:Username"] = "dummy_a_bot",
-                ["Bots:0:Token"] = "123:abcdefghijklmnopqrstuvwxyz0123456789", ["Bots:0:Type"] = "Owned", ["Bots:0:Enabled"] = "true"
+                ["Bots:0:Token"] = "123:abcdefghijklmnopqrstuvwxyz0123456789", ["Bots:0:Type"] = BotInstanceTypes.Owned, ["Bots:0:Enabled"] = "true"
             }).Build();
             if (includeSecondBot)
             {
                 Configuration["Bots:1:Id"] = "owned-b";
                 Configuration["Bots:1:Username"] = "dummy_b_bot";
                 Configuration["Bots:1:Token"] = "234:abcdefghijklmnopqrstuvwxyz0123456789";
-                Configuration["Bots:1:Type"] = "Owned";
+                Configuration["Bots:1:Type"] = BotInstanceTypes.Owned;
                 Configuration["Bots:1:Enabled"] = "true";
                 Store.Seed(new TelegramEndpointState
                 {
@@ -1113,7 +1113,11 @@ public sealed class TelegramEndpointCoordinatorTests
                 if (historyReason != null) _history.Add(new()
                 {
                     BotId = state.BotId, TelegramBotId = state.TelegramBotId, Reason = historyReason,
-                    MigrationState = state.MigrationState, ActorTelegramUserId = state.ActorTelegramUserId, OperationId = state.OperationId
+                    MigrationState = state.MigrationState, ActorTelegramUserId = state.ActorTelegramUserId, OperationId = state.OperationId,
+                    FromDesiredEndpoint = previous.DesiredEndpoint, ToDesiredEndpoint = state.DesiredEndpoint,
+                    FromEffectiveEndpoint = previous.EffectiveEndpoint, ToEffectiveEndpoint = state.EffectiveEndpoint,
+                    Outcome = state.MigrationState.ToString(), Revision = state.Revision,
+                    CreatedAtUtc = state.LastMigrationAtUtc ?? state.MigrationStartedAtUtc ?? DateTime.UtcNow
                 });
                 if (alertCategory != null)
                 {

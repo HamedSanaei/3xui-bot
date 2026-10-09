@@ -384,6 +384,13 @@ operator-alert receipts. Existing deployment preserves these rows/configuration 
 Run the normal published `--migration-check` on isolated backup copies before activation.
 
 Global Super Admins use **🗽 Admin → 🌐 مدیریت Telegram API** or `/telegram_api` in another healthy owned bot.
+The inventory/detail headline now shows actual **Cloud / Local request admission**, separately from desired and last-activated
+routes; current-operation migration success requires committed destination activation evidence. A fenced Cloud wait is not
+shown as an active route. Confirmed **bulk Local / Cloud** controls cover the entire frozen inventory and report per-bot outcomes;
+bulk Local explicitly retains one eligible independent owned Cloud administration bot. This panel change adds no database migration or
+configuration and never automatically migrates existing bots. Read-only reports last one hour and can be reopened in another
+healthy owned host; ten-minute controls and durable per-bot state/history retain their existing security/restart semantics.
+
 Endpoint incidents now go directly to the existing `loggerChannel` through an existing enabled owned bot whose active
 route is Cloud and whose channel posting permission is verified. No dedicated bot/private Super Admin chat or notifier-id
 settings are needed. Missing logger/sender prerequisites retain Pending without consuming attempts; uncertain sends never replay.

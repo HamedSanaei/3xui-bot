@@ -48,7 +48,7 @@ public enum TelegramEndpointMigrationState
     ManualInterventionRequired
 }
 
-/// <summary>Detached, secret-free endpoint state scoped to an internal id and immutable BotFather identity.</summary>
+/// <summary>Detached, secret-free endpoint state scoped to an internal id and immutable BotFather identity, with optional unmapped runtime observations for administration.</summary>
 public sealed class TelegramEndpointState
 {
     /// <summary>Exact internal registry identifier, at most 64 characters.</summary>
@@ -63,6 +63,17 @@ public sealed class TelegramEndpointState
     public TelegramEndpointMigrationState MigrationState { get; set; } = TelegramEndpointMigrationState.Cloud;
     /// <summary>Monotonic route generation; ordinary requests must retain their admission generation.</summary>
     public long Generation { get; set; } = 1;
+    /// <summary>Current process route selected by the admission gate, or null when exact current identity cannot be observed; never persisted.</summary>
+    /// <remarks>Unlike EffectiveEndpoint, this observes the running process. It does not prove remote health or receiver liveness and must be read with RuntimeAvailable.</remarks>
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public TelegramEndpointType? RuntimeEndpoint { get; set; }
+    /// <summary>Whether the exact enabled current bot can admit new ordinary requests at observation time, or null when unobserved; never persisted.</summary>
+    /// <remarks>False means paused, fenced, disabled or otherwise unavailable admission. Already admitted work can still finish its original epoch; no network probe is performed.</remarks>
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public bool? RuntimeAvailable { get; set; }
+    /// <summary>Current process route epoch observed alongside RuntimeEndpoint, or null when unobserved; never persisted.</summary>
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public long? RuntimeGeneration { get; set; }
     /// <summary>CAS version incremented by every durable state save.</summary>
     public long Revision { get; set; }
     /// <summary>Operator-control version; health-only writes do not invalidate confirmation panels.</summary>
