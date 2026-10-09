@@ -2,15 +2,20 @@ name: Deploy production
 
 on:
   push:
-    branches:
-      - main
+    branches: ['**']
+  pull_request:
   workflow_dispatch:
+    inputs:
+      verify_only:
+        description: Run complete release gate without deployment
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: production-deploy
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -19,32 +24,100 @@ env:
   SERVICE_NAME: vpnetiranbot.service
 
 jobs:
-  deploy:
-    if: github.ref == 'refs/heads/main'
-    name: Deploy Production
+  verify:
+    name: Verify immutable release
     runs-on: ubuntu-latest
-    environment:
-      name: production
-    timeout-minutes: 30
+    timeout-minutes: 80
+    outputs:
+      archive_sha256: ${{ steps.gate.outputs.archive_sha256 }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout exact workflow commit
         uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
-
-      - name: Validate deployment scripts
+          persist-credentials: false
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Exercise deployment regressions
+        shell: bash
+        run: timeout --kill-after=10s 180s bash scripts/deploy-production.tests.sh
+      - name: Run full isolated release gate
+        id: gate
         shell: bash
         run: |
           set -Eeuo pipefail
-          bash -n scripts/deploy-production.sh
-          bash -n scripts/deploy-production.tests.sh
-          bash scripts/deploy-production.tests.sh
-          if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck scripts/deploy-production.sh scripts/deploy-production.tests.sh
-          else
-            echo "shellcheck is not installed on this runner; syntax and preservation tests already passed."
-          fi
+          bash scripts/verify-release.sh "$GITHUB_SHA" "$RUNNER_TEMP/verified-release"
+          printf 'archive_sha256=%s\n' "$(cat "$RUNNER_TEMP/verified-release/release.sha256")" >> "$GITHUB_OUTPUT"
+      - name: Preserve release-gate test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-tests-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/verified-release/discovered-tests.txt
+            ${{ runner.temp }}/verified-release/test-results/*.trx
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload immutable runtime artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-release/release.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Exercise immutable artifact download without Production
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.upload.outputs.artifact-id }}
+          path: ${{ runner.temp }}/verified-download
+          merge-multiple: true
+      - name: Verify Actions artifact round trip
+        shell: bash
+        env:
+          ARCHIVE_SHA256: ${{ steps.gate.outputs.archive_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          timeout --kill-after=10s 120s python3 scripts/release-artifact.py verify \
+            "$RUNNER_TEMP/verified-download/release.tar.gz" "$GITHUB_SHA" "$ARCHIVE_SHA256"
+  deploy:
+    needs: verify
+    # Production activation is an explicit, main-only manual action; pushes and pull requests only verify.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && !inputs.verify_only
+    name: Deploy Production
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact verified artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          path: ${{ runner.temp }}/release-download
+          # ID-based downloads otherwise add an artifact-name directory; this is one exact approved ID.
+          merge-multiple: true
+
+      - name: Verify downloaded runtime archive
+        shell: bash
+        env:
+          ARCHIVE_SHA256: ${{ needs.verify.outputs.archive_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          timeout --kill-after=10s 120s python3 scripts/release-artifact.py verify \
+            "$RUNNER_TEMP/release-download/release.tar.gz" "$GITHUB_SHA" "$ARCHIVE_SHA256"
 
       - name: Configure production SSH
         shell: bash
@@ -102,25 +175,35 @@ jobs:
           PROD_HOST: ${{ secrets.PROD_HOST }}
           PROD_PORT: ${{ secrets.PROD_PORT }}
           PROD_USER: ${{ secrets.PROD_USER }}
+          ARCHIVE_SHA256: ${{ needs.verify.outputs.archive_sha256 }}
         run: |
           set -Eeuo pipefail
-          remote_cmd="$(printf 'bash -s -- %q %q %q %q %q %q' \
-            "$GITHUB_SHA" "$REPO_URL" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$DEPLOY_PATH" "$SERVICE_NAME")"
-          ssh \
-            -i "$RUNNER_TEMP/prod_deploy_key" \
-            -p "$PROD_PORT" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=10 \
-            -v \
-            -o ConnectTimeout=15 \
-            -o ConnectionAttempts=2 \
-            -o TCPKeepAlive=yes \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-            -- "$PROD_USER@$PROD_HOST" "$remote_cmd" \
-            < scripts/deploy-production.sh
+          [[ "$PROD_HOST" =~ ^[a-zA-Z0-9.-]+$ && "$PROD_USER" =~ ^[a-zA-Z0-9_-]+$ && "$PROD_PORT" =~ ^[0-9]+$ ]]
+          incoming="/root/.deploy/vpnetiran/incoming/${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ssh_options=(-i "$RUNNER_TEMP/prod_deploy_key" -p "$PROD_PORT"
+            -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+            -o ConnectTimeout=15 -o ConnectionAttempts=2 -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          # A fresh private incoming directory prevents another run from replacing this artifact.
+          remote_prepare="$(printf 'umask 077; mkdir -p /root/.deploy/vpnetiran/incoming && test ! -e %q && mkdir -m 700 %q' "$incoming" "$incoming")"
+          timeout --kill-after=10s 60s ssh "${ssh_options[@]}" -- "$PROD_USER@$PROD_HOST" "$remote_prepare"
+          remote_cleanup="$(printf 'rm -rf -- %q' "$incoming")"
+          cleanup_incoming() {
+            timeout --kill-after=10s 60s ssh "${ssh_options[@]}" -- "$PROD_USER@$PROD_HOST" "$remote_cleanup" || true
+          }
+          trap cleanup_incoming EXIT
+          # Upload fixed regular files directly; never extract an unvalidated transport archive.
+          scp_options=(-i "$RUNNER_TEMP/prod_deploy_key" -P "$PROD_PORT"
+            -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+            -o ConnectTimeout=15 -o ConnectionAttempts=2 -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          timeout --kill-after=10s 180s scp "${scp_options[@]}" \
+            "$RUNNER_TEMP/release-download/release.tar.gz" scripts/deploy-production.sh scripts/release-artifact.py \
+            "$PROD_USER@$PROD_HOST:$incoming/"
+          remote_cmd="$(printf 'timeout --signal=TERM --kill-after=15s 900s bash %q %q %q %q %q %q %q %q' \
+            "$incoming/deploy-production.sh" "$GITHUB_SHA" "$REPO_URL" "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_ATTEMPT" "$DEPLOY_PATH" "$SERVICE_NAME" "$ARCHIVE_SHA256")"
+          timeout --kill-after=15s 960s ssh "${ssh_options[@]}" -- "$PROD_USER@$PROD_HOST" "$remote_cmd"
 
       - name: Remove temporary SSH key
         if: always()

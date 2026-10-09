@@ -31,33 +31,50 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="capacity">Positive maximum queued or currently running Telegram executions.</param>
     /// <param name="token">Receiver cancellation before acceptance.</param>
     /// <returns>True when committed or already accepted; false when admission must wait for capacity.</returns>
-    /// <remarks>Duplicate delivery succeeds even when full. The count stops at capacity inside the admission transaction. Cancellation after commit is resolved by durable deduplication.
-    /// Telegram's native serializer retains the Bot API wire format now that v22 uses System.Text.Json attributes.
-    /// Payload-free timing is published after commit and before NotifyReady; it introduces no database writes.</remarks>
+    /// <remarks>Duplicate delivery succeeds even when full. Read-only duplicate/full checks avoid writer admission;
+    /// capacity and deduplication are rechecked inside the immediate transaction before insertion. Serialization
+    /// happens before the writer transaction, and readiness/telemetry publication happens after context disposal.
+    /// Cancellation after commit is resolved by durable deduplication. Telegram's native serializer retains the
+    /// Bot API wire format now that v22 uses System.Text.Json attributes.</remarks>
     /// <example><code>while (!await store.TryAcceptAsync(botId, update, capacity, token)) await Task.Delay(100, token);</code></example>
-    public Task<bool> TryAcceptAsync(string botId, Update update, int capacity, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
+    public async Task<bool> TryAcceptAsync(string botId, Update update, int capacity, CancellationToken token)
     {
-        await using var db = _factory.CreateDbContext();
-        await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        if (await db.TelegramUpdateInbox.AnyAsync(x => x.BotId == botId && x.UpdateId == update.Id, ct))
+        using var priority = SqliteWriterArbitration.Prioritize();
+        string payload = null;
+        var result = await SqliteOperation.RunAsync(async ct =>
         {
-            UpdateTelemetryTracker.Current?.CompleteDuplicate();
-            return true;
+            await using var db = _factory.CreateDbContext();
+            if (await db.TelegramUpdateInbox.AnyAsync(x => x.BotId == botId && x.UpdateId == update.Id, ct))
+                return (Accepted: true, Duplicate: true, Entry: (TelegramUpdateInboxEntry)null);
+            if (await db.TelegramUpdateInbox.Where(x => x.Status == "queued" || x.Status == "running")
+                .Select(x => x.Sequence).Take(capacity).CountAsync(ct) >= capacity)
+                return (Accepted: false, Duplicate: false, Entry: (TelegramUpdateInboxEntry)null);
+
+            payload ??= System.Text.Json.JsonSerializer.Serialize(update, Telegram.Bot.JsonBotAPI.Options);
+            await using var transaction = await db.Database.BeginTransactionAsync(ct);
+            if (await db.TelegramUpdateInbox.AnyAsync(x => x.BotId == botId && x.UpdateId == update.Id, ct))
+                return (Accepted: true, Duplicate: true, Entry: (TelegramUpdateInboxEntry)null);
+            if (await db.TelegramUpdateInbox.Where(x => x.Status == "queued" || x.Status == "running")
+                .Select(x => x.Sequence).Take(capacity).CountAsync(ct) >= capacity)
+                return (Accepted: false, Duplicate: false, Entry: (TelegramUpdateInboxEntry)null);
+            var entry = new TelegramUpdateInboxEntry
+            {
+                BotId = botId, UpdateId = update.Id, TelegramUserId = TelegramUpdateIdentity.ResolveUserId(update),
+                UpdateType = update.Type.ToString(), Payload = payload, AcceptedAtUtc = DateTime.UtcNow
+            };
+            db.TelegramUpdateInbox.Add(entry);
+            await db.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
+            return (Accepted: true, Duplicate: false, Entry: entry);
+        }, token);
+        if (result.Duplicate) UpdateTelemetryTracker.Current?.CompleteDuplicate();
+        if (result.Entry != null)
+        {
+            _telemetryTracker?.Persisted(result.Entry.Sequence, result.Entry.AcceptedAtUtc);
+            NotifyReady();
         }
-        if (await db.TelegramUpdateInbox.Where(x => x.Status == "queued" || x.Status == "running")
-            .Select(x => x.Sequence).Take(capacity).CountAsync(ct) >= capacity) return false;
-        var entry = new TelegramUpdateInboxEntry
-        {
-            BotId = botId, UpdateId = update.Id, TelegramUserId = TelegramUpdateIdentity.ResolveUserId(update),
-            UpdateType = update.Type.ToString(), Payload = System.Text.Json.JsonSerializer.Serialize(update, Telegram.Bot.JsonBotAPI.Options), AcceptedAtUtc = DateTime.UtcNow
-        };
-        db.TelegramUpdateInbox.Add(entry);
-        await db.SaveChangesAsync(ct);
-        await transaction.CommitAsync(ct);
-        _telemetryTracker?.Persisted(entry.Sequence, entry.AcceptedAtUtc);
-        NotifyReady();
-        return true;
-    }, token);
+        return result.Accepted;
+    }
 
     /// <summary>Loads only the oldest queued row behind any currently queued or running work for its bot/user key.</summary>
     /// <param name="capacity">Maximum rows to materialize; equals the validated admission capacity.</param>
@@ -81,23 +98,41 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="sequence">Internal inbox sequence selected by this scheduler.</param>
     /// <param name="token">Cancellation of the local claim.</param>
     /// <returns>A private work item including the exact persisted UTC claim time, or null if another executor already claimed the row.</returns>
-    /// <remarks>A process crash after the claim creates a terminal review receipt at recovery; unsafe business mutations are protected by their own durable operation records.
-    /// Bot API serialization options read both newly accepted updates and existing v19 snake-case payloads.</remarks>
+    /// <remarks>The conditional UPDATE claims only a queued lane head, even when competing callers selected
+    /// the same stale ready snapshot. Payload loading precedes the short transaction; the claim timestamp is
+    /// assigned after writer admission. Deserialization follows commit and context disposal. A crash after the claim
+    /// retains a review receipt; business mutations keep their own durable records. Bot API options also read v19 payloads.</remarks>
     /// <example><code>var item = await store.ClaimAsync(sequence, token); // item.StartedAtUtc is the durable wait endpoint.</code></example>
     /// <exception cref="InvalidOperationException">The committed claim contains an invalid durable update payload; recovery must preserve the claimed receipt for review.</exception>
     /// <exception cref="OperationCanceledException">The local claim operation was cancelled before returning a work item.</exception>
-    public Task<TelegramUpdateWorkItem> ClaimAsync(long sequence, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
+    public async Task<TelegramUpdateWorkItem> ClaimAsync(long sequence, CancellationToken token)
     {
-        await using var db = _factory.CreateDbContext();
-        await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        var claimed = await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "queued")
-            .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "running").SetProperty(x => x.StartedAtUtc, DateTime.UtcNow), ct);
-        if (claimed == 0) return null;
-        var row = await db.TelegramUpdateInbox.AsNoTracking().SingleAsync(x => x.Sequence == sequence, ct);
-        await transaction.CommitAsync(ct);
+        using var priority = SqliteWriterArbitration.Prioritize();
+        var row = await SqliteOperation.RunAsync(async ct =>
+        {
+            await using var db = _factory.CreateDbContext();
+            var candidate = await db.TelegramUpdateInbox.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.Sequence == sequence && x.Status == "queued"
+                    && !db.TelegramUpdateInbox.Any(prior => prior.BotId == x.BotId && prior.TelegramUserId == x.TelegramUserId
+                        && prior.Sequence < x.Sequence && (prior.Status == "queued" || prior.Status == "running")), ct);
+            if (candidate == null) return null;
+            await using var transaction = await db.Database.BeginTransactionAsync(ct);
+            var startedAtUtc = DateTime.UtcNow;
+            var claimed = await db.TelegramUpdateInbox.Where(x => x.Sequence == sequence && x.Status == "queued"
+                && !db.TelegramUpdateInbox.Any(prior => prior.BotId == x.BotId && prior.TelegramUserId == x.TelegramUserId
+                    && prior.Sequence < x.Sequence && (prior.Status == "queued" || prior.Status == "running")))
+                .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "running")
+                    .SetProperty(x => x.StartedAtUtc, startedAtUtc), ct);
+            if (claimed == 0) return null;
+            await transaction.CommitAsync(ct);
+            candidate.StartedAtUtc = startedAtUtc;
+            return candidate;
+        }, token);
+        if (row == null) return null;
         return new TelegramUpdateWorkItem(row.Sequence, new(row.BotId, row.TelegramUserId),
-            System.Text.Json.JsonSerializer.Deserialize<Update>(row.Payload, Telegram.Bot.JsonBotAPI.Options) ?? throw new InvalidOperationException("Invalid durable update payload."), row.AcceptedAtUtc, row.StartedAtUtc.Value);
-    }, token);
+            System.Text.Json.JsonSerializer.Deserialize<Update>(row.Payload, Telegram.Bot.JsonBotAPI.Options)
+                ?? throw new InvalidOperationException("Invalid durable update payload."), row.AcceptedAtUtc, row.StartedAtUtc.Value);
+    }
 
     /// <summary>Finalizes a claim as a payload-free terminal receipt after the handler exits.</summary>
     /// <param name="sequence">Internal claimed inbox sequence.</param>
@@ -105,13 +140,16 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="token">Independent persistence cancellation token, normally not the cancelled handler token.</param>
     /// <returns>True when a running claim was transitioned; false when no running claim remained and no row changed.</returns>
     /// <remarks>Every changed receipt erases the private payload. A failure requiring business reconciliation becomes
-    /// <c>completed_with_review</c>; other failures become <c>completed_with_error</c>. A false result can follow live
-    /// shutdown recovery and is not proof of a new final commit. Neither terminal state blocks later updates.</remarks>
+    /// <c>completed_with_review</c>; other failures become <c>completed_with_error</c>. An already-finalized row
+    /// is checked read-only before the conditional update. Neither terminal state blocks later updates; only a changed
+    /// receipt publishes readiness. A false result can follow live shutdown recovery and is not proof of a new final commit.</remarks>
     public async Task<bool> FinishAsync(long sequence, string failureCode, CancellationToken token)
     {
+        using var priority = SqliteWriterArbitration.Prioritize();
         var changed = await SqliteOperation.RunAsync(async ct =>
         {
             await using var db = _factory.CreateDbContext();
+            if (!await db.TelegramUpdateInbox.AnyAsync(x => x.Sequence == sequence && x.Status == "running", ct)) return 0;
             var terminalStatus = failureCode == null ? "completed"
                 : failureCode is "creation_requires_review" or "process_interrupted" or "execution_cancelled" ? "completed_with_review"
                 : "completed_with_error";
@@ -120,7 +158,7 @@ public sealed partial class TelegramUpdateInboxStore
                     .SetProperty(x => x.Payload, (string)null).SetProperty(x => x.FailureCode, failureCode)
                     .SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow), ct);
         }, token);
-        NotifyReady();
+        if (changed > 0) NotifyReady();
         return changed > 0;
     }
 
@@ -136,14 +174,15 @@ public sealed partial class TelegramUpdateInboxStore
     {
         await using var db = _factory.CreateDbContext();
         var now = DateTime.UtcNow;
-        var count = await db.TelegramUpdateInbox.Where(x => x.Status == "running" || x.Status == "uncertain")
-            .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "completed_with_review")
+        var interrupted = db.TelegramUpdateInbox.Where(x => x.Status == "running" || x.Status == "uncertain");
+        var count = await interrupted.AnyAsync(ct)
+            ? await interrupted.ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "completed_with_review")
                 .SetProperty(x => x.Payload, (string)null).SetProperty(x => x.CompletedAtUtc, now)
-                .SetProperty(x => x.FailureCode, x => x.Status == "running" ? "process_interrupted" : x.FailureCode), ct);
+                .SetProperty(x => x.FailureCode, x => x.Status == "running" ? "process_interrupted" : x.FailureCode), ct)
+            : 0;
         if (count > 0 && _telemetryTracker != null)
             await RecordRecoveryTelemetryAsync(db, now, preRestartTelemetry, ct);
-        var cutoff = DateTime.UtcNow.AddDays(-7);
-        await db.TelegramUpdateInbox.Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff).ExecuteDeleteAsync(ct);
+        await PruneAsync(ct);
         return count;
     }, token);
 
@@ -257,12 +296,14 @@ public sealed partial class TelegramUpdateInboxStore
     /// <summary>Expires all terminal Telegram receipts after the seven-day deduplication window.</summary>
     /// <param name="token">Cancellation of the short maintenance write.</param>
     /// <returns>The number of completed deduplication records older than seven days removed.</returns>
-    /// <remarks>Payloads have already been erased at completion; this runs periodically during long uptimes.</remarks>
+    /// <remarks>Payloads have already been erased at completion. An empty retention scan is read-only and
+    /// never requests the database writer; rows becoming eligible after that scan wait for the next maintenance pass.</remarks>
     public Task<int> PruneAsync(CancellationToken token) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
         var cutoff = DateTime.UtcNow.AddDays(-7);
-        return await db.TelegramUpdateInbox.Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff).ExecuteDeleteAsync(ct);
+        var expired = db.TelegramUpdateInbox.Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff);
+        return await expired.AnyAsync(ct) ? await expired.ExecuteDeleteAsync(ct) : 0;
     }, token);
 
     /// <summary>Detects linked XUI attempts whose outcome is still ambiguous despite a handled user-facing failure.</summary>

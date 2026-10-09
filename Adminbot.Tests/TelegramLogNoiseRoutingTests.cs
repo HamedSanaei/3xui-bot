@@ -315,6 +315,41 @@ public sealed partial class ConcurrencyTests
             Assert.Contains("Unexpected operation failure.", written, StringComparison.Ordinal);
     }
 
+    /// <summary>Bounds repeated queue summaries without hiding a different lane or an attached genuine failure.</summary>
+    /// <remarks>Only Telegram delivery is limited; the ten-minute boundary is monotonic and each lane gets its first alert.</remarks>
+    [Fact]
+    public void Queue_incidents_are_rate_limited_per_lane_and_failures_remain_visible()
+    {
+        const string message = "Telegram queue-delay incident. BotId=queue-limiter-regression TelegramUserId=48001 AffectedCount=25 MaxQueueWaitMs=66004";
+        Assert.False(TelegramLogSuppression.ShouldSuppress(message, null, 0));
+        Assert.True(TelegramLogSuppression.ShouldSuppress(message, null, 599999));
+        Assert.False(TelegramLogSuppression.ShouldSuppress(message, null, 600000));
+        Assert.False(TelegramLogSuppression.ShouldSuppress(
+            "Telegram queue-delay incident. BotId=queue-limiter-regression TelegramUserId=48002 AffectedCount=1", null, 1));
+        Assert.False(TelegramLogSuppression.ShouldSuppress(message, new InvalidOperationException("Persistence failure"), 600001));
+        Assert.False(TelegramLogSuppression.ShouldSuppress("Payment settlement failed", null, 600001));
+        Assert.False(TelegramLogSuppression.ShouldSuppress("Tenant order delivery failed", null, 600001));
+    }
+
+    /// <summary>Rate-limits repeated contention/writer summaries while retaining unrelated service-failure incidents.</summary>
+    /// <param name="category">One closed telemetry incident category responsible for repeated production alerts.</param>
+    /// <remarks>Bot isolation, cooldown expiry and exception fail-open behavior protect first and genuine failure alerts.</remarks>
+    [Theory]
+    [InlineData("sqlite_busy")]
+    [InlineData("telemetry_writer_loss")]
+    public void Repeated_telemetry_incidents_are_bounded_without_hiding_service_failures(string category)
+    {
+        var message = $"Latency telemetry incident. Category={category} BotId=incident-limiter-{category} Count=500";
+        Assert.False(TelegramLogSuppression.ShouldSuppress(message, null, 0));
+        Assert.True(TelegramLogSuppression.ShouldSuppress(message, null, 1));
+        Assert.False(TelegramLogSuppression.ShouldSuppress(message, null, 600000));
+        Assert.False(TelegramLogSuppression.ShouldSuppress(message, new IOException("Writer failed"), 600001));
+        Assert.False(TelegramLogSuppression.ShouldSuppress(
+            $"Latency telemetry incident. Category={category} BotId=separate-bot-{category} Count=1", null, 1));
+        Assert.False(TelegramLogSuppression.ShouldSuppress(
+            "Latency telemetry incident. Category=service_failure BotId=incident-limiter Count=1", null, 1));
+    }
+
     /// <summary>Fake Telegram log sender that records delivered text instead of contacting Telegram.</summary>
     /// <remarks>Used to prove which events the production Telegram logger actually enqueued for channel delivery.</remarks>
     private sealed class RecordingLogSender : ITelegramLogSender

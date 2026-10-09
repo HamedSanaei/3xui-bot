@@ -50,31 +50,46 @@ preflight starts no web server, Telegram receiver, hosted worker, or remote logg
 
 ## Synchronized-deployment gate (`scripts/deploy-production.sh`)
 
-The GitHub production workflow streams `scripts/deploy-production.sh` to the host, which clones the exact pushed SHA and
-synchronizes it into `/root/vpnetiran` before restarting `vpnetiranbot.service`. That path must clear the same gates as
-the immutable-release path; `dotnet publish` alone is explicitly **not** sufficient, because it compiles the application
-but never runs the suite or the EF model checks.
+The workflow verifies every push, pull request and manual dispatch on an isolated Linux Actions runner.
+Production activation is **manual only**: choose `main` and set `verify_only=false`. The default is verification
+without deployment; feature branches and pull requests never receive production secrets or run SSH/systemd.
 
-Against the freshly cloned staging checkout, and before any source or publish synchronization and before systemd is
-touched, the script now runs, in order:
+`scripts/verify-release.sh <40-character-sha> <fresh-output-directory-outside-checkout>` rejects dirty or mismatched
+source and runs the complete gate: pinned EF tool restore, solution restore/build, full test discovery and execution,
+explicit completed TRX validation, both EF pending-model checks, application-only `linux-x64` publish, tutorial-asset
+validation, and the exact published executable's fresh-database `--migration-check`.
+Every discovered test must execute and pass; a failed, empty, skipped, incomplete or aborted run cannot approve an
+artifact even if its command returns zero. The failure-propagation fix from `45fc9c5` remains in the bounded command
+orchestration; Bash errexit alone is not relied on inside conditional subshells.
 
-```bash
-dotnet tool restore
-dotnet restore Adminbot.sln
-dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=<sha>"
-dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
-dotnet ef migrations has-pending-model-changes --no-build --context UserDbContext
-dotnet ef migrations has-pending-model-changes --no-build --context CredentialsDbContext
-```
+The gate packages only runtime files into `release.tar.gz`, with an exact commit/runtime manifest and per-file
+SHA-256, size and executable-mode checks. It rejects Data/configuration/databases/tokens/private keys, test assemblies,
+source files, links and unsafe archive paths. Actions uses the immutable artifact ID and independent archive checksum,
+not a mutable artifact name or a production build. The verification job downloads that exact ID and revalidates its
+checksum/manifest, exercising the Actions transport even on feature branches without Production access.
+Discovery and TRX evidence are retained for seven days, including failed gates. A failed verification job prevents
+the deployment job from starting.
 
-It then publishes with the same `SourceRevisionId` stamp, and runs the published executable's migration preflight twice:
-once against fresh databases, then against online-backup copies of `.../publish/Data/users.db` and
-`.../publish/Data/credentials.db`. Only after every gate passes does it synchronize source and publish and restart the
-service; a failing gate exits before the protected `Data` directory or systemd is touched.
+Production receives fixed files over bounded SCP/SSH, verifies the archive and manifest again, and runs only the
+published executable's **copy-only** preflight against online backups of the live
+`/root/vpnetiran/bin/Release/net10.0/linux-x64/publish/Data/users.db` and `credentials.db`.
+No SDK, build, test or source-tree synchronization occurs on Production. Before preflight and synchronization succeed,
+systemd is untouched. Runtime synchronization preserves Data, configurations, token/key files and databases/WAL,
+including historical files outside Data. Service and canonical runtime paths remain unchanged.
 
-`scripts/deploy-production.tests.sh` asserts the *ordering* structurally (restore/build/tests/EF checks and the
-preflight all precede synchronization, and synchronization precedes the restart) so the gate cannot be dropped or moved
-by a later edit on a machine without rsync or systemd.
+Production prerequisites: the .NET/ASP.NET runtime used by `Adminbot`, Python 3, GNU `timeout`, `rsync`, `flock`,
+coreutils, systemd and working SCP/SFTP. Commands have process-group deadlines: restore 3–5 minutes, build/publish
+15 minutes each, full tests 30 minutes with a five-minute hang detector, EF/migration preflights three minutes each,
+artifact validation two minutes, deployment lock one minute and remote activation fifteen minutes.
+The deploy job is bounded at twenty minutes. Archive or preflight failure never reaches synchronization/restart;
+failed synchronization never reaches restart.
+
+`bash scripts/deploy-production.tests.sh` exercises fail-closed gate orchestration, aborted/empty test proof,
+artifact tampering/traversal/link rejection, real timeout and rsync preservation behavior without Production access.
+For rollout, review the branch's green verification and merge it; merging alone does not deploy. Take the normal
+verified production backup, confirm the prerequisites, then manually run the workflow on `main` with
+`verify_only=false` and any required production-environment approval. Keep the previous known-good runtime artifact
+for rollback. Do not bulk-reset inbox, payment, order or uncertain-delivery rows.
 
 ## SQLite scan contention and receipt acknowledgement recovery
 
@@ -106,6 +121,24 @@ only its original Processing/claim-token pair as DeliveryUncertain. If that writ
 expiry also becomes DeliveryUncertain, never Pending. An acknowledgement already applied before provider cleanup
 failed remains Delivered. Verify the Sales Assistant's actual message before any manual retry; do not bulk-reset
 Processing or DeliveryUncertain rows, because doing so can resend accepted receipts.
+
+The October 10 reliability change additionally arbitrates users/credentials SQLite writers **before** native busy
+waits. Reads remain concurrent; a bounded cancellable process-local queue gives inbox and active-handler persistence
+up to eight turns before a waiting background write. Explicit transaction ownership is reentrant and retained through
+reader/transaction cleanup. SQLite still enforces actual atomicity, constraints and cross-process isolation; this is
+not a replacement transaction manager or permission to replay financial/external effects.
+Queue-slot and writer-turn waits share the existing command/connection timeout, rather than waiting indefinitely.
+Expiry remains SQLite BUSY (5) under the existing three-attempt policy; caller cancellation is not relabelled as BUSY.
+An explicitly configured zero timeout preserves SQLite's unlimited-wait convention.
+Inbox duplicates/full-capacity checks are read-only; capacity/deduplication are rechecked inside the short insertion
+transaction. Payload serialization precedes writer admission, deserialization and wake/telemetry publication follow
+context disposal. Idle inbox/order maintenance avoids zero-row writes. Synchronous handler prologues run off the
+scheduler coordinator so independent lanes can dispatch; same-user FIFO is intentionally unchanged.
+
+Historical 66–84 second queue waits can include multiple predecessor executions and persistence/dispatch delays.
+Attribution reports clipped overlap, lane occupancy (claim through terminal receipt, **not handler-only time**) and
+the wait outside the selected predecessor separately. It does not blame all waiting time on one handler or fabricate
+a blocker when overlap is absent. Keep the detailed correlated telemetry when diagnosing any remaining long wait.
 
 No new schema migration, database repair, pool change or manual WAL switch is required by this fix. The tenant
 underfunding central-gateway fallback and personal-card funding admission rules remain unchanged. Use the normal

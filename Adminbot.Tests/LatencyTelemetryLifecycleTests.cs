@@ -19,7 +19,7 @@ public sealed partial class ConcurrencyTests
     /// <returns>A task verifying durable execution and JSONL evidence for three isolated updates.</returns>
     /// <remarks>The first lane performs a real contended SQLite write, then is deliberately held while its successor waits;
     /// another bot must respond before that lane is released. The terminal summary must retain retry evidence and
-    /// partition measured stage/gap wall time using the same handler origin as response milestones.</remarks>
+    /// partition measured stage/gap wall time using one rounded handler endpoint and the same origin as response milestones.</remarks>
     [Fact]
     public async Task Latency_timeline_correlates_real_inbox_and_http_while_preserving_bot_user_FIFO()
     {

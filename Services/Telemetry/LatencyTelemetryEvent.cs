@@ -53,6 +53,10 @@ public sealed record LatencyTelemetryEvent
     public string Category { get; init; }
     /// <summary>Monotonic elapsed milliseconds for this observation.</summary>
     public double? DurationMs { get; init; }
+    /// <summary>Exact successful background SQLite boundaries represented by one fixed histogram snapshot; null for individual events.</summary>
+    public long? ObservationCount { get; init; }
+    /// <summary>Thirty fixed logarithmic duration-bin counts for background aggregates, with upper bounds of 0.001 * 2^index milliseconds; immutable after admission.</summary>
+    public long[] DurationBucketCounts { get; init; }
     /// <summary>Numeric HTTP response code when response headers were received.</summary>
     public int? HttpStatusCode { get; init; }
     /// <summary>Numeric Telegram API rejection code when the SDK supplied one.</summary>

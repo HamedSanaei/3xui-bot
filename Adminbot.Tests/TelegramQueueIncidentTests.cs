@@ -63,7 +63,7 @@ public sealed partial class ConcurrencyTests
             3, "owned", 711, QueueEpoch, QueueEpoch.AddMilliseconds(6160), default);
         Assert.Equal(2, result!.Sequence);
         Assert.Equal(5800, result.BlockingOverlapMs);
-        Assert.Equal(5800, result.HandlerDurationMs);
+        Assert.Equal(5800, result.LaneOccupancyMs);
     }
 
     /// <summary>Exact equal overlaps choose earlier sequence; a one-tick larger overlap wins even when later.</summary>
@@ -129,7 +129,7 @@ public sealed partial class ConcurrencyTests
             Assert.Equal(selected.End is { } end ? QueueEpoch.AddMilliseconds(end) : (DateTime?)null, result.CompletedAtUtc);
             Assert.Equal(QueueEpoch.AddSeconds(10), result.ObservedAtUtc);
             Assert.Equal(selected.End is { } completed ? Math.Max(0, completed - selected.Start) : 10000 - selected.Start,
-                result.HandlerDurationMs);
+                result.LaneOccupancyMs);
         }
         Assert.All(await db.TelegramUpdateInbox.AsNoTracking().ToListAsync(), row => Assert.Equal("private-not-for-diagnostics", row.Payload));
     }
@@ -177,7 +177,7 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(711, report.TelegramUserId);
         Assert.Equal(2, report.DominantBlocker.Sequence);
         Assert.Equal("CallbackQuery", report.DominantBlocker.UpdateType);
-        Assert.Equal(6500, report.DominantBlocker.HandlerDurationMs);
+        Assert.Equal(6500, report.DominantBlocker.LaneOccupancyMs);
         Assert.Equal(6000, report.DominantBlocker.BlockingOverlapMs);
         Assert.Equal(QueueEpoch.AddSeconds(-7), report.StartedAtUtc);
         Assert.Equal(QueueEpoch.AddSeconds(2), report.EndedAtUtc);

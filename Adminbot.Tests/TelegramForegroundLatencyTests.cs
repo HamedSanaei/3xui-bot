@@ -656,7 +656,7 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(firstSequence, blocker!.Sequence);
         Assert.Equal(916840327, blocker.UpdateId);
         Assert.Equal("Message", blocker.UpdateType);
-        Assert.True(blocker.HandlerDurationMs >= 100_000, $"duration={blocker.HandlerDurationMs}");
+        Assert.True(blocker.LaneOccupancyMs >= 100_000, $"duration={blocker.LaneOccupancyMs}");
         Assert.Equal(84_000, blocker.BlockingOverlapMs);
 
         // A different lane and a non-overlapping window must not be reported as the blocker.

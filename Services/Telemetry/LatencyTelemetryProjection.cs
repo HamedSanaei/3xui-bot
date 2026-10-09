@@ -57,6 +57,8 @@ internal static class LatencyTelemetryProjection
     private const ulong TimelineLost = 1UL << 23;
     /// <summary>Identity-free endpoint health, migration and outage measurements.</summary>
     private const ulong Endpoint = 1UL << 24;
+    /// <summary>Fixed healthy background-SQLite duration histograms, separate from individual command/retry evidence.</summary>
+    private const ulong DatabaseAggregate = 1UL << 25;
 
     /// <summary>Determines the fixed relevant-field mask for one closed event family.</summary>
     /// <param name="eventType">Internal closed schema-one record family, never arbitrary customer input.</param>
@@ -82,6 +84,7 @@ internal static class LatencyTelemetryProjection
         "latency_stage_completed" => Stage | Errors,
         "unattributed_handler_time" => StageSummary,
         "sqlite_operation_completed" or "sqlite_busy_retry" or "sqlite_transaction_completed" => Database | Errors,
+        "sqlite_background_aggregate" => DatabaseAggregate,
         "telegram_poll_completed" or "telegram_poll_failed" or "telegram_poll_recovered" or "telegram_poll_backoff"
             or "telegram_receiver_started" or "telegram_receiver_stopped" or "telegram_receiver_health" or "telegram_receiver_startup" => Polling | Errors,
         "process_health" => Health | Counters,
@@ -113,9 +116,10 @@ internal static class LatencyTelemetryProjection
             or "sequence" or "updateType" or "operation" or "category" or "outcome" or "timingQuality" => Core,
         "endpointType" or "endpointGeneration" or "migrationState" => Request | Endpoint,
         "healthCheckDurationMs" or "failoverTrigger" or "failoverDurationMs" or "cloudReuseRemainingMs" or "lastSuccessUtc" => Endpoint,
-        "stage" => Request | Endpoint | Database | Polling | Stage | StageSummary | AllTimeline | HandlerStarted | FirstAttempt | FirstCompleted | FirstAcknowledged,
+        "stage" => Request | Endpoint | Database | DatabaseAggregate | Polling | Stage | StageSummary | AllTimeline | HandlerStarted | FirstAttempt | FirstCompleted | FirstAcknowledged,
         "method" => Request | FirstAttempt | FirstCompleted | FirstAcknowledged,
         "durationMs" => Request | Endpoint | Database | Polling | Stage | StageSummary | AllTimeline | HandlerCompleted | TimelineLost,
+        "observationCount" or "durationBucketCounts" => DatabaseAggregate,
         "httpStatusCode" or "apiErrorCode" => Request | Endpoint | Polling | AllTimeline | HandlerCompleted | FirstCompleted | FirstAcknowledged,
         "exceptionCategory" or "cancellationSource" or "timeoutCategory" or "failureClassification" => Errors,
         "attempt" => Request | Database | Polling,
@@ -155,7 +159,8 @@ internal static class LatencyTelemetryProjection
         "droppedEvents" or "writerFailures" or "channelDepth" or "channelCapacity" or "activeHandlers" or "pendingUpdates"
             or "fullChannelDroppedEvents" or "writeDroppedEvents" or "rejectedEvents" or "shutdownDroppedEvents" or "totalWrittenEvents"
             or "droppedIncidentNotifications" or "incidentNotificationFailures" or "incidentNotificationQueueDepth" => Counters,
-        "incidentCount" or "windowSeconds" or "p95Ms" or "baselineP95Ms" => Incident,
+        "windowSeconds" => Incident | DatabaseAggregate,
+        "incidentCount" or "p95Ms" or "baselineP95Ms" => Incident,
         _ => ulong.MaxValue
     };
 }

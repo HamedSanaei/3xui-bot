@@ -11,7 +11,7 @@ using Microsoft.Extensions.Logging;
 namespace Adminbot.Services.Telemetry;
 
 /// <summary>Bounded nonblocking latency collection with one recoverable asynchronous JSONL writer.</summary>
-/// <remarks>Producers only inspect flags, increment atomic counters and call TryWrite: they never log, perform disk/network I/O, wait for channel capacity or touch SQL. StartAsync never opens the directory. Filesystem outages discard explicitly counted observations while bounded recovery continues. Register this hosted service before receivers so it stops after their drains.</remarks>
+/// <remarks>Producers inspect flags, increment fixed atomic background-SQLite histograms or call TryWrite: they never log, perform disk/network I/O, wait for capacity or touch SQL. StartAsync never opens the directory. Filesystem outages discard explicitly counted observations while bounded recovery continues. Register this hosted service before receivers so it stops after their drains.</remarks>
 public sealed class LatencyTelemetryService : IHostedService, IDisposable
 {
     /// <summary>Closed accepted schema-one event families.</summary>
@@ -24,7 +24,7 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
         "telegram_update_handler_completed", "telegram_update_inbox_completed", "telegram_update_completed",
         "telegram_request_completed", "telegram_api_request_completed", "telegram_foreground_request_completed",
         "latency_stage_completed", "unattributed_handler_time", "sqlite_operation_completed", "sqlite_busy_retry",
-        "sqlite_transaction_completed", "telegram_poll_completed", "telegram_poll_failed", "telegram_poll_recovered",
+        "sqlite_transaction_completed", "sqlite_background_aggregate", "telegram_poll_completed", "telegram_poll_failed", "telegram_poll_recovered",
         "telegram_poll_backoff", "telegram_receiver_started", "telegram_receiver_stopped", "telegram_receiver_health",
         "telegram_receiver_startup", "process_health", "telemetry_loss", "telemetry_writer_failure", "telemetry_started",
         "telemetry_stopped", "telemetry_incident", "telegram_timeline_metadata_lost",
@@ -36,6 +36,12 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
     private readonly TimeProvider _timeProvider;
     /// <summary>Bounded multi-producer/single-consumer channel; absent when disabled.</summary>
     private readonly Channel<LatencyTelemetryEvent> _channel;
+    /// <summary>Fixed atomic healthy-background SQLite counters; allocated only when collection is enabled.</summary>
+    private readonly LatencySqliteBackgroundAggregator _backgroundSqlite;
+    /// <summary>Aggregate producers between admission and their atomic increment; writer shutdown alone observes this gauge.</summary>
+    private int _activeSqliteProducers;
+    /// <summary>Monotonic service creation instant, including observations admitted before the hosted writer starts.</summary>
+    private readonly long _aggregationStartedAt = Environment.TickCount64;
     /// <summary>Independent bounded summary-notification queue; logger providers never block the JSONL writer.</summary>
     private readonly Channel<LatencyTelemetryEvent> _incidentNotifications;
     /// <summary>Writer deadline cancellation, independent of handler/request cancellation.</summary>
@@ -92,7 +98,7 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
     /// <param name="dataDirectory">Required absolute persistent application Data directory; Telemetry is appended, never resolved relative to the working directory.</param>
     /// <param name="logger">Required incident-only logger; NullLogger may be supplied until SetIncidentLogger is called after host construction.</param>
     /// <param name="timeProvider">Optional UTC clock for deterministic file rotation and lifecycle tests; null uses the system clock.</param>
-    /// <remarks>All bot families share this process service; identifiers remain scoped in individual records. Disabled collection allocates no channel, file buffers or sampler.</remarks>
+    /// <remarks>All bot families share this process service; identifiers remain scoped in individual records. Disabled collection allocates no channel, background histogram counters, file buffers or sampler.</remarks>
     /// <exception cref="ArgumentNullException">Options or logger is null.</exception>
     /// <exception cref="ArgumentException">The persistent Data path is not absolute.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Configured resource bounds are unsafe.</exception>
@@ -109,6 +115,7 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
         StorageDirectory = Path.Combine(Path.GetFullPath(dataDirectory), "Telemetry");
         if (_options.Enabled)
         {
+            _backgroundSqlite = new LatencySqliteBackgroundAggregator();
             _channel = Channel.CreateBounded<LatencyTelemetryEvent>(new BoundedChannelOptions(_options.ChannelCapacity)
             { SingleReader = true, SingleWriter = false, AllowSynchronousContinuations = false, FullMode = BoundedChannelFullMode.Wait });
             _incidentNotifications = Channel.CreateBounded<LatencyTelemetryEvent>(new BoundedChannelOptions(16)
@@ -152,6 +159,35 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
         if (Volatile.Read(ref _accepting) == 0) AddLoss(ref _shutdownDropped, 1);
         else AddLoss(ref _fullChannelDropped, 1);
         return false;
+    }
+
+    /// <summary>Aggregates a healthy fast background SQLite boundary before constructing or enqueueing a detail event.</summary>
+    /// <param name="eventType">Compile-time sqlite_operation_completed or sqlite_transaction_completed family; retries never qualify.</param>
+    /// <param name="operation">Compile-time command/transaction boundary or allowlisted logical operation category.</param>
+    /// <param name="category">Optional fixed background-worker category; unrecognized categories collapse into sqlite_background.</param>
+    /// <param name="durationMs">Optional elapsed monotonic milliseconds; only finite nonnegative durations below SlowOperationMs qualify.</param>
+    /// <param name="outcome">Closed completion outcome; only completed successful work qualifies.</param>
+    /// <param name="correlated">True when a captured handler scope or receiver timeline owns this work, including admission/final persistence.</param>
+    /// <param name="retryCount">Actual nonnegative SQLite retry count; any retry requires a detailed completion.</param>
+    /// <returns>True when detail must be omitted because the boundary was aggregated or collection is closed/disabled; false when the caller must retain its ordinary detailed evidence.</returns>
+    /// <remarks>Call only when no exception occurred. Foreground/receiver correlation, slow results, errors, cancellations and retrying logical operations remain detailed. Fixed histograms are lock-free and emit at health intervals and shutdown; no per-completion object, SQL, logger, I/O or channel capacity is involved.</remarks>
+    /// <example><code>if (failure == null &amp;&amp; telemetry.TryAggregateBackgroundSqlite(eventType, operation, category, elapsedMs, outcome, scope != null || receiver != null, retries)) return;</code></example>
+    internal bool TryAggregateBackgroundSqlite(string eventType, string operation, string category, double? durationMs,
+        string outcome, bool correlated, int retryCount = 0)
+    {
+        if (correlated || retryCount != 0 || outcome != "completed"
+            || eventType is not ("sqlite_operation_completed" or "sqlite_transaction_completed")
+            || durationMs is not { } duration || !double.IsFinite(duration) || duration < 0 || duration >= _options.SlowOperationMs)
+            return false;
+        if (!Enabled || LatencyTelemetrySuppression.IsActive) return true;
+        Interlocked.Increment(ref _activeSqliteProducers);
+        try
+        {
+            if (Volatile.Read(ref _accepting) == 0) { AddLoss(ref _shutdownDropped, 1); return true; }
+            _backgroundSqlite.Add(operation, category, duration);
+            return true;
+        }
+        finally { Interlocked.Decrement(ref _activeSqliteProducers); }
     }
 
     /// <summary>Publishes latest aggregate scheduler health without logging or I/O.</summary>
@@ -225,7 +261,7 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
 
     /// <summary>Owns all sampling, aggregation, file I/O, maintenance, retry and operator notification work.</summary>
     /// <returns>The single writer lifetime task; expected storage failures are contained and counted.</returns>
-    /// <remarks>A 100 ms periodic tick bounds idle wake-up work; batches contain at most 256 observations so health/flush/shutdown work cannot starve behind traffic.</remarks>
+    /// <remarks>A 100 ms tick bounds idle wake-up work; channel batches contain at most 256 observations. At most ninety-six fixed background SQLite histograms drain per health interval or shutdown, independently of channel capacity.</remarks>
     private async Task WriterLoopAsync()
     {
         using var suppression = LatencyTelemetrySuppression.Enter();
@@ -237,6 +273,7 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
         var nextSample = 0L;
         var nextFlush = 0L;
         var nextMaintenance = 0L;
+        var lastSqliteDrain = _aggregationStartedAt;
         var startupRecorded = false;
         try
         {
@@ -256,6 +293,9 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
                 }
                 if (now >= nextSample)
                 {
+                    foreach (var aggregate in _backgroundSqlite.Drain(_timeProvider.GetUtcNow().UtcDateTime, Math.Max(0, now - lastSqliteDrain) / 1000d))
+                        await PersistAsync(writer, aggregate, now, token).ConfigureAwait(false);
+                    lastSqliteDrain = now;
                     var health = Counters(sampler.Capture());
                     await PersistAsync(writer, health, now, token).ConfigureAwait(false);
                     if (DroppedEvents != _reportedLoss)
@@ -286,8 +326,10 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
                     catch (Exception exception) when (IsStorageFailure(exception)) { Recover(writer, now, false); }
                     nextMaintenance = now + 30000;
                 }
-                if (Volatile.Read(ref _accepting) == 0 && ChannelDepth == 0)
+                if (Volatile.Read(ref _accepting) == 0 && ChannelDepth == 0 && Volatile.Read(ref _activeSqliteProducers) == 0)
                 {
+                    foreach (var aggregate in _backgroundSqlite.Drain(_timeProvider.GetUtcNow().UtcDateTime, Math.Max(0, now - lastSqliteDrain) / 1000d))
+                        await PersistAsync(writer, aggregate, now, token).ConfigureAwait(false);
                     await PersistAsync(writer, Counters(new LatencyTelemetryEvent { EventType = "telemetry_stopped", Outcome = "drained" }), now, token).ConfigureAwait(false);
                     await FlushAsync(writer, now, token).ConfigureAwait(false);
                     break;
@@ -357,9 +399,10 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
     /// <param name="writer">Single-owner file writer.</param>
     /// <param name="nowTicks">Current monotonic milliseconds.</param>
     /// <param name="token">Writer shutdown-deadline token.</param>
-    /// <returns>True after a successful flush, false for recoverable storage failure.</returns>
+    /// <returns>True after flushing an open file, false for unavailable storage or a recoverable failure; a no-stream no-op never marks recovery successful.</returns>
     private async ValueTask<bool> FlushAsync(LatencyTelemetryFileWriter writer, long nowTicks, CancellationToken token)
     {
+        if (!writer.IsOpen) return false;
         try
         {
             await writer.FlushAsync(token).ConfigureAwait(false);
@@ -373,15 +416,16 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
 
     /// <summary>Accounts a storage failure and schedules a bounded recovery opportunity without recursion.</summary>
     /// <param name="writer">Failed file/buffer owner, aborted before the next new file.</param>
-    /// <param name="nowTicks">Current monotonic milliseconds.</param>
+    /// <param name="nowTicks">Monotonic milliseconds captured before the failing I/O; refreshed after abort for the recovery deadline.</param>
     /// <param name="currentRecordLost">Whether a not-yet-buffered current line also failed.</param>
-    /// <remarks>Recovery attempts are spaced by one, two, five, then thirty seconds. No original record is replayed after an ambiguous write, and no logger/network call occurs here.</remarks>
+    /// <remarks>Recovery waits one, two, five, then thirty seconds after failure/abort completes, not before potentially slow I/O started. No original record is replayed after an ambiguous write, and no logger/network call occurs here.</remarks>
     private void Recover(LatencyTelemetryFileWriter writer, long nowTicks, bool currentRecordLost)
     {
         Interlocked.Increment(ref _writerFailures);
         AddLoss(ref _writeDropped, writer.Abort() + (currentRecordLost ? 1 : 0));
         _recoveryAttempt = Math.Min(4, _recoveryAttempt + 1);
-        _nextRecoveryAt = nowTicks + (_recoveryAttempt switch { 1 => 1000, 2 => 2000, 3 => 5000, _ => 30000 });
+        _nextRecoveryAt = Math.Max(nowTicks, Environment.TickCount64)
+            + (_recoveryAttempt switch { 1 => 1000, 2 => 2000, 3 => 5000, _ => 30000 });
     }
 
     /// <summary>Attaches cumulative counters and latest in-memory scheduler health to a writer-created record.</summary>
@@ -430,12 +474,13 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
     }
 
     /// <summary>Discards remaining queued references after admission closes and accounts shutdown loss.</summary>
-    /// <remarks>The bounded channel limits this operation to ChannelCapacity records; no disk or logger is touched.</remarks>
+    /// <remarks>The bounded channel and fixed SQLite histograms bound this work; no disk or logger is touched. Each discarded histogram snapshot counts as one lost aggregate record.</remarks>
     private void DiscardRemaining()
     {
         if (_channel == null) return;
         long discarded = 0;
         while (_channel.Reader.TryRead(out _)) discarded++;
+        discarded += _backgroundSqlite.Discard();
         AddLoss(ref _shutdownDropped, discarded);
     }
 
@@ -448,7 +493,7 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
     /// <summary>Checks schema family and bounded safe dimensions before any serialization or persistence.</summary>
     /// <param name="observation">Channel observation supplied by trusted internal instrumentation.</param>
     /// <returns>True for version-one, payload-free, bounded dimensions and finite stage values.</returns>
-    /// <remarks>ASCII tokens admit tenant-prefixed and underscore bot ids while excluding URLs, message text, SQL and control characters. Endpoint/state/trigger dimensions use stricter closed vocabularies; generations are positive and endpoint success timestamps require UTC. Arbitrary customer or chat ids must never be supplied by callers.</remarks>
+    /// <remarks>ASCII tokens exclude URLs, message text, SQL and controls. Endpoint/state/trigger dimensions use closed vocabularies and UTC success timestamps. Background histograms require matching fixed nonnegative counts, no correlation and no individual duration/error/retry fields. Arbitrary customer/chat ids must never be supplied.</remarks>
     private static bool IsSafe(LatencyTelemetryEvent observation)
         => observation.SchemaVersion == 1 && observation.EventType != null && EventTypes.Contains(observation.EventType)
             && IsToken(observation.TraceId) && IsToken(observation.BotId) && IsToken(observation.UpdateType)
@@ -466,6 +511,13 @@ public sealed class LatencyTelemetryService : IHostedService, IDisposable
             && IsFinite(observation.CloudReuseRemainingMs)
             && IsStageMap(observation.StageMs) && IsStageMap(observation.InclusiveStageMs)
             && (observation.GcCollections == null || observation.GcCollections.Length == 3)
+            && (observation.EventType == "sqlite_background_aggregate"
+                ? observation.TraceId == null && observation.BotId == null && observation.UpdateId == null && observation.Sequence == null
+                    && observation.Outcome == "completed" && observation.TimingQuality == "aggregated_histogram_upper_bounds"
+                    && observation.DurationMs == null && observation.SqliteErrorCode == null && observation.ExceptionCategory == null
+                    && observation.BusyRetryCount == null && observation.FailureClassification == null
+                    && LatencySqliteBackgroundAggregator.IsValid(observation.DurationBucketCounts, observation.ObservationCount)
+                : observation.DurationBucketCounts == null && observation.ObservationCount == null)
             && IsFinite(observation.DurationMs) && IsFinite(observation.ReceiverToAdmissionMs) && IsFinite(observation.AdmissionMs)
             && IsFinite(observation.AdmissionPersistenceMs) && IsFinite(observation.QueueWaitMs) && IsFinite(observation.DispatchDelayMs)
             && IsFinite(observation.ClaimedToHandlerMs)

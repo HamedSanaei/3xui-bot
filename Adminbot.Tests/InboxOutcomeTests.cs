@@ -357,7 +357,9 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>Multiple bots and fifty FIFO users share sixteen workers under coalesced concurrent admissions.</summary>
-    /// <returns>A task completing after exact effect/order assertions and measured scheduler diagnostics.</returns>
+    /// <returns>A task completing after all 150 effects and terminal commits, then measured scheduler diagnostics.</returns>
+    /// <remarks>Shutdown is tested separately: this benchmark waits for exact durable completion before requesting
+    /// shutdown, so a busy runner cannot turn the drain deadline into cancellation of the remaining FIFO workload.</remarks>
     [Fact]
     public async Task Scheduler_fifty_users_multiple_updates_benchmark()
     {
@@ -366,7 +368,7 @@ public sealed partial class ConcurrencyTests
         using var listener=new MeterListener();
         listener.InstrumentPublished=(instrument,meter)=>{if(instrument.Name=="sqlite.busy.retries")meter.EnableMeasurementEvents(instrument);};
         listener.SetMeasurementEventCallback<long>((_,value,_,_)=>Interlocked.Add(ref retries,value)); listener.Start();
-        var release=Signal(); var saturated=Signal();
+        var release=Signal(); var saturated=Signal(); var allEffects=Signal();
         using var scheduler=Create(databases,new Executor(async(item,token)=>
         {
             var running=Interlocked.Increment(ref active); InterlockedMax(ref maximum,running); if(running==16)saturated.TrySetResult();
@@ -377,17 +379,219 @@ public sealed partial class ConcurrencyTests
                 var ordinal=item.Update.Id%100; var previous=last.GetValueOrDefault(item.Key.TelegramUserId);
                 if(ordinal!=previous+1) Interlocked.Increment(ref violations);
                 last[item.Key.TelegramUserId]=ordinal; Assert.True(effects.TryAdd(item.Update.Id,0));
+                if(effects.Count==150) allEffects.TrySetResult();
             }
             finally{Interlocked.Decrement(ref active);}
         }),concurrency:16);
         // Per-user acceptance is ordered; producers for distinct users run concurrently and wakes coalesce.
         await Task.WhenAll(Enumerable.Range(1,50).Select(user=>Task.Run(async()=>
         {for(var ordinal=1;ordinal<=3;ordinal++)await scheduler.EnqueueAsync(user%2==0?"a":"b",Update(user*100+ordinal,user),default);} )));
-        await scheduler.StartAsync(default); await saturated.Task.WaitAsync(TimeSpan.FromSeconds(10)); release.TrySetResult();
-        await scheduler.StopAsync(default);
+        await scheduler.StartAsync(default);
+        try
+        {
+            await saturated.Task.WaitAsync(TimeSpan.FromSeconds(10)); release.TrySetResult();
+            await allEffects.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await WaitForAsync(async () => await databases.Inbox.CountPendingAsync(default) == 0);
+        }
+        finally { release.TrySetResult(); await scheduler.StopAsync(default); }
         Assert.Equal(150,effects.Count); Assert.Equal(0,violations); Assert.Equal(16,maximum);
+        await using var completedDb=databases.Users.CreateDbContext();
+        Assert.Equal(150,await completedDb.TelegramUpdateInbox.CountAsync(x=>x.Status=="completed"&&x.Payload==null));
         var sorted=waits.Order().ToArray(); var uncertain=(await databases.Inbox.ReadUncertainSummaryAsync(default)).Count; Assert.Equal(0,uncertain);
         _output.WriteLine($"totalUpdates=150 completed={effects.Count} uncertain={uncertain} duplicateEffects={150-effects.Count} fifoViolations={violations} maxObservedConcurrency={maximum} p50QueueWaitMs={sorted[74]:F1} p95QueueWaitMs={sorted[142]:F1} p99QueueWaitMs={sorted[148]:F1} readyQueryCount={scheduler.ReadyQueryCount} sqliteBusyRetryCount={retries}");
+    }
+
+    /// <summary>Duplicate, full and empty-maintenance inbox paths stay read-only while a real SQLite writer is held.</summary>
+    /// <returns>A task completing after no-op admission, claim, finalization and background scans without releasing the writer.</returns>
+    /// <remarks>The held immediate transaction makes an accidental zero-row write wait or fail; no timeout policy is changed.</remarks>
+    [Fact]
+    public async Task Sqlite_idle_inbox_and_background_scans_do_not_request_a_writer()
+    {
+        using var databases = new Databases();
+        await databases.Inbox.TryAcceptAsync("a", Update(1, 123), 2, default);
+        await databases.Inbox.TryAcceptAsync("a", Update(2, 123), 2, default);
+        await using var probe = databases.Users.CreateDbContext();
+        var second = await probe.TelegramUpdateInbox.Where(x => x.UpdateId == 2).Select(x => x.Sequence).SingleAsync();
+        await using var holder = databases.Users.CreateDbContext();
+        await using var transaction = await holder.Database.BeginTransactionAsync();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var token = deadline.Token;
+        Assert.True(await databases.Inbox.TryAcceptAsync("a", Update(1, 123), 2, token));
+        Assert.False(await databases.Inbox.TryAcceptAsync("b", Update(3, 456), 2, token));
+        Assert.Null(await databases.Inbox.ClaimAsync(second, token));
+        Assert.Null(await databases.Inbox.ClaimAsync(long.MaxValue, token));
+        Assert.False(await databases.Inbox.FinishAsync(long.MaxValue, null, token));
+        Assert.Equal(0, await databases.Inbox.PruneAsync(token));
+        Assert.Equal(0, await databases.Inbox.RecoverAsync(token));
+        using var worker = new TenantOrderNotificationWorker(databases.Users, new CountingOrderNotificationSender(),
+            NullLogger<TenantOrderNotificationWorker>.Instance);
+        Assert.Equal(0, await worker.ProcessOnceAsync(token));
+        var renewals = new XuiV3RenewalOperationStore(databases.Users, NullLogger<XuiV3RenewalOperationStore>.Instance);
+        Assert.Empty(await renewals.ClaimDueReconciliationAsync(10, token));
+        Assert.Equal(2, await databases.Inbox.CountPendingAsync(token));
+    }
+
+    /// <summary>A real provider begin failure releases arbitration even while its caller retains an explicitly open connection.</summary>
+    /// <param name="asynchronous">True exercises provider BeginTransactionAsync; false exercises the synchronous EF API.</param>
+    /// <returns>A task completing after rejected isolation, successful independent admission and reuse of the retained context.</returns>
+    /// <remarks>SQLite rejects Chaos isolation before creating a transaction. No diagnostic failure callback or context disposal is needed to unblock the successor.</remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Sqlite_failed_provider_begin_does_not_strand_a_retained_connection(bool asynchronous)
+    {
+        using var databases = new Databases();
+        await using var retained = databases.Users.CreateDbContext();
+        await retained.Database.OpenConnectionAsync();
+        if (asynchronous)
+            await Assert.ThrowsAnyAsync<ArgumentException>(async () =>
+                await retained.Database.BeginTransactionAsync(System.Data.IsolationLevel.Chaos));
+        else
+            Assert.ThrowsAny<ArgumentException>(() => retained.Database.BeginTransaction(System.Data.IsolationLevel.Chaos));
+        Assert.Null(retained.Database.CurrentTransaction);
+        Assert.True(await databases.Inbox.TryAcceptAsync("a", Update(1, 123), 10, default)
+            .WaitAsync(TimeSpan.FromSeconds(5)));
+        await using var recovered = await retained.Database.BeginTransactionAsync();
+        await recovered.RollbackAsync();
+        Assert.Equal(1, await databases.Inbox.CountPendingAsync(default));
+    }
+
+    /// <summary>A canceled queued admission relinquishes its writer request without consuming capacity or blocking its successor.</summary>
+    /// <returns>A task completing after cancellation, actual writer release, one durable successor and duplicate recognition.</returns>
+    /// <remarks>The first task must be suspended before cancellation; this protects against synchronous provider busy-wait starvation.</remarks>
+    [Fact]
+    public async Task Sqlite_writer_queue_cancellation_preserves_durable_admission()
+    {
+        using var databases = new Databases();
+        await using var holder = databases.Users.CreateDbContext();
+        await using var transaction = await holder.Database.BeginTransactionAsync();
+        using var cancellation = new CancellationTokenSource();
+        var cancelled = databases.Inbox.TryAcceptAsync("a", Update(1, 123), 10, cancellation.Token);
+        Assert.False(cancelled.IsCompleted);
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelled.WaitAsync(TimeSpan.FromSeconds(5)));
+        var successor = databases.Inbox.TryAcceptAsync("a", Update(2, 123), 10, default);
+        Assert.False(successor.IsCompleted);
+        await transaction.DisposeAsync();
+        Assert.True(await successor.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.True(await databases.Inbox.TryAcceptAsync("a", Update(2, 123), 1, default));
+        Assert.Equal(1, await databases.Inbox.CountPendingAsync(default));
+        await using var db = databases.Users.CreateDbContext();
+        Assert.Equal(2, (await db.TelegramUpdateInbox.SingleAsync()).UpdateId);
+    }
+
+    /// <summary>Foreground writer turns precede queued maintenance without starving the oldest background transaction.</summary>
+    /// <returns>A task completing after all independent writer turns commit in priority/FIFO order.</returns>
+    /// <remarks>The writer is held until every request is queued; completion order therefore cannot depend on sleeps or thread-pool scheduling.</remarks>
+    [Fact]
+    public async Task Sqlite_writer_arbitration_prioritizes_admission_with_a_bounded_foreground_burst()
+    {
+        using var databases = new Databases();
+        await using var holder = databases.Users.CreateDbContext();
+        await using var transaction = await holder.Database.BeginTransactionAsync();
+        var order = new ConcurrentQueue<string>();
+        var background = WriteArbitrationTurnAsync(databases.Users, "background", false, order);
+        var foreground = Enumerable.Range(1, 12)
+            .Select(i => WriteArbitrationTurnAsync(databases.Users, "foreground-" + i, true, order)).ToArray();
+        Assert.False(background.IsCompleted);
+        Assert.All(foreground, task => Assert.False(task.IsCompleted));
+        await transaction.DisposeAsync();
+        await Task.WhenAll(foreground.Append(background)).WaitAsync(TimeSpan.FromSeconds(10));
+        var turns = order.ToArray();
+        Assert.Equal("foreground-1", turns[0]);
+        Assert.InRange(Array.IndexOf(turns, "background"), 1, 8);
+        Assert.Equal(Enumerable.Range(1, 12).Select(i => "foreground-" + i), turns.Where(x => x != "background"));
+    }
+
+    /// <summary>Real pooled SQLite background transactions and concurrent admissions preserve hard capacity, FIFO and wallet idempotency.</summary>
+    /// <returns>A task completing after all accepted inputs finalize and the repeated financial key has exactly one effect.</returns>
+    /// <remarks>Pooling deliberately exercises provider Deactivate/Close cleanup. Transactions contain local persistence only.</remarks>
+    [Fact]
+    public async Task Sqlite_concurrent_admission_background_cleanup_and_wallet_replay_preserve_all_invariants()
+    {
+        using var databases = new Databases();
+        var pooled = new UserDbContextFactory(new DbContextOptionsBuilder<UserDbContext>()
+            .UseSqlite(SqliteOperation.ConnectionString(Path.Combine(databases.DirectoryPath, "users.db"))).Options);
+        var inbox = new TelegramUpdateInboxStore(pooled, databases.Credentials);
+        var wallet = new CredentialsStore(databases.Credentials);
+        await wallet.AddEmptyUser(123);
+        var start = Signal();
+        var admitted = new ConcurrentBag<int>();
+        var producers = Enumerable.Range(1, 6).Select(user => Task.Run(async () =>
+        {
+            await start.Task;
+            for (var ordinal = 1; ordinal <= 5; ordinal++)
+            {
+                var id = user * 100 + ordinal;
+                if (await inbox.TryAcceptAsync(user % 2 == 0 ? "a" : "b", Update(id, user), 12, default)) admitted.Add(id);
+            }
+        })).ToArray();
+        var background = Task.Run(async () =>
+        {
+            await start.Task;
+            for (var i = 0; i < 24; i++)
+            {
+                await using var db = pooled.CreateDbContext();
+                await using var transaction = await db.Database.BeginTransactionAsync();
+                db.BotUserStates.Add(new BotUserState { BotId = "background", TelegramUserId = 1000 + i });
+                await db.SaveChangesAsync();
+                await transaction.CommitAsync();
+            }
+        });
+        var replays = Enumerable.Range(0, 12).Select(_ => Task.Run(async () =>
+        {
+            await start.Task;
+            return await wallet.MutateWalletAsync(123, 100, "admin:contention:credit");
+        })).ToArray();
+        start.TrySetResult();
+        await Task.WhenAll(producers.Append(background).Concat(replays)).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(12, admitted.Count);
+        Assert.Equal(12, admitted.Distinct().Count());
+        Assert.Equal(12, await inbox.CountPendingAsync(default));
+        var duplicate = admitted.First();
+        Assert.True(await inbox.TryAcceptAsync(duplicate / 100 % 2 == 0 ? "a" : "b", Update(duplicate, duplicate / 100), 12, default));
+        var last = new Dictionary<(string Bot, long User), int>();
+        var completed = 0;
+        while (await inbox.CountPendingAsync(default) > 0)
+        {
+            var heads = await inbox.ReadReadyAsync(12, default);
+            Assert.NotEmpty(heads);
+            foreach (var head in heads)
+            {
+                var item = await inbox.ClaimAsync(head.Sequence, default);
+                Assert.NotNull(item);
+                var key = (item.Key.BotId, item.Key.TelegramUserId);
+                var ordinal = item.Update.Id % 100;
+                Assert.Equal(last.GetValueOrDefault(key) + 1, ordinal);
+                last[key] = ordinal;
+                Assert.True(await inbox.FinishAsync(item.Sequence, null, default));
+                completed++;
+            }
+        }
+        Assert.Equal(12, completed);
+        Assert.Equal(100, await wallet.GetAccountBalance(123));
+        await using var credentials = databases.Credentials.CreateDbContext();
+        Assert.Single(await credentials.WalletOperations.ToListAsync());
+        await using var users = pooled.CreateDbContext();
+        Assert.Equal(24, await users.BotUserStates.CountAsync(x => x.BotId == "background"));
+        Assert.Equal(12, await users.TelegramUpdateInbox.CountAsync(x => x.Status == "completed" && x.Payload == null));
+    }
+
+    /// <summary>Requests one controlled local transaction turn with optional admission priority.</summary>
+    /// <param name="factory">Isolated temporary users database factory shared with competing test connections.</param>
+    /// <param name="label">Non-secret test turn label recorded after actual writer admission.</param>
+    /// <param name="foreground">True installs receiver-admission priority; false behaves as background persistence.</param>
+    /// <param name="order">Concurrent record of transaction admission order, not task completion order.</param>
+    /// <returns>A task completing after the local transaction commits and its connection cleanup finishes.</returns>
+    /// <remarks>No network requests or deliberate sleeps occur while the writer is held.</remarks>
+    private static async Task WriteArbitrationTurnAsync(UserDbContextFactory factory, string label, bool foreground,
+        ConcurrentQueue<string> order)
+    {
+        using var priority = foreground ? SqliteWriterArbitration.Prioritize() : default;
+        await using var db = factory.CreateDbContext();
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        order.Enqueue(label);
+        await transaction.CommitAsync();
     }
 
     /// <summary>An ordinary handler exception becomes terminal and releases the same user's next message automatically.</summary>

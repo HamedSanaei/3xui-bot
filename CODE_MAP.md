@@ -11,6 +11,10 @@
   XUI/site/payment/external awaits expose contention/waits without SQL values, tokens, customer payloads or altered
   financial/FIFO/retry/budget semantics. Live shutdown/recovery emits at most one terminal summary; late commit
   publication preserves receiver origin and marks unknown queue timing explicitly.
+  Fast successful uncorrelated background SQLite boundaries now feed bounded `sqlite_background_aggregate`
+  histograms instead of per-operation JSONL. Exact observation counts and power-of-two upper-bound buckets are
+  approximate duration evidence; correlated foreground, slow/error/retry operations stay detailed.
+  Writer recovery waits from the completed failure/abort, never from a successful no-op flush of a closed file.
   `Program` handles `telemetry-report --hours 24 --bot GozargahNetwork_Bot --directory <absolute path>` and
   `telemetry-benchmark --iterations 10000` before configuration/migrations/hosting. Counts exclude deduplicated
   admissions; restart clocks remain null, recovered handler-only rankings are labelled; loss counters use process
@@ -305,18 +309,17 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `--recover-missed-tenant-card-receipts` (see the tenant receipt recovery notes below).
 - Production deployment uses immutable `/opt/vpnetiran/releases/<commit>/` directories, shared persistent Data,
   atomic `current`/`previous` symlinks, and rollback-aware systemd activation through `scripts/deploy-release.sh`.
-  The GitHub workflow uses the OTHER path: it streams `scripts/deploy-production.sh` to the host, which clones the exact
-  pushed SHA into staging and rsyncs it into the live tree before restarting. That path now runs the full gate against
-  the staged clone BEFORE any synchronization or systemd action: `dotnet tool restore`, `dotnet restore Adminbot.sln`,
-  `dotnet build Adminbot.sln -c Release --no-restore`, `dotnet test Adminbot.Tests ... --no-build`, both
-  `dotnet ef migrations has-pending-model-changes` contexts, then publish with `SourceRevisionId`, then the published
-  executable's `--migration-check` against fresh databases AND online-backup copies of the live
-  `Data/users.db` + `Data/credentials.db`. `dotnet publish` alone was previously the only check on that path and is
-  explicitly not sufficient. Each release-gate command explicitly propagates a nonzero exit status inside the
-  `( ... ) || fail` subshell; relying on Bash `set -e` there is unsafe because later successful EF checks can hide failed tests.
-  `scripts/deploy-production.tests.sh` asserts the ordering structurally.
-  See `docs/deployment.md`. A dirty or SHA-mismatched checkout is rejected before build, and systemd is untouched until
-  every build/test/EF/artifact check succeeds. Release assemblies log their embedded commit and build configuration.
+  GitHub's synchronized-runtime path now verifies on the Linux Runner through `scripts/verify-release.sh`:
+  clean exact SHA, complete Release build/discovery/test run with explicit TRX proof, both EF model checks,
+  application-only linux-x64 publish, assets and fresh published migration preflight. `45fc9c5`'s explicit
+  failure propagation is retained; bounded commands do not rely on conditional-subshell errexit.
+  `scripts/release-artifact.py` binds the data-free runtime archive to commit/runtime and file checksums/modes.
+  Actions proves upload/exact-ID download/checksum round trip on every verification; Production verifies again
+  and runs only copy-only live-database migration preflight before protected runtime rsync/restart.
+  It no longer builds/tests/syncs source.
+  All pushes/PRs verify only; activation requires manual dispatch on main with `verify_only=false`.
+  `scripts/deploy-production.tests.sh` exercises failure blocking, archive safety, timeout and real state preservation.
+  Production requires Python3/GNU timeout/rsync/flock and .NET runtime, not SDK. See `docs/deployment.md`.
 - Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
   `Data/**` is excluded because databases, production configuration, certificates, and the runtime plan catalog are
   shared state rather than release artifacts.
@@ -753,6 +756,8 @@ and the main menu.
   strict FIFO while different users and different bots run concurrently. Round-robin across bots with per-bot user
   cursors prevents starvation; global active-handler concurrency is bounded by `telegramUpdateMaxConcurrency`
   (  default 16). Idle keyed state is removed; no per-user workers or in-memory queue is required for correctness.
+  Claims/handlers dispatch off the coordinator: SQLite async calls may run synchronously, so one handler's synchronous
+  prologue cannot prevent independent lanes from reaching the configured concurrency.
 - Wake model: the coordinator waits on a coalesced `SemaphoreSlim` signal (released after durable admission commits,
   handler completion, business-review changes, and bot availability changes) OR a 2s recovery scan (`RecoveryInterval`),
   whichever fires first; `Task.Delay(25)` is gone. SQLite durable state remains the source of truth: a lost signal is
@@ -779,6 +784,14 @@ and the main menu.
 - `Data/SqliteOperation.cs`: retries ONLY SQLite BUSY/LOCKED (5/6), at most 3 attempts, fresh context per attempt,
   bounded 50/150ms + 0-50ms jitter backoff, never network inside the delegate. Both databases run WAL with a 5s busy
   timeout and private cache; connections are per-operation and short.
+  `Data/SqliteWriterArbitration.cs` moves competing process-local writes out of native synchronous busy waits.
+  Both EF contexts install command/transaction/cleanup interception; reads bypass it. Per-database cancellable
+  queues cap metadata at 256 waiters, prefer inbox/active-handler persistence for at most eight turns, then serve
+  background work. Owned transactions/readers retain their turn through cleanup; SQLite remains authoritative.
+  Queue-slot/turn waits honor the existing command/connection timeout; expiry remains SQLite BUSY (5) for the
+  unchanged three-attempt policy, while caller cancellation stays cancellation. Explicit timeout zero is unlimited.
+  Inbox duplicate/full reads and payload serialization precede its short rechecked
+  write transaction; claim deserialization and telemetry/wake publication follow context disposal.
 - SQLite scan contention (2026-10-07): payment/tenant-receipt/funding lease recovery, funding retention and discount
   quote expiry preflight their exact predicates with read-only EXISTS; idle cycles never issue UPDATE/DELETE.
   Mutations recheck the predicates; newly eligible rows after an empty read wait for the next cycle. Funding cleanup
@@ -929,8 +942,9 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   operator alert; (4) the two routine tenant storefront funding bookkeeping successes (`Underfunded tenant storefront
   customer-attempt alert queued.`, `Tenant storefront became underfunded.`) — the tenant owner still receives the
   durable funding notification; (5) individual `Telegram update waited unusually long.` records and
-  `Telegram foreground request completed.` records without attached exceptions. Their aggregate
-  `Telegram queue-delay incident.` reports remain visible, and exceptions fail open.
+  `Telegram foreground request completed.` records without attached exceptions. First aggregate queue alerts remain
+  visible; repeats are limited per bot/user lane for ten minutes. `sqlite_busy`/`telemetry_writer_loss` summaries are
+  limited per bot/category; other service/payment/order failures and attached exceptions fail open.
   Still visible: the live >= 10 s root-handler warning, any `Outcome` other than
   `completed`, a duration at or above the threshold, unparseable/negative/`NaN`/`Infinity` durations (parsing fails
   open), `Telegram queue-delay incident.` lane summaries, foreground delivery/XUI/Gozargah
@@ -957,11 +971,11 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   `TelegramForegroundDeliveryPolicy`. An account delivery that legitimately takes ~28 s still completes with
   `outcome=delivered`, and `SendStarted` / `Delivered` / `DeliveryUncertain` / `ManualReview` semantics are unchanged, so
   an ambiguous send can never become a blind duplicate account delivery.
-- **Queue-wait correlation fields** (`Services/TelegramUpdateScheduler.cs`): the single root queue-wait warning carries
-  `BotId`, `TelegramUserId`, `WaitingSequence`, `WaitingUpdateId`, `WaitingUpdateType`, `QueueWaitMs`,
-  `PreviousSequence`, `PreviousUpdateId`, `PreviousUpdateType`, and `PreviousHandlerDurationMs`; the deduplicated
-  cascade line at Debug carries the same lane/waiting fields with the already-reported blocker sequence. A victim whose
-  wait outlives its predecessor legitimately resolves to no blocker (`PreviousSequence=0`) and is not an incident.
+- **Queue-wait correlation fields** (`Services/TelegramUpdateScheduler.cs`): per-victim local details retain exact
+  bot/user/update identities, queue wait and clipped predecessor overlap. `TelegramLaneExecutionSummary.LaneOccupancyMs`
+  includes claim through terminal persistence, not handler-only time; `PreviousLaneOccupancyMs` and
+  `QueueWaitOutsideBlockerMs` do not misattribute the whole delay to one predecessor. Summaries use
+  `DominantBlockerLaneOccupancyMs`; absent overlap stays unattributed, never a fabricated blocker.
 - **Restored Persian literal** (`Services/TelegramBotService.cs`, NOWPayments creation failure): a later edit committed
   the customer-facing sentence as literal `?` characters. The intended text
   `ایجاد پرداخت ارز دیجیتال ناموفق بود. جزئیات خطا در ترمینال ثبت شد.` was recovered verbatim from the revision that

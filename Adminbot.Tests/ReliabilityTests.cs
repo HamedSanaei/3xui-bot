@@ -925,6 +925,8 @@ public sealed partial class ConcurrencyTests
 
     /// <summary>A real SQLite writer lock exhausts exactly three fresh contexts; constraint errors receive no retry.</summary>
     /// <returns>A task completing after the documented regression invariant has been verified.</returns>
+    /// <remarks>Both native SQLite contention and process-local writer arbitration must honor the configured
+    /// one-second command timeout. Keeping the blocking transaction open must not strand the retry caller indefinitely.</remarks>
     /// <example><code>dotnet test Adminbot.Tests/Adminbot.Tests.csproj --filter "FullyQualifiedName~Sqlite_retries_are_bounded_and_exclude_non_contention_errors"</code></example>
     [Fact]
     public async Task Sqlite_retries_are_bounded_and_exclude_non_contention_errors()

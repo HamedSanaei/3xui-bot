@@ -112,21 +112,25 @@ internal sealed class LatencySqliteTransactionLifetimeObserver : IDisposable, IO
         catch { /* Diagnostic cleanup never alters provider connection cleanup. */ }
     }
 
-    /// <summary>Emits one sanitized inclusive lifetime completion using captured origin identity.</summary>
+    /// <summary>Aggregates healthy fast uncorrelated commits or emits one sanitized inclusive lifetime completion with captured origin identity.</summary>
     /// <param name="active">Opaque lifetime clocks and coarse correlation only.</param>
     /// <param name="outcome">Fixed terminal category assigned by an actual provider notification.</param>
     /// <param name="timingQuality">Closed provenance separating lifetime from command/stage accounting.</param>
-    /// <remarks>UTC origin is retained for provenance but duration uses only the monotonic clock; no CPU-time claim is made.</remarks>
+    /// <remarks>UTC origin is retained for provenance but duration uses only the monotonic clock. Slow, correlated, rollback, disposal and uncertain endpoints remain detailed; fast successful background commits allocate no event.</remarks>
     private void Record(ActiveTransaction active, string outcome, string timingQuality)
     {
         if (LatencyTelemetrySuppression.IsActive || Volatile.Read(ref _disposed) != 0) return;
+        var elapsedMs = _clock.GetElapsedTime(active.StartedTimestamp, _clock.GetTimestamp()).TotalMilliseconds;
+        if (timingQuality == "inclusive_transaction_lifetime_not_handler_stage"
+            && _telemetry.TryAggregateBackgroundSqlite("sqlite_transaction_completed", "transaction_lifetime", active.Category,
+                elapsedMs, outcome, active.TraceId != null || active.BotId != null || active.UpdateId != null || active.Sequence != null)) return;
         _telemetry.TryRecord(new LatencyTelemetryEvent
         {
             EventType = "sqlite_transaction_completed", TimestampUtc = _clock.GetUtcNow().UtcDateTime,
             TraceId = active.TraceId, BotId = active.BotId, UpdateId = active.UpdateId, Sequence = active.Sequence,
             Stage = "sqlite_transaction", Operation = "transaction_lifetime", Outcome = outcome,
             Category = active.Category,
-            DurationMs = _clock.GetElapsedTime(active.StartedTimestamp, _clock.GetTimestamp()).TotalMilliseconds,
+            DurationMs = elapsedMs,
             TimingQuality = timingQuality
         });
     }

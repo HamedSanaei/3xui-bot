@@ -44,12 +44,12 @@ public sealed class TelegramLaneExecutionSummary
     public double BlockingOverlapMs { get; set; }
 
     /// <summary>
-    /// Gets the previous execution's duration in milliseconds, ending at its terminal time or this observation.
+    /// Gets the previous execution's occupied FIFO-lane duration in milliseconds, ending at its terminal time or this observation.
     /// </summary>
     /// <remarks>
-    /// Completed receipts retain their full duration. A still-running predecessor reports elapsed time up to
-    /// <see cref="ObservedAtUtc" />, not a misleading zero. Blocking overlap is separately clipped to the victim wait.
+    /// This includes claim processing, handler execution, diagnostics and final receipt persistence; it is not handler-only
+    /// or CPU time. A still-running predecessor ends at <see cref="ObservedAtUtc" />. Blocking overlap is separately clipped.
     /// </remarks>
     [System.ComponentModel.DataAnnotations.Schema.NotMapped]
-    public double HandlerDurationMs => Math.Max(0, ((CompletedAtUtc ?? ObservedAtUtc) - StartedAtUtc).TotalMilliseconds);
+    public double LaneOccupancyMs => Math.Max(0, ((CompletedAtUtc ?? ObservedAtUtc) - StartedAtUtc).TotalMilliseconds);
 }

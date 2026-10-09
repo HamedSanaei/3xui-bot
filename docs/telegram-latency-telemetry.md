@@ -109,6 +109,16 @@ Polling records (`telegram_poll_completed`, `telegram_poll_failed`, `telegram_po
 
 SQLite records contain only fixed operation categories, duration, `busyRetryCount`, `busyWaitMs`, numeric `sqliteErrorCode` and failure category. The existing `SqliteOperation` retry policy remains three attempts with its original jitter/delays. Each retry's `durationMs` is its individual actual delay; `busyWaitMs` is cumulative and must not be added repeatedly. EF read timing ends at reader acquisition, not row materialization. Transaction begin/commit/rollback/savepoint boundaries and separately labelled transaction lifetime are independent diagnostic views; do not sum lifetime with its boundaries. No SQL, parameters, connection strings, customer or financial values are recorded.
 
+Fast successful **uncorrelated background** SQLite command, transaction and logical-operation boundaries no longer
+create individual JSONL records. They increment fixed lock-free histograms before event allocation/channel admission.
+`sqlite_background_aggregate` records are drained at health intervals and shutdown, with `observationCount`,
+`durationBucketCounts` (30 bins; upper bound `0.001 × 2^index` milliseconds), `windowSeconds` and
+`timingQuality=aggregated_histogram_upper_bounds`. Worker/operation series are bounded; unknown dimensions collapse to
+the global background category. Counts are exact; percentile/max duration bounds are approximate, not reconstructed
+individual operations. Different command/logical/transaction boundaries remain separate and must not be summed.
+Correlated receiver/handler work, slow boundaries, errors, cancellations and retried operations keep detailed events.
+Aggregation never waits on the writer and never reads or writes SQLite.
+
 ### Endpoint routing observations
 
 Request records additionally carry nullable `endpointType` (`cloud`/`local`), positive `endpointGeneration` and closed `migrationState`, captured at actual request admission. Legacy records have unavailable endpoint metadata and report as `unknown`, not inferred Cloud. Receiver callbacks never inherit a long-poll route scope. Foreground completion captures the actual admitted epoch even after the inner SDK scope exits.
@@ -131,6 +141,15 @@ Loss counters are `droppedEvents`, `fullChannelDroppedEvents`, `writeDroppedEven
 Only cooldown incident summaries reach the existing plain Warning operator logger. Raw observations stay local. Five-minute bounded windows, a ten-minute per-bot/category cooldown and at most eight incidents per health tick cover sustained polling degradation, repeated foreground timeouts, significant P95 regression, severe queue buildup, repeated SQLite contention (including botless workers), writer failure/loss and sustained channel pressure. A separate capacity-16 notification queue/worker isolates collection from all logger-provider I/O. `droppedIncidentNotifications`, `incidentNotificationFailures` and `incidentNotificationQueueDepth` are independent health gauges, not raw-event loss. Logger sends are telemetry-suppressed to prevent recursive self-observation. Logger channel availability does not govern collection.
 
 Default incident thresholds: at least three polling failures sustained for sixty seconds; three foreground timeouts per five-minute window; twenty updates in both current/prior P95 windows, current P95 at least 5000 ms and twice baseline; three queue waits of thirty seconds, or 1000 pending sustained thirty seconds; ten SQLite busy observations or 2000 ms accumulated retry wait; eighty-percent channel depth sustained sixty seconds. The first observed writer failure/event loss is incident-eligible, then cooldown applies. Unsupported/overflow bot windows remain explicitly global rather than creating unlimited labels.
+
+Storage retry deadlines begin after failure/abort completes. A successful flush with no open file does not mark
+storage recovered or clear its backoff. Slow failing I/O previously could consume its backoff before the error was
+observed, allowing the next storage attempt without the intended recovery interval.
+Recovery creates a new file, never replays uncertain writes. The 500 MiB limit is a
+retention ceiling, not a target allocation; aggregation reduces healthy background volume without changing that cap.
+Repeated `sqlite_busy`/`telemetry_writer_loss` operator summaries have an additional per-bot/category ten-minute
+delivery guard. Scheduler queue-delay summaries are limited per bot/user lane; first alerts, other service failures,
+payment/order failures and events with attached exceptions remain visible. Local incident evidence is retained.
 
 ## Read-only reporting
 
