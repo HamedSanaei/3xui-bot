@@ -636,9 +636,10 @@ public sealed class TelegramEndpointCoordinatorTests
         Assert.Equal(1, f.Lifecycle.MaximumReceivers);
     }
 
-    /// <summary>Current global authorization, frozen identity and notifier reservation are enforced independently of UI.</summary>
+    /// <summary>Current global authorization, frozen identity and control revision are enforced independently of UI.</summary>
+    /// <returns>A task completing after denied actors, replaced identities, stale controls and revoked live authorization cause no migration.</returns>
     [Fact]
-    public async Task Commands_recheck_admin_identity_revision_and_reserved_notification_session()
+    public async Task Commands_recheck_admin_identity_and_revision()
     {
         using var f = new Fixture();
         await f.InitializeAsync();
@@ -647,15 +648,6 @@ public sealed class TelegramEndpointCoordinatorTests
         Assert.Equal("stale", await f.Coordinator.SetAutoFailoverAsync("owned-a", false, 7, 5, 123, default));
         f.Configuration["AdminsUserIds:0"] = "9";
         Assert.Equal("denied", await f.RequestAsync(TelegramEndpointType.Local));
-        using var reserved = new Fixture(options: new TelegramEndpointRoutingOptions
-        {
-            NotificationBotId = "owned-a", NotificationTelegramBotId = 123,
-            LocalFileServerRoot = "/data/local", LocalFileHostRoot = Path.GetTempPath()
-        });
-        await reserved.InitializeAsync();
-        Assert.Equal("reserved", await reserved.RequestAsync(TelegramEndpointType.Local));
-        Assert.Equal("reserved", await reserved.Coordinator.SetAutoFailoverAsync("owned-a", false, 7, 0, 123, default));
-        Assert.Empty(reserved.Protocol.Events);
     }
 
     /// <summary>Health-only CAS writes must not stale an operator's control confirmation.</summary>

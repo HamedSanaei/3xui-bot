@@ -32,14 +32,6 @@ public sealed partial class TelegramEndpointCoordinator
                 {
                     var state = await _store.GetOrCreateAsync(pending.BotId, pending.TelegramBotId, cancellationToken);
                     if ((!IsPending(state) && !CanRecoverLocal(state)) || state.NextAttemptAtUtc > UtcNow) continue;
-                    if (IsReservedIdentity(state.TelegramBotId))
-                    {
-                        state.MigrationState = TelegramEndpointMigrationState.ManualInterventionRequired;
-                        state.LastFailureCategory = "configuration_missing";
-                        state.NextAttemptAtUtc = null;
-                        await SaveAsync(state, "manual_intervention", "manual_intervention", cancellationToken);
-                        continue;
-                    }
                     await ExecuteOperationAsync(state, cancellationToken);
                 }
                 finally { mutex.Release(); }
@@ -187,7 +179,6 @@ public sealed partial class TelegramEndpointCoordinator
                 }
                 var bot = FindBot(state.BotId);
                 if (bot == null || !bot.Enabled || TelegramBotTokenIdentity.ExtractBotId(bot.Token) != state.TelegramBotId ||
-                    IsReservedIdentity(state.TelegramBotId) ||
                     (endpoint == TelegramEndpointType.Cloud && !HasLocalFileMapping) ||
                     (state.Trigger == "manual" && _configuration.GetSection(nameof(AppConfig.AdminsUserIds))
                         .Get<List<long>>()?.Contains(state.ActorTelegramUserId ?? 0) != true))

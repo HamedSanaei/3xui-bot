@@ -29,12 +29,8 @@ public sealed class TelegramEndpointRoutingOptions
     public int RecoveryMaxAttempts { get; set; } = 12;
     /// <summary>Maximum exponential retry delay in seconds, from 5 to 3600.</summary>
     public int RetryMaxSeconds { get; set; } = 300;
-    /// <summary>Maximum safe independent-notification claims before manual review, from 1 to 100.</summary>
+    /// <summary>Maximum actual safe notification attempts before manual review, from 1 to 100; missing logger/sender prerequisites do not consume this budget.</summary>
     public int NotificationMaxAttempts { get; set; } = 12;
-    /// <summary>Explicit exact enabled owned Cloud-only reserved notifier id; empty means no independent transport.</summary>
-    public string NotificationBotId { get; set; } = "";
-    /// <summary>Positive expected BotFather identity of the reserved notifier; no default-bot substitution.</summary>
-    public long? NotificationTelegramBotId { get; set; }
     /// <summary>Trusted absolute Local server root, normally a POSIX container directory; empty blocks Local migration.</summary>
     public string LocalFileServerRoot { get; set; } = "";
     /// <summary>Trusted absolute host directory mapped to the server root; empty blocks Local migration.</summary>
@@ -63,10 +59,6 @@ public sealed class TelegramEndpointRoutingOptions
         Bound(RecoveryMaxAttempts, 1, 100, nameof(RecoveryMaxAttempts));
         Bound(RetryMaxSeconds, 5, 3600, nameof(RetryMaxSeconds));
         Bound(NotificationMaxAttempts, 1, 100, nameof(NotificationMaxAttempts));
-        var notifier = NotificationBotId ?? "";
-        if (notifier.Length > 64 || notifier != notifier.Trim() || notifier.Any(char.IsControl) ||
-            (notifier.Length == 0) != !NotificationTelegramBotId.HasValue || NotificationTelegramBotId is <= 0)
-            throw new ArgumentException("Notifier requires an exact bot id and positive BotFather identity together.");
         var server = LocalFileServerRoot ?? "";
         var host = LocalFileHostRoot ?? "";
         if ((server.Length == 0) != (host.Length == 0) ||
@@ -75,7 +67,6 @@ public sealed class TelegramEndpointRoutingOptions
         var copy = (TelegramEndpointRoutingOptions)MemberwiseClone();
         copy.CloudBaseUrl = cloud.GetLeftPart(UriPartial.Authority);
         copy.LocalBaseUrl = local.GetLeftPart(UriPartial.Authority);
-        copy.NotificationBotId = notifier;
         copy.LocalFileServerRoot = server;
         copy.LocalFileHostRoot = host;
         return copy;
@@ -84,13 +75,6 @@ public sealed class TelegramEndpointRoutingOptions
     /// <summary>Whether both trusted file roots are explicitly configured; file existence is checked by the host mapper.</summary>
     public bool HasLocalFileMapping => !string.IsNullOrEmpty(LocalFileServerRoot) && !string.IsNullOrEmpty(LocalFileHostRoot);
 
-    /// <summary>Checks whether an exact current bot identity is the Cloud-only reserved notifier.</summary>
-    /// <param name="botId">Exact internal registry bot id; no normalization or default fallback is performed.</param>
-    /// <param name="identity">Positive numeric BotFather bot identity.</param>
-    /// <returns>True only when both explicit configured identities match.</returns>
-    /// <example><code>if (options.IsNotificationBot(bot.Id, identity)) return;</code></example>
-    public bool IsNotificationBot(string botId, long identity) =>
-        !string.IsNullOrEmpty(NotificationBotId) && string.Equals(NotificationBotId, botId, StringComparison.Ordinal) && NotificationTelegramBotId == identity;
 
     /// <summary>Rejects path, credential, query, and fragment components in an origin.</summary>
     /// <param name="uri">Parsed required absolute endpoint URI.</param>

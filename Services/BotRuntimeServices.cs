@@ -558,14 +558,54 @@ public class BotClientProvider : IDisposable
         return await GetProbeSdk(route.BotId, token, route, registered: false).GetMe(cancellationToken);
     }
 
-    /// <summary>Creates a narrowly scoped endpoint transport for migration probes/logout or the reserved independent notifier.</summary>
+    /// <summary>Admits an enabled owned bot's current Cloud route and returns its pooled SDK for one logger-channel incident.</summary>
+    /// <param name="botId">Exact canonical owned registry id; default-id fallback is prohibited.</param>
+    /// <param name="expectedTelegramBotId">Positive BotFather identity captured from the current registry token.</param>
+    /// <param name="expectedToken">Exact unlogged registry secret captured before admission; token rotation invalidates this selection.</param>
+    /// <returns>The shared Cloud SDK and an owned ordinary request lease that the caller must retain through reads, the durable send boundary and completion.</returns>
+    /// <remarks>This is not a migration control bypass. Unknown, unhydrated, Local, fenced or migrating routes cannot probe Cloud. The counted lease prevents logout until the complete incident attempt ends; CloudRecovered is eligible regardless of older Local history.</remarks>
+    /// <exception cref="BotTransportUnavailableException">The shared gate or exact enabled owned Cloud identity is unavailable.</exception>
+    /// <example><code>var delivery = clients.GetCloudNotificationClient(bot.Id, identity, bot.Token); using var lease = delivery.Lease;</code></example>
+    internal (ITelegramBotClient Client, TelegramEndpointRuntimeGate.RequestLease Lease) GetCloudNotificationClient(
+        string botId, long expectedTelegramBotId, string expectedToken)
+    {
+        if (_endpointGate == null) throw new BotTransportUnavailableException("notification_gate_unavailable");
+        var bot = _registry.GetById(botId);
+        if (bot == null || !string.Equals(bot.Id, botId, StringComparison.Ordinal) || !bot.Enabled ||
+            bot.Type != BotInstanceTypes.Owned || bot.IsSalesAssistant ||
+            TelegramBotTokenIdentity.ExtractBotId(bot.Token) != expectedTelegramBotId ||
+            !string.Equals(bot.Token, expectedToken, StringComparison.Ordinal))
+            throw new BotTransportUnavailableException("notification_bot_unavailable");
+        var lease = _endpointGate.AcquireRequest(botId, expectedTelegramBotId);
+        try
+        {
+            var route = lease.Route;
+            if (!route.Available || route.Endpoint != TelegramEndpointType.Cloud ||
+                route.MigrationState is not (TelegramEndpointMigrationState.Cloud or TelegramEndpointMigrationState.CloudRecovered))
+                throw new BotTransportUnavailableException("notification_cloud_unavailable");
+            var client = GetEndpointSdk(botId, route);
+            bot = _registry.GetById(botId);
+            if (bot == null || !string.Equals(bot.Id, botId, StringComparison.Ordinal) || !bot.Enabled ||
+                bot.Type != BotInstanceTypes.Owned || bot.IsSalesAssistant ||
+                !string.Equals(bot.Token, expectedToken, StringComparison.Ordinal))
+                throw new BotTransportUnavailableException("notification_bot_changed");
+            return (client, lease);
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Creates a narrowly scoped endpoint transport only for migration probes/logout.</summary>
     /// <param name="botId">Exact configured bot id; default-bot fallback is forbidden.</param>
     /// <param name="endpoint">Trusted explicit Cloud or Local destination enum.</param>
     /// <param name="generation">Positive operation epoch used to correlate the control request.</param>
-    /// <param name="expectedTelegramBotId">Required positive exact BotFather identity from durable migration/notifier state; a replaced registry token is rejected before dispatch.</param>
+    /// <param name="expectedTelegramBotId">Required positive exact BotFather identity from durable migration state; a replaced registry token is rejected before dispatch.</param>
     /// <returns>A pooled identity-bound control view; never pass it to customer handlers or general background workers.</returns>
     /// <exception cref="BotTransportUnavailableException">The exact bot is absent, disabled, or token identity is invalid.</exception>
-    /// <remarks>This bypass is necessary only while ordinary admissions are fenced. The coordinator persists intent before logOut and never repeats an ambiguous irreversible call.</remarks>
+    /// <remarks>This bypass is necessary only while ordinary admissions are fenced. The coordinator persists intent before logOut and never repeats an ambiguous irreversible call. Logger incidents instead use counted normal Cloud admission through GetCloudNotificationClient.</remarks>
     /// <example><code>var control = provider.CreateEndpointControlClient(bot.Id, TelegramEndpointType.Cloud, state.Generation, state.TelegramBotId);</code></example>
     public ITelegramBotClient CreateEndpointControlClient(string botId, TelegramEndpointType endpoint, long generation, long expectedTelegramBotId)
     {

@@ -8,11 +8,15 @@ public sealed partial class ConcurrencyTests
 {
     /// <summary>Production migrations retain wallet evidence and refuse a downgrade that would discard an admitted sale.</summary>
     /// <returns>A task completing after migrations and a rejected downgrade against disposable real SQLite databases.</returns>
+    /// <remarks>The financial downgrade guard is exercised before the unrelated irreversible logger cutover; the final full upgrade must preserve the same paid order, wallet debit receipt and balance.</remarks>
     [Fact]
     public async Task TenantCustomerWallet_Migration_refuses_to_erase_financial_history()
     {
         using var databases = new Databases(initialize: false);
-        await using (var users = databases.Users.CreateDbContext()) await users.Database.MigrateAsync();
+        // Isolate the existing financial downgrade guard before the unrelated logger cutover guard.
+        // Apply the complete current upgrade after refusal and verify the same financial evidence.
+        await using (var users = databases.Users.CreateDbContext())
+            await users.GetService<IMigrator>().MigrateAsync("20261009120000_AddTelegramEndpointRouting");
         await using (var credentials = databases.Credentials.CreateDbContext()) await credentials.Database.MigrateAsync();
         var (wallet, funding, order) = await SeedCustomerWalletOrderAsync(databases);
         Assert.True(await funding.DebitAsync(order));
@@ -31,6 +35,11 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("20260923083845_TenantCustomerWallet", await verify.Database.GetAppliedMigrationsAsync());
         // The attempted downgrade can remove later audit-only columns before the older financial guard rejects it.
         // Read the protected historical value without materializing today's full TenantBotOrder model.
+        Assert.Equal("paid", await verify.Database.SqlQueryRaw<string>(
+            "SELECT \"CustomerWalletState\" AS \"Value\" FROM \"TenantBotOrders\"").SingleAsync());
+        Assert.NotNull(await wallet.GetWalletOperationAsync(TenantCustomerWalletFunding.DebitKey(order.Id)));
+        Assert.Equal(400000, await wallet.GetAccountBalance(123));
+        await verify.Database.MigrateAsync();
         Assert.Equal("paid", await verify.Database.SqlQueryRaw<string>(
             "SELECT \"CustomerWalletState\" AS \"Value\" FROM \"TenantBotOrders\"").SingleAsync());
         Assert.NotNull(await wallet.GetWalletOperationAsync(TenantCustomerWalletFunding.DebitKey(order.Id)));

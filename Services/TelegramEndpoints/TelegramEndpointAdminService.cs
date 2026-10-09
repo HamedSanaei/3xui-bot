@@ -89,7 +89,7 @@ public sealed class TelegramEndpointAdminService
     /// <param name="coordinator">Required identity-bound metadata and queued-command implementation.</param>
     /// <param name="configuration">Required global super-admin allow-list, not tenant authorization.</param>
     /// <param name="registry">Required exact owned/tenant/assistant registry; fallback lookup is deliberately not used.</param>
-    /// <param name="options">Validated endpoint and independent notification settings, never user-supplied callback URLs.</param>
+    /// <param name="options">Validated endpoint resource settings, never user-supplied callback URLs.</param>
     /// <param name="logger">Required safe diagnostics logger; raw exceptions and callback contents are never logged.</param>
     /// <param name="timeouts">Optional immutable callback budget; defaults to the existing production deadline.</param>
     /// <param name="timeProvider">Optional deterministic UTC clock for session expiry and cooldown presentation.</param>
@@ -358,21 +358,19 @@ public sealed class TelegramEndpointAdminService
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData(label, data) });
     }
 
-    /// <summary>Shows whether an explicit independent Cloud notifier is eligible; never promises Telegram delivery.</summary>
-    /// <param name="token">Cancels notifier metadata lookup.</param>
-    /// <returns>A fixed Persian prerequisite/guarantee description with no token or configured URL.</returns>
-    private async Task<string> NotificationLabelAsync(CancellationToken token)
+    /// <summary>Describes logger-channel prerequisites without claiming posting permission or notification delivery.</summary>
+    /// <param name="token">Cancellation checked before reading trusted local configuration.</param>
+    /// <returns>A fixed Persian logger prerequisite label; the worker verifies Cloud admission and channel posting rights.</returns>
+    /// <remarks>Private Super Admin chats and dedicated notification identities are never selected. No Telegram request or migration occurs while rendering this label.</remarks>
+    private Task<string> NotificationLabelAsync(CancellationToken token)
     {
-        var notifier = _registry.Bots.FirstOrDefault(x => x.Id == _options.NotificationBotId);
-        if (notifier == null || !notifier.Enabled || notifier.Type != BotInstanceTypes.Owned || notifier.IsSalesAssistant ||
-            _options.NotificationTelegramBotId is not > 0)
-            return "⚠️ اعلان مستقل تضمین‌شده نیست: ربات Owned و شناسه مستقل Cloud باید صریحاً تنظیم شوند؛ هشدارها پایدار و قابل بررسی می‌مانند.";
-        var status = await _coordinator.GetStatusAsync(notifier.Id, token);
-        if (status.TelegramBotId != _options.NotificationTelegramBotId || status.EffectiveEndpoint != TelegramEndpointType.Cloud ||
-            status.DesiredEndpoint != TelegramEndpointType.Cloud || status.MigrationState != TelegramEndpointMigrationState.Cloud ||
-            status.LastMigrationAtUtc.HasValue || status.LogoutAttemptedAtUtc.HasValue || status.CloudReuseEligibleAtUtc > _time.GetUtcNow().UtcDateTime)
-            return "⚠️ مسیر اعلان مستقل Cloud ایمن نیست؛ تحویل تضمین‌شده نیست و هشدارهای پایدار نیازمند بررسی‌اند.";
-        return "اعلان مستقل Cloud پیکربندی شده؛ تحویل Telegram تضمین‌پذیر نیست. ارسال نامطمئن تکرار نمی‌شود؛ وضعیت هشدارها را بررسی کنید.";
+        token.ThrowIfCancellationRequested();
+        var channel = Adminbot.Domain.Logging.TelegramDestination.SelectValid(
+            _liveConfiguration != null ? _liveConfiguration["loggerChannel"] : _configuration.LoggerChannel,
+            _registry.DefaultBot?.LoggerChannel);
+        return Task.FromResult(string.IsNullOrEmpty(channel)
+            ? "⚠️ کانال loggerChannel تنظیم نشده است؛ هشدارها در صف پایدار منتظر می‌مانند و به گفت‌وگوی خصوصی ارسال نمی‌شوند."
+            : "اعلان‌ها مستقیماً به کانال لاگر ارسال می‌شوند؛ ربات Cloud فعال و مجوز ارسال بررسی می‌شود. بدون فرستنده واجدشرایط، هشدار Pending می‌ماند؛ ارسال نامطمئن تکرار نمی‌شود.");
     }
 
     /// <summary>Removes expired controls while holding the session lock.</summary>
@@ -460,7 +458,6 @@ public sealed class TelegramEndpointAdminService
         "stale" => "پنل قدیمی است؛ وضعیت جدید را بررسی کنید.",
         "busy" => "عملیات دیگری برای این ربات در جریان است؛ انتقال جدید ثبت نشد.",
         "denied" => "مجوز مدیر کل یا پیش‌نیاز ایمنی وجود ندارد؛ انتقال ثبت نشد.",
-        "reserved" => "این ربات برای اعلان مستقل Cloud رزرو شده و قابل انتقال نیست.",
         "aliased" => "شناسه BotFather این ربات در چند تنظیم ربات مشترک است؛ انتقال ثبت نشد. ابتدا پیکربندی تکراری را اصلاح کنید؛ غیرفعال کردن ربات تکراری کافی نیست.",
         "disabled" => "مدیریت مسیر یا ربات در پیکربندی غیرفعال است.",
         "control_path_missing" => "انتقال به Local ثبت نشد: یک ربات Owned فعال و مستقل باید روی Cloud باقی بماند تا هنگام قطع Local، پنل مدیریت از مسیر دیگری در دسترس باشد.",

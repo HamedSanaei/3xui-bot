@@ -82,8 +82,6 @@
     "recoveryMaxAttempts": 12,
     "retryMaxSeconds": 300,
     "notificationMaxAttempts": 12,
-    "notificationBotId": "",
-    "notificationTelegramBotId": null,
     "localFileServerRoot": "",
     "localFileHostRoot": ""
   },

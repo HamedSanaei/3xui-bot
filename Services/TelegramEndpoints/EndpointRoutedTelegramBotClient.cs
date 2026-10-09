@@ -14,7 +14,7 @@ namespace Adminbot.Services.TelegramEndpoints;
 /// <remarks>
 /// Background workers may retain this facade: it resolves the active generation on each operation rather than retaining
 /// an obsolete SDK client. Receiver views are pinned and reject stale epochs. Control views are reserved for explicit
-/// migration probes/logout and the authorized independent notifier; they must never be handed to business handlers.
+/// migration probes/logout; they must never be handed to notification workers or business handlers.
 /// Each generation shares the provider's socket pool. No operation is retried or transparently rerouted after starting.
 /// </remarks>
 internal sealed class EndpointRoutedTelegramBotClient : ITelegramBotClient

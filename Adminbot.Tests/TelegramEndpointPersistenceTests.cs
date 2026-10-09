@@ -10,7 +10,6 @@ using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
-using Telegram.Bot;
 using Xunit;
 
 public sealed partial class ConcurrencyTests
@@ -85,13 +84,13 @@ public sealed partial class ConcurrencyTests
         finally { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
     }
 
-    /// <summary>CAS admits only one stale proposal and makes state, history, and per-global-superadmin alerts one atomic outcome.</summary>
-    /// <returns>A task completing after one writer wins and duplicate incidents remain deduplicated.</returns>
+    /// <summary>CAS admits one stale proposal and commits a single incident intent regardless of administrator or logger configuration.</summary>
+    /// <returns>A task completing after one writer wins and duplicate incidents remain durably deduplicated.</returns>
     [Fact]
-    public async Task Endpoint_cas_is_atomic_and_outbox_deduplicates_per_global_admin()
+    public async Task Endpoint_cas_is_atomic_and_outbox_deduplicates_per_incident()
     {
         using var databases = new Databases();
-        var configuration = new AppConfig { AdminsUserIds = [711, 712, 711, -1] };
+        var configuration = new AppConfig { AdminsUserIds = [] };
         var store = new TelegramEndpointStore(databases.Users, configuration);
         var first = await store.GetOrCreateAsync("owned-cas", 123, default);
         first.OperationId = Guid.NewGuid().ToString("N");
@@ -102,17 +101,17 @@ public sealed partial class ConcurrencyTests
             new TelegramEndpointStore(databases.Users, configuration).TrySaveAsync(stale, 0, "migration_requested", "migration_started"));
         Assert.Single(results, x => x);
         Assert.Single(await store.ReadHistoryAsync("owned-cas", 123, 100, default));
-        Assert.Equal(2, await store.CountPendingAlertsAsync(default));
+        Assert.Equal(1, await store.CountPendingAlertsAsync(default));
         var latest = await store.GetOrCreateAsync("owned-cas", 123, default);
         Assert.True(await store.TrySaveAsync(latest, latest.Revision, "safe_retry_scheduled", "migration_started"));
-        Assert.Equal(2, await store.CountPendingAlertsAsync(default));
+        Assert.Equal(1, await store.CountPendingAlertsAsync(default));
         latest.OperationId = Guid.NewGuid().ToString("N");
         Assert.True(await store.TrySaveAsync(latest, latest.Revision, "migration_requested", "migration_started"));
-        Assert.Equal(4, await store.CountPendingAlertsAsync(default));
+        Assert.Equal(2, await store.CountPendingAlertsAsync(default));
         await using var db = databases.Users.CreateDbContext();
         Assert.Empty(await db.WalletLedgerEntries.ToListAsync());
         Assert.Empty(await db.ReferralRewards.ToListAsync());
-        Assert.All(await db.TelegramEndpointAlerts.ToListAsync(), x => Assert.Contains(x.RecipientTelegramUserId, new long[] { 711, 712 }));
+        Assert.All(await db.TelegramEndpointAlerts.ToListAsync(), x => Assert.Null(x.DestinationChatId));
     }
 
     /// <summary>Health counters and Local degradation do not stale operator confirmations, while failover or migration intent does.</summary>
@@ -144,26 +143,25 @@ public sealed partial class ConcurrencyTests
         await Assert.ThrowsAsync<ArgumentException>(() => store.TrySaveAsync(state, state.Revision));
     }
 
-    /// <summary>Unconfigured independent transport retains incidents across restart and caps safe attempts into visible manual review.</summary>
-    /// <returns>A task completing after retry backoff and the undelivered count are asserted.</returns>
+    /// <summary>A missing logger survives long absence and restart without consuming the finite network retry budget.</summary>
+    /// <returns>A task completing after repeated capped deferrals remain Pending with no SDK requests.</returns>
     [Fact]
-    public async Task Endpoint_alert_unconfigured_transport_restart_retry_cap_never_drops_incident()
+    public async Task Endpoint_alert_missing_logger_restart_and_long_absence_never_exhaust_budget()
     {
         using var harness = new EndpointAlertHarness(configured: false, maxAttempts: 2);
         await harness.QueueAsync();
-        using var worker = harness.Worker();
-        Assert.True(await worker.ProcessOneAsync(default));
-        var first = await harness.AlertAsync();
-        Assert.Equal(TelegramEndpointAlertStatus.Pending, first.Status);
-        Assert.Equal("transport_unconfigured", first.ErrorCategory);
-        Assert.True(first.NextAttemptAtUtc > harness.Now);
-        Assert.False(await worker.ProcessOneAsync(default));
-        harness.Advance(TimeSpan.FromMinutes(1));
-        using var restarted = harness.Worker(new TelegramEndpointStore(harness.Databases.Users, harness.Configuration, harness.Options));
-        Assert.True(await restarted.ProcessOneAsync(default));
-        var retained = await harness.AlertAsync();
-        Assert.Equal(TelegramEndpointAlertStatus.ManualReview, retained.Status);
-        Assert.Equal(2, retained.Attempts);
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            using var worker = harness.Worker(new TelegramEndpointStore(harness.Databases.Users, harness.Configuration, harness.Options));
+            Assert.True(await worker.ProcessOneAsync(default));
+            var retained = await harness.AlertAsync();
+            Assert.Equal(TelegramEndpointAlertStatus.Pending, retained.Status);
+            Assert.Equal("logger_unconfigured", retained.ErrorCategory);
+            Assert.Equal(0, retained.Attempts);
+            Assert.Equal(harness.Now.AddSeconds(harness.Options.RetryMaxSeconds), retained.NextAttemptAtUtc);
+            Assert.False(await worker.ProcessOneAsync(default));
+            harness.Advance(TimeSpan.FromDays(30));
+        }
         Assert.Equal(1, await harness.Store.CountPendingAlertsAsync(default));
         Assert.Equal(0, harness.Http.Sends);
         Assert.Equal(0, harness.Http.Probes);
@@ -197,6 +195,26 @@ public sealed partial class ConcurrencyTests
         Assert.DoesNotContain("private fixture error", row.ErrorCategory);
     }
 
+    /// <summary>Actual failed read attempts, unlike missing prerequisites, retain the finite retry cap and safe fixed diagnostics.</summary>
+    /// <returns>A task completing after two failed SDK identity reads require manual review without dispatch.</returns>
+    [Fact]
+    public async Task Endpoint_alert_actual_read_failures_exhaust_finite_retry_budget()
+    {
+        using var harness = new EndpointAlertHarness(maxAttempts: 2);
+        await harness.QueueAsync();
+        harness.Http.FailProbeCount = 10;
+        using var worker = harness.Worker();
+        Assert.True(await worker.ProcessOneAsync(default));
+        Assert.Equal(1, (await harness.AlertAsync()).Attempts);
+        harness.Advance(TimeSpan.FromMinutes(1));
+        Assert.True(await worker.ProcessOneAsync(default));
+        var exhausted = await harness.AlertAsync();
+        Assert.Equal(TelegramEndpointAlertStatus.ManualReview, exhausted.Status);
+        Assert.Equal(2, exhausted.Attempts);
+        Assert.Equal("pre_send_failure", exhausted.ErrorCategory);
+        Assert.Equal(0, harness.Http.Sends);
+    }
+
     /// <summary>Interrupted pre-send leases recover safely; interrupted send-boundary leases become uncertain on restart.</summary>
     /// <returns>A task completing after both persisted crash boundaries are reconciled.</returns>
     [Fact]
@@ -211,7 +229,7 @@ public sealed partial class ConcurrencyTests
         var recovered = await restarted.ClaimAlertAsync(harness.Now, default);
         Assert.NotNull(recovered);
         Assert.NotEqual(beforeSend!.ClaimId, recovered!.ClaimId);
-        Assert.True(await restarted.MarkAlertSendStartedAsync(recovered, harness.Now, default));
+        Assert.True(await restarted.MarkAlertSendStartedAsync(recovered, -100711000, harness.Now, default));
         harness.Advance(TimeSpan.FromMinutes(5));
         Assert.Null(await restarted.ClaimAlertAsync(harness.Now, default));
         Assert.Equal(TelegramEndpointAlertStatus.DeliveryUncertain, (await harness.AlertAsync()).Status);
@@ -219,48 +237,57 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(1, await restarted.CountPendingAlertsAsync(default));
     }
 
-    /// <summary>Current global authorization is checked even when the recipient had privileges when the incident was queued.</summary>
-    /// <returns>A task completing after revoked authorization prevents every network request.</returns>
+    /// <summary>The send boundary accepts only negative channel ids and freezes the destination across definitive 429 and proven pre-dispatch deferrals.</summary>
+    /// <returns>A task completing after atomic destination CAS rejects retargeting and unused marked claims are safely refunded.</returns>
     [Fact]
-    public async Task Endpoint_alert_recipient_authorization_is_rechecked_and_retained()
+    public async Task Endpoint_alert_send_boundary_pins_channel_and_defers_only_before_dispatch()
     {
         using var harness = new EndpointAlertHarness();
         await harness.QueueAsync();
-        harness.Configuration.AdminsUserIds.Clear();
-        using var worker = harness.Worker();
-        Assert.True(await worker.ProcessOneAsync(default));
-        Assert.Equal(TelegramEndpointAlertStatus.ManualReview, (await harness.AlertAsync()).Status);
-        Assert.Equal(0, harness.Http.Probes);
+        var first = await harness.Store.ClaimAlertAsync(harness.Now, default);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            harness.Store.MarkAlertSendStartedAsync(first!, 711, harness.Now, default));
+        Assert.True(await harness.Store.MarkAlertSendStartedAsync(first!, -100711000, harness.Now, default));
+        await harness.Store.RetryRateLimitedAlertAsync(first!, harness.Now, 1, default);
+        harness.Advance(TimeSpan.FromSeconds(2));
+        var second = await harness.Store.ClaimAlertAsync(harness.Now, default);
+        Assert.Equal(-100711000L, second!.DestinationChatId);
+        Assert.False(await harness.Store.MarkAlertSendStartedAsync(second, -100711001, harness.Now, default));
+        Assert.True(await harness.Store.MarkAlertSendStartedAsync(second, -100711000, harness.Now, default));
+        await harness.Store.DeferUnsentAlertAsync(second, "transport_unavailable", harness.Now, default);
+        var deferred = await harness.AlertAsync();
+        Assert.Equal(TelegramEndpointAlertStatus.Pending, deferred.Status);
+        Assert.Null(deferred.SendStartedAtUtc);
+        Assert.Null(deferred.SendDeadlineAtUtc);
+        Assert.Equal(-100711000L, deferred.DestinationChatId);
+        Assert.Equal(1, deferred.Attempts);
+        Assert.Equal(harness.Now.AddSeconds(harness.Options.RetryMaxSeconds), deferred.NextAttemptAtUtc);
         Assert.Equal(0, harness.Http.Sends);
-        Assert.Equal(1, await harness.Store.CountPendingAlertsAsync(default));
     }
 
-    /// <summary>Live allowlist removal blocks a queued alert even when the startup AppConfig still contains the recipient.</summary>
-    /// <returns>A task completing after the durable intent remains visible without an identity probe or send.</returns>
+    /// <summary>Live logger configuration overrides startup authority and invalid/removed root values use only the explicit current fallback.</summary>
     [Fact]
-    public async Task Endpoint_alert_live_allowlist_reload_does_not_reuse_startup_authority()
+    public void Endpoint_logger_resolution_uses_live_root_and_sanitized_current_fallback()
     {
         using var harness = new EndpointAlertHarness();
-        await harness.QueueAsync();
         var live = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["AdminsUserIds:0"] = "711"
+            ["loggerChannel"] = " @current_channel "
         }).Build();
         var store = new TelegramEndpointStore(harness.Databases.Users, harness.Configuration, harness.Options, live);
-        Assert.True(store.IsAuthorizedRecipient(711));
-        live["AdminsUserIds:0"] = null;
-        using var worker = harness.Worker(store);
-        Assert.True(await worker.ProcessOneAsync(default));
-        Assert.Equal(TelegramEndpointAlertStatus.ManualReview, (await harness.AlertAsync()).Status);
-        Assert.Equal(0, harness.Http.Probes);
-        Assert.Equal(0, harness.Http.Sends);
-        Assert.Equal(1, await store.CountPendingAlertsAsync(default));
+        Assert.Equal("@current_channel", store.ResolveLoggerChannel("-100711001"));
+        live["loggerChannel"] = null;
+        Assert.Equal("-100711001", store.ResolveLoggerChannel(" -100711001 "));
+        Assert.Equal("", store.ResolveLoggerChannel("not_a_destination"));
+        live["loggerChannel"] = "malformed";
+        Assert.Equal("", store.ResolveLoggerChannel(null));
+        Assert.Equal("-100711000", harness.Store.ResolveLoggerChannel(null));
     }
 
-    /// <summary>A read-only notifier getMe must prove the exact configured identity before any incident send.</summary>
+    /// <summary>A read-only sender getMe must prove the exact current owned identity before any incident send.</summary>
     /// <returns>A task completing after wrong remote identity is retained as a safe pre-send retry.</returns>
     [Fact]
-    public async Task Endpoint_alert_notifier_remote_identity_mismatch_never_sends()
+    public async Task Endpoint_alert_sender_remote_identity_mismatch_never_sends()
     {
         using var harness = new EndpointAlertHarness();
         await harness.QueueAsync();
@@ -269,13 +296,32 @@ public sealed partial class ConcurrencyTests
         Assert.True(await worker.ProcessOneAsync(default));
         var row = await harness.AlertAsync();
         Assert.Equal(TelegramEndpointAlertStatus.Pending, row.Status);
-        Assert.Equal("notifier_identity_mismatch", row.ErrorCategory);
+        Assert.Equal("pre_send_identity_mismatch", row.ErrorCategory);
         Assert.Null(row.SendStartedAtUtc);
         Assert.Equal(1, harness.Http.Probes);
         Assert.Equal(0, harness.Http.Sends);
     }
 
-    /// <summary>A definitive independent-notifier 429 is retryable after its provider delay, while a permanent rejection is retained for manual review.</summary>
+    /// <summary>Changing the configured logger during read-only preparation defers instead of sending to stale or newly substituted destinations.</summary>
+    /// <returns>A task completing after the live target fence retains a zero-budget Pending intent without a send boundary.</returns>
+    [Fact]
+    public async Task Endpoint_alert_logger_change_during_probe_blocks_send_boundary()
+    {
+        using var harness = new EndpointAlertHarness();
+        await harness.QueueAsync();
+        harness.Http.AfterProbe = () => harness.Configuration.LoggerChannel = "-100711001";
+        using var worker = harness.Worker();
+        Assert.True(await worker.ProcessOneAsync(default));
+        var row = await harness.AlertAsync();
+        Assert.Equal(TelegramEndpointAlertStatus.Pending, row.Status);
+        Assert.Equal("logger_unavailable", row.ErrorCategory);
+        Assert.Equal(0, row.Attempts);
+        Assert.Null(row.DestinationChatId);
+        Assert.Null(row.SendStartedAtUtc);
+        Assert.Equal(0, harness.Http.Sends);
+    }
+
+    /// <summary>A definitive 429 retries the same frozen channel after its delay; a permanent rejection remains manual review.</summary>
     /// <param name="status">Explicit Telegram API rejection code, not a transport ambiguity.</param>
     /// <returns>A task completing after durable state proves only the 429 can cause a second provider send.</returns>
     [Theory]
@@ -291,6 +337,9 @@ public sealed partial class ConcurrencyTests
         var rejected = await harness.AlertAsync();
         Assert.Equal(status == 429 ? TelegramEndpointAlertStatus.Pending : TelegramEndpointAlertStatus.ManualReview, rejected.Status);
         Assert.Equal(status == 429 ? "rate_limited" : "send_rejected", rejected.ErrorCategory);
+        Assert.Equal(-100711000L, rejected.DestinationChatId);
+        harness.Configuration.LoggerChannel = "-100711001";
+        harness.Http.ChannelId = -100711001;
         harness.Advance(TimeSpan.FromSeconds(2));
         Assert.False(await worker.ProcessOneAsync(default));
         harness.Http.RejectedSendStatus = null;
@@ -298,65 +347,49 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(status == 429, await worker.ProcessOneAsync(default));
         Assert.Equal(status == 429 ? 2 : 1, harness.Http.Sends);
         Assert.Equal(status == 429 ? TelegramEndpointAlertStatus.Delivered : TelegramEndpointAlertStatus.ManualReview, (await harness.AlertAsync()).Status);
+        Assert.All(harness.Http.SentChatIds, id => Assert.Equal(-100711000L, id));
     }
 
-    /// <summary>Authorization revoked while the independent identity probe is in flight must still block the final send.</summary>
-    /// <returns>A task completing after the second authorization fence prevents delivery.</returns>
+    /// <summary>Current unavailable Local senders defer without budget loss; verified CloudRecovered senders remain eligible after Local history.</summary>
+    /// <returns>A task completing after current route gating, safe restart deferral, and recovered logger delivery.</returns>
     [Fact]
-    public async Task Endpoint_alert_authorization_changed_during_probe_blocks_send_boundary()
+    public async Task Endpoint_alert_local_sender_defers_and_cloud_recovered_sender_delivers()
     {
-        using var harness = new EndpointAlertHarness();
+        using var harness = new EndpointAlertHarness(maxAttempts: 2);
         await harness.QueueAsync();
-        harness.Http.AfterProbe = () => harness.Configuration.AdminsUserIds.Clear();
-        using var worker = harness.Worker();
-        Assert.True(await worker.ProcessOneAsync(default));
-        var row = await harness.AlertAsync();
-        Assert.Equal(TelegramEndpointAlertStatus.ManualReview, row.Status);
-        Assert.Null(row.SendStartedAtUtc);
-        Assert.Equal(1, harness.Http.Probes);
-        Assert.Equal(0, harness.Http.Sends);
-    }
-
-    /// <summary>Notifier reservation is exact, enabled, owned, identity-bound, and cannot reuse a formerly Local identity.</summary>
-    /// <returns>A task completing after denied transports produce no notifier probes or sends.</returns>
-    [Fact]
-    public async Task Endpoint_alert_notifier_must_be_exact_enabled_owned_cloud_only_identity()
-    {
-        using var harness = new EndpointAlertHarness();
-        await harness.QueueAsync();
-        var notifier = harness.Registry.Bots.Single(x => x.Id == "endpoint-notifier");
-        notifier.Enabled = false;
-        using var worker = harness.Worker();
-        Assert.True(await worker.ProcessOneAsync(default));
-        notifier.Enabled = true;
-        notifier.Type = BotInstanceTypes.Tenant;
-        harness.Advance(TimeSpan.FromMinutes(1));
-        Assert.True(await worker.ProcessOneAsync(default));
-        notifier.Type = BotInstanceTypes.Owned;
-        notifier.Token = "910001:" + new string('b', 35);
-        harness.Advance(TimeSpan.FromMinutes(1));
-        Assert.True(await worker.ProcessOneAsync(default));
-        notifier.Token = "910000:" + new string('a', 35);
-        var oldAlias = await harness.Store.GetOrCreateAsync("former-notifier-alias", 910000, default);
-        oldAlias.DesiredEndpoint = TelegramEndpointType.Local;
-        oldAlias.EffectiveEndpoint = TelegramEndpointType.Local;
-        oldAlias.MigrationState = TelegramEndpointMigrationState.Local;
-        Assert.True(await harness.Store.TrySaveAsync(oldAlias, oldAlias.Revision, "migration_succeeded"));
-        oldAlias.DesiredEndpoint = TelegramEndpointType.Cloud;
-        oldAlias.EffectiveEndpoint = TelegramEndpointType.Cloud;
-        oldAlias.MigrationState = TelegramEndpointMigrationState.Cloud;
-        Assert.True(await harness.Store.TrySaveAsync(oldAlias, oldAlias.Revision, "cloud_recovered"));
-        harness.Advance(TimeSpan.FromMinutes(1));
-        Assert.True(await worker.ProcessOneAsync(default));
-        Assert.Equal("notifier_not_cloud", (await harness.AlertAsync()).ErrorCategory);
-        Assert.Equal(0, harness.Http.Sends);
+        var sender = await harness.Store.GetOrCreateAsync("endpoint-sender", 910000, default);
+        sender.DesiredEndpoint = TelegramEndpointType.Local;
+        sender.EffectiveEndpoint = TelegramEndpointType.Local;
+        sender.MigrationState = TelegramEndpointMigrationState.Local;
+        Assert.True(await harness.Store.TrySaveAsync(sender, sender.Revision, "migration_succeeded"));
+        harness.Gate.Publish(sender);
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            using var worker = harness.Worker();
+            Assert.True(await worker.ProcessOneAsync(default));
+            var pending = await harness.AlertAsync();
+            Assert.Equal(TelegramEndpointAlertStatus.Pending, pending.Status);
+            Assert.Equal("transport_unavailable", pending.ErrorCategory);
+            Assert.Equal(0, pending.Attempts);
+            harness.Advance(TimeSpan.FromDays(30));
+        }
         Assert.Equal(0, harness.Http.Probes);
+        Assert.Equal(0, harness.Http.Sends);
+        sender.EffectiveEndpoint = TelegramEndpointType.Cloud;
+        sender.MigrationState = TelegramEndpointMigrationState.CloudRecovered;
+        sender.Generation++;
+        Assert.True(await harness.Store.TrySaveAsync(sender, sender.Revision, "cloud_recovered"));
+        harness.Gate.Publish(sender);
+        using var recoveredWorker = harness.Worker();
+        Assert.True(await recoveredWorker.ProcessOneAsync(default));
+        Assert.Equal(TelegramEndpointAlertStatus.Delivered, (await harness.AlertAsync()).Status);
+        Assert.Equal(1, harness.Http.Sends);
     }
 
-    /// <summary>Provider acknowledgment delivers exactly once and renders Persian text without storing message or error bodies.</summary>
-    /// <returns>A task completing after SDK delivery and durable receipt checks.</returns>
+    /// <summary>Provider acknowledgment delivers exactly once to the verified channel without persisting message/error bodies or private recipients.</summary>
+    /// <returns>A task completing after real SDK logger delivery and durable receipt checks.</returns>
     [Fact]
-    public async Task Endpoint_alert_acknowledged_send_delivers_once_with_independent_cloud_transport()
+    public async Task Endpoint_alert_acknowledged_send_delivers_once_to_logger_channel()
     {
         using var harness = new EndpointAlertHarness();
         await harness.QueueAsync();
@@ -367,13 +400,15 @@ public sealed partial class ConcurrencyTests
         Assert.NotNull(row.DeliveredAtUtc);
         Assert.NotNull(row.SendStartedAtUtc);
         Assert.Null(row.ErrorCategory);
+        Assert.Equal(-100711000L, row.DestinationChatId);
+        Assert.Single(harness.Http.SentChatIds, id => id == -100711000L);
         Assert.Equal(1, harness.Http.Sends);
         Assert.Equal(1, harness.Http.Probes);
         Assert.False(await worker.ProcessOneAsync(default));
         Assert.Equal(0, await harness.Store.CountPendingAlertsAsync(default));
     }
 
-    /// <summary>Detailed delivered history expires without erasing the permanent incident/recipient deduplication receipt.</summary>
+    /// <summary>Detailed delivered history expires without erasing the permanent incident-only deduplication receipt.</summary>
     /// <returns>A task completing after an old incident cannot create another send intent.</returns>
     [Fact]
     public async Task Endpoint_alert_retention_preserves_durable_deduplication()
@@ -415,31 +450,6 @@ public sealed partial class ConcurrencyTests
     public void Endpoint_options_reject_untrusted_origins(string cloud, string local) =>
         Assert.Throws<ArgumentException>(() => new TelegramEndpointRoutingOptions { CloudBaseUrl = cloud, LocalBaseUrl = local }.ValidateAndSnapshot());
 
-    /// <summary>Missing Local file mapping blocks eligibility rather than changing the shared container; paired absolute roots are required.</summary>
-    [Fact]
-    public void Endpoint_options_default_cloud_mapping_prerequisites_and_exact_notifier()
-    {
-        var source = new TelegramEndpointRoutingOptions();
-        var snapshot = source.ValidateAndSnapshot();
-        Assert.True(snapshot.Enabled);
-        Assert.False(snapshot.AutomaticFailback);
-        Assert.False(snapshot.HasLocalFileMapping);
-        Assert.Equal("https://api.telegram.org", snapshot.CloudBaseUrl);
-        source.FailureThreshold = 8;
-        Assert.Equal(3, snapshot.FailureThreshold);
-        Assert.Throws<ArgumentException>(() => new TelegramEndpointRoutingOptions { LocalFileServerRoot = "/var/lib/telegram" }.ValidateAndSnapshot());
-        Assert.Throws<ArgumentException>(() => new TelegramEndpointRoutingOptions { NotificationBotId = "notifier" }.ValidateAndSnapshot());
-        Assert.Throws<ArgumentException>(() => new TelegramEndpointRoutingOptions { NotificationTelegramBotId = 910000 }.ValidateAndSnapshot());
-        var configured = new TelegramEndpointRoutingOptions
-        {
-            LocalFileServerRoot = "/var/lib/telegram", LocalFileHostRoot = Path.GetFullPath(Path.GetTempPath()),
-            NotificationBotId = "notifier", NotificationTelegramBotId = 910000
-        }.ValidateAndSnapshot();
-        Assert.True(configured.HasLocalFileMapping);
-        Assert.True(configured.IsNotificationBot("notifier", 910000));
-        Assert.False(configured.IsNotificationBot("NOTIFIER", 910000));
-        Assert.False(configured.IsNotificationBot("notifier", 910001));
-    }
 
     /// <summary>Raw payloads cannot enter endpoint history or error fields.</summary>
     /// <returns>A task completing after unsafe state/history proposals are rejected without persistence.</returns>
@@ -468,7 +478,7 @@ public sealed partial class ConcurrencyTests
         var migrator = db.GetService<IMigrator>();
         await migrator.MigrateAsync("20261005120000_AddTenantPublicChannelPostsEnabled");
         var before = await EndpointSchemaAsync(db);
-        await migrator.MigrateAsync("20261009120000_AddTelegramEndpointRouting");
+        await migrator.MigrateAsync("20261009130000_RouteEndpointIncidentsToLoggerChannel");
         var after = await EndpointSchemaAsync(db);
         foreach (var definition in before) Assert.Equal(definition.Value, after[definition.Key]);
         Assert.Empty(await db.TelegramEndpointStates.AsNoTracking().ToListAsync());
@@ -480,6 +490,97 @@ public sealed partial class ConcurrencyTests
         Assert.Contains("table:TelegramEndpointAlertReceipts", after.Keys);
         var store = new TelegramEndpointStore(databases.Users, new AppConfig());
         Assert.Equal(TelegramEndpointType.Cloud, (await store.GetOrCreateAsync("old-owned", 123, default)).EffectiveEndpoint);
+    }
+
+    /// <summary>Legacy private-recipient upgrade collapses only proven unsent incidents and fences acknowledged, started, uncertain, or pruned recipients.</summary>
+    /// <returns>A task completing after the real retrofit migration retains deduplication and leaves all non-outbox definitions unchanged.</returns>
+    [Fact]
+    public async Task Endpoint_logger_migration_consolidates_legacy_intents_and_preserves_receipt_fences()
+    {
+        using var databases = new Databases(initialize: false);
+        await using var db = databases.Users.CreateDbContext();
+        var migrator = db.GetService<IMigrator>();
+        await migrator.MigrateAsync("20261009120000_AddTelegramEndpointRouting");
+        var before = await EndpointSchemaAsync(db);
+        var scenarios = new[]
+        {
+            (Name: "pending", Status: TelegramEndpointAlertStatus.Pending, Started: false, Expected: TelegramEndpointAlertStatus.Pending),
+            (Name: "started", Status: TelegramEndpointAlertStatus.Processing, Started: true, Expected: TelegramEndpointAlertStatus.DeliveryUncertain),
+            (Name: "uncertain", Status: TelegramEndpointAlertStatus.DeliveryUncertain, Started: false, Expected: TelegramEndpointAlertStatus.DeliveryUncertain),
+            (Name: "manual_started", Status: TelegramEndpointAlertStatus.ManualReview, Started: true, Expected: TelegramEndpointAlertStatus.DeliveryUncertain),
+            (Name: "delivered", Status: TelegramEndpointAlertStatus.Delivered, Started: true, Expected: TelegramEndpointAlertStatus.Delivered),
+            (Name: "mixed_pruned", Status: TelegramEndpointAlertStatus.Pending, Started: false, Expected: TelegramEndpointAlertStatus.Delivered)
+        };
+        var operations = new Dictionary<string, string>(StringComparer.Ordinal);
+        var now = DateTime.UtcNow;
+        foreach (var scenario in scenarios)
+        {
+            var operation = operations[scenario.Name] = Guid.NewGuid().ToString("N");
+            var key = $"legacy-owned:123:{operation}:migration_started";
+            await SeedLegacyEndpointAlertAsync(db, key, 711, scenario.Status, scenario.Started ? now : null, now);
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"INSERT INTO TelegramEndpointAlertReceipts (IncidentKey, RecipientTelegramUserId) VALUES ({key}, {712L})");
+            if (scenario.Name != "mixed_pruned")
+                await SeedLegacyEndpointAlertAsync(db, key, 712, TelegramEndpointAlertStatus.Pending, null, now, receiptExists: true);
+        }
+        var receiptOnlyOperation = Guid.NewGuid().ToString("N");
+        var receiptOnlyKey = $"legacy-owned:123:{receiptOnlyOperation}:migration_started";
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"INSERT INTO TelegramEndpointAlertReceipts (IncidentKey, RecipientTelegramUserId) VALUES ({receiptOnlyKey}, {711L})");
+        // An orphan detailed intent must gain a permanent receipt during the retrofit too.
+        var orphanOperation = Guid.NewGuid().ToString("N");
+        var orphanKey = $"legacy-owned:123:{orphanOperation}:migration_started";
+        await SeedLegacyEndpointAlertAsync(db, orphanKey, 711, TelegramEndpointAlertStatus.Pending, null, now);
+        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM TelegramEndpointAlertReceipts WHERE IncidentKey = {orphanKey}");
+
+        await migrator.MigrateAsync("20261009130000_RouteEndpointIncidentsToLoggerChannel");
+        var after = await EndpointSchemaAsync(db);
+        foreach (var definition in before.Where(x =>
+            !x.Key.Contains("TelegramEndpointAlerts", StringComparison.Ordinal) &&
+            !x.Key.Contains("TelegramEndpointAlertReceipts", StringComparison.Ordinal)))
+            Assert.Equal(definition.Value, after[definition.Key]);
+        var rows = await db.TelegramEndpointAlerts.AsNoTracking().ToListAsync();
+        Assert.Equal(scenarios.Length + 1, rows.Count);
+        Assert.Equal(scenarios.Length + 2, await db.TelegramEndpointAlertReceipts.CountAsync());
+        Assert.All(rows, row => { Assert.Null(row.DestinationChatId); Assert.Null(row.ClaimId); Assert.Null(row.LeaseUntilUtc); });
+        foreach (var scenario in scenarios)
+        {
+            var key = $"legacy-owned:123:{operations[scenario.Name]}:migration_started";
+            var row = rows.Single(x => x.IncidentKey == key);
+            Assert.Equal(scenario.Expected, row.Status);
+            if (scenario.Name == "mixed_pruned") Assert.Null(row.DeliveredAtUtc);
+        }
+        Assert.DoesNotContain(rows, x => x.IncidentKey == receiptOnlyKey);
+        Assert.Equal(TelegramEndpointAlertStatus.Pending, rows.Single(x => x.IncidentKey == orphanKey).Status);
+        var store = new TelegramEndpointStore(databases.Users, new AppConfig { AdminsUserIds = [] });
+        var state = await store.GetOrCreateAsync("legacy-owned", 123, default);
+        foreach (var operation in operations.Values.Append(receiptOnlyOperation).Append(orphanOperation))
+        {
+            state.OperationId = operation;
+            Assert.True(await store.TrySaveAsync(state, state.Revision, alertCategory: "migration_started"));
+        }
+        Assert.Equal(scenarios.Length + 1, await db.TelegramEndpointAlerts.CountAsync());
+        await Assert.ThrowsAsync<NotSupportedException>(() => migrator.MigrateAsync("20261009120000_AddTelegramEndpointRouting"));
+    }
+
+    /// <summary>Seeds the historical private-recipient schema without using the current EF entity mapping.</summary>
+    /// <param name="db">Fixture-owned users.db context migrated only through the legacy routing migration.</param>
+    /// <param name="key">Secret-free incident/category key shared by legacy recipient copies.</param>
+    /// <param name="recipient">Positive synthetic legacy private user id.</param>
+    /// <param name="status">Legacy durable delivery state to preserve during consolidation.</param>
+    /// <param name="started">Optional durable legacy send boundary; any value prohibits new logger delivery.</param>
+    /// <param name="now">Fixture UTC creation/scheduling time.</param>
+    /// <param name="receiptExists">Whether the caller already inserted the matching compact recipient receipt.</param>
+    /// <returns>A task completing after one historical outbox detail and its compact receipt exist.</returns>
+    private static async Task SeedLegacyEndpointAlertAsync(UserDbContext db, string key, long recipient,
+        TelegramEndpointAlertStatus status, DateTime? started, DateTime now, bool receiptExists = false)
+    {
+        if (!receiptExists)
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"INSERT INTO TelegramEndpointAlertReceipts (IncidentKey, RecipientTelegramUserId) VALUES ({key}, {recipient})");
+        DateTime? delivered = status == TelegramEndpointAlertStatus.Delivered ? now : null;
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"INSERT INTO TelegramEndpointAlerts (IncidentKey, BotId, TelegramBotId, RecipientTelegramUserId, Category, MigrationState, DesiredEndpoint, EffectiveEndpoint, Generation, CreatedAtUtc, Status, Attempts, NextAttemptAtUtc, SendStartedAtUtc, DeliveredAtUtc) VALUES ({key}, {"legacy-owned"}, {123L}, {recipient}, {"migration_started"}, {0}, {0}, {0}, {1L}, {now}, {(int)status}, {0}, {now}, {started}, {delivered})");
     }
 
     /// <summary>Captures non-endpoint SQLite definitions for additive migration compatibility assertions.</summary>
@@ -502,55 +603,54 @@ public sealed partial class ConcurrencyTests
     {
         /// <summary>Isolated real SQLite databases; never the production files.</summary>
         public Databases Databases { get; } = new();
-        /// <summary>Global authorization remains mutable to exercise revocation.</summary>
-        public AppConfig Configuration { get; } = new() { AdminsUserIds = [711] };
-        /// <summary>Trusted origin settings with explicitly fake reserved bot identity.</summary>
+        /// <summary>Root logger authority; administrator membership does not affect incident delivery.</summary>
+        public AppConfig Configuration { get; } = new() { AdminsUserIds = [], LoggerChannel = "-100711000" };
+        /// <summary>Trusted origins and finite network retry budget.</summary>
         public TelegramEndpointRoutingOptions Options { get; }
         /// <summary>Exact current registry bots.</summary>
         public BotRegistry Registry { get; }
         /// <summary>Endpoint-only outbox store.</summary>
         public TelegramEndpointStore Store { get; }
+        /// <summary>Actual durable route admission gate shared by the worker and pooled SDK provider.</summary>
+        public TelegramEndpointRuntimeGate Gate { get; }
         /// <summary>Controlled SDK transport that never opens a socket.</summary>
         public EndpointAlertHttp Http { get; } = new();
         /// <summary>Controlled monotonic UTC wall clock.</summary>
         private readonly EndpointAlertClock _clock = new();
-        /// <summary>Provider still applies exact registry lookup and control-client behavior.</summary>
+        /// <summary>Provider uses the real shared gate and pooled SDK construction over the fake wire.</summary>
         private readonly BotClientProvider _clients;
         /// <summary>Fixture clock's current UTC instant.</summary>
         public DateTime Now => _clock.GetUtcNow().UtcDateTime;
 
         /// <summary>Creates fake bot definitions and isolated persistence without using any production token.</summary>
-        /// <param name="configured">Whether to configure the independent notifier explicitly.</param>
+        /// <param name="configured">Whether the root logger destination is configured.</param>
         /// <param name="maxAttempts">Finite safe pre-send retry cap.</param>
         public EndpointAlertHarness(bool configured = true, int maxAttempts = 12)
         {
-            Options = new TelegramEndpointRoutingOptions
-            {
-                NotificationBotId = configured ? "endpoint-notifier" : "",
-                NotificationTelegramBotId = configured ? 910000 : null,
-                NotificationMaxAttempts = maxAttempts
-            };
+            Options = new TelegramEndpointRoutingOptions { NotificationMaxAttempts = maxAttempts };
+            if (!configured) Configuration.LoggerChannel = "";
             var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
             {
-                ["Bots:0:Id"] = "endpoint-notifier", ["Bots:0:Token"] = "910000:" + new string('a', 35),
+                ["Bots:0:Id"] = "endpoint-sender", ["Bots:0:Token"] = "910000:" + new string('a', 35),
                 ["Bots:0:Type"] = BotInstanceTypes.Owned, ["Bots:0:Enabled"] = "true", ["Bots:0:IsDefault"] = "true"
             }).Build();
             Registry = new BotRegistry(configuration);
-            _clients = new BotClientProvider(Registry, bot => new TelegramBotClient(
-                new TelegramBotClientOptions(bot.Token) { RetryCount = 0 }, new HttpClient(Http, disposeHandler: false)));
             Store = new TelegramEndpointStore(Databases.Users, Configuration, Options);
+            Gate = new TelegramEndpointRuntimeGate(Registry, Store);
+            _clients = new BotClientProvider(Registry, Gate, Options, Http);
         }
 
         /// <summary>Creates a worker against the current durable store or a simulated restarted store.</summary>
         /// <param name="store">Optional independently constructed replacement store.</param>
         /// <returns>A disposable worker using the shared fake-only transport and deterministic clock.</returns>
         public TelegramEndpointNotificationWorker Worker(TelegramEndpointStore? store = null) => new(store ?? Store, Options,
-            Registry, _clients, NullLogger<TelegramEndpointNotificationWorker>.Instance, _clock);
+            Registry, _clients, Gate, NullLogger<TelegramEndpointNotificationWorker>.Instance, _clock);
 
         /// <summary>Queues one safe synthetic migration incident transactionally.</summary>
-        /// <returns>A task completing after the per-superadmin intent is durable.</returns>
+        /// <returns>A task completing after one incident intent is durable and the sender's actual Cloud route is hydrated.</returns>
         public async Task QueueAsync()
         {
+            await Gate.HydrateAsync("endpoint-sender", 910000, default);
             var state = await Store.GetOrCreateAsync("migrating-owned", 123, default);
             state.OperationId = Guid.NewGuid().ToString("N");
             state.MigrationState = TelegramEndpointMigrationState.CheckingLocal;
@@ -599,16 +699,20 @@ public sealed partial class ConcurrencyTests
         public bool AmbiguousSend { get; set; }
         /// <summary>Optional definitive provider rejection; the fixture returns a valid typed Bot API error envelope.</summary>
         public int? RejectedSendStatus { get; set; }
-        /// <summary>BotFather identity returned by the synthetic independent Cloud probe.</summary>
+        /// <summary>BotFather identity returned by the synthetic Cloud identity probe.</summary>
         public long Identity { get; set; } = 910000;
-        /// <summary>Optional fixture callback simulating authorization or registry changes during the probe.</summary>
+        /// <summary>Optional callback simulating registry or logger changes during the identity probe.</summary>
         public Action? AfterProbe { get; set; }
+        /// <summary>Channel returned for current logger lookup; numeric frozen lookups return their requested id.</summary>
+        public long ChannelId { get; set; } = -100711000;
+        /// <summary>Wire destinations observed only in this fixture, proving no private send or retry retargeting.</summary>
+        public List<long> SentChatIds { get; } = [];
 
         /// <summary>Produces Bot API responses or scripted failures without persisting private request data.</summary>
-        /// <param name="request">Private SDK request inspected only for its final method name.</param>
+        /// <param name="request">Synthetic SDK request inspected for method and fixture chat id only; tokens and message bodies are not retained.</param>
         /// <param name="cancellationToken">Cancellation of the synthetic request.</param>
         /// <returns>A valid SDK response or a deliberate ambiguous transport exception.</returns>
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             string body;
@@ -622,18 +726,36 @@ public sealed partial class ConcurrencyTests
                     ok = true, result = new { id = Identity, is_bot = true, first_name = "fixture", username = "endpoint_fixture_bot" }
                 });
             }
+            else if (request.RequestUri.AbsolutePath.EndsWith("/getChat", StringComparison.OrdinalIgnoreCase))
+            {
+                using var payload = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+                var target = payload.RootElement.GetProperty("chat_id");
+                var id = target.ValueKind == JsonValueKind.Number ? target.GetInt64() :
+                    long.TryParse(target.GetString(), out var numeric) ? numeric : ChannelId;
+                body = JsonSerializer.Serialize(new { ok = true, result = new { id, type = "channel", title = "fixture logger" } });
+            }
+            else if (request.RequestUri.AbsolutePath.EndsWith("/getChatMember", StringComparison.OrdinalIgnoreCase))
+                body = JsonSerializer.Serialize(new { ok = true, result = new { status = "administrator", can_post_messages = true,
+                    can_manage_chat = true, can_delete_messages = true, can_manage_video_chats = true, can_restrict_members = true,
+                    can_promote_members = true, can_change_info = true, can_invite_users = true, is_anonymous = false,
+                    user = new { id = Identity, is_bot = true, first_name = "fixture" } } });
             else
             {
                 Assert.EndsWith("/sendMessage", request.RequestUri.AbsolutePath, StringComparison.OrdinalIgnoreCase);
+                using var payload = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+                var target = payload.RootElement.GetProperty("chat_id");
+                var chatId = target.ValueKind == JsonValueKind.Number ? target.GetInt64() : long.Parse(target.GetString()!);
+                SentChatIds.Add(chatId);
                 Sends++;
                 if (AmbiguousSend) throw new HttpRequestException("private fixture error");
                 if (RejectedSendStatus is int status)
-                    return Task.FromResult(new HttpResponseMessage((HttpStatusCode)status) { Content = new StringContent(
+                    return new HttpResponseMessage((HttpStatusCode)status) { Content = new StringContent(
                         $"{{\"ok\":false,\"error_code\":{status},\"description\":\"synthetic rejection\",\"parameters\":{{\"retry_after\":5}}}}",
-                        Encoding.UTF8, "application/json") });
-                body = "{\"ok\":true,\"result\":{\"message_id\":1,\"date\":1700000000,\"chat\":{\"id\":711,\"type\":\"private\"},\"text\":\"ack\"}}";
+                        Encoding.UTF8, "application/json") };
+                body = JsonSerializer.Serialize(new { ok = true, result = new { message_id = 1, date = 1700000000,
+                    chat = new { id = chatId, type = "channel", title = "fixture logger" }, text = "ack" } });
             }
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(body, Encoding.UTF8, "application/json") });
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
         }
     }
 }

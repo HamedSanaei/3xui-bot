@@ -147,22 +147,22 @@ public sealed class TelegramEndpointHistory
     public long Revision { get; set; }
 }
 
-/// <summary>At-most-once delivery phases for independent global operator alerts.</summary>
+/// <summary>At-most-once delivery phases for logger-channel endpoint incidents.</summary>
 public enum TelegramEndpointAlertStatus
 {
     /// <summary>Durable unsent intent awaiting configured transport or safe retry.</summary>
     Pending,
     /// <summary>Claimed by one worker; SendStartedAtUtc determines replay safety.</summary>
     Processing,
-    /// <summary>Telegram returned a successful delivery acknowledgment.</summary>
+    /// <summary>Telegram acknowledged delivery, including a legacy private delivery proven by a compact/pruned receipt; never replayed into the logger.</summary>
     Delivered,
     /// <summary>The send may have happened; automatic replay is prohibited.</summary>
     DeliveryUncertain,
-    /// <summary>Safe attempts exhausted or authorization changed; retained for operator review.</summary>
+    /// <summary>Real safe attempts exhausted or a definitive send rejection requires operator review.</summary>
     ManualReview
 }
 
-/// <summary>Durable per-global-superadmin independent Cloud notification intent without stored message bodies or secrets.</summary>
+/// <summary>One durable logger-channel intent per incident without stored message bodies, private recipients, or secrets.</summary>
 public sealed class TelegramEndpointAlert
 {
     /// <summary>Database-generated notification identity.</summary>
@@ -173,8 +173,9 @@ public sealed class TelegramEndpointAlert
     public string BotId { get; set; }
     /// <summary>BotFather identity affected by the incident.</summary>
     public long TelegramBotId { get; set; }
-    /// <summary>Global superadmin recipient Telegram user id captured when the intent was committed.</summary>
-    public long RecipientTelegramUserId { get; set; }
+    /// <summary>Verified negative channel chat id frozen at the first send boundary; retained across definitive 429 retries.</summary>
+    /// <remarks>Null for unsent intents and migrated legacy delivery fences; a legacy Delivered row is not proof of channel delivery.</remarks>
+    public long? DestinationChatId { get; set; }
     /// <summary>Closed safe notification category.</summary>
     public string Category { get; set; }
     /// <summary>Incident migration phase, frozen at creation.</summary>
@@ -197,32 +198,30 @@ public sealed class TelegramEndpointAlert
     public DateTime? SendStartedAtUtc { get; set; }
     /// <summary>UTC send deadline used to reconcile interrupted workers.</summary>
     public DateTime? SendDeadlineAtUtc { get; set; }
-    /// <summary>Count of claims, including safe pre-send transport failures.</summary>
+    /// <summary>Count of budgeted claims; missing sender/channel prerequisites refund their pre-send claim.</summary>
     public int Attempts { get; set; }
     /// <summary>UTC next bounded retry time.</summary>
     public DateTime NextAttemptAtUtc { get; set; }
     /// <summary>Closed diagnostic category; raw errors are never persisted.</summary>
     public string ErrorCategory { get; set; }
-    /// <summary>UTC acknowledgment time, null for every unacknowledged alert.</summary>
+    /// <summary>Observed UTC acknowledgment time; null for unacknowledged sends and legacy pruned acknowledgments whose timestamp no longer exists.</summary>
     public DateTime? DeliveredAtUtc { get; set; }
 }
 
-/// <summary>Compact permanent incident/recipient deduplication receipt, retained after detailed acknowledged outbox history expires.</summary>
-/// <remarks>Contains no message body, transport identity, token, or error payload. Never cascades with bot deletion.</remarks>
+/// <summary>Compact permanent incident deduplication receipt retained after acknowledged outbox history expires.</summary>
+/// <remarks>Contains no message body, recipient, transport identity, token, or error payload. Never cascades with bot deletion.</remarks>
 public sealed class TelegramEndpointAlertReceipt
 {
     /// <summary>Stable affected-bot identity, incident, and category key.</summary>
     public string IncidentKey { get; set; }
-    /// <summary>Global superadmin Telegram user id captured when the intent was created.</summary>
-    public long RecipientTelegramUserId { get; set; }
 }
 
-/// <summary>Shared endpoint-only EF mapping; never configures financial entities.</summary>
+/// <summary>Shared endpoint-only EF mapping with one logger intent and permanent receipt per incident; never configures financial entities.</summary>
 public static class TelegramEndpointModelConfiguration
 {
-    /// <summary>Adds endpoint state, append-only history, and independent alert outbox mappings.</summary>
+    /// <summary>Adds endpoint state, append-only history, and incident-only logger outbox mappings.</summary>
     /// <param name="modelBuilder">Required users.db runtime or migration model builder.</param>
-    /// <remarks>There are no foreign keys or cascading deletes; historical identities survive bot replacement.</remarks>
+    /// <remarks>IncidentKey alone uniquely identifies an alert and its compact permanent receipt. DestinationChatId is nullable until the verified negative channel is frozen. No foreign keys or cascading deletes exist; historical identities and dedupe survive bot replacement.</remarks>
     public static void Configure(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<TelegramEndpointState>(b =>
@@ -262,14 +261,14 @@ public static class TelegramEndpointModelConfiguration
             b.Property(x => x.Category).IsRequired().HasMaxLength(64);
             b.Property(x => x.ClaimId).HasMaxLength(32);
             b.Property(x => x.ErrorCategory).HasMaxLength(64);
-            b.HasIndex(x => new { x.IncidentKey, x.RecipientTelegramUserId }).IsUnique();
+            b.HasIndex(x => x.IncidentKey).IsUnique();
             b.HasIndex(x => new { x.Status, x.NextAttemptAtUtc, x.Id });
             b.HasIndex(x => new { x.Status, x.LeaseUntilUtc });
         });
         modelBuilder.Entity<TelegramEndpointAlertReceipt>(b =>
         {
             b.ToTable("TelegramEndpointAlertReceipts");
-            b.HasKey(x => new { x.IncidentKey, x.RecipientTelegramUserId });
+            b.HasKey(x => x.IncidentKey);
             b.Property(x => x.IncidentKey).IsRequired().HasMaxLength(240);
         });
     }

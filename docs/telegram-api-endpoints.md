@@ -2,7 +2,7 @@
 
 ## Scope and operational boundary
 
-Cloud is the upgrade/install default. Existing bots do not migrate after deployment. A current global Super Admin can select a bot from **🗽 Admin → 🌐 مدیریت Telegram API**, or use `/telegram_api` in any healthy configured owned bot's private chat. Tenant ownership, customer privileges, assistant hosts and group chats grant no endpoint authority. The same panel inventories owned, tenant and assistant identities; the explicitly reserved notification identity cannot migrate.
+Cloud is the upgrade/install default. Existing bots do not migrate after deployment. A current global Super Admin can select a bot from **🗽 Admin → 🌐 مدیریت Telegram API**, or use `/telegram_api` in any healthy configured owned bot's private chat. Tenant ownership, customer privileges, assistant hosts and group chats grant no endpoint authority. The panel inventories owned, tenant and assistant identities; logger delivery selects existing eligible owned Cloud bots and reserves no dedicated identity.
 
 Reuse the existing official Local Bot API at `http://127.0.0.1:8081` on Nethederland. Adminbot does not install, manage, restart, stop, reconfigure or inspect private credentials of the downloader container. The Local port must remain bound to loopback. No new `api_id` / `api_hash` is used.
 
@@ -24,7 +24,7 @@ Primary references:
 | `BotClientProvider` / `EndpointRoutedTelegramBotClient` | Shared HTTP pool, cached per-endpoint epochs, reusable worker facade, pinned receiver epochs and exact identity checks |
 | `MultiBotHostedService` | Existing per-bot lifecycle semaphore; stop/join old receiver and strict destination identity/webhook/poll readiness |
 | `TelegramEndpointAdminService` | Private owned-host global-admin panel, ten-minute message/actor/host/identity-bound single-use controls |
-| `TelegramEndpointNotificationWorker` | Durable independent Cloud-only operator alerts; phase-aware uncertainty without send replay |
+| `TelegramEndpointNotificationWorker` | One durable incident sent directly to the existing logger channel through a counted, authorized active Cloud bot |
 | Existing latency telemetry | Payload-free endpoint request/health/migration events and Cloud/Local reporting |
 
 A bot's state key is `(internal BotId, exact numeric BotFather identity)`. Token rotation retaining the identity does not transfer selection to another bot. Replacing the identity gets a separate Cloud-default row; historical migration receipts remain private audit data and cannot activate the replacement. Startup hydrates current saved identities before any hosted sender/receiver starts. Pending/uncertain Local state is never interpreted as permission to log into Cloud.
@@ -78,15 +78,21 @@ Typed categories distinguish connection refusal, timeout/network, invalid Bot AP
 
 Outage episodes have stable ids and deduplicated alerts. New admissions are fenced, and the affected receiver is stopped under bot-specific lifecycle ownership. Safe recovery is bounded by configured attempts and exponential delay; no indefinitely repeated mutation occurs. Automatic failback is a separate explicit startup policy, disabled by default; when enabled it still executes the same Cloud logout protocol and recovery thresholds.
 
-## Independent Super Admin notifications
+## Direct logger-channel notifications
 
-Configure a dedicated **enabled owned bot identity that stays Cloud-only**, not the affected Local bot and not an inferred default. Bind both its internal id and exact numeric BotFather identity. Every configured global Super Admin must first start that notifier bot privately. The reserved identity, including aliases, cannot migrate. Historic Local intent/session evidence disqualifies it as a Cloud-only notifier.
+Endpoint incidents go directly to the existing **`loggerChannel`**, never private Super Admin chats or the generic logger queue. The live root value takes precedence, with the current default bot's sanitized logger channel as fallback. No new bot, `notificationBotId` or `notificationTelegramBotId` is required; those routing options have been removed. Old keys left in an existing private configuration are ignored, not rewritten.
 
-Alert intent and state transition commit in the same users.db transaction. Notification delivery never holds a migration transaction or blocks migration. Missing/unavailable transport retains visible pending intents and bounded backoff. Attempts eventually enter `ManualReview`, not silent deletion. A removed global admin is rejected again immediately before the send boundary.
+The worker prefers the existing default owned bot when eligible, then checks a bounded rotating page of other enabled owned non-assistant bots. Current hydrated **Cloud/CloudRecovered** admission is mandatory: Local, migrating, fenced, disabled, replaced and unhydrated bots cannot even probe Cloud. It uses the existing pooled SDK with `https://api.telegram.org`, verifies exact `getMe` identity, resolves `getChat` to a negative **channel** id, and checks the same bot's `getChatMember` owner or administrator `can_post_messages` authority. Tenants/assistants are intentionally excluded from this global operational transport.
 
-A send-start marker separates safe pre-send failures from potentially delivered requests. Timeout/disconnect or interruption after that marker becomes `DeliveryUncertain` and is not automatically resent. Acknowledged delivery is recorded independently. This prioritizes no duplicate ambiguous sends over an impossible exactly-once Telegram guarantee. The panel displays undelivered/uncertain alert count and does not promise real-time notification merely because configuration exists. Detailed delivered outbox history expires after 90 days; compact permanent incident/recipient receipts prevent recreation after pruning.
+One normal request lease spans the read-only checks, SQLite send marker and complete send. Identity/token/generation/admission are rechecked across awaited boundaries; migration must drain that lease before logout. No migration-control bypass or speculative send is used. Definite pre-send permission denial may try another eligible sender; after dispatch, no alternate bot or endpoint is tried.
 
-Alerts cover outage, migration start, delayed fallback/cooldown, success/failure, intervention and Local recovery, with readable Persian state/error labels. Raw telemetry is never forwarded event-by-event. Existing local incident logging remains available if Telegram notifications fail.
+State transition, one incident-only intent and permanent deduplication receipt commit together in users.db, including when no admins/logger/sender are configured. Missing logger, posting authority or active Cloud sender leaves the alert **Pending indefinitely**, refunds the unused claim attempt and schedules a bounded `retryMaxSeconds` delay (default 300 seconds). Fixed local console/file warnings record the condition; the exact retained-worker warning is excluded from generic Telegram logging to prevent recursion or unsafe Local fallback. Real failed read attempts and definitive send 429 still use the finite `notificationMaxAttempts` policy; permanent send rejection requires `ManualReview`.
+
+The verified negative destination is frozen at the durable send marker. Explicit 429 retries and proven undispatched post-marker deferrals keep that channel even if configuration changes; a config edit cannot redirect an already bound incident. Acknowledgment is required for Delivered. Timeout/disconnect/5xx or interruption after invoking send becomes **DeliveryUncertain**, never automatic replay. A post-marker prerequisite loss can return Pending only while the worker proves it has not invoked the SDK send.
+
+Migration `20261009130000_RouteEndpointIncidentsToLoggerChannel` consolidates old per-admin rows/receipts to one incident. Only provably unsent legacy incidents resume Pending. Old acknowledged/pruned receipts suppress new sends; started/uncertain incidents stay quarantined. Legacy Delivered rows can have no channel destination or acknowledgment timestamp: they represent prior private delivery evidence, not a new channel send. Detailed acknowledged history retains the existing 90-day pruning; compact incident receipts remain permanent.
+
+Alerts cover Local outage/recovery, migration, delayed fallback/cooldown and intervention. Persian bodies are rendered at delivery, never stored with tokens or raw provider payloads. The panel exposes Pending/uncertain counts; actual channel membership/permission/network readiness must be verified in a separately approved production rollout.
 
 ## Configuration and file prerequisites
 
@@ -108,8 +114,6 @@ Add only the optional `telegramEndpointRouting` object to the existing persisten
     "recoveryMaxAttempts": 12,
     "retryMaxSeconds": 300,
     "notificationMaxAttempts": 12,
-    "notificationBotId": "",
-    "notificationTelegramBotId": null,
     "localFileServerRoot": "",
     "localFileHostRoot": ""
   }
@@ -126,13 +130,15 @@ The host directory must already exist, be readable by the Adminbot service accou
 
 Additive migration: `20261009120000_AddTelegramEndpointRouting` in **users.db only**. Four endpoint-only tables: states, append-only history, operator alert outbox and compact alert receipts. No financial/tenant columns are rewritten, no cascade references, and no new production project, dependency, API secret or telemetry database is introduced. SQLite retries contain database work only; no network mutation runs inside a retried transaction.
 
+The logger-channel cutover migration rebuilds **only the two endpoint alert/receipt tables**, removes private recipient ids and preserves incident delivery fences. Endpoint state/history, FIFO and financial schemas are unchanged. Run isolated migration preflight on backups before activation. Its Down path deliberately refuses to reconstruct discarded recipients; do not roll back to the previous per-private-recipient worker against this schema or restore an old financial database to reverse notification routing.
+
 Existing deployment preserves users.db and configuration. Immutable releases share `/opt/vpnetiran/shared/Data`; synchronized deployment preserves its existing application Data. JSONL remains `Telemetry/` adjacent to the resolved users.db, with existing retention/security/publish exclusions. No new endpoint state file is copied from publish. Never expose endpoint control/telemetry through a public HTTP endpoint.
 
 ## Staged rollout and read-only validation
 
 1. Deploy the normal single application artifact with all existing bots still Cloud. Run the existing isolated migration preflight on backups first; ordinary startup applies the additive migration before receivers.
-2. Verify `/telegram_api` from two healthy authorized owned administration paths. Confirm selected/effective Cloud, current identity, strict callback authority and reserved notifier visibility.
-3. Configure the independent Cloud notifier and read-only file mapping after inspecting existing mounts/permissions. Validate an operator receives a benign dedicated-test-bot migration incident; do not rely on the affected bot's token for alerts.
+2. Verify `/telegram_api` from two healthy authorized owned administration paths. Confirm selected/effective Cloud, current identity and strict callback authority.
+3. Verify the existing logger channel and at least one existing active owned Cloud bot's posting access; no dedicated notifier setup or private `/start` is needed. Configure the read-only file mapping after inspecting existing mounts/permissions. Confirm a benign dedicated-test-bot incident arrives once in the logger channel.
 4. Migrate one dedicated test bot only after explicit panel confirmation. Check identity, poll readiness, message/edit/media/file delivery, durable inbox receipts and endpoint generations.
 5. Exercise outage/cooldown/restart only against isolated fake/test Local infrastructure. Never stop the shared downloader container or issue production logOut from automated tests.
 6. Only after those checks, explicitly confirm Local for `GozargahNetwork_Bot`. Monitor errors, durable state/history and Cloud/Local telemetry; expand one identity at a time.
@@ -157,23 +163,27 @@ The migration preflight copies source databases through SQLite online backup, mi
 
 Before rolling back to a release that does not understand routing, safely migrate every Local identity to Cloud using this release, wait for the recorded eligibility and verify Cloud receiving readiness. Resolve uncertain/pending cleanup with provider evidence first; an older Cloud-only binary is not safe to start while a Local/uncertain session exists. Do not downgrade/drop the additive tables, restore an old financial database, discard pending alerts or reset generations. Retain the current capable release when safety cannot be proved. The existing deployment rollback mechanism preserves databases but cannot override Telegram's session restrictions.
 
+The logger-channel outbox cutover is intentionally not downgradable to private recipients. Keep the current schema-aware worker/receipts; an older private-recipient worker is incompatible even after bots return to Cloud. No migration Down or database reset is a safe notification rollback.
+
 ## Verification and limits
 
 Deterministic coverage lives in the existing `Adminbot.Tests` project: panel/global-authority/replay/identity, durable CAS/alerts/migration upgrade, real v22 pooled origin routing and generation/file fencing, actual receiver lifecycle/FIFO isolation, fake migration/health/cooldown/crash/ambiguous sends and endpoint JSONL/reporting. Automated verification uses synthetic tokens and in-process transports only; no production bot token, Local session or downloader process is exercised.
 
-Observed final endpoint-routing verification:
+Observed verification (initial routing smoke rows are explicitly labeled):
 
 | Check | Observed result |
 |---|---|
-| Focused endpoint, token-probe, telemetry, receiver and financial recovery regressions | 254 passed; zero failed/skipped |
-| Complete Release regression suite | 1,447 passed; zero failed/skipped; includes existing tenant and financial regressions |
+| Logger-channel endpoint, suppression and financial downgrade/upgrade regressions | 202 passed; zero failed/skipped |
+| Complete Release regression suite after logger-channel cutover | 1,496 passed; zero failed/skipped; includes tenant/financial invariants and downgrade-before-cutover/full-upgrade receipt preservation |
+| Actual private panel entry/callback smoke with isolated metadata and captured SDK edit requests | Missing/configured logger labels render readable Persian and show channel delivery plus Pending/uncertain semantics rather than private notifier setup; no live Telegram traffic |
 | Release application build | Success; zero warnings/errors |
 | `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false` | Success; single production application, no auxiliary project dependency; clean external publish contains no tests, private databases/configuration or telemetry archives |
 | Both EF `has-pending-model-changes` checks | No pending model changes |
 | Isolated Release `--migration-check` | UserDbContext and CredentialsDbContext OK |
-| Two-bot runtime smoke using the actual v22 SDK, receiver service, private panel and real scratch SQLite migration | Cloud → Local → CloudWait → Cloud; exactly one source poller maximum; independent Cloud control/panel remained available during wait |
-| Smoke JSONL | 80 endpoint observations; zero dropped events/writer faults; synthetic tokens absent |
-| Read-only analyzer against synthetic Cloud/Local archive | Independent endpoint/method/boundary quantiles and migration history displayed; no receiver/worker startup |
+| Initial routing two-bot runtime smoke using the actual v22 SDK, receiver service, private panel and scratch SQLite | Cloud → Local → CloudWait → Cloud; exactly one source poller maximum; independent Cloud control/panel remained available during wait |
+| Initial routing smoke JSONL | 80 endpoint observations; zero dropped events/writer faults; synthetic tokens absent |
+| Initial routing read-only analyzer against synthetic Cloud/Local archive | Independent endpoint/method/boundary quantiles and migration history displayed; no receiver/worker startup |
+| Logger-channel runtime smoke using the actual worker, v22 SDK and migrated scratch SQLite | Existing Cloud bot posts once to the verified channel; no eligible Cloud sender stays Pending beyond attempt cap; lost send response is DeliveryUncertain with no replay. Fake HTTP only; no private destination or live mutation |
 
 The controlled benchmark and allocation caveats are recorded in [latency telemetry verification](telegram-latency-telemetry.md#controlled-overhead-benchmark-and-verification). Temporary smoke/report tooling lives outside the repository and is removed after verification.
 

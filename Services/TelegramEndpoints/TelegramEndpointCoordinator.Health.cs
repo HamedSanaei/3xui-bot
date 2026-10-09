@@ -21,8 +21,7 @@ public sealed partial class TelegramEndpointCoordinator
         foreach (var state in await GetInventoryAsync(cancellationToken))
         {
             var bot = FindBot(state.BotId);
-            if (bot == null || !bot.Enabled || TelegramBotTokenIdentity.ExtractBotId(bot.Token) != state.TelegramBotId ||
-                IsReservedIdentity(state.TelegramBotId)) continue;
+            if (bot == null || !bot.Enabled || TelegramBotTokenIdentity.ExtractBotId(bot.Token) != state.TelegramBotId) continue;
             if (state.EffectiveEndpoint == TelegramEndpointType.Local)
                 await RefreshBotHealthAsync(state.BotId, root, cancellationToken);
             else if (state.DesiredEndpoint == TelegramEndpointType.Local &&

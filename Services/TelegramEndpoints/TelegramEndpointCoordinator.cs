@@ -195,7 +195,7 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
     /// <param name="expectedControlRevision">Nonnegative control revision shown in the one-use confirmation.</param>
     /// <param name="expectedTelegramBotId">Positive BotFather identity frozen by the displayed confirmation; replacement identities are stale.</param>
     /// <param name="cancellationToken">Callback token used only for authorization/persistence, not background migration.</param>
-    /// <returns>A fixed status code: accepted, unchanged, stale, busy, denied, reserved, aliased, unavailable, disabled, unsafe or control_path_missing.</returns>
+    /// <returns>A fixed status code: accepted, unchanged, stale, busy, denied, aliased, unavailable, disabled, unsafe or control_path_missing.</returns>
     /// <remarks>Bot-specific nonwaiting locks prevent concurrent intents. Uncertain logout cannot be manually overridden.
     /// Cloud-to-Local intent retains another enabled owned Cloud identity for independent private administration.
     /// The hosted worker owns lifecycle drain; this method never waits for the callback's own handler to finish.</remarks>
@@ -252,7 +252,7 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
     /// <param name="expectedTelegramBotId">Positive BotFather identity frozen by the displayed confirmation, checked again under the bot lock.</param>
     /// <param name="cancellationToken">Caller-owned persistence cancellation.</param>
     /// <returns>A fixed authorization/concurrency code or accepted/unchanged.</returns>
-    /// <remarks>The reserved Cloud notification bot cannot be changed. Health counters alone do not stale this confirmation.</remarks>
+    /// <remarks>Health counters alone do not stale this confirmation. Logger notification sender selection does not reserve or modify this bot's migration policy.</remarks>
     public async Task<string> SetAutoFailoverAsync(string botId, bool enabled, long actor,
         long expectedControlRevision, long expectedTelegramBotId, CancellationToken cancellationToken)
     {
@@ -339,7 +339,7 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
         return result;
     }
 
-    /// <summary>Rechecks current global authority, enabled configuration and reserved notifier identity.</summary>
+    /// <summary>Rechecks current global authority and exact enabled bot identity.</summary>
     /// <param name="botId">Exact selected internal id.</param>
     /// <param name="actor">Telegram user id asserted by the authenticated update.</param>
     /// <param name="bot">Resolved bot configuration only if present.</param>
@@ -353,15 +353,10 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
             return "denied";
         if (!_options.Enabled) return "disabled";
         if (bot == null || !bot.Enabled || identity <= 0) return "unavailable";
-        if (IsReservedIdentity(identity)) return "reserved";
         if (HasIdentityAlias(bot.Id, identity)) return "aliased";
         return null;
     }
 
-    /// <summary>Reserves the notifier's BotFather session across every internal alias of that identity.</summary>
-    /// <param name="identity">Current positive numeric BotFather id, not an internal registry or customer id.</param>
-    /// <returns>True when migrating this identity would affect the explicitly configured Cloud-only notifier.</returns>
-    private bool IsReservedIdentity(long identity) => _options.NotificationTelegramBotId == identity;
 
     /// <summary>Retains a separately admitted owned Cloud identity so a shared Local outage cannot remove all private administration paths.</summary>
     /// <param name="identity">Positive BotFather identity about to leave Cloud; its aliases cannot serve as independent control.</param>

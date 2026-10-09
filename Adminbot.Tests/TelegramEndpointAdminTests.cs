@@ -229,7 +229,7 @@ public sealed class TelegramEndpointAdminTests
         Assert.Contains("جزئیات «disabled_bot»", observed);
     }
 
-    /// <summary>Exposes cooldown, unsafe logout, timestamps, independent notification prerequisites and safe numeric audit actors.</summary>
+    /// <summary>Exposes cooldown, unsafe logout, timestamps, logger notification prerequisites and safe numeric audit actors.</summary>
     /// <returns>A task completing after detail rendering and secret-free history assertions.</returns>
     [Fact]
     public async Task Detail_exposes_safety_prerequisites_and_sanitizes_history()
@@ -254,7 +254,6 @@ public sealed class TelegramEndpointAdminTests
         Assert.Contains("UTC", text);
         Assert.Contains("خروج نامطمئن", text);
         Assert.Contains("نگاشت مطمئن", text);
-        Assert.Contains("اعلان مستقل تضمین‌شده نیست", text);
         Assert.Contains("عامل: 123", text);
         Assert.DoesNotContain("secret-token", text);
         Assert.DoesNotContain("raw-provider-error", text);

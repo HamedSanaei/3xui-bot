@@ -1,4 +1,5 @@
 using Adminbot.Domain;
+using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
 
 namespace Adminbot.Services.TelegramEndpoints;
@@ -31,7 +32,7 @@ public interface ITelegramEndpointStateStore
     /// <example><code>var aliases = await store.ReadIdentityStatesAsync(identity, cancellationToken);</code></example>
     Task<IReadOnlyList<TelegramEndpointState>> ReadIdentityStatesAsync(long identity, CancellationToken token) =>
         Task.FromException<IReadOnlyList<TelegramEndpointState>>(new BotTransportUnavailableException("endpoint_identity_authority_unavailable"));
-    /// <summary>CAS-commits a state and optional append-only history and per-global-admin alert intents atomically.</summary>
+    /// <summary>CAS-commits a state and optional append-only history and incident-only logger intent atomically.</summary>
     /// <param name="state">Required detached proposed state; secrets and raw errors are forbidden.</param>
     /// <param name="expectedRevision">Nonnegative revision read before proposing the transition.</param>
     /// <param name="historyReason">Optional closed internal transition reason.</param>
@@ -53,8 +54,8 @@ public interface ITelegramEndpointStateStore
     Task<IReadOnlyList<TelegramEndpointHistory>> ReadHistoryAsync(string botId, long identity, int limit, CancellationToken token);
     /// <summary>Counts undelivered incidents including uncertain and manual-review rows.</summary>
     /// <param name="token">Cancellation of local database work.</param>
-    /// <returns>Visible outstanding per-recipient intent count; uncertainty is never silently excluded.</returns>
-    /// <remarks>Unconfigured transports, revoked recipients, uncertain sends, and exhausted safe attempts remain visible until reviewed.</remarks>
+    /// <returns>Visible outstanding incident count; uncertainty is never silently excluded.</returns>
+    /// <remarks>Missing logger prerequisites, uncertain sends, and exhausted real safe attempts remain visible until reviewed.</remarks>
     /// <example><code>var outstanding = await store.CountPendingAlertsAsync(token);</code></example>
     Task<int> CountPendingAlertsAsync(CancellationToken token);
 }
@@ -65,9 +66,9 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
 {
     /// <summary>Independent users.db context factory.</summary>
     private readonly UserDbContextFactory _factory;
-    /// <summary>Current global operator authorization; tenant administrators never receive these alerts.</summary>
+    /// <summary>Startup logger configuration; never used as private incident recipient authority.</summary>
     private readonly AppConfig _configuration;
-    /// <summary>Optional live global authority; removed operators cannot receive old incident intents after reload.</summary>
+    /// <summary>Optional live root logger configuration, authoritative over the startup snapshot.</summary>
     private readonly Microsoft.Extensions.Configuration.IConfiguration _liveConfiguration;
     /// <summary>Validated startup resource bounds.</summary>
     private readonly TelegramEndpointRoutingOptions _options;
@@ -87,7 +88,7 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
     /// <summary>Finite safe worker result categories.</summary>
     private static readonly HashSet<string> DeliveryCategories = new(StringComparer.Ordinal)
     {
-        "transport_unconfigured", "transport_unavailable", "notifier_identity_mismatch", "notifier_not_cloud", "recipient_unauthorized",
+        "logger_unconfigured", "logger_unavailable", "transport_unavailable", "pre_send_identity_mismatch",
         "pre_send_timeout", "pre_send_failure", "send_uncertain", "worker_interrupted", "retry_exhausted", "send_rejected", "rate_limited"
     };
 
@@ -101,9 +102,9 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
     };
     /// <summary>Creates the endpoint-only durable store.</summary>
     /// <param name="factory">Required users.db factory; every operation owns and disposes its context.</param>
-    /// <param name="configuration">Required application global-superadmin authorization source; tokens are never persisted.</param>
+    /// <param name="configuration">Required application logger configuration; tokens are never persisted.</param>
     /// <param name="options">Optional trusted startup settings; omission uses safe defaults.</param>
-    /// <param name="liveConfiguration">Optional live global configuration; production rechecks the current allow-list before creating or sending operator incidents.</param>
+    /// <param name="liveConfiguration">Optional live root logger configuration; when supplied it replaces startup logger authority.</param>
     /// <remarks>No schema creation, network calls, or migrations run in this constructor.</remarks>
     public TelegramEndpointStore(UserDbContextFactory factory, AppConfig configuration, TelegramEndpointRoutingOptions options = null,
         Microsoft.Extensions.Configuration.IConfiguration liveConfiguration = null)
@@ -202,7 +203,7 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
         {
             await using var db = _factory.CreateDbContext();
             await using var transaction = await db.Database.BeginTransactionAsync(ct);
-            // The same SQLite transaction fences the CAS proposal, immutable receipt, and global-recipient intents.
+            // The same SQLite transaction fences the CAS proposal, immutable history, and one permanent incident receipt.
             var existing = await db.TelegramEndpointStates.SingleOrDefaultAsync(x => x.BotId == proposed.BotId && x.TelegramBotId == proposed.TelegramBotId, ct);
             if (existing == null || existing.Revision != expectedRevision) return (Success: false, Revision: 0L, Control: 0L);
             if (proposed.Generation < existing.Generation) throw new ArgumentException("Endpoint generation cannot decrease.", nameof(state));
@@ -230,13 +231,10 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
                     ? next.OutageId ?? next.OperationId : next.OperationId ?? next.OutageId;
                 incident ??= $"revision:{next.Revision}";
                 var key = $"{next.BotId}:{next.TelegramBotId}:{incident}:{alertCategory}";
-                foreach (var recipient in TelegramEndpointAdministratorPolicy.Recipients(_liveConfiguration, _configuration).Distinct())
-                {
-                    var inserted = await db.Database.ExecuteSqlInterpolatedAsync(
-                        $"INSERT OR IGNORE INTO TelegramEndpointAlertReceipts (IncidentKey, RecipientTelegramUserId) VALUES ({key}, {recipient})", ct);
-                    if (inserted == 1)
-                        await db.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO TelegramEndpointAlerts (IncidentKey, BotId, TelegramBotId, RecipientTelegramUserId, Category, MigrationState, DesiredEndpoint, EffectiveEndpoint, Generation, CreatedAtUtc, Status, Attempts, NextAttemptAtUtc) VALUES ({key}, {next.BotId}, {next.TelegramBotId}, {recipient}, {alertCategory}, {(int)next.MigrationState}, {(int)next.DesiredEndpoint}, {(int)next.EffectiveEndpoint}, {next.Generation}, {now}, {(int)TelegramEndpointAlertStatus.Pending}, {0}, {now})", ct);
-                }
+                var inserted = await db.Database.ExecuteSqlInterpolatedAsync(
+                    $"INSERT OR IGNORE INTO TelegramEndpointAlertReceipts (IncidentKey) VALUES ({key})", ct);
+                if (inserted == 1)
+                    await db.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO TelegramEndpointAlerts (IncidentKey, BotId, TelegramBotId, Category, MigrationState, DesiredEndpoint, EffectiveEndpoint, Generation, CreatedAtUtc, Status, Attempts, NextAttemptAtUtc) VALUES ({key}, {next.BotId}, {next.TelegramBotId}, {alertCategory}, {(int)next.MigrationState}, {(int)next.DesiredEndpoint}, {(int)next.EffectiveEndpoint}, {next.Generation}, {now}, {(int)TelegramEndpointAlertStatus.Pending}, {0}, {now})", ct);
             }
             await transaction.CommitAsync(ct);
             return (Success: true, Revision: next.Revision, Control: next.ControlRevision);
@@ -300,31 +298,41 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
         return row;
     }, token);
 
-    /// <summary>Persists the at-most-once send boundary after all pre-send transport checks.</summary>
+    /// <summary>Atomically freezes the verified channel destination and persists the at-most-once send boundary.</summary>
     /// <param name="alert">Exclusive detached claim containing its id and claim identity.</param>
+    /// <param name="destinationChatId">Negative Telegram channel chat id verified by the worker using current bot post permissions.</param>
     /// <param name="now">Current UTC instant.</param>
     /// <param name="token">Cancellation of local database work.</param>
-    /// <returns>True only when the live pre-send claim was fenced durably; false prohibits sending.</returns>
-    /// <remarks>Authorization is checked here immediately before the send boundary. No Telegram request occurs in this method.</remarks>
-    public Task<bool> MarkAlertSendStartedAsync(TelegramEndpointAlert alert, DateTime now, CancellationToken token)
+    /// <returns>True only when the live pre-send claim and unchanged destination were fenced durably; false prohibits sending.</returns>
+    /// <remarks>The worker must retain a normal Cloud request lease through this write and send completion. A frozen destination cannot change after a definitive 429. No Telegram request occurs here.</remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The destination is not negative.</exception>
+    /// <example><code>if (await store.MarkAlertSendStartedAsync(alert, channel.Id, now, token)) await client.SendMessage(channel.Id, text, cancellationToken: token);</code></example>
+    public Task<bool> MarkAlertSendStartedAsync(TelegramEndpointAlert alert, long destinationChatId, DateTime now, CancellationToken token)
     {
-        if (!IsAuthorizedRecipient(alert.RecipientTelegramUserId)) return Task.FromResult(false);
+        ArgumentNullException.ThrowIfNull(alert);
+        if (destinationChatId >= 0) throw new ArgumentOutOfRangeException(nameof(destinationChatId));
         return SqliteOperation.RunAsync(async ct =>
         {
             await using var db = _factory.CreateDbContext();
-            return await db.TelegramEndpointAlerts.Where(x => x.Id == alert.Id && x.ClaimId == alert.ClaimId && x.Status == TelegramEndpointAlertStatus.Processing && x.SendStartedAtUtc == null && x.LeaseUntilUtc > now)
-                .ExecuteUpdateAsync(s => s.SetProperty(x => x.SendStartedAtUtc, (DateTime?)now).SetProperty(x => x.SendDeadlineAtUtc, (DateTime?)now.AddSeconds(_options.MigrationTimeoutSeconds + 30)), ct) == 1;
+            var updated = await db.TelegramEndpointAlerts.Where(x => x.Id == alert.Id && x.ClaimId == alert.ClaimId &&
+                    x.Status == TelegramEndpointAlertStatus.Processing && x.SendStartedAtUtc == null && x.LeaseUntilUtc > now &&
+                    (x.DestinationChatId == null || x.DestinationChatId == destinationChatId))
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.DestinationChatId, (long?)destinationChatId)
+                    .SetProperty(x => x.SendStartedAtUtc, (DateTime?)now)
+                    .SetProperty(x => x.SendDeadlineAtUtc, (DateTime?)now.AddSeconds(_options.MigrationTimeoutSeconds + 30)), ct) == 1;
+            if (updated) alert.DestinationChatId = destinationChatId;
+            return updated;
         }, token);
     }
 
-    /// <summary>Commits a safe retry or terminal delivery outcome without ever clearing a send boundary.</summary>
+    /// <summary>Commits a safe pre-send retry or terminal delivery outcome without clearing an ambiguous send boundary.</summary>
     /// <param name="alert">Exclusive detached claim.</param>
     /// <param name="status">Pending only before the send boundary; Delivered requires successful provider acknowledgment.</param>
     /// <param name="category">Optional closed worker category; never raw exception text.</param>
     /// <param name="now">Current UTC instant.</param>
     /// <param name="token">Cancellation of local database work.</param>
     /// <returns>A task completing after the owned claim is updated; a superseded claim changes nothing.</returns>
-    /// <remarks>Attempts are capped and unresolved rows retained indefinitely. Only acknowledged delivery history is pruned.</remarks>
+    /// <remarks>Missing logger/sender prerequisites refund the pre-send claim and remain Pending indefinitely with capped scheduling. Real read failures consume the finite attempt budget. Unresolved rows and compact receipts are never pruned.</remarks>
     /// <exception cref="ArgumentException">The result status or diagnostic category is not part of the closed delivery protocol.</exception>
     /// <exception cref="InvalidOperationException">Acknowledged delivery is proposed without a persisted send boundary.</exception>
     public Task FinishAlertAsync(TelegramEndpointAlert alert, TelegramEndpointAlertStatus status, string category, DateTime now, CancellationToken token)
@@ -341,10 +349,14 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
             if (status == TelegramEndpointAlertStatus.Delivered && row.SendStartedAtUtc == null)
                 throw new InvalidOperationException("Delivery acknowledgment requires a durable send boundary.");
             if (status == TelegramEndpointAlertStatus.Pending && row.SendStartedAtUtc != null) status = TelegramEndpointAlertStatus.DeliveryUncertain;
-            if (status == TelegramEndpointAlertStatus.Pending && row.Attempts >= _options.NotificationMaxAttempts) status = TelegramEndpointAlertStatus.ManualReview;
+            var prerequisiteMissing = status == TelegramEndpointAlertStatus.Pending &&
+                category is "logger_unconfigured" or "logger_unavailable" or "transport_unavailable";
+            if (prerequisiteMissing) row.Attempts = Math.Max(0, row.Attempts - 1);
+            else if (status == TelegramEndpointAlertStatus.Pending && row.Attempts >= _options.NotificationMaxAttempts) status = TelegramEndpointAlertStatus.ManualReview;
             row.Status = status;
             row.ErrorCategory = category;
-            row.NextAttemptAtUtc = now.AddSeconds(Math.Min(_options.RetryMaxSeconds, 5 * Math.Pow(2, Math.Min(row.Attempts - 1, 10))));
+            row.NextAttemptAtUtc = now.AddSeconds(Math.Min(_options.RetryMaxSeconds,
+                prerequisiteMissing ? _options.RetryMaxSeconds : 5 * Math.Pow(2, Math.Clamp(row.Attempts - 1, 0, 10))));
             row.ClaimId = null;
             row.LeaseUntilUtc = null;
             if (status == TelegramEndpointAlertStatus.Delivered) row.DeliveredAtUtc = now;
@@ -359,7 +371,7 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
     /// <param name="retryAfterSeconds">Provider retry-after seconds, optional; bounded by the configured finite retry cap.</param>
     /// <param name="token">Local persistence cancellation, never a mutation retry token.</param>
     /// <returns>A task completing after the matching claim is released; stale claims cannot clear another send boundary.</returns>
-    /// <remarks>Only a definitive 429 proves this message was not accepted. Timeouts/5xx/lost replies remain uncertain through FinishAlertAsync. Maximum attempts still produce visible manual review.</remarks>
+    /// <remarks>Only a definitive 429 proves this message was not accepted. The frozen DestinationChatId remains unchanged, preventing retry into a newly configured channel. Timeouts/5xx/lost replies remain uncertain through FinishAlertAsync. Maximum attempts still produce visible manual review.</remarks>
     /// <example><code>await store.RetryRateLimitedAlertAsync(alert, DateTime.UtcNow, api.Parameters?.RetryAfter, token);</code></example>
     public Task RetryRateLimitedAlertAsync(TelegramEndpointAlert alert, DateTime now, int? retryAfterSeconds, CancellationToken token)
     {
@@ -381,6 +393,38 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
         }, token);
     }
 
+    /// <summary>Releases a marked claim only when the worker proves that it never invoked the SDK send method.</summary>
+    /// <param name="alert">Exclusive detached Processing claim whose send marker was persisted but no send was dispatched.</param>
+    /// <param name="category">Closed logger_unavailable or transport_unavailable prerequisite category; never an exception message.</param>
+    /// <param name="now">Current UTC scheduling instant.</param>
+    /// <param name="token">Cancellation of the local persistence write.</param>
+    /// <returns>A task completing after the matching marked claim returns to Pending; stale claims change nothing.</returns>
+    /// <remarks>Only the immediate post-marker/pre-SDK admission fence may call this method. Never call after invoking SendMessage, including on cancellation, timeout, or lost response. The negative destination remains frozen, while the unused attempt is refunded and scheduling is capped.</remarks>
+    /// <exception cref="ArgumentException">The category is not one of the two supported pre-dispatch prerequisites.</exception>
+    /// <example><code>if (!routeStillAvailable) await store.DeferUnsentAlertAsync(alert, "transport_unavailable", now, token); // Before any SDK dispatch only.</code></example>
+    public Task DeferUnsentAlertAsync(TelegramEndpointAlert alert, string category, DateTime now, CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(alert);
+        if (category is not ("logger_unavailable" or "transport_unavailable"))
+            throw new ArgumentException("Invalid pre-dispatch prerequisite category.", nameof(category));
+        return SqliteOperation.RunAsync(async ct =>
+        {
+            await using var db = _factory.CreateDbContext();
+            var row = await db.TelegramEndpointAlerts.SingleOrDefaultAsync(x => x.Id == alert.Id && x.ClaimId == alert.ClaimId &&
+                x.Status == TelegramEndpointAlertStatus.Processing && x.SendStartedAtUtc != null, ct);
+            if (row == null) return false;
+            row.Status = TelegramEndpointAlertStatus.Pending;
+            row.ErrorCategory = category;
+            row.Attempts = Math.Max(0, row.Attempts - 1);
+            row.NextAttemptAtUtc = now.AddSeconds(_options.RetryMaxSeconds);
+            row.SendStartedAtUtc = row.SendDeadlineAtUtc = null;
+            row.ClaimId = null;
+            row.LeaseUntilUtc = null;
+            await db.SaveChangesAsync(ct);
+            return true;
+        }, token);
+    }
+
     /// <summary>Prunes a bounded page of old acknowledged alerts; unresolved incidents and transition history are never deleted.</summary>
     /// <param name="now">Current UTC instant; delivered receipts are retained at least 90 days.</param>
     /// <param name="token">Cancellation of local database work.</param>
@@ -393,33 +437,13 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
         return await db.TelegramEndpointAlerts.Where(x => ids.Contains(x.Id)).ExecuteDeleteAsync(ct);
     }, token);
 
-    /// <summary>Rechecks current global-superadmin authorization without consulting tenant privileges.</summary>
-    /// <param name="recipient">Positive global Telegram user id captured by an alert intent.</param>
-    /// <returns>True only for a current globally configured superadmin.</returns>
-    public bool IsAuthorizedRecipient(long recipient) => TelegramEndpointAdministratorPolicy.IsAuthorized(_liveConfiguration, _configuration, recipient);
-
-    /// <summary>Checks durable history across all internal aliases before allowing an identity to be the reserved Cloud notifier.</summary>
-    /// <param name="botId">Exact reserved owned registry identifier.</param>
-    /// <param name="identity">Positive expected notifier BotFather identity.</param>
-    /// <param name="token">Cancellation of local database work.</param>
-    /// <returns>True only when the current identity and all its historical aliases have no Local intent or session evidence.</returns>
-    /// <remarks>No probing or transport activation occurs. Append-only history prevents a recovered formerly Local bot being repurposed as independent notifier.</remarks>
-    public Task<bool> IsNotifierCloudOnlyAsync(string botId, long identity, CancellationToken token)
-    {
-        ValidateIdentity(botId, identity);
-        return SqliteOperation.RunAsync(async ct =>
-        {
-            await using var db = _factory.CreateDbContext();
-            if (await db.TelegramEndpointStates.AnyAsync(x => x.TelegramBotId == identity &&
-                (x.DesiredEndpoint != TelegramEndpointType.Cloud || x.EffectiveEndpoint != TelegramEndpointType.Cloud ||
-                 x.MigrationState != TelegramEndpointMigrationState.Cloud || x.CloudReuseEligibleAtUtc != null ||
-                 x.LogoutAttemptedAtUtc != null || x.LogoutAcknowledgedAtUtc != null || x.OperationId != null), ct)) return false;
-            return !await db.TelegramEndpointHistory.AnyAsync(x => x.TelegramBotId == identity &&
-                (x.FromDesiredEndpoint == TelegramEndpointType.Local || x.ToDesiredEndpoint == TelegramEndpointType.Local ||
-                 x.FromEffectiveEndpoint == TelegramEndpointType.Local || x.ToEffectiveEndpoint == TelegramEndpointType.Local ||
-                 x.MigrationState != TelegramEndpointMigrationState.Cloud), ct);
-        }, token);
-    }
+    /// <summary>Resolves the current root logger destination with the current registry-default fallback.</summary>
+    /// <param name="fallback">Optional current default bot logger destination, supplied by the worker; never a bot id or token.</param>
+    /// <returns>Canonical destination text, or an empty string when neither configured source is valid. The worker must still prove a negative Channel and actual post permission.</returns>
+    /// <remarks>Live configuration, when supplied, is authoritative even when blank; a removed live value never revives startup configuration. This performs no Telegram or database operation and never authorizes a private recipient.</remarks>
+    /// <example><code>var destination = store.ResolveLoggerChannel(registry.DefaultBot?.LoggerChannel);</code></example>
+    public string ResolveLoggerChannel(string fallback) =>
+        TelegramDestination.SelectValid(_liveConfiguration != null ? _liveConfiguration["loggerChannel"] : _configuration.LoggerChannel, fallback);
 
     /// <summary>Identifies migration/control intent changes while ignoring ordinary health hysteresis.</summary>
     /// <param name="before">Durable state before CAS.</param>

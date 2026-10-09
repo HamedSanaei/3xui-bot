@@ -259,7 +259,7 @@ public sealed partial class ConcurrencyTests
 
     /// <summary>Additive rollout preserves existing conversation state, performs no historical grant backfill and retains terminal receipts on rollback.</summary>
     /// <returns>A task after real migration upgrade, empty rollout, durable denial and refused destructive downgrade are checked.</returns>
-    /// <remarks>Even an unused free quota denial is permanent event evidence; rollback may not erase it to reauthorize delivery.</remarks>
+    /// <remarks>Even an unused free quota denial is permanent event evidence; rollback may not erase it to reauthorize delivery. Exercise the quota downgrade before the unrelated irreversible logger cutover, then prove the complete upgrade preserves the receipt and conversation.</remarks>
     [Fact]
     public async Task ColleagueTrialQuota_Migration_has_no_backfill_and_downgrade_cannot_erase_receipts()
     {
@@ -271,14 +271,19 @@ public sealed partial class ConcurrencyTests
         await db.GetService<IMigrator>().MigrateAsync(previous);
         db.BotUserStates.Add(new BotUserState { BotId = "owned-existing", TelegramUserId = 901, Flow = "active-purchase" });
         await db.SaveChangesAsync();
-        await db.Database.MigrateAsync();
+        // Reach the complete pre-cutover schema so the quota guard, rather than the unrelated
+        // irreversible logger migration, rejects destructive rollback. Upgrade to latest afterward.
+        await db.GetService<IMigrator>().MigrateAsync("20261009120000_AddTelegramEndpointRouting");
         Assert.Equal(0, await db.ColleagueTrialGrants.CountAsync());
         Assert.Equal("active-purchase", (await db.BotUserStates.AsNoTracking().SingleAsync()).Flow);
-        Assert.False(db.Database.HasPendingModelChanges());
         var denied = await new ColleagueTrialQuotaStore(databases.Users).ReserveAsync(901, "owned-existing", "normal",
             "trial:owned-existing:901:1", 0, new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc));
         await Assert.ThrowsAsync<SqliteException>(() => db.GetService<IMigrator>().MigrateAsync(previous));
         Assert.Equal(denied.Id, (await db.ColleagueTrialGrants.AsNoTracking().SingleAsync()).Id);
+        await db.Database.MigrateAsync();
+        Assert.False(db.Database.HasPendingModelChanges());
+        Assert.Equal(denied.Id, (await db.ColleagueTrialGrants.AsNoTracking().SingleAsync()).Id);
+        Assert.Equal("active-purchase", (await db.BotUserStates.AsNoTracking().SingleAsync()).Flow);
     }
 
     /// <summary>Same-event free duplicates grant one executor; a crash before POST cannot free or replay its held request.</summary>

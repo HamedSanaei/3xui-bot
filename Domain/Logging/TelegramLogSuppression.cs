@@ -124,7 +124,8 @@ namespace Adminbot.Domain.Logging
         /// latency-telemetry families handled by <see cref="ShouldSuppressLatencyTelemetry"/>, the controlled guard
         /// outcomes handled by <see cref="ShouldSuppressControlledLatencyEvent"/>, the routine success families handled
         /// by <see cref="ShouldSuppressRoutineSuccessTelemetry"/>, the repeated Warning families handled by
-        /// <see cref="ShouldSuppressRepeatedIncidentFamily"/>, and the two routine tenant storefront funding bookkeeping
+        /// <see cref="ShouldSuppressRepeatedIncidentFamily"/>, the exact endpoint logger-delivery retained warning
+        /// (preventing recursive transport fallback), and the two routine tenant storefront funding bookkeeping
         /// successes (the durable owner notification is unaffected). The first ambiguous UniquePay create and the
         /// terminal recovery/manual-review transition use different messages and remain visible. Business failures such
         /// as invalid tokens, duplicate tokens, XUI scan/delivery failures, funding delivery uncertainty, payment
@@ -165,6 +166,12 @@ namespace Adminbot.Domain.Logging
             // A Telegram 429 is itself the failure being reported. Forwarding it to the Telegram channel would issue
             // another send that is subject to the same rate limit, amplifying the 429 storm instead of quieting it.
             if (TelegramRateLimitPolicy.IsRateLimited(exception))
+                return true;
+
+            // The durable endpoint worker owns this delivery itself. Never route its own retained-outbox
+            // diagnostic through the ordinary logger, which might recursively use a Local or private fallback.
+            if (exception == null && message?.StartsWith(
+                    "Telegram endpoint operator alert retained. category=", StringComparison.Ordinal) == true)
                 return true;
 
             // Controlled UX latency-guard outcomes are expected results, not incidents. They stay fully visible in the

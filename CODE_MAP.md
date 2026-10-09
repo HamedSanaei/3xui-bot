@@ -1681,8 +1681,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 ## Per-bot Telegram Cloud / Local routing
 
 - `Services/TelegramEndpoints/` owns validated startup options, exact-identity users.db state/history/alert stores,
-  durable coordinator/health worker, runtime admission gate, routed SDK facade, private Super Admin panel and independent
-  Cloud-only notification worker. Existing bots default Cloud; no install/deployment migration changes their endpoint.
+  durable coordinator/health worker, runtime admission gate, routed SDK facade, private Super Admin panel and direct
+  logger-channel notification worker. Existing bots default Cloud; no install/deployment migration changes their endpoint.
 - Migration `20261009120000_AddTelegramEndpointRouting` adds four endpoint-only users.db tables (state, append-only
   history, alert outbox, permanent compact alert receipts), no financial/schema cutover. Key is internal BotId + numeric
   BotFather id; CAS `Revision` differs from operator `ControlRevision`; token/identity replacement cannot reuse old routing.
@@ -1702,12 +1702,15 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - **🌐 مدیریت Telegram API** / `/telegram_api`: global live Super Admin allowlist only, private enabled owned host,
   actor/chat/message/host/BotFather-bound ten-minute single-use callbacks, confirmation + control revision. Another healthy
   owned bot provides recovery control; tenant owners/customers/assistant hosts have no authority.
-- Explicit `notificationBotId` + `notificationTelegramBotId` reserve an enabled owned Cloud-only identity, including aliases.
-  Durable incident/recipient deduplication survives delivered-detail retention. Post-send uncertainty is visible, not replayed;
-  absent notification transport retains bounded pending/manual-review alerts. Never assume the affected token can alert via Cloud.
+- Endpoint incidents: one permanent incident receipt/outbox row, sent directly to live root `loggerChannel` (current default
+  logger fallback) using an existing enabled owned nonassistant Cloud/CloudRecovered bot; verify getMe/channel/post permission.
+  Counted normal lease spans checks/marker/send; Local/migrating/unhydrated/fenced tokens never probe Cloud. No notifier ids/private sends.
+  Missing logger/eligible sender stays Pending with budget refund/capped delay; frozen negative destination survives 429; uncertainty never replayed.
+  Migration `20261009130000_RouteEndpointIncidentsToLoggerChannel` consolidates only endpoint alert/receipt tables;
+  prior ACK/pruned/started receipts prohibit replay, private recipient ids removed. Down deliberately refuses unsafe reconstruction.
 - JSONL v1 adds nullable endpoint type/generation/state and four closed endpoint event families. Report series separate
   bot/endpoint/method/HTTP-SDK-foreground boundary and retain bounded newest-100 endpoint history; private actor audit stays in DB.
-- `docs/telegram-api-endpoints.md` covers official restrictions, file/notifier prerequisites, safe disable, staged dedicated-bot
+- `docs/telegram-api-endpoints.md` covers official restrictions, file/logger prerequisites, safe disable, staged dedicated-bot
   rollout and rollback. Older Cloud-only binaries are unsafe until every Local/uncertain identity is safely resolved to Cloud.
 
 - Dynamic registry/token probes hydrate exact saved routes before admission; A→B→A cannot forget Local/uncertain epochs.
