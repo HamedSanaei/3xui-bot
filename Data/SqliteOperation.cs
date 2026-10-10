@@ -107,7 +107,8 @@ public static class SqliteOperation
     /// <param name="attempt">One-based actual invocation count; zero if cancelled before the first invocation.</param>
     /// <param name="failure">Optional original failure; only safe category and numeric SQLite code are inspected.</param>
     /// <param name="outcome">Closed completed, failed, cancelled, or retrying category.</param>
-    /// <remarks>Background records deliberately omit unavailable update identity rather than inventing an update.</remarks>
+    /// <remarks>Fast, successful background completions contribute bounded aggregates before any detail event
+    /// is allocated. Slow/error/retried work retains full details; background records omit unavailable update identity.</remarks>
     private static void Record(LatencyTelemetryService telemetry, TelegramUpdateLatencyScope scope, string eventType,
         string category, double elapsedMs, int retryCount, double busyWaitMs, int attempt, Exception failure, string outcome)
     {
@@ -115,6 +116,8 @@ public static class SqliteOperation
         {
             if (LatencyTelemetrySuppression.IsActive || telemetry?.Enabled != true) return;
             var receiver = UpdateTelemetryTracker.Current;
+            if (failure == null && telemetry.TryAggregateBackgroundSqlite(eventType, category,
+                LatencySqliteOperationScope.Current, elapsedMs, outcome, scope != null || receiver != null, retryCount)) return;
             telemetry.TryRecord(new LatencyTelemetryEvent
             {
                 EventType = eventType, TraceId = scope?.TraceId ?? receiver?.TraceId,

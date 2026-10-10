@@ -176,6 +176,36 @@ public sealed class LatencyTelemetryReportTests
         Assert.DoesNotContain("bot=", text, StringComparison.Ordinal);
     }
 
+    /// <summary>Healthy background histograms contribute exact weighted operation counts without inventing individual durations.</summary>
+    /// <returns>A task asserting weighted quantiles, approximate maxima, global visibility and rejection of malformed archive weights.</returns>
+    /// <remarks>Ten thousand fast operations occupy one record. Negative, overflowing, wrong-length and mismatched histograms must not contaminate its metrics or become arbitrary report output.</remarks>
+    [Fact]
+    public async Task Background_sqlite_histograms_are_weighted_bounded_and_validated()
+    {
+        using var archive = new Archive();
+        var now = DateTime.UtcNow.AddMinutes(-1);
+        var counts = new long[LatencySqliteBackgroundAggregator.BucketCount];
+        counts[8] = 9000; counts[10] = 1000;
+        var valid = Row("sqlite_background_aggregate", now, null) with
+        {
+            Category = "payment_settlement_notification", Operation = "sqlite_read", TimingQuality = "aggregated_histogram_upper_bounds",
+            ObservationCount = 10000, DurationBucketCounts = counts, WindowSeconds = 30
+        };
+        var negative = (long[])counts.Clone(); negative[0] = -1;
+        var overflow = new long[LatencySqliteBackgroundAggregator.BucketCount]; overflow[0] = long.MaxValue; overflow[1] = 1;
+        await archive.WriteAsync(valid, valid with { ObservationCount = 9999 },
+            valid with { DurationBucketCounts = new long[1] }, valid with { DurationBucketCounts = negative },
+            valid with { DurationBucketCounts = overflow }, valid with { TraceId = "correlated_trace" });
+        var (code, text) = await archive.ReportAsync("--bot", "GozargahNetwork_Bot");
+        Assert.Equal(0, code);
+        var line = Assert.Single(text.Split('\n'), row => row.StartsWith("bot/category/event=global/payment_settlement_notification/sqlite_background_aggregate/sqlite_read", StringComparison.Ordinal));
+        Assert.Contains("events=10000 count=10000", line);
+        Assert.Contains("max~=1.024 ms failed=0 slow=0", line);
+        Assert.Contains("malformed=5", text);
+        Assert.DoesNotContain("correlated_trace", text);
+        Assert.DoesNotContain("unknownEvents=1", text);
+    }
+
 
     /// <summary>Bot filtering isolates all bot families while global loss remains visible and cumulative gauges are not summed.</summary>
     /// <returns>A task completing after a filtered scan.</returns>

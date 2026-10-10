@@ -1063,6 +1063,8 @@ public class XuiV3RenewalOperationStore
     /// <remarks>
     /// Ambiguous and stale processing rows are eligible only after their backoff time. Applied-but-unsettled rows are
     /// also returned so settlement can finish after a restart. Claiming never sends a panel mutation.
+    /// Idle scans read eligibility first and never issue a zero-row expiry UPDATE. The write repeats the same
+    /// no-mutation predicate; a row becoming stale after the read is safely deferred to the next reconciliation scan.
     /// </remarks>
     /// <example><code>var due = await store.ClaimDueReconciliationAsync(10, stoppingToken);</code></example>
     public async Task<IReadOnlyList<XuiV3RenewalOperation>> ClaimDueReconciliationAsync(
@@ -1075,12 +1077,13 @@ public class XuiV3RenewalOperationStore
 
         // A pending row with no mutation marker cannot have called UpdateClient. Once its original lease is stale it
         // is safe to fail and unlock; processing/mutation-started rows are never handled this way.
-        await context.XuiV3RenewalOperations
+        var expiredPending = context.XuiV3RenewalOperations
             .Where(x => x.RecoveryEligible &&
                         x.Status == XuiV3RenewalOperationStatuses.Pending &&
                         x.MutationStartedAtUtc == null &&
-                        x.LeaseUntilUtc < now)
-            .ExecuteUpdateAsync(
+                        x.LeaseUntilUtc < now);
+        if (await expiredPending.AnyAsync(cancellationToken))
+            await expiredPending.ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(x => x.Status, XuiV3RenewalOperationStatuses.Failed)
                     .SetProperty(x => x.AccountLockKey, (string)null)

@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using System.Data.Common;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot.Exceptions;
@@ -81,8 +83,8 @@ public sealed partial class ConcurrencyTests
 
     /// <summary>Routes a live blocked-handler warning while keeping its completed stage timing local.</summary>
     /// <returns>A task completing after the controlled barrier releases and actual operator routing drains.</returns>
-    /// <remarks>Formatter spellings are not pinned. The barrier proves the warning occurs during execution;
-    /// completed diagnostic stages remain Information and never become operator-channel events.</remarks>
+    /// <remarks>The stage-entry barrier also proves a slow stage actually ran before the test releases it.
+    /// A loaded machine can fire the handler watchdog before the executor reaches its first stage.</remarks>
     [Fact]
     public async Task Live_probe_warning_routes_but_completed_stage_timing_stays_local()
     {
@@ -95,16 +97,23 @@ public sealed partial class ConcurrencyTests
             "-1001234567890", "-1001234567891", dispatcher,
             new TrialAccountLoggingSettings(new AppConfig(), fixture.Options.OutboxDatabasePath + ".settings.json")));
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var scheduler = new TelegramUpdateScheduler(databases.Inbox, new Executor(async (_, token) =>
         {
             using (TelegramUpdateLatencyScope.Current!.Measure(TelegramUpdateStage.TelegramProbe))
+            {
+                // Watchdog delivery alone does not prove the executor has entered or spent time in this stage.
+                await Task.Delay(TimeSpan.FromMilliseconds(20), token);
+                entered.TrySetResult();
                 await release.Task.WaitAsync(token);
+            }
         }), new AppConfig { TelegramUpdateMaxConcurrency = 1, TelegramUpdateQueueCapacity = 4, TelegramUpdateShutdownDrainSeconds = 2 }, logs)
         { LongHandlerWarningThreshold = TimeSpan.FromMilliseconds(40), SlowStageThreshold = TimeSpan.FromMilliseconds(10) };
         await scheduler.StartAsync(default);
         try
         {
             await scheduler.EnqueueAsync("identity-probe-routing", Update(1, 92002), default);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await Until(() => sender.Texts.Any(x => x.Contains("running unusually long", StringComparison.Ordinal)));
             release.SetResult();
             await Until(() => logs.Records.Any(x => x.Message.Contains("slow update stage", StringComparison.Ordinal)) && scheduler.ActiveHandlerCount == 0);
@@ -116,6 +125,126 @@ public sealed partial class ConcurrencyTests
         Assert.Equal("TelegramProbe", stage.State["Stage"]?.ToString());
         Assert.True(Assert.IsType<double>(stage.State["ElapsedMs"]) >= 10);
         Assert.DoesNotContain(sender.Texts, x => x.Contains("slow update stage", StringComparison.Ordinal));
+    }
+
+    /// <summary>Completed handlers cannot emit live warnings or inherit delayed post-handler SQLite review time.</summary>
+    /// <returns>A task completing after the real review query is released and both terminal receipts persist.</returns>
+    /// <remarks>A second genuinely blocked handler proves the watchdog service still fires while the first completed
+    /// handler remains in post-handler persistence. This protects against false blocker alerts and inflated handler
+    /// durations without disabling diagnostics or changing their threshold.</remarks>
+    [Fact]
+    public async Task Post_handler_review_does_not_extend_live_watchdog_or_handler_duration()
+    {
+        using var databases = new Databases();
+        var review = new PostHandlerReviewBarrier();
+        var factory = new UserDbContextFactory(new DbContextOptionsBuilder<UserDbContext>()
+            .UseSqlite(SqliteOperation.ConnectionString(Path.Combine(databases.DirectoryPath, "users.db")))
+            .AddInterceptors(review).Options);
+        var inbox = new TelegramUpdateInboxStore(factory, databases.Credentials);
+        var logs = new SchedulerRoutingLogger(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+        var releaseSlow = Signal();
+        TelegramUpdateLatencyScope? completedScope = null;
+        using var scheduler = new TelegramUpdateScheduler(inbox, new Executor(async (item, token) =>
+        {
+            if (item.Update.Id == 1)
+            {
+                completedScope = TelegramUpdateLatencyScope.Current!;
+                review.Armed = true;
+            }
+            else await releaseSlow.Task.WaitAsync(token);
+        }), new AppConfig { TelegramUpdateMaxConcurrency = 2, TelegramUpdateQueueCapacity = 4,
+            TelegramUpdateShutdownDrainSeconds = 5 }, logs)
+        { LongHandlerWarningThreshold = TimeSpan.FromMilliseconds(40), InteractiveHandlerThreshold = TimeSpan.FromMilliseconds(30) };
+        await scheduler.StartAsync(default);
+        try
+        {
+            await scheduler.EnqueueAsync("review-watchdog", Update(1, 92011), default);
+            await review.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var priorWarnings = logs.Records.Count(x => x.State.ContainsKey("HandlerElapsedMs")
+                && Equals(x.State["UpdateId"], 1));
+            await scheduler.EnqueueAsync("review-watchdog", Update(2, 92012), default);
+            await Until(() => logs.Records.Any(x => x.State.ContainsKey("HandlerElapsedMs")
+                && Equals(x.State["UpdateId"], 2)));
+            Assert.Equal(priorWarnings, logs.Records.Count(x => x.State.ContainsKey("HandlerElapsedMs")
+                && Equals(x.State["UpdateId"], 1)));
+        }
+        finally
+        {
+            review.Release.TrySetResult();
+            releaseSlow.TrySetResult();
+            await scheduler.StopAsync(default);
+        }
+        var completion = Assert.Single(logs.Records, x => x.Level == LogLevel.Debug
+            && x.State.ContainsKey("HandlerDurationMs") && Equals(x.State["Sequence"], 1L));
+        Assert.Equal(completedScope!.Elapsed.TotalMilliseconds, Assert.IsType<double>(completion.State["HandlerDurationMs"]));
+        await using var check = factory.CreateDbContext();
+        var receipts = await check.TelegramUpdateInbox.OrderBy(x => x.Sequence).ToListAsync();
+        Assert.Equal(new[] { 1, 2 }, receipts.Select(x => x.UpdateId));
+        Assert.All(receipts, row => { Assert.Equal("completed", row.Status); Assert.Null(row.Payload); });
+    }
+
+    /// <summary>Holds the actual post-handler creation-review read after the first business handler completes.</summary>
+    /// <remarks>Only the isolated test database is affected; admission, claim and terminal persistence remain usable.</remarks>
+    private sealed class PostHandlerReviewBarrier : DbCommandInterceptor
+    {
+        /// <summary>Enabled by the completed business handler, never during database setup or admission.</summary>
+        internal volatile bool Armed;
+        /// <summary>Signals that post-handler review has reached the provider boundary.</summary>
+        internal readonly TaskCompletionSource Entered = Signal();
+        /// <summary>Test-controlled release of every intercepted review read.</summary>
+        internal readonly TaskCompletionSource Release = Signal();
+        /// <inheritdoc />
+        /// <remarks>Delays the real XUI creation-review query, not ExecuteAsync; cancellation still propagates.</remarks>
+        public override async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Armed && command.CommandText.Contains("\"XuiV3CreationOperations\"", StringComparison.Ordinal))
+            {
+                Entered.TrySetResult();
+                await Release.Task.WaitAsync(cancellationToken);
+            }
+            return result;
+        }
+    }
+
+    /// <summary>Dispatches an unrelated lane while another handler is executing a synchronous prologue.</summary>
+    /// <returns>A task completing after both effects and their durable terminal receipts are observed.</returns>
+    /// <remarks>Microsoft.Data.Sqlite async calls can complete synchronously. A blocking prologue must consume one
+    /// handler slot, not the coordinator or every other lane; the second lane must run before the first is released.</remarks>
+    [Fact]
+    public async Task Synchronous_handler_prologue_does_not_block_other_fifo_lanes()
+    {
+        using var databases = new Databases();
+        using var release = new ManualResetEventSlim();
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var scheduler = Create(databases, new Executor((item, token) =>
+        {
+            if (item.Update.Id == 1)
+            {
+                firstEntered.TrySetResult();
+                if (!release.Wait(TimeSpan.FromSeconds(5), token))
+                    throw new TimeoutException("The second lane did not dispatch independently.");
+            }
+            else secondEntered.TrySetResult();
+            return Task.CompletedTask;
+        }), concurrency: 2);
+        await scheduler.EnqueueAsync("sync-dispatch-regression", Update(1, 93001), default);
+        await scheduler.EnqueueAsync("sync-dispatch-regression", Update(2, 93002), default);
+        await scheduler.StartAsync(default);
+        try
+        {
+            await firstEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await secondEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            release.Set();
+            await scheduler.StopAsync(default);
+        }
+        Assert.Equal(0, (await databases.Inbox.ReadUncertainSummaryAsync(default)).Count);
+        Assert.Equal(0, await databases.Inbox.CountPendingAsync(default));
     }
 
     /// <summary>Separates a live request from whole-handler timing and keeps completed request telemetry local.</summary>

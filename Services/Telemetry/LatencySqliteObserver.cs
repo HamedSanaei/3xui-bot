@@ -41,7 +41,7 @@ internal sealed class LatencySqliteObserver(LatencyTelemetryService telemetry)
         catch { /* Diagnostics cannot change provider behavior. */ }
     }
 
-    /// <summary>Completes one SQLite boundary and emits a sanitized result, including operations with no update scope.</summary>
+    /// <summary>Completes one SQLite boundary, aggregating healthy fast background work and retaining correlated or problematic detail.</summary>
     /// <param name="id">EF-generated ownership id matching the start notification.</param>
     /// <param name="connection">Provider connection for a SQLite-only check; never retained.</param>
     /// <param name="duration">Optional EF-reported execution duration when no active slot exists; null means unavailable, never zero.</param>
@@ -50,7 +50,7 @@ internal sealed class LatencySqliteObserver(LatencyTelemetryService telemetry)
     /// <param name="stage">Compile-time fallback read/write stage.</param>
     /// <param name="outcome">Closed completed, failed, or cancelled category.</param>
     /// <param name="exception">Optional provider failure inspected only for numeric SQLite code and closed exception category.</param>
-    /// <remarks>Disposes the exact stage handle, then performs only a nonblocking writer enqueue. No SQL metadata is emitted.</remarks>
+    /// <remarks>Disposes the exact stage handle, then increments fixed atomic counters before allocating eligible detail; all other results use a nonblocking enqueue. Receiver admission correlation is preserved and no SQL metadata is emitted.</remarks>
     internal void Complete(Guid id, DbConnection connection, TimeSpan? duration, string eventType, string operation,
         TelegramUpdateStage stage, string outcome, Exception exception = null)
     {
@@ -64,15 +64,18 @@ internal sealed class LatencySqliteObserver(LatencyTelemetryService telemetry)
             if (LatencyTelemetrySuppression.IsActive || telemetry?.Enabled != true) return;
             var scope = found ? active.Scope : TelegramUpdateLatencyScope.Current;
             var receiver = UpdateTelemetryTracker.Current;
+            var elapsedMs = found ? Stopwatch.GetElapsedTime(active.Started).TotalMilliseconds : duration?.TotalMilliseconds;
+            var actualOperation = found ? active.Operation : operation;
+            var category = found ? active.Category : LatencySqliteOperationScope.Current;
+            if (exception == null && telemetry.TryAggregateBackgroundSqlite(eventType, actualOperation, category, elapsedMs,
+                outcome, scope != null || receiver != null)) return;
             telemetry.TryRecord(new LatencyTelemetryEvent
             {
                 EventType = eventType, TraceId = scope?.TraceId ?? receiver?.TraceId,
                 BotId = scope?.BotId ?? receiver?.BotId, UpdateId = scope?.UpdateId ?? receiver?.UpdateId,
                 Sequence = scope == null ? receiver?.Sequence : scope.Sequence > 0 ? scope.Sequence : null,
                 Stage = TelegramUpdateLatencyScope.StageName(found ? active.Stage : stage),
-                Operation = found ? active.Operation : operation, Outcome = outcome,
-                Category = found ? active.Category : LatencySqliteOperationScope.Current,
-                DurationMs = found ? Stopwatch.GetElapsedTime(active.Started).TotalMilliseconds : duration?.TotalMilliseconds,
+                Operation = actualOperation, Outcome = outcome, Category = category, DurationMs = elapsedMs,
                 SqliteErrorCode = ErrorCode(exception), ExceptionCategory = ExceptionCategory(exception),
                 CancellationSource = outcome == "cancelled" ? "caller" : null,
                 FailureClassification = ErrorCode(exception) is 5 or 6 ? "sqlite_contention" : exception == null ? null : "sqlite_failure",

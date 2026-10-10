@@ -193,7 +193,7 @@ namespace Adminbot.Domain.Logging
             // Repeated Warning families: the first occurrence of a condition is delivered as one bounded incident, and
             // the repeats that describe the same still-unresolved condition are withheld until its window elapses.
             // Every occurrence remains fully visible locally.
-            if (ShouldSuppressRepeatedIncidentFamily(message, nowTicks))
+            if (exception == null && ShouldSuppressRepeatedIncidentFamily(message, nowTicks))
                 return true;
 
             var combined = string.Join(
@@ -440,7 +440,7 @@ namespace Adminbot.Domain.Logging
         /// <summary>
         /// Decides whether one repeated Warning family must be withheld because the same condition was already reported.
         /// </summary>
-        /// <param name="message">Formatted log message. Only exact closed-vocabulary Warning families are inspected.</param>
+        /// <param name="message">Formatted log message with no attached exception. Only closed-vocabulary incident families are inspected.</param>
         /// <param name="nowTicks">Monotonic millisecond timestamp used by the bounded rate limiter.</param>
         /// <returns>
         /// <c>true</c> when an identical alert for the same bot and closed-vocabulary detail was already delivered inside
@@ -448,7 +448,7 @@ namespace Adminbot.Domain.Logging
         /// </returns>
         /// <remarks>
         /// <para>
-        /// Two production families repeat for as long as one condition lasts:
+        /// The following production families repeat for as long as one condition lasts:
         /// </para>
         /// <list type="bullet">
         /// <item><c>Telegram foreground delivery exceeded its interactive budget</c> — one customer interaction whose
@@ -458,6 +458,10 @@ namespace Adminbot.Domain.Logging
         /// <item><c>Telegram update handler running unusually long</c> — the live watchdog alert. It is keyed by bot and
         /// by the closed-vocabulary execution stage the handler is currently inside, so a handler that is genuinely
         /// stuck in a different stage still reports, while the same stuck stage does not repeat once a minute.</item>
+        /// <item><c>Telegram queue-delay incident.</c> — the aggregate for one bot/user FIFO lane. Repeated windows
+        /// stay local for ten minutes; another lane still reports independently.</item>
+        /// <item><c>Latency telemetry incident.</c> with <c>sqlite_busy</c> or <c>telemetry_writer_loss</c> — bounded
+        /// summaries keyed by category and bot. Other service, order and payment failures are never matched.</item>
         /// </list>
         /// <para>
         /// Keys are built only from identifiers already present in scheduler telemetry plus a closed enumeration member
@@ -484,6 +488,24 @@ namespace Adminbot.Domain.Logging
                                      (TryReadMessageToken(message, "BotId=") ?? "-") + "|" +
                                      (TryReadMessageToken(message, "Stage=") ?? "none");
                 return !RepeatedIncidentNotifications.ShouldNotify(longHandlerKey, RepeatedIncidentOperatorWindow, nowTicks);
+            }
+
+            if (message.StartsWith("Telegram queue-delay incident.", StringComparison.Ordinal))
+            {
+                var botId = TryReadMessageToken(message, "BotId=");
+                var userId = TryReadMessageToken(message, "TelegramUserId=");
+                if (botId == null || userId == null) return false;
+                return !RepeatedIncidentNotifications.ShouldNotify("queue-delay|" + botId + "|" + userId,
+                    RepeatedIncidentOperatorWindow, nowTicks);
+            }
+
+            if (message.StartsWith("Latency telemetry incident.", StringComparison.Ordinal))
+            {
+                var category = TryReadMessageToken(message, "Category=");
+                var botId = TryReadMessageToken(message, "BotId=");
+                if (botId != null && category is "sqlite_busy" or "telemetry_writer_loss")
+                    return !RepeatedIncidentNotifications.ShouldNotify("telemetry|" + category + "|" + botId,
+                        RepeatedIncidentOperatorWindow, nowTicks);
             }
 
             return false;

@@ -13,256 +13,112 @@ fail() {
   exit 64
 }
 
-# Built-in installation tutorials are shipped as ordinary publish files beside the application. The tenant customer flow
-# exposes the tutorial buttons unconditionally, so a release whose images were never copied would ship a guide that fails
-# at send time. This preflight inspects ONLY the staged publish artifact - never the developer source tree - so it proves
-# both that the asset copy rules work and that the artifact about to be synchronized is complete.
-REQUIRED_TUTORIAL_ASSET_DIRS=(
-  "android_v2rayng"
-  "windows_v2rayn"
-  "ios_android_v2box"
-)
+# Explicit status propagation preserves the fail-closed fix from 45fc9c5 even when callers use an OR-list.
+# GNU timeout kills the entire child process group, including hung command descendants.
+run_bounded() {
+  local seconds="$1"
+  shift
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || fail "command timeout must be a positive number of seconds."
+  timeout --signal=TERM --kill-after=10s "${seconds}s" "$@" 9>&- || return $?
+}
 
+REQUIRED_TUTORIAL_ASSET_DIRS=(android_v2rayng windows_v2rayn ios_android_v2box)
 assert_tutorial_assets() {
-  local publish_root="$1"
-  local tutorial_root="$publish_root/Assets/tutorials"
-  local dir target entry image_count
-
-  [[ -d "$tutorial_root" ]] || fail "published artifact is missing Assets/tutorials."
+  local publish_root="$1" dir entry count
   for dir in "${REQUIRED_TUTORIAL_ASSET_DIRS[@]}"; do
-    target="$tutorial_root/$dir"
-    [[ -d "$target" ]] || fail "published artifact is missing the built-in tutorial directory Assets/tutorials/$dir."
-    image_count=0
-    for entry in "$target"/*; do
-      [[ -f "$entry" ]] || continue
-      case "${entry,,}" in
-        *.jpg|*.jpeg|*.png) image_count=$((image_count + 1)) ;;
-      esac
+    [[ -d "$publish_root/Assets/tutorials/$dir" ]] || fail "missing built-in tutorial directory: $dir."
+    count=0
+    for entry in "$publish_root/Assets/tutorials/$dir"/*; do
+      [[ -f "$entry" && ! -L "$entry" ]] || continue
+      case "${entry,,}" in *.jpg|*.jpeg|*.png) count=$((count + 1)) ;; esac
     done
-    if ((image_count == 0)); then
-      fail "published tutorial directory Assets/tutorials/$dir contains no supported image files."
-    fi
+    ((count > 0)) || fail "tutorial directory contains no images: $dir."
   done
 }
 
-sync_source() {
-  local source_dir="$1"
-  local live_root="$2"
-  rsync -a --delete --checksum \
-    --filter='P bin/Release/net10.0/linux-x64/publish/Data/***' \
-    --filter='P Data/Telemetry/***' \
-    --exclude='.git/' \
-    --exclude='bin/' \
-    --exclude='obj/' \
-    --exclude='Adminbot.Tests/bin/' \
-    --exclude='Adminbot.Tests/obj/' \
-    --exclude='Data/configuration.json' \
-    --exclude='Data/Telemetry/' \
+# Synchronize only verified runtime files, never a checkout. Protect existing config/token/databases in any layout.
+sync_publish() {
+  local stage_publish="$1" live_publish="$2"
+  run_bounded 120 rsync -a --delete --checksum --safe-links \
+    --filter='P Data/***' --exclude='Data/' \
     --exclude='*.db' --exclude='*.db-*' \
-    "$source_dir/" "$live_root/"
+    --exclude='configuration*.json' --exclude='appsettings*.json' \
+    --exclude='*token*' --exclude='*secret*' --exclude='.env*' \
+    --exclude='*.key' --exclude='*.pem' --exclude='*.pfx' \
+    "$stage_publish/" "$live_publish/" || return $?
 }
 
-sync_publish() {
-  local stage_publish="$1"
-  local live_publish="$2"
-  rsync -a --delete --checksum \
-    --filter='P Data/***' \
-    --exclude='Data/' \
-    "$stage_publish/" "$live_publish/"
+# This is the only pre-sync path used by production and the behavioral harness. Any verification/preflight failure
+# returns before rsync/systemd. MigrationPreflight uses SQLite online backups into temporary databases, never live writes.
+install_verified_release() {
+  local archive="$1" sha="$2" checksum="$3" stage_publish="$4" live_publish="$5" service="$6" verifier="$7"
+  run_bounded 120 python3 "$verifier" verify "$archive" "$sha" "$checksum" --extract "$stage_publish" || return $?
+  assert_tutorial_assets "$stage_publish" || return $?
+  run_bounded 180 "$stage_publish/Adminbot" --migration-check \
+    --users-source "$live_publish/Data/users.db" \
+    --credentials-source "$live_publish/Data/credentials.db" || return $?
+  assert_data_unchanged || return $?
+  sync_publish "$stage_publish" "$live_publish" || return $?
+  assert_data_unchanged || return $?
+  run_bounded 60 systemctl restart "$service" || return $?
 }
 
 main() {
-  local deploy_sha="${1:-}"
-  local repo_url="${2:-}"
-  local run_id="${3:-manual}"
-  local run_attempt="${4:-1}"
-  local live_root="${5:-$EXPECTED_LIVE_ROOT}"
-  local service_name="${6:-$EXPECTED_SERVICE_NAME}"
-
-  printf 'Production deploy script started.\n'
-  printf 'Commit: %s\n' "$deploy_sha"
-  printf 'Run: %s attempt %s\n' "$run_id" "$run_attempt"
-
-  [[ "$deploy_sha" =~ ^[0-9a-fA-F]{40}$ ]] || fail "deployment SHA must be exactly 40 hexadecimal characters."
-  [[ "$run_id" =~ ^[0-9]+$ ]] || fail "GitHub run id must be numeric."
-  [[ "$run_attempt" =~ ^[0-9]+$ ]] || fail "GitHub run attempt must be numeric."
+  local deploy_sha="${1:-}" repo_url="${2:-}" run_id="${3:-}" run_attempt="${4:-}"
+  local live_root="${5:-$EXPECTED_LIVE_ROOT}" service_name="${6:-$EXPECTED_SERVICE_NAME}"
+  local checksum="${7:-}"
+  [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ ]] || fail "deployment SHA must be exactly 40 lowercase hexadecimal characters."
+  [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || fail "artifact checksum must be exactly 64 lowercase hexadecimal characters."
+  [[ "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ ]] || fail "run id and attempt must be numeric."
   [[ "$repo_url" == "$CANONICAL_REPO_URL" ]] || fail "repository URL does not match the canonical origin."
   [[ "$live_root" == "$EXPECTED_LIVE_ROOT" ]] || fail "live root must remain $EXPECTED_LIVE_ROOT."
   [[ "$service_name" == "$EXPECTED_SERVICE_NAME" ]] || fail "service name must remain $EXPECTED_SERVICE_NAME."
-
-  printf 'Checking production prerequisites.\n'
-  command -v git >/dev/null || fail "git is required on the production host."
-  command -v dotnet >/dev/null || fail "dotnet is required on the production host."
-  command -v rsync >/dev/null || fail "rsync is required on the production host."
-  command -v flock >/dev/null || fail "flock is required on the production host."
-  command -v realpath >/dev/null || fail "realpath is required on the production host."
-  command -v stat >/dev/null || fail "stat is required on the production host."
-  command -v systemctl >/dev/null || fail "systemctl is required on the production host."
-  command -v journalctl >/dev/null || fail "journalctl is required on the production host."
-
-  # A cancelled deployment must not leave a reusable MSBuild node alive. Such a node can inherit the
-  # deployment lock descriptor and block every later deploy even after the GitHub Actions run has ended.
-  export MSBUILDDISABLENODEREUSE=1
-  printf 'Checking .NET 10 SDK.\n'
-  dotnet --info >/dev/null || fail "dotnet --info failed on the production host."
-  dotnet --list-sdks | awk '{print $1}' | grep -Eq '^10\.' || fail ".NET 10 SDK is required to publish net10.0."
-
-  printf 'Checking production paths and systemd service.\n'
+  local command
+  for command in python3 rsync flock realpath stat systemctl journalctl timeout; do
+    command -v "$command" >/dev/null || fail "$command is required on production."
+  done
   local live_publish="$live_root/bin/Release/net10.0/linux-x64/publish"
   local live_data="$live_publish/Data"
-  [[ -d "$live_root" ]] || fail "live root does not exist."
-  [[ -d "$live_publish" ]] || fail "live publish directory does not exist."
-  [[ -d "$live_data" ]] || fail "protected production Data directory is missing."
-  [[ ! -L "$live_data" ]] || fail "protected production Data must be a real directory, not a symlink."
-  systemctl cat "$service_name" >/dev/null || fail "systemd service does not exist or cannot be read."
-  local service_exec
-  service_exec="$(systemctl show "$service_name" -p ExecStart --value)"
-  [[ "$service_exec" == *"$live_publish/Adminbot"* ]] || fail "systemd ExecStart does not point to the expected live Adminbot executable."
-
-  local data_real data_identity
-  data_real="$(realpath -e -- "$live_data")"
+  [[ -d "$live_publish" && -d "$live_data" && ! -L "$live_data" ]] || fail "protected production paths are missing or symlinked."
+  local service_exec data_real data_identity
+  run_bounded 15 systemctl cat "$service_name" >/dev/null || fail "systemd service cannot be read."
+  service_exec="$(run_bounded 15 systemctl show "$service_name" -p ExecStart --value)" || fail "systemd ExecStart cannot be read."
+  [[ "$service_exec" == *"$live_publish/Adminbot"* ]] || fail "systemd ExecStart does not point to the live Adminbot executable."
+  data_real="$(realpath -e -- "$live_data")" || fail "Data cannot be resolved."
   [[ "$data_real" == "$live_data" ]] || fail "protected Data path resolves somewhere unexpected."
-  data_identity="$(stat -Lc '%d:%i' -- "$live_data")"
-
+  data_identity="$(stat -Lc '%d:%i' -- "$live_data")" || fail "Data identity cannot be read."
   assert_data_unchanged() {
-    [[ -d "$live_data" && ! -L "$live_data" ]] || fail "protected production Data directory disappeared or changed type."
-    [[ "$(realpath -e -- "$live_data")" == "$data_real" ]] || fail "protected production Data path identity changed."
-    [[ "$(stat -Lc '%d:%i' -- "$live_data")" == "$data_identity" ]] || fail "protected production Data directory was replaced."
+    [[ -d "$live_data" && ! -L "$live_data" ]] || fail "production Data disappeared or changed type."
+    [[ "$(realpath -e -- "$live_data")" == "$data_real" ]] || fail "production Data path changed."
+    [[ "$(stat -Lc '%d:%i' -- "$live_data")" == "$data_identity" ]] || fail "production Data directory was replaced."
   }
-
-  mkdir -p "$STAGING_BASE"
-
   exec 9>"$LOCK_FILE"
-  printf 'Waiting up to 60 seconds for production deployment lock.\n'
-  if ! flock -w 60 -x 9; then
-    printf 'Production deployment lock is still busy. Diagnostics follow.\n' >&2
-    if command -v lslocks >/dev/null 2>&1; then
-      lslocks | grep -F 'vpnetiran-deploy.lock' >&2 || true
-    fi
-    if command -v lsof >/dev/null 2>&1; then
-      lsof "$LOCK_FILE" >&2 || true
-    fi
-    fail "production deployment lock remained busy for more than 60 seconds."
-  fi
-  printf 'Production deployment lock acquired.\n'
-
+  flock -w 60 -x 9 || fail "production deployment lock remained busy for more than 60 seconds."
+  local incoming="$STAGING_BASE/incoming/${deploy_sha}-${run_id}-${run_attempt}"
   local stage_root="$STAGING_BASE/${deploy_sha}-${run_id}-${run_attempt}"
-  local stage_source="$stage_root/source"
-  local stage_publish="$stage_root/publish"
-  local canonical_stage
-  canonical_stage="$(realpath -m -- "$stage_root")"
-  [[ "$canonical_stage" == "$STAGING_BASE/"* ]] || fail "staging path escaped the validated deployment root."
-  [[ ! -e "$stage_root" ]] || fail "unique staging directory already exists."
+  [[ "$(realpath -e -- "$incoming")" == "$incoming" && ! -L "$incoming" ]] || fail "incoming artifact path is unsafe."
+  [[ "$(realpath -m -- "$stage_root")" == "$stage_root" && ! -e "$stage_root" ]] || fail "unique staging path is unsafe or already exists."
+  mkdir -m 700 -- "$stage_root" || fail "cannot create staging directory."
   CURRENT_STAGE_ROOT="$stage_root"
-
   cleanup_stage() {
-    if [[ -n "$CURRENT_STAGE_ROOT" && -e "$CURRENT_STAGE_ROOT" ]]; then
-      local cleanup_target
-      cleanup_target="$(realpath -m -- "$CURRENT_STAGE_ROOT")"
-      if [[ "$cleanup_target" == "$STAGING_BASE/"* ]]; then
-        rm -rf -- "$CURRENT_STAGE_ROOT"
-      else
-        printf 'Refusing unsafe staging cleanup: %s\n' "$cleanup_target" >&2
-      fi
-    fi
+    rm -rf -- "$CURRENT_STAGE_ROOT"
   }
   trap cleanup_stage EXIT
-
-  mkdir -p "$stage_root"
-  printf 'Cloning exact deployment source into staging.\n'
-  git clone --no-checkout "$repo_url" "$stage_source"
-  git -C "$stage_source" fetch --no-tags origin "$deploy_sha"
-  git -C "$stage_source" checkout --detach "$deploy_sha"
-
-  local actual_sha
-  actual_sha="$(git -C "$stage_source" rev-parse HEAD)"
-  [[ "$actual_sha" == "$deploy_sha" ]] || fail "fresh clone HEAD does not match requested GitHub SHA."
-  [[ -z "$(git -C "$stage_source" status --porcelain)" ]] || fail "fresh staging checkout is unexpectedly dirty."
-
-  # Repository-required release gates. These run against the freshly checked-out staging clone BEFORE any source or
-  # publish synchronization and BEFORE systemd is touched, so a commit that does not build, does not pass its tests, or
-  # leaves either EF context with pending model changes can never reach production. Publish alone is deliberately not
-  # treated as a sufficient gate: it compiles the application but never runs the suite or the EF model checks.
-  printf 'Running release gates for commit %s.\n' "$actual_sha"
-  (
-    # Build/test tooling may spawn reusable or orphanable children. Never let those children inherit fd 9,
-    # otherwise an interrupted deploy can leave the production lock pinned indefinitely.
-    exec 9>&-
-    cd "$stage_source"
-    dotnet tool restore
-    dotnet restore Adminbot.sln
-    dotnet build Adminbot.sln -c Release --no-restore "/p:SourceRevisionId=$actual_sha"
-    dotnet test Adminbot.Tests/Adminbot.Tests.csproj -c Release --no-build
-    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context UserDbContext --configuration Release
-    dotnet ef migrations has-pending-model-changes --no-build --project Adminbot.csproj --startup-project Adminbot.csproj --context CredentialsDbContext --configuration Release
-  ) || fail "release gates failed for commit $actual_sha; production was not synchronized or restarted."
-  printf 'Release gates passed for commit %s.\n' "$actual_sha"
-
-  mkdir -p "$stage_publish"
-  printf 'Publishing verified commit %s in staging.\n' "$actual_sha"
-  (
-    # Keep the same lock-descriptor isolation for publish-time MSBuild processes.
-    exec 9>&-
-    cd "$stage_source"
-    dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false \
-      "/p:SourceRevisionId=$actual_sha" -o "$stage_publish"
-  )
-
-  [[ -x "$stage_publish/Adminbot" ]] || fail "staged publish is missing the Adminbot executable."
-
-  # Built-in tutorial images must exist in the artifact before anything is synchronized or restarted. This runs after
-  # publish and before the migration preflight and any source/publish synchronization, so an incomplete release can never
-  # replace a working one.
-  printf 'Verifying built-in tutorial assets in the staged publish artifact.\n'
-  assert_tutorial_assets "$stage_publish"
-  printf 'Built-in tutorial assets verified in the staged publish artifact.\n'
-
-  # Migration preflight on the exact published executable: fresh databases first, then online-backup copies of the
-  # live production databases. This starts no web server, Telegram receiver, or worker, and it only reads the live
-  # database files, so a schema change that cannot apply to real production data aborts the deployment here.
-  printf 'Running migration preflight against fresh databases.\n'
-  "$stage_publish/Adminbot" --migration-check 9>&- \
-    || fail "migration preflight failed against fresh databases."
-  printf 'Running migration preflight against production database copies.\n'
-  "$stage_publish/Adminbot" --migration-check \
-    --users-source "$live_data/users.db" \
-    --credentials-source "$live_data/credentials.db" \
-    9>&- \
-    || fail "migration preflight failed against production database copies."
-  assert_data_unchanged
-
-  printf 'Synchronizing repository source into live tree.\n'
-  sync_source "$stage_source" "$live_root"
-  assert_data_unchanged
-
-  printf 'Synchronizing staged publish into live publish directory.\n'
-  sync_publish "$stage_publish" "$live_publish"
-  assert_data_unchanged
-
-  printf 'Restarting %s after successful synchronization.\n' "$service_name"
-  if ! systemctl restart "$service_name"; then
-    printf 'Service restart command failed. Showing bounded journal output.\n' >&2
-    journalctl -u "$service_name" --since "15 minutes ago" -n 300 --no-pager || true
-    fail "systemd restart failed after deployment."
-  fi
-
+  printf 'Installing verified runner artifact for %s (run %s attempt %s).\n' "$deploy_sha" "$run_id" "$run_attempt"
+  install_verified_release "$incoming/release.tar.gz" "$deploy_sha" "$checksum" "$stage_root/publish" \
+    "$live_publish" "$service_name" "$incoming/release-artifact.py" \
+    || fail "artifact verification, copy-only migration preflight, synchronization or restart failed."
   local active=false
   for _ in {1..10}; do
-    if systemctl is-active --quiet "$service_name"; then
-      active=true
-      break
-    fi
+    if run_bounded 10 systemctl is-active --quiet "$service_name"; then active=true; break; fi
     sleep 2
   done
   if [[ "$active" != true ]]; then
-    printf 'Service did not become active. Showing bounded journal output.\n' >&2
-    journalctl -u "$service_name" --since "15 minutes ago" -n 300 --no-pager || true
+    run_bounded 15 journalctl -u "$service_name" --since "15 minutes ago" -n 300 --no-pager || true
     fail "service health verification failed after restart."
   fi
-
   assert_data_unchanged
-  printf 'Deployment health check passed. Recent bounded service logs follow.\n'
-  journalctl -u "$service_name" --since "5 minutes ago" -n 150 --no-pager || true
+  run_bounded 15 journalctl -u "$service_name" --since "5 minutes ago" -n 150 --no-pager || true
   printf 'Production deployment completed for commit %s.\n' "$deploy_sha"
 }
 

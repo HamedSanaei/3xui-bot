@@ -559,12 +559,14 @@ public sealed partial class ConcurrencyTests
     /// A connected burst retains full metadata locally and reports newly affected victims once to operators.
     /// </summary>
     /// <returns>A task completing after same-lane execution, detail, and incident assertions.</returns>
-    /// <remarks>Operator coalescing must not erase per-update detail. A release barrier holds the head until both victims are admitted and past the wait threshold, independent of SQLite admission speed.</remarks>
+    /// <remarks>Operator coalescing must retain each victim exactly once. A release barrier holds the head until both
+    /// victims are past the wait threshold. Attribution separates clipped lane occupancy from the remaining queue wait;
+    /// window count, independent handlers' elapsed time and rendered field wording are not contracts.</remarks>
     [Fact]
     public async Task Queue_wait_detail_carries_full_correlation_and_operator_incident_coalesces_the_cascade()
     {
         using var databases = new Databases();
-        var logs = new DiagnosticLogger<TelegramUpdateScheduler>();
+        var logs = new SchedulerRoutingLogger(NullLogger.Instance);
         var headEntered = Signal();
         var releaseHead = Signal();
         var executor = new Executor(async (item, token) =>
@@ -594,38 +596,42 @@ public sealed partial class ConcurrencyTests
             await scheduler.EnqueueAsync("vpnetiranbot", Update(916840329, 711), default);
             await scheduler.EnqueueAsync("vpnetiranbot", Update(916840330, 711), default);
             await Task.Delay(TimeSpan.FromMilliseconds(120));
+            await Until(() => logs.Records.Any(x => x.State.ContainsKey("HandlerElapsedMs") && Equals(x.State["UpdateId"], 916840327)));
             releaseHead.TrySetResult();
 
-            await Until(() => logs.Count(LogLevel.Warning, "waited unusually long") == 2);
+            await Until(() => new[] { 916840329, 916840330 }.All(id =>
+                logs.Records.Any(x => x.State.ContainsKey("WaitingUpdateId") && Equals(x.State["WaitingUpdateId"], id))));
             await Until(() => scheduler.ActiveHandlerCount == 0);
         }
         finally { releaseHead.TrySetResult(); await scheduler.StopAsync(default); }
 
-        // One warning for the slow root handler, and no per-second repeat.
-        Assert.Equal(1, logs.Count(LogLevel.Warning, "handler running unusually long"));
+        // One live warning for the barrier-held root; independently slow handlers may report their own incident.
+        Assert.Single(logs.Records, x => x.State.ContainsKey("HandlerElapsedMs") && Equals(x.State["UpdateId"], 916840327));
 
-        var waits = logs.Messages(LogLevel.Warning)
-            .Where(x => x.Contains("waited unusually long", StringComparison.Ordinal))
-            .ToList();
-        Assert.Equal(2, waits.Count);
+        var waits = logs.Records.Where(x => x.State.ContainsKey("WaitingUpdateId")).ToList();
         foreach (var victimId in new[] { 916840329, 916840330 })
         {
-            var detail = Assert.Single(waits, x => x.Contains($"WaitingUpdateId={victimId} ", StringComparison.Ordinal));
-            Assert.Contains("BotId=vpnetiranbot ", detail, StringComparison.Ordinal);
-            Assert.Contains("TelegramUserId=711 ", detail, StringComparison.Ordinal);
-            Assert.Contains("WaitingUpdateType=Message ", detail, StringComparison.Ordinal);
-            Assert.Contains("QueueWaitMs=", detail, StringComparison.Ordinal);
-            Assert.Contains("PreviousUpdateId=916840327 ", detail, StringComparison.Ordinal);
-            Assert.Contains("PreviousUpdateType=Message ", detail, StringComparison.Ordinal);
-            Assert.Contains("PreviousHandlerDurationMs=", detail, StringComparison.Ordinal);
-            Assert.Contains("BlockingOverlapMs=", detail, StringComparison.Ordinal);
-            Assert.DoesNotContain("PreviousSequence=0 ", detail, StringComparison.Ordinal);
+            var detail = Assert.Single(waits, x => Equals(x.State["WaitingUpdateId"], victimId)).State;
+            Assert.Equal("vpnetiranbot", detail["BotId"]);
+            Assert.Equal(711L, detail["TelegramUserId"]);
+            Assert.True(Assert.IsType<int>(detail["PreviousUpdateId"]) < victimId);
+            var wait = Assert.IsType<double>(detail["QueueWaitMs"]);
+            var overlap = Assert.IsType<double>(detail["BlockingOverlapMs"]);
+            var outside = Assert.IsType<double>(detail["QueueWaitOutsideBlockerMs"]);
+            Assert.True(overlap > 0);
+            Assert.True(Assert.IsType<double>(detail["PreviousLaneOccupancyMs"]) >= overlap);
+            Assert.Equal(wait, overlap + outside, precision: 6);
         }
-        var summaries = logs.Messages(LogLevel.Warning)
-            .Where(x => x.Contains("queue-delay incident", StringComparison.Ordinal)).ToList();
-        Assert.Equal(2, summaries.Count);
-        Assert.All(summaries, summary => Assert.Contains("AffectedCount=1 ", summary, StringComparison.Ordinal));
-        Assert.All(summaries, summary => Assert.Contains("DominantBlockerUpdateId=916840327 ", summary, StringComparison.Ordinal));
+        var summaries = logs.Records.Where(x => x.State.ContainsKey("AffectedCount")).ToList();
+        Assert.Equal(2L + waits.Count(x => Equals(x.State["WaitingUpdateId"], 916840327)),
+            summaries.Sum(x => Assert.IsType<long>(x.State["AffectedCount"])));
+        Assert.All(summaries, summary =>
+        {
+            Assert.Equal("vpnetiranbot", summary.State["BotId"]);
+            Assert.Equal(711L, summary.State["TelegramUserId"]);
+        });
+        Assert.All(waits.Where(x => Equals(x.State["WaitingUpdateId"], 916840327)),
+            x => Assert.Equal(0L, x.State["PreviousSequence"]));
     }
 
     /// <summary>

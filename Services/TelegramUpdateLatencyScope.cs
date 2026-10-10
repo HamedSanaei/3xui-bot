@@ -152,6 +152,8 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
     private readonly double[] _inclusiveStageMs = new double[StageCount];
     /// <summary>Last timestamp at which exclusive wall time was assigned.</summary>
     private long _accountedTimestamp;
+    /// <summary>Start-relative rounded elapsed milliseconds at the last accounting timestamp, frozen as the authoritative handler total.</summary>
+    private double _accountedElapsedMs;
     /// <summary>Start of the currently open uninstrumented wall-time interval.</summary>
     private long _gapStartedTimestamp;
     /// <summary>Safe preceding stage label for the currently open gap.</summary>
@@ -478,15 +480,17 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
         if (_currentStage == null) { _gapStartedTimestamp = now; _gapBeforeStage = _lastStage; }
     }
 
-    /// <summary>Assigns the elapsed interval to exactly one active stage or the unattributed bucket.</summary>
+    /// <summary>Assigns one start-relative elapsed interval to exactly one active stage or the unattributed bucket.</summary>
     /// <param name="now">Monotonic timestamp; the caller holds the stage metadata lock.</param>
-    /// <remarks>No intervals are stored: completed durations and the longest gap use constant aggregate storage.</remarks>
+    /// <remarks>Both endpoints use the handler origin before subtraction, so TimeSpan tick rounding cannot accumulate across stage boundaries. No intervals are retained.</remarks>
     private void AccountUntil(long now)
     {
-        var elapsed = _timeProvider.GetElapsedTime(_accountedTimestamp, now).TotalMilliseconds;
+        var totalElapsed = _timeProvider.GetElapsedTime(_startedTimestamp, now).TotalMilliseconds;
+        var elapsed = totalElapsed - _accountedElapsedMs;
         if (_currentStage is { } stage) _exclusiveStageMs[(int)stage] += elapsed;
         else _unattributedMs += elapsed;
         _accountedTimestamp = now;
+        _accountedElapsedMs = totalElapsed;
     }
 
     /// <summary>Finalizes an unattributed interval with safe preceding/following stage labels.</summary>
@@ -844,6 +848,7 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
     /// <returns>A detached snapshot; exclusive stages plus unattributed time partition HandlerMs, inclusive stages do not.</returns>
     /// <remarks>
     /// Safe after disposal: handler accounting is frozen at its endpoint. Active snapshots include open stage/gap time.
+    /// One start-relative rounded endpoint is shared by HandlerMs, its terminal UTC milestone and the exclusive partition.
     /// Capacity overflow is explicit in TimingQuality. Gaps are measured waits or work with an unknown cause, not CPU.
     /// </remarks>
     /// <example><code>var summary = scope.CaptureTelemetry() with { EventType = "telegram_update_handler_completed" };</code></example>
@@ -891,8 +896,8 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
                 return CreateEvent("telegram_update_handler_completed") with
                 {
                     HandlerStartedAtUtc = _handlerStartedUtc,
-                    HandlerCompletedAtUtc = _endedTimestamp == null ? null : AtOffset(Elapsed.TotalMilliseconds),
-                    HandlerMs = _timeProvider.GetElapsedTime(_startedTimestamp, now).TotalMilliseconds,
+                    HandlerCompletedAtUtc = _endedTimestamp == null ? null : AtOffset(_accountedElapsedMs),
+                    HandlerMs = _accountedElapsedMs,
                     StageMs = exclusive, InclusiveStageMs = inclusive, UnattributedHandlerMs = _unattributedMs,
                     MaxUnattributedGapMs = gapMs, MaxGapStartedMs = gapStart, MaxGapEndedMs = gapEnd,
                     GapBeforeStage = gapBefore, GapAfterStage = gapAfter, SlowestStage = slowest,

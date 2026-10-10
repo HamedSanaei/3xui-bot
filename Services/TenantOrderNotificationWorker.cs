@@ -377,20 +377,22 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
     /// Returns expired Processing rows whose Telegram transport was never invoked to Pending for retry.
     /// </summary>
     /// <param name="cancellationToken">Cancellation of the short SQLite update.</param>
-    /// <returns>A task completing after the conditional update.</returns>
+    /// <returns>A task completing after a read-only idle scan or the conditional update of eligible expired claims.</returns>
     /// <remarks>
     /// A crash right after the atomic claim but before <see cref="SendStartedAtUtc"/> is persisted means no Telegram
     /// request could have been sent, so recycling the row to Pending is safe and cannot duplicate delivery.
+    /// An empty eligibility check never acquires the writer; the same predicate is checked again by the update.
     /// </remarks>
     private async Task RecoverExpiredClaimsBeforeSendAsync(CancellationToken cancellationToken)
     {
         var now = DateTime.UtcNow;
         await using var db = _contextFactory.CreateDbContext();
-        var count = await db.TenantOrderNotifications
+        var expired = db.TenantOrderNotifications
             .Where(x => x.Status == TenantOrderNotificationStatuses.Processing &&
                         x.SendStartedAtUtc == null &&
-                        x.LeaseUntilUtc.HasValue && x.LeaseUntilUtc <= now)
-            .ExecuteUpdateAsync(setters => setters
+                        x.LeaseUntilUtc.HasValue && x.LeaseUntilUtc <= now);
+        if (!await expired.AnyAsync(cancellationToken)) return;
+        var count = await expired.ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, TenantOrderNotificationStatuses.Pending)
                 .SetProperty(x => x.LastError, "processing_lease_expired_before_send_started")
                 .SetProperty(x => x.ClaimToken, (string)null)
@@ -405,20 +407,22 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
     /// Marks expired Processing rows whose Telegram transport may have been invoked as DeliveryUncertain.
     /// </summary>
     /// <param name="cancellationToken">Cancellation of the short SQLite update.</param>
-    /// <returns>A task completing after the conditional update.</returns>
+    /// <returns>A task completing after a read-only idle scan or the conditional quarantine of eligible expired claims.</returns>
     /// <remarks>
     /// <see cref="SendStartedAtUtc"/> was persisted before the transport call, so the remote outcome is ambiguous
     /// and the row must never be replayed automatically; it is retained for operator review.
+    /// An empty eligibility check never acquires the writer; rows becoming eligible later wait for the next scan.
     /// </remarks>
     private async Task MarkExpiredClaimsUncertainAsync(CancellationToken cancellationToken)
     {
         var now = DateTime.UtcNow;
         await using var db = _contextFactory.CreateDbContext();
-        var count = await db.TenantOrderNotifications
+        var expired = db.TenantOrderNotifications
             .Where(x => x.Status == TenantOrderNotificationStatuses.Processing &&
                         x.SendStartedAtUtc != null &&
-                        x.LeaseUntilUtc.HasValue && x.LeaseUntilUtc <= now)
-            .ExecuteUpdateAsync(setters => setters
+                        x.LeaseUntilUtc.HasValue && x.LeaseUntilUtc <= now);
+        if (!await expired.AnyAsync(cancellationToken)) return;
+        var count = await expired.ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, TenantOrderNotificationStatuses.DeliveryUncertain)
                 .SetProperty(x => x.LastError, "processing_lease_expired_after_possible_delivery")
                 .SetProperty(x => x.ClaimToken, (string)null)
@@ -439,22 +443,22 @@ public sealed class TenantOrderNotificationWorker : BackgroundService
     /// Pending, Processing, DeliveryUncertain, ManualReview, and FailedPermanent rows are never candidates so they
     /// stay available for diagnostics and manual handling. The batch limit keeps one maintenance cycle bounded and
     /// the (Status, DeliveredAtUtc) index keeps the scan narrow.
+    /// Empty retention scans are read-only. The DELETE retains the full predicate and bounded subquery so concurrent
+    /// changes cannot delete a newly nonterminal row. One call issues at most one batch, including after a cleanup error.
     /// </remarks>
     internal async Task<int> CompactDeliveredAsync(CancellationToken cancellationToken = default)
     {
         if (_retentionDays <= 0)
             return 0;
         var cutoff = DateTime.UtcNow.AddDays(-Math.Min(_retentionDays, 36500));
-        return await SqliteOperation.RunAsync(async ct =>
-        {
-            await using var db = _contextFactory.CreateDbContext();
-            var candidates = db.TenantOrderNotifications
-                .Where(x => x.Status == TenantOrderNotificationStatuses.Delivered &&
-                            x.DeliveredAtUtc != null && x.DeliveredAtUtc < cutoff &&
-                            x.ClaimToken == null && x.LeaseUntilUtc == null)
-                .OrderBy(x => x.Id).Select(x => x.Id).Take(MaximumCompactionBatch);
-            return await db.TenantOrderNotifications.Where(x => candidates.Contains(x.Id)).ExecuteDeleteAsync(ct);
-        }, cancellationToken);
+        await using var db = _contextFactory.CreateDbContext();
+        var eligible = db.TenantOrderNotifications
+            .Where(x => x.Status == TenantOrderNotificationStatuses.Delivered &&
+                        x.DeliveredAtUtc != null && x.DeliveredAtUtc < cutoff &&
+                        x.ClaimToken == null && x.LeaseUntilUtc == null);
+        if (!await eligible.AnyAsync(cancellationToken)) return 0;
+        var candidates = eligible.OrderBy(x => x.Id).Select(x => x.Id).Take(MaximumCompactionBatch);
+        return await db.TenantOrderNotifications.Where(x => candidates.Contains(x.Id)).ExecuteDeleteAsync(cancellationToken);
     }
     private async Task<IReadOnlyList<TenantOrderNotification>> ClaimDueBatchAsync(CancellationToken cancellationToken)
     {

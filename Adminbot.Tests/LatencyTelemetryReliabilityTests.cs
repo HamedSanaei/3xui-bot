@@ -36,6 +36,117 @@ public sealed class LatencyTelemetryReliabilityTests
         Assert.Equal(0, service.ChannelDepth);
     }
 
+    /// <summary>Healthy background SQLite traffic bypasses event allocation and channel capacity while important evidence stays individual.</summary>
+    /// <returns>A task asserting exact weighted counts, bounded JSONL output, retained slow/error/retry detail and foreground correlation.</returns>
+    /// <remarks>An unstarted 64-slot writer receives eighty thousand fast completions without filling its queue. A measured hot loop protects against reintroducing a per-completion object; separate detailed boundaries prove aggregation is not disabling diagnostics.</remarks>
+    [Fact]
+    public async Task Fast_background_sqlite_is_aggregated_before_allocation_and_keeps_important_details()
+    {
+        using var files = new TemporaryFiles();
+        using var service = files.Service(capacity: 64);
+        Assert.True(service.TryAggregateBackgroundSqlite("sqlite_operation_completed", "sqlite_read", null, 0.25, "completed", false));
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        var accepted = true;
+        for (var index = 0; index < 10000; index++)
+            accepted &= service.TryAggregateBackgroundSqlite("sqlite_operation_completed", "sqlite_read", null, 0.25, "completed", false);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        Assert.True(accepted);
+        Assert.Equal(0, allocated);
+        await Task.WhenAll(Enumerable.Range(0, 7).Select(_ => Task.Run(() =>
+        {
+            for (var index = 0; index < 10000; index++)
+                Assert.True(service.TryAggregateBackgroundSqlite("sqlite_operation_completed", "sqlite_read", null, 0.25, "completed", false));
+        }))).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, service.ChannelDepth);
+        Assert.Equal(0, service.DroppedEvents);
+        Assert.False(Directory.Exists(service.StorageDirectory));
+        Assert.False(service.TryAggregateBackgroundSqlite("sqlite_busy_retry", "inbox", null, 1, "retrying", false, 1));
+        Assert.False(service.TryAggregateBackgroundSqlite("sqlite_operation_completed", "inbox", null, 1, "completed", false, 1));
+        var observer = new LatencySqliteObserver(service);
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        observer.Complete(Guid.NewGuid(), connection, TimeSpan.FromMilliseconds(2500), "sqlite_operation_completed",
+            "sqlite_read", TelegramUpdateStage.SqliteRead, "completed");
+        observer.Complete(Guid.NewGuid(), connection, TimeSpan.FromMilliseconds(1), "sqlite_operation_completed",
+            "sqlite_write", TelegramUpdateStage.SqliteWrite, "failed", new SqliteException("private-provider-error", 5));
+        using (var scope = Push(service, new ControlledClock()))
+            observer.Complete(Guid.NewGuid(), connection, TimeSpan.FromMilliseconds(1), "sqlite_operation_completed",
+                "sqlite_read", TelegramUpdateStage.SqliteRead, "completed");
+        var tracker = new UpdateTelemetryTracker(service, 10);
+        using (tracker.Receive("owned", 99, "Message"))
+            observer.Complete(Guid.NewGuid(), connection, TimeSpan.FromMilliseconds(1), "sqlite_operation_completed",
+                "sqlite_read", TelegramUpdateStage.SqliteRead, "completed");
+        await service.StartAsync(default);
+        await service.StopAsync(default);
+        var events = ReadEvents(service.StorageDirectory);
+        var aggregate = Assert.Single(events, item => item.EventType == "sqlite_background_aggregate");
+        Assert.Equal(80001, aggregate.ObservationCount);
+        Assert.Equal(80001, aggregate.DurationBucketCounts!.Sum());
+        Assert.Null(aggregate.TraceId);
+        Assert.Null(aggregate.BotId);
+        Assert.Null(aggregate.DurationMs);
+        Assert.Contains(events, item => item.DurationMs == 2500 && item.EventType == "sqlite_operation_completed");
+        Assert.Contains(events, item => item.SqliteErrorCode == 5 && item.Outcome == "failed");
+        Assert.Contains(events, item => item.TraceId == UpdateTelemetryTracker.TraceIdentity("owned", 2) && item.EventType == "sqlite_operation_completed");
+        Assert.Contains(events, item => item.TraceId == UpdateTelemetryTracker.TraceIdentity("owned", 99) && item.EventType == "sqlite_operation_completed");
+        Assert.Equal(0, service.DroppedEvents);
+        Assert.InRange(Directory.GetFiles(service.StorageDirectory, "*.jsonl").Sum(path => new FileInfo(path).Length), 1, 32 * 1024);
+    }
+
+    /// <summary>Concurrent aggregate drains preserve exact counts without contended locks or queues.</summary>
+    /// <returns>A task asserting every successful boundary belongs to exactly one valid fixed-size histogram.</returns>
+    [Fact]
+    public async Task Concurrent_background_histogram_drains_never_duplicate_or_lose_boundaries()
+    {
+        var aggregator = new LatencySqliteBackgroundAggregator();
+        var producer = Task.Run(() =>
+        {
+            for (var index = 0; index < 100000; index++) aggregator.Add("sqlite_read", null, index % 10);
+        });
+        long observed = 0;
+        while (!producer.IsCompleted)
+        {
+            foreach (var row in aggregator.Drain(DateTime.UtcNow, 1))
+            {
+                Assert.True(LatencySqliteBackgroundAggregator.IsValid(row.DurationBucketCounts, row.ObservationCount));
+                observed += row.ObservationCount!.Value;
+            }
+            await Task.Yield();
+        }
+        await producer;
+        observed += aggregator.Drain(DateTime.UtcNow, 1).Sum(row => row.ObservationCount!.Value);
+        Assert.Equal(100000, observed);
+        Assert.Empty(aggregator.Drain(DateTime.UtcNow, 1));
+    }
+
+    /// <summary>The writer rejects malformed background histograms instead of persisting false weighted measurements.</summary>
+    /// <returns>A task asserting fixed cardinality, nonnegative bins, matching totals and bounded invalid-record losses.</returns>
+    [Fact]
+    public async Task Unsafe_background_histograms_are_rejected_before_serialization()
+    {
+        using var files = new TemporaryFiles();
+        using var service = files.Service();
+        var counts = new long[LatencySqliteBackgroundAggregator.BucketCount];
+        counts[0] = 2;
+        var valid = new LatencyTelemetryEvent
+        {
+            EventType = "sqlite_background_aggregate", Operation = "sqlite_read", Category = "sqlite_background",
+            Outcome = "completed", TimingQuality = "aggregated_histogram_upper_bounds", ObservationCount = 2, DurationBucketCounts = counts
+        };
+        var negative = (long[])counts.Clone(); negative[1] = -1;
+        var overflowing = (long[])counts.Clone(); overflowing[0] = long.MaxValue; overflowing[1] = 1;
+        Assert.True(service.TryRecord(valid));
+        foreach (var invalid in new[]
+        {
+            valid with { ObservationCount = 1 }, valid with { DurationBucketCounts = new long[1] },
+            valid with { DurationBucketCounts = negative }, valid with { DurationBucketCounts = overflowing },
+            valid with { BotId = "owned" }
+        }) Assert.True(service.TryRecord(invalid));
+        await service.StartAsync(default);
+        await service.StopAsync(default);
+        Assert.Single(ReadEvents(service.StorageDirectory), item => item.EventType == "sqlite_background_aggregate");
+        Assert.Equal(5, service.DroppedEvents);
+    }
+
     /// <summary>Disabled collection creates no directory or losses even when supplied unsafe observations.</summary>
     /// <returns>A task asserting the true no-writer path across startup, producers and shutdown.</returns>
     [Fact]
@@ -386,6 +497,33 @@ public sealed class LatencyTelemetryReliabilityTests
         Assert.Equal(summary.HandlerMs, summary.StageMs.Values.Sum() + summary.UnattributedHandlerMs);
         Assert.Null(TelegramUpdateLatencyScope.Current);
     }
+    /// <summary>Sub-TimeSpan-tick stage boundaries still exactly partition one frozen high-resolution handler measurement.</summary>
+    /// <remarks>Nanosecond timestamps deterministically reproduce production's 0.0001 ms-per-boundary truncation drift. The assertion stays strict; it does not relax precision or derive expected time by summing the implementation's buckets.</remarks>
+    [Fact]
+    public void High_resolution_handler_partition_uses_shared_endpoint_rounding_and_stays_frozen()
+    {
+        var clock = new NanosecondClock();
+        using var scope = Push(null, clock);
+        for (var index = 0; index < 100; index++)
+        {
+            clock.Advance(55);
+            var stage = scope.Measure(TelegramUpdateStage.SqliteRead);
+            clock.Advance(55);
+            stage.Dispose();
+        }
+        scope.Dispose();
+        var summary = scope.CaptureTelemetry();
+        Assert.Equal(0.011, summary.HandlerMs);
+        Assert.InRange(Math.Abs(summary.StageMs!.Values.Sum() + summary.UnattributedHandlerMs!.Value - 0.011), 0, 0.000001);
+        Assert.NotNull(summary.HandlerCompletedAtUtc);
+        clock.Advance(1000000000);
+        var later = scope.CaptureTelemetry();
+        Assert.Equal(summary.HandlerMs, later.HandlerMs);
+        Assert.Equal(summary.HandlerCompletedAtUtc, later.HandlerCompletedAtUtc);
+        Assert.Equal(summary.UnattributedHandlerMs, later.UnattributedHandlerMs);
+        Assert.Equal(summary.StageMs["sqlite_read"], later.StageMs!["sqlite_read"]);
+    }
+
 
     /// <summary>Concurrent bot SDK calls retain independent ambient traces, exclusive stages and actual HTTP correlation.</summary>
     /// <returns>A task asserting persisted HTTP/API/foreground correlation for two genuinely overlapping asynchronous calls.</returns>
@@ -874,6 +1012,22 @@ public sealed class LatencyTelemetryReliabilityTests
         /// <param name="duration">Nonnegative controlled elapsed TimeSpan.</param>
         public void Advance(TimeSpan duration) => Interlocked.Add(ref _ticks, duration.Ticks);
     }
+    /// <summary>Provides nanosecond diagnostic ticks whose boundaries need rounding to TimeSpan's 100 ns resolution.</summary>
+    private sealed class NanosecondClock : TimeProvider
+    {
+        /// <summary>Fixture-local monotonically advanced nanoseconds.</summary>
+        private long _nanoseconds;
+        /// <inheritdoc />
+        public override long TimestampFrequency => 1000000000;
+        /// <inheritdoc />
+        public override long GetTimestamp() => _nanoseconds;
+        /// <inheritdoc />
+        public override DateTimeOffset GetUtcNow() => new(2026, 10, 10, 0, 0, 0, TimeSpan.Zero);
+        /// <summary>Advances only diagnostic monotonic time; no handler waits or runtime budgets are affected.</summary>
+        /// <param name="nanoseconds">Nonnegative number of high-resolution ticks.</param>
+        public void Advance(long nanoseconds) => _nanoseconds += nanoseconds;
+    }
+
 
     /// <summary>Provides real SDK HTTP responses and controlled asynchronous boundaries without a network socket.</summary>
     private sealed class ScriptedHandler : HttpMessageHandler

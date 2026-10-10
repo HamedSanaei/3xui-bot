@@ -14,6 +14,12 @@ public class CredentialsDbContext : DbContext
     /// <param name="options">Required factory options for the global credentials database.</param>
     public CredentialsDbContext(DbContextOptions<CredentialsDbContext> options) : base(options) { }
 
+    /// <summary>Installs asynchronous writer arbitration for all global-wallet contexts.</summary>
+    /// <param name="optionsBuilder">Existing factory-supplied SQLite options; connection and financial isolation stay unchanged.</param>
+    /// <remarks>Wallet writes share only a per-database writer turn, never a context or change tracker. Reads remain concurrent.</remarks>
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+        => SqliteWriterArbitration.Configure(optionsBuilder);
+
     /// <summary>Maps global profiles and immutable wallet receipts; receipts have no cross-database foreign key.</summary>
     /// <param name="modelBuilder">EF model builder for credentials.db.</param>
     /// <remarks>Schema configuration adds immutable receipt keys without a cross-database foreign key or financial backfill.</remarks>

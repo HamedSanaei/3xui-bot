@@ -69,7 +69,7 @@ public static class LatencyTelemetryReportCli
         "telegram_update_claimed", "telegram_update_handler_started", "telegram_update_first_response_attempt",
         "telegram_update_first_response_completed", "telegram_update_handler_completed", "telegram_update_inbox_completed",
         "telegram_update_completed", "telegram_request_completed", "telegram_foreground_request_completed", "latency_stage_completed",
-        "unattributed_handler_time", "sqlite_operation_completed", "sqlite_busy_retry", "sqlite_transaction_completed",
+        "unattributed_handler_time", "sqlite_operation_completed", "sqlite_busy_retry", "sqlite_transaction_completed", "sqlite_background_aggregate",
         "telegram_poll_completed", "telegram_poll_failed", "telegram_poll_recovered", "telegram_poll_backoff",
         "telegram_receiver_started", "telegram_receiver_stopped", "telegram_receiver_health", "process_health", "telemetry_loss",
         "telemetry_writer_failure", "telemetry_started", "telemetry_stopped", "telemetry_incident",
@@ -322,7 +322,7 @@ public static class LatencyTelemetryReportCli
         return trigger != null && TelegramEndpointTelemetryContext.IsFailoverTrigger(trigger) ? trigger : "unknown";
     }
 
-    /// <summary>Fixed logarithmic histogram; bucket upper bounds approximate quantiles within 5% above 0.1 ms.</summary>
+    /// <summary>Fixed logarithmic histogram; individual quantiles have 5% resolution above 0.1 ms, while background samples retain their coarser input-bin upper bounds.</summary>
     private sealed class Histogram
     {
         /// <summary>Fixed per-bucket observation counts, independent of input length.</summary>
@@ -331,17 +331,24 @@ public static class LatencyTelemetryReportCli
         private static readonly double[] UpperBounds = Enumerable.Range(0, 512).Select(i => 0.1 * Math.Pow(1.05, i)).ToArray();
         /// <summary>Exact number of accepted duration observations.</summary>
         public long Count;
-        /// <summary>Exact maximum accepted milliseconds; unavailable until Count is nonzero.</summary>
+        /// <summary>Greatest accepted milliseconds or aggregate upper bound; unavailable until Count is nonzero.</summary>
         public double Max;
-        /// <summary>Adds one validated measurement without retaining individual observations.</summary>
-        /// <param name="value">Nonnegative milliseconds.</param>
-        public void Add(double value)
+        /// <summary>Whether any contributing measurement has only a histogram upper-bound maximum.</summary>
+        public bool EstimatedMaximum;
+        /// <summary>Adds a validated individual measurement or weighted aggregate bin without expanding observations.</summary>
+        /// <param name="value">Nonnegative finite milliseconds; an aggregate supplies its fixed bin upper bound.</param>
+        /// <param name="weight">Positive contributing-observation count; the caller ensures summed counts cannot overflow.</param>
+        /// <param name="estimatedMaximum">True when only an aggregate's upper-bound maximum is known.</param>
+        /// <remarks>Weighted bins use the same bounded memory and work as individual records; output labels aggregate maxima approximate.</remarks>
+        /// <example><code>histogram.Add(0.512, weight: 1000, estimatedMaximum: true);</code></example>
+        public void Add(double value, long weight = 1, bool estimatedMaximum = false)
         {
             var index = Array.BinarySearch(UpperBounds, value);
             if (index < 0) index = ~index;
-            buckets[Math.Min(index, 511)]++; Count++; Max = Math.Max(Max, value);
+            buckets[Math.Min(index, 511)] += weight; Count += weight; Max = Math.Max(Max, value);
+            EstimatedMaximum |= estimatedMaximum;
         }
-        /// <summary>Computes a rank's histogram upper bound, capped at the exact maximum.</summary>
+        /// <summary>Computes a rank's histogram upper bound, capped at the greatest accepted individual value or aggregate upper bound.</summary>
         /// <param name="fraction">Requested percentile in 0..1.</param><returns>Approximate milliseconds or unavailable for no data.</returns>
         public double? Quantile(double fraction)
         {
@@ -352,7 +359,7 @@ public static class LatencyTelemetryReportCli
         }
         /// <summary>Formats all required aggregate latency metrics.</summary>
         /// <returns>Safe invariant count/percentiles/max labels.</returns>
-        public string Summary() => $"count={Count} P50~={Ms(Quantile(.50))} P95~={Ms(Quantile(.95))} P99~={Ms(Quantile(.99))} max={Ms(Count == 0 ? null : Max)} ms";
+        public string Summary() => $"count={Count} P50~={Ms(Quantile(.50))} P95~={Ms(Quantile(.95))} P99~={Ms(Quantile(.99))} {(EstimatedMaximum ? "max~" : "max")}={Ms(Count == 0 ? null : Max)} ms";
     }
 
     /// <summary>Per-bot aggregates keep update metrics independent of request and poll counts.</summary>
@@ -766,10 +773,16 @@ public static class LatencyTelemetryReportCli
             var duration = Number(r, "durationMs");
             if (duration.HasValue) { group.Duration.Add(duration.Value); if (duration >= slowMs) group.Slow++; }
         }
-        /// <summary>Aggregates SQLite categories and busy incidents without reading SQL or arbitrary operation names.</summary>
-        /// <param name="r">Database record.</param><param name="type">Known SQLite family.</param><param name="bot">Safe bot id.</param>
+        /// <summary>Aggregates SQLite categories, bounded weighted background histograms and detailed busy incidents without reading SQL.</summary>
+        /// <param name="r">Untrusted database record; aggregate counts are validated before mutating totals.</param><param name="type">Known SQLite family.</param><param name="bot">Safe bot id or global background label.</param>
+        /// <remarks>Background bins stay in a separate series and retain exact operation counts but approximate duration upper bounds. Invalid histograms count as quality loss, never fabricated latency samples.</remarks>
         private void AddDatabase(JsonElement r, string type, string bot)
         {
+            if (type == "sqlite_background_aggregate")
+            {
+                AddBackgroundDatabase(r, bot);
+                return;
+            }
             var category = Label(Text(r, "category"), Labels);
             if (category == "other") category = Label(Text(r, "stage"), Stages);
             var group = GetGroup(database, bot + "/" + category + "/" + type + "/" + Label(Text(r, "operation"), DatabaseOperations));
@@ -783,6 +796,47 @@ public static class LatencyTelemetryReportCli
                 var wait = Number(r, "durationMs") ?? (Count(r, "busyRetryCount") <= 1 ? Number(r, "busyWaitMs") : null);
                 if (wait.HasValue) group.BusyWait += wait.Value;
             }
+        }
+        /// <summary>Validates and weights one fixed background SQLite histogram without allocating per represented operation.</summary>
+        /// <param name="r">Untrusted aggregate JSON object from an already bounded archive line.</param>
+        /// <param name="bot">Expected global label; correlated aggregate records are invalid.</param>
+        /// <remarks>The fixed stack buffer bounds parsing work. Every bin and the advertised total are checked, including cumulative group overflow, before report counters change.</remarks>
+        private void AddBackgroundDatabase(JsonElement r, string bot)
+        {
+            Span<long> counts = stackalloc long[LatencySqliteBackgroundAggregator.BucketCount];
+            if (bot != "global"
+                || r.TryGetProperty("botId", out var botIdentity) && botIdentity.ValueKind != JsonValueKind.Null
+                || r.TryGetProperty("traceId", out var traceIdentity) && traceIdentity.ValueKind != JsonValueKind.Null
+                || r.TryGetProperty("updateId", out var updateIdentity) && updateIdentity.ValueKind != JsonValueKind.Null
+                || r.TryGetProperty("sequence", out var sequenceIdentity) && sequenceIdentity.ValueKind != JsonValueKind.Null
+                || r.TryGetProperty("durationMs", out var individualDuration) && individualDuration.ValueKind != JsonValueKind.Null
+                || r.TryGetProperty("sqliteErrorCode", out var errorCode) && errorCode.ValueKind != JsonValueKind.Null
+                || r.TryGetProperty("exceptionCategory", out var exceptionCategory) && exceptionCategory.ValueKind != JsonValueKind.Null
+                || r.TryGetProperty("busyRetryCount", out var retryCount) && retryCount.ValueKind != JsonValueKind.Null
+                || r.TryGetProperty("failureClassification", out var failure) && failure.ValueKind != JsonValueKind.Null
+                || Text(r, "outcome") != "completed" || Text(r, "timingQuality") != "aggregated_histogram_upper_bounds"
+                || !r.TryGetProperty("durationBucketCounts", out var bins) || bins.ValueKind != JsonValueKind.Array
+                || bins.GetArrayLength() != counts.Length)
+            { Quality.Malformed++; return; }
+            var index = 0;
+            foreach (var bin in bins.EnumerateArray())
+            {
+                if (bin.ValueKind != JsonValueKind.Number || !bin.TryGetInt64(out counts[index++]))
+                { Quality.Malformed++; return; }
+            }
+            var observations = Count(r, "observationCount");
+            if (!LatencySqliteBackgroundAggregator.IsValid(counts, observations))
+            { Quality.Malformed++; return; }
+            var category = Label(Text(r, "category"), Labels);
+            var operation = Label(Text(r, "operation"), DatabaseOperations);
+            var group = GetGroup(database, bot + "/" + category + "/sqlite_background_aggregate/" + operation);
+            if (group == null) return;
+            if (observations > long.MaxValue - group.Events || observations > long.MaxValue - group.Duration.Count)
+            { Quality.Malformed++; return; }
+            group.Events += observations;
+            group.Outcomes["completed"] = group.Events;
+            for (var bucket = 0; bucket < counts.Length; bucket++)
+                if (counts[bucket] > 0) group.Duration.Add(LatencySqliteBackgroundAggregator.UpperBound(bucket), counts[bucket], estimatedMaximum: true);
         }
         /// <summary>Tracks failure sequences and explicit recovered/degraded periods per bot with bounded episode retention.</summary>
         /// <param name="r">Poll or receiver health record.</param><param name="type">Known event family.</param><param name="bot">Safe bot identity.</param><param name="stats">Bot metrics.</param><param name="utc">Event UTC timestamp.</param>
@@ -868,7 +922,7 @@ public static class LatencyTelemetryReportCli
                 token.ThrowIfCancellationRequested();
                 await output.WriteLineAsync($"bot={episode.Bot} degradedSinceUtc={Time(episode.Start)} lastFailureUtc={Time(episode.Last)} recoveredUtc={Time(episode.End)} failures={episode.Failures} recoveryMs={Ms(episode.RecoveryMs)} degradedMs={Ms(Math.Max(0, ((episode.End ?? until) - episode.Start).TotalMilliseconds))} state={(episode.End.HasValue ? "recovered" : "open")} sequence={string.Join('>', episode.Sequence)} omittedFailures={episode.SequenceOmitted}");
             }
-            await output.WriteLineAsync("5. SQLite per bot/category/event/boundary and busy incidents (SQL/parameters/connection strings are never read or printed; retries and command failures are separate observations)");
+            await output.WriteLineAsync("5. SQLite per bot/category/event/boundary and busy incidents (healthy background histogram counts are weighted; max~ and percentiles are upper-bound estimates; correlated/slow/error/retry evidence stays individual; SQL/parameters/connection strings are never read or printed)");
             foreach (var pair in database.OrderBy(p => p.Key, StringComparer.Ordinal))
             {
                 token.ThrowIfCancellationRequested();

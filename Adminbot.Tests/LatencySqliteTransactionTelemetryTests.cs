@@ -109,17 +109,17 @@ public sealed class LatencySqliteTransactionTelemetryTests
 
     /// <summary>Independent worker categories survive asynchronous SQLite boundaries and remain visible in a filtered bot report.</summary>
     /// <returns>A task verifying real committed rows, cross-worker isolation and global diagnostic visibility.</returns>
-    /// <remarks>No global writer binding is installed. Production command interceptors collect actual SQLite work
-    /// outside a handler, and the existing AsyncLocal category cannot bleed between concurrently executing workers.</remarks>
+    /// <remarks>No global writer binding is installed. Production interceptors aggregate actual healthy SQLite work
+    /// before enqueue while preserving async-local ownership. A diagnostic clock makes transaction lifetimes deterministically fast; committed database rows and categories remain independent.</remarks>
     [Fact]
     public async Task Concurrent_background_sqlite_workers_keep_categories_and_global_report_visibility()
     {
         var root = Path.Combine(Path.GetTempPath(), "adminbot-worker-latency-" + Guid.NewGuid().ToString("N"));
         try
         {
-            using var telemetry = new LatencyTelemetryService(new LatencyTelemetryOptions(), root, NullLogger<LatencyTelemetryService>.Instance);
+            using var telemetry = new LatencyTelemetryService(new LatencyTelemetryOptions { SlowOperationMs = 300000 }, root, NullLogger<LatencyTelemetryService>.Instance);
             var commands = new LatencySqliteCommandInterceptor(telemetry);
-            using var transactions = new LatencySqliteTransactionInterceptor(telemetry);
+            using var transactions = new LatencySqliteTransactionInterceptor(telemetry, new ControlledClock());
             var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var arrivals = 0;
             Func<Task> barrier = () =>
@@ -137,13 +137,21 @@ public sealed class LatencySqliteTransactionTelemetryTests
                 ["telemetry-report", "--directory", telemetry.StorageDirectory, "--bot", "GozargahNetwork_Bot"], output, default);
             Assert.Equal(0, result);
             var report = output.ToString();
-            Assert.Contains("global/payment_settlement_notification/sqlite_transaction_completed/transaction_lifetime", report);
-            Assert.Contains("global/xui_renewal_recovery/sqlite_transaction_completed/transaction_lifetime", report);
+            Assert.Contains("global/payment_settlement_notification/sqlite_background_aggregate/transaction_lifetime", report);
+            Assert.Contains("global/xui_renewal_recovery/sqlite_background_aggregate/transaction_lifetime", report);
             Assert.DoesNotContain("bot=", report, StringComparison.Ordinal);
             Assert.DoesNotContain("worker_probe", report);
             var rows = Directory.EnumerateFiles(telemetry.StorageDirectory, "*.jsonl").SelectMany(File.ReadLines)
-                .Select(line => JsonSerializer.Deserialize<LatencyTelemetryEvent>(line, WireOptions)!);
-            Assert.All(rows.Where(row => row.Operation == "transaction_lifetime"), row => { Assert.Null(row.BotId); Assert.Null(row.TraceId); });
+                .Select(line => JsonSerializer.Deserialize<LatencyTelemetryEvent>(line, WireOptions)!).ToArray();
+            Assert.DoesNotContain(rows, row => row.EventType is "sqlite_operation_completed" or "sqlite_transaction_completed");
+            var lifetimes = rows.Where(row => row.Operation == "transaction_lifetime").ToArray();
+            Assert.Equal(2, lifetimes.Length);
+            Assert.All(lifetimes, row =>
+            {
+                Assert.Null(row.BotId); Assert.Null(row.TraceId);
+                Assert.Equal(1, row.ObservationCount);
+                Assert.Equal(1, row.DurationBucketCounts!.Sum());
+            });
             Assert.Equal(0, telemetry.DroppedEvents);
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }

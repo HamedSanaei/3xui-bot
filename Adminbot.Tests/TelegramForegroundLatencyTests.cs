@@ -432,12 +432,14 @@ public sealed partial class ConcurrencyTests
     /// One slow lane head retains local detail for every victim while operator reports count each victim once.
     /// </summary>
     /// <returns>A task completing after FIFO, detailed correlation, and coalesced incident assertions.</returns>
-    /// <remarks>The head is held behind a barrier until every victim is accepted and has exceeded the test queue threshold, so slower database admission cannot let late victims escape the incident.</remarks>
+    /// <remarks>The head stays behind a barrier until every victim is accepted and has exceeded the queue threshold.
+    /// Assertions use structured identities/counts, not rendered wording or timer-dependent incident partitions;
+    /// independently slow victims may legitimately produce their own handler warning on a loaded runner.</remarks>
     [Fact]
     public async Task Slow_lane_head_retains_each_victim_detail_and_coalesces_operator_incident()
     {
         using var databases = new Databases();
-        var logs = new DiagnosticLogger<TelegramUpdateScheduler>();
+        var logs = new SchedulerRoutingLogger(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
         var started = new ConcurrentQueue<int>();
         var headEntered = Signal();
         var releaseHead = Signal();
@@ -473,6 +475,7 @@ public sealed partial class ConcurrencyTests
                 await scheduler.EnqueueAsync("owned", Update(id, 711), default);
             // Age every accepted victim past the threshold while the head remains held, not while admission is still running.
             await Task.Delay(TimeSpan.FromMilliseconds(120));
+            await Until(() => logs.Records.Any(x => x.State.ContainsKey("HandlerElapsedMs") && Equals(x.State["UpdateId"], 1)));
             releaseHead.TrySetResult();
 
             await Until(() => started.Count >= 4);
@@ -482,29 +485,31 @@ public sealed partial class ConcurrencyTests
 
         Assert.Equal(new[] { 1, 2, 3, 4 }, started.ToArray());
 
-        // Exactly one live warning for the slow root handler, never one per second or one per victim.
-        Assert.Equal(1, logs.Count(LogLevel.Warning, "handler running unusually long"));
-        // Exactly one completion diagnostic for the long handler, recorded at Information because the live warning
-        // already alerted for that incident.
-        Assert.Equal(1, logs.Count(LogLevel.Information, "long update handler completed"));
-        var waits = logs.Messages(LogLevel.Warning).Where(x => x.Contains("waited unusually long", StringComparison.Ordinal)).ToList();
+        // The held root reports once while genuinely active; timing of unrelated handlers is not pinned.
+        Assert.Single(logs.Records, x => x.Level == LogLevel.Warning
+            && x.State.ContainsKey("HandlerElapsedMs") && Equals(x.State["UpdateId"], 1));
+        Assert.Single(logs.Records, x => x.Level == LogLevel.Information
+            && x.State.ContainsKey("HandlerDurationMs") && Equals(x.State["UpdateId"], 1));
+        foreach (var warnings in logs.Records.Where(x => x.State.ContainsKey("HandlerElapsedMs"))
+            .GroupBy(x => x.State["UpdateId"]))
+            Assert.Single(warnings);
+        var waits = logs.Records.Where(x => x.State.ContainsKey("WaitingUpdateId")).ToList();
         foreach (var victimId in new[] { 2, 3, 4 })
         {
-            var detail = Assert.Single(waits, x => x.Contains($"WaitingUpdateId={victimId} ", StringComparison.Ordinal));
-            Assert.Contains("PreviousUpdateId=1 ", detail, StringComparison.Ordinal);
-            Assert.Contains("BlockingOverlapMs=", detail, StringComparison.Ordinal);
+            var detail = Assert.Single(waits, x => Equals(x.State["WaitingUpdateId"], victimId));
+            var overlap = Assert.IsType<double>(detail.State["BlockingOverlapMs"]);
+            var wait = Assert.IsType<double>(detail.State["QueueWaitMs"]);
+            Assert.True(overlap > 0);
+            Assert.True(Assert.IsType<int>(detail.State["PreviousUpdateId"]) < victimId);
+            Assert.InRange(overlap, 0, wait);
+            Assert.Equal(wait - overlap, Assert.IsType<double>(detail.State["QueueWaitOutsideBlockerMs"]));
         }
-        var summaries = logs.Messages(LogLevel.Warning).Where(x => x.Contains("queue-delay incident", StringComparison.Ordinal)).ToList();
-        Assert.Equal(2, summaries.Count);
-        Assert.Contains("AffectedCount=1 ", summaries[0], StringComparison.Ordinal);
-        Assert.Contains("AffectedCount=2 ", summaries[1], StringComparison.Ordinal);
-        Assert.All(summaries, x => Assert.Contains("DominantBlockerUpdateId=1 ", x, StringComparison.Ordinal));
-        // The slow head itself waited behind nothing, so it must never be reported as a victim of a real predecessor.
-        // This is expressed through the head's own waiting update id rather than through the absence of any
-        // PreviousSequence=0 line, because a victim whose wait outlives its predecessor legitimately has no resolved
-        // blocker and that is not the amplification defect this test protects against.
-        Assert.DoesNotContain(waits, x => x.Contains("WaitingUpdateId=1", StringComparison.Ordinal) &&
-                                         !x.Contains("PreviousSequence=0", StringComparison.Ordinal));
+        var summaries = logs.Records.Where(x => x.State.ContainsKey("AffectedCount")).ToList();
+        Assert.Equal(3 + waits.Count(x => Equals(x.State["WaitingUpdateId"], 1)),
+            summaries.Sum(x => Assert.IsType<long>(x.State["AffectedCount"])));
+        // A head whose admission itself was delayed can be a queue victim, but never has a real predecessor.
+        Assert.All(waits.Where(x => Equals(x.State["WaitingUpdateId"], 1)),
+            x => Assert.Equal(0L, x.State["PreviousSequence"]));
     }
 
     /// <summary>A slow execution stage is attributed to one closed-vocabulary stage name.</summary>
@@ -656,7 +661,7 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(firstSequence, blocker!.Sequence);
         Assert.Equal(916840327, blocker.UpdateId);
         Assert.Equal("Message", blocker.UpdateType);
-        Assert.True(blocker.HandlerDurationMs >= 100_000, $"duration={blocker.HandlerDurationMs}");
+        Assert.True(blocker.LaneOccupancyMs >= 100_000, $"duration={blocker.LaneOccupancyMs}");
         Assert.Equal(84_000, blocker.BlockingOverlapMs);
 
         // A different lane and a non-overlapping window must not be reported as the blocker.

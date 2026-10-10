@@ -48,6 +48,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
 {
     private static readonly Meter Meter = new("Adminbot.TelegramUpdates");
     private static readonly Histogram<double> QueueWait = Meter.CreateHistogram<double>("telegram.update.queue.wait", "ms");
+    /// <summary>Actual invoked-handler wall-clock milliseconds, excluding claim, review and final persistence; uninvoked claims contribute no sample.</summary>
     private static readonly Histogram<double> Duration = Meter.CreateHistogram<double>("telegram.update.handler.duration", "ms");
     private static readonly Histogram<int> QueueDepth = Meter.CreateHistogram<int>("telegram.update.queue.depth", "updates");
     private readonly TelegramUpdateInboxStore _store;
@@ -230,7 +231,9 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <summary>Runs eligible lane heads while maintaining a fixed upper bound on tracked handler tasks.</summary>
     /// <param name="token">Coordinator cancellation after shutdown draining has ended.</param>
     /// <returns>The complete coordinator lifetime, including observation of every started handler.</returns>
-    /// <remarks>The ready query excludes only earlier queued or running work. Round-robin bots cannot reorder live work in a lane. Queue diagnostics are flushed on the existing coordinator wake/recovery path; their failures are isolated.</remarks>
+    /// <remarks>The ready query excludes only earlier queued or running work. Round-robin bots cannot reorder live work in a lane.
+    /// Claims and handlers run independently of the coordinator because SQLite async calls may execute synchronously.
+    /// Queue diagnostics are flushed on the existing coordinator wake/recovery path; their failures are isolated.</remarks>
     private async Task RunAsync(CancellationToken token)
     {
         var active = new Dictionary<long, Task>();
@@ -320,13 +323,19 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <remarks>The host owns scheduler lifetime and FIFO/concurrency are unchanged. Correlated summaries distinguish claim,
     /// queue, actual ExecuteAsync, post-handler review and final persistence. Foreground API observations and watchdogs
     /// retain their original budgets; private payloads and exception bodies never enter JSONL. Endpoint migration pauses new
-    /// claims atomically while admitted handlers finish their original epoch; no terminal receipt is created for a merely paused head.</remarks>
+    /// claims atomically while admitted handlers finish their original epoch; no terminal receipt is created for a merely paused head.
+    /// The initial yield isolates synchronous SQLite/handler prologues without an extra Task.Run wrapper per update.
+    /// Live watchdogs stop when ExecuteAsync ends. Handler duration uses its frozen scope clock; claim, review and
+    /// terminal persistence belong to lane occupancy and lifecycle diagnostics, never handler-only alerts.</remarks>
     private async Task ProcessAsync(long sequence, CancellationToken token, long readyObservedTimestamp = 0,
         TelegramEndpointRuntimeGate.TelegramEndpointExecutionLease endpointLease = null)
     {
         using var endpointAdmission = endpointLease;
         using var endpointFlow = endpointLease?.Enter();
         _store.Executing.TryAdd(sequence, 0);
+        // Microsoft.Data.Sqlite async calls may execute synchronously. Return a trackable task before claim/handler
+        // work begins so the coordinator can dispatch unrelated lanes up to the existing concurrency bound.
+        await Task.Yield();
         TelegramUpdateWorkItem item = null;
         var started = Stopwatch.GetTimestamp();
         string failure = null;
@@ -402,8 +411,14 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     finally
                     {
                         var handlerCompletedTimestamp = Stopwatch.GetTimestamp();
-                        // Freeze the authoritative handler clock before constructing diagnostic dictionaries.
+                        // End the watchdog at the business boundary, not after an awaited post-handler review read.
+                        System.Threading.Volatile.Write(ref handlerFinished.Value, 1);
+                        // Freeze before waiting for an already-running diagnostic callback; it is not handler work.
                         latencyScope.Dispose();
+                        handlerWarningRegistration.Dispose();
+                        handlerWarningRegistration = default;
+                        handlerWarningTimer.Dispose();
+                        handlerWarningTimer = null;
                         timeline?.HandlerCompleted(latencyScope.CaptureTelemetry(), handlerCompletedTimestamp);
                     }
                 }
@@ -440,7 +455,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         }
         finally
         {
-            // Stop the watchdog first so a finished handler can never be reported as still running.
+            // Also clean up executions that failed before reaching the handler's own terminal boundary.
             System.Threading.Volatile.Write(ref handlerFinished.Value, 1);
             handlerWarningRegistration.Dispose();
             handlerWarningTimer?.Dispose();
@@ -449,8 +464,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                 Interlocked.Decrement(ref _activeCount);
                 _telemetry?.UpdateActiveHandlers(ActiveHandlerCount);
             }
-            var duration = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            Duration.Record(duration);
+            var duration = latencyScope?.Elapsed.TotalMilliseconds ?? 0;
+            if (latencyScope != null) Duration.Record(duration);
             RecordHandlerDurationDiagnostic(
                 duration,
                 failure,
@@ -498,7 +513,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// Each delayed update retains a Warning detail locally, even if its attributed sequence changes. Operator
     /// summaries are emitted separately by the coordinator. Ordinary lookup/aggregation/logger failures are
     /// diagnostic-only. Cancellation still propagates to the existing execution_cancelled terminal policy before
-    /// business execution. No payload is loaded for attribution.
+    /// business execution. No payload is loaded for attribution. Predecessor duration is lane occupancy, not handler-only
+    /// time; the wait outside its clipped overlap is reported separately and is never attributed to that predecessor.
     /// </remarks>
     /// <exception cref="OperationCanceledException">The predecessor read was cancelled; business execution must not begin.</exception>
     /// <example><code>await ReportLongQueueWaitAsync(item, item.Sequence, waitMilliseconds, token);</code></example>
@@ -519,10 +535,11 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             _queueIncidents.Observe(item.Key, item.AcceptedAtUtc, item.StartedAtUtc, waitMilliseconds, blocker, DateTime.UtcNow);
             Wake();
             _logger.LogWarning(
-                "Telegram update waited unusually long. BotId={BotId} TelegramUserId={TelegramUserId} WaitingSequence={WaitingSequence} WaitingUpdateId={WaitingUpdateId} WaitingUpdateType={WaitingUpdateType} QueueWaitMs={QueueWaitMs} AcceptedAtUtc={AcceptedAtUtc} StartedAtUtc={StartedAtUtc} PreviousSequence={PreviousSequence} PreviousUpdateId={PreviousUpdateId} PreviousUpdateType={PreviousUpdateType} PreviousHandlerDurationMs={PreviousHandlerDurationMs} BlockingOverlapMs={BlockingOverlapMs}",
+                "Telegram update waited unusually long. BotId={BotId} TelegramUserId={TelegramUserId} WaitingSequence={WaitingSequence} WaitingUpdateId={WaitingUpdateId} WaitingUpdateType={WaitingUpdateType} QueueWaitMs={QueueWaitMs} AcceptedAtUtc={AcceptedAtUtc} StartedAtUtc={StartedAtUtc} PreviousSequence={PreviousSequence} PreviousUpdateId={PreviousUpdateId} PreviousUpdateType={PreviousUpdateType} PreviousLaneOccupancyMs={PreviousLaneOccupancyMs} BlockingOverlapMs={BlockingOverlapMs} QueueWaitOutsideBlockerMs={QueueWaitOutsideBlockerMs}",
                 item.Key.BotId, item.Key.TelegramUserId, sequence, item.Update.Id, item.Update.Type, waitMilliseconds,
                 item.AcceptedAtUtc, item.StartedAtUtc, blocker?.Sequence ?? 0, blocker?.UpdateId ?? 0,
-                blocker?.UpdateType ?? string.Empty, blocker?.HandlerDurationMs ?? 0, blocker?.BlockingOverlapMs ?? 0);
+                blocker?.UpdateType ?? string.Empty, blocker?.LaneOccupancyMs ?? 0, blocker?.BlockingOverlapMs ?? 0,
+                Math.Max(0, waitMilliseconds - (blocker?.BlockingOverlapMs ?? 0)));
         }
         catch
         {
@@ -539,10 +556,10 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         {
             _queueIncidents.Flush(DateTime.UtcNow, summary =>
                 _logger.LogWarning(
-                    "Telegram queue-delay incident. BotId={BotId} TelegramUserId={TelegramUserId} AffectedCount={AffectedCount} MaxQueueWaitMs={MaxQueueWaitMs} DominantBlockerSequence={DominantBlockerSequence} DominantBlockerUpdateId={DominantBlockerUpdateId} DominantBlockerType={DominantBlockerType} DominantBlockerDurationMs={DominantBlockerDurationMs} DominantBlockerOverlapMs={DominantBlockerOverlapMs} StartedAtUtc={StartedAtUtc} EndedAtUtc={EndedAtUtc} WindowStartedAtUtc={WindowStartedAtUtc} WindowEndedAtUtc={WindowEndedAtUtc} WindowMs={WindowMs} Reason={Reason} Overflow={Overflow}",
+                    "Telegram queue-delay incident. BotId={BotId} TelegramUserId={TelegramUserId} AffectedCount={AffectedCount} MaxQueueWaitMs={MaxQueueWaitMs} DominantBlockerSequence={DominantBlockerSequence} DominantBlockerUpdateId={DominantBlockerUpdateId} DominantBlockerType={DominantBlockerType} DominantBlockerLaneOccupancyMs={DominantBlockerLaneOccupancyMs} DominantBlockerOverlapMs={DominantBlockerOverlapMs} StartedAtUtc={StartedAtUtc} EndedAtUtc={EndedAtUtc} WindowStartedAtUtc={WindowStartedAtUtc} WindowEndedAtUtc={WindowEndedAtUtc} WindowMs={WindowMs} Reason={Reason} Overflow={Overflow}",
                     summary.BotId, summary.TelegramUserId, summary.AffectedCount, summary.MaxQueueWaitMs,
                     summary.DominantBlocker?.Sequence ?? 0, summary.DominantBlocker?.UpdateId ?? 0,
-                    summary.DominantBlocker?.UpdateType ?? string.Empty, summary.DominantBlocker?.HandlerDurationMs ?? 0,
+                    summary.DominantBlocker?.UpdateType ?? string.Empty, summary.DominantBlocker?.LaneOccupancyMs ?? 0,
                     summary.DominantBlocker?.BlockingOverlapMs ?? 0, summary.StartedAtUtc, summary.EndedAtUtc,
                     summary.WindowStartedAtUtc, summary.WindowEndedAtUtc, TelegramQueueDelayIncidentAggregator.Window.TotalMilliseconds,
                     summary.Reason, summary.Overflow), shutdown);
@@ -600,7 +617,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// <summary>
     /// Records the completed handler duration so long updates stay visible even when they eventually succeed.
     /// </summary>
-    /// <param name="durationMilliseconds">Total handler wall-clock duration in milliseconds.</param>
+    /// <param name="durationMilliseconds">Frozen ExecuteAsync wall-clock milliseconds; excludes claim, post-handler review and terminal persistence.</param>
     /// <param name="failureCode">Null on success; otherwise the coarse durable failure classification.</param>
     /// <param name="item">The claimed work item, or null when the claim never completed.</param>
     /// <param name="sequence">Internal inbox sequence of the update.</param>
@@ -621,6 +638,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// long-handler completion echo are performance telemetry and stay out of the central Telegram logger channel, while
     /// the completion line at or above the long-handler value remains channel-visible when the live watchdog did not
     /// already report it. See <see cref="TelegramLogSuppression"/>.
+    /// A delayed post-handler review cannot produce a live warning or inflate this duration. Its delay remains
+    /// visible in lifecycle and lane-occupancy diagnostics; an execution that never reached a handler has no duration.
     /// </remarks>
     private void RecordHandlerDurationDiagnostic(
         double durationMilliseconds,
