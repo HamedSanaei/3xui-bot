@@ -239,9 +239,12 @@ public sealed partial class ConcurrencyTests
             using var services = new ServiceCollection()
                 .AddScoped<UserDbContext>(_ => databases.Users.CreateDbContext()).BuildServiceProvider();
             var logger = new EndpointStartupLogger();
+            using var coordinator = new TelegramEndpointCoordinator(store, gate, registry, clients, new ConfigurationBuilder().Build(),
+                new TelegramEndpointRoutingOptions(), services, NullLogger<TelegramEndpointCoordinator>.Instance,
+                protocol: new EndpointStartupProtocol(store, clients, rootFailure: true));
             var runtime = new MultiBotHostedService(registry, clients, new EndpointRuntimeNoopScheduler(),
                 services.GetRequiredService<IServiceScopeFactory>(), new BotContextAccessor(), new BotRuntimeStatusStore(),
-                new ConfigurationBuilder().Build(), logger, endpointGate: gate);
+                new ConfigurationBuilder().Build(), logger, endpointGate: gate, endpointCoordinator: coordinator);
             try
             {
                 await runtime.StartAsync(default);
@@ -272,6 +275,150 @@ public sealed partial class ConcurrencyTests
                 await runtime.StopAsync(stopping.Token);
             }
         }
+    }
+
+    /// <summary>A duplicate tenant cannot arm first-start intent or bypass duplicate rejection through an already pending endpoint fence.</summary>
+    /// <param name="pending">Whether a durable migration intent already fences the shared identity.</param>
+    /// <returns>A task after actual runtime rejection proves no receiver, identity HTTP or session logout.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Endpoint_duplicate_tenant_startup_never_arms_or_logs_out_shared_session(bool pending)
+    {
+        using var databases = new Databases();
+        var registry = EndpointRuntimeRegistry();
+        registry.Upsert(new BotInstance { Id = "tenant-duplicate", Token = EndpointRuntimeToken(123456),
+            Type = BotInstanceTypes.Tenant, Enabled = true });
+        var store = new TelegramEndpointStore(databases.Users, new AppConfig());
+        var registered = await store.GetOrCreateAsync("tenant-duplicate", 123456, default);
+        registered.DesiredEndpoint = TelegramEndpointType.Local;
+        registered.Trigger = "tenant_startup";
+        if (pending)
+        {
+            registered.MigrationState = TelegramEndpointMigrationState.CheckingLocal;
+            registered.OperationId = Guid.NewGuid().ToString("N");
+        }
+        Assert.True(await store.TrySaveAsync(registered, registered.Revision));
+        var gate = new TelegramEndpointRuntimeGate(registry, store);
+        using var http = new EndpointRuntimeHttp();
+        using var clients = new BotClientProvider(registry, gate, new TelegramEndpointRoutingOptions(), http);
+        using var services = new ServiceCollection()
+            .AddScoped<UserDbContext>(_ => databases.Users.CreateDbContext()).BuildServiceProvider();
+        var logger = new EndpointStartupLogger();
+        var statuses = new BotRuntimeStatusStore();
+        using var coordinator = new TelegramEndpointCoordinator(store, gate, registry, clients, new ConfigurationBuilder().Build(),
+            new TelegramEndpointRoutingOptions(), services, NullLogger<TelegramEndpointCoordinator>.Instance,
+            protocol: new EndpointStartupProtocol(store, clients, rootFailure: false));
+        var runtime = new MultiBotHostedService(registry, clients, new EndpointRuntimeNoopScheduler(),
+            services.GetRequiredService<IServiceScopeFactory>(), new BotContextAccessor(), statuses,
+            new ConfigurationBuilder().Build(), logger, endpointGate: gate, endpointCoordinator: coordinator);
+        try
+        {
+            Assert.False(await runtime.StartBotAsync("tenant-duplicate").WaitAsync(TimeSpan.FromSeconds(3)));
+            Assert.Equal("duplicate", Assert.Single(statuses.GetSnapshots(registry.Bots),
+                snapshot => snapshot.BotId == "tenant-duplicate").Status);
+            var saved = await store.GetOrCreateAsync("tenant-duplicate", 123456, default);
+            Assert.Equal(registered.OperationId, saved.OperationId);
+            Assert.Equal(registered.MigrationState, saved.MigrationState);
+            Assert.Empty(http.Calls);
+        }
+        finally { await runtime.StopAsync(default); }
+    }
+
+    /// <summary>A newly registered tenant arms Local intent before its first real receiver; safe root failure starts only Cloud.</summary>
+    /// <param name="rootFailure">Whether tokenless Local preflight fails before any logout or Local identity call.</param>
+    /// <param name="ownerStart">Whether activation uses owner startup rather than the hosted initial startup pass.</param>
+    /// <returns>A task after real SDK origins prove no initial Cloud poll, strict Local readiness or safe Cloud fallback, and one receiver.</returns>
+    /// <remarks>The real coordinator calls the real runtime while holding its bot lock, exercising strict startup without recursive preparation. All HTTP is captured in-process.</remarks>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Endpoint_new_tenant_first_receiver_obeys_startup_intent(bool rootFailure, bool ownerStart)
+    {
+        using var databases = new Databases();
+        var root = Path.Combine(Path.GetTempPath(), "endpoint-startup-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var registry = EndpointRuntimeRegistry();
+            var tenant = new BotInstance { Id = "endpoint-a", Token = EndpointRuntimeToken(123456),
+                Type = BotInstanceTypes.Tenant, Enabled = !ownerStart };
+            registry.Upsert(tenant);
+            var options = new TelegramEndpointRoutingOptions { LocalFileServerRoot = "/data/local", LocalFileHostRoot = root };
+            var configuration = new ConfigurationBuilder().Build();
+            var store = new TelegramEndpointStore(databases.Users, new AppConfig(), options);
+            var registered = await store.GetOrCreateAsync("endpoint-a", 123456, default);
+            registered.DesiredEndpoint = TelegramEndpointType.Local;
+            registered.Trigger = "tenant_startup";
+            Assert.True(await store.TrySaveAsync(registered, registered.Revision));
+            var gate = new TelegramEndpointRuntimeGate(registry, store);
+            using var http = new EndpointRuntimeHttp();
+            using var clients = new BotClientProvider(registry, gate, options, http);
+            MultiBotHostedService? runtime = null;
+            using var services = new ServiceCollection()
+                .AddScoped<UserDbContext>(_ => databases.Users.CreateDbContext())
+                .AddSingleton<ITelegramEndpointReceiverLifecycle>(_ => runtime!).BuildServiceProvider();
+            var protocol = new EndpointStartupProtocol(store, clients, rootFailure);
+            using var coordinator = new TelegramEndpointCoordinator(store, gate, registry, clients, configuration,
+                options, services, NullLogger<TelegramEndpointCoordinator>.Instance, protocol: protocol);
+            runtime = new MultiBotHostedService(registry, clients, new EndpointRuntimeNoopScheduler(),
+                services.GetRequiredService<IServiceScopeFactory>(), new BotContextAccessor(), new BotRuntimeStatusStore(),
+                configuration, NullLogger<MultiBotHostedService>.Instance, endpointGate: gate, endpointCoordinator: coordinator);
+            try
+            {
+                if (ownerStart)
+                {
+                    // Owner activation occurs in an already running host; staged startup requires its host lifetime.
+                    await runtime.StartAsync(default).WaitAsync(TimeSpan.FromSeconds(3));
+                    tenant.Enabled = true;
+                    registry.Upsert(tenant);
+                    Assert.False(await runtime.StartBotAsync("endpoint-a").WaitAsync(TimeSpan.FromSeconds(3)));
+                }
+                else
+                    await runtime.StartAsync(default).WaitAsync(TimeSpan.FromSeconds(3));
+                var pending = await coordinator.GetStatusAsync("endpoint-a", default);
+                Assert.Equal(TelegramEndpointMigrationState.CheckingLocal, pending.MigrationState);
+                Assert.False(gate.CanReceive("endpoint-a"));
+                Assert.DoesNotContain(http.Calls, call => call.Identity == 123456);
+
+                await coordinator.RunPendingOperationsAsync(default).WaitAsync(TimeSpan.FromSeconds(5));
+                if (rootFailure)
+                    Assert.True(await runtime.StartBotAsync("endpoint-a").WaitAsync(TimeSpan.FromSeconds(3)));
+                await (rootFailure ? http.CloudPollStarted.Task : http.LocalPollStarted.Task)
+                    .WaitAsync(TimeSpan.FromSeconds(3));
+                var ready = await coordinator.GetStatusAsync("endpoint-a", default);
+                var expectedOrigin = rootFailure ? "cloud" : "local";
+                Assert.Equal(rootFailure ? TelegramEndpointType.Cloud : TelegramEndpointType.Local, ready.EffectiveEndpoint);
+                Assert.True(gate.CanReceive("endpoint-a"));
+                Assert.Equal(1, http.MaximumPollers[123456]);
+                Assert.Contains(http.Calls, call => call.Identity == 123456 && call.Method == "getUpdates" &&
+                    !call.ShortPoll && call.Endpoint == expectedOrigin);
+                Assert.DoesNotContain(http.Calls, call => call.Identity == 123456 && call.Method == "getUpdates" &&
+                    call.Endpoint != expectedOrigin);
+                if (rootFailure)
+                {
+                    Assert.DoesNotContain(http.Calls, call => call.Identity == 123456 && (call.Endpoint == "local" || call.Method == "logOut"));
+                    Assert.Null(ready.LogoutAttemptedAtUtc);
+                }
+                else
+                {
+                    Assert.Contains(http.Calls, call => call.Identity == 123456 && call.Method == "getUpdates" &&
+                        call.ShortPoll && call.Endpoint == "local");
+                    Assert.Single(http.Calls, call => call.Identity == 123456 && call.Method == "logOut" && call.Endpoint == "cloud");
+                    var ordered = http.Calls.Where(call => call.Identity == 123456).ToArray();
+                    Assert.True(Array.FindIndex(ordered, call => call.Method == "logOut") <
+                        Array.FindIndex(ordered, call => call.Endpoint == "local"));
+                }
+            }
+            finally
+            {
+                using var stopping = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await runtime.StopAsync(stopping.Token);
+            }
+        }
+        finally { Directory.Delete(root, recursive: true); }
     }
 
     /// <summary>The actual runtime lifecycle joins old polling, validates destination getUpdates, and starts exactly one Local receiver without changing another bot.</summary>
@@ -746,6 +893,38 @@ public sealed partial class ConcurrencyTests
             return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new { ok = true, result }), Encoding.UTF8, "application/json") };
         }
     }
+    /// <summary>Supplies tokenless root success/failure while identity and logout still use captured real SDK transport.</summary>
+    /// <param name="store">Isolated durable store used to enforce write-before-logout ordering.</param>
+    /// <param name="clients">Real route-bound SDK clients using in-process HTTP capture.</param>
+    /// <param name="rootFailure">Whether to fail tokenless preflight safely before bot-specific API calls.</param>
+    private sealed class EndpointStartupProtocol(ITelegramEndpointStateStore store, BotClientProvider clients,
+        bool rootFailure) : ITelegramEndpointProtocol
+    {
+        /// <inheritdoc />
+        public Task<TelegramEndpointProbeResult> ProbeLocalServerAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new TelegramEndpointProbeResult(rootFailure ? TelegramEndpointFailure.ConnectionRefused : TelegramEndpointFailure.None));
+
+        /// <inheritdoc />
+        public async Task<TelegramEndpointProbeResult> VerifyIdentityAsync(string botId, long identity,
+            TelegramEndpointType endpoint, long generation, CancellationToken cancellationToken)
+        {
+            var me = await clients.CreateEndpointControlClient(botId, endpoint, generation, identity).GetMe(cancellationToken);
+            return new TelegramEndpointProbeResult(me.Id == identity ? TelegramEndpointFailure.None : TelegramEndpointFailure.IdentityMismatch);
+        }
+
+        /// <inheritdoc />
+        public async Task<TelegramEndpointLogoutResult> LogOutOnceAsync(string botId, long identity,
+            TelegramEndpointType endpoint, long generation, CancellationToken cancellationToken)
+        {
+            var state = await store.GetOrCreateAsync(botId, identity, cancellationToken);
+            Assert.Equal(endpoint, state.LogoutEndpoint);
+            Assert.NotNull(state.LogoutAttemptedAtUtc);
+            var acknowledged = await clients.CreateEndpointControlClient(botId, endpoint, generation, identity)
+                .SendRequest(new LogOutRequest(), cancellationToken);
+            return new TelegramEndpointLogoutResult(acknowledged, false);
+        }
+    }
+
     /// <summary>Runtime admission sink used when polling fixtures deliberately return no updates.</summary>
     private sealed class EndpointRuntimeNoopScheduler : ITelegramUpdateScheduler
     {

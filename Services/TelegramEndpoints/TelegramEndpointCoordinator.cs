@@ -146,6 +146,63 @@ public sealed partial class TelegramEndpointCoordinator : ITelegramEndpointAdmin
         finally { _initialization.Release(); }
     }
 
+    /// <summary>Resolves a newly registered tenant's one-time Local-first receiving preference without reinitializing existing routes.</summary>
+    /// <param name="botId">Required exact internal tenant-store id from the registry; never a Telegram bot, chat or owner id.</param>
+    /// <param name="cancellationToken">Caller cancellation while hydrating and committing the short users.db startup intent.</param>
+    /// <returns>A task completing after Local readiness is queued, management-disabled startup is durably kept Cloud, or an existing, disabled or unrelated route is left unchanged.</returns>
+    /// <remarks>
+    /// Token registration atomically seeds tenant_startup with the first exact-identity endpoint row.
+    /// Saved routes, token rotations and previously attempted startup operations are never reinitialized.
+    /// Call before acquiring receiver lifecycle ownership: hosted migration work takes the coordinator lock first.
+    /// This method performs no Telegram request, receiver drain or logout; the existing worker owns those boundaries.
+    /// Local preflight failure preserves Cloud, while post-logout fallback requires proven cleanup and Cloud eligibility.
+    /// Disabled endpoint management consumes the first-start preference while keeping Cloud, so enabling management
+    /// on a later deployment cannot mistake that already started Cloud tenant for an unstarted registration.
+    /// </remarks>
+    /// <exception cref="ArgumentException">The internal bot id is missing.</exception>
+    /// <exception cref="InvalidOperationException">The startup intent cannot be committed; ordinary receiving remains fenced.</exception>
+    /// <exception cref="OperationCanceledException">Startup is canceled while waiting for route authority, the bot lock or local persistence; callers must not assume a receiver was started.</exception>
+    /// <example><code>await coordinator.PrepareTenantStartupAsync(tenant.Id, shutdownToken); // Before the receiver lifecycle gate.</code></example>
+    public async Task PrepareTenantStartupAsync(string botId, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(botId)) throw new ArgumentException("A tenant bot id is required.", nameof(botId));
+        await InitializeAsync(cancellationToken);
+        var bot = FindBot(botId);
+        if (bot == null || !bot.Enabled || bot.Type != BotInstanceTypes.Tenant ||
+            TelegramBotTokenIdentity.ExtractBotId(bot.Token) is not long identity) return;
+        var mutex = GetLock(bot.Id);
+        await mutex.WaitAsync(cancellationToken);
+        try
+        {
+            var state = await _store.GetOrCreateAsync(bot.Id, identity, cancellationToken);
+            var current = FindBot(bot.Id);
+            if (current == null || !current.Enabled || current.Type != BotInstanceTypes.Tenant ||
+                TelegramBotTokenIdentity.ExtractBotId(current.Token) != identity ||
+                state.Trigger != "tenant_startup" || state.OperationId != null ||
+                state.DesiredEndpoint != TelegramEndpointType.Local || state.EffectiveEndpoint != TelegramEndpointType.Cloud ||
+                state.MigrationState != TelegramEndpointMigrationState.Cloud ||
+                state.LogoutAttemptedAtUtc.HasValue || state.LogoutAcknowledgedAtUtc.HasValue ||
+                state.CloudReuseEligibleAtUtc.HasValue) return;
+            BeginIntent(state, TelegramEndpointType.Local, null, "tenant_startup", preserveDesired: true);
+            if (!_options.Enabled)
+            {
+                // First startup must remain one-shot even when operator configuration prevents Local admission.
+                state.MigrationState = TelegramEndpointMigrationState.Cloud;
+                state.NextAttemptAtUtc = null;
+                state.LastFailureCategory = "configuration_missing";
+                state.LastFailureAtUtc = UtcNow;
+            }
+            if (!await SaveAsync(state, _options.Enabled ? "migration_requested" : "migration_admission_failed",
+                _options.Enabled ? "migration_started" : null, cancellationToken))
+            {
+                _gate.Fence(state.BotId, state.TelegramBotId);
+                throw new InvalidOperationException("Tenant endpoint startup intent conflicted.");
+            }
+            if (_options.Enabled) SignalWork();
+        }
+        finally { mutex.Release(); }
+    }
+
     /// <summary>Lists current registry identities, including disabled and token-missing panel entries.</summary>
     /// <param name="cancellationToken">Caller persistence-read cancellation token.</param>
     /// <returns>Detached bot states ordered by canonical id with unmapped runtime admission snapshots; missing configuration is represented explicitly, never guessed Cloud.</returns>

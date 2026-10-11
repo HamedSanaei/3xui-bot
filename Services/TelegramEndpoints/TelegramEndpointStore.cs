@@ -470,6 +470,8 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
     /// <param name="state">Required detached state proposal.</param>
     /// <param name="revision">Expected nonnegative CAS version.</param>
     /// <exception cref="ArgumentException">An identity, enum, counter, incident key, or safe category is invalid.</exception>
+    /// <remarks>tenant_startup is a trusted first-registration preference or its current startup operation, not an owner-supplied endpoint command. Validation performs no persistence or Telegram I/O.</remarks>
+    /// <example><code>ValidateState(proposed, current.Revision); // Before committing endpoint-only CAS state.</code></example>
     private static void ValidateState(TelegramEndpointState state, long revision)
     {
         ValidateIdentity(state.BotId, state.TelegramBotId);
@@ -479,7 +481,7 @@ public sealed class TelegramEndpointStore : ITelegramEndpointStateStore
         foreach (var id in new[] { state.OperationId, state.OutageId })
             if (id != null && (id.Length != 32 || !id.All(Uri.IsHexDigit))) throw new ArgumentException("Invalid endpoint incident identity.");
         if (state.LastFailureCategory != null && !FailureCategories.Contains(state.LastFailureCategory)) throw new ArgumentException("Unknown endpoint failure category.");
-        if (state.Trigger != null && state.Trigger is not ("manual" or "automatic_outage" or "automatic_failback" or "startup_recovery")) throw new ArgumentException("Unknown endpoint trigger.");
+        if (state.Trigger != null && state.Trigger is not ("manual" or "automatic_outage" or "automatic_failback" or "startup_recovery" or "tenant_startup")) throw new ArgumentException("Unknown endpoint trigger.");
     }
 
     /// <summary>Validates an exact internal id and numeric identity without normalizing historical keys.</summary>

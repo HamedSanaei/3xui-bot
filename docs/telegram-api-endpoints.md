@@ -2,7 +2,7 @@
 
 ## Scope and operational boundary
 
-Cloud is the upgrade/install default. Existing bots do not migrate after deployment. A current global Super Admin can select a bot from **🗽 Admin → 🌐 مدیریت Telegram API**, or use `/telegram_api` in any healthy configured owned bot's private chat. Tenant ownership, customer privileges, assistant hosts and group chats grant no endpoint authority. The panel inventories owned, tenant and assistant identities; logger delivery selects existing eligible owned Cloud bots and reserves no dedicated identity.
+Existing bots retain their saved endpoint after an upgrade/install; legacy identities without routing metadata still default Cloud. Newly registered tenant identities prefer Local for their first receiver, with protocol-safe Cloud fallback. A current global Super Admin can select a bot from **🗽 Admin → 🌐 مدیریت Telegram API**, or use `/telegram_api` in any healthy configured owned bot's private chat. Tenant ownership, customer privileges, assistant hosts and group chats grant no endpoint authority. The panel inventories owned, tenant and assistant identities; logger delivery selects existing eligible owned Cloud bots and reserves no dedicated identity.
 
 Reuse the existing official Local Bot API at `http://127.0.0.1:8081` on Nethederland. Adminbot does not install, manage, restart, stop, reconfigure or inspect private credentials of the downloader container. The Local port must remain bound to loopback. No new `api_id` / `api_hash` is used.
 
@@ -28,7 +28,7 @@ Primary references:
 | `TelegramEndpointNotificationWorker` | One durable incident sent directly to the existing logger channel through a counted, authorized active Cloud bot |
 | Existing latency telemetry | Payload-free endpoint request/health/migration events and Cloud/Local reporting |
 
-A bot's state key is `(internal BotId, exact numeric BotFather identity)`. Token rotation retaining the identity does not transfer selection to another bot. Replacing the identity gets a separate Cloud-default row; historical migration receipts remain private audit data and cannot activate the replacement. Startup hydrates current saved identities before any hosted sender/receiver starts. Pending/uncertain Local state is never interpreted as permission to log into Cloud.
+A bot's state key is `(internal BotId, exact numeric BotFather identity)`. Token rotation retaining the identity does not transfer selection to another bot. Replacing an owned/assistant identity gets a separate Cloud-default row; the tenant registration workflow seeds a missing exact row with its Local-first preference. Historical migration receipts remain private audit data and cannot activate the replacement. Startup hydrates current saved identities before any hosted sender/receiver starts. Pending/uncertain Local state is never interpreted as permission to log into Cloud.
 
 `Revision` is the SQLite optimistic CAS version. `ControlRevision` changes only control-relevant intent/settings, not ordinary health refreshes. Endpoint `Generation` is monotonic per exact identity. Retained ordinary clients resolve the admitted generation for each complete operation; a retained pinned receiver cannot poll a newer epoch. Once an HTTP operation starts it cannot be rerouted/replayed. SDK retries remain zero; foreground deadlines, existing polling backoff/429/409 handling and scheduler concurrency are unchanged.
 
@@ -41,6 +41,20 @@ Cloud-to-Local requires another enabled non-assistant owned BotFather identity w
 The scheduler acquires an endpoint execution lease **before** durable claim. A paused lane head stays queued, preserving strict per-bot/user FIFO and deduplication. Admitted handlers may finish their original epoch; migrations wait for handlers, requests and file transfers before session cleanup. Other bots continue independently. Lifecycle ownership is the existing runtime semaphore, not a second competing receiver lock. Management callbacks persist/enqueue intent and return before their own receiver or handler is drained.
 
 Durable settlement, order, receipt and weekly notifications defer exact pre-HTTP endpoint fences; conditional claim release refunds provisional attempts rather than consuming network budgets during a long Cloud wait. Identity replacement remains manual review. Ambiguous payment HTTP/timeouts/5xx and receipt photo/fallback failures remain `DeliveryUncertain`, never endpoint-switch replay. Definite receipt photo rejections/file-read failures retain the existing fallback, but a potentially delivered photo never triggers a speculative second message.
+
+## New tenant first receiver
+
+The owner token workflow saves the validated token and a missing exact endpoint row **in one users.db transaction**, with desired Local, effective Cloud and idle `tenant_startup`. An existing row is never overwritten, including revision-zero Cloud/Local state, token rotation and historical cleanup evidence. Owned/assistant defaults and existing tenant routes are unchanged; no schema migration or configuration rewrite is added.
+
+While the store is disabled, existing authority-aware token/capability probes may still validate the Cloud source. Before its first ordinary receiver, the runtime arms the existing Local migration protocol **before acquiring the lifecycle semaphore**. Worker-owned strict destination startup does not reenter preparation. The first receiver is Local only after acknowledged Cloud logout, exact identity, nondropping webhook/poll readiness and final activation; there is no optimistic Cloud receiver beforehand.
+
+- Missing/inaccessible file mapping, disabled endpoint management, unavailable tokenless Local preflight or missing independent owned Cloud control leave Cloud available without a Local login or logout.
+  Management-disabled first startup still consumes the one-time preference; re-enabling endpoint management later does not migrate that already started Cloud route.
+- Local identity/readiness failure **after** Cloud logout schedules safe Cloud fallback. The original Cloud logout proof remains durable until Local cleanup is verified; Local logout commits its own at-most-once marker and acknowledgment, then the existing conservative ten-minute Cloud wait precedes strict Cloud readiness.
+- Unreachable Local cleanup retries only bounded safe reads. Token/identity rejection, refused cleanup and ambiguous logout remain fenced for intervention; no speculative Cloud login, repeated logout or replayed send is allowed.
+
+The owner sees queued startup rather than a false active connection, and the store remains enabled so hosted work can finish. If activation completes between runtime refusal and status observation, one serialized/idempotent runtime check proves actual receiver readiness before reporting success. The saved Local preference remains visible after Cloud fallback; default automatic failback remains off.
+
 
 ## Reading status and using bulk migration
 
@@ -80,7 +94,7 @@ Bulk admission has a nonwaiting single-batch lock and uses the existing per-bot 
 
 Callback confirmations/navigation remain actor/chat/message/host-bound, single-use and ten-minute expiring. Read-only actor-scoped reports have a separate **absolute one-hour** lifetime, bounded to 512 reports, so the ten-minute Cloud wait does not erase them before normal completion. After ten minutes reopen inventory for fresh controls; refresh does not extend report lifetime. Only the latest three reports for that actor are linked from inventory. Aggregate reports are process-local and disappear on restart/expiry; each accepted bot's operation, phase and audit history remain durable and available through its details. Pending operations continue after restart without resubmitting the batch.
 
-This panel enhancement requires no new configuration, database migration, timeout change, receiver/FIFO change or notification transport. Bulk does not alter financial processing, retry ambiguous sends or control the downloader container. No bot changes endpoint until explicit confirmation.
+The bulk panel requires no new configuration, database migration, timeout change, receiver/FIFO change or notification transport. Bulk does not alter financial processing, retry ambiguous sends or control the downloader container. Existing routes change only after explicit confirmation; the separate first-registration tenant default is described above.
 
 ## Durable phases and truthful availability
 

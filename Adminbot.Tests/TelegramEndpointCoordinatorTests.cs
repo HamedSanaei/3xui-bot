@@ -17,6 +17,193 @@ using Xunit;
 /// gate and coordinator are exercised with a CAS store, controlled clock and serialized receiver lifecycle.</remarks>
 public sealed partial class TelegramEndpointCoordinatorTests
 {
+    /// <summary>A freshly registered tenant's first receiving path is Local, with no optimistic Cloud receiver or repeated startup intent.</summary>
+    /// <returns>A task after durable intent, exact protocol ordering and first receiver readiness are verified.</returns>
+    /// <remarks>Cloud getMe is token validation, not receiving; Local login still requires acknowledged Cloud logout.</remarks>
+    [Fact]
+    public async Task New_tenant_first_receiver_is_local_and_startup_preparation_is_idempotent()
+    {
+        using var f = new Fixture();
+        f.RegisterTenant();
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        var pending = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.CheckingLocal, pending.MigrationState);
+        Assert.False(f.Gate.IsAvailable("owned-a", 123));
+        Assert.Empty(f.Protocol.Events);
+        Assert.Equal(0, f.Lifecycle.Acquisitions);
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        Assert.Equal(pending.Revision, (await f.StatusAsync()).Revision);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var active = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.Local, active.MigrationState);
+        Assert.Equal(TelegramEndpointType.Local, active.EffectiveEndpoint);
+        Assert.Equal(pending.OperationId, active.OperationId);
+        Assert.Equal(1, f.Lifecycle.Starts);
+        Assert.Equal(new[] { "root", "identity:Cloud", "logout:Cloud", "identity:Local" }, f.Protocol.Events);
+    }
+
+    /// <summary>Starting a new tenant with endpoint management disabled consumes its startup preference without migrating it later.</summary>
+    /// <returns>A task after re-enabling management and restarting preserves the first Cloud route without logout or lifecycle work.</returns>
+    /// <remarks>This prevents an already running Cloud tenant from being mistaken for an unstarted new tenant on the next deployment.</remarks>
+    [Fact]
+    public async Task Disabled_endpoint_management_consumes_first_startup_without_future_migration()
+    {
+        using var f = new Fixture(options: new TelegramEndpointRoutingOptions { Enabled = false });
+        f.RegisterTenant();
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        var cloud = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.Cloud, cloud.MigrationState);
+        Assert.NotNull(cloud.OperationId);
+        Assert.True(f.Gate.IsAvailable("owned-a", 123));
+        f.Options.Enabled = true;
+        f.RestartCoordinator();
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var retained = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.Cloud, retained.MigrationState);
+        Assert.Equal(cloud.OperationId, retained.OperationId);
+        Assert.Equal(cloud.Revision, retained.Revision);
+        Assert.Empty(f.Protocol.Events);
+        Assert.Equal(0, f.Lifecycle.Acquisitions);
+    }
+
+    /// <summary>Existing tenant routes cannot be migrated by application restart or token-rotation startup.</summary>
+    /// <param name="endpoint">Saved Cloud or Local route chosen before this feature.</param>
+    /// <returns>A task after unchanged route, generation, revisions and absence of lifecycle/protocol work are verified.</returns>
+    [Theory]
+    [InlineData(TelegramEndpointType.Cloud)]
+    [InlineData(TelegramEndpointType.Local)]
+    public async Task Existing_tenant_startup_preserves_saved_endpoint(TelegramEndpointType endpoint)
+    {
+        using var f = new Fixture(endpoint);
+        f.RegisterTenant(localFirstPreference: false);
+        await f.InitializeAsync();
+        var before = await f.StatusAsync();
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        var after = await f.StatusAsync();
+        Assert.Equal(endpoint, after.EffectiveEndpoint);
+        Assert.Equal(before.Generation, after.Generation);
+        Assert.Equal(before.Revision, after.Revision);
+        Assert.Equal(before.ControlRevision, after.ControlRevision);
+        Assert.Null(after.OperationId);
+        Assert.Empty(f.Protocol.Events);
+        Assert.Equal(0, f.Lifecycle.Acquisitions);
+    }
+
+    /// <summary>An unreachable Local preflight permits immediate Cloud startup without logging out or trying a Local identity.</summary>
+    /// <returns>A task after Cloud admission and one consumed, non-replayed startup preference are verified.</returns>
+    [Fact]
+    public async Task New_tenant_local_preflight_failure_keeps_cloud_available_without_logout()
+    {
+        using var f = new Fixture();
+        f.RegisterTenant();
+        f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var state = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.Cloud, state.MigrationState);
+        Assert.Equal(TelegramEndpointType.Local, state.DesiredEndpoint);
+        Assert.True(f.Gate.IsAvailable("owned-a", 123));
+        Assert.Equal(new[] { "root" }, f.Protocol.Events);
+        Assert.Equal(0, f.Protocol.LogoutCalls);
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        Assert.Equal(state.OperationId, (await f.StatusAsync()).OperationId);
+        Assert.Equal(state.Revision, (await f.StatusAsync()).Revision);
+    }
+
+    /// <summary>Failed initial Local identity or receiver readiness falls back only after Local cleanup and the persisted Cloud cooldown.</summary>
+    /// <param name="receiverFailure">True fails strict receiver readiness; false fails the session-creating Local identity request.</param>
+    /// <returns>A task after the first successful receiver is Cloud and no Cloud login occurs during unsafe cleanup/wait.</returns>
+    /// <remarks>Even a failed Local getMe may create a session; fallback must never be a BaseUrl swap.</remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task New_tenant_local_startup_failure_cleans_local_before_first_cloud_receiver(bool receiverFailure)
+    {
+        using var f = new Fixture();
+        f.RegisterTenant();
+        if (receiverFailure) f.Lifecycle.Ready = false;
+        else f.Protocol.LocalFailure = TelegramEndpointFailure.Network;
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var fallback = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.FallbackPending, fallback.MigrationState);
+        Assert.Equal(TelegramEndpointType.Cloud, fallback.LogoutEndpoint);
+        Assert.NotNull(fallback.LogoutAcknowledgedAtUtc);
+        Assert.Equal(0, f.Lifecycle.Starts);
+        Assert.False(f.Gate.IsAvailable("owned-a", 123));
+        f.Protocol.LocalFailure = TelegramEndpointFailure.None;
+        f.Lifecycle.Ready = true;
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var waiting = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.CloudWait, waiting.MigrationState);
+        Assert.Equal(TelegramEndpointType.Local, waiting.LogoutEndpoint);
+        Assert.Equal(2, f.Protocol.LogoutCalls);
+        Assert.Equal(1, f.Protocol.Events.Count(x => x == "identity:Cloud"));
+        f.Clock.Advance(TimeSpan.FromMinutes(10) - TimeSpan.FromSeconds(1));
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        Assert.Equal(0, f.Lifecycle.Starts);
+        Assert.Equal(1, f.Protocol.Events.Count(x => x == "identity:Cloud"));
+        f.Clock.Advance(TimeSpan.FromSeconds(1));
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var active = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.CloudRecovered, active.MigrationState);
+        Assert.Equal(TelegramEndpointType.Cloud, active.EffectiveEndpoint);
+        Assert.Equal(TelegramEndpointType.Local, active.DesiredEndpoint);
+        Assert.Equal(fallback.OperationId, active.OperationId);
+        Assert.Equal(1, f.Lifecycle.Starts);
+        Assert.True(f.Gate.IsAvailable("owned-a", 123));
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        Assert.Equal(active.Revision, (await f.StatusAsync()).Revision);
+    }
+
+    /// <summary>Unreachable Local cleanup after first-start failure remains fenced and cannot silently resume Cloud.</summary>
+    /// <returns>A task after bounded retry retains the original logout proof and precise fallback phase.</returns>
+    [Fact]
+    public async Task New_tenant_unreachable_local_cleanup_does_not_guess_cloud_or_retry_cloud_logout()
+    {
+        using var f = new Fixture();
+        f.RegisterTenant();
+        f.Protocol.LocalFailure = TelegramEndpointFailure.Network;
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var pending = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.FallbackPending, pending.MigrationState);
+        Assert.Equal(TelegramEndpointType.Cloud, pending.LogoutEndpoint);
+        Assert.NotNull(pending.LogoutAcknowledgedAtUtc);
+        Assert.Equal(1, pending.RecoveryAttempts);
+        Assert.Equal(1, f.Protocol.LogoutCalls);
+        Assert.Equal(1, f.Protocol.Events.Count(x => x == "identity:Cloud"));
+        Assert.Equal(0, f.Lifecycle.Starts);
+        Assert.False(f.Gate.IsAvailable("owned-a", 123));
+    }
+
+    /// <summary>A refused or ambiguous first-start Local cleanup cannot restore the logged-out Cloud source or replay logout.</summary>
+    /// <param name="uncertain">True models ambiguous mutation delivery; false models definitive cleanup refusal.</param>
+    /// <returns>A task after explicit fenced intervention and absence of Cloud login/receiving are verified.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task New_tenant_failed_local_cleanup_never_restores_logged_out_cloud(bool uncertain)
+    {
+        using var f = new Fixture();
+        f.RegisterTenant();
+        f.Lifecycle.Ready = false;
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        f.Lifecycle.Ready = true;
+        f.Protocol.LogoutResult = new(false, uncertain, uncertain ? TelegramEndpointFailure.LogoutUncertain : TelegramEndpointFailure.LogoutRefused);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        Assert.Equal(uncertain ? TelegramEndpointMigrationState.LocalLogoutUncertain : TelegramEndpointMigrationState.ManualInterventionRequired,
+            (await f.StatusAsync()).MigrationState);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        Assert.Equal(2, f.Protocol.LogoutCalls);
+        Assert.Equal(1, f.Protocol.Events.Count(x => x == "identity:Cloud"));
+        Assert.Equal(0, f.Lifecycle.Starts);
+        Assert.False(f.Gate.IsAvailable("owned-a", 123));
+    }
     /// <summary>Cloud logout must commit its marker and be acknowledged before the first real Local identity request.</summary>
     [Fact]
     public async Task Cloud_to_local_verifies_root_and_source_then_logs_out_once_before_local_identity()
@@ -1008,6 +1195,22 @@ public sealed partial class TelegramEndpointCoordinatorTests
         /// <returns>A controller with no real bot SDK request path.</returns>
         private TelegramEndpointCoordinator CreateCoordinator() => new(Store, Gate, Registry, Clients, Configuration,
             Options, _services, NullLogger<TelegramEndpointCoordinator>.Instance, telemetry: Telemetry, timeProvider: Clock, protocol: Protocol);
+
+        /// <summary>Models a registered tenant before its first receiver, without touching real credentials or SQLite.</summary>
+        /// <param name="localFirstPreference">True seeds the new-registration preference; false models an existing saved tenant route.</param>
+        /// <remarks>The initial receiver count is zero. The independent owned Cloud control remains available.</remarks>
+        /// <example><code>fixture.RegisterTenant(); await fixture.Coordinator.PrepareTenantStartupAsync("owned-a", default);</code></example>
+        internal void RegisterTenant(bool localFirstPreference = true)
+        {
+            Registry.Upsert(new BotInstance
+            {
+                Id = "owned-a", Username = "dummy_a_bot", Token = "123:abcdefghijklmnopqrstuvwxyz0123456789",
+                Type = BotInstanceTypes.Tenant, Enabled = true
+            });
+            Lifecycle.ActiveReceivers = 0;
+            if (localFirstPreference)
+                Store.Mutate(state => { state.DesiredEndpoint = TelegramEndpointType.Local; state.Trigger = "tenant_startup"; });
+        }
         /// <summary>Hydrates saved fake state exactly as production prehost initialization does.</summary>
         /// <returns>The completed route hydration task.</returns>
         internal Task InitializeAsync() => Coordinator.InitializeAsync(default);
@@ -1230,8 +1433,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
     {
         /// <summary>Existing runtime per-bot lifecycle semaphore.</summary>
         private readonly SemaphoreSlim _gate = new(1, 1);
-        /// <summary>Current fake live receiver count.</summary>
-        internal int ActiveReceivers { get; private set; } = 1;
+        /// <summary>Current fake live receiver count; new-tenant fixtures start at zero while migration fixtures retain one source receiver.</summary>
+        internal int ActiveReceivers { get; set; } = 1;
         /// <summary>Maximum simultaneous receiver count, asserted never above one.</summary>
         internal int MaximumReceivers { get; private set; } = 1;
         /// <summary>Controlled strict readiness result.</summary>

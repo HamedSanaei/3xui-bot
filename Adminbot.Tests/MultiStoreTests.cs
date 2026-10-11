@@ -777,12 +777,14 @@ public sealed partial class ConcurrencyTests
     /// <param name="gatewayAvailability">Optional live in-memory global switch store for invoice-admission transitions.</param>
     /// <param name="tokenProbe">Optional controlled getMe transport; owner-panel tests never contact Telegram.</param>
     /// <param name="ownerTokenProbeCache">Optional short-budget cache shared by the test's actual scoped handlers.</param>
+    /// <param name="configureServices">Optional test-owned dependency overrides applied before provider construction; use isolated transports and deterministic race barriers only.</param>
     /// <returns>A provider that the test must asynchronously dispose.</returns>
     /// <remarks>Each fixture supplies its own database paths. Inject a probe before using saved tokens so owner regressions remain network-free.</remarks>
     /// <example><code>await using var provider = StorefrontProvider(databases, tokenProbe: probe);</code></example>
     private static ServiceProvider StorefrontProvider(Databases databases, string? websiteUrl = null, string? catalogPath = null,
         string? panelUrl = null, IPaymentGatewayAvailability? gatewayAvailability = null,
-        ITelegramTokenProbe? tokenProbe = null, TenantOwnerTokenProbeCache? ownerTokenProbeCache = null)
+        ITelegramTokenProbe? tokenProbe = null, TenantOwnerTokenProbeCache? ownerTokenProbeCache = null,
+        Action<ServiceCollection>? configureServices = null)
     {
         var configuration = new ConfigurationBuilder().AddJsonFile(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../Data/configuration.example.json")))
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -798,6 +800,7 @@ public sealed partial class ConcurrencyTests
         if (gatewayAvailability != null) services.AddSingleton<IPaymentGatewayAvailability>(gatewayAvailability);
         if (tokenProbe != null) services.AddSingleton<ITelegramTokenProbe>(tokenProbe);
         if (ownerTokenProbeCache != null) services.AddSingleton(ownerTokenProbeCache);
+        configureServices?.Invoke(services);
         return services.BuildServiceProvider();
     }
 

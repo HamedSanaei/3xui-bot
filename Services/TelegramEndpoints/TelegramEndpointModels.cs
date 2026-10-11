@@ -55,7 +55,7 @@ public sealed class TelegramEndpointState
     public string BotId { get; set; }
     /// <summary>Positive numeric BotFather identity; token rotation does not change this key.</summary>
     public long TelegramBotId { get; set; }
-    /// <summary>Operator-selected destination, preserved during automatic fallback.</summary>
+    /// <summary>Operator-selected destination or a new tenant's Local-first preference, preserved during automatic fallback.</summary>
     public TelegramEndpointType DesiredEndpoint { get; set; } = TelegramEndpointType.Cloud;
     /// <summary>Last activated endpoint; not proof that ordinary admissions are currently open.</summary>
     public TelegramEndpointType EffectiveEndpoint { get; set; } = TelegramEndpointType.Cloud;
@@ -100,7 +100,8 @@ public sealed class TelegramEndpointState
     public string OperationId { get; set; }
     /// <summary>Global superadmin Telegram user id, or null for automatic operations.</summary>
     public long? ActorTelegramUserId { get; set; }
-    /// <summary>Closed manual, automatic_outage, automatic_failback, or startup_recovery trigger.</summary>
+    /// <summary>Closed manual, automatic_outage, automatic_failback, startup_recovery, or tenant_startup trigger.</summary>
+    /// <remarks>tenant_startup with no OperationId marks an unconsumed first-receiver preference, seeded atomically with token registration; it never reinitializes an existing route.</remarks>
     public string Trigger { get; set; }
     /// <summary>Migration start in UTC.</summary>
     public DateTime? MigrationStartedAtUtc { get; set; }

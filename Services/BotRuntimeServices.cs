@@ -1106,6 +1106,8 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     private readonly LatencyTelemetryService _telemetry;
     /// <summary>Shared endpoint admission gate; null preserves original direct-constructor lifecycle tests.</summary>
     private readonly TelegramEndpointRuntimeGate _endpointGate;
+    /// <summary>Arms new tenant endpoint intent before lifecycle locking; staged migration starts never reenter the coordinator.</summary>
+    private readonly TelegramEndpointCoordinator _endpointCoordinator;
     /// <summary>Authorized operator control path available from every healthy owned bot.</summary>
     private readonly TelegramEndpointAdminService _endpointAdmin;
     /// <summary>Coalesces route availability changes into the existing single tracked receiver-recovery lifetime.</summary>
@@ -1168,6 +1170,7 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     /// <param name="updateTelemetry">Optional per-update receiver tracker; null preserves existing direct-constructor callers.</param>
     /// <param name="endpointGate">Optional shared routing fence; saved pending migrations never start an ordinary receiver.</param>
     /// <param name="endpointAdmin">Optional global-super-admin endpoint panel; customer/tenant callbacks cannot use it.</param>
+    /// <param name="endpointCoordinator">Optional shared coordinator that arms first-receiver tenant intent before lifecycle admission; null preserves direct-constructor compatibility.</param>
     /// <remarks>The host tracks receiver, initialization, and recovery lifetimes; each replacement waits for the previous receiver generation to terminate.</remarks>
     public MultiBotHostedService(
         BotRegistry registry,
@@ -1181,7 +1184,8 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
         LatencyTelemetryService telemetry = null,
         UpdateTelemetryTracker updateTelemetry = null,
         TelegramEndpointRuntimeGate endpointGate = null,
-        TelegramEndpointAdminService endpointAdmin = null)
+        TelegramEndpointAdminService endpointAdmin = null,
+        TelegramEndpointCoordinator endpointCoordinator = null)
     {
         _registry = registry;
         _clientProvider = clientProvider;
@@ -1193,6 +1197,7 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
         _telemetry = telemetry;
         _endpointGate = endpointGate;
         _endpointAdmin = endpointAdmin;
+        _endpointCoordinator = endpointCoordinator;
         if (_endpointGate != null) _endpointGate.AvailabilityChanged += SignalEndpointRecovery;
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
         _startupProbeTimeout = TimeSpan.FromSeconds(Math.Clamp(appConfig.TelegramBotStartupProbeTimeoutSeconds, 5, 60));
@@ -1238,7 +1243,7 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     /// <param name="cancellationToken">Token that cancels waiting for the per-bot lifecycle gate and startup work.</param>
     /// <returns>
     /// <c>true</c> when the receiver is already running or successfully started; <c>false</c> when the bot is
-    /// disabled, missing a token, duplicated, or rejected by Telegram.
+    /// disabled, missing a token, duplicated, rejected by Telegram, or awaiting verified first-receiver endpoint startup.
     /// </returns>
     /// <remarks>
     /// This method is intentionally fail-soft. A revoked tenant token disables only that tenant row in users.db
@@ -1247,10 +1252,13 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     /// webhook is removed without dropping pending updates. A webhook probe/removal failure does not start polling
     /// and remains eligible for the persistent, capped-backoff recovery loop. A transient <c>getMe</c> timeout may
     /// still start one optimistic receiver after that webhook preflight succeeds.
+    /// New tenant endpoint intent is prepared before taking the lifecycle gate, preserving coordinator-to-lifecycle
+    /// lock order and preventing an initial optimistic Cloud receiver while Local startup is pending.
     /// </remarks>
     public async Task<bool> StartBotAsync(string botId, CancellationToken cancellationToken = default)
     {
         const int maxAttempts = 3;
+        await PrepareOrdinaryTenantStartupAsync(botId, cancellationToken);
         var lifecycleGate = GetLifecycleGate(botId);
         await lifecycleGate.WaitAsync(cancellationToken);
 
@@ -1291,11 +1299,13 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     /// <remarks>
     /// Application startup and background recovery use this helper. Owner-triggered startup uses
     /// <see cref="StartBotAsync" /> so its bounded retry sequence remains inside one uninterrupted lifecycle lease.
+    /// Tenant endpoint preparation runs before lifecycle locking; staged migration calls the core directly.
     /// </remarks>
     private async Task<BotStartupResult> StartBotAttemptSerializedAsync(
         string botId,
         CancellationToken cancellationToken)
     {
+        await PrepareOrdinaryTenantStartupAsync(botId, cancellationToken);
         var lifecycleGate = GetLifecycleGate(botId);
         await lifecycleGate.WaitAsync(cancellationToken);
         try
@@ -1306,6 +1316,28 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
         {
             lifecycleGate.Release();
         }
+    }
+
+    /// <summary>Arms eligible first-receiver tenant preference before entering lifecycle serialization.</summary>
+    /// <param name="botId">Exact internal registry bot id; owned, assistant, missing and disabled bots are unchanged.</param>
+    /// <param name="cancellationToken">Token cancelling coordinator preparation before a lifecycle lease is acquired.</param>
+    /// <returns>A task completing after durable intent is prepared, without Telegram HTTP or receiver startup.</returns>
+    /// <remarks>
+    /// The migration worker holds its coordinator lock before acquiring a lifecycle lease, so ordinary startup must
+    /// use the same order. A duplicate loser is not armed; the core still runs the authoritative duplicate cleanup.
+    /// Strict destination validation bypasses this helper because its worker already owns the coordinator lock.
+    /// </remarks>
+    /// <exception cref="OperationCanceledException">The ordinary startup caller cancels before coordinator preparation completes.</exception>
+    /// <example><code>await PrepareOrdinaryTenantStartupAsync(tenant.Id, shutdownToken); // Before taking its lifecycle gate.</code></example>
+    private async Task PrepareOrdinaryTenantStartupAsync(string botId, CancellationToken cancellationToken)
+    {
+        if (_endpointCoordinator == null) return;
+        var bot = _registry.GetById(botId);
+        if (bot == null || !string.Equals(bot.Id, botId, StringComparison.OrdinalIgnoreCase) ||
+            !IsTenant(bot) || !bot.Enabled || string.IsNullOrWhiteSpace(bot.Token) ||
+            FindRuntimeTokenConflict(bot).HasConflict)
+            return;
+        await _endpointCoordinator.PrepareTenantStartupAsync(bot.Id, cancellationToken);
     }
 
     /// <summary>
@@ -1334,6 +1366,8 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     /// is explicit and never creates a durable inbox receipt. SDK-validated polls own health recovery. The existing
     /// receiver-start log and tenant lifecycle message include the captured receiver generation's Cloud/Local origin;
     /// a staged migration start is explicitly not proof of final destination activation.
+    /// Ordinary callers prepare new tenant intent before acquiring this gate; this core never enters coordinator
+    /// locking. Duplicate protection precedes endpoint admission so a pending migration cannot hide token conflicts.
     /// </remarks>
     private async Task<BotStartupResult> StartBotCoreAsync(string botId, CancellationToken cancellationToken = default,
         bool strictEndpointValidation = false)
@@ -1346,13 +1380,6 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
         {
             _logger.LogInformation("Telegram bot receiver skipped. botId={BotId}, enabled={Enabled}, hasToken={HasToken}", bot.Id, bot.Enabled, !string.IsNullOrWhiteSpace(bot.Token));
             _runtimeStatusStore.MarkSkipped(bot, bot.Enabled ? "missing token" : "disabled by configuration");
-            return BotStartupResult.Skipped;
-        }
-        if (_endpointGate != null && TelegramBotTokenIdentity.ExtractBotId(bot.Token) is long currentIdentity)
-            await _endpointGate.HydrateAsync(bot.Id, currentIdentity, cancellationToken);
-        if (!strictEndpointValidation && _endpointGate != null && !_endpointGate.CanReceive(bot.Id))
-        {
-            _runtimeStatusStore.MarkSkipped(bot, "endpoint migration pending");
             return BotStartupResult.Skipped;
         }
 
@@ -1389,6 +1416,13 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
         }
 
         await DisableTenantConflictsWonByAsync(bot, cancellationToken);
+        if (_endpointGate != null && TelegramBotTokenIdentity.ExtractBotId(bot.Token) is long currentIdentity)
+            await _endpointGate.HydrateAsync(bot.Id, currentIdentity, cancellationToken);
+        if (!strictEndpointValidation && _endpointGate != null && !_endpointGate.CanReceive(bot.Id))
+        {
+            _runtimeStatusStore.MarkSkipped(bot, "endpoint migration pending");
+            return BotStartupResult.Skipped;
+        }
 
         CancellationTokenSource botCts = null;
         try

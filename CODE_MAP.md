@@ -1706,6 +1706,13 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - `Services/TelegramEndpoints/` owns validated startup options, exact-identity users.db state/history/alert stores,
   durable coordinator/health worker, runtime admission gate, routed SDK facade, private Super Admin panel and direct
   logger-channel notification worker. Existing bots default Cloud; no install/deployment migration changes their endpoint.
+- New tenant token registration atomically adds a missing exact endpoint row with desired Local and idle
+  `tenant_startup` preference in `TenantBotService`; existing Cloud/Local rows and token rotations are preserved.
+  `MultiBotHostedService` arms intent before lifecycle locking, never starts an initial optimistic Cloud receiver,
+  and bypasses preparation for worker-owned strict activation. Safe preflight failure permits Cloud immediately;
+  post-logout Local startup failure retains cleanup proof, performs Local logout and the existing ten-minute Cloud wait.
+  Owner enable keeps safely queued startup enabled; completion races require a serialized real-receiver readiness check.
+  Management-disabled first startup consumes its preference, preventing an unexpected Local migration on a later restart.
 - Migration `20261009120000_AddTelegramEndpointRouting` adds four endpoint-only users.db tables (state, append-only
   history, alert outbox, permanent compact alert receipts), no financial/schema cutover. Key is internal BotId + numeric
   BotFather id; CAS `Revision` differs from operator `ControlRevision`; token/identity replacement cannot reuse old routing.

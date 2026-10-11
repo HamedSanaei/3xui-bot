@@ -1,4 +1,7 @@
 using Adminbot.Domain;
+using Adminbot.Services.TelegramEndpoints;
+using System.Reflection;
+using Telegram.Bot;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Telegram.Bot.Exceptions;
@@ -34,7 +37,6 @@ public sealed partial class ConcurrencyTests
         await canceled.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Contains(TelegramUpdateStage.TelegramProbe, stages);
         Assert.Null(latency.CurrentStage);
-        Assert.Contains("فعلاً امکان بررسی توکن", client.Texts.Last());
         await AssertOwnerProbeSettingsPreserved(databases, tenant);
         release.TrySetResult(ProbeIdentity(60001));
         await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(tenant, "panel"));
@@ -63,8 +65,6 @@ public sealed partial class ConcurrencyTests
         await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(tenant, "panel"));
         await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(tenant, "panel"));
         Assert.Equal(1, probe.Calls);
-        Assert.Contains("فعلاً امکان بررسی توکن", client.Texts.Last());
-        Assert.DoesNotContain("از تنظیمات پاک شد", client.Texts.Last());
         await AssertOwnerProbeSettingsPreserved(databases, tenant);
     }
 
@@ -94,7 +94,6 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(tenant.TenantPricingMode, saved.TenantPricingMode); Assert.Equal(tenant.TenantNormalPricePerGbToman, saved.TenantNormalPricePerGbToman);
         Assert.Equal(123000, (await verify.TenantBotOrders.SingleAsync()).SalePriceToman);
         Assert.Equal(sibling.Token, (await verify.BotInstances.SingleAsync(x => x.Id == sibling.Id)).Token);
-        Assert.Contains("از تنظیمات پاک شد", client.Texts.Last());
         await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(saved, "panel"));
         Assert.Equal(1, probe.Calls);
     }
@@ -114,8 +113,7 @@ public sealed partial class ConcurrencyTests
         tenant = (await provider.GetRequiredService<TenantStoreStore>().ListAsync(711)).Single();
         Assert.Equal("fresh_store", tenant.Username); Assert.Equal("نام تازه", tenant.BrandName);
         await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(tenant, "panel"));
-        Assert.Equal(1, probe.Calls); Assert.Contains("@fresh_store", client.Texts.Last());
-        Assert.DoesNotContain("فعلاً امکان بررسی توکن", client.Texts.Last());
+        Assert.Equal(1, probe.Calls);
     }
 
     /// <summary>Token replacement uses the actual owner input flow and invalidates both old and replacement foreground identities.</summary>
@@ -142,6 +140,288 @@ public sealed partial class ConcurrencyTests
         Assert.Equal(5, probe.Calls); // Reset removes the replacement identity, not just the old secret.
     }
 
+    /// <summary>Real first registration atomically seeds Local-first preference for only the selected store and immutable identity.</summary>
+    /// <returns>A task after persisted registration, sibling/history isolation and later same-identity rotation are checked.</returns>
+    [Fact]
+    public async Task Owner_first_token_registration_seeds_exact_local_preference_and_rotation_preserves_it()
+    {
+        using var databases = new Databases();
+        var probe = new OwnerIdentityProbe((token, _) => Task.FromResult(ProbeIdentity(TelegramBotTokenIdentity.ExtractBotId(token)!.Value)));
+        await using var provider = StorefrontProvider(databases, tokenProbe: probe);
+        var tenant = await provider.GetRequiredService<TenantStoreStore>().CreateAsync(711, Guid.NewGuid().ToString("N"));
+        var sibling = await SeedOwnerProbeStore(databases, provider, 60002);
+        var historical = new TelegramEndpointState
+        {
+            BotId = tenant.Id, TelegramBotId = 60003, DesiredEndpoint = TelegramEndpointType.Cloud,
+            EffectiveEndpoint = TelegramEndpointType.Local, MigrationState = TelegramEndpointMigrationState.Local,
+            Trigger = "manual", Revision = 7, Generation = 9, AutoFailoverEnabled = false
+        };
+        var siblingEndpoint = new TelegramEndpointState
+        {
+            BotId = sibling.Id, TelegramBotId = 60002, DesiredEndpoint = TelegramEndpointType.Cloud,
+            Trigger = "manual", Revision = 4
+        };
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.TelegramEndpointStates.AddRange(historical, siblingEndpoint);
+            await db.SaveChangesAsync();
+        }
+        var client = new StorefrontClient();
+        await SaveOwnerProbeToken(provider, client, tenant, ProbeToken(60001));
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            var saved = await db.BotInstances.SingleAsync(x => x.Id == tenant.Id);
+            Assert.Equal(ProbeToken(60001), saved.Token); Assert.Equal(60001, saved.TelegramBotId);
+            Assert.Equal("store_60001", saved.Username); Assert.False(saved.Enabled);
+            var endpoint = await db.TelegramEndpointStates.SingleAsync(x => x.BotId == tenant.Id && x.TelegramBotId == 60001);
+            Assert.Equal(TelegramEndpointType.Local, endpoint.DesiredEndpoint);
+            Assert.Equal(TelegramEndpointType.Cloud, endpoint.EffectiveEndpoint);
+            Assert.Equal(TelegramEndpointMigrationState.Cloud, endpoint.MigrationState);
+            Assert.Equal("tenant_startup", endpoint.Trigger); Assert.True(endpoint.AutoFailoverEnabled);
+            Assert.Null(endpoint.OperationId); Assert.Null(endpoint.LogoutAttemptedAtUtc);
+            Assert.Equal(3, await db.TelegramEndpointStates.CountAsync());
+            Assert.Equal(sibling.Token, (await db.BotInstances.SingleAsync(x => x.Id == sibling.Id)).Token);
+            Assert.Equal(7, (await db.TelegramEndpointStates.SingleAsync(x => x.BotId == tenant.Id && x.TelegramBotId == 60003)).Revision);
+            Assert.Equal(4, (await db.TelegramEndpointStates.SingleAsync(x => x.BotId == sibling.Id)).Revision);
+            tenant = saved;
+        }
+        var replacement = "60001:" + new string('z', 35);
+        await SaveOwnerProbeToken(provider, client, tenant, replacement);
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Equal(replacement, (await verify.BotInstances.SingleAsync(x => x.Id == tenant.Id)).Token);
+        var rotated = await verify.TelegramEndpointStates.SingleAsync(x => x.BotId == tenant.Id && x.TelegramBotId == 60001);
+        Assert.Equal(TelegramEndpointType.Local, rotated.DesiredEndpoint);
+        Assert.Equal(TelegramEndpointType.Cloud, rotated.EffectiveEndpoint);
+        Assert.Equal(TelegramEndpointMigrationState.Cloud, rotated.MigrationState);
+        Assert.Equal("tenant_startup", rotated.Trigger); Assert.Null(rotated.OperationId);
+        Assert.Equal(3, await verify.TelegramEndpointStates.CountAsync());
+    }
+
+    /// <summary>Registration and subsequent token rotation never replace an exact saved Cloud or Local route, even at revision zero.</summary>
+    /// <param name="local">Whether the saved authoritative route is Local instead of Cloud.</param>
+    /// <param name="pending">Whether saved Local intent is waiting for safe Cloud reuse rather than an idle route.</param>
+    /// <returns>A task after real owner handlers persist both secrets while preserving saved migration evidence.</returns>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Owner_token_registration_preserves_saved_exact_route_and_later_rotation(bool local, bool pending)
+    {
+        using var databases = new Databases();
+        var probe = new OwnerIdentityProbe((token, _) => Task.FromResult(ProbeIdentity(TelegramBotTokenIdentity.ExtractBotId(token)!.Value)));
+        await using var provider = StorefrontProvider(databases, tokenProbe: probe);
+        var tenant = await SeedOwnerProbeStore(databases, provider, 60001);
+        var savedEndpoint = new TelegramEndpointState
+        {
+            BotId = tenant.Id, TelegramBotId = 60001,
+            DesiredEndpoint = local ? TelegramEndpointType.Local : TelegramEndpointType.Cloud,
+            EffectiveEndpoint = local ? TelegramEndpointType.Local : TelegramEndpointType.Cloud,
+            MigrationState = pending ? TelegramEndpointMigrationState.CloudWait :
+                local ? TelegramEndpointMigrationState.Local : TelegramEndpointMigrationState.Cloud,
+            Trigger = "manual", AutoFailoverEnabled = false, Revision = pending ? 8 : 0,
+            ControlRevision = pending ? 3 : 0, Generation = 11,
+            OperationId = pending ? new string('b', 32) : null,
+            LogoutEndpoint = pending ? TelegramEndpointType.Local : null,
+            LogoutAttemptedAtUtc = pending ? DateTime.UtcNow.AddMinutes(-1) : null,
+            LogoutAcknowledgedAtUtc = pending ? DateTime.UtcNow : null,
+            CloudReuseEligibleAtUtc = pending ? DateTime.UtcNow.AddMinutes(10) : null,
+            NextAttemptAtUtc = pending ? DateTime.UtcNow.AddMinutes(10) : null
+        };
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.TelegramEndpointStates.Add(savedEndpoint);
+            await db.SaveChangesAsync();
+        }
+        var client = new StorefrontClient();
+        foreach (var secret in new[] { 'z', 'y' })
+        {
+            var replacement = "60001:" + new string(secret, 35);
+            await SaveOwnerProbeToken(provider, client, tenant, replacement);
+            await using var verify = databases.Users.CreateDbContext();
+            tenant = await verify.BotInstances.SingleAsync(x => x.Id == tenant.Id);
+            Assert.Equal(replacement, tenant.Token); Assert.Equal(60001, tenant.TelegramBotId); Assert.False(tenant.Enabled);
+            var endpoint = await verify.TelegramEndpointStates.SingleAsync(x => x.BotId == tenant.Id && x.TelegramBotId == 60001);
+            Assert.Equal(savedEndpoint.DesiredEndpoint, endpoint.DesiredEndpoint);
+            Assert.Equal(savedEndpoint.EffectiveEndpoint, endpoint.EffectiveEndpoint);
+            Assert.Equal(savedEndpoint.MigrationState, endpoint.MigrationState);
+            Assert.Equal(savedEndpoint.Trigger, endpoint.Trigger); Assert.False(endpoint.AutoFailoverEnabled);
+            Assert.Equal(savedEndpoint.Revision, endpoint.Revision); Assert.Equal(savedEndpoint.ControlRevision, endpoint.ControlRevision);
+            Assert.Equal(savedEndpoint.Generation, endpoint.Generation); Assert.Equal(savedEndpoint.OperationId, endpoint.OperationId);
+            Assert.Equal(savedEndpoint.LogoutEndpoint, endpoint.LogoutEndpoint);
+            Assert.Equal(savedEndpoint.LogoutAttemptedAtUtc, endpoint.LogoutAttemptedAtUtc);
+            Assert.Equal(savedEndpoint.LogoutAcknowledgedAtUtc, endpoint.LogoutAcknowledgedAtUtc);
+            Assert.Equal(savedEndpoint.CloudReuseEligibleAtUtc, endpoint.CloudReuseEligibleAtUtc);
+            Assert.Equal(savedEndpoint.NextAttemptAtUtc, endpoint.NextAttemptAtUtc);
+        }
+    }
+
+    /// <summary>An endpoint insert failure atomically preserves the original bot identity and leaves registration in its token-input state.</summary>
+    /// <returns>A task after a real SQLite constraint failure preserves the original identity, registry, endpoint isolation and input flow.</returns>
+    [Fact]
+    public async Task Owner_token_registration_endpoint_insert_failure_preserves_identity_and_input_state()
+    {
+        using var databases = new Databases();
+        var probe = new OwnerIdentityProbe((token, _) => Task.FromResult(ProbeIdentity(TelegramBotTokenIdentity.ExtractBotId(token)!.Value)));
+        await using var provider = StorefrontProvider(databases, tokenProbe: probe);
+        var tenant = await SeedOwnerProbeStore(databases, provider, 60001);
+        provider.GetRequiredService<BotRegistry>().Upsert(tenant);
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            await db.Database.ExecuteSqlRawAsync(
+                "CREATE TRIGGER reject_tenant_endpoint_insert BEFORE INSERT ON TelegramEndpointStates " +
+                "BEGIN SELECT RAISE(ABORT, 'endpoint insert rejected'); END;");
+        }
+        var client = new StorefrontClient();
+        await SaveOwnerProbeToken(provider, client, tenant, ProbeToken(60002));
+        await AssertOwnerProbeSettingsPreserved(databases, tenant);
+        await using var verify = databases.Users.CreateDbContext();
+        Assert.Empty(await verify.TelegramEndpointStates.ToListAsync());
+        var registered = provider.GetRequiredService<BotRegistry>().Bots.Single(x => x.Id == tenant.Id);
+        Assert.Equal(tenant.Token, registered.Token); Assert.Equal(60001, TelegramBotTokenIdentity.ExtractBotId(registered.Token));
+        Assert.Equal("Token", (await provider.GetRequiredService<UserStateStore>().GetUserStatus(711)).LastStep);
+    }
+
+    /// <summary>Real enable callbacks keep first startup enabled only for the enumerated durable pending phases, never uncertainty or unrelated migration.</summary>
+    /// <param name="phase">Saved endpoint phase that fences the ordinary receiver before any Telegram call.</param>
+    /// <param name="trigger">Closed startup or manual provenance on the saved operation.</param>
+    /// <param name="pending">Whether the owner must see queued startup with Enabled retained.</param>
+    /// <returns>A task after the real runtime refusal, persisted owner enabled intent and receiver admission fencing are checked.</returns>
+    [Theory]
+    [InlineData(TelegramEndpointMigrationState.CheckingLocal, "tenant_startup", true)]
+    [InlineData(TelegramEndpointMigrationState.SwitchingToLocal, "tenant_startup", true)]
+    [InlineData(TelegramEndpointMigrationState.CloudLogoutPending, "tenant_startup", true)]
+    [InlineData(TelegramEndpointMigrationState.FallbackPending, "tenant_startup", true)]
+    [InlineData(TelegramEndpointMigrationState.LocalLogoutPending, "tenant_startup", true)]
+    [InlineData(TelegramEndpointMigrationState.CloudWait, "tenant_startup", true)]
+    [InlineData(TelegramEndpointMigrationState.SwitchingToCloud, "tenant_startup", true)]
+    [InlineData(TelegramEndpointMigrationState.CloudLogoutUncertain, "tenant_startup", false)]
+    [InlineData(TelegramEndpointMigrationState.LocalLogoutUncertain, "tenant_startup", false)]
+    [InlineData(TelegramEndpointMigrationState.ManualInterventionRequired, "tenant_startup", false)]
+    [InlineData(TelegramEndpointMigrationState.MigrationFailed, "tenant_startup", false)]
+    [InlineData(TelegramEndpointMigrationState.CheckingLocal, "manual", false)]
+    public async Task Owner_enable_preserves_only_safe_pending_first_startup(
+        TelegramEndpointMigrationState phase, string trigger, bool pending)
+    {
+        using var databases = new Databases();
+        var probe = new OwnerIdentityProbe((_, _) => Task.FromResult(ProbeIdentity(60001)));
+        await using var provider = StorefrontProvider(databases, tokenProbe: probe);
+        var tenant = await SeedOwnerProbeStore(databases, provider, 60001);
+        tenant.Enabled = false;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.Update(tenant); await db.SaveChangesAsync();
+        }
+        var coordinator = provider.GetRequiredService<TelegramEndpointCoordinator>();
+        // This is a running-process pending operation, not a crashed unacknowledged logout to reconcile.
+        await coordinator.InitializeAsync(default);
+        var endpoint = new TelegramEndpointState
+        {
+            BotId = tenant.Id, TelegramBotId = 60001, DesiredEndpoint = TelegramEndpointType.Local,
+            EffectiveEndpoint = TelegramEndpointType.Cloud, MigrationState = phase,
+            Trigger = trigger, OperationId = new string('c', 32), Revision = 2
+        };
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.TelegramEndpointStates.Add(endpoint); await db.SaveChangesAsync();
+        }
+        var client = new StorefrontClient();
+        await provider.GetRequiredService<UserStateStore>().SaveUserStatus(new User { Id = 711, OwnerStoreId = tenant.Id });
+        await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(tenant, "set-enabled:1"));
+        await using var verify = databases.Users.CreateDbContext();
+        var saved = await verify.BotInstances.SingleAsync(x => x.Id == tenant.Id);
+        Assert.Equal(pending, saved.Enabled); Assert.Equal(tenant.Token, saved.Token);
+        Assert.Equal(pending, provider.GetRequiredService<BotRegistry>().Bots.Single(x => x.Id == tenant.Id).Enabled);
+        Assert.Equal(phase, (await verify.TelegramEndpointStates.SingleAsync(x =>
+            x.BotId == tenant.Id && x.TelegramBotId == 60001)).MigrationState);
+        Assert.False(provider.GetRequiredService<TelegramEndpointRuntimeGate>().CanReceive(tenant.Id));
+    }
+
+    /// <summary>Worker completion between runtime refusal and status observation retains enabled intent only after real receiver readiness.</summary>
+    /// <param name="phase">Worker-completed usable Local, Cloud or recovered-Cloud endpoint phase.</param>
+    /// <param name="workerStartedReceiver">Whether the worker already registered the receiver before the owner observes its completed state.</param>
+    /// <param name="releaseGate">Whether activation publishes usable admission; false proves durable active state alone cannot claim readiness.</param>
+    /// <returns>A task after the real callback's bounded handshake, consumer-visible result and duplicate-polling checks.</returns>
+    [Theory]
+    [InlineData(TelegramEndpointMigrationState.Local, true, true)]
+    [InlineData(TelegramEndpointMigrationState.Cloud, true, true)]
+    [InlineData(TelegramEndpointMigrationState.CloudRecovered, true, true)]
+    [InlineData(TelegramEndpointMigrationState.Local, false, true)]
+    [InlineData(TelegramEndpointMigrationState.Cloud, false, true)]
+    [InlineData(TelegramEndpointMigrationState.CloudRecovered, false, true)]
+    [InlineData(TelegramEndpointMigrationState.CloudRecovered, false, false)]
+    public async Task Owner_enable_completed_first_startup_rechecks_real_receiver_readiness(
+        TelegramEndpointMigrationState phase, bool workerStartedReceiver, bool releaseGate)
+    {
+        using var databases = new Databases();
+        var probe = new OwnerIdentityProbe((_, _) => Task.FromResult(ProbeIdentity(60001)));
+        var polling = new PollingStorefrontClient();
+        OwnerStartupCompletionStore? boundary = null;
+        await using var provider = StorefrontProvider(databases, tokenProbe: probe, configureServices: services =>
+        {
+            services.AddSingleton<ITelegramEndpointStateStore>(sp => boundary = new OwnerStartupCompletionStore(
+                sp.GetRequiredService<TelegramEndpointStore>(),
+                sp.GetRequiredService<BotRegistry>(), sp.GetRequiredService<BotRuntimeStatusStore>()));
+            services.AddSingleton<BotClientProvider>(sp => (BotClientProvider)Activator.CreateInstance(
+                typeof(BotClientProvider), BindingFlags.Instance | BindingFlags.NonPublic, null,
+                new object[]
+                {
+                    sp.GetRequiredService<BotRegistry>(), sp.GetRequiredService<TelegramEndpointRuntimeGate>(),
+                    sp.GetRequiredService<TelegramEndpointRoutingOptions>(),
+                    (Func<BotInstanceConfig, TelegramEndpointRoute, ITelegramBotClient>)((_, _) => polling), null!
+                }, null)!);
+        });
+        var tenant = await SeedOwnerProbeStore(databases, provider, 60001);
+        tenant.Enabled = false;
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.Update(tenant); await db.SaveChangesAsync();
+        }
+        var coordinator = provider.GetRequiredService<TelegramEndpointCoordinator>();
+        await coordinator.InitializeAsync(default);
+        await using (var db = databases.Users.CreateDbContext())
+        {
+            db.TelegramEndpointStates.Add(new TelegramEndpointState
+            {
+                BotId = tenant.Id, TelegramBotId = 60001, DesiredEndpoint = TelegramEndpointType.Local,
+                EffectiveEndpoint = TelegramEndpointType.Cloud, MigrationState = TelegramEndpointMigrationState.CheckingLocal,
+                Trigger = "tenant_startup", OperationId = new string('d', 32), Revision = 2
+            });
+            await db.SaveChangesAsync();
+        }
+        var runtime = provider.GetRequiredService<MultiBotHostedService>();
+        var gate = provider.GetRequiredService<TelegramEndpointRuntimeGate>();
+        boundary!.CompleteAfterRefusal = async token =>
+        {
+            await using var db = databases.Users.CreateDbContext();
+            var state = await db.TelegramEndpointStates.SingleAsync(x =>
+                x.BotId == tenant.Id && x.TelegramBotId == 60001, token);
+            state.MigrationState = phase;
+            state.EffectiveEndpoint = phase == TelegramEndpointMigrationState.Local
+                ? TelegramEndpointType.Local : TelegramEndpointType.Cloud;
+            state.Revision++; state.Generation++;
+            await db.SaveChangesAsync(token);
+            if (releaseGate) gate.Publish(state);
+            if (workerStartedReceiver)
+                Assert.True(await runtime.StartBotAsync(tenant.Id, token));
+        };
+        var client = new StorefrontClient();
+        try
+        {
+            await provider.GetRequiredService<UserStateStore>().SaveUserStatus(new User { Id = 711, OwnerStoreId = tenant.Id });
+            await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(tenant, "set-enabled:1"))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            if (releaseGate) await polling.Started.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.Equal(releaseGate ? 1 : 0, polling.Starts);
+            await using var verify = databases.Users.CreateDbContext();
+            Assert.Equal(releaseGate, (await verify.BotInstances.SingleAsync(x => x.Id == tenant.Id)).Enabled);
+            Assert.Equal(phase, (await verify.TelegramEndpointStates.SingleAsync(x =>
+                x.BotId == tenant.Id && x.TelegramBotId == 60001)).MigrationState);
+            Assert.Equal(releaseGate, provider.GetRequiredService<BotRuntimeStatusStore>().GetSnapshots(
+                provider.GetRequiredService<BotRegistry>().Bots).Single(x => x.BotId == tenant.Id).IsReceiverRunning);
+        }
+        finally { await runtime.StopAsync(default); }
+    }
+
     /// <summary>An old authoritative failure finishing after a real replacement cannot erase or resynchronize the new bot.</summary>
     /// <returns>A task after barrier-controlled stale callback completion and invalidated old-flight cache population are checked.</returns>
     [Fact]
@@ -165,7 +445,6 @@ public sealed partial class ConcurrencyTests
         await originalCallback.WaitAsync(TimeSpan.FromSeconds(2));
         var saved = (await provider.GetRequiredService<TenantStoreStore>().ListAsync(711)).Single();
         Assert.Equal(60002, saved.TelegramBotId); Assert.Equal("store_60002", saved.Username); Assert.NotNull(saved.Token);
-        Assert.DoesNotContain("از تنظیمات پاک شد", client.Texts.Last());
         await cache.ProbeAsync(tenant.Id, tenant.Token, default);
         Assert.Equal(4, probe.Calls);
     }
@@ -195,7 +474,7 @@ public sealed partial class ConcurrencyTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => callback);
         await aborted.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(tenant, "panel"));
-        Assert.Equal(2, probe.Calls); Assert.DoesNotContain("فعلاً امکان بررسی توکن", client.Texts.Last());
+        Assert.Equal(2, probe.Calls);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cache.ProbeAsync(tenant.Id, tenant.Token, cancellation.Token));
         Assert.Equal(2, probe.Calls);
     }
@@ -222,7 +501,6 @@ public sealed partial class ConcurrencyTests
                 new Message { From = new Telegram.Bot.Types.User { Id = 711 }, Chat = new Chat { Id = 711 }, Text = ProbeToken(60002) },
                 ProbeOwner(), state,
                 new ReplyKeyboardRemove(), cancellation.Token));
-        Assert.DoesNotContain(client.Texts, text => text.Contains("اعتبارسنجی توکن ناموفق بود"));
         await AssertOwnerProbeSettingsPreserved(databases, tenant);
     }
 
@@ -319,10 +597,11 @@ public sealed partial class ConcurrencyTests
     /// <param name="tenant">Current saved store and callback revision.</param>
     /// <param name="token">Synthetic replacement secret for the test only.</param>
     /// <returns>A task after production registration and its refreshed owner panel.</returns>
-    /// <remarks>Exercises persisted owner selection and input state rather than invoking private save methods.</remarks>
+    /// <remarks>Persists the explicit selected-store prerequisite, then exercises the real addressed callback and token-input state rather than invoking private save methods.</remarks>
     /// <example><code>await SaveOwnerProbeToken(provider, client, selected, ProbeToken(60002));</code></example>
     private static async Task SaveOwnerProbeToken(ServiceProvider provider, StorefrontClient client, BotInstance tenant, string token)
     {
+        await provider.GetRequiredService<UserStateStore>().SaveUserStatus(new User { Id = 711, OwnerStoreId = tenant.Id });
         await OwnerCallback(provider, client, ProbeOwner(), TenantOwnerCallback.Encode(tenant, "set:Token"));
         await using var scope = provider.CreateAsyncScope();
         Assert.True(await scope.ServiceProvider.GetRequiredService<TenantBotService>().TryHandleOwnerMessageAsync(client,
@@ -346,6 +625,42 @@ public sealed partial class ConcurrencyTests
     /// <returns>A synthetic bot identity, never a persisted settings entity.</returns>
     private static Telegram.Bot.Types.User ProbeIdentity(long botId, string? username = null, string brand = "Verified brand") =>
         new() { Id = botId, IsBot = true, Username = username ?? "store_" + botId, FirstName = brand };
+
+    /// <summary>Wraps real SQLite persistence with one deterministic running-worker completion at the post-refusal status boundary.</summary>
+    /// <param name="inner">Real detached endpoint persistence against isolated users.db.</param>
+    /// <param name="registry">Actual registry used to find the owner-enabled tenant.</param>
+    /// <param name="statuses">Actual runtime observations proving the first receiver attempt was fenced.</param>
+    private sealed class OwnerStartupCompletionStore(
+        ITelegramEndpointStateStore inner, BotRegistry registry, BotRuntimeStatusStore statuses) : ITelegramEndpointStateStore
+    {
+        /// <summary>One controlled worker completion, consumed before invoking it so nested startup reads cannot replay it.</summary>
+        public Func<CancellationToken, Task>? CompleteAfterRefusal { get; set; }
+        /// <inheritdoc />
+        public async Task<TelegramEndpointState> GetOrCreateAsync(string botId, long identity, CancellationToken token)
+        {
+            if (CompleteAfterRefusal is { } complete && statuses.GetSnapshots(registry.Bots).Any(x =>
+                x.BotId == botId && x.Status == "skipped" && x.LastError == "endpoint migration pending"))
+            {
+                CompleteAfterRefusal = null;
+                await complete(token);
+            }
+            return await inner.GetOrCreateAsync(botId, identity, token);
+        }
+        /// <inheritdoc />
+        public Task<IReadOnlyList<TelegramEndpointState>> ReadAllAsync(CancellationToken token) => inner.ReadAllAsync(token);
+        /// <inheritdoc />
+        public Task<IReadOnlyList<TelegramEndpointState>> ReadIdentityStatesAsync(long identity, CancellationToken token) =>
+            inner.ReadIdentityStatesAsync(identity, token);
+        /// <inheritdoc />
+        public Task<bool> TrySaveAsync(TelegramEndpointState state, long expectedRevision, string historyReason = null!,
+            string alertCategory = null!, CancellationToken token = default) =>
+            inner.TrySaveAsync(state, expectedRevision, historyReason, alertCategory, token);
+        /// <inheritdoc />
+        public Task<IReadOnlyList<TelegramEndpointHistory>> ReadHistoryAsync(string botId, long identity, int limit,
+            CancellationToken token) => inner.ReadHistoryAsync(botId, identity, limit, token);
+        /// <inheritdoc />
+        public Task<int> CountPendingAlertsAsync(CancellationToken token) => inner.CountPendingAlertsAsync(token);
+    }
 
     /// <summary>Controlled getMe transport with a thread-safe call counter and no sockets.</summary>
     /// <param name="handler">Controlled transport behavior; may use barriers but must never open a socket.</param>

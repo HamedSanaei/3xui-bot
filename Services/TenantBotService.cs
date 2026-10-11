@@ -7,6 +7,7 @@ using Adminbot.Domain.Logging;
 using Adminbot.Domain.TelegramUi;
 using Adminbot.Services;
 using Adminbot.Services.AppleMobileConfig;
+using Adminbot.Services.TelegramEndpoints;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -2182,16 +2183,19 @@ public partial class TenantBotService
     /// <summary>
     /// Validates a BotFather token with getMe and saves it only on the explicitly selected owner storefront.
     /// </summary>
-    /// <param name="botClient">Main brand Bot client used to Reply to the owner.</param>
-    /// <param name="Message">owner Message containing the Token.</param>
-    /// <param name="owner">colleague owner profile.</param>
-    /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <param name="botClient">Required configured owned-host Telegram client, wrapped for the selected owner panel; replies go to the owner's private chat, not the tenant receiver.</param>
+    /// <param name="Message">Required private owner message from the selected token-input flow. Its text contains the BotFather token secret, which is trimmed and validated but must never be logged or echoed.</param>
+    /// <param name="owner">Required authenticated colleague profile; its numeric TelegramUserId identifies the tenant owner and authorizes only the explicitly selected internal storefront.</param>
+    /// <param name="CancellationToken">Owner update cancellation forwarded to bounded authority-aware Telegram validation, users.db reads and atomic token/endpoint persistence, runtime shutdown and owner replies.</param>
     /// <returns>A task completing after token validation, tenant persistence, runtime refresh and the owner response.</returns>
     /// <remarks>The returned numeric identity must match the token and be unique across tenant, owned and assistant bots.
     /// Stops only the selected receiver before replacement. The unique database identity closes concurrent registration races.
     /// A changed numeric bot or owner identity revokes all customer-wallet approval evidence before persistence.
-    /// Token registration retains its existing configured startup-sized budget, using the read-only routed transport.
+    /// Token registration retains its existing configured startup-sized budget, using the read-only authority-aware routed transport.
     /// Registered and replacement secrets of the same numeric identity retain their authoritative endpoint; historical Local aliases or uncertain cleanup prohibit an unregistered Cloud login.
+    /// Only a missing exact internal-store/BotFather endpoint row is seeded with desired Local, effective Cloud and tenant_startup;
+    /// that preference and the validated token commit atomically in users.db while the tenant stays disabled. Existing rows,
+    /// including revision-zero preferences and token-rotation migration state, are never overwritten. First receiver startup owns migration.
     /// Every successful save removes cached foreground checks, including checks for a replaced secret with the same bot id.
     /// Raw tokens and probe exception text are never sent to logs or replies. All financial history is preserved.</remarks>
     /// <exception cref="OperationCanceledException">The owner update was canceled during validation or persistence.</exception>
@@ -2278,6 +2282,21 @@ public partial class TenantBotService
             tenant.TenantPriceMarkupPercent = 0;
         if (string.IsNullOrWhiteSpace(tenant.SupportAccount) && !string.IsNullOrWhiteSpace(owner.Username))
             tenant.SupportAccount = "@" + owner.Username.TrimStart('@');
+
+        var hasEndpointState = await _workflow.ReadAsync(db => db.TelegramEndpointStates.AnyAsync(
+            state => state.BotId == tenant.Id && state.TelegramBotId == me.Id, CancellationToken));
+        if (!hasEndpointState)
+        {
+            _workflow.Add(new TelegramEndpointState
+            {
+                BotId = tenant.Id,
+                TelegramBotId = me.Id,
+                DesiredEndpoint = TelegramEndpointType.Local,
+                EffectiveEndpoint = TelegramEndpointType.Cloud,
+                MigrationState = TelegramEndpointMigrationState.Cloud,
+                Trigger = "tenant_startup"
+            });
+        }
 
         try
         {
@@ -2580,21 +2599,29 @@ public partial class TenantBotService
     /// <summary>
     /// Applies an idempotent enabled target state to a tenant bot and starts or stops its serialized runtime receiver.
     /// </summary>
-    /// <param name="botClient">Main brand Bot client.</param>
-    /// <param name="CallbackQuery">Owner callback carrying the panel message and callback id.</param>
-    /// <param name="owner">colleague owner profile.</param>
-    /// <param name="desiredEnabled">Desired persisted and runtime state; repeated calls with the same value are no-ops.</param>
+    /// <param name="botClient">Required configured owned-host Telegram client wrapped for the selected owner's panel; never the tenant receiver client.</param>
+    /// <param name="CallbackQuery">Required private owner-panel callback from Telegram, already addressed to an authorized internal storefront. From.Id is the numeric owner user id; Message and Id identify the panel and callback acknowledgement.</param>
+    /// <param name="owner">Required authenticated colleague profile whose numeric TelegramUserId owns the selected internal storefront; never a BotFather bot id.</param>
+    /// <param name="desiredEnabled">Desired persisted receiver intent; true may queue safe first-start migration. Repeating the same value is a no-op.</param>
     /// <param name="expectedRevision">
-    /// Revision embedded in the keyboard that produced the callback. It must match the freshly loaded tenant row.
+    /// Required hexadecimal users.db timestamp revision embedded in the selected storefront keyboard; must match the freshly loaded exact tenant row before mutation.
     /// </param>
-    /// <param name="issuedAt">Hexadecimal Unix timestamp used to reject mutation buttons older than ten minutes.</param>
-    /// <param name="CancellationToken">Cancellation Token.</param>
+    /// <param name="issuedAt">Required hexadecimal Unix timestamp in seconds from the addressed owner keyboard; rejects mutation buttons older than ten minutes.</param>
+    /// <param name="CancellationToken">Owner update cancellation forwarded to bounded Telegram/join validation, tenant persistence, serialized runtime startup and endpoint-status reads, and owner replies.</param>
     /// <remarks>
     /// The callback is acknowledged before channel validation or Telegram startup. This prevents callback expiry
-    /// during network delays. Enabling is persisted only when <see cref="MultiBotHostedService.StartBotAsync" />
-    /// registers a receiver; duplicate enable callbacks never invert the state or create a second receiver.
+    /// during network delays. Enabling remains persisted when <see cref="MultiBotHostedService.StartBotAsync" />
+    /// registers a receiver or the exact identity has a durable tenant_startup migration in a safely pending phase.
+    /// If first startup completes between runtime refusal and status observation, an exact startup active phase
+    /// permits one serialized, idempotent runtime retry; durable endpoint activation alone never proves receiver readiness.
+    /// A failed retry refreshes durable status before deciding whether startup is still safely queued.
+    /// Pending startup is reported as queued, never as an active receiver; logout uncertainty, manual intervention
+    /// and other failures retain the disabled failure behavior. Duplicate enable callbacks never invert state or create a second receiver.
     /// A fresh blocked owner cannot enable a store. Runtime access independently checks owner suspension on every update.
     /// </remarks>
+    /// <returns>A task completing after receiver activation, a safely queued first startup, shutdown, or an owner-visible refusal.</returns>
+    /// <exception cref="OperationCanceledException">The owner update was canceled during validation, persistence, runtime startup or panel rendering.</exception>
+    /// <example><code>await SETTENANTBOTENABLEDASYNC(client, callback, owner, true, revision, issuedAt, cancellationToken);</code></example>
     private async Task SETTENANTBOTENABLEDASYNC(
         ITelegramBotClient botClient,
         CallbackQuery CallbackQuery,
@@ -2733,23 +2760,60 @@ public partial class TenantBotService
                 var started = await runtime.StartBotAsync(tenant.Id, CancellationToken);
                 if (!started)
                 {
-                    tenant.Enabled = false;
-                    tenant.UpdatedAtUtc = DateTime.UtcNow;
-                    await _workflow.SaveAsync(CancellationToken);
-                    _botRegistry.Upsert(tenant);
-                    _botClientProvider.Invalidate(tenant.Id);
+                    var coordinator = _serviceProvider.GetService<TelegramEndpointCoordinator>();
+                    var endpointState = coordinator == null
+                        ? null
+                        : await coordinator.GetStatusAsync(tenant.Id, CancellationToken);
+                    if (endpointState != null && endpointState.TelegramBotId == tenant.TelegramBotId &&
+                        string.Equals(endpointState.Trigger, "tenant_startup", StringComparison.Ordinal) &&
+                        endpointState.MigrationState is TelegramEndpointMigrationState.Local or
+                            TelegramEndpointMigrationState.LocalDegraded or TelegramEndpointMigrationState.Cloud or
+                            TelegramEndpointMigrationState.CloudRecovered)
+                    {
+                        started = await runtime.StartBotAsync(tenant.Id, CancellationToken);
+                        if (!started)
+                            endpointState = await coordinator.GetStatusAsync(tenant.Id, CancellationToken);
+                    }
+                    if (!started && endpointState != null && endpointState.TelegramBotId == tenant.TelegramBotId &&
+                        string.Equals(endpointState.Trigger, "tenant_startup", StringComparison.Ordinal) &&
+                        endpointState.MigrationState is TelegramEndpointMigrationState.CheckingLocal or
+                            TelegramEndpointMigrationState.SwitchingToLocal or TelegramEndpointMigrationState.CloudLogoutPending or
+                            TelegramEndpointMigrationState.FallbackPending or TelegramEndpointMigrationState.LocalLogoutPending or
+                            TelegramEndpointMigrationState.CloudWait or TelegramEndpointMigrationState.SwitchingToCloud)
+                    {
+                        await botClient.SendMessage(
+                            CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                            "⏳ راه‌اندازی اولیه ربات فروشگاهی در صف انجام است. فروشگاه روشن می‌ماند تا آماده‌سازی اتصال تلگرام کامل شود؛ دریافت پیام هنوز فعال نشده است. چند لحظه بعد پنل را به‌روزرسانی کنید.",
+                            cancellationToken: CancellationToken);
+                        await SHOWOWNERPANELASYNC(
+                            botClient,
+                            CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                            owner,
+                            CallbackQuery.Message?.MessageId,
+                            CancellationToken);
+                        return;
+                    }
 
-                    await botClient.SendMessage(
-                        CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
-                        "⚠️ راه‌اندازی ربات فروشگاهی کامل نشد. چند لحظه بعد پنل را به‌روزرسانی و دوباره تلاش کنید.",
-                        cancellationToken: CancellationToken);
-                    await SHOWOWNERPANELASYNC(
-                        botClient,
-                        CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
-                        owner,
-                        CallbackQuery.Message?.MessageId,
-                        CancellationToken);
-                    return;
+                    if (!started)
+                    {
+                        tenant.Enabled = false;
+                        tenant.UpdatedAtUtc = DateTime.UtcNow;
+                        await _workflow.SaveAsync(CancellationToken);
+                        _botRegistry.Upsert(tenant);
+                        _botClientProvider.Invalidate(tenant.Id);
+
+                        await botClient.SendMessage(
+                            CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                            "⚠️ راه‌اندازی ربات فروشگاهی کامل نشد. چند لحظه بعد پنل را به‌روزرسانی و دوباره تلاش کنید.",
+                            cancellationToken: CancellationToken);
+                        await SHOWOWNERPANELASYNC(
+                            botClient,
+                            CallbackQuery.Message?.Chat.Id ?? CallbackQuery.From.Id,
+                            owner,
+                            CallbackQuery.Message?.MessageId,
+                            CancellationToken);
+                        return;
+                    }
                 }
             }
             else

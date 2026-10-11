@@ -48,7 +48,10 @@ public sealed partial class TelegramEndpointCoordinator
     /// <remarks>The marker commits before mutation. Failure after that boundary stays fenced and uncertain.
     /// Cloud-to-Local also retains independent owned Cloud control before intent execution, before marker commit
     /// and immediately before dispatch. Losing control before HTTP restores the verified source without logout.
-    /// Failures persist the exact closed mapping, probe, stop/drain, cleanup or receiving boundary; raw exception text never becomes an operator diagnostic.</remarks>
+    /// Failures persist the exact closed mapping, probe, stop/drain, cleanup or receiving boundary; raw exception text never becomes an operator diagnostic.
+    /// A first tenant receiver never starts optimistically on Cloud before Local preparation.
+    /// If Local readiness fails after acknowledged Cloud logout, fallback retains that proof until Local cleanup
+    /// is verified and acknowledged; unreachable or uncertain cleanup cannot authorize a speculative Cloud login.</remarks>
     private async Task ExecuteOperationAsync(TelegramEndpointState state, CancellationToken shutdownToken)
     {
         if (CanRecoverLocal(state))
@@ -133,7 +136,9 @@ public sealed partial class TelegramEndpointCoordinator
             }
             else if (state.MigrationState == TelegramEndpointMigrationState.FallbackPending)
             {
-                if (state.LogoutAttemptedAtUtc.HasValue)
+                if (state.LogoutAttemptedAtUtc.HasValue && !(state.Trigger == "tenant_startup" &&
+                    state.EffectiveEndpoint == TelegramEndpointType.Cloud && state.LogoutEndpoint == TelegramEndpointType.Cloud &&
+                    state.LogoutAcknowledgedAtUtc.HasValue))
                 {
                     await MarkUncertainAsync(state);
                     return;
@@ -243,6 +248,15 @@ public sealed partial class TelegramEndpointCoordinator
                 {
                     state.LastFailureCategory = endpoint == TelegramEndpointType.Local ? "local_logout_refused" : "cloud_logout_refused";
                     state.LastFailureAtUtc = UtcNow;
+                    if (endpoint == TelegramEndpointType.Local && state.Trigger == "tenant_startup" &&
+                        state.EffectiveEndpoint == TelegramEndpointType.Cloud)
+                    {
+                        // Cloud is only the saved pre-start source, not a safe source to restore after its logout.
+                        state.MigrationState = TelegramEndpointMigrationState.ManualInterventionRequired;
+                        state.NextAttemptAtUtc = null;
+                        await SaveAsync(state, "logout_refused", "manual_intervention", CancellationToken.None);
+                        return;
+                    }
                     state.LogoutAttemptedAtUtc = null;
                     state.LogoutEndpoint = null;
                     await RestoreSourceAsync(state, lease, scope.Token);
@@ -316,6 +330,8 @@ public sealed partial class TelegramEndpointCoordinator
                 state.NextAttemptAtUtc = null;
                 await SaveAsync(state, "manual_intervention", "manual_intervention", CancellationToken.None);
             }
+            else if (state.MigrationState == TelegramEndpointMigrationState.FallbackPending)
+                await ScheduleSafeRetryAsync(state, failure, CancellationToken.None, category);
             else if (state.LogoutAcknowledgedAtUtc.HasValue)
             {
                 if (IsActive(state))
@@ -324,8 +340,6 @@ public sealed partial class TelegramEndpointCoordinator
                     ? TelegramEndpointMigrationState.SwitchingToLocal : TelegramEndpointMigrationState.SwitchingToCloud;
                 await ScheduleSafeRetryAsync(state, failure, CancellationToken.None, category);
             }
-            else if (state.MigrationState == TelegramEndpointMigrationState.FallbackPending)
-                await ScheduleSafeRetryAsync(state, failure, CancellationToken.None, category);
             else if (stopped && lease != null)
             {
                 state.LastFailureCategory = category;
@@ -356,7 +370,10 @@ public sealed partial class TelegramEndpointCoordinator
     /// <param name="token">Whole operation budget, separate from the admin callback.</param>
     /// <param name="shutdownToken">Host lifetime used to distinguish shutdown from destination budget expiry.</param>
     /// <returns>A task completing with an active committed route or a fenced bounded safe retry.</returns>
-    /// <remarks>The parent lifecycle checks webhook absence and nondropping short getUpdates. Identity and readiness failures retain their exact destination boundary across restart without altering retry policy.</remarks>
+    /// <remarks>The parent lifecycle checks webhook absence and nondropping short getUpdates. Identity and readiness
+    /// failures retain their exact destination boundary across restart. New-tenant Local startup failures schedule
+    /// Cloud fallback rather than repeatedly attempting to activate Local. Cleanup proof, cooldown, strict
+    /// identity/readiness and ambiguous-error rules remain mandatory; existing routes retain their retry policy.</remarks>
     private async Task ActivateAsync(TelegramEndpointState state, TelegramEndpointType endpoint,
         ITelegramEndpointReceiverLease lease, CancellationToken token, CancellationToken shutdownToken)
     {
@@ -366,7 +383,7 @@ public sealed partial class TelegramEndpointCoordinator
         catch (Exception exception) { identity = new(TelegramEndpointHealthPolicy.Classify(exception)); }
         if (!identity.Success)
         {
-            await ScheduleSafeRetryAsync(state, identity.Failure, CancellationToken.None,
+            await HandleDestinationFailureAsync(state, endpoint, identity.Failure, CancellationToken.None,
                 TelegramEndpointDiagnosticCatalog.ProbeCategory(endpoint == TelegramEndpointType.Local ? "local_destination_identity" : "cloud_destination_identity", identity.Failure));
             return;
         }
@@ -380,7 +397,7 @@ public sealed partial class TelegramEndpointCoordinator
             if (!await lease.StartValidatedAsync(token).WaitAsync(token))
             {
                 await StopReceiverBoundedAsync(state, lease);
-                await ScheduleSafeRetryAsync(state, TelegramEndpointFailure.ReceiverNotReady, CancellationToken.None,
+                await HandleDestinationFailureAsync(state, endpoint, TelegramEndpointFailure.ReceiverNotReady, CancellationToken.None,
                     endpoint == TelegramEndpointType.Local ? "local_destination_receiver_not_ready" : "cloud_destination_receiver_not_ready");
                 return;
             }
@@ -390,7 +407,7 @@ public sealed partial class TelegramEndpointCoordinator
         {
             var failure = TelegramEndpointHealthPolicy.Classify(exception);
             await StopReceiverBoundedAsync(state, lease);
-            await ScheduleSafeRetryAsync(state, failure, CancellationToken.None,
+            await HandleDestinationFailureAsync(state, endpoint, failure, CancellationToken.None,
                 (endpoint == TelegramEndpointType.Local ? "local_destination_receiver" : "cloud_destination_receiver") +
                 (failure == TelegramEndpointFailure.Timeout ? "_timeout" : "_failed"));
             return;
@@ -414,6 +431,41 @@ public sealed partial class TelegramEndpointCoordinator
             await StopReceiverBoundedAsync(state, lease);
             return;
         }
+    }
+
+    /// <summary>Schedules safe Cloud fallback for failed first-tenant Local readiness, or retains ordinary recovery policy.</summary>
+    /// <param name="state">Detached exact-identity destination state; the original Cloud logout proof must already be durable.</param>
+    /// <param name="endpoint">Explicit destination whose bounded identity or receiver-readiness attempt failed.</param>
+    /// <param name="failure">Closed typed failure; identity, token and configuration rejection require intervention, not endpoint switching.</param>
+    /// <param name="token">Persistence cancellation; callers use an independent token after observing a failed destination.</param>
+    /// <param name="category">Closed stage-qualified diagnostic for the failed destination; never external text or a secret.</param>
+    /// <returns>A task completing after durable fenced fallback intent or the existing bounded safe-retry decision.</returns>
+    /// <remarks>
+    /// Only tenant_startup with automatic fallback enabled may leave failed Local activation.
+    /// The same startup operation and desired Local preference are retained; no logout proof is cleared.
+    /// The next worker pass verifies Local session cleanup, persists its own non-replayable attempt and waits
+    /// for acknowledged cleanup plus Cloud eligibility before starting the first Cloud receiver.
+    /// Ordinary migrations, existing routes and fatal identity errors retain their prior recovery behavior.
+    /// </remarks>
+    /// <example><code>await HandleDestinationFailureAsync(state, TelegramEndpointType.Local, probe.Failure, CancellationToken.None, "local_destination_identity_timeout");</code></example>
+    private async Task HandleDestinationFailureAsync(TelegramEndpointState state, TelegramEndpointType endpoint,
+        TelegramEndpointFailure failure, CancellationToken token, string category)
+    {
+        if (endpoint != TelegramEndpointType.Local || state.Trigger != "tenant_startup" || !state.AutoFailoverEnabled ||
+            state.LogoutEndpoint != TelegramEndpointType.Cloud || !state.LogoutAcknowledgedAtUtc.HasValue ||
+            failure is TelegramEndpointFailure.IdentityMismatch or TelegramEndpointFailure.TokenRejected or TelegramEndpointFailure.ConfigurationMissing)
+        {
+            await ScheduleSafeRetryAsync(state, failure, token, category);
+            return;
+        }
+        // Local getMe may have created a session even when readiness failed; never swap straight back to Cloud.
+        _gate.Fence(state.BotId, state.TelegramBotId);
+        state.MigrationState = TelegramEndpointMigrationState.FallbackPending;
+        state.LastFailureCategory = category;
+        state.LastFailureAtUtc = UtcNow;
+        state.RecoveryAttempts = 0;
+        state.NextAttemptAtUtc = UtcNow;
+        await SaveAsync(state, "fallback_pending", "fallback_pending", token);
     }
 
     /// <summary>Restarts only the known source after a definitive logout refusal or a newly detected identity alias.</summary>
