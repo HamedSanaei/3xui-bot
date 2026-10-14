@@ -62,14 +62,17 @@ public partial interface ITelegramEndpointAdministration
     Task<int> GetPendingAlertCountAsync(CancellationToken cancellationToken);
 }
 
-/// <summary>Provides the private owned-bot Persian endpoint panel with message-bound, single-use random controls.</summary>
+/// <summary>Provides the private owned-bot endpoint panel with reusable inventory navigation and message-bound, single-use controls.</summary>
 /// <remarks>Global AdminsUserIds is rechecked on every update. Tenant owners, customers, assistant hosts and group chats cannot enter.
-/// Callback sessions contain no credentials and are bounded to 512 entries with ten-minute expiry; read-only batch reports last one hour to outlive Cloud cooldown. The coordinator alone changes routes.</remarks>
+/// Inventory navigation reads current metadata without session authority, probes or mutations. Other callback sessions contain no credentials
+/// and are bounded to 512 entries with ten-minute expiry; read-only batch reports last one hour to outlive Cloud cooldown. The coordinator alone changes routes.</remarks>
 public sealed class TelegramEndpointAdminService
 {
     /// <summary>The exact owned administration-menu entry; /telegram_api provides an alternate healthy owned-host path.</summary>
     public const string Action = "🌐 مدیریت Telegram API";
     private const string Prefix = "tep:";
+    /// <summary>Read-only inventory callback namespace; carries only a nonnegative page, never mutation authority or captured identity.</summary>
+    private const string InventoryPrefix = Prefix + "list:";
     /// <summary>Three complete operational summaries per page keep fixed Persian diagnostics below Telegram's text limit without truncation.</summary>
     private const int PageSize = 3;
     private const int MaxSessions = 512;
@@ -126,7 +129,8 @@ public sealed class TelegramEndpointAdminService
     /// <param name="update">Required authenticated Telegram update; the callback's actor and message supply all security bindings.</param>
     /// <param name="token">Receiver/update cancellation token; not retained by queued migrations.</param>
     /// <returns>True when this is a panel update, including rejected attempts; false for unrelated business updates.</returns>
-    /// <remarks>Each valid callback consumes the entire displayed session before awaiting work, rejecting replay and concurrent taps.
+    /// <remarks>Inventory navigation is reusable after expiry or restart, but requires live global/private-owned authorization on every tap.
+    /// All other valid callbacks consume the entire displayed session before awaiting work, rejecting replay and concurrent mutation taps.
     /// Migration and bulk progress are rendered before registration, so migrating this host never needs a post-fence ordinary send.
     /// Bulk confirmations freeze the entire configured inventory; reports are actor-scoped, process-local, absolutely one-hour bounded and read-only on refresh.</remarks>
     /// <exception cref="OperationCanceledException">The update caller cancels its work.</exception>
@@ -152,6 +156,14 @@ public sealed class TelegramEndpointAdminService
             if (!isCallback)
             {
                 await RenderAsync(hostingBotId, client, actor, message.Chat.Id, 0, new PanelCommand(CommandKind.Inventory), token);
+                return true;
+            }
+            if (TryGetInventoryPage(callback.Data, out var inventoryPage))
+            {
+                // This path can only render fresh metadata. It cannot reconstruct or authorize an expired migration.
+                await AckAsync(client, callback, hostingBotId, null, token);
+                await RenderAsync(hostingBotId, client, actor, message.Chat.Id, message.Id,
+                    new PanelCommand(CommandKind.Inventory, Page: inventoryPage), token);
                 return true;
             }
             PanelSession session;
@@ -294,7 +306,7 @@ public sealed class TelegramEndpointAdminService
         return !string.IsNullOrWhiteSpace(username) && string.Equals(text, "/telegram_api@" + username, StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>Renders bounded metadata and a fresh message-bound session; no endpoint mutation occurs here.</summary>
+    /// <summary>Renders bounded metadata with reusable inventory links and a fresh message-bound control session; no endpoint mutation occurs here.</summary>
     /// <param name="host">Exact authorized receiving bot id.</param>
     /// <param name="client">Receiving bot's ordinary client.</param>
     /// <param name="actor">Authorized Telegram sender id.</param>
@@ -717,19 +729,37 @@ public sealed class TelegramEndpointAdminService
         if (state.OperationId != result.OperationId) return "changed";
         return TelegramEndpointPresentation.Outcome(state, history);
     }
-    /// <summary>Adds one short opaque callback and its server-held operation without a captured rendering closure.</summary>
+    /// <summary>Adds reusable inventory navigation or a short opaque callback bound to a server-held operation.</summary>
     /// <param name="rows">Required output keyboard rows for this rendering.</param>
     /// <param name="commands">Required server-held commands bound to the new session.</param>
     /// <param name="nonce">Cryptographically random 24-hex session nonce, not a bot token.</param>
     /// <param name="label">Fixed Persian button label or sanitized configured bot name.</param>
-    /// <param name="command">Immutable identity/revision-bound server-held control.</param>
-    /// <remarks>Payloads contain no URLs or operation parameters and stay below Telegram's 64-byte bound.</remarks>
+    /// <param name="command">Immutable view/control; only Inventory is encoded as a page instead of session authority.</param>
+    /// <remarks>Inventory payloads are read-only and reauthorize against the live receiving host on every tap, including after restart.
+    /// All other payloads retain identity/revision/message-bound single-use authority. No payload contains credentials or URLs.</remarks>
+    /// <example><code>AddButton(rows, commands, nonce, "🔄 تازه‌سازی فهرست", new PanelCommand(CommandKind.Inventory, Page: 0));</code></example>
     private static void AddButton(List<InlineKeyboardButton[]> rows, List<PanelCommand> commands,
         string nonce, string label, PanelCommand command)
     {
-        var data = Prefix + nonce + ":" + commands.Count.ToString(CultureInfo.InvariantCulture);
-        commands.Add(command);
+        var data = command.Kind == CommandKind.Inventory
+            ? InventoryPrefix + Math.Max(0, command.Page).ToString(CultureInfo.InvariantCulture)
+            : Prefix + nonce + ":" + commands.Count.ToString(CultureInfo.InvariantCulture);
+        if (command.Kind != CommandKind.Inventory) commands.Add(command);
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData(label, data) });
+    }
+
+    /// <summary>Recognizes only bounded nonnegative inventory pages, never an operation or expired session index.</summary>
+    /// <param name="data">Untrusted Telegram callback text; null, malformed, signed and oversized values are rejected.</param>
+    /// <param name="page">Nonnegative zero-based inventory page on success; the renderer clamps it to current inventory size.</param>
+    /// <returns>True only for a read-only inventory callback within Telegram's 64-byte bound; confers no authorization.</returns>
+    /// <remarks>The caller must independently require a current global admin in a private enabled owned bot. No state, health or endpoint write occurs.</remarks>
+    /// <example><code>if (TryGetInventoryPage("tep:list:0", out var page)) { /* Render current inventory after authorization. */ }</code></example>
+    private static bool TryGetInventoryPage(string data, out int page)
+    {
+        page = 0;
+        return data != null && Encoding.UTF8.GetByteCount(data) <= 64 &&
+            data.StartsWith(InventoryPrefix, StringComparison.Ordinal) &&
+            int.TryParse(data.AsSpan(InventoryPrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out page) && page >= 0;
     }
 
     /// <summary>Describes logger-channel prerequisites without claiming posting permission or notification delivery.</summary>

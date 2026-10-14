@@ -1759,7 +1759,10 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   boundaries (admission, both prelogout checks, resolution), not fatal Cloud startup; origins/resource bounds stay fatal.
   `TGFile` provenance/epoch + capped bindings protect read-only transfers; never touch the shared downloader container.
 - **🌐 مدیریت Telegram API** / `/telegram_api`: global live Super Admin allowlist only, private enabled owned host,
-  actor/chat/message/host/BotFather-bound ten-minute single-use callbacks, confirmation + control revision. Another healthy
+  actor/chat/message/host/BotFather-bound ten-minute single-use controls, confirmation + control revision. Read-only
+  `tep:list:<page>` inventory refresh/page/return links survive expiry, prior navigation and restart; every tap rechecks
+  live private-owned admin authorization and renders current metadata only, never health probes or migration replay.
+  Previously delivered nonce-based inventory buttons need one panel reopen after upgrading. Another healthy
   owned bot provides recovery control; tenant owners/customers/assistant hosts have no authority.
 - Endpoint main views lead with exact `☁️ CLOUD` / `🏠 LOCAL` from nullable `[NotMapped]` actual admission; fenced/unknown
   routes stay explicit. Pending source/destination is separated from live connection. `🔍 جزئیات فنی` paginates complete

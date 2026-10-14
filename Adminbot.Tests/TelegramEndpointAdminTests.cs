@@ -252,6 +252,120 @@ public sealed class TelegramEndpointAdminTests
         Assert.Contains("جزئیات «disabled_bot»", observed);
     }
 
+    /// <summary>Inventory refresh is read-only navigation, not an expiring or consumed migration authorization.</summary>
+    /// <param name="scenario">Expiry, consumed rendering, or process restart that previously invalidated refresh.</param>
+    /// <returns>A task proving the old refresh reads current inventory without migration or health probes.</returns>
+    [Theory]
+    [InlineData("expiry")]
+    [InlineData("consumed")]
+    [InlineData("restart")]
+    public async Task Inventory_refresh_survives_expiry_consumption_and_restart(string scenario)
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        var original = fixture.Control;
+        var refresh = Button(original, "🔄 تازه‌سازی فهرست");
+        if (scenario == "expiry") fixture.Clock.Advance(TimeSpan.FromHours(2));
+        if (scenario == "consumed")
+            await fixture.TapAsync(original, Button(original, "جزئیات «owned_bot»"));
+        if (scenario == "restart") fixture = new Fixture();
+        fixture.Backend.States["owned"].ControlRevision++;
+        fixture.Backend.States["owned"].RuntimeEndpoint = TelegramEndpointType.Local;
+        var reads = fixture.Backend.Reads;
+        await fixture.TapAsync(original, refresh);
+        Assert.True(fixture.Backend.Reads > reads);
+        Assert.Contains("فهرست ربات‌ها", fixture.Control.Text);
+        Assert.Contains("🏠 LOCAL: 1", fixture.Control.Text);
+        Assert.Null(fixture.Client.Answers.Last().Text);
+        await fixture.TapAsync(original, refresh);
+        Assert.Null(fixture.Client.Answers.Last().Text);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Empty(fixture.Backend.Batches);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
+    /// <summary>Stateless refresh still requires a current global administrator's private enabled owned host.</summary>
+    /// <param name="host">Exact receiving registry bot id, including forbidden tenant and disabled hosts.</param>
+    /// <param name="actor">Incoming synthetic Telegram user id.</param>
+    /// <param name="chat">Incoming Telegram chat type.</param>
+    /// <returns>A task proving unauthorized refresh performs no metadata reads or edits.</returns>
+    [Theory]
+    [InlineData("owned", 202, ChatType.Private)]
+    [InlineData("tenant", Admin, ChatType.Private)]
+    [InlineData("disabled", Admin, ChatType.Private)]
+    [InlineData("owned-assistant", Admin, ChatType.Private)]
+    [InlineData("owned", Admin, ChatType.Group)]
+    public async Task Inventory_refresh_rechecks_authority(string host, long actor, ChatType chat)
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        var original = fixture.Control;
+        var reads = fixture.Backend.Reads;
+        await fixture.Panel.TryHandleAsync(host, fixture.Client,
+            Callback(original, Button(original, "🔄 تازه‌سازی فهرست"), actor: actor, chatId: actor, chatType: chat), default);
+        Assert.Equal(reads, fixture.Backend.Reads);
+        Assert.Equal(original, fixture.Control);
+        Assert.Empty(fixture.Backend.Migrations);
+    }
+
+    /// <summary>Rejects malformed stateless inventory payloads instead of interpreting them as mutation authority.</summary>
+    /// <param name="data">Untrusted malformed page callback, including signed, overflow and extra-segment values.</param>
+    /// <returns>A task proving no metadata read, edit, probe or migration occurs.</returns>
+    [Theory]
+    [InlineData("tep:list:-1")]
+    [InlineData("tep:list:+1")]
+    [InlineData("tep:list:")]
+    [InlineData("tep:list:2147483648")]
+    [InlineData("tep:list:0:extra")]
+    [InlineData("tep:list:migrate")]
+    public async Task Inventory_navigation_rejects_malformed_pages(string data)
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        var original = fixture.Control;
+        var reads = fixture.Backend.Reads;
+        await fixture.TapAsync(original, data);
+        Assert.Equal(reads, fixture.Backend.Reads);
+        Assert.Equal(original, fixture.Control);
+        Assert.Contains("نامعتبر", fixture.Client.Answers.Last().Text);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Empty(fixture.Backend.Batches);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
+    /// <summary>Expired inventory paging and return links reload current pages without resurrecting an old confirmation.</summary>
+    /// <returns>A task proving navigation survives expiry, clamps pages, and preserves strict mutation replay rejection.</returns>
+    [Fact]
+    public async Task Inventory_navigation_preserves_pages_and_never_revives_confirmation()
+    {
+        var fixture = new Fixture(extraBots: 13);
+        await fixture.OpenAsync();
+        var first = fixture.Control;
+        var next = Button(first, "صفحه بعد ▶️");
+        fixture.Clock.Advance(TimeSpan.FromMinutes(11));
+        await fixture.TapAsync(first, next);
+        Assert.Contains("صفحه 2/7", fixture.Control.Text);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی فهرست"));
+        Assert.Contains("صفحه 2/7", fixture.Control.Text);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "◀️ صفحه قبل"));
+        Assert.Contains("صفحه 1/7", fixture.Control.Text);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "جزئیات «owned_bot»"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "انتقال به Local…"));
+        var confirmation = fixture.Control;
+        var migrate = Button(confirmation, "✅ تأیید انتقال به Local (محلی)");
+        var back = Button(confirmation, "📋 بازگشت به فهرست");
+        fixture.Clock.Advance(TimeSpan.FromMinutes(11));
+        await fixture.TapAsync(confirmation, back);
+        Assert.Contains("صفحه 1/7", fixture.Control.Text);
+        await fixture.TapAsync(confirmation, migrate);
+        Assert.Contains("نامعتبر", fixture.Client.Answers.Last().Text);
+        await fixture.TapAsync(fixture.Control, "tep:list:2147483647");
+        Assert.Contains("صفحه 7/7", fixture.Control.Text);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Empty(fixture.Backend.Batches);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
     /// <summary>Initial inventory totals cover all pages and actual routes across bot types, then change on a read-only refresh.</summary>
     /// <returns>A task after the first sent message, next page and fresh runtime observations are checked.</returns>
     /// <remarks>Saved Local preferences do not count a fenced source as active; disabled and unobserved routes occupy separate buckets.</remarks>
