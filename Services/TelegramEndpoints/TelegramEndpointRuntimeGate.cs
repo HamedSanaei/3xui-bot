@@ -144,7 +144,8 @@ public sealed class TelegramEndpointRuntimeGate
 
     /// <summary>Hydrates saved authority without reopening a lifecycle fence or ignoring a newer restrictive alias state.</summary>
     /// <param name="state">Detached exact-identity saved state read by startup, current inventory or a first request.</param>
-    /// <remarks>Active ordinary reads never overwrite hydrated lifecycle state. Restrictive committed rows close every alias immediately; if original operations remain, their endpoint and epoch survive until a drained restrictive publication adopts the saved replacement.</remarks>
+    /// <remarks>Active ordinary reads never overwrite hydrated lifecycle state. During staged startup, same/older-revision reads cannot undo the lifecycle owner's destination or receiver-only admission. A genuinely newer restrictive receipt still cancels staging and closes every alias; occupied original routes survive until drained restrictive publication.</remarks>
+    /// <example><code>gate.PublishIfUnhydrated(savedState); // Observe saved authority without cancelling staged readiness.</code></example>
     public void PublishIfUnhydrated(TelegramEndpointState state) => PublishCore(state, onlyIfUnhydrated: true);
 
     /// <summary>Applies exact committed authority while preserving identity-wide lifecycle fence ownership.</summary>
@@ -152,9 +153,10 @@ public sealed class TelegramEndpointRuntimeGate
     /// <param name="onlyIfUnhydrated">True for ordinary reads, which may close but never reopen an existing lifecycle fence.</param>
     /// <param name="hydratingEntry">Original exact entry for an asynchronous hydration flight, or null for ordinary committed publication.</param>
     /// <param name="authorityVersion">Registry-incarnation counter captured before hydration I/O; stale A→B→A reads cannot publish after return.</param>
-    /// <remarks>Notifications occur outside the lock. Real route replacement drains all same-identity work; an initial unknown saved epoch may load only without conflicting leased routes. Restrictive authority closes admission immediately while preserving an occupied original route. Returning identities reject obsolete hydration flights.</remarks>
+    /// <remarks>Notifications occur outside the lock. Real route replacement drains all same-identity work; an initial unknown saved epoch may load only without conflicting leased routes. Repeated read snapshots preserve staged lifecycle authority without opening ordinary delivery; newer restrictive authority still cancels staging. Returning identities reject obsolete hydration flights.</remarks>
     /// <exception cref="InvalidOperationException">An active different route is published before same-identity work drains.</exception>
     /// <exception cref="BotTransportUnavailableException">An asynchronous hydration belongs to an obsolete registry incarnation.</exception>
+    /// <example><code>PublishCore(state, onlyIfUnhydrated: true); // Inventory reads cannot replace lifecycle-owned staging.</code></example>
     private void PublishCore(TelegramEndpointState state, bool onlyIfUnhydrated, Entry hydratingEntry = null, long authorityVersion = 0)
     {
         ArgumentNullException.ThrowIfNull(state);
@@ -166,7 +168,11 @@ public sealed class TelegramEndpointRuntimeGate
             if (hydratingEntry != null && (!ReferenceEquals(entry, hydratingEntry) || entry.AuthorityVersion != authorityVersion))
                 throw new BotTransportUnavailableException("telegram_identity_changed");
             var active = IsActive(state.MigrationState);
-            if (onlyIfUnhydrated && entry.Hydrated && active) return;
+            // Inventory/status reads can race with strict readiness after PrepareActivation. The saved
+            // pending row still names the source; reapplying it would undo staging or cancel getUpdates.
+            // Only a newer restrictive receipt may override that lifecycle-owned preparation.
+            if (onlyIfUnhydrated && entry.Hydrated &&
+                (active || entry.Starting && state.Revision <= entry.Revision)) return;
             if (state.Revision < entry.Revision || state.Generation < entry.Generation) return;
             var bindingChanged = entry.Generation != state.Generation || entry.Endpoint != state.EffectiveEndpoint;
             var deferBinding = bindingChanged && (entry.Admission.Handlers != 0 || entry.Admission.Requests != 0) &&

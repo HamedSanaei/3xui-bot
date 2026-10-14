@@ -338,6 +338,7 @@ public sealed class TelegramEndpointNotificationWorker : BackgroundService
     /// <summary>Renders safe Persian operator text at send time rather than persisting a body.</summary>
     /// <param name="alert">Secret-free frozen incident metadata.</param>
     /// <returns>Plain-text Persian alert with fixed category labels and safe bot identity.</returns>
+    /// <remarks>Frozen CloudWait receipts describe acknowledged cleanup and a scheduled ten-minute wait, not an active Cloud receiver or unfinished Local cleanup. No extra notification or probe is created.</remarks>
     private static string Render(TelegramEndpointAlert alert)
     {
         var title = alert.Category switch
@@ -347,10 +348,14 @@ public sealed class TelegramEndpointNotificationWorker : BackgroundService
             "migration_succeeded" => "انتقال Telegram API تکمیل شد",
             "local_outage" => "سرویس Local Telegram API از دسترس خارج شد",
             "local_recovered" => "سرویس Local Telegram API بازیابی شد",
+            "fallback_pending" when alert.MigrationState == TelegramEndpointMigrationState.CloudWait => "خروج Local تأیید شد؛ فعال‌سازی Cloud در انتظار مهلت ایمنی است",
             "fallback_pending" => "بازیابی Cloud منتظر پاک‌سازی ایمن Local است",
             "cloud_recovered" => "سرویس ربات روی Cloud بازیابی شد",
             _ => "وضعیت Telegram API نیازمند بررسی مدیر است"
         };
-        return $"🌐 {title}\nربات: {alert.BotId}\nشناسه ربات: {alert.TelegramBotId}\nوضعیت: {alert.MigrationState}\nمسیر فعال: {alert.EffectiveEndpoint}\nمسیر درخواستی: {alert.DesiredEndpoint}\nنسل مسیر: {alert.Generation}";
+        var waiting = alert.MigrationState == TelegramEndpointMigrationState.CloudWait
+            ? "\n⏳ ربات در این مرحله پاسخ نمی‌دهد. پس از حداقل ۱۰ دقیقه از خروج تأییدشده، فعال‌سازی Cloud خودکار بررسی می‌شود؛ خطای شبکه می‌تواند انتظار را بیشتر کند. خروج یا انتقال را تکرار نکنید."
+            : string.Empty;
+        return $"🌐 {title}\nربات: {alert.BotId}\nشناسه ربات: {alert.TelegramBotId}\nوضعیت: {alert.MigrationState}\nآخرین مسیر فعال‌شده: {alert.EffectiveEndpoint}\nمسیر درخواستی: {alert.DesiredEndpoint}\nنسل مسیر: {alert.Generation}{waiting}";
     }
 }

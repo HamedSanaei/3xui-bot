@@ -306,6 +306,7 @@ public sealed class TelegramEndpointAdminService
     /// <returns>A task completing after the new control keyboard is published.</returns>
     /// <remarks>Main screens contain only connection, migration outcome and fixed Persian action; inventory includes whole-inventory live Cloud/Local counts, with paused/disabled and unknown routes separate.
     /// Bulk confirmation explicitly states that active destinations are skipped without receiver interruption or preference changes.
+    /// Cloud confirmations explain the ten-minute post-cleanup pause and automatic scheduled activation; this is not an immediate endpoint switch.
     /// Technical screens are read-only fresh snapshots, paginated without dropping diagnostic content. Registration receipts expire independently and remain identity/control-revision bound.</remarks>
     private async Task RenderAsync(string host, ITelegramBotClient client, long actor, long chat, int messageId,
         PanelCommand view, CancellationToken token, string notice = null)
@@ -325,7 +326,7 @@ public sealed class TelegramEndpointAdminService
             text.AppendLine("ربات‌هایی که از قبل روی مقصد فعال‌اند رد می‌شوند (skip)؛ تنظیم مسیرشان تغییر نمی‌کند و قطع‌و‌وصل نمی‌شوند. فقط ربات‌های مسیر مقابل منتقل می‌شوند.");
             text.AppendLine(view.Target == TelegramEndpointType.Local
                 ? "🏠 یک ربات Owned فعال و مستقل روی Cloud برای مسیر مدیریت باقی می‌ماند (ترجیحاً همین میزبان). قانون آخرین مسیر مستقل Cloud دور زده نمی‌شود؛ بعضی درخواست‌ها ممکن است رد شوند."
-                : "☁️ همه ربات‌های این فهرست، از جمله میزبان، بررسی می‌شوند. پاک‌سازی و مهلت رسمی Cloud می‌تواند تکمیل را به تأخیر بیندازد.");
+                : "☁️ همه ربات‌های این فهرست، از جمله میزبان، بررسی می‌شوند. ربات‌های منتقل‌شونده پس از خروج تأییدشده از Local، حداقل ۱۰ دقیقه پاسخ نمی‌دهند؛ سپس فعال‌سازی Cloud خودکار بررسی می‌شود. درخواست یا خروج را تکرار نکنید.");
             text.AppendLine("ثبت درخواست ≠ تکمیل انتقال. دریافت پیام میزبان ممکن است متوقف شود؛ گزارش را با تازه‌سازی یا /telegram_api در ربات Owned سالم دیگری ببینید.");
             AddButton(rows, commands, nonce, "✅ تأیید انتقال دسته‌ای به " + EndpointLabel(view.Target),
                 view with { Kind = CommandKind.BulkMigrate, Identity = hostState.TelegramBotId, Revision = hostState.ControlRevision, Targets = targets });
@@ -413,7 +414,11 @@ public sealed class TelegramEndpointAdminService
                 AppendDiagnostic(text, receiptCategory, state, technical: false);
                 AppendDiagnostic(text, state.LastFailureCategory, state, technical: false);
                 if (view.Kind == CommandKind.Confirm)
+                {
                     text.AppendLine($"⚠️ انتقال به {EndpointLabel(view.Target)} را تأیید می‌کنید؟ دریافت پیام این ربات موقتاً متوقف می‌شود؛ خروج اختصاصی ربات و مهلت رسمی CLOUD لازم است.");
+                    if (view.Target == TelegramEndpointType.Cloud)
+                        text.AppendLine("⏳ پس از خروج تأییدشده از Local، حداقل ۱۰ دقیقه پاسخ‌گویی متوقف است. پایان مهلت و شروع Cloud خودکار بررسی می‌شود؛ خطای موقت شبکه ممکن است انتظار را بیشتر کند. درخواست یا خروج را تکرار نکنید.");
+                }
                 if (state.TelegramBotId <= 0)
                     AddButton(rows, commands, nonce, "🔄 تازه‌سازی وضعیت", detail);
                 else if (view.Kind == CommandKind.Confirm)

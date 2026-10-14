@@ -597,6 +597,45 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.Equal(1, f.Lifecycle.MaximumReceivers);
     }
 
+    /// <summary>A manual Cloud transfer survives restart and a destination timeout without repeating Local logout or opening early admission.</summary>
+    /// <returns>A task proving scheduled safe recovery activates exactly one receiver after cooldown and preserves unrelated bot admission.</returns>
+    /// <remarks>All reads, cleanup and receiving are fake; the durable acknowledgment is retained across two coordinator restarts.</remarks>
+    [Fact]
+    public async Task Manual_cloud_transfer_restart_and_transient_read_failure_resume_without_second_logout()
+    {
+        using var f = new Fixture(TelegramEndpointType.Local, includeSecondBot: true);
+        await f.InitializeAsync();
+        Assert.Equal("accepted", await f.RequestAsync(TelegramEndpointType.Cloud));
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var wait = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.CloudWait, wait.MigrationState);
+        Assert.False(f.Gate.IsAvailable("owned-a", 123));
+        Assert.True(f.Gate.IsAvailable("owned-b", 234));
+        f.RestartCoordinator();
+        await f.InitializeAsync();
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        Assert.DoesNotContain("identity:Cloud", f.Protocol.Events);
+        f.Clock.Advance(TimeSpan.FromMinutes(10));
+        f.Protocol.CloudFailure = TelegramEndpointFailure.Timeout;
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        var retry = await f.StatusAsync();
+        Assert.NotNull(retry.NextAttemptAtUtc);
+        Assert.Equal(wait.LogoutAcknowledgedAtUtc, retry.LogoutAcknowledgedAtUtc);
+        Assert.False(f.Gate.IsAvailable("owned-a", 123));
+        Assert.Equal(0, f.Lifecycle.Starts);
+        f.RestartCoordinator();
+        await f.InitializeAsync();
+        f.Protocol.CloudFailure = TelegramEndpointFailure.None;
+        f.Clock.Advance(retry.NextAttemptAtUtc!.Value - f.Clock.GetUtcNow().UtcDateTime);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        Assert.Equal(TelegramEndpointMigrationState.Cloud, (await f.StatusAsync()).MigrationState);
+        Assert.True(f.Gate.IsAvailable("owned-a", 123));
+        Assert.True(f.Gate.IsAvailable("owned-b", 234));
+        Assert.Equal(1, f.Protocol.LogoutCalls);
+        Assert.Equal(1, f.Lifecycle.Starts);
+        Assert.Equal(1, f.Lifecycle.MaximumReceivers);
+    }
+
     /// <summary>An unreachable Local session cannot be bypassed with Cloud getMe; exhausting safe retries preserves its exact root failure stage.</summary>
     /// <returns>A task after bounded reads end in explicit intervention with no logout or destination activation.</returns>
     [Fact]

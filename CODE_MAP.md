@@ -1737,6 +1737,11 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   and zero-offset/non-dropping receiving readiness. Ambiguous/interrupted logout is manual intervention, never blindly repeated.
   Local→Cloud requires proven Local cleanup and persisted Cloud eligibility; conservative fresh ten-minute Local-logout wait.
   Unreachable Local cannot produce false Cloud success. Default automatic failback is off; desired and effective stay separate.
+- Strict receiver staging is lifecycle-owned: inventory/status reads of the same/older committed pending revision
+  must not reset `Starting` or restore the saved source endpoint; genuinely newer restrictive receipts still fence it.
+  Manual/bulk Cloud confirmations and CloudWait logger alerts explicitly describe the minimum ten-minute post-cleanup
+  response pause and automatic scheduled activation, not immediate Cloud availability. Cleanup/cooldown/non-replay rules
+  are unchanged; real-SDK regression coverage includes both migration directions and same-Local outage recovery.
 - Official Local GetFile gives server filesystem paths, not Cloud /file HTTP downloads. `localFileServerRoot` and existing
   searchable/listable nonsymlink `localFileHostRoot` mapping are required before migration. Linux uses effective ACL/privilege
   `faccessat` plus bounded listing, never customer contents/probe writes. Root syntax validation occurs at named Local-use

@@ -16,6 +16,70 @@ using Xunit;
 
 public sealed partial class ConcurrencyTests
 {
+    /// <summary>Inventory/status reads during recovery must not undo the lifecycle owner's staged receiver route.</summary>
+    /// <param name="source">Synthetic persisted source endpoint; no production bot or token is used.</param>
+    /// <param name="destination">Synthetic authorized destination, including same-Local outage recovery.</param>
+    /// <returns>A task proving receiver readiness remains possible, ordinary sends stay fenced, and only committed activation enables delivery.</returns>
+    /// <remarks>Regression: a repeated restrictive snapshot previously reset Starting and could restore the source endpoint during strict startup.</remarks>
+    [Theory]
+    [InlineData(TelegramEndpointType.Cloud, TelegramEndpointType.Local)]
+    [InlineData(TelegramEndpointType.Local, TelegramEndpointType.Cloud)]
+    [InlineData(TelegramEndpointType.Local, TelegramEndpointType.Local)]
+    public async Task Endpoint_status_read_preserves_staged_receiver_authority(
+        TelegramEndpointType source, TelegramEndpointType destination)
+    {
+        var registry = EndpointRuntimeRegistry();
+        var gate = new TelegramEndpointRuntimeGate(registry);
+        using var http = new EndpointRuntimeHttp();
+        using var clients = new BotClientProvider(registry, gate, new TelegramEndpointRoutingOptions(), http);
+        var pending = EndpointRuntimeState("endpoint-a", 123456, source, 2);
+        pending.MigrationState = destination == TelegramEndpointType.Cloud
+            ? TelegramEndpointMigrationState.SwitchingToCloud : source == TelegramEndpointType.Cloud
+                ? TelegramEndpointMigrationState.SwitchingToLocal : TelegramEndpointMigrationState.FallbackPending;
+        gate.Publish(pending);
+        gate.PrepareActivation("endpoint-a", 123456, destination, 2);
+
+        // Health inventory and administrative reads may repeat this exact committed source snapshot.
+        for (var i = 0; i < 3; i++) gate.PublishIfUnhydrated(pending.Copy());
+        Assert.Equal(destination, gate.GetRoute("endpoint-a", 123456).Endpoint);
+        Assert.False(gate.CanReceive("endpoint-a"));
+        await Assert.ThrowsAsync<BotTransportUnavailableException>(() => clients.GetClient("endpoint-a").SendMessage(711, "must remain fenced"));
+        await clients.GetEndpointReceiverClient("endpoint-a").GetUpdates(offset: 0, limit: 1, timeout: 0);
+        Assert.Single(http.Calls, call => call.Identity == 123456 && call.Method == "getUpdates" &&
+            call.Endpoint == (destination == TelegramEndpointType.Cloud ? "cloud" : "local"));
+
+        var active = EndpointRuntimeState("endpoint-a", 123456, destination, 2);
+        active.Revision = pending.Revision + 1;
+        gate.Publish(active);
+        Assert.True(gate.CanReceive("endpoint-a"));
+        await clients.GetClient("endpoint-a").SendMessage(711, "committed destination");
+    }
+
+    /// <summary>A genuinely newer restrictive receipt must still cancel staged readiness; a read cannot bypass uncertainty.</summary>
+    /// <returns>A task proving both ordinary delivery and the staged receiver stop before any HTTP request.</returns>
+    /// <remarks>Protects fail-closed behavior while repeated same-revision snapshots become observational only.</remarks>
+    [Fact]
+    public async Task Endpoint_newer_restrictive_read_cancels_staged_receiver()
+    {
+        var registry = EndpointRuntimeRegistry();
+        var gate = new TelegramEndpointRuntimeGate(registry);
+        using var http = new EndpointRuntimeHttp();
+        using var clients = new BotClientProvider(registry, gate, new TelegramEndpointRoutingOptions(), http);
+        var pending = EndpointRuntimeState("endpoint-a", 123456, TelegramEndpointType.Local, 2);
+        pending.MigrationState = TelegramEndpointMigrationState.SwitchingToCloud;
+        gate.Publish(pending);
+        gate.PrepareActivation("endpoint-a", 123456, TelegramEndpointType.Cloud, 2);
+        var receiver = clients.GetEndpointReceiverClient("endpoint-a");
+        var uncertain = pending.Copy();
+        uncertain.Revision++;
+        uncertain.MigrationState = TelegramEndpointMigrationState.LocalLogoutUncertain;
+        gate.PublishIfUnhydrated(uncertain);
+        Assert.False(gate.CanReceive("endpoint-a"));
+        await Assert.ThrowsAsync<OperationCanceledException>(() => receiver.GetUpdates(timeout: 0));
+        await Assert.ThrowsAsync<BotTransportUnavailableException>(() => clients.GetClient("endpoint-a").SendMessage(711, "must not dispatch"));
+        Assert.Empty(http.Calls);
+    }
+
     /// <summary>A retained normal facade follows committed generations, while an old receiver cannot start another poll.</summary>
     /// <returns>A task completing after actual v22 HTTP origins and obsolete epoch rejection are asserted.</returns>
     [Fact]

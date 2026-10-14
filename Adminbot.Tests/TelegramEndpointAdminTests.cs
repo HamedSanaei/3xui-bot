@@ -88,6 +88,22 @@ public sealed class TelegramEndpointAdminTests
         Assert.Contains("مصرف‌شده", fixture.Client.Answers.Last().Text);
     }
 
+    /// <summary>Cloud confirmation explains the response outage before the operator authorizes logout.</summary>
+    /// <returns>A task proving the duration and automatic recovery notice are visible without starting a migration.</returns>
+    [Fact]
+    public async Task Cloud_confirmation_warns_about_ten_minute_response_pause()
+    {
+        var fixture = new Fixture();
+        await fixture.OpenDetailAsync();
+        var control = fixture.Control;
+        Assert.DoesNotContain("حداقل ۱۰ دقیقه", control.Text);
+        await fixture.TapAsync(control, Button(control, "انتقال به Cloud…"));
+        Assert.Contains("حداقل ۱۰ دقیقه", fixture.Control.Text);
+        Assert.Contains("خودکار بررسی می‌شود", fixture.Control.Text);
+        Assert.Contains("درخواست یا خروج را تکرار نکنید", fixture.Control.Text);
+        Assert.Empty(fixture.Backend.Migrations);
+    }
+
     /// <summary>Rejects actor, hosting bot, chat and message forgery without burning the legitimate actor's session.</summary>
     /// <returns>A task completing after forged updates and a valid confirmation.</returns>
     [Fact]
@@ -672,13 +688,14 @@ public sealed class TelegramEndpointAdminTests
 
     /// <summary>The host may close immediately after Cloud batch registration; pre-existing progress is usable from another authorized owned entry.</summary>
     /// <returns>A task completing after recovery-host report access with no promised post-fence edit or repeated API call.</returns>
+    /// <remarks>The confirmation discloses the minimum ten-minute response pause before authorizing a whole-inventory transfer.</remarks>
     [Fact]
     public async Task Bulk_host_migration_pre_renders_progress_and_allows_other_owned_entry()
     {
         var fixture = new Fixture();
         await fixture.OpenAsync();
         await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
-        Assert.Contains("مهلت رسمی Cloud", fixture.Control.Text);
+        Assert.Contains("حداقل ۱۰ دقیقه", fixture.Control.Text);
         fixture.Backend.BeforeBulk = () => fixture.Backend.States["owned"].RuntimeAvailable = false;
         var edits = fixture.Client.Edits.Count;
         await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)"));

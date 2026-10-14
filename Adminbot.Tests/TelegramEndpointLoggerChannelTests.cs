@@ -14,6 +14,26 @@ using Xunit;
 
 public sealed partial class ConcurrencyTests
 {
+    /// <summary>The frozen CloudWait alert must describe completed cleanup and a paused receiver, not an already active Cloud route.</summary>
+    /// <remarks>Rendering alone has no send, wallet, receiver, or database side effect.</remarks>
+    [Fact]
+    public void Endpoint_cloud_wait_alert_does_not_claim_cleanup_is_still_pending()
+    {
+        var render = typeof(TelegramEndpointNotificationWorker).GetMethod("Render",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        var text = (string)render.Invoke(null, [new TelegramEndpointAlert
+        {
+            BotId = "synthetic", TelegramBotId = 123456, Category = "fallback_pending",
+            MigrationState = TelegramEndpointMigrationState.CloudWait,
+            EffectiveEndpoint = TelegramEndpointType.Local, DesiredEndpoint = TelegramEndpointType.Cloud, Generation = 2
+        }])!;
+        Assert.Contains("خروج Local تأیید شد", text);
+        Assert.Contains("حداقل ۱۰ دقیقه", text);
+        Assert.Contains("ربات در این مرحله پاسخ نمی‌دهد", text);
+        Assert.Contains("آخرین مسیر فعال‌شده: Local", text);
+        Assert.DoesNotContain("منتظر پاک‌سازی", text);
+    }
+
     /// <summary>The existing global or default logger destination delivers one incident with no notifier id or private-admin addressing.</summary>
     /// <param name="defaultFallback">Whether the root logger is absent and the existing default-owned logger supplies the target.</param>
     /// <returns>A task completing after actual SDK Cloud routing, negative destination, acknowledgment and incident-only receipt are asserted.</returns>
