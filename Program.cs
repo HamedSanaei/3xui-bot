@@ -42,6 +42,7 @@ public class Program
     /// configuration, then preserves migrate-before-receiver ordering. No assembly-directory fallback can shadow the source.
     /// Durable identity-bound endpoint routes are hydrated before any hosted
     /// sender/receiver starts; pending migration states never fall back to Cloud merely because the process restarted.
+    /// Explicit DatabaseCleanup resource bounds are validated before hosting; the worker only prunes disposable diagnostics and never financially settles or deletes business operations.
     /// Read-only <c>telemetry-report</c> and isolated <c>telemetry-benchmark</c> exit before host construction,
     /// configuration loading, migrations, Telegram receivers and financial workers.
     ///
@@ -92,6 +93,8 @@ public class Program
         var configuration = configurationSource.Load();
         using var configurationLifetime = configuration as IDisposable;
         var appConfig = configuration.Get<AppConfig>() ?? new AppConfig();
+        appConfig.DatabaseCleanup ??= new DatabaseCleanupOptions();
+        appConfig.DatabaseCleanup.Validate();
         ReferralConfigurationValidator.ValidateConfigurationAndThrow(configuration);
         ValidateXuiV3LinkChangeConfiguration(appConfig);
         ValidateXuiV3VolumeReminderConfiguration(appConfig);
@@ -372,7 +375,7 @@ public class Program
         services.AddSingleton<TelegramUpdateInboxStore>(sp =>
         {
             var store = new TelegramUpdateInboxStore(sp.GetRequiredService<UserDbContextFactory>(),
-                sp.GetRequiredService<CredentialsDbContextFactory>(), sp.GetRequiredService<UpdateTelemetryTracker>());
+                sp.GetRequiredService<CredentialsDbContextFactory>(), sp.GetRequiredService<UpdateTelemetryTracker>(), appConfig.DatabaseCleanup);
             sp.GetRequiredService<BotRegistry>().AvailabilityChanged += store.NotifyReady;
             return store;
         });
@@ -388,6 +391,7 @@ public class Program
         // Migration work starts after receiver host initialization and stops before receivers: no detached migration survives shutdown.
         services.AddHostedService<TelegramEndpointCoordinatorWorker>();
         services.AddHostedService<TelegramEndpointNotificationWorker>();
+        services.AddHostedService<DatabaseCleanupService>();
 
         //services.AddHostedService<ZibalPaymentCheckerService>();
 

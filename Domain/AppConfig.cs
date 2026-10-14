@@ -16,6 +16,8 @@ namespace Adminbot.Domain
         }
         public List<long> AdminsUserIds { get; set; }
         public List<BotInstanceConfig> Bots { get; set; } = new();
+        /// <summary>Disposable-data retention; financial, wallet, order and XUI operation records are never age-pruned.</summary>
+        public DatabaseCleanupOptions DatabaseCleanup { get; set; } = new();
         /// <summary>Startup-bound, payload-free latency telemetry settings shared by all bot families; missing configuration enables bounded collection.</summary>
         /// <remarks>Files live beneath the application's persistent Data/Telemetry directory, never in SQLite. Invalid resource bounds are rejected explicitly; filesystem outages fail soft and recover in the writer.</remarks>
         public Adminbot.Services.Telemetry.LatencyTelemetryOptions LatencyTelemetry { get; set; } = new();

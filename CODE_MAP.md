@@ -1,5 +1,16 @@
 # CODE_MAP.md
 
+- `AppConfig.DatabaseCleanup` restores the existing startup section; absent/disabled leaves new diagnostic cleanup off.
+  `DatabaseCleanupService` has bounded per-table batches/daily default and no financial/order/XUI-operation deletion.
+  Inbox hourly pruning shares configurable >=7-day bounds, preserves unresolved/recently resolved review and XUI-linked
+  audit receipts; only terminal leftover payloads age-redact. Endpoint history keeps latest 20/current operation;
+  delivered alerts require permanent incident receipts, which never expire. Existing feature-specific retention stays intact.
+  `TelegramUpdateAdmissionPolicy` limits all receiver subscriptions/persistence to actually handled Message/CallbackQuery
+  shapes, eliminating unused channel/boost/membership receipt churn; forwarded/admin/channel-publication inputs still work.
+  Maintenance is PASSIVE checkpoint plus bounded incremental vacuum only if already enabled; never live full VACUUM,
+  schema conversion, WAL deletion or financial cleanup. Offline backup/compaction: `docs/database-cleanup.md`.
+  Existing-project coverage: `DatabaseCleanupTests.cs`; no migration/new test project or production database mutation.
+
 - October 13 latency fixes: `TelegramRenewalSelectorCoalescer` recognizes only same-bot/user/chat/message/target/page
   `x3:aren`/`x3:asren` clicks accepted while a preceding successful selector was running. The scheduler keeps every
   durable FIFO receipt but answers those queued repeats without another panel read or state reset. New deliberate

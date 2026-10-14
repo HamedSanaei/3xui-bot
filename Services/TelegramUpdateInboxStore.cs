@@ -11,6 +11,8 @@ public sealed partial class TelegramUpdateInboxStore
     private readonly UserDbContextFactory _factory;
     /// <summary>Optional payload-free receiver timing published immediately after admission commit.</summary>
     private readonly UpdateTelemetryTracker _telemetryTracker;
+    /// <summary>Validated startup retention limits; disabled/missing configuration keeps the original seven-day window.</summary>
+    private readonly DatabaseCleanupOptions _cleanup;
     /// <summary>Post-commit readiness notification; subscribers must never throw or treat signals as durable work.</summary>
     public event Action ReadyChanged;
     /// <summary>Notifies the coordinator that persisted work or runtime availability may now permit execution.</summary>
@@ -20,10 +22,17 @@ public sealed partial class TelegramUpdateInboxStore
     /// <param name="factory">Required users.db context factory.</param>
     /// <param name="credentials">Global wallet receipt factory; missing configuration refuses reviewed resolution.</param>
     /// <param name="telemetryTracker">Optional bounded receiver metadata tracker; never participates in durable admission or FIFO.</param>
+    /// <param name="cleanup">Optional startup users.db retention bounds; enabled values are validated, and no financial/XUI operation is deleted.</param>
     /// <remarks>Queries return detached metadata without loading payloads. Business recovery records never consume Telegram admission capacity.</remarks>
+    /// <exception cref="ArgumentException">Explicitly enabled cleanup resource bounds are invalid.</exception>
+    /// <example><code>var inbox = new TelegramUpdateInboxStore(factory, cleanup: configuration.DatabaseCleanup);</code></example>
     public TelegramUpdateInboxStore(UserDbContextFactory factory, CredentialsDbContextFactory credentials = null,
-        UpdateTelemetryTracker telemetryTracker = null)
-    { _factory = factory; _credentials = credentials; _telemetryTracker = telemetryTracker; }
+        UpdateTelemetryTracker telemetryTracker = null, DatabaseCleanupOptions cleanup = null)
+    {
+        _factory = factory; _credentials = credentials; _telemetryTracker = telemetryTracker;
+        _cleanup = cleanup ?? new DatabaseCleanupOptions();
+        _cleanup.Validate();
+    }
 
     /// <summary>Attempts durable admission without exceeding the configured unfinished-work limit.</summary>
     /// <param name="botId">Required canonical runtime bot id; never a token.</param>
@@ -293,18 +302,49 @@ public sealed partial class TelegramUpdateInboxStore
         return await db.TelegramUpdateInbox.CountAsync(x => x.Status == "queued" || x.Status == "running", token);
     }
 
-    /// <summary>Expires all terminal Telegram receipts after the seven-day deduplication window.</summary>
+    /// <summary>Expires disposable terminal receipts in bounded batches after the configured deduplication window.</summary>
     /// <param name="token">Cancellation of the short maintenance write.</param>
-    /// <returns>The number of completed deduplication records older than seven days removed.</returns>
-    /// <remarks>Payloads have already been erased at completion. An empty retention scan is read-only and
-    /// never requests the database writer; rows becoming eligible after that scan wait for the next maintenance pass.</remarks>
-    public Task<int> PruneAsync(CancellationToken token) => SqliteOperation.RunAsync(async ct =>
+    /// <returns>Removed receipt count, capped per invocation; the original business operations are never deleted.</returns>
+    /// <remarks>Missing/disabled cleanup keeps seven days. Unresolved review, queued/running/unknown states and
+    /// receipts linked to any durable XUI operation are retained. Resolved review gets a fresh full retention window.
+    /// Candidate selection is read-only; deletion repeats every predicate so newly protected receipts survive.</remarks>
+    /// <example><code>var removed = await inbox.PruneAsync(shutdownToken);</code></example>
+    public async Task<int> PruneAsync(CancellationToken token)
     {
-        await using var db = _factory.CreateDbContext();
-        var cutoff = DateTime.UtcNow.AddDays(-7);
-        var expired = db.TelegramUpdateInbox.Where(x => x.Status.StartsWith("completed") && x.CompletedAtUtc < cutoff);
-        return await expired.AnyAsync(ct) ? await expired.ExecuteDeleteAsync(ct) : 0;
-    }, token);
+        var cutoff = DateTime.UtcNow.AddDays(-(_cleanup.Enabled ? _cleanup.InboxRetentionDays : 7));
+        var batchSize = _cleanup.Enabled ? _cleanup.BatchSize : 2000;
+        var batches = _cleanup.Enabled ? _cleanup.MaxBatchesPerTable : 20;
+        var total = 0;
+        for (var batch = 0; batch < batches; batch++)
+        {
+            var removed = await SqliteOperation.RunAsync(async ct =>
+            {
+                await using var db = _factory.CreateDbContext();
+                var expired = ExpiredReceipts(db, cutoff);
+                var ids = await expired.OrderBy(x => x.Sequence).Select(x => x.Sequence).Take(batchSize).ToArrayAsync(ct);
+                if (ids.Length == 0) return 0;
+                // Retain independent operation anchors; receipt deletion never changes their keys or outcomes.
+                return await ExpiredReceipts(db, cutoff).Where(x => ids.Contains(x.Sequence)).ExecuteDeleteAsync(ct);
+            }, token);
+            total += removed;
+            if (removed == 0) break;
+        }
+        return total;
+    }
+
+    /// <summary>Builds the exact safe receipt predicate shared by candidate reads and guarded deletion.</summary>
+    /// <param name="db">Required current users.db context; no credentials or external service is accessed.</param>
+    /// <param name="cutoff">UTC deduplication cutoff, at least seven days before the scan.</param>
+    /// <returns>A deferred query containing only disposable terminal receipts; no payload is materialized.</returns>
+    /// <remarks>Linked XUI audit references and unreviewed business ambiguity are never age-pruned.</remarks>
+    /// <example><code>var ids = await ExpiredReceipts(db, cutoff).Select(x => x.Sequence).Take(2000).ToArrayAsync(token);</code></example>
+    private static IQueryable<TelegramUpdateInboxEntry> ExpiredReceipts(UserDbContext db, DateTime cutoff) =>
+        db.TelegramUpdateInbox.Where(x => x.CompletedAtUtc < cutoff &&
+            (x.Status == "completed" || x.Status == "completed_with_error" ||
+                x.Status == "completed_with_review" && x.ReviewedAtUtc != null && x.ReviewedAtUtc < cutoff) &&
+            !db.XuiV3CreationOperations.Any(o => o.InboxSequence == x.Sequence) &&
+            !db.XuiV3RenewalOperations.Any(o => o.InboxSequence == x.Sequence) &&
+            !db.XuiV3LinkChangeOperations.Any(o => o.InboxSequence == x.Sequence));
 
     /// <summary>Detects linked XUI attempts whose outcome is still ambiguous despite a handled user-facing failure.</summary>
     /// <param name="sequence">Internal inbox sequence of the handler that just returned.</param>

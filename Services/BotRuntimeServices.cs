@@ -1368,6 +1368,7 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
     /// a staged migration start is explicitly not proof of final destination activation.
     /// Ordinary callers prepare new tenant intent before acquiring this gate; this core never enters coordinator
     /// locking. Duplicate protection precedes endpoint admission so a pending migration cannot hide token conflicts.
+    /// Receivers subscribe only to handled messages/callbacks; leftover channel/boost/membership updates are discarded before durable admission, reducing users.db writes without changing any business handler.
     /// </remarks>
     private async Task<BotStartupResult> StartBotCoreAsync(string botId, CancellationToken cancellationToken = default,
         bool strictEndpointValidation = false)
@@ -1474,6 +1475,9 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
             var receiverTask = client.ReceiveAsync(
                 updateHandler: async (_, update, token) =>
                 {
+                    // Telegram can return a leftover batch from its previous broad subscription. These shapes
+                    // have no business handler and must not create payloads, receipts or logger feedback traffic.
+                    if (!TelegramUpdateAdmissionPolicy.RequiresHandling(update)) return;
                     using var received = _updateTelemetry?.Receive(bot.Id, update.Id, update.Type.ToString());
                     _clientProvider.PollingTelemetry.ReceivedUpdate(bot.Id);
                     // The tracked receiver owns this bounded super-admin control path, which must remain usable
@@ -1515,7 +1519,7 @@ public class MultiBotHostedService : IHostedService, ITelegramEndpointReceiverLi
                     HandleBotPollingErrorAsync(bot.Id, exception, token),
                 receiverOptions: new ReceiverOptions
                 {
-                    AllowedUpdates = Array.Empty<UpdateType>()
+                    AllowedUpdates = TelegramUpdateAdmissionPolicy.AllowedUpdates
                 },
                 cancellationToken: botCts.Token);
 
