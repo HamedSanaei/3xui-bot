@@ -1,5 +1,6 @@
 using Adminbot.Domain;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 
 namespace Adminbot.Services.TelegramEndpoints;
 
@@ -12,6 +13,9 @@ public sealed partial class TelegramEndpointCoordinator
     private readonly AsyncLocal<BulkAdmissionCapture> _bulkAdmission = new();
 
     /// <inheritdoc />
+    /// <remarks>Expected disabled or identity-unconfigured entries are omitted before individual admission and logged locally at Debug.
+    /// Identity replacements remain stale refusals. Active destination skips still use the existing locked individual path;
+    /// pending, ambiguous, aliased and unsafe states never become successful skips.</remarks>
     public async Task<IReadOnlyList<TelegramEndpointBulkResult>> RequestBulkMigrationAsync(string hostingBotId,
         long hostingIdentity, TelegramEndpointType target, long actor,
         IReadOnlyList<TelegramEndpointBulkTarget> targets, CancellationToken cancellationToken)
@@ -76,6 +80,14 @@ public sealed partial class TelegramEndpointCoordinator
                     continue;
                 }
 
+                var configurationOutcome = GetBulkConfigurationOutcome(entry);
+                if (configurationOutcome != null)
+                {
+                    // An expected omission never enters mutation admission, creates an operation, or touches a receiver.
+                    results[index] = new(entry.BotId, entry.Identity, configurationOutcome, null);
+                    continue;
+                }
+
                 var capture = new BulkAdmissionCapture(entry.BotId, entry.Identity);
                 var previousCapture = _bulkAdmission.Value;
                 _bulkAdmission.Value = capture;
@@ -113,6 +125,25 @@ public sealed partial class TelegramEndpointCoordinator
             retainedLock?.Release();
             _bulkIntents.Release();
         }
+    }
+
+    /// <summary>Separates expected bulk omissions from actual admission failures without changing registry or endpoint state.</summary>
+    /// <param name="entry">Required frozen internal/BotFather identity; zero identifies a configuration that had no token identity.</param>
+    /// <returns>skipped_disabled or skipped_unconfigured for the same current identity, stale for replacement, or null for full individual validation.</returns>
+    /// <remarks>Called only after current global/owned-host authorization. Removed entries still undergo normal failure handling.
+    /// Expected omissions emit Debug only; replacement emits the existing safe warning. No database write, gate publication,
+    /// network call, logout, financial effect or receiver restart occurs. The individual path revalidates every nonomitted target.</remarks>
+    /// <example><code>var omission = GetBulkConfigurationOutcome(confirmedTarget);</code></example>
+    private string GetBulkConfigurationOutcome(TelegramEndpointBulkTarget entry)
+    {
+        var bot = FindBot(entry.BotId);
+        if (bot == null) return null;
+        var identity = TelegramBotTokenIdentity.ExtractBotId(bot.Token) ?? 0;
+        if (identity != entry.Identity) return AdmissionFailure(bot, "stale");
+        var code = !bot.Enabled ? "skipped_disabled" : identity <= 0 ? "skipped_unconfigured" : null;
+        if (code != null)
+            _logger.LogDebug("Telegram endpoint bulk entry skipped. BotId={BotId} Category={Category}", bot.Id, code);
+        return code;
     }
 
     /// <summary>Rechecks the current owned private-panel host and live global authority without requiring a post-intent route.</summary>

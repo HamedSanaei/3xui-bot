@@ -800,6 +800,32 @@ public sealed class TelegramEndpointAdminTests
         Assert.Single(fixture.Backend.Batches);
     }
 
+    /// <summary>Expected disabled/unconfigured omissions are visible skips, not failed or successful migrations.</summary>
+    /// <returns>A task proving the actual Persian report keeps omission counts separate and never resubmits a batch on refresh.</returns>
+    [Fact]
+    public async Task Bulk_report_separates_expected_configuration_skips_from_failures()
+    {
+        var fixture = new Fixture();
+        foreach (var state in fixture.Backend.States.Values) fixture.Backend.BulkCodes[state.BotId] = "unchanged";
+        fixture.Backend.BulkCodes["owned"] = "retained_cloud_control";
+        fixture.Backend.BulkCodes["disabled"] = "skipped_disabled";
+        fixture.Backend.BulkCodes["owned-assistant"] = "skipped_unconfigured";
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🏠 انتقال همه ربات‌ها به Local…"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Local (محلی)"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        Assert.Contains("انتقال موفق: 0 | رد/ناموفق: 0", fixture.Control.Text);
+        Assert.Contains("از قبل روی مقصد: 3", fixture.Control.Text);
+        Assert.Contains("⏭ نادیده‌گرفته‌شده: 2 | غیرفعال: 1 | بدون هویت آماده: 1", fixture.Control.Text);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "صفحه بعد گزارش ▶️"));
+        Assert.Contains("ربات غیرفعال است؛ از انتقال دسته‌ای کنار گذاشته شد", fixture.Control.Text);
+        Assert.Contains("هویت ربات تنظیم نشده است؛ از انتقال دسته‌ای کنار گذاشته شد", fixture.Control.Text);
+        Assert.Contains("این مورد خطای انتقال نیست", fixture.Control.Text);
+        Assert.Single(fixture.Backend.Batches);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
     /// <summary>The host may close immediately after Cloud batch registration; pre-existing progress is usable from another authorized owned entry.</summary>
     /// <returns>A task completing after recovery-host report access with no promised post-fence edit or repeated API call.</returns>
     /// <remarks>The confirmation discloses the minimum ten-minute response pause before authorizing a whole-inventory transfer.</remarks>

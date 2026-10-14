@@ -3,11 +3,55 @@ using Adminbot.Domain;
 using Adminbot.Services.TelegramEndpoints;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 /// <summary>Bulk-admission regressions using the real coordinator/gate and the existing detached CAS, clock and fake protocol fixtures.</summary>
 public sealed partial class TelegramEndpointCoordinatorTests
 {
+    /// <summary>Reproduces the production batch: 26 already-Local entries, 14 disabled entries, two moves and one retained Cloud control.</summary>
+    /// <returns>A task proving expected omissions emit no warning, intent, logout or receiver work.</returns>
+    [Fact]
+    public async Task Bulk_production_inventory_skips_disabled_without_false_failure_warnings()
+    {
+        using var f = new BulkFixture(TelegramEndpointType.Local);
+        for (var i = 0; i < 25; i++) f.AddBot("local-" + i, 2000 + i, endpoint: TelegramEndpointType.Local);
+        for (var i = 0; i < 14; i++) f.AddBot("disabled-" + i, i < 8 ? 0 : 3000 + i, enabled: false);
+        f.AddBot("move-a", 4000, BotInstanceTypes.Tenant);
+        f.AddBot("move-b", 4001, BotInstanceTypes.Tenant);
+        var frozen = await f.FreezeAsync();
+        var results = await f.RequestAsync(TelegramEndpointType.Local, frozen);
+        Assert.Equal(43, results.Count);
+        Assert.Equal(26, results.Count(x => x.ResultCode == "unchanged"));
+        Assert.Equal(14, results.Count(x => x.ResultCode == "skipped_disabled"));
+        Assert.Equal(2, results.Count(x => x.ResultCode == "accepted"));
+        Assert.Single(results, x => x.ResultCode == "retained_cloud_control");
+        Assert.DoesNotContain(f.Log.Levels, level => level >= LogLevel.Warning);
+        Assert.Equal(new[] { "move-a", "move-b" }, f.Store.Intents.ToArray());
+        Assert.All(results.Where(x => x.ResultCode == "skipped_disabled"), x => Assert.Null(x.OperationId));
+        Assert.Empty(f.Protocol.Events);
+        Assert.Equal(0, f.Lifecycle.Acquisitions);
+    }
+
+    /// <summary>Only an unchanged incomplete or disabled configuration is skipped; frozen identity replacement stays a genuine refusal.</summary>
+    /// <param name="changedIdentity">Whether a missing-token entry gained a different identity after confirmation.</param>
+    /// <returns>A task proving expected omission has no warning while replacement is stale, never automatically retargeted.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Bulk_unconfigured_skip_does_not_hide_identity_replacement(bool changedIdentity)
+    {
+        using var f = new BulkFixture(TelegramEndpointType.Local);
+        f.AddBot("incomplete", 0);
+        var frozen = await f.FreezeAsync();
+        if (changedIdentity) f.AddBot("incomplete", 456, enabled: false);
+        var results = await f.RequestAsync(TelegramEndpointType.Local, frozen);
+        Assert.Equal(changedIdentity ? "stale" : "skipped_unconfigured", results.Single(x => x.BotId == "incomplete").ResultCode);
+        if (!changedIdentity) Assert.DoesNotContain(f.Log.Levels, level => level >= LogLevel.Warning);
+        Assert.Empty(f.Store.Intents);
+        Assert.Empty(f.Protocol.Events);
+    }
+
     /// <summary>Cloud includes its own Local hosting identity and every configured entry; registration never performs network or lifecycle work.</summary>
     /// <returns>A task after exact frozen-entry results and durable per-bot intent admission have been asserted.</returns>
     [Fact]
@@ -29,7 +73,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         {
             if (result.BotId is "disabled" or "missing")
             {
-                Assert.Equal("unavailable", result.ResultCode);
+                Assert.Equal(result.BotId == "disabled" ? "skipped_disabled" : "skipped_unconfigured", result.ResultCode);
                 Assert.Null(result.OperationId);
                 continue;
             }
@@ -47,7 +91,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.Equal(0, f.Lifecycle.Acquisitions);
     }
 
-    /// <summary>Local deliberately retains the eligible Cloud hosting identity while admitting owned, tenant and assistant targets, including truthful disabled/missing refusals.</summary>
+    /// <summary>Local retains the eligible Cloud hosting identity while admitting owned, tenant and assistant targets, with explicit disabled/missing skips.</summary>
     /// <returns>A task after every frozen result and the still-admitted Cloud control have been asserted.</returns>
     [Fact]
     public async Task Bulk_local_retains_host_and_reports_every_snapshot_without_health_dependency()
@@ -66,8 +110,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.Equal(frozen.Select(x => (x.BotId, x.Identity)), results.Select(x => (x.BotId, x.Identity)));
         Assert.Equal("retained_cloud_control", results.Single(x => x.BotId == "owned-a").ResultCode);
         Assert.Null(results.Single(x => x.BotId == "owned-a").OperationId);
-        Assert.Equal("unavailable", results.Single(x => x.BotId == "disabled").ResultCode);
-        Assert.Equal("unavailable", results.Single(x => x.BotId == "missing").ResultCode);
+        Assert.Equal("skipped_disabled", results.Single(x => x.BotId == "disabled").ResultCode);
+        Assert.Equal("skipped_unconfigured", results.Single(x => x.BotId == "missing").ResultCode);
         foreach (var result in results.Where(x => x.BotId is not ("owned-a" or "disabled" or "missing")))
         {
             Assert.Equal("accepted", result.ResultCode);
@@ -135,7 +179,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
 
         Assert.DoesNotContain(results, x => x.ResultCode == "retained_cloud_control");
         Assert.Equal("unchanged", results.Single(x => x.BotId == "owned-a").ResultCode);
-        Assert.Equal("unavailable", results.Single(x => x.BotId == "disabled-owned").ResultCode);
+        Assert.Equal("skipped_disabled", results.Single(x => x.BotId == "disabled-owned").ResultCode);
         Assert.All(results.Where(x => x.BotId is not ("owned-a" or "disabled-owned")),
             x => Assert.Equal("control_path_missing", x.ResultCode));
         Assert.Empty(f.Store.Intents);
@@ -205,7 +249,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
 
         Assert.Equal(frozen.Length, results.Count);
         Assert.Equal("aliased", results.Single(x => x.BotId == "operator-control").ResultCode);
-        Assert.Equal("unavailable", results.Single(x => x.BotId == "alias").ResultCode);
+        Assert.Equal("skipped_disabled", results.Single(x => x.BotId == "alias").ResultCode);
         Assert.Equal("migration_in_progress", results.Single(x => x.BotId == "pending").ResultCode);
         Assert.Equal("migration_in_progress", results.Single(x => x.BotId == "cooldown").ResultCode);
         Assert.Equal("unsafe", results.Single(x => x.BotId == "uncertain").ResultCode);
@@ -706,6 +750,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
         internal FakeLifecycle Lifecycle => Source.Lifecycle;
         /// <summary>Existing deterministic UTC and deadline clock.</summary>
         internal ControlledClock Clock => Source.Clock;
+        /// <summary>Captured local logging levels; expected skips must never reach the warning-level Telegram logger.</summary>
+        internal BulkAdmissionLogger Log { get; } = new();
         /// <summary>Lazy isolated lifecycle container used only when a test explicitly invokes durable worker execution.</summary>
         private readonly ServiceProvider _services;
 
@@ -723,7 +769,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         /// <summary>Creates the real coordinator without starting its hosted worker or any transport.</summary>
         /// <returns>A coordinator bound to the current fixture gate and durable wrapper.</returns>
         private TelegramEndpointCoordinator CreateCoordinator() => new(Store, Source.Gate, Source.Registry, Source.Clients,
-            Source.Configuration, Source.Options, _services, NullLogger<TelegramEndpointCoordinator>.Instance,
+            Source.Configuration, Source.Options, _services, Log,
             timeProvider: Source.Clock, protocol: Source.Protocol);
 
         /// <summary>Adds or replaces an isolated configured identity and seeds its exact detached endpoint state.</summary>
@@ -780,6 +826,20 @@ public sealed partial class TelegramEndpointCoordinatorTests
             _services.Dispose();
             Source.Dispose();
         }
+    }
+
+    /// <summary>Captures admission log severity without contacting Telegram or retaining tokens, callbacks or exception payloads.</summary>
+    private sealed class BulkAdmissionLogger : ILogger<TelegramEndpointCoordinator>
+    {
+        /// <summary>Observed local severities, including debug skips and genuine warning-level failures.</summary>
+        internal ConcurrentQueue<LogLevel> Levels { get; } = new();
+        /// <inheritdoc />
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        /// <inheritdoc />
+        public bool IsEnabled(LogLevel logLevel) => true;
+        /// <inheritdoc />
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) => Levels.Enqueue(logLevel);
     }
 
     /// <summary>Controllable persistence adapter over the existing real-behavior detached CAS fake, never a mock command echo.</summary>

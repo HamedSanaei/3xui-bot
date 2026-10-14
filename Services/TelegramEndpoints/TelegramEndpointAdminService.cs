@@ -633,7 +633,8 @@ public sealed class TelegramEndpointAdminService
     /// <param name="token">Cancels metadata reads only.</param>
     /// <returns>A task completing with paginated registration and current-operation outcomes plus refresh controls.</returns>
     /// <remarks>Reports expire absolutely after one hour and are lost on restart; callback controls still expire after ten minutes and must be reopened from inventory. Per-bot durable state/history remain accessible after either expiry. Identity/operation replacements are never credited to this batch.
-    /// Technical buttons expose each bot's complete diagnostics behind the same one-use, actor/message/host/identity/revision-bound callback security.</remarks>
+    /// Technical buttons expose each bot's complete diagnostics behind the same one-use, actor/message/host/identity/revision-bound callback security.
+    /// Expected disabled/unconfigured omissions have separate skip counts and never count as failed or completed migrations.</remarks>
     private async Task AppendBulkReportAsync(StringBuilder text, List<InlineKeyboardButton[]> rows,
         List<PanelCommand> commands, string nonce, long actor, TelegramEndpointState host, PanelCommand view, CancellationToken token)
     {
@@ -671,12 +672,13 @@ public sealed class TelegramEndpointAdminService
         var pending = observations.Count(x => x.Outcome == "pending");
         var succeeded = observations.Count(x => x.Outcome == "succeeded");
         var refused = observations.Count(x => x.Outcome is "refused" or "failed" || (x.Result != null &&
-            x.Result.ResultCode is not ("accepted" or "unchanged" or "retained_cloud_control" or "not_submitted" or "registration_uncertain")));
+            x.Result.ResultCode is not ("accepted" or "unchanged" or "retained_cloud_control" or "skipped_disabled" or "skipped_unconfigured" or "not_submitted" or "registration_uncertain")));
         text.AppendLine($"📊 گزارش انتقال دسته‌ای به {EndpointLabel(report.Target)}");
         text.AppendLine($"ثبت پذیرفته: {accepted} | در انتظار اجرا: {pending} | انتقال موفق: {succeeded} | رد/ناموفق: {refused}");
         text.AppendLine($"Cloud نگه‌داشته: {observations.Count(x => x.Result?.ResultCode == "retained_cloud_control")} | ثبت نامطمئن: {observations.Count(x => x.Result?.ResultCode == "registration_uncertain")} | نتیجه تغییرکرده/اثبات‌نشده: {observations.Count(x => x.Outcome is "changed" or "unproven")}");
         text.AppendLine($"اجرای نامطمئن/بررسی دستی: {observations.Count(x => x.Outcome == "uncertain")} | ثبت‌نشده: {observations.Count(x => x.Result?.ResultCode == "not_submitted")}");
         text.AppendLine($"از قبل روی مقصد: {observations.Count(x => x.Outcome == "already_active")}؛ برای این ربات‌ها انتقال جدیدی انجام نشد.");
+        text.AppendLine($"⏭ نادیده‌گرفته‌شده: {observations.Count(x => x.Result?.ResultCode is "skipped_disabled" or "skipped_unconfigured")} | غیرفعال: {observations.Count(x => x.Result?.ResultCode == "skipped_disabled")} | بدون هویت آماده: {observations.Count(x => x.Result?.ResultCode == "skipped_unconfigured")}");
         text.AppendLine(registering ? "⏳ ثبت درخواست‌ها در جریان است؛ نتیجه هر ربات هنوز قطعی نیست." : "ثبت درخواست‌ها پایان یافته؛ پذیرش به معنی تکمیل نیست. فقط تازه‌سازی، بدون ثبت مجدد.");
         text.AppendLine("اگر میزبان بسته شود، ارسال به‌روزرسانی نهایی تضمین نمی‌شود؛ /telegram_api را در ربات Owned سالم دیگری باز کنید.");
         if (report.Target == TelegramEndpointType.Local)
@@ -695,6 +697,7 @@ public sealed class TelegramEndpointAdminService
                 "changed" => "هویت/عملیات تغییر کرده یا درخواست دیگری جایگزین شده؛ نتیجه فعلی به این دسته نسبت داده نمی‌شود.",
                 "not_registered" => "درخواست قابل‌انتساب ثبت نشده؛ نتیجه ثبت بالا را بررسی کنید.",
                 "already_active" => "مقصد هنگام ثبت درخواست از قبل برقرار بود؛ انتقال جدیدی برای این دسته انجام نشد. نشان مسیر فعلی را جداگانه بررسی کنید.",
+                "skipped" => "در این دسته انتقالی ثبت نشد؛ ربات غیرفعال یا فاقد هویت آماده بود. این مورد خطای انتقال نیست.",
                 _ => TelegramEndpointPresentation.OutcomeLabel(item.State, item.History)
             }));
             if (item.State != null)
@@ -718,11 +721,15 @@ public sealed class TelegramEndpointAdminService
     /// <param name="result">Registration result, null while registration is still in progress.</param>
     /// <param name="state">Current detached state, null when configuration was removed.</param>
     /// <param name="history">Current identity's bounded durable activation receipts.</param>
-    /// <returns>A closed operation outcome, already_active, changed, or not_registered; acceptance and old unchanged-operation receipts never imply new batch success.</returns>
+    /// <returns>A closed operation outcome, already_active, skipped, changed, or not_registered; expected omissions and old activation receipts never imply new batch success.</returns>
+    /// <remarks>Read-only reporting only: omitted configurations have no attributable operation. Replaced identities and newer operations
+    /// are not credited to the old batch; accepted mutations still require the exact committed activation evidence.</remarks>
+    /// <example><code>var outcome = BatchOutcome(frozenTarget, admissionResult, currentState, currentHistory);</code></example>
     private static string BatchOutcome(TelegramEndpointBulkTarget target, TelegramEndpointBulkResult result, TelegramEndpointState state,
         IReadOnlyList<TelegramEndpointHistory> history)
     {
         if (state == null || state.TelegramBotId != target.Identity) return "changed";
+        if (result?.ResultCode is "skipped_disabled" or "skipped_unconfigured") return "skipped";
         if (result?.ResultCode == "unchanged")
             return state.OperationId == result.OperationId ? "already_active" : "changed";
         if (result?.ResultCode != "accepted" || string.IsNullOrEmpty(result.OperationId)) return "not_registered";
@@ -858,7 +865,8 @@ public sealed class TelegramEndpointAdminService
     /// <summary>Maps closed command outcomes to safe Persian without echoing unknown error strings.</summary>
     /// <param name="result">Coordinator's closed outcome code.</param>
     /// <returns>A fixed safe operational explanation.</returns>
-    /// <remarks>New validation refusal categories use the shared fixed catalog; no raw backend strings appear in either single or bulk summaries.</remarks>
+    /// <remarks>Expected bulk omissions have explicit nonfailure labels. Validation refusal categories use the shared fixed catalog;
+    /// no raw backend strings appear in either single or bulk summaries.</remarks>
     private static string ResultLabel(string result) => result switch
     {
         "accepted" => "درخواست ثبت شد؛ وضعیت تازه‌سازی و هشدارهای پایدار را بررسی کنید.",
@@ -869,6 +877,8 @@ public sealed class TelegramEndpointAdminService
         "disabled" => "مدیریت مسیر یا ربات در پیکربندی غیرفعال است.",
         "control_path_missing" => "انتقال به Local ثبت نشد: یک ربات Owned فعال و مستقل باید روی Cloud باقی بماند تا هنگام قطع Local، پنل مدیریت از مسیر دیگری در دسترس باشد.",
         "unchanged" => "وضعیت درخواستی از قبل برقرار است؛ انتقال تازه‌ای ثبت نشد.",
+        "skipped_disabled" => "⏭ ربات غیرفعال است؛ از انتقال دسته‌ای کنار گذاشته شد و درخواست جدیدی ثبت نشد.",
+        "skipped_unconfigured" => "⏭ هویت ربات تنظیم نشده است؛ از انتقال دسته‌ای کنار گذاشته شد و درخواست جدیدی ثبت نشد.",
         "unsafe" => "خروج یا پاک‌سازی نامطمئن است؛ انتقال خودکار یا اجبار مسیر مجاز نیست و بررسی دستی لازم است.",
         "unavailable" => "ربات، هویت یا نگاشت فایل Local آماده نیست؛ انتقال ثبت نشد.",
         "retained_cloud_control" => "☁️ روی Cloud نگه داشته شد؛ مسیر مستقل مدیریت محفوظ است و انتقال Local ثبت نشد.",

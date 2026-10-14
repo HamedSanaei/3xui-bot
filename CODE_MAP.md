@@ -1786,6 +1786,10 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   Active effective destinations (including CloudRecovered/LocalDegraded) skip as `unchanged` under the bot lock, even if
   desired intent differs; preserve preference/operation/revisions/receiver epoch without a write, fence, logout or restart.
   Only opposite-route bots get new bulk intents; individual confirmations retain preference-only updates without reconnecting.
+  Same-identity disabled/token-unconfigured entries are explicit `skipped_disabled`/`skipped_unconfigured` omissions,
+  not failures: no individual admission, operation, logout, gate publication or receiver restart; local Debug only.
+  Bulk reports separate these omissions from already-on-target and real failures. Changed identity, aliases, pending,
+  uncertain cleanup and genuine migration failures retain their refusals/warnings; disabled aliases still fence active peers.
   Local explicitly retains one eligible owned Cloud control, preferring host then ordinal id; never bypasses last-control safety.
   Read-only per-actor paginated reports last one hour (max 512; latest three linked), reopenable from another healthy owned host;
   controls still expire after ten minutes. Aggregate reports vanish on restart/expiry, individual operation/history remain durable.
