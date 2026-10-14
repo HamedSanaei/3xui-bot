@@ -37,6 +37,13 @@ public interface ITelegramUpdateExecutor
     /// <returns>A task representing all handler work; exceptions must be observed by the scheduler.</returns>
     /// <remarks>The host owns the scheduler lifetime. Only eligible bot/user lane heads enter the bounded worker set; full durable admission applies explicit backpressure.</remarks>
     Task ExecuteAsync(TelegramUpdateWorkItem item, CancellationToken cancellationToken);
+
+    /// <summary>Acknowledges a queued repeat of an already successful, non-financial renewal selector.</summary>
+    /// <param name="item">Claimed update from the same bot, sender, message and target as the completed selector.</param>
+    /// <param name="cancellationToken">Current handler cancellation, not an invoice or mutation retry budget.</param>
+    /// <returns>A task completing after best-effort callback acknowledgement, without account/state or financial work.</returns>
+    /// <remarks>The production executor answers using the exact bot route. Test executors may use the no-op default.</remarks>
+    Task AcknowledgeRenewalSelectorAsync(TelegramUpdateWorkItem item, CancellationToken cancellationToken) => Task.CompletedTask;
 }
 
 /// <summary>Runs bounded, fair, per-bot/user FIFO scheduling over the durable inbox.</summary>
@@ -114,6 +121,8 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
 
     /// <summary>Instance-owned, bounded queue incidents; observations never perform operator delivery.</summary>
     private readonly TelegramQueueDelayIncidentAggregator _queueIncidents = new();
+    /// <summary>Bounded metadata for burst duplicates of read-only renewal selectors, isolated by bot/user lane.</summary>
+    private readonly TelegramRenewalSelectorCoalescer _renewalSelectors = new();
     /// <summary>Deterministic wait seam; production waits on the coalesced signal or the recovery timeout.</summary>
     internal Func<SemaphoreSlim, TimeSpan, CancellationToken, Task<bool>> WaitAsync { get; init; }
         = (signal, interval, token) => signal.WaitAsync(interval, token);
@@ -326,7 +335,9 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
     /// claims atomically while admitted handlers finish their original epoch; no terminal receipt is created for a merely paused head.
     /// The initial yield isolates synchronous SQLite/handler prologues without an extra Task.Run wrapper per update.
     /// Live watchdogs stop when ExecuteAsync ends. Handler duration uses its frozen scope clock; claim, review and
-    /// terminal persistence belong to lane occupancy and lifecycle diagnostics, never handler-only alerts.</remarks>
+    /// terminal persistence belong to lane occupancy and lifecycle diagnostics, never handler-only alerts.
+    /// Repeated account-card renewal selectors accepted during an earlier successful selector receive only an ACK;
+    /// each still keeps its durable FIFO receipt. Navigation and all financial callbacks execute normally.</remarks>
     private async Task ProcessAsync(long sequence, CancellationToken token, long readyObservedTimestamp = 0,
         TelegramEndpointRuntimeGate.TelegramEndpointExecutionLease endpointLease = null)
     {
@@ -340,6 +351,7 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
         var started = Stopwatch.GetTimestamp();
         string failure = null;
         var counted = false;
+        var coalescedSelector = false;
         TelegramUpdateLatencyScope latencyScope = null;
         UpdateTelemetryTracker.UpdateTelemetryTimeline timeline = null;
         // Live long-handler diagnostics: one timer per execution and one flag that proves the handler was still
@@ -407,7 +419,18 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
                     // Scope and lifecycle use one clock origin/end; watchdog setup cannot be charged to handler work.
                     handlerWarningTimer.CancelAfter(LongHandlerWarningThreshold);
                     timeline?.HandlerStarted(latencyScope.HandlerStartedAtUtc);
-                    try { await _executor.ExecuteAsync(item, token); }
+                    try
+                    {
+                        coalescedSelector = _renewalSelectors.ShouldCoalesce(item);
+                        if (coalescedSelector)
+                        {
+                            await _executor.AcknowledgeRenewalSelectorAsync(item, token);
+                            _logger.LogDebug("Repeated renewal selector acknowledged. BotId={BotId} Sequence={Sequence}",
+                                item.Key.BotId, sequence);
+                        }
+                        else
+                            await _executor.ExecuteAsync(item, token);
+                    }
                     finally
                     {
                         var handlerCompletedTimestamp = Stopwatch.GetTimestamp();
@@ -478,6 +501,10 @@ public sealed class TelegramUpdateScheduler : ITelegramUpdateScheduler, IHostedS
             using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             var persistenceStarted = Stopwatch.GetTimestamp();
             bool? persisted = false;
+            // Publish before FinishAsync releases the FIFO head and wakes another coordinator pass. A failed
+            // terminal write keeps that head running, so this memory-only marker cannot admit a later handler.
+            if (item != null && failure == null && !coalescedSelector)
+                _renewalSelectors.RecordSuccess(item);
             try
             {
                 if (item != null || failure != null)

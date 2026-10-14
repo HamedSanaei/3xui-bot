@@ -10819,7 +10819,8 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// XUI can commit an update before a TLS or timeout failure reaches the bot. This read-only probe prevents such
     /// an account from bypassing the mandatory inbound and traffic reconciliation. It never retries the identity
-    /// mutation and therefore cannot create a duplicate rename.
+    /// mutation and therefore cannot create a duplicate rename. A valid exact direct-client identity avoids a full
+    /// list and traffic read; authoritative absence or missing numeric identity is checked against a fresh list.
     /// </remarks>
     private async Task<XuiV3LinkChangeObservationStatus> ObserveChangedLinkIdentityAsync(
         ServerInfo serverInfo,
@@ -10829,26 +10830,39 @@ public partial class XuiV3BotFlowService
     {
         try
         {
-            var liveResult = await ReadLiveChangeLinkStateAsync(
-                serverInfo,
-                newEmail,
-                knownListClient: null,
-                requireInboundIds: false,
-                requireTraffic: false,
-                cancellationToken);
-            if (liveResult.ObservationStatus != XuiV3LinkChangeObservationStatus.Observed)
-                return liveResult.ObservationStatus;
-            return liveResult.State?.Client?.Id == expectedClientId
-                ? XuiV3LinkChangeObservationStatus.Observed
-                : XuiV3LinkChangeObservationStatus.NotFound;
+            XuiV3Client directClient = null;
+            try
+            {
+                var response = await ApiServicev3.GetClientAsync(serverInfo, _configuration, newEmail, cancellationToken);
+                if (response.Success) directClient = response.Obj;
+            }
+            catch (XuiV3ApiException ex) when (ex.StatusCode == 404)
+            {
+                // Confirm absence against a live list; an interrupted direct GET remains Unknown below.
+            }
+            if (directClient != null)
+            {
+                if (!string.Equals(directClient.Email?.Trim(), newEmail?.Trim(), StringComparison.OrdinalIgnoreCase))
+                    return XuiV3LinkChangeObservationStatus.Unknown;
+                if (directClient.Id > 0)
+                    return directClient.Id == expectedClientId
+                        ? XuiV3LinkChangeObservationStatus.Observed : XuiV3LinkChangeObservationStatus.NotFound;
+            }
+
+            var list = await ApiServicev3.GetClientsAsync(serverInfo, _configuration, cancellationToken);
+            if (!list.Success || list.Obj == null) return XuiV3LinkChangeObservationStatus.Unknown;
+            var matches = list.Obj.Where(candidate =>
+                string.Equals(candidate.Email?.Trim(), newEmail?.Trim(), StringComparison.OrdinalIgnoreCase)).ToList();
+            if (matches.Count > 1) return XuiV3LinkChangeObservationStatus.Unknown;
+            return matches.Count == 1 && matches[0].Id == expectedClientId
+                ? XuiV3LinkChangeObservationStatus.Observed : XuiV3LinkChangeObservationStatus.NotFound;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(
-                ex,
-                "XUI link-change ambiguous update probe failed. clientId={ClientId}, newEmail={NewEmail}",
+                "XUI link-change identity probe failed. clientId={ClientId}, errorType={ErrorType}",
                 expectedClientId,
-                newEmail);
+                ex.GetType().Name);
             return XuiV3LinkChangeObservationStatus.Unknown;
         }
     }
@@ -10872,6 +10886,8 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// This method never reads inbound ids from the JSON comment. It is used both for the pre-change fail-closed
     /// snapshot and post-change repair reads where an empty set is precisely the condition that must be repaired.
+    /// List and detail rows must agree on any supplied numeric id and UUID; mismatched responses are Unknown and
+    /// cannot authorize a repair. Missing detail identity never becomes a merged successful observation.
     /// </remarks>
     private async Task<XuiV3LinkChangeLiveStateResult> ReadLiveChangeLinkStateAsync(
         ServerInfo serverInfo,
@@ -10930,6 +10946,13 @@ public partial class XuiV3BotFlowService
             return XuiV3LinkChangeLiveStateResult.Unknown(
                 "The direct client endpoint did not return the stable client fields required for verification.");
         }
+
+        if (directClient != null &&
+            (!string.Equals(directClient.Email?.Trim(), email.Trim(), StringComparison.OrdinalIgnoreCase) ||
+             (listClient != null && ((listClient.Id > 0 && directClient.Id > 0 && listClient.Id != directClient.Id) ||
+              (!string.IsNullOrWhiteSpace(listClient.Uuid) && !string.IsNullOrWhiteSpace(directClient.Uuid) &&
+               !ChangeLinkTextEquals(listClient.Uuid, directClient.Uuid))))))
+            return XuiV3LinkChangeLiveStateResult.Unknown("Client identity disagrees across live panel responses.");
 
         if (listClient == null && directClient == null)
         {
@@ -11011,7 +11034,10 @@ public partial class XuiV3BotFlowService
     /// <remarks>
     /// One corrective client update is allowed before inbound repair. Missing inbounds are attached and unexpected
     /// inbounds are detached. Traffic is restored only when a counter decreased, using the greater of current and
-    /// snapshot values so legitimate traffic accrued during the operation is never reduced.
+    /// snapshot values so legitimate traffic accrued during the operation is never reduced. A fresh post-mutation
+    /// observation is reused for subsequent pure comparisons until another mutation occurs; every repair invalidates
+    /// it and requires read-back. Final identity, field, inbound and traffic checks always run. A reused email with a
+    /// different numeric client id is never repaired, even when list and detail both describe that replacement.
     /// </remarks>
     private async Task<XuiV3LinkChangePreservationResult> ReconcileChangedLinkStateAsync(
         ServerInfo serverInfo,
@@ -11035,6 +11061,9 @@ public partial class XuiV3BotFlowService
                 observationStatus: stateResult.ObservationStatus);
 
         var state = stateResult.State;
+        if (state.Client.Id != snapshot.ClientId)
+            return XuiV3LinkChangePreservationResult.Failed(
+                "post-update-identity", "The replacement email belongs to a different numeric client id.", state);
         var differences = GetPreservedChangeLinkDifferences(state.Client, snapshot.ClientId, expectedPayload);
         if (differences.HasCriticalDifferences)
         {
@@ -11081,6 +11110,9 @@ public partial class XuiV3BotFlowService
                     observationStatus: stateResult.ObservationStatus,
                     differences: differences.Differences);
             state = stateResult.State;
+            if (state.Client.Id != snapshot.ClientId)
+                return XuiV3LinkChangePreservationResult.Failed(
+                    "corrective-read-identity", "The client identity changed during corrective read-back.", state);
             differences = GetPreservedChangeLinkDifferences(state.Client, snapshot.ClientId, expectedPayload);
         }
 
@@ -11149,13 +11181,14 @@ public partial class XuiV3BotFlowService
                 return XuiV3LinkChangePreservationResult.Failed("detach-inbounds", detachResponse.Msg, state);
         }
 
-        stateResult = await ReadLiveChangeLinkStateAsync(
-            serverInfo,
-            newEmail,
-            knownListClient: null,
-            requireInboundIds: true,
-            requireTraffic: true,
-            cancellationToken);
+        if (missingInboundIds.Count > 0 || unexpectedInboundIds.Count > 0 || !state.TrafficObserved)
+            stateResult = await ReadLiveChangeLinkStateAsync(
+                serverInfo,
+                newEmail,
+                knownListClient: null,
+                requireInboundIds: true,
+                requireTraffic: true,
+                cancellationToken);
         if (stateResult.State == null)
             return XuiV3LinkChangePreservationResult.Failed(
                 "post-inbound-read",
@@ -11164,6 +11197,10 @@ public partial class XuiV3BotFlowService
                 differences: differences.Differences);
         state = stateResult.State;
 
+        if (state.Client.Id != snapshot.ClientId)
+            return XuiV3LinkChangePreservationResult.Failed(
+                "post-inbound-identity", "The client identity changed during inbound read-back.", state);
+        var trafficRestored = false;
         if (state.Traffic.Up < snapshot.Up || state.Traffic.Down < snapshot.Down)
         {
             var preservedUp = Math.Max(state.Traffic.Up, snapshot.Up);
@@ -11191,15 +11228,19 @@ public partial class XuiV3BotFlowService
             }
             if (!trafficResponse.Success)
                 return XuiV3LinkChangePreservationResult.Failed("restore-traffic", trafficResponse.Msg, state);
+            trafficRestored = true;
         }
 
-        var finalResult = await ReadLiveChangeLinkStateAsync(
-            serverInfo,
-            newEmail,
-            knownListClient: null,
-            requireInboundIds: true,
-            requireTraffic: true,
-            cancellationToken);
+        // Without a new mutation, stateResult is already the final fresh read-back. Never use a pre-update snapshot.
+        var finalResult = trafficRestored
+            ? await ReadLiveChangeLinkStateAsync(
+                serverInfo,
+                newEmail,
+                knownListClient: null,
+                requireInboundIds: true,
+                requireTraffic: true,
+                cancellationToken)
+            : stateResult;
         if (finalResult.State == null)
             return XuiV3LinkChangePreservationResult.Failed(
                 "final-read",
@@ -11407,12 +11448,14 @@ public partial class XuiV3BotFlowService
     /// <param name="inboundIds">Union of positive inbound ids returned by live XUI endpoints.</param>
     /// <param name="traffic">Traffic counters returned by the traffic/list/direct endpoint, or null during repair reads.</param>
     /// <returns>A detached client containing the richest available panel fields and cloned mutable JSON values.</returns>
+    /// <remarks>Local snapshot cloning is measured without retaining any client or JSON content in telemetry.</remarks>
     private static XuiV3Client BuildCanonicalChangeLinkClient(
         XuiV3Client listClient,
         XuiV3Client directClient,
         IReadOnlyCollection<int> inboundIds,
         XuiV3ClientTraffic traffic)
     {
+        using var processing = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiSnapshotProcessing) ?? default;
         // The direct endpoint is the authoritative source for stable client fields. The list endpoint primarily
         // supplies inbound membership and traffic and may deserialize omitted scalar fields to misleading defaults.
         var primary = directClient ?? listClient;
@@ -11457,11 +11500,13 @@ public partial class XuiV3BotFlowService
     /// A structured report whose critical entries require correction or recovery. Empty and representation-only
     /// differences are normalized before entries are added.
     /// </returns>
+    /// <remarks>Local semantic comparisons contribute to xui_snapshot_processing, without field values in telemetry.</remarks>
     private static XuiV3LinkChangeDifferenceReport GetPreservedChangeLinkDifferences(
         XuiV3Client actualClient,
         int expectedClientId,
         XuiV3ClientPayload expectedPayload)
     {
+        using var processing = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiSnapshotProcessing) ?? default;
         var report = new XuiV3LinkChangeDifferenceReport();
         if (actualClient == null || expectedPayload == null)
         {

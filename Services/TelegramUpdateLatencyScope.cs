@@ -58,7 +58,11 @@ public enum TelegramUpdateStage
     /// <summary>Waiting for an in-process business resource gate; resource identifiers are never retained.</summary>
     LockWait,
     /// <summary>Explicitly identified local dispatch or business work, not an assumed CPU measurement.</summary>
-    BusinessProcessing
+    BusinessProcessing,
+    /// <summary>Local XUI response JSON conversion after HTTP completes; never contains response data.</summary>
+    XuiResponseParsing,
+    /// <summary>Local cloning and semantic comparison of link-change snapshots, excluding external requests.</summary>
+    XuiSnapshotProcessing
 }
 
 /// <summary>
@@ -137,7 +141,7 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
     /// <summary>Limits retained overlapping diagnostic slots; overflow is explicitly marked, never silently attributed.</summary>
     private const int MaximumActiveSlots = 1024;
     /// <summary>Closed contiguous enum size, avoiding temporary Enum.GetValues allocations per update.</summary>
-    private const int StageCount = (int)TelegramUpdateStage.BusinessProcessing + 1;
+    private const int StageCount = (int)TelegramUpdateStage.XuiSnapshotProcessing + 1;
     /// <summary>Serializes stage transitions and gap accounting without holding a lock during business work.</summary>
     private readonly Lock _stageGate = new();
     /// <summary>Reusable active stage slots; the ordinary sequential case uses the inline slot.</summary>
@@ -381,6 +385,8 @@ public sealed class TelegramUpdateLatencyScope : IDisposable
     {
         TelegramUpdateStage.XuiRead => "xui_read",
         TelegramUpdateStage.XuiMutation => "xui_write",
+        TelegramUpdateStage.XuiResponseParsing => "xui_response_parse",
+        TelegramUpdateStage.XuiSnapshotProcessing => "xui_snapshot_processing",
         TelegramUpdateStage.TelegramSend => "telegram_send",
         TelegramUpdateStage.TelegramEdit => "telegram_edit",
         TelegramUpdateStage.TelegramMembership => "telegram_membership",

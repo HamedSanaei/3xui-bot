@@ -1,5 +1,16 @@
 # CODE_MAP.md
 
+- October 13 latency fixes: `TelegramRenewalSelectorCoalescer` recognizes only same-bot/user/chat/message/target/page
+  `x3:aren`/`x3:asren` clicks accepted while a preceding successful selector was running. The scheduler keeps every
+  durable FIFO receipt but answers those queued repeats without another panel read or state reset. New deliberate
+  clicks, intervening navigation, failed originals, financial/external-proof callbacks and restart run normally.
+  Bounded process-local metadata (1024 lanes, 30 s retention) never authorizes a renewal or replaces financial locks.
+  Link-change identity probes use exact direct-client email/id, with live list fallback for missing identity/absence;
+  full reconciliation still checks id/UUID/preserved fields/inbounds/traffic. Pure comparisons reuse a fresh
+  post-mutation observation; every corrective, inbound or traffic mutation requires read-back. Local JSON conversion
+  and snapshot comparisons now expose `xui_response_parse` / `xui_snapshot_processing` without payloads. Coverage:
+  `Adminbot.Tests/RenewalSelectorAndLinkLatencyTests.cs`; no schema, pricing, or mutation-retry policy change.
+
 - Persistent Telegram latency telemetry: `Services/Telemetry/` owns a bounded single JSONL writer, UTC/monotonic
   version-one metadata, receiver/inbox timeline correlation, runtime health, cooldown incidents, read-only reporting
   and a controlled benchmark. Enabled defaults: 8192 events, daily/25 MiB files, 14-day/500 MiB retention; storage is

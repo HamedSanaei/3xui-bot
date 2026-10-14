@@ -1075,7 +1075,8 @@ public class ApiServicev3
     /// Current 3x-ui releases return <c>obj.client</c> and keep inbound membership in <c>obj.inboundIds</c>, while
     /// older compatible deployments may return the client directly in <c>obj</c>. This method performs no HTTP call,
     /// panel mutation, persistence, wallet operation, tenant operation, or logging. Numeric id, email, UUID, and SubId
-    /// are not synthesized; downstream identity checks remain authoritative.
+    /// are not synthesized; downstream identity checks remain authoritative. Local JSON conversion is timed as
+    /// xui_response_parse separately from HTTP, without recording any response content.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1087,6 +1088,7 @@ public class ApiServicev3
     internal static XuiV3ApiResponse<XuiV3Client> NormalizeClientDetailResponse(
         XuiV3ApiResponse<JToken> response)
     {
+        using var parsing = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiResponseParsing) ?? default;
         if (response?.Success != true)
         {
             return new XuiV3ApiResponse<XuiV3Client>
@@ -2437,6 +2439,7 @@ public class ApiServicev3
     /// <remarks>
     /// A successful HTTP status can still contain <c>success=false</c>; callers remain responsible for checking the
     /// panel envelope. Exceptions retain endpoint detail only for private diagnostics and must not be shown to users.
+    /// JSON conversion is measured independently as xui_response_parse; network retry and mutation policies are unchanged.
     /// </remarks>
     public static async Task<XuiV3ApiResponse<T>> SendAsync<T>(
         ServerInfo serverInfo,
@@ -2451,6 +2454,7 @@ public class ApiServicev3
         XuiV3RequestExecutionPolicy executionPolicy = XuiV3RequestExecutionPolicy.BackgroundRead)
     {
         var raw = await SendRawAsync(serverInfo, configuration, method, relativePath, body, authenticate, cancellationToken, query, EffectiveRetryMode(retryMode, executionPolicy), executionPolicy);
+        using var parsing = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.XuiResponseParsing) ?? default;
         var result = JsonConvert.DeserializeObject<XuiV3ApiResponse<T>>(raw);
         if (result == null)
             throw new XuiV3ApiException(method.ToString(), BuildPanelUri(serverInfo, relativePath, query).ToString(), 0, raw, null);

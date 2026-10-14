@@ -20,7 +20,7 @@ public static class LatencyTelemetryReportCli
     {
         "telegram_send", "telegram_edit", "telegram_upload", "telegram_callback_ack", "telegram_polling",
         "telegram_lookup", "telegram_probe", "sqlite_read", "sqlite_write", "sqlite_busy_retry", "database_wait",
-        "payment_gateway", "xui_read", "xui_write", "external_http", "lock_wait", "business_processing",
+        "payment_gateway", "xui_read", "xui_write", "xui_response_parse", "xui_snapshot_processing", "external_http", "lock_wait", "business_processing",
         "telegram_membership", "site_lookup",
         "unattributed", "admission", "admission_persistence", "queue_wait", "dispatch_delay", "claim", "final_persistence",
         "receiver_checks", "claim_to_handler", "post_handler", "admission_non_db_time", "admission_total",

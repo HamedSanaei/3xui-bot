@@ -2,6 +2,7 @@ using Adminbot.Domain;
 using Telegram.Bot.Types;
 using Adminbot.Services.Telemetry;
 using Adminbot.Services.TelegramEndpoints;
+using Telegram.Bot;
 
 /// <summary>Restores bot identity and owns the disposable service graph of one scheduled execution.</summary>
 /// <remarks>Per-operation stores own short database contexts; legacy coordinated workflows share only this execution's unit of work.</remarks>
@@ -85,6 +86,25 @@ public sealed class TelegramUpdateExecutor : ITelegramUpdateExecutor
             await scope.ServiceProvider.GetRequiredService<TelegramBotService>()
                 .DispatchUpdateAsync(client, item.Update, runtime, cancellationToken);
         }
+    }
+
+    /// <summary>Answers a queued repeat renewal click without resetting state or reading XUI again.</summary>
+    /// <param name="item">Claimed selector callback from the scheduler's exact bot/user/message burst match.</param>
+    /// <param name="cancellationToken">Current handler shutdown token; callback answering keeps its existing bounded policy.</param>
+    /// <returns>Completion of one best-effort answer; no selector, payment, wallet, or XUI handler is invoked.</returns>
+    /// <remarks>
+    /// Uses the same routed provider as normal execution, including endpoint migration fences. Only callback feedback
+    /// is sent, so it grants no ownership or account information and works for owned and tenant account cards.
+    /// </remarks>
+    /// <example><code>await executor.AcknowledgeRenewalSelectorAsync(repeatedItem, cancellationToken);</code></example>
+    public async Task AcknowledgeRenewalSelectorAsync(TelegramUpdateWorkItem item, CancellationToken cancellationToken)
+    {
+        if (!IsAvailable(item.Key.BotId) || string.IsNullOrWhiteSpace(item.Update.CallbackQuery?.Id)) return;
+        using var actor = TelegramInteractionActor.Push(ResolveActor(item.Update));
+        await TelegramCallbackAnswerPolicy.TryAnswerAsync(
+            _clients.GetClient(item.Key.BotId), item.Update.CallbackQuery.Id,
+            text: "درخواست قبلی بررسی شد؛ نتیجه را در پیام ربات ببینید.",
+            cancellationToken: cancellationToken, botId: item.Key.BotId);
     }
 
     /// <summary>
