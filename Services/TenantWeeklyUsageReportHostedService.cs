@@ -82,6 +82,8 @@ public sealed class TenantWeeklyUsageReportHostedService : BackgroundService
     /// before the atomic send barrier. The scoped assistant repeats ownership validation before its one HTTP call.
     /// Known 429/no-route outcomes and proven pre-dispatch endpoint fences may retry next cycle; permanent rejection
     /// and ambiguous outcomes cannot. A fence resets the dispatch barrier only because no HTTP send occurred.
+    /// One read-only private-chat probe per owner per cycle precedes chart generation. Definite missing/blocked recipients
+    /// wait six hours using existing dispatch timestamps and local Debug diagnostics, not repeated photo requests or warnings.
     /// </remarks>
     /// <exception cref="OperationCanceledException">Host shutdown interrupted the cycle.</exception>
     /// <example><code>await worker.ProcessOnceAsync(new DateTime(2026, 10, 10, 0, 0, 0), token);</code></example>
@@ -116,19 +118,16 @@ public sealed class TenantWeeklyUsageReportHostedService : BackgroundService
         var comparisons = await _analytics.GetTenantWeeklyReportsAsync(periodEndIran,
             targets.Select(x => new TenantWeeklyReportTarget(x.Bot.Id, x.Bot.OwnerTelegramUserId.Value)).ToArray(), cancellationToken);
         var startUtc = _analytics.ConvertIranTimeToUtc(periodEndIran.AddDays(-7));
+        var recipientFailures = new Dictionary<long, string>();
         var delivered = 0;
         foreach (var target in targets)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var started = false;
             int? messageId = null;
+            var stage = "recipient_probe";
             try
             {
-                var comparison = comparisons[target.Bot.Id];
-                var png = _chartRenderer.RenderWeeklyComparison(comparison.CurrentWeek, comparison.PreviousWeek);
-                var caption = WeeklyUsageReportContent.BuildCaption(comparison.CurrentWeek, comparison.PreviousWeek,
-                    target.Bot.Username, target.Bot.Id);
-                await using var image = new MemoryStream(png, writable: false);
                 using var scope = _scopeFactory.CreateScope();
                 var assistant = scope.ServiceProvider.GetRequiredService<SalesAssistantService>();
                 await using (var context = _contextFactory.CreateDbContext())
@@ -142,9 +141,25 @@ public sealed class TenantWeeklyUsageReportHostedService : BackgroundService
                     if (current == null || string.IsNullOrWhiteSpace(current.Token) || string.IsNullOrWhiteSpace(current.Username))
                         continue;
                 }
+                var ownerId = target.Bot.OwnerTelegramUserId.Value;
+                if (!recipientFailures.TryGetValue(ownerId, out var recipientFailure))
+                    recipientFailures[ownerId] = recipientFailure = await assistant.CheckTenantWeeklyRecipientAsync(ownerId, cancellationToken);
+                if (recipientFailure != null)
+                {
+                    await _dispatchStore.RecordTenantPreSendFailureAsync(target.Key, startUtc, endUtc, recipientFailure, false, cancellationToken);
+                    _logger.LogDebug("Tenant weekly target deferred before send. reportKey={ReportKey}, failureCode={FailureCode}", target.Key, recipientFailure);
+                    continue;
+                }
+                stage = "chart_generation";
+                var comparison = comparisons[target.Bot.Id];
+                var png = _chartRenderer.RenderWeeklyComparison(comparison.CurrentWeek, comparison.PreviousWeek);
+                var caption = WeeklyUsageReportContent.BuildCaption(comparison.CurrentWeek, comparison.PreviousWeek,
+                    target.Bot.Username, target.Bot.Id);
+                await using var image = new MemoryStream(png, writable: false);
                 started = await _dispatchStore.TryStartTenantSendAsync(target.Key, startUtc, endUtc, cancellationToken);
                 if (!started)
                     continue;
+                stage = "send_photo";
                 messageId = await assistant.SendTenantWeeklyReportPhotoAsync(target.Bot.Id,
                     target.Bot.OwnerTelegramUserId.Value, target.Bot.TelegramBotId.Value, image, caption, cancellationToken);
                 if (!messageId.HasValue)
@@ -166,20 +181,28 @@ public sealed class TenantWeeklyUsageReportHostedService : BackgroundService
             {
                 if (started && !messageId.HasValue)
                     await RecordOutcomeAsync(target.Key, UsageReportDispatchStatuses.Failed, ex.ReasonCode);
+                else if (!started)
+                    await _dispatchStore.RecordTenantPreSendFailureAsync(target.Key, startUtc, endUtc, ex.ReasonCode, false, CancellationToken.None);
             }
             catch (Exception ex)
             {
-                var code = ex is ApiRequestException api ? "telegram_" + api.ErrorCode.ToString(CultureInfo.InvariantCulture) : ex.GetType().Name;
+                var code = TenantWeeklyDeliveryPolicy.GetFailureCode(ex);
                 if (messageId.HasValue)
                     await RecordKnownDeliveryAsync(target.Key, messageId.Value, code);
                 else if (started)
                 {
-                    var status = ex is ApiRequestException { ErrorCode: 429 } ? UsageReportDispatchStatuses.Failed :
+                    var status = TenantWeeklyDeliveryPolicy.IsRecipientUnavailable(code) || ex is ApiRequestException { ErrorCode: 429 } ? UsageReportDispatchStatuses.Failed :
                         ex is ApiRequestException { ErrorCode: >= 400 and < 500 and not 408 } ? UsageReportDispatchStatuses.Rejected :
                         UsageReportDispatchStatuses.DeliveryUncertain;
                     await RecordOutcomeAsync(target.Key, status, code);
                 }
-                _logger.LogWarning("Tenant weekly target failed. reportKey={ReportKey}, failureCode={FailureCode}", target.Key, code);
+                else if (stage == "recipient_probe" && (code == TenantWeeklyDeliveryPolicy.RecipientIdentityMismatch ||
+                         ex is ApiRequestException { ErrorCode: >= 400 and < 500 and not 408 and not 429 }))
+                    await _dispatchStore.RecordTenantPreSendFailureAsync(target.Key, startUtc, endUtc, code, true, CancellationToken.None);
+                if (!messageId.HasValue && TenantWeeklyDeliveryPolicy.IsRecipientUnavailable(code))
+                    _logger.LogDebug("Tenant weekly target deferred. reportKey={ReportKey}, stage={Stage}, failureCode={FailureCode}", target.Key, stage, code);
+                else
+                    _logger.LogWarning("Tenant weekly target failed. reportKey={ReportKey}, stage={Stage}, failureCode={FailureCode}", target.Key, stage, code);
             }
         }
         return delivered;

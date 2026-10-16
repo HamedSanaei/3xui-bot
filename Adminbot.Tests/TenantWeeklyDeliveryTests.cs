@@ -9,12 +9,171 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 using Telegram.Bot;
 using Xunit;
 
 /// <summary>Exercises tenant dashboards using real SQLite, real chart rendering and the Telegram SDK transport.</summary>
 public sealed class TenantWeeklyDeliveryTests
 {
+    /// <summary>Chat-not-found is a read-only recipient deferral, not four failed photo uploads every weekly run.</summary>
+    /// <param name="statusCode">Definitive Bot API status for an unreachable owner, not a transport timeout.</param>
+    /// <param name="description">Untrusted recipient rejection; its raw value must never enter persistence or logs.</param>
+    /// <param name="failureCode">Expected closed recipient diagnostic category.</param>
+    /// <returns>A task proving zero initial photos/claims/warnings, six-hour restart backoff and exactly one later delivery per store.</returns>
+    [Theory]
+    [InlineData(400, "Bad Request: chat not found fixture-secret-must-not-persist", "telegram_recipient_chat_unavailable")]
+    [InlineData(403, "Forbidden: bot was blocked by the user", "telegram_recipient_blocked")]
+    [InlineData(403, "Forbidden: user is deactivated", "telegram_recipient_deactivated")]
+    public async Task Missing_assistant_chat_defers_before_claim_and_recovers_after_backoff_without_duplicates(int statusCode, string description, string failureCode)
+    {
+        using var fixture = new Fixture();
+        await fixture.SeedAsync(Store("missing-a", 711, 20001), Store("missing-b", 711, 20002), Store("healthy", 712, 20003));
+        fixture.Http.ProbeRespond = (owner, _) => Task.FromResult(owner == 711
+            ? Failure(statusCode, description) : ChatSuccess(owner));
+        var end = new DateTime(2026, 10, 17);
+        Assert.Equal(1, await fixture.Worker().ProcessOnceAsync(end));
+        Assert.Equal(2, fixture.Http.Probes.Count); // Two stores for one owner share one read-only probe.
+        Assert.Single(fixture.Http.Sends);
+        Assert.DoesNotContain(fixture.Log.Levels, level => level >= LogLevel.Warning);
+        await using (var db = fixture.Users.CreateDbContext())
+        {
+            var deferred = await db.UsageReportDispatches.Where(x => x.Status == UsageReportDispatchStatuses.Failed).ToListAsync();
+            Assert.Equal(2, deferred.Count);
+            Assert.All(deferred, row =>
+            {
+                Assert.Equal(0, row.AttemptCount);
+                Assert.Equal(failureCode, row.LastError);
+                Assert.Null(row.TelegramMessageId);
+            });
+        }
+        fixture.Http.ProbeRespond = (owner, _) => Task.FromResult(ChatSuccess(owner));
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end.AddMinutes(1)));
+        Assert.Equal(2, fixture.Http.Probes.Count);
+        await using (var db = fixture.Users.CreateDbContext())
+            await db.UsageReportDispatches.Where(x => x.Status == UsageReportDispatchStatuses.Failed)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.UpdatedAtUtc, DateTime.UtcNow.AddHours(-7)));
+        Assert.Equal(2, await fixture.Worker().ProcessOnceAsync(end.AddHours(7)));
+        Assert.Equal(3, fixture.Http.Probes.Count);
+        Assert.Equal(3, fixture.Http.Sends.Count);
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end.AddHours(8)));
+        await using var verify = fixture.Users.CreateDbContext();
+        Assert.Equal(3, await verify.UsageReportDispatches.CountAsync(x => x.Status == UsageReportDispatchStatuses.Sent && x.AttemptCount == 1));
+    }
+
+    /// <summary>Failed read-only probing cannot consume or make photo delivery uncertain; a later successful read can send once.</summary>
+    /// <returns>A task proving one GET-method failure, no premature photo/claim, and safe later delivery without a duplicate.</returns>
+    [Fact]
+    public async Task Transient_recipient_probe_failure_does_not_cross_photo_send_barrier()
+    {
+        using var fixture = new Fixture();
+        await fixture.SeedAsync(Store("probe", 711, 20001));
+        fixture.Http.ProbeRespond = (owner, attempt) => Task.FromResult(attempt == 1
+            ? Failure(500, "chat not found fixture-secret-must-not-persist") : ChatSuccess(owner));
+        var end = new DateTime(2026, 10, 17);
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end));
+        Assert.Empty(fixture.Http.Sends);
+        await using (var db = fixture.Users.CreateDbContext()) Assert.Empty(await db.UsageReportDispatches.ToListAsync());
+        Assert.Contains(fixture.Log.Levels, level => level == LogLevel.Warning);
+        Assert.Equal(1, await fixture.Worker().ProcessOnceAsync(end.AddMinutes(1)));
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end.AddMinutes(2)));
+        Assert.Equal(2, fixture.Http.Probes.Count);
+        Assert.Single(fixture.Http.Sends);
+    }
+
+    /// <summary>A private-chat probe must match the exact owner; unexpected identity is terminal and cannot redirect a dashboard.</summary>
+    /// <returns>A task proving no photo, no repeated probe/warning and a sanitized permanent identity diagnosis.</returns>
+    [Fact]
+    public async Task Wrong_recipient_identity_is_rejected_without_photo_or_repeated_probe()
+    {
+        using var fixture = new Fixture();
+        await fixture.SeedAsync(Store("wrong-recipient", 711, 20001));
+        fixture.Http.ProbeRespond = (owner, _) => Task.FromResult(ChatSuccess(owner + 1));
+        var end = new DateTime(2026, 10, 17);
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end));
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end.AddMinutes(1)));
+        Assert.Single(fixture.Http.Probes);
+        Assert.Empty(fixture.Http.Sends);
+        await using var db = fixture.Users.CreateDbContext();
+        var row = await db.UsageReportDispatches.SingleAsync();
+        Assert.Equal(UsageReportDispatchStatuses.Rejected, row.Status);
+        Assert.Equal(TenantWeeklyDeliveryPolicy.RecipientIdentityMismatch, row.LastError);
+        Assert.Equal(0, row.AttemptCount);
+    }
+
+    /// <summary>Tenant recipient backoff cannot change global weekly-report retry/lease semantics.</summary>
+    /// <returns>A task proving a failed global report remains claimable even with the same diagnostic text.</returns>
+    [Fact]
+    public async Task Recipient_backoff_never_changes_global_weekly_claims()
+    {
+        using var fixture = new Fixture();
+        const string key = "weekly:20261017";
+        var end = DateTime.UtcNow;
+        Assert.True(await fixture.Store.TryClaimAsync(key, end.AddDays(-7), end, default));
+        await fixture.Store.MarkFailedAsync(key, "telegram_recipient_chat_unavailable", default);
+        Assert.Empty(await fixture.Store.GetNonRetryableKeysAsync(new[] { key }, default));
+        Assert.True(await fixture.Store.TryClaimAsync(key, end.AddDays(-7), end, default));
+    }
+
+    /// <summary>A generic historical rejection and an ambiguous/started photo cannot be revived by new pre-send deferral writes.</summary>
+    /// <param name="status">Existing terminal or crossed-send state that must remain consumed across multiple worker cycles.</param>
+    /// <returns>A task proving no historical send, claim or state repair occurs.</returns>
+    [Theory]
+    [InlineData(UsageReportDispatchStatuses.Rejected)]
+    [InlineData(UsageReportDispatchStatuses.SendStarted)]
+    [InlineData(UsageReportDispatchStatuses.DeliveryUncertain)]
+    [InlineData(UsageReportDispatchStatuses.Sent)]
+    public async Task Recipient_deferral_never_repairs_historical_or_inflight_dispatches(string status)
+    {
+        using var fixture = new Fixture();
+        await fixture.SeedAsync(Store("old", 711, 20001));
+        var end = new DateTime(2026, 10, 17);
+        var key = TenantWeeklyUsageReportHostedService.CreateReportKey(end, "old", 711, 20001);
+        await using (var db = fixture.Users.CreateDbContext())
+        {
+            db.UsageReportDispatches.Add(new UsageReportDispatch { ReportKey = key, Status = status, AttemptCount = 1,
+                LastError = "telegram_400", PeriodStartUtc = DateTime.UtcNow.AddDays(-7), PeriodEndUtc = DateTime.UtcNow });
+            await db.SaveChangesAsync();
+        }
+        await fixture.Store.RecordTenantPreSendFailureAsync(key, DateTime.UtcNow.AddDays(-7), DateTime.UtcNow,
+            "telegram_recipient_chat_unavailable", false, default);
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end));
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end.AddHours(7)));
+        Assert.Empty(fixture.Http.Probes);
+        Assert.Empty(fixture.Http.Sends);
+        await using var verify = fixture.Users.CreateDbContext();
+        var row = await verify.UsageReportDispatches.SingleAsync();
+        Assert.Equal(status, row.Status);
+        Assert.Equal("telegram_400", row.LastError);
+        Assert.Equal(1, row.AttemptCount);
+    }
+
+    /// <summary>Definitive photo rejection after a positive probe may defer, but invalid captions remain terminal warnings.</summary>
+    /// <param name="description">Untrusted Bot API error description; must be classified without persistence or logging.</param>
+    /// <param name="expectedCode">Closed expected diagnostic category.</param>
+    /// <param name="recipientFailure">Whether this is a definite temporary recipient condition rather than an application bug.</param>
+    /// <returns>A task proving precise sanitized diagnostics, appropriate severity, and no immediate photo replay.</returns>
+    [Theory]
+    [InlineData("Bad Request: chat not found", "telegram_recipient_chat_unavailable", true)]
+    [InlineData("Bad Request: can't parse entities fixture-secret-must-not-persist", "telegram_invalid_caption", false)]
+    [InlineData("Bad Request: PHOTO_INVALID_DIMENSIONS", "telegram_invalid_photo", false)]
+    [InlineData("fixture-secret-must-not-persist", "telegram_400", false)]
+    public async Task Definite_send_failure_keeps_closed_diagnosis_and_real_errors_visible(string description, string expectedCode, bool recipientFailure)
+    {
+        using var fixture = new Fixture();
+        await fixture.SeedAsync(Store("store", 711, 20001));
+        fixture.Http.Respond = (_, _) => Task.FromResult(Failure(400, description));
+        var end = new DateTime(2026, 10, 17);
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end));
+        Assert.Equal(0, await fixture.Worker().ProcessOnceAsync(end.AddMinutes(1)));
+        Assert.Single(fixture.Http.Sends);
+        await using var db = fixture.Users.CreateDbContext();
+        var row = await db.UsageReportDispatches.SingleAsync();
+        Assert.Equal(expectedCode, row.LastError);
+        Assert.Equal(recipientFailure ? UsageReportDispatchStatuses.Failed : UsageReportDispatchStatuses.Rejected, row.Status);
+        Assert.Equal(!recipientFailure, fixture.Log.Levels.Any(x => x >= LogLevel.Warning));
+    }
+
     /// <summary>Friday's final second still addresses the older week; Saturday midnight immediately starts the newly completed week.</summary>
     /// <returns>A task after the real worker's UTC periods and two distinct dispatches have been checked.</returns>
     [Fact]
@@ -311,9 +470,16 @@ public sealed class TenantWeeklyDeliveryTests
 
     /// <summary>Returns a definite Telegram rejection or server error with a deliberately untrusted description.</summary>
     /// <param name="code">Telegram HTTP/API status, such as 429, 403 or 500.</param>
+    /// <param name="description">Optional untrusted provider description used only at the synthetic transport boundary.</param>
     /// <returns>A fresh failure response interpreted by the real SDK.</returns>
-    private static HttpResponseMessage Failure(int code) => new((HttpStatusCode)code)
-    { Content = new StringContent(JsonSerializer.Serialize(new { ok = false, error_code = code, description = "fixture-secret-must-not-persist", parameters = new { retry_after = 1 } }), Encoding.UTF8, "application/json") };
+    private static HttpResponseMessage Failure(int code, string description = "fixture-secret-must-not-persist") => new((HttpStatusCode)code)
+    { Content = new StringContent(JsonSerializer.Serialize(new { ok = false, error_code = code, description, parameters = new { retry_after = 1 } }), Encoding.UTF8, "application/json") };
+
+    /// <summary>Returns an exact private getChat response without requiring a bot conversation-state row.</summary>
+    /// <param name="owner">Synthetic positive Telegram owner/chat id.</param>
+    /// <returns>A fresh response parsed by the real SDK as ChatFullInfo.</returns>
+    private static HttpResponseMessage ChatSuccess(long owner) => new(HttpStatusCode.OK)
+    { Content = new StringContent(JsonSerializer.Serialize(new { ok = true, result = new { id = owner, type = "private", first_name = "Synthetic" } }), Encoding.UTF8, "application/json") };
 
     /// <summary>Captures the assistant identity, owner chat, caption and actual rendered PNG from SDK multipart serialization.</summary>
     private sealed record Upload(long BotIdentity, long ChatId, string Caption, byte[] Photo);
@@ -323,15 +489,28 @@ public sealed class TenantWeeklyDeliveryTests
     {
         /// <summary>Thread-safe observed attempts, including rejected/ambiguous requests.</summary>
         public ConcurrentQueue<Upload> Sends { get; } = new();
+        /// <summary>Read-only private chat probes, separate from all mutating photo uploads.</summary>
+        public ConcurrentQueue<long> Probes { get; } = new();
+        /// <summary>Optional response selector for getChat, before any chart upload or send barrier.</summary>
+        public Func<long, int, Task<HttpResponseMessage>>? ProbeRespond { get; set; }
         /// <summary>Optional asynchronous response selector; permits in-flight concurrency barriers.</summary>
         public Func<Upload, int, Task<HttpResponseMessage>>? Respond { get; set; }
         private int _count;
-        /// <summary>Reads genuine multipart parts and returns the selected Telegram response.</summary>
+        /// <summary>Answers read-only getChat or captures genuine sendPhoto multipart parts using selected responses.</summary>
         /// <param name="request">SDK-owned request containing the assistant token and multipart payload; never logged.</param>
         /// <param name="cancellationToken">SDK request cancellation token.</param>
         /// <returns>Selected synthetic response for the real SDK parser.</returns>
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/getChat", StringComparison.Ordinal))
+            {
+                Assert.StartsWith("/bot90001:", request.RequestUri.AbsolutePath);
+                var body = await request.Content!.ReadAsStringAsync(cancellationToken);
+                using var json = JsonDocument.Parse(body);
+                var owner = json.RootElement.GetProperty("chat_id").GetInt64();
+                Probes.Enqueue(owner);
+                return ProbeRespond == null ? ChatSuccess(owner) : await ProbeRespond(owner, Probes.Count);
+            }
             var multipart = Assert.IsAssignableFrom<MultipartFormDataContent>(request.Content);
             var parts = new Dictionary<string, byte[]>(StringComparer.Ordinal);
             byte[]? photo = null;
@@ -371,6 +550,8 @@ public sealed class TenantWeeklyDeliveryTests
         public TelegramEndpointRuntimeGate? Gate { get; }
         /// <summary>HTTP capture boundary shared by all clients in this fixture.</summary>
         public CaptureHandler Http { get; } = new();
+        /// <summary>Safe log severity capture proving expected recipient waits never spam the warning-level logger.</summary>
+        public WeeklyLog Log { get; } = new();
         /// <summary>Scope provider resolving real SalesAssistantService instances.</summary>
         public ServiceProvider Provider { get; }
         /// <summary>Optional inventory-to-send mutation invoked while resolving the real assistant service.</summary>
@@ -407,7 +588,7 @@ public sealed class TenantWeeklyDeliveryTests
         /// <summary>Creates a fresh production worker sharing only the durable database and controlled transport.</summary>
         /// <returns>An unstarted worker for deterministic ProcessOnceAsync cycles.</returns>
         public TenantWeeklyUsageReportHostedService Worker() => new(Users, Analytics, new UsageReportChartRenderer(), Store,
-            Provider.GetRequiredService<IServiceScopeFactory>(), Registry, NullLogger<TenantWeeklyUsageReportHostedService>.Instance);
+            Provider.GetRequiredService<IServiceScopeFactory>(), Registry, Log);
         /// <summary>Persists storefront inventory and mirrors it into the runtime registry.</summary>
         /// <param name="bots">Detached fixture rows, including intentionally ineligible inventory.</param>
         /// <returns>A task completing after all rows are committed.</returns>
@@ -425,5 +606,19 @@ public sealed class TenantWeeklyDeliveryTests
             Http.Dispose();
             Directory.Delete(_directory, recursive: true);
         }
+    }
+
+    /// <summary>Captures severity only; no exception descriptions, tokens or photo contents enter verification logs.</summary>
+    private sealed class WeeklyLog : ILogger<TenantWeeklyUsageReportHostedService>
+    {
+        /// <summary>Observed local logging levels across worker recreation.</summary>
+        public ConcurrentQueue<LogLevel> Levels { get; } = new();
+        /// <inheritdoc />
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        /// <inheritdoc />
+        public bool IsEnabled(LogLevel logLevel) => true;
+        /// <inheritdoc />
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => Levels.Enqueue(logLevel);
     }
 }

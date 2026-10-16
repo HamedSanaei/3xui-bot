@@ -79,20 +79,53 @@ public sealed class UsageReportDispatchStore
     /// <param name="reportKeys">Bounded unique keys for the current inventory and latest completed week.</param>
     /// <param name="cancellationToken">Host cancellation token for the users.db read.</param>
     /// <returns>Non-retryable keys; an empty set means all supplied targets remain eligible.</returns>
-    /// <remarks>Any state other than Pending or Failed is conservatively consumed; SendStarted has no expiry.</remarks>
+    /// <remarks>Any state other than Pending or Failed is conservatively consumed; SendStarted has no expiry.
+    /// Recent Failed rows with definite recipient-unavailable codes are temporarily excluded for six hours. Historical
+    /// generic telegram_400 rejections remain consumed; this method never repairs or replays them.</remarks>
     /// <example><code>var consumed = await store.GetNonRetryableKeysAsync(keys, cancellationToken);</code></example>
     public async Task<HashSet<string>> GetNonRetryableKeysAsync(
         IReadOnlyCollection<string> reportKeys, CancellationToken cancellationToken)
     {
         if (reportKeys.Count == 0)
             return new HashSet<string>(StringComparer.Ordinal);
+        var recipientCutoff = DateTime.UtcNow - TenantWeeklyDeliveryPolicy.RecipientRetryDelay;
+        var recipientCodes = TenantWeeklyDeliveryPolicy.RecipientFailureCodes.ToArray();
         await using var context = _contextFactory.CreateDbContext();
         var keys = await context.UsageReportDispatches.AsNoTracking()
             .Where(x => reportKeys.Contains(x.ReportKey) &&
-                        x.Status != UsageReportDispatchStatuses.Pending &&
-                        x.Status != UsageReportDispatchStatuses.Failed)
+                        ((x.Status != UsageReportDispatchStatuses.Pending && x.Status != UsageReportDispatchStatuses.Failed) ||
+                         (x.ReportKey.StartsWith("tenantweekly:") && x.Status == UsageReportDispatchStatuses.Failed &&
+                          recipientCodes.Contains(x.LastError) && x.UpdatedAtUtc > recipientCutoff)))
             .Select(x => x.ReportKey).ToListAsync(cancellationToken);
         return new HashSet<string>(keys, StringComparer.Ordinal);
+    }
+
+    /// <summary>Records a definite tenant failure before the photo-send barrier without consuming send attempts.</summary>
+    /// <param name="reportKey">Required tenantweekly key within the existing 64-character limit; never a financial or global report key.</param>
+    /// <param name="periodStartUtc">Inclusive completed-week UTC boundary.</param>
+    /// <param name="periodEndUtc">Exclusive completed-week UTC boundary.</param>
+    /// <param name="errorCode">Required sanitized failure code, never raw Telegram descriptions or credentials.</param>
+    /// <param name="permanent">True for definitive unexpected API rejection; false for retryable pre-send route/recipient failure.</param>
+    /// <param name="cancellationToken">Token for users.db insertion and conditional update only.</param>
+    /// <returns>A task after a Pending/Failed row is recorded; concurrent SendStarted, delivered, uncertain or rejected rows are never modified.</returns>
+    /// <remarks>No external request runs in database work. Recipient codes receive their delay through GetNonRetryableKeysAsync;
+    /// AttemptCount stays unchanged because no photo claim occurred. Existing terminal/historical records cannot be revived.</remarks>
+    /// <exception cref="ArgumentException">The tenant key or sanitized code is invalid.</exception>
+    /// <example><code>await store.RecordTenantPreSendFailureAsync(key, startUtc, endUtc, code, false, token);</code></example>
+    public async Task RecordTenantPreSendFailureAsync(string reportKey, DateTime periodStartUtc, DateTime periodEndUtc,
+        string errorCode, bool permanent, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(reportKey) || !reportKey.StartsWith("tenantweekly:", StringComparison.Ordinal) || reportKey.Length > 64 ||
+            string.IsNullOrWhiteSpace(errorCode) || errorCode.Length > 100 || errorCode.Any(c => !(char.IsAsciiLetterOrDigit(c) || c == '_')))
+            throw new ArgumentException("A tenant report key and sanitized failure code are required.");
+        var now = DateTime.UtcNow;
+        await EnsureRowExistsAsync(reportKey, periodStartUtc, periodEndUtc, now, cancellationToken);
+        await using var context = _contextFactory.CreateDbContext();
+        // Never release another worker's crossed send barrier or turn an old terminal row into a retry.
+        await context.UsageReportDispatches.Where(x => x.ReportKey == reportKey &&
+                (x.Status == UsageReportDispatchStatuses.Pending || x.Status == UsageReportDispatchStatuses.Failed))
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, permanent ? UsageReportDispatchStatuses.Rejected : UsageReportDispatchStatuses.Failed)
+                .SetProperty(x => x.LastError, errorCode).SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
     }
 
     /// <summary>Durably crosses the tenant photo send boundary exactly once across concurrent processes.</summary>

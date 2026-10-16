@@ -62,6 +62,21 @@ A definite rate-limit rejection or unavailable assistant route can retry; ambigu
 require review instead of automatic resend. Reports never use the storefront token to contact the owner and never
 change wallets, orders, profit or ledger balances.
 
+Before chart generation and the durable photo barrier, the current routed Sales Assistant checks the exact
+owner's private chat with read-only `getChat`, bounded to five seconds and at most once per owner in a cycle. Missing chat, blocked-user and
+deactivated-user rejections are expected recipient waits: existing `Failed` rows carry a closed diagnostic and
+six-hour retry delay via `UpdatedAtUtc`, with no photo claim/attempt or repeated Telegram logger warning. An owner
+must start/unblock the assistant; the next due probe may then deliver the latest completed week once. There is no
+fallback to a storefront/owned token. Absence of `BotUserStates` is deliberately not treated as missing consent,
+because the assistant does not need to create purchase/conversation state even for reachable owners.
+
+Known recipient rejection after a positive probe is also definite no-delivery and receives the same delay.
+Caption/photo bugs and unknown failures retain sanitized Warning diagnostics including the stage; raw API text,
+tokens and report content are never logged. A network/408/5xx **photo** outcome is still uncertain and never
+automatically resent; a failed read-only probe has not crossed that boundary. Historical generic `telegram_400`
+Rejected rows and existing Sent/SendStarted/DeliveryUncertain rows are not repaired, backfilled or reopened.
+No migration or financial change is required. See [Telegram's bot conversation rules](https://core.telegram.org/bots#how-are-bots-different-from-users).
+
 ## Public-channel posts
 
 In an owned bot, configured super-admins open **🗽 Admin → 📣 پست عمومی کانال‌ها**, send text or 1–10 photos

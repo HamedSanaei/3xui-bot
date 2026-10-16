@@ -144,6 +144,40 @@ public class SalesAssistantService
         return sent.MessageId;
     }
 
+    /// <summary>Checks a weekly-report owner's private chat through the current Sales Assistant before rendering or claiming a photo.</summary>
+    /// <param name="ownerTelegramUserId">Positive persisted storefront owner's Telegram user id, never a tenant bot or group id.</param>
+    /// <param name="cancellationToken">Host cancellation token for one routed read-only getChat request, additionally bounded to five seconds.</param>
+    /// <returns>Null for an exact private chat; a closed recipient code for definite unavailability, or assistant_route_or_target_unavailable before HTTP.</returns>
+    /// <remarks>No send, dispatch claim, wallet effect or fallback to an owned/tenant bot occurs. BotUserStates absence is not evidence
+    /// of missing contact: assistant updates need not create conversation-state rows. getChat success is not a guarantee against a later block.</remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The owner id is not positive.</exception>
+    /// <exception cref="ApiRequestException">An unexpected Telegram rejection occurred; callers must retain its sanitized diagnosis.</exception>
+    /// <exception cref="InvalidOperationException">Telegram returned a different or nonprivate chat.</exception>
+    /// <exception cref="HttpRequestException">The read-only transport failed; no photo has been sent.</exception>
+    /// <exception cref="BotTransportUnavailableException">The current assistant endpoint is fenced; no fallback or photo send is attempted.</exception>
+    /// <exception cref="OperationCanceledException">The read was canceled; no photo has been sent.</exception>
+    /// <example><code>var failure = await assistant.CheckTenantWeeklyRecipientAsync(ownerId, token);</code></example>
+    public async Task<string> CheckTenantWeeklyRecipientAsync(long ownerTelegramUserId, CancellationToken cancellationToken)
+    {
+        if (ownerTelegramUserId <= 0) throw new ArgumentOutOfRangeException(nameof(ownerTelegramUserId));
+        var assistant = GetAssistantBot();
+        if (assistant == null || !assistant.Enabled || string.IsNullOrWhiteSpace(assistant.Token))
+            return "assistant_route_or_target_unavailable";
+        try
+        {
+            using var probeDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            probeDeadline.CancelAfter(TenantWeeklyDeliveryPolicy.RecipientProbeTimeout);
+            var chat = await _botClientProvider.GetClient(assistant.Id).GetChat(ownerTelegramUserId, probeDeadline.Token);
+            if (chat == null || chat.Id != ownerTelegramUserId || chat.Type != ChatType.Private)
+                throw new InvalidOperationException(TenantWeeklyDeliveryPolicy.RecipientIdentityMismatch);
+            return null;
+        }
+        catch (ApiRequestException ex) when (TenantWeeklyDeliveryPolicy.IsRecipientUnavailable(TenantWeeklyDeliveryPolicy.GetFailureCode(ex)))
+        {
+            return TenantWeeklyDeliveryPolicy.GetFailureCode(ex);
+        }
+    }
+
     /// <summary>Sends one tenant weekly dashboard only through the configured Sales Assistant to its exact owner.</summary>
     /// <param name="tenantBotId">Required internal users.db BotInstance.Id captured from the tenant inventory; not a Telegram id.</param>
     /// <param name="ownerTelegramUserId">Positive global Telegram user id of that storefront's persisted owner.</param>

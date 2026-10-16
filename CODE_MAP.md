@@ -73,6 +73,11 @@
   `WeeklyUsageReportContent` shares the existing Persian comparison caption; unchanged renderer makes three panels.
   Existing users.db dispatch keys and atomic `SendStarted` prevent concurrent/restart duplicates. Definite 429/no-route
   failures may retry; ambiguous delivery never automatically replays. No schema/configuration/financial change.
+  `TenantWeeklyDeliveryPolicy` classifies closed recipient/caption/photo failures without raw API text. A routed
+  assistant `getChat` probe (five-second bound, once per owner/cycle) precedes chart rendering/claim; no BotUserStates-contact assumption.
+  Definite missing/blocked/deactivated recipients wait six hours in existing Failed/LastError/UpdatedAtUtc fields,
+  with zero pre-send AttemptCount and local Debug only. Old rejected telegram_400/Sent/SendStarted/uncertain rows
+  remain consumed; no historical repair/replay. Other failures retain Warning with closed stage/code.
   Existing-project `TenantWeekly*Tests.cs` cover boundaries/isolation/real-SDK delivery; operator details in
   `docs/multiple-storefronts.md` and `docs/deployment.md`.
 
