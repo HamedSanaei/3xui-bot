@@ -777,6 +777,174 @@ public sealed class TelegramEndpointAdminTests
         Assert.Single(fixture.Backend.Batches);
     }
 
+    /// <summary>The original report link survives control expiry, other navigation and repeated taps without submitting another batch.</summary>
+    /// <returns>A task proving repeated metadata reads after eleven minutes preserve single-use confirmation and never invoke health or migration APIs.</returns>
+    [Fact]
+    public async Task Original_bulk_report_refresh_is_reusable_after_control_expiry_and_navigation()
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
+        var confirmation = fixture.Control;
+        var submit = Button(confirmation, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)");
+        await fixture.TapAsync(confirmation, submit);
+        var original = fixture.Control;
+        var refresh = Button(original, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)");
+        var next = Button(original, "صفحه بعد گزارش ▶️");
+        Assert.StartsWith("tep:report:", refresh);
+        Assert.InRange(Encoding.UTF8.GetByteCount(refresh), 1, 64);
+        fixture.Clock.Advance(TimeSpan.FromMinutes(11));
+        fixture.Backend.States["owned"].ControlRevision++;
+        await fixture.TapAsync(original, next);
+        Assert.Contains("صفحه گزارش 2/", fixture.Control.Text);
+        await fixture.TapAsync(fixture.Control, Buttons(fixture.Control).First(x => x.Text.StartsWith("🔍 جزئیات فنی «", StringComparison.Ordinal)).CallbackData!);
+        for (var repeat = 0; repeat < 3; repeat++)
+        {
+            await fixture.TapAsync(original, refresh);
+            Assert.Contains("صفحه گزارش 1/", fixture.Control.Text);
+            Assert.Null(fixture.Client.Answers.Last().Text);
+        }
+        await fixture.TapAsync(confirmation, submit);
+        Assert.NotNull(fixture.Client.Answers.Last().Text);
+        Assert.Single(fixture.Backend.Batches);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
+    /// <summary>Report expiry and process restart produce an honest read-only missing-report screen instead of reviving a batch.</summary>
+    /// <param name="restart">True recreates process-local report storage; false advances the original absolute retention deadline.</param>
+    /// <returns>A task proving original links explain missing results and provide stable inventory navigation without another registration.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Original_bulk_report_refresh_handles_expiry_and_restart_without_replay(bool restart)
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)"));
+        var original = fixture.Control;
+        var refresh = Button(original, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)");
+        if (restart) fixture = new Fixture();
+        else fixture.Clock.Advance(TimeSpan.FromHours(1));
+        await fixture.TapAsync(original, refresh);
+        Assert.Contains("گزارش دسته‌ای منقضی/ناموجود است؛ انتقال را تکرار نکنید", fixture.Control.Text);
+        Assert.Equal("tep:list:0", Button(fixture.Control, "📋 بازگشت به فهرست"));
+        Assert.Null(fixture.Client.Answers.Last().Text);
+        Assert.Equal(restart ? 0 : 1, fixture.Backend.Batches.Count);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
+    /// <summary>Report links are not authority: another global admin cannot read the actor's report, and live revocation stops metadata access.</summary>
+    /// <param name="otherActor">True tests a different authorized administrator; false tests revocation of the original actor.</param>
+    /// <returns>A task proving actor isolation and fresh authorization without migration, health probes or batch replay.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Bulk_report_navigation_rechecks_actor_and_live_authority(bool otherActor)
+    {
+        var live = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+            { ["AdminsUserIds:0"] = Admin.ToString(), ["AdminsUserIds:1"] = (Admin + 1).ToString() }).Build();
+        var fixture = new Fixture(liveConfiguration: live);
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)"));
+        var original = fixture.Control;
+        var refresh = Button(original, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)");
+        var reads = fixture.Backend.Reads;
+        if (otherActor)
+        {
+            await fixture.Panel.TryHandleAsync("alternate", fixture.Client, Callback(original, refresh, actor: Admin + 1, chatId: Admin + 1), default);
+            Assert.Contains("گزارش دسته‌ای منقضی/ناموجود", fixture.Control.Text);
+        }
+        else
+        {
+            live["AdminsUserIds:0"] = "0";
+            await fixture.TapAsync(original, refresh);
+            Assert.Equal(reads, fixture.Backend.Reads);
+            Assert.Equal(original, fixture.Control);
+            Assert.NotNull(fixture.Client.Answers.Last().Text);
+        }
+        Assert.Single(fixture.Backend.Batches);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
+    /// <summary>Reusable report navigation retains the private enabled owned-host boundary and never trusts an opaque id as access authority.</summary>
+    /// <param name="host">Synthetic receiving host, including forbidden tenant, disabled, assistant and unknown ids.</param>
+    /// <param name="actor">Synthetic sender's numeric Telegram id; must be globally authorized.</param>
+    /// <param name="chat">Incoming chat type; only the administrator's private self-chat is authorized.</param>
+    /// <returns>A task proving denied navigation makes no metadata read, edit, health probe or new batch.</returns>
+    [Theory]
+    [InlineData("owned", 202, ChatType.Private)]
+    [InlineData("tenant", Admin, ChatType.Private)]
+    [InlineData("disabled", Admin, ChatType.Private)]
+    [InlineData("owned-assistant", Admin, ChatType.Private)]
+    [InlineData("unknown", Admin, ChatType.Private)]
+    [InlineData("owned", Admin, ChatType.Group)]
+    public async Task Bulk_report_refresh_rechecks_private_owned_host(string host, long actor, ChatType chat)
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        var original = fixture.Control;
+        var reads = fixture.Backend.Reads;
+        await fixture.Panel.TryHandleAsync(host, fixture.Client,
+            Callback(original, "tep:report:0123456789abcdef01234567:0", actor: actor, chatId: actor, chatType: chat), default);
+        Assert.Equal(reads, fixture.Backend.Reads);
+        Assert.Equal(original, fixture.Control);
+        Assert.NotNull(fixture.Client.Answers.Last().Text);
+        Assert.Empty(fixture.Backend.Batches);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
+    /// <summary>Untrusted report payloads cannot be treated as a control nonce, operation, or unbounded report page.</summary>
+    /// <param name="data">Malformed report callback with invalid id, signed/overflow page, extra fields or oversized input.</param>
+    /// <returns>A task proving malformed navigation stops before metadata, health, migration and batch admission.</returns>
+    [Theory]
+    [InlineData("tep:report:bad:0")]
+    [InlineData("tep:report:gggggggggggggggggggggggg:0")]
+    [InlineData("tep:report:0123456789abcdef01234567:-1")]
+    [InlineData("tep:report:0123456789abcdef01234567:+1")]
+    [InlineData("tep:report:0123456789abcdef01234567:2147483648")]
+    [InlineData("tep:report:0123456789abcdef01234567:0:migrate")]
+    [InlineData("tep:report:0123456789abcdef012345670123456789abcdef01234567:0")]
+    public async Task Bulk_report_navigation_rejects_malformed_payloads(string data)
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        var reads = fixture.Backend.Reads;
+        var original = fixture.Control;
+        await fixture.TapAsync(original, data);
+        Assert.Equal(reads, fixture.Backend.Reads);
+        Assert.Equal(original, fixture.Control);
+        Assert.NotNull(fixture.Client.Answers.Last().Text);
+        Assert.Empty(fixture.Backend.Batches);
+        Assert.Empty(fixture.Backend.Migrations);
+    }
+
+    /// <summary>Only Telegram's definitive unchanged-report result is benign; the same text with another status still reports an error without retry.</summary>
+    /// <param name="errorCode">400 for semantic no-op, 500 for a real transport/provider failure that must remain visible.</param>
+    /// <returns>A task proving repeated read-only refresh never retries migration and does not conceal unrelated API failures.</returns>
+    [Theory]
+    [InlineData(400)]
+    [InlineData(500)]
+    public async Task Bulk_report_refresh_treats_only_definitive_message_not_modified_as_success(int errorCode)
+    {
+        var fixture = new Fixture();
+        await fixture.OpenAsync();
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "☁️ انتقال همه ربات‌ها به Cloud…"));
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "✅ تأیید انتقال دسته‌ای به Cloud (ابری)"));
+        fixture.Client.EditFailure = new ApiRequestException("Bad Request: message is not modified", errorCode);
+        await fixture.TapAsync(fixture.Control, Button(fixture.Control, "🔄 تازه‌سازی گزارش (بدون ثبت مجدد)"));
+        if (errorCode == 400) Assert.Null(fixture.Client.Answers.Last().Text);
+        else Assert.Contains("پنل فعلاً در دسترس نیست", fixture.Client.Answers.Last().Text);
+        Assert.Single(fixture.Backend.Batches);
+        Assert.Empty(fixture.Backend.Migrations);
+        Assert.Equal(0, fixture.Backend.HealthRefreshes);
+    }
+
     /// <summary>Already-Cloud entries with old proven migrations are not counted as newly successful operations in a no-op Cloud batch.</summary>
     /// <returns>A task completing after the real report distinguishes unchanged destinations from the new batch's successful migrations.</returns>
     [Fact]
@@ -1392,6 +1560,8 @@ public sealed class TelegramEndpointAdminTests
     /// <summary>Records actual SDK request objects and returns deterministic Bot API-shaped message identities.</summary>
     private sealed class RecordingClient : ITelegramBotClient
     {
+        /// <summary>Optional deterministic edit failure, allowing safe no-op classification to be checked without Telegram traffic.</summary>
+        public ApiRequestException? EditFailure { get; set; }
         /// <summary>All produced control-message edits.</summary>
         public List<EditMessageTextRequest> Edits { get; } = new();
         /// <summary>All produced initial message sends.</summary>
@@ -1426,6 +1596,7 @@ public sealed class TelegramEndpointAdminTests
                     Sends.Add(send);
                     return Task.FromResult((TResponse)(object)new Message { Id = Sends.Count, Chat = new Chat { Id = Admin, Type = ChatType.Private } });
                 case EditMessageTextRequest edit:
+                    if (EditFailure != null) throw EditFailure;
                     Edits.Add(edit);
                     return Task.FromResult((TResponse)(object)new Message { Id = edit.MessageId, Chat = new Chat { Id = Admin, Type = ChatType.Private } });
                 case AnswerCallbackQueryRequest answer:

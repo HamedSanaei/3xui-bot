@@ -1797,7 +1797,11 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   uncertain cleanup and genuine migration failures retain their refusals/warnings; disabled aliases still fence active peers.
   Local explicitly retains one eligible owned Cloud control, preferring host then ordinal id; never bypasses last-control safety.
   Read-only per-actor paginated reports last one hour (max 512; latest three linked), reopenable from another healthy owned host;
-  controls still expire after ten minutes. Aggregate reports vanish on restart/expiry, individual operation/history remain durable.
+  report refresh/page/reopen links use reusable `tep:report:<opaque-id>:<page>` independent of consumed/ten-minute controls.
+  Each tap rechecks live private-owned global-admin access and report actor/absolute expiry; no probes or intent replay.
+  Missing/expired/restarted reports show a clear notice and inventory return, never fabricate aggregate recovery.
+  Report-only Telegram 400 message-not-modified is benign; unrelated edit failures remain visible without retry.
+  Mutation controls still expire after ten minutes. Aggregate reports vanish on restart/expiry, individual operation/history remain durable.
   No schema/configuration/FIFO/financial/protocol change; disabled/missing/tenant/assistant entries remain visible, no uncertain replay.
 - Endpoint incidents: one permanent incident receipt/outbox row, sent directly to live root `loggerChannel` (current default
   logger fallback) using an existing enabled owned nonassistant Cloud/CloudRecovered bot; verify getMe/channel/post permission.
