@@ -51,8 +51,19 @@ preflight starts no web server, Telegram receiver, hosted worker, or remote logg
 ## Synchronized-deployment gate (`scripts/deploy-production.sh`)
 
 The workflow verifies every push, pull request and manual dispatch on an isolated Linux Actions runner.
-Production activation is **manual only**: choose `main` and set `verify_only=false`. The default is verification
-without deployment; feature branches and pull requests never receive production secrets or run SSH/systemd.
+Production activation is **automatic after a successful push verification on `main`**. Every other branch and pull
+request still verifies without receiving production secrets or running SSH/systemd. Manual dispatch on `main` also
+deploys by default; select `verify_only=true` for an explicit verification-only run. The deployment job still needs
+successful verification and the exact checksummed artifact from that run; failed tests never produce an approved
+deployment. Any protection rules configured on the GitHub `production` environment still apply.
+
+`scripts/deploy-workflow.tests.py` checks main pushes (including absent dispatch inputs), manual deploy/dry-run,
+feature branches, tags and pull requests against the actual workflow condition, plus the required verification,
+artifact and concurrency gates. It runs before the existing shell deployment regressions without secrets or SSH.
+The telemetry restart regression retains its full record/byte-preservation assertions and uses the unchanged
+five-second production shutdown budget; the previous one-second test-only deadline could discard the second writer's
+tail under parallel runner load. Both lifetimes now explicitly assert zero drops and writer failures. There is no
+automatic test retry, skipped test, or change to production telemetry settings.
 
 `scripts/verify-release.sh <40-character-sha> <fresh-output-directory-outside-checkout>` rejects dirty or mismatched
 source and runs the complete gate: pinned EF tool restore, solution restore/build, full test discovery and execution,
@@ -86,9 +97,9 @@ failed synchronization never reaches restart.
 
 `bash scripts/deploy-production.tests.sh` exercises fail-closed gate orchestration, aborted/empty test proof,
 artifact tampering/traversal/link rejection, real timeout and rsync preservation behavior without Production access.
-For rollout, review the branch's green verification and merge it; merging alone does not deploy. Take the normal
-verified production backup, confirm the prerequisites, then manually run the workflow on `main` with
-`verify_only=false` and any required production-environment approval. Keep the previous known-good runtime artifact
+Before pushing or merging into `main`, review branch verification, take the normal verified production backup and
+confirm the prerequisites: the resulting main push automatically deploys after its own complete verification gate.
+For a deliberate manual activation, run the workflow on `main` with `verify_only=false`; any configured production-environment approval still applies. Keep the previous known-good runtime artifact
 for rollback. Do not bulk-reset inbox, payment, order or uncertain-delivery rows.
 
 ## SQLite scan contention and receipt acknowledgement recovery

@@ -254,26 +254,33 @@ public sealed class LatencyTelemetryReliabilityTests
         Assert.Contains(events, item => item.EventType == "telemetry_stopped" && item.WriterFailures > 0 && item.DroppedEvents > 0);
     }
 
-    /// <summary>Graceful shutdown flushes every queued tail record, and a restarted writer never truncates prior files.</summary>
-    /// <returns>A task asserting exact update persistence and byte-for-byte preservation after restart.</returns>
+    /// <summary>Graceful shutdown within the production drain budget flushes every queued tail record, and restart never truncates prior files.</summary>
+    /// <returns>A task asserting zero loss and writer failures for both lifetimes, exact update persistence, and byte-for-byte preservation.</returns>
+    /// <remarks>The former one-second fixture budget also covered Task.Run startup and could expire under parallel Linux CI load.
+    /// Use the existing five-second production default, not an unbounded wait or an automatic test retry. Forced-cancellation coverage keeps its separate short budget.</remarks>
     [Fact]
     public async Task Shutdown_flushes_tail_and_restart_preserves_previous_files()
     {
         using var files = new TemporaryFiles();
-        using (var first = files.Service())
+        var shutdownSeconds = new LatencyTelemetryOptions().ShutdownFlushSeconds;
+        using (var first = files.Service(shutdownFlushSeconds: shutdownSeconds))
         {
             for (var index = 1; index <= 40; index++) Assert.True(first.TryRecord(Summary() with { UpdateId = index }));
             await first.StartAsync(CancellationToken.None);
             await first.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
             Assert.Equal(0, first.DroppedEvents);
             Assert.Equal(0, first.ChannelDepth);
+            Assert.Equal(0, first.WriterFailures);
         }
         var before = Directory.GetFiles(files.TelemetryDirectory, "latency-*.jsonl").ToDictionary(path => path, File.ReadAllBytes);
-        using (var second = files.Service())
+        using (var second = files.Service(shutdownFlushSeconds: shutdownSeconds))
         {
             Assert.True(second.TryRecord(Summary() with { UpdateId = 41 }));
             await second.StartAsync(CancellationToken.None);
             await second.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(0, second.DroppedEvents);
+            Assert.Equal(0, second.ChannelDepth);
+            Assert.Equal(0, second.WriterFailures);
         }
         foreach (var pair in before) Assert.Equal(pair.Value, File.ReadAllBytes(pair.Key));
         Assert.Equal(Enumerable.Range(1, 41).Select(id => (long?)id), ReadEvents(files.TelemetryDirectory)
@@ -985,12 +992,16 @@ public sealed class LatencyTelemetryReliabilityTests
         /// <summary>Creates an explicit unstarted production service owned by the calling test.</summary>
         /// <param name="enabled">Collection flag for disabled-path tests.</param>
         /// <param name="capacity">Validated event queue capacity.</param>
+        /// <param name="shutdownFlushSeconds">Optional bounded drain duration in seconds, from one through thirty; null retains the short one-second fixture policy.</param>
         /// <returns>An independent writer whose disposal precedes fixture cleanup.</returns>
-        public LatencyTelemetryService Service(bool enabled = true, int capacity = 64)
+        /// <remarks>Only this test instance receives the override; runtime configuration and other short-deadline fixtures are unchanged.</remarks>
+        /// <example><code>using var service = files.Service(shutdownFlushSeconds: new LatencyTelemetryOptions().ShutdownFlushSeconds);</code></example>
+        public LatencyTelemetryService Service(bool enabled = true, int capacity = 64, int? shutdownFlushSeconds = null)
         {
             var options = Options();
             options.Enabled = enabled;
             options.ChannelCapacity = capacity;
+            if (shutdownFlushSeconds.HasValue) options.ShutdownFlushSeconds = shutdownFlushSeconds.Value;
             return new LatencyTelemetryService(options, Root, NullLogger<LatencyTelemetryService>.Instance);
         }
         /// <summary>Deletes only this fixture's temporary files after explicitly owned resources have stopped.</summary>

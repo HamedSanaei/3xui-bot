@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       verify_only:
-        description: Run complete release gate without deployment
+        description: Verify only; skip deployment (main deploys by default)
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -44,7 +44,9 @@ jobs:
           dotnet-version: 10.0.x
       - name: Exercise deployment regressions
         shell: bash
-        run: timeout --kill-after=10s 180s bash scripts/deploy-production.tests.sh
+        run: |
+          timeout --kill-after=5s 30s python3 scripts/deploy-workflow.tests.py
+          timeout --kill-after=10s 180s bash scripts/deploy-production.tests.sh
       - name: Run full isolated release gate
         id: gate
         shell: bash
@@ -87,8 +89,8 @@ jobs:
             "$RUNNER_TEMP/verified-download/release.tar.gz" "$GITHUB_SHA" "$ARCHIVE_SHA256"
   deploy:
     needs: verify
-    # Production activation is an explicit, main-only manual action; pushes and pull requests only verify.
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && !inputs.verify_only
+    # Only verified main pushes or explicit main dispatches activate Production; PRs and other branches never deploy.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.verify_only))
     name: Deploy Production
     runs-on: ubuntu-latest
     environment:

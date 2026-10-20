@@ -344,7 +344,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   Actions proves upload/exact-ID download/checksum round trip on every verification; Production verifies again
   and runs only copy-only live-database migration preflight before protected runtime rsync/restart.
   It no longer builds/tests/syncs source.
-  All pushes/PRs verify only; activation requires manual dispatch on main with `verify_only=false`.
+  All pushes/PRs verify; successful main pushes automatically activate the same verified artifact.
+  Manual main dispatch deploys by default; `verify_only=true` is the explicit dry run. Other branches/PRs never deploy.
+  `scripts/deploy-workflow.tests.py` checks the event matrix and intact verification/artifact gates without secrets/SSH.
+  Telemetry graceful-restart regression uses the unchanged five-second production drain budget (not the one-second fixture),
+  asserting zero loss/failure for both writers and all 41 records; forced-cancellation tests retain short deadlines.
   `scripts/deploy-production.tests.sh` exercises failure blocking, archive safety, timeout and real state preservation.
   Production requires Python3/GNU timeout/rsync/flock and .NET runtime, not SDK. See `docs/deployment.md`.
 - Server publish: `dotnet publish Adminbot.csproj -c Release -f net10.0 -r linux-x64 --self-contained false`.
